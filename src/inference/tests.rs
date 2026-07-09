@@ -1810,6 +1810,8 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS",
         "CAMELID_Q8_0_PACKED_4X4_DOT",
         "CAMELID_Q8_0_PACKED_4X8_DOT",
+        "CAMELID_X86_KQUANT_MATMUL_OWNER",
+        "CAMELID_X86_Q6K_AVX2",
         "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
         "CAMELID_Q8_0_FILE_CACHE_BYTES",
         "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
@@ -3394,15 +3396,18 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
     for (in_dim, out_dim) in [(512usize, 96usize), (768, 40)] {
         let row_bytes = (in_dim / 256) * 144;
         // Deterministic wire: small finite f16 d/dmin, adversarial scale/min
-        // and nibble bytes over the FULL 0..=255 range (every bit pattern is
-        // structurally valid Q4_K; the kmask unpack caps live scales at 63).
+        // and nibble bytes with genuine full-byte coverage via a
+        // multiplicative hash (a linear-in-index generator collapses to one
+        // parity class because the 144-byte block stride is even; every bit
+        // pattern is structurally valid Q4_K — the kmask unpack caps live
+        // scales at 63).
         let wire: Vec<u8> = (0..out_dim * row_bytes)
             .map(|i| match i % 144 {
                 0 => 0x66,
                 1 => 0x2e, // d ~= 0.1
                 2 => 0x99,
                 3 => 0x24, // dmin ~= 0.018
-                pos => ((i * 31 + pos * 7 + 11) % 256) as u8,
+                _ => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
             })
             .collect();
         for n_rows in [4usize, 5, 13, 64, 67] {
@@ -3448,12 +3453,17 @@ fn q6_k_owner_prefill_bitwise_matches_block_dot_core() {
 
     for (in_dim, out_dim) in [(512usize, 96usize), (768, 40)] {
         let row_bytes = (in_dim / 256) * 210;
-        // Deterministic wire over the full byte range; d f16 fixed small.
+        // Deterministic wire with genuine full-byte coverage (multiplicative
+        // hash — a linear-in-index generator collapses to one parity class
+        // because the 210-byte block stride is even); d f16 fixed small, and
+        // one scale byte per superblock forced to 0x80 (-128, the i8
+        // extreme) so the scale sign path is pinned end-to-end.
         let wire: Vec<u8> = (0..out_dim * row_bytes)
             .map(|i| match i % 210 {
+                192 => 0x80, // first per-16 scale = -128
                 208 => 0x66,
                 209 => 0x2e, // d ~= 0.1
-                pos => ((i * 29 + pos * 11 + 3) % 256) as u8,
+                _ => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
             })
             .collect();
         for n_rows in [4usize, 5, 13, 64, 67] {
@@ -3493,15 +3503,18 @@ fn q6_k_owner_aux32_scalar_matches_avx2() {
             return;
         }
         for salt in 0..4usize {
-            let a: Vec<i8> = (0..256)
-                .map(|i| ((((i * 17 + salt * 5) % 64) as i16) - 32) as i8)
-                .collect();
-            let scales: Vec<u8> = (0..16)
-                .map(|j| ((j * 37 + salt * 13) % 256) as u8)
-                .collect();
-            let q8: Vec<i8> = (0..256)
-                .map(|i| (((i * 23 + salt * 11) % 255) as i16 - 127) as i8)
-                .collect();
+            let a: [i8; 256] =
+                std::array::from_fn(|i| ((((i * 17 + salt * 5) % 64) as i16) - 32) as i8);
+            // Includes -128 (0x80) among the i8 scales when salt selects it.
+            let scales: [u8; 16] = std::array::from_fn(|j| {
+                if j == 0 {
+                    0x80
+                } else {
+                    ((j * 37 + salt * 13) % 256) as u8
+                }
+            });
+            let q8: [i8; 256] =
+                std::array::from_fn(|i| (((i * 23 + salt * 11) % 255) as i16 - 127) as i8);
             let scalar = q6_k_owner_aux32_scalar(&a, &scales, &q8);
             // SAFETY: avx2 confirmed present above.
             let simd = unsafe { q6_k_owner_aux32_avx2(&a, &scales, &q8) };

@@ -1,4 +1,4 @@
-# STAMPEDE P3 Lane B — Q6_K owner sibling: verdict + a routing discovery
+# STAMPEDE P3 Lane B — Q6_K owner sibling: verdict (REVISED after the reachability fix)
 
 ## What was built
 `q6_k_owner_prefill_tiled` (same flag `CAMELID_X86_KQUANT_MATMUL_OWNER`, same rows≥4 dispatch,
@@ -7,33 +7,47 @@ weight row (the default per-cell path re-runs the full scalar rebuild for EVERY 
 the in-tree bit-identity-proven AVX2 `aux32` lane kernel; the bits-sensitive per-cell f32 shape
 (8 lane accumulators, `sums[l] += d·aux32[l]` per superblock, final left-fold) is kept verbatim
 per `q6_k_wire_row_dot` — the shape KQUANT_RECON proved must not be restructured. Bitwise twin
-tests (owner-vs-block-dot with engaged-check; scalar-vs-AVX2 aux32).
+tests (owner-vs-block-dot with engaged-check; scalar-vs-AVX2 aux32; full-byte-coverage wire with
+a forced −128 scale per superblock).
 
-## Measured
+## The reachability bug the adversarial review caught (MAJOR)
+As first committed, the owner dispatch lived only in `q6_k_block_dot_core` — but production
+Q6_K traffic calls `matmul_rhs_transposed_q6_k_block_dot`, which carried its own inline
+duplicate of the core body and never reached the core. **The owner was production-unreachable
+for Q6_K**, which is why the first end-to-end receipts
+(`stampede-p3-kquant-owner-v3q6k-on-*.json`) were flat (0.99×/0.95× vs the Q4_K-only owner) —
+they measured the unreachable version, NOT a small Q6_K share (this file's earlier "~4% of the
+stream" explanation was wrong and is retracted). Fix: the wrapper now delegates to the core
+(the Q4_K wrapper's pattern), de-duplicating the body and routing every Q6_K block-dot consumer
+— the main linear intercept, the tied lm-head path, and the borrowed dispatch — through the
+owner dispatch.
 
-| leg | prefill tok/s | vs Q4_K-owner-only (v2) | text |
+## Measured after the fix (single-engine probe, bench-memory-safety rules)
+`scripts/` single-engine protocol: ONE camelid serve (no concurrent llama-server), CUDA hidden,
+3B Q4_K_M, 4 cold prefills per leg (nonce cache-defeat), off → on → off drift check, engaged
+counter from response telemetry:
+
+| leg | cold prefill tok/s (4 probes) | median | kquant_owner_prefill_taken |
 |---|---|---|---|
-| 3B Q4_K_M, owner on (v3 = Q4_K+Q6_K) | 22.19 | 0.99× (flat) | ≡ P0 receipt |
-| Qwen3-4B Q4_K_M, owner on (v3) | 16.38 | 0.95× (flat/noise) | ≡ P0 receipt |
+| off | 13.62, 13.68, 13.81, 13.82 | 13.74 | 0 |
+| on (Q4_K+Q6_K owner) | 23.76, 23.77, 23.81, 23.89 | **23.79** | **392** |
+| off (drift check) | 13.97, 14.04, 14.22, 14.39 | 14.13 | 0 |
 
-**Why flat, and why that's expected in hindsight:** `camelid inspect` shows the 3B Q4_K_M GGUF
-carries 168 Q4K vs 29 Q6K tensors — the Q6K ones are per-layer `attn_v` (small) plus the lm head
-(which executes at rows==1, outside the owner). Q6_K is ~4% of the batched prefill weight
-stream on Q4_K_M rows; a kernel win on 4% is invisible end-to-end.
+**Speedup 1.73× (drift 1.028×)** — vs the Q4_K-only owner's ~1.50× on the dual-engine harness.
+Byte-identity: bitwise twin tests over both quants; greedy text identity was verified e2e on the
+earlier legs and the kernels are unchanged since (only routing moved).
 
-## The routing discovery (bench-design trap, receipt-worthy)
-A pure-Q6_K validation model was minted locally (`llama-quantize --allow-requantize` from the
-tinyllama Q8_0 → Q6_K). The A/B on it measured **flat prefill and the owner counter read 0**:
-the response's `lane` field says `"experimental"` — a locally-requantized GGUF is not a
-supported capability row, so serve routes it through the experimental/generic engine, which
-never reaches the native K-quant block-dot kernels at all. **Local requants cannot exercise
-native-lane kernels via serve**; any future K-quant kernel benchmark must use a supported row
-(receipts `stampede-p3-q6k-owner-{off,on}-tinyllama-q6k-20260708.json` kept as the honest
-negative; its decode swing is cold-page-cache noise on the freshly minted file).
+Note: single-engine absolute numbers differ from the dual-engine medN receipts (no concurrent
+llama-server contention); ratios are the honest comparison. Dual-engine measurement is now
+restricted per the bench-memory-safety rules (this box crashed on memory pressure 2026-07-08).
+
+## Standing discovery (unchanged)
+A locally-requantized pure-Q6_K GGUF routes to the EXPERIMENTAL lane via serve — native K-quant
+kernels never run for it (owner counter 0, lane:"experimental"). Local requants cannot validate
+native-lane kernels; use supported rows.
+(`stampede-p3-q6k-owner-{off,on}-tinyllama-q6k-20260708.json` kept as the honest negative.)
 
 ## Verdict
-Ship as COVERAGE: bitwise-correct, zero-risk (opt-in flag unchanged), completes the owner
-across both K-quants used by supported rows, and removes the per-cell rebuild for any future
-Q6_K-heavy supported row. No end-to-end speedup claim is made for current rows — the receipts
-above say exactly that. The Lane B escalation ladder for real Q4_K_M prefill gains remains:
+GO as opt-in: combined K-quant owner now delivers **1.73× on 3B Q4_K_M prefill** (0.15× → ~0.26×
+of llama.cpp b9918), byte-identical. Remaining escalation to the campaign's 0.6× target:
 8-row interleaved repack, AVX-512 VNNI main side.

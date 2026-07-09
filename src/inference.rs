@@ -17519,8 +17519,6 @@ fn matmul_rhs_transposed_q6_k_block_dot(
     weight: &CpuTensor,
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
-    use rayon::prelude::*;
-    let n_rows = input.dim(0)?;
     let in_dim = input.dim(1)?;
     if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
         return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -17541,26 +17539,12 @@ fn matmul_rhs_transposed_q6_k_block_dot(
         )));
     }
     let out_dim = wire.len() / row_bytes;
-    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
-        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
-        .collect();
-    let cols: Vec<Vec<f32>> = (0..out_dim)
-        .into_par_iter()
-        .map(|o| {
-            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
-            preps
-                .iter()
-                .map(|q8| q6_k_wire_row_dot_simd(w_row, q8))
-                .collect()
-        })
-        .collect();
-    let mut out = vec![0f32; n_rows * out_dim];
-    for (o, col) in cols.iter().enumerate() {
-        for (r, &v) in col.iter().enumerate() {
-            out[r * out_dim + o] = v;
-        }
-    }
-    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+    // Delegate to the shared core (the Q4_K wrapper's pattern) so EVERY Q6_K
+    // block-dot consumer — including the main linear intercept and the tied
+    // lm-head path, which call this wrapper directly — reaches the batched
+    // owner dispatch. The previous inline duplicate of the core body made the
+    // owner production-unreachable for Q6_K (review finding, 2026-07-08).
+    q6_k_block_dot_core(input, wire, out_dim, in_dim, name)
 }
 
 /// Whether the experimental CPU Q4_K block-dot decode path is enabled. Default
@@ -17678,8 +17662,10 @@ fn matmul_rhs_transposed_q4_k_block_dot(
     q4_k_block_dot_core(input, wire, out_dim, in_dim, name)
 }
 
-/// STAMPEDE Phase 3 Lane B — batched Q4_K prefill owner flag. Default OFF
-/// (opt-in until receipts flip it): `CAMELID_X86_KQUANT_MATMUL_OWNER=1|on`.
+/// STAMPEDE Phase 3 Lane B — batched K-quant (Q4_K + Q6_K) prefill owner
+/// flag. Default OFF (opt-in until receipts flip it):
+/// `CAMELID_X86_KQUANT_MATMUL_OWNER=1|on`. The shared telemetry counter
+/// `kquant_owner_prefill_taken` counts dispatches of BOTH quants.
 /// Honors the bench sweep's uncached-plan bypass so in-process A/B configs
 /// take effect (the same fake-null trap as the Q8 owner sweep).
 /// Scope notes: the flag is honored on every arch (the scalar twin is
@@ -18017,7 +18003,11 @@ fn q6_k_owner_rebuild_superblock(block: &[u8], a: &mut [i8; Q6_K_VALUES_PER_BLOC
 /// body lifted from the in-tree bit-identical `q6_k_wire_row_dot_avx2`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn q6_k_owner_aux32_avx2(a: &[i8], scales: &[u8], q8: &[i8]) -> [i32; 8] {
+unsafe fn q6_k_owner_aux32_avx2(
+    a: &[i8; Q6_K_VALUES_PER_BLOCK],
+    scales: &[u8; 16],
+    q8: &[i8; Q6_K_VALUES_PER_BLOCK],
+) -> [i32; 8] {
     use std::arch::x86_64::*;
     let mut acc = _mm256_setzero_si256();
     let aptr = a.as_ptr();
@@ -18045,7 +18035,11 @@ unsafe fn q6_k_owner_aux32_avx2(a: &[i8], scales: &[u8], q8: &[i8]) -> [i32; 8] 
 
 /// Scalar twin of [`q6_k_owner_aux32_avx2`] — [`q6_k_wire_row_dot`]'s exact
 /// integer loop over a pre-rebuilt superblock.
-fn q6_k_owner_aux32_scalar(a: &[i8], scales: &[u8], q8: &[i8]) -> [i32; 8] {
+fn q6_k_owner_aux32_scalar(
+    a: &[i8; Q6_K_VALUES_PER_BLOCK],
+    scales: &[u8; 16],
+    q8: &[i8; Q6_K_VALUES_PER_BLOCK],
+) -> [i32; 8] {
     let mut aux32 = [0i32; 8];
     for (j, &scale) in scales.iter().enumerate().take(16) {
         let scale = scale as i8 as i32;
@@ -18136,22 +18130,28 @@ fn q6_k_owner_prefill_tiled(
                     let mut sums = [0f32; 8];
                     for (i, y) in blocks.iter().enumerate().take(superblocks) {
                         let d = wd[i] * y.d;
-                        let a = &a_all[i * Q6_K_VALUES_PER_BLOCK..(i + 1) * Q6_K_VALUES_PER_BLOCK];
-                        let scales = &wsc[i * 16..(i + 1) * 16];
-                        let aux32 = {
+                        let a: &[i8; Q6_K_VALUES_PER_BLOCK] = a_all
+                            [i * Q6_K_VALUES_PER_BLOCK..(i + 1) * Q6_K_VALUES_PER_BLOCK]
+                            .try_into()
+                            .expect("owner superblock slice is exactly 256 weights");
+                        let scales: &[u8; 16] = wsc[i * 16..(i + 1) * 16]
+                            .try_into()
+                            .expect("owner scale slice is exactly 16 bytes");
+                        // `use_avx2` is read on every target (the cfg split is
+                        // inside the arm), so non-x86 builds see no unused
+                        // binding.
+                        let aux32 = if use_avx2 {
                             #[cfg(target_arch = "x86_64")]
-                            {
-                                if use_avx2 {
-                                    // SAFETY: avx2 confirmed present at dispatch.
-                                    unsafe { q6_k_owner_aux32_avx2(a, scales, &y.qs) }
-                                } else {
-                                    q6_k_owner_aux32_scalar(a, scales, &y.qs)
-                                }
+                            // SAFETY: avx2 confirmed present at dispatch; the
+                            // fixed-size array refs guarantee the 256/16-byte
+                            // reads are in bounds.
+                            unsafe {
+                                q6_k_owner_aux32_avx2(a, scales, &y.qs)
                             }
                             #[cfg(not(target_arch = "x86_64"))]
-                            {
-                                q6_k_owner_aux32_scalar(a, scales, &y.qs)
-                            }
+                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
+                        } else {
+                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
                         };
                         for l in 0..8 {
                             sums[l] += d * aux32[l] as f32;
