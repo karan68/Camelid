@@ -10128,6 +10128,10 @@ fn generate_token_ids(
         // valid JSON-object prefix; EOG only once the object is complete.
         let grammar_allowed: Option<&[bool]> = match grammar.as_ref() {
             Some(state) => {
+                // `done` gates whether EOG is allowed this step. With the current loop
+                // structure it is always false here (the loop breaks the moment a token
+                // drives the state to done, below); it is kept defensive so the mask
+                // stays correct if that stop/advance ordering ever changes.
                 let done = state.is_done();
                 let mut any_allowed = false;
                 for (id, slot) in grammar_mask.iter_mut().enumerate() {
@@ -10316,7 +10320,15 @@ fn generate_token_ids(
         if let Some(state) = grammar.as_mut() {
             if let Some(bytes) = grammar_token_bytes.get(step.next_token_id as usize) {
                 for &b in bytes {
-                    let _ = state.advance(b);
+                    // The mask guaranteed every byte of the chosen token is acceptable.
+                    // Advance in all builds (the grammar must consume the emitted bytes)
+                    // and assert acceptance in debug, so a mask/advance divergence fails
+                    // a test instead of silently emitting invalid output.
+                    let accepted = state.advance(b).is_ok();
+                    debug_assert!(
+                        accepted,
+                        "constrained-decode mask allowed a token whose bytes the grammar rejects"
+                    );
                 }
             }
             if state.is_done() {

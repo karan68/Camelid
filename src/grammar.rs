@@ -504,10 +504,12 @@ fn compile_node(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
     };
     if let Some(constant) = map.get("const") {
         reject_unknown(map, &["const", "type"])?;
+        reject_conflicting_literal_type(map, "const")?;
         return compile_string_literals(std::slice::from_ref(constant), "const");
     }
     if let Some(values) = map.get("enum") {
         reject_unknown(map, &["enum", "type"])?;
+        reject_conflicting_literal_type(map, "enum")?;
         let arr = values
             .as_array()
             .ok_or_else(|| serr("`enum` must be an array"))?;
@@ -621,6 +623,22 @@ fn ensure_disjoint_start_bytes(members: &[Schema]) -> Result<(), SchemaError> {
         }
     }
     Ok(())
+}
+
+/// String `const`/`enum` may carry a redundant `type`, but only a string one: a
+/// non-string `type` alongside string members is a self-contradictory schema, which
+/// we reject rather than silently ignore (the members would be enforced either way).
+fn reject_conflicting_literal_type(
+    map: &serde_json::Map<String, serde_json::Value>,
+    keyword: &str,
+) -> Result<(), SchemaError> {
+    match map.get("type") {
+        None => Ok(()),
+        Some(serde_json::Value::String(s)) if s == "string" => Ok(()),
+        Some(_) => Err(serr(format!(
+            "`{keyword}` members are strings; a non-string `type` alongside them is contradictory"
+        ))),
+    }
 }
 
 fn compile_string_literals(
@@ -1680,5 +1698,28 @@ mod tests {
             "properties": {"x": {"type": ["string"]}}, "required": ["x"]
         }))
         .is_ok());
+    }
+
+    #[test]
+    fn const_or_enum_with_conflicting_type_is_rejected() {
+        use serde_json::json;
+        // const/enum members are strings; a contradictory non-string `type` is
+        // rejected rather than silently ignored (no dropped constraint).
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"k": {"const": "x", "type": "number"}}, "required": ["k"]
+        }))
+        .is_err());
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"k": {"enum": ["a", "b"], "type": "integer"}}, "required": ["k"]
+        }))
+        .is_err());
+        // A redundant but consistent `type: "string"` is accepted.
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"k": {"const": "x", "type": "string"}}, "required": ["k"]
+        }));
+        assert!(schema_complete(&s, r#"{"k":"x"}"#));
     }
 }
