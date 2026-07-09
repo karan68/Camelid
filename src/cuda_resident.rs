@@ -4446,10 +4446,8 @@ struct StreamOverlap {
     /// V chain done on side_b → attention on main may read `cache_v[li]`.
     ev_v: CudaEvent,
     /// ffn norm+quantize done on main → up gemv on side_a may read `d_in_*`/`d_q8k_*`.
-    #[allow(dead_code)] // consumed by the FFN block threading (wired next commit).
     ev_ffn: CudaEvent,
     /// up gemv done on side_a → silu on main may read `d_up` (and overwrite `d_in_*`).
-    #[allow(dead_code)] // consumed by the FFN block threading (wired next commit).
     ev_up: CudaEvent,
 }
 
@@ -6257,6 +6255,20 @@ impl CudaResidentDecode {
                 )
                 .map_err(map)?;
             }
+            // Phase 6 overlap (FFN): publish the ffn activation to side_a and run the
+            // up gemv there while the gate gemv keeps main warm. Full layers only —
+            // the SSM mixer is out of scope in v1, so an SSM layer's FFN stays serial.
+            let ffn_overlap =
+                ov_streams.is_some() && matches!(&self.layers[li].kind, LayerKind::Full);
+            let s_up: &Arc<CudaStream> = if ffn_overlap {
+                let (a, _) = ov_streams.as_ref().expect("overlap streams");
+                let o = self.overlap.as_ref().expect("overlap state");
+                o.ev_ffn.record(&s).map_err(map)?;
+                a.wait(&o.ev_ffn).map_err(map)?;
+                a
+            } else {
+                &s
+            };
             dispatch_gemv(
                 &s,
                 &self.k,
@@ -6273,7 +6285,7 @@ impl CudaResidentDecode {
             )
             .map_err(map)?;
             dispatch_gemv(
-                &s,
+                s_up,
                 &self.k,
                 lq[5],
                 &self.d_in_scales,
@@ -6287,6 +6299,15 @@ impl CudaResidentDecode {
                 0,
             )
             .map_err(map)?;
+            // Join: silu on main reads d_up, so it waits on the side up gemv. The
+            // wait also transitively orders silu's write of the shared d_in_*
+            // (/d_q8k_*) scratch after the up gemv's read of it (WAR), and the next
+            // layer's attn norm write after that.
+            if ffn_overlap {
+                let o = self.overlap.as_ref().expect("overlap state");
+                o.ev_up.record(s_up).map_err(map)?;
+                s.wait(&o.ev_up).map_err(map)?;
+            }
             // SiLU(gate)*up -> down's activation, in down's format.
             if lq[6] == ProjQuant::Q8_0 {
                 if fused {
