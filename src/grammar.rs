@@ -148,6 +148,11 @@ fn num_advance(num: Num, b: u8, integer_only: bool) -> NumStep {
 /// One transition of the shared JSON *string* body sub-grammar (the bytes between
 /// the quotes). Shared by [`JsonState`] and the schema validator so both treat
 /// escapes, `\u` hex, and raw control characters identically.
+///
+/// Known relaxation (inherited, not enforced): raw bytes >= 0x80 pass without UTF-8
+/// well-formedness checks, and a `\u` escape accepts a lone surrogate. The emitted
+/// output is still accepted by essentially all JSON parsers; strict
+/// well-formedness / surrogate-pairing is a possible follow-up.
 enum StrStep {
     /// Still inside the string; carries the new escape/hex sub-state.
     Stay { escape: bool, hex: u8 },
@@ -801,6 +806,14 @@ impl SchemaState {
         matches!(self.mode, SchemaMode::Done)
     }
 
+    /// Would appending `bytes` keep the output a valid prefix of the constrained
+    /// value? Probes on a clone so the live state is untouched.
+    ///
+    /// Cost note: the decode loop calls this once per vocab token per step, so each
+    /// step clones this state O(vocab) times (as the existing `json_object` path
+    /// already does). Acceptable for opt-in constrained decoding; if structured
+    /// output becomes hot, a reusable scratch state reset from `self` (instead of a
+    /// clone) would remove the per-token allocation.
     fn accepts(&self, bytes: &[u8]) -> bool {
         let mut probe = self.clone();
         for &b in bytes {
@@ -1173,7 +1186,7 @@ pub enum ConstraintState {
     /// `response_format: {"type":"json_object"}` — any valid JSON object.
     Json(JsonState),
     /// `response_format: {"type":"json_schema", ...}` — a value matching a compiled
-    /// JSON Schema (the supported subset; see [`ConstraintState::new_schema`]).
+    /// JSON Schema (the supported subset; see [`ConstraintSpec::from_schema`]).
     Schema(SchemaState),
 }
 
