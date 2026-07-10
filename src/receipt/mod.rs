@@ -199,11 +199,7 @@ impl LaneIdentity {
 /// Human label for the GGUF's quantization: `general.file_type` when present
 /// (llama.cpp ftype naming), else the dominant tensor type by count.
 pub fn quantization_label(gguf: &GgufFile) -> String {
-    if let Some(label) = gguf
-        .metadata
-        .get("general.file_type")
-        .and_then(file_type_label)
-    {
+    if let Some(label) = declared_file_type_label(gguf) {
         return label.to_string();
     }
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -217,6 +213,15 @@ pub fn quantization_label(gguf: &GgufFile) -> String {
         .max_by_key(|(_, count)| *count)
         .map(|(label, _)| label)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The declared `general.file_type` as its llama.cpp ftype name, when present
+/// and recognized. Shared by receipts and the execution plan so both surfaces
+/// name the same file the same way.
+pub fn declared_file_type_label(gguf: &GgufFile) -> Option<&'static str> {
+    gguf.metadata
+        .get("general.file_type")
+        .and_then(file_type_label)
 }
 
 fn file_type_label(value: &GgufMetadataValue) -> Option<&'static str> {
@@ -245,6 +250,8 @@ fn file_type_label(value: &GgufMetadataValue) -> Option<&'static str> {
         17 => "Q5_K_M",
         18 => "Q6_K",
         32 => "BF16",
+        36 => "TQ1_0",
+        37 => "TQ2_0",
         _ => return None,
     })
 }
