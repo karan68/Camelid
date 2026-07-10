@@ -93,8 +93,18 @@ pub struct ExecutionPlan {
     pub cpu_model: String,
     pub cpu_features: Vec<String>,
     pub model_family: String,
+    /// Human quantization label: the declared `general.file_type` (llama.cpp
+    /// ftype naming) when present and credible, else a tensor-scan bucket.
+    /// Descriptive only — routing branches on tensor predicates, not this.
     pub quant_type: String,
+    /// Row identity as recognized from `general.name` (or the filename when
+    /// the name is junk). Name-derived: it does NOT imply the quant on disk
+    /// matches the row's evidence — see `support_level`.
     pub exact_model_row: String,
+    /// Plan-level support string for the recognized row, quant-gated: only a
+    /// Q8_0 file of a recognized row reports that row's level; every other
+    /// quant reports `unknown_or_unvalidated`. `/api/capabilities` remains
+    /// the support source of truth.
     pub support_level: String,
     pub selected_backend: String,
     pub selected_q8_path: String,
@@ -267,9 +277,9 @@ pub fn plan_for_model_with_platform(
         None => requested_profile(),
     };
     let row = exact_model_row(model_path, gguf);
-    let support_level = support_level(&row);
     let model_family = model_family(&row, gguf);
     let quant_type = quant_type(gguf);
+    let support_level = support_level(&row, &quant_type);
     let thread_count = threads.unwrap_or_else(default_thread_count);
     let diagnostics_status = match profile {
         ExecutionProfile::Debug => {
@@ -288,6 +298,16 @@ pub fn plan_for_model_with_platform(
         env_updates.insert("CAMELID_FORWARD_RSS_TIMINGS", Some("on"));
     }
 
+    // Routing branches on the tensor scan, not the human `quant_type` label
+    // above: the label may be more specific (Q6_K, Q5_K_M, TQ1_0) than the
+    // lanes it admits to, and a file with a wrong declared file_type must
+    // still route by what its tensors actually are. These predicates preserve
+    // the pre-label-fix branch semantics exactly: "Q8_0" meant any Q8_0
+    // tensor present, "Q4_K_M" meant K-quant tensors with no Q8_0.
+    let has_tensor = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
+    let has_q8_0_tensors = has_tensor(GgufTensorType::Q8_0);
+    let has_kquant_tensors = has_tensor(GgufTensorType::Q4K) || has_tensor(GgufTensorType::Q6K);
+
     let (
         selected_backend,
         selected_q8_path,
@@ -295,7 +315,7 @@ pub fn plan_for_model_with_platform(
         prefill_runtime_policy,
         decode_path,
         fallback_path,
-    ) = if quant_type == "Q8_0" && is_supported_exact_q8_row(&row) {
+    ) = if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
         } else if platform.architecture == "x86_64"
@@ -312,7 +332,7 @@ pub fn plan_for_model_with_platform(
                 );
             safe_q8_plan()
         }
-    } else if quant_type == "Q8_0"
+    } else if has_q8_0_tensors
         && platform.cuda_resident_active
         && is_gpu_runnable_arch(gguf)
         && !env_flag_disabled("CAMELID_GPU_RUNNABLE_TIER")
@@ -327,7 +347,7 @@ pub fn plan_for_model_with_platform(
                 .into(),
         );
         cuda_resident_q8_runnable_plan()
-    } else if quant_type == "Q4_K_M" {
+    } else if !has_q8_0_tensors && has_kquant_tensors {
         select_kquant_plan(&platform, &mut reasons)
     } else {
         reasons.push("non-validated row or quant; failing closed to safe path".into());
@@ -924,8 +944,8 @@ fn exact_model_row(model_path: &Path, gguf: &GgufFile) -> String {
     // instead of its GPU lane. This only ever UPGRADES an unrecognized name to a
     // recognized row — it never overrides a name that already matches a row.
     if let (Some(name), Some(file)) = (&from_name, &from_file) {
-        if support_level(name) == "unknown_or_unvalidated"
-            && support_level(file) != "unknown_or_unvalidated"
+        if recognized_row_level(name) == "unknown_or_unvalidated"
+            && recognized_row_level(file) != "unknown_or_unvalidated"
         {
             return file.clone();
         }
@@ -933,19 +953,38 @@ fn exact_model_row(model_path: &Path, gguf: &GgufFile) -> String {
     from_name.or(from_file).unwrap_or_else(|| "unknown".into())
 }
 
-fn support_level(row: &str) -> String {
+/// The plan's support-level string for a recognized row, gated on the quant
+/// the row's evidence actually covers. Every row in the recognized table is
+/// Q8_0 evidence, so any other quant of the same model name reports
+/// `unknown_or_unvalidated` here — a Q6_K TinyLlama must not echo the Q8_0
+/// gate row's level. `/api/capabilities` (filename-anchored, quant-aware)
+/// remains the support source of truth; this string only describes the row
+/// the load-time plan recognized.
+fn support_level(row: &str, quant_type: &str) -> String {
+    if quant_type != "Q8_0" {
+        return "unknown_or_unvalidated".into();
+    }
+    recognized_row_level(row).into()
+}
+
+/// Quant-blind name→level table. Besides `support_level` above, this powers
+/// row *recognition* — the junk general.name → filename upgrade in
+/// `exact_model_row` and the supported-row planner gate — which must keep
+/// working for non-Q8_0 files: recognition and support claims are different
+/// questions.
+fn recognized_row_level(row: &str) -> &'static str {
     let normalized = normalize_row(row);
     if normalized.contains("tinyllama") {
-        "supported_current_gate".into()
+        "supported_current_gate"
     } else if normalized.contains("llama_3_2_1b_instruct") {
-        "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
+        "supported_exact_row_smoke_512_1024_2048_4096_8192"
     } else if normalized.contains("llama_3_2_3b_instruct")
         || normalized.contains("llama_3_8b_instruct")
         || normalized.contains("meta_llama_3_8b_instruct")
     {
-        "supported_exact_row_smoke_512_1024_2048".into()
+        "supported_exact_row_smoke_512_1024_2048"
     } else if normalized.contains("mistral_7b_instruct_v0_3") {
-        "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
+        "supported_exact_row_smoke_512_1024_2048_4096_8192"
     } else if normalized.contains("qwen3_0_6b_instruct")
         || normalized.contains("qwen3_1_7b_instruct")
         || normalized.contains("qwen3_4b_instruct")
@@ -959,17 +998,17 @@ fn support_level(row: &str) -> String {
         // (Replaces the broader `contains("qwen3")` branch from PR #283, whose
         // label claimed 512/1024/2048 context packs and matched MoE/base/other
         // sizes — neither validated for qwen3.)
-        "supported_exact_row_smoke_chatml".into()
+        "supported_exact_row_smoke_chatml"
     } else if normalized.contains("mixtral_8x7b_instruct_v0_1") {
-        "bounded_runtime_only_unsupported".into()
+        "bounded_runtime_only_unsupported"
     } else {
-        "unknown_or_unvalidated".into()
+        "unknown_or_unvalidated"
     }
 }
 
 fn is_supported_exact_q8_row(row: &str) -> bool {
     matches!(
-        support_level(row).as_str(),
+        recognized_row_level(row),
         "supported_current_gate"
             | "supported_exact_row_smoke_512_1024_2048_4096_8192"
             | "supported_exact_row_smoke_512_1024_2048"
@@ -992,16 +1031,33 @@ fn model_family(row: &str, gguf: &GgufFile) -> String {
     }
 }
 
+/// Human label for the file's quantization, reported in the plan (and from
+/// there `/v1/health` and the System page). The declared `general.file_type`
+/// (llama.cpp ftype naming, shared with receipts) is the most specific
+/// truthful source — it keeps a pure-Q6_K or TQ1_0 file from being collapsed
+/// into the coarse "Q4_K_M"/"Q8_0" buckets of the tensor-scan fallback. A
+/// declared "Q8_0" is accepted only when the scan actually finds Q8_0 tensors,
+/// because the Q8_0 label is what gates `support_level` onto a promoted row.
+/// Routing never reads this label — the planner branches on the tensor
+/// predicates directly (see `plan_for_model_with_platform`).
 fn quant_type(gguf: &GgufFile) -> String {
     let has = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
-    if has(GgufTensorType::Q8_0) {
+    let has_q8_0 = has(GgufTensorType::Q8_0);
+    if let Some(declared) = crate::receipt::declared_file_type_label(gguf) {
+        if declared != "Q8_0" || has_q8_0 {
+            return declared.into();
+        }
+    }
+    if has_q8_0 {
         "Q8_0".into()
-    } else if has(GgufTensorType::Q4K) || has(GgufTensorType::Q6K) {
-        // Mixed K-quant (Q4_K_M = Q4_K + Q6_K). Decoded by the GPU-resident engine
-        // (q4k_gemv/q6k_gemv) or, on CPU, the K-quant block-dot — both consume the
-        // wire-only blocks. Recognized here so the plan stops mislabeling it as the
-        // `dense_or_other` cpu_reference fallback (K-quant conductor disclosure fix).
+    } else if has(GgufTensorType::Q4K) {
+        // Undeclared K-quant mix (Q4_K_M = Q4_K + Q6_K). Decoded by the GPU-resident
+        // engine (q4k_gemv/q6k_gemv) or, on CPU, the K-quant block-dot — both consume
+        // the wire-only blocks. Recognized here so the plan stops mislabeling it as
+        // the `dense_or_other` cpu_reference fallback (K-quant conductor disclosure fix).
         "Q4_K_M".into()
+    } else if has(GgufTensorType::Q6K) {
+        "Q6_K".into()
     } else {
         "dense_or_other".into()
     }
@@ -1254,6 +1310,34 @@ mod tests {
         }
     }
 
+    /// `fixture` with explicit tensor types and an optional declared
+    /// `general.file_type`, for the quant-label truth tests.
+    fn quant_fixture(
+        name: &str,
+        file_type: Option<u32>,
+        tensor_types: &[GgufTensorType],
+    ) -> GgufFile {
+        let mut gguf = fixture(name);
+        if let Some(ft) = file_type {
+            gguf.metadata
+                .insert("general.file_type".into(), GgufMetadataValue::U32(ft));
+        }
+        gguf.tensor_count = tensor_types.len() as i64;
+        gguf.tensors = tensor_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| GgufTensorDescriptor {
+                name: format!("blk.{i}.attn_q.weight"),
+                dimensions: vec![32, 32],
+                tensor_type: *t,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 34,
+            })
+            .collect();
+        gguf
+    }
+
     fn clear_profile_env() {
         for key in [
             "CAMELID_PROFILE",
@@ -1317,7 +1401,7 @@ mod tests {
         );
         // Junk name AND unrecognizable filename stays unrecognized.
         assert_eq!(
-            support_level(&exact_model_row(
+            recognized_row_level(&exact_model_row(
                 &PathBuf::from("/models/mystery.gguf"),
                 &fixture("hub")
             )),
@@ -1489,6 +1573,112 @@ mod tests {
         assert_eq!(off.plan.selected_backend, "cpu_reference");
         env::remove_var("CAMELID_X86_Q4K_DECODE");
         clear_profile_env();
+    }
+
+    #[test]
+    fn pure_q6k_reports_q6k_label_unknown_level_and_keeps_kquant_routing() {
+        // Truth-in-labeling: a pure-Q6_K file (declared ftype 18) must not be
+        // collapsed into the "Q4_K_M" bucket, and a Q6_K file of the TinyLlama
+        // gate row's NAME must not echo the Q8_0 row's support level. Routing
+        // is unchanged: it branches on the tensor scan, never on the label.
+        let _guard = env_lock();
+        clear_profile_env();
+        env::remove_var("CAMELID_X86_Q4K_DECODE");
+        let q6k = quant_fixture("TinyLlama 1.1B Chat v1.0", Some(18), &[GgufTensorType::Q6K]);
+        let path = PathBuf::from("/tmp/tinyllama-1.1b-chat-v1.0.Q6_K.gguf");
+
+        let cpu = plan_for_model_with_platform(
+            &path,
+            &q6k,
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(cpu.plan.quant_type, "Q6_K");
+        assert_eq!(
+            cpu.plan.support_level, "unknown_or_unvalidated",
+            "a Q6_K TinyLlama must not inherit the Q8_0 gate row's support level"
+        );
+        assert_eq!(
+            cpu.plan.selected_backend, "cpu_kquant_block_dot",
+            "the label fix must not change K-quant routing"
+        );
+
+        let gpu = plan_for_model_with_platform(
+            &path,
+            &q6k,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(gpu.plan.selected_backend, "cuda_resident_kquant_runtime");
+        clear_profile_env();
+    }
+
+    #[test]
+    fn declared_file_type_names_tq_and_kquant_variants() {
+        // A TQ1_0 file that carries a few K-quant tensors reports TQ1_0 (not a
+        // K-quant mix guess), and a declared Q5_K_M names itself precisely.
+        let tq = quant_fixture(
+            "Ternary Bonsai 4B",
+            Some(36),
+            &[GgufTensorType::Tq1_0, GgufTensorType::Q4K],
+        );
+        assert_eq!(quant_type(&tq), "TQ1_0");
+        let q5km = quant_fixture(
+            "whatever",
+            Some(17),
+            &[GgufTensorType::Q5K, GgufTensorType::Q6K],
+        );
+        assert_eq!(quant_type(&q5km), "Q5_K_M");
+        // Undeclared file_type falls back to the tensor-scan buckets.
+        let undeclared_q6k = quant_fixture("whatever", None, &[GgufTensorType::Q6K]);
+        assert_eq!(quant_type(&undeclared_q6k), "Q6_K");
+        let undeclared_mix = quant_fixture(
+            "whatever",
+            None,
+            &[GgufTensorType::Q4K, GgufTensorType::Q6K],
+        );
+        assert_eq!(quant_type(&undeclared_mix), "Q4_K_M");
+    }
+
+    #[test]
+    fn declared_q8_0_without_q8_0_tensors_is_refused() {
+        // A wrong general.file_type=7 with zero Q8_0 tensors must not produce
+        // the "Q8_0" label — that label is what gates support_level onto a
+        // promoted row (and the supported-Q8 planner branch keys on tensors,
+        // so the file routes as what it actually is either way).
+        let lying = quant_fixture("TinyLlama 1.1B Chat v1.0", Some(7), &[GgufTensorType::Q6K]);
+        assert_eq!(quant_type(&lying), "Q6_K");
+        assert_eq!(
+            support_level("TinyLlama 1.1B Chat v1.0", &quant_type(&lying)),
+            "unknown_or_unvalidated"
+        );
+    }
+
+    #[test]
+    fn supported_q8_row_keeps_level_and_kquant_name_variant_reports_unknown() {
+        // Anchor: quant-gating must not move any promoted Q8_0 row…
+        let _guard = env_lock();
+        clear_profile_env();
+        let q8 = quant_fixture("TinyLlama 1.1B Chat v1.0", Some(7), &[GgufTensorType::Q8_0]);
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/tinyllama-1.1b-chat-v1.0.Q8_0.gguf"),
+            &q8,
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.quant_type, "Q8_0");
+        assert_eq!(outcome.plan.support_level, "supported_current_gate");
+        assert_eq!(outcome.plan.selected_backend, "cpu_q8_runtime_repack");
+        clear_profile_env();
+
+        // …while a K-quant file sharing a supported row's NAME stays unknown in
+        // the plan string (its own K-quant claim lives in /api/capabilities),
+        // and row recognition stays quant-blind for the planner gate.
+        assert_eq!(
+            support_level("Llama 3.2 3B Instruct", "Q4_K_M"),
+            "unknown_or_unvalidated"
+        );
+        assert!(is_supported_exact_q8_row("Llama 3.2 3B Instruct"));
     }
 
     #[test]
