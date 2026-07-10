@@ -9734,6 +9734,15 @@ fn clear_prompt_prefix_cache(state: &AppState) {
 }
 
 fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<CachedPromptPrefix> {
+    // The prompt-prefix cache never interacts with constrained decoding. The
+    // cache key is (model, path, tokens, sampling) -- the constraint is not in
+    // it -- and a warm hit samples the first token from raw cached logits with
+    // no grammar mask, with the grammar state never advanced over it. The gate
+    // lives here (and in store, below) rather than at the call sites so every
+    // decode path inherits it; re-prefill is the honest cost of the guarantee.
+    if prepared.constraint.is_some() {
+        return None;
+    }
     let cached = prepared.cached_prompt_prefix.lock().ok()?.clone()?;
     (cached.model_id == prepared.model_id
         && cached.model_path == prepared.model_path
@@ -9743,6 +9752,12 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<CachedPro
 }
 
 fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
+    // The prompt-prefix cache never interacts with constrained decoding (see
+    // lookup_prompt_prefix_cache). Storing raw prefill logits would arguably be
+    // safe, but skipping both directions keeps the invariant one sentence.
+    if prepared.constraint.is_some() {
+        return;
+    }
     // A resident-GPU-prefilled session keeps its K/V history on the GPU only; the cached
     // clone would drop it and resume from empty CPU buffers. Skip caching those sessions â€”
     // a cache miss just re-runs the (fast, resident) prefill.
@@ -14517,6 +14532,80 @@ mod tests {
             prepared_for_cache("tiny", "model-b.gguf", vec![1, 2], cached.session);
         different_model.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         assert!(lookup_prompt_prefix_cache(&different_model).is_none());
+    }
+
+    #[test]
+    fn constrained_generation_skips_prompt_prefix_cache_lookup() {
+        // B1 regression: the cache key is (model, path, tokens, sampling) -- the
+        // constraint is NOT in the key. On a warm hit the first token would be
+        // sampled from raw cached logits with no mask and the grammar state never
+        // advanced over it, breaking the response_format guarantee on the second
+        // identical request. Constrained requests must not read the cache.
+        let config = tiny_config();
+        let weights = tiny_weights();
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&unconstrained, &step);
+        assert!(
+            lookup_prompt_prefix_cache(&unconstrained).is_some(),
+            "control: the unconstrained twin hits the warm cache"
+        );
+
+        let mut constrained = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![1, 2],
+            lookup_prompt_prefix_cache(&unconstrained).unwrap().session,
+        );
+        constrained.cached_prompt_prefix = unconstrained.cached_prompt_prefix.clone();
+        constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
+        assert!(
+            lookup_prompt_prefix_cache(&constrained).is_none(),
+            "a constrained request must never read the prompt-prefix cache"
+        );
+    }
+
+    #[test]
+    fn constrained_generation_does_not_store_prompt_prefix_cache() {
+        // Mirror of the lookup test: skipping both directions keeps the invariant
+        // one sentence -- the prompt-prefix cache never interacts with constrained
+        // decoding.
+        let config = tiny_config();
+        let weights = tiny_weights();
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut constrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
+        store_prompt_prefix_cache(&constrained, &step);
+
+        let mut unconstrained = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![1, 2],
+            constrained.session.clone(),
+        );
+        unconstrained.cached_prompt_prefix = constrained.cached_prompt_prefix.clone();
+        assert!(
+            lookup_prompt_prefix_cache(&unconstrained).is_none(),
+            "a constrained request must never write the prompt-prefix cache"
+        );
     }
 
     #[test]
