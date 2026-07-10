@@ -796,6 +796,11 @@ enum SchemaMode {
     AfterValue,
     /// The root value is complete; only trailing whitespace remains.
     Done,
+    /// A byte was rejected: the state is poisoned. Accepts nothing and is never
+    /// done, so a rejected `advance` can only surface as an error — never as a
+    /// silently "complete" value (`advance` parks the live mode in `Done` while
+    /// dispatching, so without this sink every rejection would fail open).
+    Failed,
 }
 
 /// Incremental validator for the supported JSON Schema subset. Mirrors [`JsonState`]
@@ -839,6 +844,18 @@ impl SchemaState {
     }
 
     fn advance(&mut self, b: u8) -> Result<(), ()> {
+        let result = self.advance_inner(b);
+        if result.is_err() {
+            // Fail sticky-closed: `advance_inner` parks the live mode in `Done`
+            // while it dispatches, so an error path would otherwise leave the
+            // state reporting `is_done()` — and a truncated/invalid value would
+            // finish as a clean "stop". Poison the state instead.
+            self.mode = SchemaMode::Failed;
+        }
+        result
+    }
+
+    fn advance_inner(&mut self, b: u8) -> Result<(), ()> {
         match std::mem::replace(&mut self.mode, SchemaMode::Done) {
             SchemaMode::Value(schema) => {
                 if is_ws(b) {
@@ -874,7 +891,7 @@ impl SchemaState {
                     } else {
                         Err(())
                     }
-                } else if b == b'"' {
+                } else if b == b'"' && self.has_unused_property() {
                     self.mode = SchemaMode::KeyStr {
                         matched: Vec::new(),
                     };
@@ -939,6 +956,7 @@ impl SchemaState {
                     Err(())
                 }
             }
+            SchemaMode::Failed => Err(()),
         }
     }
 
@@ -1135,8 +1153,12 @@ impl SchemaState {
         if is_object {
             match b {
                 b',' => {
-                    self.mode = SchemaMode::Key { allow_close: false };
-                    Ok(())
+                    if self.has_unused_property() {
+                        self.mode = SchemaMode::Key { allow_close: false };
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
                 }
                 b'}' => {
                     if self.required_satisfied() {
@@ -1171,6 +1193,22 @@ impl SchemaState {
         } else {
             SchemaMode::AfterValue
         };
+    }
+
+    /// Whether the current object still has a declared property left to emit.
+    /// Gates `,` after a member and the `"` that opens a key: with
+    /// `additionalProperties:false`, once every declared property is used no key
+    /// could follow, so allowing `,`/`"` would walk into a dead end (the common
+    /// BPE token `,"` would pass the mask and leave the next step with an
+    /// all-false mask). This gate can never lock an object out: no unused
+    /// properties implies every required property is used, i.e.
+    /// `required_satisfied()`, so `}` is legal at that point — in `AfterValue`
+    /// and in `Key { allow_close: true }` alike.
+    fn has_unused_property(&self) -> bool {
+        match self.stack.last() {
+            Some(SchemaFrame::Object { used, .. }) => used.iter().any(|u| !u),
+            _ => false,
+        }
     }
 
     /// Whether every required property of the current object has been emitted.
@@ -1774,5 +1812,71 @@ mod tests {
             "properties": {"unit": {"enum": ["celsius", "fahrenheit"]}}, "required": ["unit"]
         }));
         assert!(schema_complete(&s, r#"{"unit":"celsius"}"#));
+    }
+
+    #[test]
+    fn exhausted_object_rejects_comma_and_key_quote() {
+        use serde_json::json;
+        // Review repro (B2): once every declared property is used, `,` (and the
+        // common BPE token `,"`) must be masked out — otherwise the next step's
+        // mask is all-false and an ordinary schema 422s mid-generation.
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"type": "integer"}}, "required": ["a"]
+        }));
+        let st = feed_schema(&s, r#"{"a":1"#).expect("valid prefix");
+        assert!(!st.accepts(b","));
+        assert!(!st.accepts(b",\"")); // the two-byte BPE token from the review
+        assert!(st.accepts(b"}"));
+    }
+
+    #[test]
+    fn empty_object_schema_rejects_key_quote() {
+        use serde_json::json;
+        // Sibling dead-end: a zero-property object must reject `"` right after `{`
+        // (no property could ever complete the key) but still close with `}`.
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false, "properties": {}
+        }));
+        let st = feed_schema(&s, "{").expect("valid prefix");
+        assert!(!st.accepts(b"\""));
+        assert!(st.accepts(b"}"));
+        assert!(schema_complete(&s, "{}"));
+    }
+
+    #[test]
+    fn partial_object_still_accepts_comma() {
+        use serde_json::json;
+        // The unused-property gate must not be over-broad: with a declared
+        // property still unused, `,` (and the next key) stays legal.
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            "required": ["a", "b"]
+        }));
+        let st = feed_schema(&s, r#"{"a":1"#).expect("valid prefix");
+        assert!(st.accepts(b","));
+        assert!(st.accepts(b",\"b\":2}"));
+        assert!(schema_complete(&s, r#"{"a":1,"b":2}"#));
+    }
+
+    #[test]
+    fn advance_error_is_sticky_failed() {
+        use serde_json::json;
+        // A rejected byte must poison the state, not park it in Done: `advance`
+        // dispatches via mem::replace(mode, Done), so without the Failed sink a
+        // truncated/invalid value would report is_done() and finish as "stop".
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"type": "integer"}}, "required": ["a"]
+        }));
+        let mut st = SchemaState::new(s);
+        assert!(st.advance(b'x').is_err()); // '{' required
+        assert!(!st.is_done());
+        // Every subsequent byte — including otherwise-legal ones — is rejected.
+        assert!(!st.accepts(b"{"));
+        assert!(!st.accepts(b" "));
+        assert!(st.advance(b'{').is_err());
+        assert!(!st.is_done());
     }
 }
