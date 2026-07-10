@@ -61,7 +61,8 @@ branding_matches=$(git grep -n -I -E "$branding_pattern" -- \
   ':!docs/archive/STATUS_ARCHIVE_2026-04.md' \
   frontend/README.md \
   qa/validation-notes \
-  .github || true)
+  .github \
+  src || true)
 if [[ -n "$branding_matches" ]]; then
   printf 'public scrub guard failed for legacy backend branding: %s\n%s\n' "$branding_pattern" "$branding_matches" >&2
   status=1

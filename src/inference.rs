@@ -4483,19 +4483,18 @@ fn prefill_layer_major_attribution_enabled() -> bool {
 }
 
 /// Gate for the per-stage decode timing probes
-/// (`BACKENDINFERENCE_DECODE_TIMINGS`, default ON to preserve current
+/// (`CAMELID_DECODE_TIMINGS`, default ON to preserve current
 /// behavior â€” harnesses set it explicitly). Resolved once outside tests.
 fn decode_timings_enabled() -> bool {
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_on_fail_closed("BACKENDINFERENCE_DECODE_TIMINGS")
+        q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_DECODE_TIMINGS")
     }
     #[cfg(not(test))]
     {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_on_fail_closed("BACKENDINFERENCE_DECODE_TIMINGS")
-        })
+        *ENABLED
+            .get_or_init(|| q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_DECODE_TIMINGS"))
     }
 }
 
@@ -4808,11 +4807,11 @@ fn run_on_prefill_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
 /// with neither flag set this resolves to `None` and decode runs inline on the
 /// caller's pool, byte-identical to before.
 ///
-/// * `BACKENDINFERENCE_DECODE_THREADS=N` sizes a dedicated decode pool to N
+/// * `CAMELID_DECODE_THREADS=N` sizes a dedicated decode pool to N
 ///   workers (P0 attribution: decode is a memory-bound matvec stream that is
 ///   fastest well below the logical core count — SMT siblings only add
 ///   memory-controller contention; see the decode-sched receipts).
-/// * `BACKENDINFERENCE_DECODE_POOL_DEDICATED=1` isolates decode onto its own
+/// * `CAMELID_DECODE_POOL_DEDICATED=1` isolates decode onto its own
 ///   pool at the current global width without resizing (the serve/tokio
 ///   interference probe).
 ///
@@ -4886,8 +4885,8 @@ fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
         }
     };
     let target = resolve_decode_thread_count_from(
-        env::var("BACKENDINFERENCE_DECODE_THREADS").ok().as_deref(),
-        q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_DECODE_POOL_DEDICATED"),
+        env::var("CAMELID_DECODE_THREADS").ok().as_deref(),
+        q8_0_env_flag_enabled_default_off("CAMELID_DECODE_POOL_DEDICATED"),
         global,
         default_physical,
     )?;
@@ -4914,8 +4913,8 @@ fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
 
 /// Pure resolution of the decode pool width, factored out for testing.
 ///
-/// * `spec` — raw `BACKENDINFERENCE_DECODE_THREADS` value, if present.
-/// * `dedicated` — `BACKENDINFERENCE_DECODE_POOL_DEDICATED` flag.
+/// * `spec` — raw `CAMELID_DECODE_THREADS` value, if present.
+/// * `dedicated` — `CAMELID_DECODE_POOL_DEDICATED` flag.
 /// * `global` — current global pool width (the no-resize isolation width).
 /// * `default_physical` — the promoted default policy input: detected
 ///   physical core count, already `None` off-Windows, on detection failure,
@@ -23273,7 +23272,7 @@ fn causal_attention_context_batch(
 }
 
 /// Flag gate for the canonical blocked f32 attention kernels
-/// (`BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT`, default off). Scoped to the
+/// (`CAMELID_ATTENTION_F32_BLOCKED_DOT`, default off). Scoped to the
 /// Windows x86_64 decode attention lane; any guard failing (flag off, AVX2 or
 /// FMA missing) keeps the exact legacy scalar code path. Resolved once per
 /// process outside tests.
@@ -23281,7 +23280,7 @@ fn causal_attention_context_batch(
 fn attention_f32_blocked_dot_enabled() -> bool {
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT")
+        q8_0_env_flag_enabled_default_off("CAMELID_ATTENTION_F32_BLOCKED_DOT")
             && std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma")
     }
@@ -23289,7 +23288,7 @@ fn attention_f32_blocked_dot_enabled() -> bool {
     {
         static ATTENTION_F32_BLOCKED_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
         *ATTENTION_F32_BLOCKED_DOT_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT")
+            q8_0_env_flag_enabled_default_off("CAMELID_ATTENTION_F32_BLOCKED_DOT")
                 && std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma")
         })
@@ -23297,7 +23296,7 @@ fn attention_f32_blocked_dot_enabled() -> bool {
 }
 
 /// Flag gate for the decode attention head-parallel lane
-/// (`BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL`, default off). Scoped to
+/// (`CAMELID_ATTENTION_DECODE_PARALLEL`, default off). Scoped to
 /// Windows x86_64 per the standing Windows-first directive ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the mechanism
 /// itself is arch-agnostic (scheduling only, no arithmetic), so lifting the
 /// gate is a one-line follow-up decision, not a code change. Resolved once
@@ -23307,18 +23306,16 @@ fn attention_decode_parallel_enabled() -> bool {
     // DEFAULT ON (Windows x86_64 promotion): the lane carries a
     // bitwise-identity contract (Item-2 matrix + A/B, zero divergent bits),
     // so the flip cannot change any output byte. Explicit rollback:
-    // `BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL=0`.
+    // `CAMELID_ATTENTION_DECODE_PARALLEL=0`.
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_on_fail_closed("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL")
+        q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_ATTENTION_DECODE_PARALLEL")
     }
     #[cfg(not(test))]
     {
         static ATTENTION_DECODE_PARALLEL_ENABLED: OnceLock<bool> = OnceLock::new();
         *ATTENTION_DECODE_PARALLEL_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_on_fail_closed(
-                "BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL",
-            )
+            q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_ATTENTION_DECODE_PARALLEL")
         })
     }
 }
@@ -23331,14 +23328,14 @@ const ATTENTION_DECODE_PARALLEL_DEFAULT_MIN_POSITIONS: usize = 64;
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn attention_decode_parallel_min_positions_uncached() -> usize {
-    env::var("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL_MIN_POSITIONS")
+    env::var("CAMELID_ATTENTION_DECODE_PARALLEL_MIN_POSITIONS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(ATTENTION_DECODE_PARALLEL_DEFAULT_MIN_POSITIONS)
 }
 
 /// Position threshold for the head-parallel lane
-/// (`BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL_MIN_POSITIONS`). Resolved once
+/// (`CAMELID_ATTENTION_DECODE_PARALLEL_MIN_POSITIONS`). Resolved once
 /// per process outside tests.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn attention_decode_parallel_min_positions() -> usize {

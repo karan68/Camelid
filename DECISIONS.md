@@ -49,6 +49,17 @@ by introducing `backendinference`. **Decision: use `camelid` / `CAMELID_*` every
 memory-cap discipline the spec invokes is enforced via
 `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`.
 
+**Addendum (2026-07-10):** the last eight live `BACKENDINFERENCE_*` env vars — perf-lane
+knobs introduced by the attention/KV/decode-scheduler campaigns (`DECODE_TIMINGS`,
+`DECODE_THREADS`, `DECODE_POOL_DEDICATED`, `ATTENTION_F32_BLOCKED_DOT`,
+`ATTENTION_DECODE_PARALLEL`, `ATTENTION_DECODE_PARALLEL_MIN_POSITIONS`, `KV_F16`,
+`KV_LAYOUT_HEAD_MAJOR`) — are renamed to `CAMELID_*` as a **clean break** (operator
+decision: no fallback reads; the flags were undocumented and never appeared in release
+notes). Defaults and behavior are unchanged under the new names. Historical receipts,
+archived docs, and this file's older entries keep the old names verbatim. The public-scrub
+branding guard now also scans `src/` so legacy-prefixed identifiers cannot reappear in live
+code.
+
 ## D3 — Reuse existing infrastructure; the lane's deliverable is the receipt, not plumbing (2026-06-13)
 
 Recon (see `DISTRIBUTED_RECON.md`) found the transport, shard servers, coordinator,

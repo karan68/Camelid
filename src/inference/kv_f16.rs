@@ -1,5 +1,5 @@
 //! Canonical f32<->f16 (IEEE binary16) conversions for the KV f16 storage
-//! lane (`BACKENDINFERENCE_KV_F16`).
+//! lane (`CAMELID_KV_F16`).
 //!
 //! Load-bearing discovery (2026-07-01): the CPU KV write path ALREADY rounds
 //! every stored key/value through f16 unconditionally
