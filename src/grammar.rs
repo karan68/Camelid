@@ -409,6 +409,26 @@ impl JsonState {
     }
 }
 
+// Compile-time caps on schema dimensions. Every declared property and enum
+// member multiplies the per-step full-vocab `accepts()` scan, and `SchemaState`
+// clones (including one `used: Vec<bool>` per object frame) once per candidate
+// token per decode step — an uncapped schema turns one request into gigabytes
+// of memcpy per step on the single engine worker. Oversized schemas are a
+// typed 400 at compile time, never a slow decode.
+
+/// Maximum declared properties per object.
+const MAX_OBJECT_PROPERTIES: usize = 256;
+/// Maximum bytes in a declared property name.
+const MAX_PROPERTY_NAME_BYTES: usize = 64;
+/// Maximum members in a string `enum`.
+const MAX_ENUM_MEMBERS: usize = 256;
+/// Maximum bytes of one `enum`/`const` member's JSON encoding (quotes included).
+const MAX_ENUM_MEMBER_BYTES: usize = 256;
+/// Maximum nesting depth of the schema tree (the root node is depth 0).
+/// serde_json's parse recursion limit bounds this in practice today; the cap
+/// makes the bound explicit and owned by this subsystem.
+const MAX_SCHEMA_DEPTH: usize = 32;
+
 /// Failure compiling a JSON Schema into the supported subset. The message names
 /// the offending keyword/type so the API can return a precise, honest 400 rather
 /// than silently ignoring a constraint it cannot enforce.
@@ -495,14 +515,19 @@ fn reject_unknown(
 /// (`is_done`) is triggered by a unique closing `}`/`]`; top-level scalars have no
 /// terminator and are rejected.
 fn compile_root(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
-    let compiled = compile_node(schema)?;
+    let compiled = compile_node(schema, 0)?;
     match compiled {
         Schema::Object(_) | Schema::Array(_) => Ok(compiled),
         _ => Err(serr("the root schema must be an object or array")),
     }
 }
 
-fn compile_node(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
+fn compile_node(schema: &serde_json::Value, depth: usize) -> Result<Schema, SchemaError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(serr(format!(
+            "schema nesting exceeds the supported maximum depth of {MAX_SCHEMA_DEPTH}"
+        )));
+    }
     let map = match schema {
         serde_json::Value::Object(map) => map,
         _ => return Err(serr("each schema must be a JSON object")),
@@ -554,14 +579,14 @@ fn compile_node(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
     }
     reject_unknown(map, &allowed)?;
     if types.len() == 1 {
-        return compile_typed(types[0], map);
+        return compile_typed(types[0], map, depth);
     }
     // A multi-type union (e.g. the OpenAI nullable pattern ["string","null"]): compile
     // each member reusing the surrounding keywords, and require distinct start bytes so
     // a single lookahead selects the branch.
     let mut members = Vec::with_capacity(types.len());
     for &ty in &types {
-        members.push(compile_typed(ty, map)?);
+        members.push(compile_typed(ty, map, depth)?);
     }
     ensure_disjoint_start_bytes(&members)?;
     Ok(Schema::Union(Arc::new(members)))
@@ -572,10 +597,11 @@ fn compile_node(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
 fn compile_typed(
     ty: &str,
     map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
 ) -> Result<Schema, SchemaError> {
     match ty {
-        "object" => compile_object(map),
-        "array" => compile_array(map),
+        "object" => compile_object(map, depth),
+        "array" => compile_array(map, depth),
         "string" => Ok(Schema::Str),
         "integer" => Ok(Schema::Integer),
         "number" => Ok(Schema::Number),
@@ -653,6 +679,12 @@ fn compile_string_literals(
     if values.is_empty() {
         return Err(serr(format!("`{keyword}` must be non-empty")));
     }
+    if values.len() > MAX_ENUM_MEMBERS {
+        return Err(serr(format!(
+            "`{keyword}` declares {} members; the supported maximum is {MAX_ENUM_MEMBERS}",
+            values.len()
+        )));
+    }
     let mut encodings = Vec::with_capacity(values.len());
     for value in values {
         match value {
@@ -673,6 +705,12 @@ fn compile_string_literals(
                 }
                 let encoded = serde_json::to_vec(value)
                     .map_err(|e| serr(format!("`{keyword}` member is not serializable: {e}")))?;
+                if encoded.len() > MAX_ENUM_MEMBER_BYTES {
+                    return Err(serr(format!(
+                        "`{keyword}` member {s:?} encodes to {} bytes; the supported maximum is {MAX_ENUM_MEMBER_BYTES}",
+                        encoded.len()
+                    )));
+                }
                 encodings.push(encoded);
             }
             _ => {
@@ -685,7 +723,10 @@ fn compile_string_literals(
     Ok(Schema::Enum(Arc::new(encodings)))
 }
 
-fn compile_object(map: &serde_json::Map<String, serde_json::Value>) -> Result<Schema, SchemaError> {
+fn compile_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> Result<Schema, SchemaError> {
     match map.get("additionalProperties") {
         Some(serde_json::Value::Bool(false)) => {}
         Some(serde_json::Value::Bool(true)) | None => {
@@ -710,12 +751,25 @@ fn compile_object(map: &serde_json::Map<String, serde_json::Value>) -> Result<Sc
             .collect::<Result<_, _>>()?,
         Some(_) => return Err(serr("`required` must be an array")),
     };
+    let required_set: std::collections::HashSet<&str> = required.iter().copied().collect();
     let mut props = Vec::new();
     if let Some(properties) = map.get("properties") {
         let properties = properties
             .as_object()
             .ok_or_else(|| serr("`properties` must be an object"))?;
+        if properties.len() > MAX_OBJECT_PROPERTIES {
+            return Err(serr(format!(
+                "`properties` declares {} properties; the supported maximum is {MAX_OBJECT_PROPERTIES}",
+                properties.len()
+            )));
+        }
         for (name, sub) in properties {
+            if name.len() > MAX_PROPERTY_NAME_BYTES {
+                return Err(serr(format!(
+                    "property name {name:?} is {} bytes; the supported maximum is {MAX_PROPERTY_NAME_BYTES}",
+                    name.len()
+                )));
+            }
             if !is_simple_key(name) {
                 return Err(serr(format!(
                     "property name {name:?} requires JSON escaping; not supported yet"
@@ -723,13 +777,14 @@ fn compile_object(map: &serde_json::Map<String, serde_json::Value>) -> Result<Sc
             }
             props.push(PropSchema {
                 name: name.clone(),
-                schema: compile_node(sub)?,
-                required: required.contains(&name.as_str()),
+                schema: compile_node(sub, depth + 1)?,
+                required: required_set.contains(name.as_str()),
             });
         }
     }
+    let declared: std::collections::HashSet<&str> = props.iter().map(|p| p.name.as_str()).collect();
     for name in &required {
-        if !props.iter().any(|p| p.name.as_str() == *name) {
+        if !declared.contains(name) {
             return Err(serr(format!(
                 "required property {name:?} is not declared in `properties`"
             )));
@@ -738,9 +793,12 @@ fn compile_object(map: &serde_json::Map<String, serde_json::Value>) -> Result<Sc
     Ok(Schema::Object(Arc::new(ObjectSchema { props })))
 }
 
-fn compile_array(map: &serde_json::Map<String, serde_json::Value>) -> Result<Schema, SchemaError> {
+fn compile_array(
+    map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> Result<Schema, SchemaError> {
     match map.get("items") {
-        Some(items) => Ok(Schema::Array(Arc::new(compile_node(items)?))),
+        Some(items) => Ok(Schema::Array(Arc::new(compile_node(items, depth + 1)?))),
         None => Err(serr(
             "array schemas must declare `items` (unconstrained arrays are not supported yet)",
         )),
@@ -1812,6 +1870,94 @@ mod tests {
             "properties": {"unit": {"enum": ["celsius", "fahrenheit"]}}, "required": ["unit"]
         }));
         assert!(schema_complete(&s, r#"{"unit":"celsius"}"#));
+    }
+
+    /// An object schema with `n` integer properties named `p0000`..
+    fn object_with_n_properties(n: usize) -> serde_json::Value {
+        let mut props = serde_json::Map::new();
+        for i in 0..n {
+            props.insert(format!("p{i:04}"), serde_json::json!({"type": "integer"}));
+        }
+        serde_json::json!({
+            "type": "object", "additionalProperties": false, "properties": props
+        })
+    }
+
+    /// An object schema whose single property is an enum with `n` members.
+    fn object_with_enum_members(n: usize) -> serde_json::Value {
+        let members: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+        serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"e": {"enum": members}}, "required": ["e"]
+        })
+    }
+
+    /// A schema nested `levels` objects deep (each level one property `a`).
+    /// The innermost node is an integer, so the deepest node sits at depth
+    /// `levels` (the root object is depth 0).
+    fn nested_object_schema(levels: usize) -> serde_json::Value {
+        let mut node = serde_json::json!({"type": "integer"});
+        for _ in 0..levels {
+            node = serde_json::json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {"a": node}, "required": ["a"]
+            });
+        }
+        node
+    }
+
+    #[test]
+    fn schema_dimension_caps_reject_oversized_and_accept_at_cap() {
+        use serde_json::json;
+        // Property count: 256 per object compiles, 257 is a typed error.
+        assert!(compile_root(&object_with_n_properties(MAX_OBJECT_PROPERTIES)).is_ok());
+        let err = compile_root(&object_with_n_properties(MAX_OBJECT_PROPERTIES + 1))
+            .expect_err("over-cap property count must be rejected");
+        assert!(err.to_string().contains("properties"), "{err}");
+
+        // Property-name length: 64 bytes compiles, 65 is rejected.
+        let ok_name = "n".repeat(MAX_PROPERTY_NAME_BYTES);
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {ok_name: {"type": "integer"}}
+        }))
+        .is_ok());
+        let long_name = "n".repeat(MAX_PROPERTY_NAME_BYTES + 1);
+        let err = compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {long_name: {"type": "integer"}}
+        }))
+        .expect_err("over-cap property name must be rejected");
+        assert!(err.to_string().contains("property name"), "{err}");
+
+        // Enum member count: 256 compiles, 257 is rejected.
+        assert!(compile_root(&object_with_enum_members(MAX_ENUM_MEMBERS)).is_ok());
+        let err = compile_root(&object_with_enum_members(MAX_ENUM_MEMBERS + 1))
+            .expect_err("over-cap enum member count must be rejected");
+        assert!(err.to_string().contains("enum"), "{err}");
+
+        // Enum member size (JSON-encoded, quotes included): 254 chars encode to
+        // exactly 256 bytes and compile; one more byte is rejected. `const` shares
+        // the cap via the same literal compiler.
+        let at_cap = "x".repeat(MAX_ENUM_MEMBER_BYTES - 2);
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"e": {"enum": [at_cap]}}
+        }))
+        .is_ok());
+        let over_cap = "x".repeat(MAX_ENUM_MEMBER_BYTES - 1);
+        let err = compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"e": {"const": over_cap}}
+        }))
+        .expect_err("over-cap literal must be rejected");
+        assert!(err.to_string().contains("bytes"), "{err}");
+
+        // Nesting depth: a leaf at depth 32 compiles, depth 33 is rejected.
+        assert!(compile_root(&nested_object_schema(MAX_SCHEMA_DEPTH)).is_ok());
+        let err = compile_root(&nested_object_schema(MAX_SCHEMA_DEPTH + 1))
+            .expect_err("over-cap nesting depth must be rejected");
+        assert!(err.to_string().contains("depth"), "{err}");
     }
 
     #[test]
