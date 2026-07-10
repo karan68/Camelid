@@ -214,9 +214,12 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
           </div>
         )}
 
-        {message.role === 'assistant' && !assistantStreaming && <MessageMetaFooter message={message} />}
-        {/* reserve the footer's space during streaming so it never shifts layout */}
-        {message.role === 'assistant' && assistantStreaming && <div className="cxturn__meta cxturn__meta--reserve" aria-hidden="true" />}
+        {/* Rendered during streaming too: tokens_out_per_sec is live-patched per
+           frame (backed token-for-token by window.__tpsTrace), so the footer
+           doubles as the live tok/s readout while decoding. Absent fields stay
+           hidden until the stream completes; the footer itself reserves the
+           layout space the old placeholder div held. */}
+        {message.role === 'assistant' && <MessageMetaFooter message={message} />}
 
         {message.role === 'assistant' && !assistantStreaming && message.camelid_receipt && (
           <ParityReceiptCard receipt={message.camelid_receipt} />

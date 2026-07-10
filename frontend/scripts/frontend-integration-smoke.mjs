@@ -184,7 +184,7 @@ try {
       updated_at: '2026-05-13T04:21:00.000Z',
       messages: [
         { id: 'user-1', role: 'user', content: 'Create one self-contained HTML page', created_at: '2026-05-13T04:21:00.000Z' },
-        { id: 'assistant-1', role: 'assistant', content: '```html\n<!doctype html>\n<button id="go">Go</button>', streaming: true, streaming_phase: 'streaming', created_at: '2026-05-13T04:21:01.000Z' },
+        { id: 'assistant-1', role: 'assistant', content: '```html\n<!doctype html>\n<button id="go">Go</button>', streaming: true, streaming_phase: 'streaming', created_at: '2026-05-13T04:21:01.000Z', model_id: 'llama32_3b_instruct_q8_0', tokens_out_per_sec: 12.7 },
       ],
     },
     selectedModel,
@@ -214,6 +214,9 @@ try {
   assert.match(streamingMarkup, /Streaming code response/, 'streaming code rows should keep an active live-generation label')
   assert.match(streamingMarkup, /aria-busy="true"/, 'streaming rows and code cards should be marked busy while backend generation is active')
   assert.match(streamingMarkup, /message-code-card is-generating/, 'open streaming code should render as the real ForgeLocal-derived code card, not fallback prose')
+  assert.match(streamingMarkup, /Generation details \(client-measured telemetry\)/, 'the meta footer should render during streaming as the live tok/s readout')
+  assert.match(streamingMarkup, /13 tok\/s/, 'the streaming footer should show the live-patched decode rate')
+  assert.doesNotMatch(streamingMarkup, /cxturn__meta--reserve/, 'the invisible footer placeholder must not render; the live footer holds the layout slot itself')
 
   const activeSendStreamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
