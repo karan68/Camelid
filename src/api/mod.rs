@@ -7794,6 +7794,10 @@ struct ReceiptRequestStamp {
     top_k: Option<u32>,
     seed: Option<u64>,
     stop: Vec<String>,
+    /// The raw `response_format` request value (not the compiled spec): the
+    /// receipt records the request as made, and replay re-parses it through
+    /// the same constraint compiler serving used.
+    response_format: Option<serde_json::Value>,
     reproducible: bool,
 }
 
@@ -7819,6 +7823,7 @@ fn receipt_request_stamp(
         req.top_k,
         req.seed,
         stop_spec_to_vec(req.stop.as_ref()),
+        req.response_format.clone().filter(|v| !v.is_null()),
     ))
 }
 
@@ -7845,9 +7850,12 @@ fn receipt_completion_request_stamp(
         req.top_k,
         req.seed,
         stop_spec_to_vec(req.stop.as_ref()),
+        // The raw completions endpoint has no response_format field.
+        None,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receipt_stamp_from_parts(
     endpoint: &'static str,
     messages_or_prompt: serde_json::Value,
@@ -7856,6 +7864,7 @@ fn receipt_stamp_from_parts(
     top_k: Option<u32>,
     seed: Option<u64>,
     stop: Vec<String>,
+    response_format: Option<serde_json::Value>,
 ) -> ReceiptRequestStamp {
     let temperature = f64::from(temperature.unwrap_or(0.0));
     // Reproducible means byte-for-byte replayable: strict greedy decoding
@@ -7870,6 +7879,7 @@ fn receipt_stamp_from_parts(
         top_k,
         seed,
         stop,
+        response_format,
         reproducible,
     }
 }
@@ -7931,6 +7941,7 @@ async fn build_server_receipt(
             top_k: stamp.top_k,
             seed: stamp.seed,
             stop: stamp.stop,
+            response_format: stamp.response_format,
         },
         reproducible: stamp.reproducible,
         result: ReceiptResult {
@@ -7996,6 +8007,14 @@ pub async fn replay_receipt_request(
             })?;
         (Some(prompt), None)
     };
+    // Re-compile the receipt's recorded response_format through the same
+    // constraint compiler serving used, so a constrained receipt replays
+    // constrained (an unconstrained replay of a constrained generation would
+    // deterministically fail verify-receipt on an honest receipt).
+    let constraint = match constraint_from_response_format(request.response_format.as_ref()) {
+        Ok(constraint) => constraint,
+        Err(response) => return Err(response_error_text(*response).await),
+    };
     let session_request = GenerationSessionRequest {
         model: Some(loaded.id.clone()),
         prompt,
@@ -8029,7 +8048,7 @@ pub async fn replay_receipt_request(
         tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
-        constraint: None,
+        constraint,
     };
     // Prep needs no lock: the GPU-runnable-tier parity probe inside
     // prepare_generation serializes via its own engine job. The replay decode
@@ -12890,6 +12909,44 @@ mod tests {
             camelid_receipt: Some(true),
             unsupported_fields: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn receipt_stamp_records_response_format() {
+        // M4 regression: a constrained request's receipt must carry the raw
+        // response_format so replay re-compiles the same constraint -- an
+        // unconstrained replay of a constrained generation deterministically
+        // fails verify-receipt on an honest receipt.
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"schema": {
+                "type": "object", "additionalProperties": false,
+                "properties": {"a": {"type": "integer"}}, "required": ["a"]
+            }}
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "response_format": response_format,
+        }))
+        .expect("chat request parses");
+        let stamp = receipt_request_stamp(&req).expect("stamp");
+        assert_eq!(stamp.response_format, Some(response_format));
+
+        // Unconstrained requests stamp None (the field stays out of the receipt).
+        let plain: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+        }))
+        .expect("chat request parses");
+        assert_eq!(
+            receipt_request_stamp(&plain)
+                .expect("stamp")
+                .response_format,
+            None
+        );
     }
 
     #[test]

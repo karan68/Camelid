@@ -48,6 +48,7 @@ fn request() -> ReceiptRequest {
         top_k: None,
         seed: None,
         stop: Vec::new(),
+        response_format: None,
     }
 }
 
