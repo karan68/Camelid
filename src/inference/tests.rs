@@ -5163,29 +5163,44 @@ fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
     .unwrap();
     reset_q8_schedule_telemetry();
 
-    let actual = try_x86_q8_ffn_decode_chain_path(
-        &input,
-        &packed_gate,
-        &packed_up,
-        &packed_down,
-        "layer_0_ffn_activated",
-        "layer_0_ffn_down",
-        &plan,
-    )
-    .unwrap()
-    .expect("x86 FFN decode chain should cover runtime-packed gate/up/down");
+    // Run the chain enough times for the stage timings to be deterministic:
+    // they accumulate nanoseconds, but on Windows `Instant` ticks at QPC
+    // granularity (commonly 100ns), so one sub-tick stage (the 64-element row
+    // quantize is tens of ns) can legitimately measure 0 in a single call.
+    // Across 128 calls the accumulated readings cannot all round to zero.
+    const CHAIN_CALLS: u64 = 128;
+    let mut actual = None;
+    for _ in 0..CHAIN_CALLS {
+        actual = Some(
+            try_x86_q8_ffn_decode_chain_path(
+                &input,
+                &packed_gate,
+                &packed_up,
+                &packed_down,
+                "layer_0_ffn_activated",
+                "layer_0_ffn_down",
+                &plan,
+            )
+            .unwrap()
+            .expect("x86 FFN decode chain should cover runtime-packed gate/up/down"),
+        );
+    }
+    let actual = actual.expect("at least one chain call");
 
     assert_eq!(actual.tensor.shape.dims, expected.shape.dims);
     assert_slice_close_with_tolerance(&actual.tensor.data, &expected.data, 5e-4);
     let telemetry = snapshot_q8_schedule_telemetry();
     assert_eq!(telemetry.ffn_gate_up_decode_consumer_taken, 0);
-    assert_eq!(telemetry.ffn_gate_up_decode_fused_activation_taken, 1);
-    assert_eq!(telemetry.ffn_decode_chain_taken, 1);
-    assert_eq!(telemetry.ffn_down_decode_consumer_taken, 1);
-    assert!(telemetry.ffn_decode_chain_total_us > 0);
-    assert!(telemetry.ffn_decode_chain_input_quantize_us > 0);
-    assert!(telemetry.ffn_decode_chain_activation_quantize_us > 0);
-    assert!(telemetry.ffn_decode_chain_down_us > 0);
+    assert_eq!(
+        telemetry.ffn_gate_up_decode_fused_activation_taken,
+        CHAIN_CALLS
+    );
+    assert_eq!(telemetry.ffn_decode_chain_taken, CHAIN_CALLS);
+    assert_eq!(telemetry.ffn_down_decode_consumer_taken, CHAIN_CALLS);
+    assert!(telemetry.ffn_decode_chain_total_ns > 0);
+    assert!(telemetry.ffn_decode_chain_input_quantize_ns > 0);
+    assert!(telemetry.ffn_decode_chain_activation_quantize_ns > 0);
+    assert!(telemetry.ffn_decode_chain_down_ns > 0);
     assert!(telemetry
         .output_projection_by_route
         .contains_key("ffn_gate_up.decode_fused_activation"));

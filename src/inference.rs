@@ -12424,9 +12424,11 @@ fn try_x86_q8_ffn_decode_chain_path(
     let total_started = Instant::now();
     let input_quantize_started = Instant::now();
     let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    // Chain stage timings accumulate nanoseconds: a single-row quantize is tens
+    // of ns, which microsecond truncation would record as a permanent 0.
     add_q8_schedule_counter(
-        &Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US,
-        input_quantize_started.elapsed().as_micros() as u64,
+        &Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_NS,
+        input_quantize_started.elapsed().as_nanos() as u64,
     );
 
     let order = diagnostic_ffn_gate_up_order()?;
@@ -12474,8 +12476,8 @@ fn try_x86_q8_ffn_decode_chain_path(
     let activation_quantize_started = Instant::now();
     let quantized_activated = quantize_q8_0_row(&activated.data[..down_route.input_width]);
     add_q8_schedule_counter(
-        &Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US,
-        activation_quantize_started.elapsed().as_micros() as u64,
+        &Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_NS,
+        activation_quantize_started.elapsed().as_nanos() as u64,
     );
 
     let down_started = Instant::now();
@@ -12572,14 +12574,20 @@ fn try_x86_q8_ffn_decode_chain_path(
             decode_group_chunking,
         )?
     };
-    let down_elapsed = down_started.elapsed().as_micros();
+    // The chain counters take nanoseconds; the by-route map stays microseconds
+    // (its `elapsed_us` field is shared by every projection route).
+    let down_duration = down_started.elapsed();
+    let down_elapsed = down_duration.as_micros();
     add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
     add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_TAKEN, 1);
     add_q8_schedule_counter(
-        &Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US,
-        total_started.elapsed().as_micros() as u64,
+        &Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_NS,
+        total_started.elapsed().as_nanos() as u64,
     );
-    add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US, down_elapsed as u64);
+    add_q8_schedule_counter(
+        &Q8_SCHED_FFN_DECODE_CHAIN_DOWN_NS,
+        down_duration.as_nanos() as u64,
+    );
     record_q8_schedule_output_projection_route_call(
         "ffn_down",
         down_route_name,
