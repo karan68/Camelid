@@ -114,7 +114,7 @@ impl PartialEq for LlamaKvCache {
 }
 
 /// Physical arrangement of the K/V buffers. Chosen ONCE at cache
-/// construction (`BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR`, default off) and
+/// construction (`CAMELID_KV_LAYOUT_HEAD_MAJOR`, default off) and
 /// carried on the cache; every element address goes through the layout-aware
 /// accessors below, so the choice never appears in hot loops as more than a
 /// resolved stride. Values and arithmetic are identical in both layouts —
@@ -139,16 +139,14 @@ pub enum KvLayout {
 /// DEFAULT ON (Windows x86_64 promotion): the lane carries a bitwise-identity
 /// contract (Item-3 Lane-A matrix incl. rollback/growth/CUDA-mirror, zero
 /// divergent bits), so the flip cannot change any output byte. Explicit
-/// rollback: `BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR=0`.
+/// rollback: `CAMELID_KV_LAYOUT_HEAD_MAJOR=0`.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn kv_layout_head_major_enabled() -> bool {
-    super::q8_runtime::q8_0_env_flag_enabled_default_on_fail_closed(
-        "BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR",
-    )
+    super::q8_runtime::q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_KV_LAYOUT_HEAD_MAJOR")
 }
 
 /// Element storage for the K/V buffers. Chosen ONCE at cache construction
-/// (`BACKENDINFERENCE_KV_F16`, default off). f16 storage holds exactly the
+/// (`CAMELID_KV_F16`, default off). f16 storage holds exactly the
 /// values the write path has always produced (it rounds through f16
 /// unconditionally), so both dtypes carry the bitwise-identity contract —
 /// f16 just stops paying 2x the bytes for them.
@@ -164,13 +162,13 @@ pub enum KvDtype {
 /// without it, the flag is inert and logged once.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn kv_f16_enabled() -> bool {
-    let requested = super::q8_runtime::q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_KV_F16");
+    let requested = super::q8_runtime::q8_0_env_flag_enabled_default_off("CAMELID_KV_F16");
     if requested && !super::attention_f32_blocked_dot_enabled() {
         static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         LOGGED.get_or_init(|| {
             eprintln!(
-                "[kv-f16] BACKENDINFERENCE_KV_F16 requested without \
-                 BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT; the f16 lane is inert \
+                "[kv-f16] CAMELID_KV_F16 requested without \
+                 CAMELID_ATTENTION_F32_BLOCKED_DOT; the f16 lane is inert \
                  (the fused f16 kernels require the blocked-dot lane)"
             );
         });

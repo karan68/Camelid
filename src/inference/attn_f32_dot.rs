@@ -215,7 +215,7 @@ pub(super) fn axpy_blocked(out: &mut [f32], prob: f32, v: &[f32]) {
 }
 
 // ---------------------------------------------------------------------------
-// f16-operand variants (KV f16 storage lane, `BACKENDINFERENCE_KV_F16`).
+// f16-operand variants (KV f16 storage lane, `CAMELID_KV_F16`).
 //
 // Canonical order: convert each f16 element to f32 (exact expansion, pinned
 // to the existing-helper semantics — see `kv_f16`), THEN the identical
