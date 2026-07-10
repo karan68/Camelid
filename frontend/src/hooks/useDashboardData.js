@@ -7,6 +7,7 @@ import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversatio
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
+import { executionRuntimeFields } from '../lib/executionPlan'
 import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
 import { getConfiguredMaxTokens as getModelMaxTokens } from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
@@ -433,6 +434,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       active_model_id: health?.active_model_id || null,
       generation_ready: Boolean(health?.generation_ready),
       q8_runtime: health?.q8_runtime || null,
+      ...executionRuntimeFields(health),
       status: health?.ok ? 'online' : 'offline',
       api_base: apiBase,
       current_model: currentModel || null,

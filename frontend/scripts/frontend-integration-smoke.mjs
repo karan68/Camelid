@@ -41,6 +41,12 @@ try {
     loaded_now: true,
     generation_ready: true,
     active_model_id: 'llama32_3b_instruct_q8_0',
+    status: 'online',
+    backend: 'llama',
+    execution_plan: {
+      selected_backend: 'cpu_q8_runtime_repack',
+      cuda_resident_active: false,
+    },
   }
   const selectedModel = {
     id: 'llama32_3b_instruct_q8_0',
@@ -363,6 +369,21 @@ try {
   assert.match(exactReadySystemMarkup, /COMPATIBILITY\.md rows from \/api\/capabilities[\s\S]*Template\/Jinja: Template rendering ready for this exact row[\s\S]*Checked context: Checked context packs ready for this exact row[\s\S]*Throughput: Production throughput not promoted/, 'System compatibility row list should render row-scoped 3B capability lanes, not just raw row status')
   assert.doesNotMatch(exactReadySystemMarkup, /normalizing model-native\/larger context; arbitrary\/Jinja template behavior; production throughput/, 'System compatibility list next-step copy should filter resolved template/Jinja caveats while retaining production-throughput blockers')
   assert.doesNotMatch(exactReadySystemMarkup, /# Use only after \/v1\/health returns generation_ready=true/, 'System curl should not imply generation_ready alone is sufficient for 3B UX chat')
+  assert.match(exactReadySystemMarkup, /Selected device at load[\s\S]*CPU[\s\S]*Selected backend at load[\s\S]*cpu q8 runtime repack/, 'System should render the selected CPU load plan instead of static backend prose')
+  assert.doesNotMatch(exactReadySystemMarkup, /GPU acceleration remains future work|local CPU generation path today/, 'System should not render stale static execution claims')
+  const cudaSystemMarkup = renderToStaticMarkup(React.createElement(SystemView, {
+    runtime: { ...readyRuntime, execution_plan: { selected_backend: 'cuda_resident_q8_runtime', cuda_resident_active: true } },
+    selectedModel,
+    capabilities,
+  }))
+  assert.match(cudaSystemMarkup, /Selected device at load[\s\S]*CUDA GPU[\s\S]*cuda resident q8 runtime/, 'System should render a consistent CUDA load plan without implying current effective execution')
+  const idleSystemMarkup = renderToStaticMarkup(React.createElement(SystemView, {
+    runtime: { api_base: 'http://127.0.0.1:8181', status: 'online', loaded_now: false, generation_ready: false },
+    selectedModel: null,
+    capabilities: { ...capabilities, execution_plan: null },
+  }))
+  assert.match(idleSystemMarkup, /Runtime[\s\S]*Idle[\s\S]*Runtime state[\s\S]*Online, no model loaded/, 'online no-model System state should report idle rather than offline')
+  assert.match(idleSystemMarkup, /Selected device at load[\s\S]*No model loaded[\s\S]*Selected backend at load[\s\S]*No active plan/, 'online no-model System state should not infer CPU or GPU execution')
   assert.match(exactReadyMarkup, /chat completions/, 'API view should display provider-scoped feature ids as neutral capability names')
   assert.match(exactReadyMarkup, /standard-compatible streaming stays enabled\./, 'API view should sanitize provider-specific feature notes before rendering')
 
