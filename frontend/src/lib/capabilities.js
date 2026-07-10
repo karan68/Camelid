@@ -220,10 +220,20 @@ function isReadyEvidenceStatus(status = '') {
   return value === 'validated' || value.startsWith('validated_') || value === 'measured' || value.startsWith('measured_') || value === 'pass' || value.startsWith('pass_')
 }
 
-function statusContainsSupportedEvidence(value = '') {
+export function statusContainsSupportedEvidence(value = '') {
   const status = String(value || '').toLowerCase()
   if (!status || status.includes('not_') || status.includes('unsupported') || status.includes('blocked') || status.includes('missing') || status.includes('planned')) return false
   return isSupportedCapabilityStatus(status) || isReadyEvidenceStatus(status) || status.includes('supported') || status.includes('validated') || status.includes('measured') || status.includes('pass')
+}
+export function capabilityRowMatchesSearch(row, query = '') {
+  const normalizedQuery = String(query).trim().toLowerCase()
+  if (!normalizedQuery) return true
+  return Object.values(row || {}).some((value) => (
+    value !== null
+    && value !== undefined
+    && typeof value !== 'object'
+    && String(value).toLowerCase().includes(normalizedQuery)
+  ))
 }
 
 function findSupportedFeature(features = [], pattern) {

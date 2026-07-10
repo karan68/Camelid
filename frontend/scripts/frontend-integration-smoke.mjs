@@ -26,9 +26,11 @@ try {
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
   const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
   const {
+    capabilityRowMatchesSearch,
     exactRowSupportLanes,
     rowSupportBoundaryCopy,
     rowSupportNextStepCopy,
+    statusContainsSupportedEvidence,
   } = await server.ssrLoadModule('/src/lib/capabilities.js')
   const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
   const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
@@ -105,6 +107,8 @@ try {
         status: 'planned',
         family: 'future_decoder',
         quantization: 'Q8_0',
+        bounded_context_512_pack: 'not_started',
+        bounded_context_512_pack_id: 'future-context-512-smoke-v1',
         next_step: 'Do not unlock selected chat.',
       },
     ],
@@ -117,6 +121,8 @@ try {
   }
   const selectedModelRunnable = getChatGateState(capabilities, selectedModel, readyRuntime).chatUnlocked
   assert.equal(selectedModelRunnable, true, '3B Q8_0 fixture must be end-to-end runnable only when model path, runtime readiness, and exact-row support are all green')
+  assert.equal(statusContainsSupportedEvidence('not_started'), false, 'reserved future pack ids must not count as verified evidence')
+  assert.equal(capabilityRowMatchesSearch(capabilities.model_compatibility[2], 'future-context-512-smoke-v1'), true, 'ledger search should include displayed evidence bundle ids')
 
   const wrongArtifactModel = {
     ...selectedModel,
@@ -792,6 +798,8 @@ try {
   assert.match(ledgerMarkup, /tinyllama_1_1b_chat_q8_0/, 'ledger rows must come from the capabilities payload')
   assert.match(ledgerMarkup, /Not claimed/, 'every ledger row must carry the not-claimed column')
   assert.match(ledgerMarkup, /arbitrary\/Jinja templates, production throughput, portability/, 'the not-claimed column must render the contract blocker copy verbatim')
+    assert.match(ledgerMarkup, /other_future_row_q8_0[\s\S]*?0<\/b> verified of 1 tracked lanes[\s\S]*?no verified pack/, 'planned pack ids must not be presented as verified evidence or checked contexts')
+    assert.match(blockedApiMarkup, /Q8_0[\s\S]*2 supported[\s\S]*1 guarded/, 'grouped quant evidence must keep supported and guarded postures visible')
   assert.match(ledgerMarkup, /How to read this ledger/, 'the ledger must keep its explainer')
   assert.doesNotMatch(ledgerMarkup, /broad_family_trap|broad_quant_trap/, 'the ledger must not render non-row capability lists as support evidence')
   const emptyLedgerMarkup = renderToStaticMarkup(React.createElement(CompatibilityView, { capabilities: null }))

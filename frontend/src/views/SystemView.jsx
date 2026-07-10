@@ -3,6 +3,8 @@ import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getRuntimeRequestModelId } from '../lib/modelState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
+import { CanonicalStatement } from '../components/ui/CanonicalStatement'
+import { ExactRowEvidenceSummary } from '../components/ui/ExactRowEvidenceSummary'
 import { EmptyState } from '../components/ui/EmptyState'
 import { IconSystem } from '../components/ui/icons'
 
@@ -26,6 +28,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const supportContract = capabilities?.support_contract
   const supportContractCurrentGate = frontendSupportContractCopy(capabilities)
   const compatibilityTargets = capabilities?.model_compatibility || []
+  const supportedCompatibilityCount = compatibilityTargets.filter((target) => isSupportedCapabilityStatus(target.status)).length
   const apiFeatures = capabilities?.api_features || []
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
   const unsupportedFeatures = apiFeatures.filter((feature) => isGuardedCapabilityStatus(feature.status))
@@ -59,12 +62,6 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
     : `# Blocked for UX chat until selected exact row evidence and runtime readiness both match
 # loaded_now=${runtime?.loaded_now ? 'true' : 'false'} generation_ready=${runtime?.generation_ready ? 'true' : 'false'} active_model_id=${runtime?.active_model_id || 'none'}
 # selected_exact_row=${selectedCompatibilityTarget?.id || 'none'} support_gate=${selectedChatGate.label}`
-  const exactRowQuantEvidence = compatibilityTargets.length
-    ? compatibilityTargets.map((target) => `${target.id}: ${target.quantization} (${formatCapabilityStatus(target.status)})`).join(' · ')
-    : 'No exact compatibility rows advertised.'
-  const exactRowFamilyEvidence = compatibilityTargets.length
-    ? compatibilityTargets.map((target) => `${target.id}: ${target.family} (${formatCapabilityStatus(target.status)})`).join(' · ')
-    : 'No exact compatibility rows advertised.'
   const q8Runtime = runtime?.q8_runtime
   const q8RuntimeLabel = q8Runtime?.retain_q8_blocks
     ? 'Retained Q8 blocks'
@@ -184,9 +181,18 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
             <strong>Current contract</strong>
             {supportContract ? (
               <>
-                <p><b>Current gate:</b> {supportContractCurrentGate}</p>
-                <p>{supportContract.support_policy}</p>
-                <p>{supportContract.unsupported_policy}</p>
+                <div className="sys-contract-overview">
+                  <span><b>{supportedCompatibilityCount}</b> supported exact rows</span>
+                  <span><b>{compatibilityTargets.length - supportedCompatibilityCount}</b> guarded or unclaimed rows</span>
+                </div>
+                <details className="sys-evidence-details sys-evidence-details--canonical">
+                  <summary>Read the complete current-gate statement</summary>
+                  <CanonicalStatement text={supportContractCurrentGate} />
+                </details>
+                <dl className="sys-policy-list">
+                  <div><dt>Support policy</dt><dd>{supportContract.support_policy}</dd></div>
+                  <div><dt>Unsupported policy</dt><dd>{supportContract.unsupported_policy}</dd></div>
+                </dl>
               </>
             ) : (
               <p>/api/capabilities is unavailable, so Camelid falls back to health/model readiness only and does not infer broader support.</p>
@@ -215,12 +221,12 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
         <div className="cxv-grid cxv-grid--two">
           <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Exact-row quant evidence</strong>
-            <p>{exactRowQuantEvidence}</p>
+            <ExactRowEvidenceSummary targets={compatibilityTargets} field="quantization" />
             <p>Quant labels here come only from compatibility rows and do not unlock chat without a matching loaded model.</p>
           </div>
           <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Exact-row family evidence</strong>
-            <p>{exactRowFamilyEvidence}</p>
+            <ExactRowEvidenceSummary targets={compatibilityTargets} field="family" />
             <p>Family labels remain row-scoped evidence boundaries, not broad support for neighboring files.</p>
           </div>
         </div>
@@ -228,9 +234,17 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
         <div className="cxv-card cxv-card--flat sys-evidence">
           <strong>Validated API features</strong>
           {supportedFeatures.length ? (
-            supportedFeatures.map((feature) => (
-              <p key={feature.id}><b>{displayCapabilityId(feature.id)}:</b> {displayCapabilityCopy(feature.notes)}</p>
-            ))
+            <div className="sys-rows">
+              {supportedFeatures.map((feature) => (
+                <div key={feature.id} className="sys-row">
+                  <div className="sys-row__head">
+                    <span>{displayCapabilityId(feature.id)}</span>
+                    <EvidenceChip status={feature.status} source={{ rowId: feature.id }} size="sm" />
+                  </div>
+                  <small>{displayCapabilityCopy(feature.notes)}</small>
+                </div>
+              ))}
+            </div>
           ) : (
             <p>No supported API feature rows advertised yet.</p>
           )}
