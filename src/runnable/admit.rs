@@ -16,7 +16,10 @@
 //! verbatim from the spec — it intentionally differs from `model.rs`'s
 //! optimized-lane architecture allowlist (see `BACKEND_ASKS.md` RA-4). In
 //! particular the runnable set includes `gemma2` and excludes
-//! `mistral`/`smollm3`/`gemma4`/`lfm2`.
+//! `mistral`/`smollm3`/`gemma4`/`lfm2`. That is not an admit-then-fail gap:
+//! admitted files bind through the runnable lane's own generic runtime
+//! (`runnable::model`, which implements the gemma2 attention/final logit
+//! soft-caps), never through `model.rs`'s `LlamaModelConfig`.
 
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -195,7 +198,7 @@ fn check_quants(file: &GgufFile) -> Result<BTreeSet<GgufTensorType>, AdmissionRe
                 tensor: Some(tensor.name.clone()),
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
-                     F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K",
+                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K",
                     tensor.tensor_type, tensor.name
                 ),
             });
