@@ -523,7 +523,6 @@
 
 /* ---- Phase 8B: fluidity ---- */
 .cxturn { contain: layout style; }
-.cxturn__meta--reserve { min-height: 30px; visibility: hidden; border-top-color: transparent; }
 .cxchat__jump-latest {
   position: sticky;
   bottom: var(--space-3);
