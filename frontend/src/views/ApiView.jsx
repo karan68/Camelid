@@ -3,19 +3,14 @@ import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId, modelRuntimeIdMatches } from '../lib/modelState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
+import { CanonicalStatement } from '../components/ui/CanonicalStatement'
+import { ExactRowEvidenceSummary } from '../components/ui/ExactRowEvidenceSummary'
 import { ApiWorkbench } from '../components/api/ApiWorkbench'
 import { EmptyState } from '../components/ui/EmptyState'
 import { IconApi } from '../components/ui/icons'
 
 function guardedApiFeatures(features = []) {
   return features.filter((feature) => isGuardedCapabilityStatus(feature.status))
-}
-
-function summarizeExactRowField(targets = [], field, fallback = 'No exact compatibility rows advertised by this backend.') {
-  const rows = targets
-    .filter((target) => target?.id && target?.[field])
-    .map((target) => `${displayCapabilityCopy(target[field])}: ${formatCapabilityStatus(target.status)} (${target.id})`)
-  return rows.length ? rows.join(' · ') : fallback
 }
 
 function supportLaneTitle(lane) {
@@ -31,6 +26,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
   const supportContractCurrentGate = frontendSupportContractCopy(capabilities)
   const compatibilityTargets = capabilities?.model_compatibility || []
   const apiFeatures = capabilities?.api_features || []
+  const supportedCompatibilityCount = compatibilityTargets.filter((target) => isSupportedCapabilityStatus(target.status)).length
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
   const guardedFeatures = guardedApiFeatures(apiFeatures)
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
@@ -126,9 +122,18 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
             <strong>Current gate</strong>
             {supportContract ? (
               <>
-                <p><b>{supportContractCurrentGate}</b></p>
-                <p>{supportContract.support_policy}</p>
-                <p>{supportContract.unsupported_policy}</p>
+                <div className="sys-contract-overview">
+                  <span><b>{supportedCompatibilityCount}</b> supported exact rows</span>
+                  <span><b>{compatibilityTargets.length - supportedCompatibilityCount}</b> guarded or unclaimed rows</span>
+                </div>
+                <details className="sys-evidence-details sys-evidence-details--canonical">
+                  <summary>Read the complete current-gate statement</summary>
+                  <CanonicalStatement text={supportContractCurrentGate} />
+                </details>
+                <dl className="sys-policy-list">
+                  <div><dt>Support policy</dt><dd>{supportContract.support_policy}</dd></div>
+                  <div><dt>Unsupported policy</dt><dd>{supportContract.unsupported_policy}</dd></div>
+                </dl>
               </>
             ) : (
               <p>/api/capabilities is unavailable, so this frontend falls back to runtime health only and will not infer broad support from filenames or saved browser entries.</p>
@@ -148,12 +153,12 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
         <div className="cxv-grid cxv-grid--two">
           <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Exact-row quant evidence</strong>
-            <p>{summarizeExactRowField(compatibilityTargets, 'quantization')}</p>
+            <ExactRowEvidenceSummary targets={compatibilityTargets} field="quantization" />
             <p>Quant labels here come from compatibility rows only; broad quant lists do not unlock chat.</p>
           </div>
           <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Exact-row family evidence</strong>
-            <p>{summarizeExactRowField(compatibilityTargets, 'family')}</p>
+            <ExactRowEvidenceSummary targets={compatibilityTargets} field="family" />
             <p>Family names remain row-scoped evidence boundaries, not inherited support for neighboring files.</p>
           </div>
         </div>

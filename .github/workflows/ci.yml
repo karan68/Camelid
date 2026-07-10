@@ -290,6 +290,9 @@ jobs:
       - name: Frontend integration smoke
         run: npm run smoke:integration
 
+      - name: Frontend UI regression smoke
+        run: npm run smoke:ui
+
   # ---------------------------------------------------------------------------
   # Single aggregate gate. Make THIS the only required status check in branch
   # protection (see the note in the PR/commit). It runs on every event and

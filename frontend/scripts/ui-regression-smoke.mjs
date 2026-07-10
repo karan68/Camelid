@@ -17,11 +17,23 @@ import {
 } from '../src/lib/chatState.js'
 import { normalizeStoredConversations } from '../src/lib/conversationStorage.js'
 import { conversationToJson, conversationToMarkdown } from '../src/lib/conversationExport.js'
+import { canonicalStatementLabel, splitCanonicalStatement } from '../src/lib/canonicalStatement.js'
 
 /* ---- Behavioral asserts: conversation selection + stored-stream recovery ---- */
 const oldChat = { id: 'old-chat', title: 'Old chat', messages: [{ role: 'user', content: 'old prompt' }] }
 const newerChat = { id: 'newer-chat', title: 'Newer chat', messages: [{ role: 'user', content: 'newer prompt' }] }
 const conversations = [newerChat, oldChat]
+
+const canonicalStatementSample = 'Current exact-row support: Alpha (detail; retained); Beta evidence. These are exact bounded lanes only.'
+const canonicalStatementParts = splitCanonicalStatement(canonicalStatementSample)
+assert.deepEqual(canonicalStatementParts, [
+  'Current exact-row support: Alpha (detail; retained);',
+  'Beta evidence.',
+  'These are exact bounded lanes only.',
+], 'canonical statements should split only at top-level evidence boundaries')
+assert.equal(canonicalStatementParts.join(' '), canonicalStatementSample, 'structured canonical statements must preserve the complete source text')
+assert.equal(canonicalStatementLabel(canonicalStatementParts[0], 0), 'Current gate', 'the opening contract claim should retain its current-gate identity')
+assert.equal(canonicalStatementLabel(canonicalStatementParts[2], 2), 'Contract statement', 'prose-derived blocks should stay neutral unless the backend explicitly names their semantic type')
 
 assert.equal(resolveSelectedConversation(conversations, NEW_CHAT_SENTINEL), null, 'new-chat sentinel must render an empty landing, not the newest old chat')
 assert.equal(resolveSelectedConversation(conversations, null), newerChat, 'null selection should recover to the newest available chat so the main pane does not blank during streaming')
@@ -76,6 +88,8 @@ const analyticsViewSource = read('../src/views/AnalyticsView.jsx')
 const capabilitiesSource = read('../src/lib/capabilities.js')
 const streamParserSource = read('../src/lib/chatCompletionStream.js')
 const evidenceChipSource = read('../src/components/ui/EvidenceChip.jsx')
+const canonicalStatementSource = read('../src/components/ui/CanonicalStatement.jsx')
+const exactRowEvidenceSummarySource = read('../src/components/ui/ExactRowEvidenceSummary.jsx')
 const modelInspectorSource = read('../src/components/models/ModelInspector.jsx')
 const compatibilityViewSource = read('../src/views/CompatibilityView.jsx')
 const apiWorkbenchSource = read('../src/components/api/ApiWorkbench.jsx')
@@ -162,6 +176,7 @@ assert.match(streamParserSource, /split\('\\n\\n'\)/, 'stream parser should spli
 
 /* ---- API view ---- */
 assert.match(apiViewSource, /Selected exact-row evidence/, 'API support view should show selected exact-row evidence instead of a broad validated-target claim')
+assert.match(apiViewSource, /<CanonicalStatement text=\{supportContractCurrentGate\}/, 'API should render the complete gate through the shared structured canonical statement')
 assert.match(apiViewSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API endpoint readiness should use the shared exact-row chat gate')
 assert.match(apiViewSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API endpoint readiness should stay aligned with Chat/System exact-row chat unlocks')
 assert.match(apiViewSource, /selectedRuntimeMatches/, 'API endpoint readiness should require active_model_id to match the selected model')
@@ -178,7 +193,9 @@ assert.match(apiViewSource, /rowSupportBoundaryCopy\(selectedCompatibilityTarget
 assert.match(apiViewSource, /rowSupportNextStepCopy\(target, apiFeatures\)/, 'API support view should filter resolved template/Jinja and throughput blockers out of row next-step copy')
 assert.match(capabilitiesSource, /function frontendSupportContractCopy/, 'frontend support contract copy should filter resolved template/Jinja and throughput caveats for current supported rows')
 assert.match(capabilitiesSource, /Production-throughput readiness is green/, 'capability helpers should describe production-throughput as a green exact-row readiness lane when perf evidence is supported')
-assert.match(apiViewSource, /function summarizeExactRowField/, 'API support view should summarize quant and family evidence from exact compatibility rows')
+assert.match(exactRowEvidenceSummarySource, /function groupExactRows[\s\S]*target\?\.id && target\?\.\[field\]/, 'exact-row evidence summaries should group only concrete compatibility rows with the requested field')
+assert.match(apiViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="quantization"/, 'API support view should summarize quant evidence with the shared exact-row renderer')
+assert.match(apiViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="family"/, 'API support view should summarize family evidence with the shared exact-row renderer')
 assert.match(apiViewSource, /Exact-row quant evidence/, 'API support view should label quant evidence as exact-row scoped')
 assert.match(apiViewSource, /Exact-row family evidence/, 'API support view should label family evidence as exact-row scoped')
 assert.match(apiViewSource, /broad quant lists do not unlock chat/, 'API support view should not promote broad quant lists into chat readiness')
@@ -194,12 +211,22 @@ assert.match(apiViewSource, /<EvidenceChip/, 'API contract rows should render th
 
 /* ---- System view ---- */
 assert.match(systemViewSource, /Selected exact-row evidence/, 'System support view should show selected exact-row evidence instead of broad quant or family capability lists')
+assert.match(systemViewSource, /<CanonicalStatement text=\{supportContractCurrentGate\}/, 'System should render the complete gate through the shared structured canonical statement')
 assert.match(systemViewSource, /Exact-row quant evidence/, 'System support view should scope quant evidence to compatibility rows')
 assert.match(systemViewSource, /Exact-row family evidence/, 'System support view should scope family evidence to compatibility rows')
+assert.match(systemViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="quantization"/, 'System support view should summarize quant evidence with the shared exact-row renderer')
+assert.match(systemViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="family"/, 'System support view should summarize family evidence with the shared exact-row renderer')
 assert.doesNotMatch(systemViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|summarizeCapabilityItems/, 'System support view should not render non-row capability lists as support evidence')
 assert.match(systemViewSource, /displayCapabilityId\(feature\.id\)/, 'System view should not render raw provider-scoped API feature ids')
 assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
 assert.match(systemViewSource, /<EvidenceChip/, 'System contract rows should render their status claims through the Evidence Chip')
+assert.match(compatibilityViewSource, /<CanonicalStatement text=\{displayCapabilityCopy\(supportContract\.current_gate\)\}/, 'Compatibility should render the complete gate through the shared structured canonical statement')
+assert.match(canonicalStatementSource, /View as one canonical paragraph/, 'the structured disclosure should retain one-click access to the unbroken canonical paragraph')
+assert.match(compatibilityViewSource, /if \(query \|\| posture !== 'all'\)[\s\S]*setQuery\(''\)[\s\S]*setPosture\('all'\)/, 'ledger deep-links should clear filters before resolving their target row')
+assert.match(compatibilityViewSource, /if \(!node\) return undefined[\s\S]*node\.scrollIntoView[\s\S]*onFocusConsumed/, 'ledger deep-links should be consumed only after the target row exists')
+assert.match(compatibilityViewSource, /node\.focus\(\{ preventScroll: true \}\)[\s\S]*node\.scrollIntoView/, 'ledger deep-links should transfer keyboard focus before scrolling the destination into view')
+assert.match(compatibilityViewSource, /data-row-id=\{row\.id\}[\s\S]*tabIndex=\{-1\}/, 'model evidence rows should be programmatically focusable')
+assert.match(compatibilityViewSource, /data-row-id=\{feature\.id\} tabIndex=\{-1\}/, 'API feature evidence rows should be programmatically focusable')
 
 /* ---- Models view ----
    Redesign (2026-07, D14): the page was rebuilt as five derived zones. The tracked-row
