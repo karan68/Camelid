@@ -3941,7 +3941,7 @@ impl TensorStore {
             GgufTensorType::Tq2_0 => decode_tq2_0_tensor(name, &bytes, expected_elements)?,
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL"
+                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, TQ1_0, TQ2_0"
                 )))
             }
         };

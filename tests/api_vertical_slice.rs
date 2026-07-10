@@ -1129,9 +1129,18 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "llama_spm_q4_k_q5_k")
         .unwrap();
-    assert_eq!(planned_quant["status"], "planned_phase_10");
-    assert_eq!(planned_quant["tensors_load"], "unsupported_typed_error");
-    assert_eq!(planned_quant["generation_runs"], "blocked_until_dequant");
+    assert_eq!(
+        planned_quant["status"],
+        "planned_beyond_named_certified_rows"
+    );
+    assert_eq!(
+        planned_quant["tensors_load"],
+        "cpu_f32_dequant_and_wire_kernels_implemented_engine_fact_no_family_claim"
+    );
+    assert_eq!(
+        planned_quant["generation_runs"],
+        "certified_on_named_exact_rows_only_otherwise_unverified_experimental_lane"
+    );
     assert_eq!(planned_quant["chat_template_renderer"], "not_selected");
     assert_eq!(planned_quant["chat_template_shape_pack"], "not_started");
     assert_eq!(planned_quant["chat_template_shape_pack_id"], "not_selected");

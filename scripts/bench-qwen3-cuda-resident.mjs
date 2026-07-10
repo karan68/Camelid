@@ -36,6 +36,11 @@ const prefillPromptTokens = Number.parseInt(args.get('prefill-prompt-tokens') ||
 const runs = Number.parseInt(args.get('runs') || '5', 10)
 const outPath = args.get('out') || null
 const requireGpu = args.get('allow-cpu') !== 'true'
+// --decode-prompt-tokens N: run the decode benchmark at depth ~N (a long prompt
+// precedes the generated tokens, so decode steps attend over ~N cached positions).
+// The two-point method subtracts t(1) from t(N), so the prefill cost still cancels.
+// Default 0 keeps today's ~empty-context decode.
+const decodePromptTokens = Number.parseInt(args.get('decode-prompt-tokens') || '0', 10)
 
 const DECODE_PROMPT = 'Count slowly:' // short, ~empty-context decode
 
@@ -45,17 +50,18 @@ async function main() {
   // A long deterministic prompt for the prefill benchmark. We measure how many
   // prompt tokens the server reports and divide by prefill wall time.
   const longPrompt = buildLongPrompt(prefillPromptTokens)
+  const decodePrompt = decodePromptTokens > 0 ? buildLongPrompt(decodePromptTokens) : DECODE_PROMPT
 
   // Warm up (build resident engine, JIT kernels, fill caches) — not measured.
-  await complete(DECODE_PROMPT, 8)
+  await complete(decodePrompt, 8)
   await complete(longPrompt, 1)
 
-  // --- Decode benchmark (empty-context) ---
+  // --- Decode benchmark (empty-context, or depth-N with --decode-prompt-tokens) ---
   const tN = []
   const t1 = []
   for (let i = 0; i < runs; i++) {
-    tN.push(await timed(() => complete(DECODE_PROMPT, decodeTokens)))
-    t1.push(await timed(() => complete(DECODE_PROMPT, 1)))
+    tN.push(await timed(() => complete(decodePrompt, decodeTokens)))
+    t1.push(await timed(() => complete(decodePrompt, 1)))
   }
   // Per-run decode tok/s using paired (t(N), t(1)) from the same iteration.
   const decodeTokS = tN.map((tn, i) => (decodeTokens - 1) / (tn.ms - t1[i].ms) * 1000)
@@ -82,6 +88,7 @@ async function main() {
     runs,
     decode: {
       generated_tokens: decodeTokens,
+      context_prompt_tokens: decodePromptTokens,
       tok_s: stats(decodeTokS),
       short_prefill_first_token_ms: stats(shortPrefillMs),
     },
