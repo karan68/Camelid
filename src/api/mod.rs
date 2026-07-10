@@ -467,10 +467,13 @@ pub struct ChatCompletionRequest {
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
     pub parallel_tool_calls: Option<bool>,
-    /// OpenAI `response_format`. Only `{"type":"json_object"}` is honored â€” it turns
-    /// on JSON-grammar-constrained decoding so the output is guaranteed valid JSON.
-    /// `{"type":"text"}`/absent is normal decoding; other shapes (json_schema) are
-    /// rejected. Declared here so it is not in `unsupported_fields`.
+    /// OpenAI `response_format`. `{"type":"json_object"}` turns on JSON-grammar-
+    /// constrained decoding (output guaranteed valid JSON). `{"type":"json_schema",
+    /// "json_schema":{"schema":{...}}}` constrains the output to a supported JSON
+    /// Schema subset -- see `docs/architecture/STRUCTURED_OUTPUTS.md` for the exact
+    /// contract; schemas outside the subset are a typed 400 naming the keyword.
+    /// `{"type":"text"}`/absent is normal decoding; other types are rejected.
+    /// Non-streaming only. Declared here so it is not in `unsupported_fields`.
     pub response_format: Option<serde_json::Value>,
     /// OpenAI `stream_options`. The only honored subfield is `include_usage`
     /// (bool); any other shape or subfield is tolerated silently and ignored,
@@ -961,10 +964,10 @@ pub struct GenerationSessionRequest {
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
     default_max_tokens_cap: Option<u32>,
-    /// JSON-grammar-constrained decoding (`response_format: json_object`). Set by the
-    /// chat handler; never deserialized from the wire.
+    /// Active output constraint (`response_format: json_object` / `json_schema`),
+    /// compiled by the chat handler; never deserialized from the wire.
     #[serde(default, skip_deserializing)]
-    json_object_mode: bool,
+    constraint: Option<crate::grammar::ConstraintSpec>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1400,9 +1403,10 @@ struct PreparedGeneration {
     /// When set, collect per-token logprobs each step (chosen + this many top
     /// alternatives). Forces the full-host-logits decode path (no GPU greedy-fast).
     logprobs_top_n: Option<usize>,
-    /// JSON-grammar-constrained decoding: each step is masked to tokens that keep a
-    /// valid JSON-object prefix. Forces the full-logits CPU decode path.
-    json_object_mode: bool,
+    /// Active output constraint (`response_format` json_object / json_schema): each
+    /// step is masked to tokens that keep a valid prefix of the constrained value.
+    /// Forces the full-logits CPU decode path.
+    constraint: Option<crate::grammar::ConstraintSpec>,
     stop_sequences: Vec<String>,
     logit_diagnostic_token_ids: Vec<u32>,
     collect_dense_diagnostics: bool,
@@ -2295,7 +2299,7 @@ async fn llama_server_completion(
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
-        json_object_mode: false,
+        constraint: None,
     };
     // Prep runs OUTSIDE any serialization (D3); the decode runs on the engine
     // worker, and CancelOnDrop stops it within one step on client disconnect.
@@ -7267,7 +7271,7 @@ async fn completions(
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
-        json_object_mode: false,
+        constraint: None,
     };
     let stream = req.stream.unwrap_or(false);
     if n_choices > 1 {
@@ -7468,11 +7472,33 @@ async fn chat_completions(
             return response;
         }
     }
+    // response_format -> constrained decoding (json_object / json_schema,
+    // non-streaming). Parsed BEFORE lane dispatch -- it is pure request-shape
+    // validation with no model access -- so a malformed schema 400s uniformly on
+    // every lane, and the env-gated serve lanes below (which do not enforce
+    // constraints) can reject a constrained request instead of silently
+    // returning unconstrained output with a 200.
+    let constraint = match constraint_from_response_format(req.response_format.as_ref()) {
+        Ok(constraint) => constraint,
+        Err(response) => return *response,
+    };
+    let constraint_unsupported_on_lane = || {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "response_format constrained decoding is not supported on this model's serve lane yet"
+                .to_string(),
+            Some("response_format"),
+        )
+    };
     // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE). Short-circuits
     // if this request targets a loaded gemma4 runtime; otherwise falls through to
     // the existing Llama/3B path unchanged.
     match resolve_gemma4_runtime(&state, &req).await {
         Ok(Some((id, runtime))) => {
+            if constraint.is_some() {
+                return constraint_unsupported_on_lane();
+            }
             return if req.stream.unwrap_or(false) {
                 gemma4_chat_streaming(id, runtime, &req).await
             } else {
@@ -7487,6 +7513,9 @@ async fn chat_completions(
     // chunk shape with think tokens as `reasoning_content` deltas.
     match resolve_runnable_runtime(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
+            if constraint.is_some() {
+                return constraint_unsupported_on_lane();
+            }
             if req.stream.unwrap_or(false) {
                 return runnable_chat_streaming(id, runtime, &req).await;
             }
@@ -7500,6 +7529,9 @@ async fn chat_completions(
     // (block-level SSE; a denoise block is minutes of compute).
     match resolve_dg_runtime(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
+            if constraint.is_some() {
+                return constraint_unsupported_on_lane();
+            }
             if req.stream.unwrap_or(false) {
                 return dg_chat_streaming(id, runtime, &req).await;
             }
@@ -7569,17 +7601,15 @@ async fn chat_completions(
     // request supplied tools and tool_choice is not "none".
     let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
-    // response_format: json_object -> JSON-grammar-constrained decoding (non-streaming).
-    let json_object_mode = match json_object_mode_from_response_format(req.response_format.as_ref())
-    {
-        Ok(mode) => mode,
-        Err(response) => return *response,
-    };
-    if json_object_mode && req.stream.unwrap_or(false) {
+    // The constraint itself was parsed before lane dispatch (see above); this
+    // captures whether one is active before `constraint` moves into the
+    // generation request, for the tool-call parse gate below.
+    let constraint_active = constraint.is_some();
+    if constraint_active && req.stream.unwrap_or(false) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "response_format json_object is not supported with stream:true; request it without streaming".to_string(),
+            "response_format constrained decoding is not supported with stream:true; request it without streaming".to_string(),
             Some("response_format"),
         );
     }
@@ -7638,7 +7668,7 @@ async fn chat_completions(
         tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
-        json_object_mode,
+        constraint,
     };
     let stream = req.stream.unwrap_or(false);
     if n_choices > 1 {
@@ -7696,7 +7726,7 @@ async fn chat_completions(
             // Parse the model's tool-call output into structured tool_calls when the
             // request supplied tools and tool_choice permits it. On a tool call,
             // content is emptied and finish_reason flips to "tool_calls".
-            let tool_calls = if tools_active {
+            let tool_calls = if should_parse_tool_calls(tools_active, constraint_active) {
                 parse_tool_calls(&content)
             } else {
                 None
@@ -7767,6 +7797,10 @@ struct ReceiptRequestStamp {
     top_k: Option<u32>,
     seed: Option<u64>,
     stop: Vec<String>,
+    /// The raw `response_format` request value (not the compiled spec): the
+    /// receipt records the request as made, and replay re-parses it through
+    /// the same constraint compiler serving used.
+    response_format: Option<serde_json::Value>,
     reproducible: bool,
 }
 
@@ -7792,6 +7826,7 @@ fn receipt_request_stamp(
         req.top_k,
         req.seed,
         stop_spec_to_vec(req.stop.as_ref()),
+        req.response_format.clone().filter(|v| !v.is_null()),
     ))
 }
 
@@ -7818,9 +7853,12 @@ fn receipt_completion_request_stamp(
         req.top_k,
         req.seed,
         stop_spec_to_vec(req.stop.as_ref()),
+        // The raw completions endpoint has no response_format field.
+        None,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receipt_stamp_from_parts(
     endpoint: &'static str,
     messages_or_prompt: serde_json::Value,
@@ -7829,6 +7867,7 @@ fn receipt_stamp_from_parts(
     top_k: Option<u32>,
     seed: Option<u64>,
     stop: Vec<String>,
+    response_format: Option<serde_json::Value>,
 ) -> ReceiptRequestStamp {
     let temperature = f64::from(temperature.unwrap_or(0.0));
     // Reproducible means byte-for-byte replayable: strict greedy decoding
@@ -7843,6 +7882,7 @@ fn receipt_stamp_from_parts(
         top_k,
         seed,
         stop,
+        response_format,
         reproducible,
     }
 }
@@ -7904,6 +7944,7 @@ async fn build_server_receipt(
             top_k: stamp.top_k,
             seed: stamp.seed,
             stop: stamp.stop,
+            response_format: stamp.response_format,
         },
         reproducible: stamp.reproducible,
         result: ReceiptResult {
@@ -7969,6 +8010,14 @@ pub async fn replay_receipt_request(
             })?;
         (Some(prompt), None)
     };
+    // Re-compile the receipt's recorded response_format through the same
+    // constraint compiler serving used, so a constrained receipt replays
+    // constrained (an unconstrained replay of a constrained generation would
+    // deterministically fail verify-receipt on an honest receipt).
+    let constraint = match constraint_from_response_format(request.response_format.as_ref()) {
+        Ok(constraint) => constraint,
+        Err(response) => return Err(response_error_text(*response).await),
+    };
     let session_request = GenerationSessionRequest {
         model: Some(loaded.id.clone()),
         prompt,
@@ -8002,7 +8051,7 @@ pub async fn replay_receipt_request(
         tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
-        json_object_mode: false,
+        constraint,
     };
     // Prep needs no lock: the GPU-runnable-tier parity probe inside
     // prepare_generation serializes via its own engine job. The replay decode
@@ -8768,7 +8817,7 @@ async fn prepare_generation(
         session,
         sampling,
         logprobs_top_n,
-        json_object_mode: req.json_object_mode,
+        constraint: req.constraint.clone(),
         stop_sequences,
         logit_diagnostic_token_ids,
         collect_dense_diagnostics,
@@ -9152,7 +9201,10 @@ fn validate_unsupported_generation_fields(
             "the camelid parse_tool_calls control is not supported on this route yet"
         }
         "response_format" | "json_schema" | "schema" | "grammar" => {
-            "JSON/schema/grammar constrained generation is not supported yet"
+            // Only the raw-completions / llama-server compatibility routes flatten
+            // these keys into unsupported_fields; the chat route declares
+            // response_format and enforces it.
+            "constrained generation is supported on /v1/chat/completions via response_format; this route does not support json_schema/grammar fields"
         }
         "stream_options" => {
             "OpenAI stream_options are not supported yet; Camelid streams plain SSE chunks"
@@ -9734,6 +9786,15 @@ fn clear_prompt_prefix_cache(state: &AppState) {
 }
 
 fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<CachedPromptPrefix> {
+    // The prompt-prefix cache never interacts with constrained decoding. The
+    // cache key is (model, path, tokens, sampling) -- the constraint is not in
+    // it -- and a warm hit samples the first token from raw cached logits with
+    // no grammar mask, with the grammar state never advanced over it. The gate
+    // lives here (and in store, below) rather than at the call sites so every
+    // decode path inherits it; re-prefill is the honest cost of the guarantee.
+    if prepared.constraint.is_some() {
+        return None;
+    }
     let cached = prepared.cached_prompt_prefix.lock().ok()?.clone()?;
     (cached.model_id == prepared.model_id
         && cached.model_path == prepared.model_path
@@ -9743,6 +9804,12 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<CachedPro
 }
 
 fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
+    // The prompt-prefix cache never interacts with constrained decoding (see
+    // lookup_prompt_prefix_cache). Storing raw prefill logits would arguably be
+    // safe, but skipping both directions keeps the invariant one sentence.
+    if prepared.constraint.is_some() {
+        return;
+    }
     // A resident-GPU-prefilled session keeps its K/V history on the GPU only; the cached
     // clone would drop it and resume from empty CPU buffers. Skip caching those sessions â€”
     // a cache miss just re-runs the (fast, resident) prefill.
@@ -9889,12 +9956,12 @@ fn generate_token_ids(
     let mut top_logits = Vec::new();
     let mut step_top_logits = Vec::new();
     let mut step_logprobs: Vec<StepLogprob> = Vec::new();
-    // JSON-grammar-constrained decoding setup (response_format json_object). Cache
-    // each token's output bytes once; mask the logits to valid JSON-prefix tokens
-    // each step; stop as soon as the top-level object closes.
-    let json_grammar_active = prepared.json_object_mode;
+    // Constrained-decoding setup (response_format json_object / json_schema). Cache
+    // each token's output bytes once; mask the logits to tokens that keep a valid
+    // prefix of the constrained value each step; stop as soon as it completes.
+    let constraint_active = prepared.constraint.is_some();
     let grammar_vocab = prepared.tokenizer.tokens.len();
-    let grammar_token_bytes: Vec<Vec<u8>> = if json_grammar_active {
+    let grammar_token_bytes: Vec<Vec<u8>> = if constraint_active {
         (0..grammar_vocab as u32)
             .map(|id| {
                 prepared
@@ -9907,16 +9974,12 @@ fn generate_token_ids(
     } else {
         Vec::new()
     };
-    let mut grammar: Option<crate::grammar::JsonState> =
-        json_grammar_active.then(crate::grammar::JsonState::new);
-    let mut grammar_mask: Vec<bool> = vec![
-        false;
-        if json_grammar_active {
-            grammar_vocab
-        } else {
-            0
-        }
-    ];
+    let mut grammar: Option<crate::grammar::ConstraintState> = prepared
+        .constraint
+        .as_ref()
+        .map(crate::grammar::ConstraintSpec::build);
+    let mut grammar_mask: Vec<bool> =
+        vec![false; if constraint_active { grammar_vocab } else { 0 }];
     let collect_step_top_logits = !prepared.logit_diagnostic_token_ids.is_empty();
     let mut output_projection = Vec::new();
     let mut dense = None;
@@ -10147,7 +10210,12 @@ fn generate_token_ids(
         // valid JSON-object prefix; EOG only once the object is complete.
         let grammar_allowed: Option<&[bool]> = match grammar.as_ref() {
             Some(state) => {
+                // `done` gates whether EOG is allowed this step. With the current loop
+                // structure it is always false here (the loop breaks the moment a token
+                // drives the state to done, below); it is kept defensive so the mask
+                // stays correct if that stop/advance ordering ever changes.
                 let done = state.is_done();
+                let mut any_allowed = false;
                 for (id, slot) in grammar_mask.iter_mut().enumerate() {
                     let bytes = grammar_token_bytes
                         .get(id)
@@ -10160,6 +10228,27 @@ fn generate_token_ids(
                     } else {
                         state.accepts(bytes)
                     };
+                    any_allowed |= *slot;
+                }
+                // Fail closed if no token can extend the constrained value and
+                // stopping is not yet allowed. This arises when the next required byte
+                // is only reachable through a multibyte-UTF-8 fragment token:
+                // `grammar_token_bytes` decodes each token in isolation and drops
+                // incomplete UTF-8, so a byte-level-BPE / byte-fallback fragment decodes
+                // to "" and is masked out above (having a byte token is not enough — it
+                // must survive an in-isolation decode). Non-ASCII `enum`/`const` literals,
+                // which would force exactly such a byte, are rejected at schema-compile
+                // time (a request-time 400), so in practice this only guards free-form
+                // values on pathological tokenizers; sampling a fully-masked (all -inf)
+                // distribution would otherwise emit an invalid token or NaN, so we
+                // surface a typed error instead.
+                if !any_allowed {
+                    return Err(Box::new(api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "constraint_unsatisfiable",
+                        "the response_format constraint cannot be satisfied by this model's tokenizer (no token can produce the next required byte)".to_string(),
+                        Some("response_format"),
+                    )));
                 }
                 Some(grammar_mask.as_slice())
             }
@@ -10318,7 +10407,15 @@ fn generate_token_ids(
         if let Some(state) = grammar.as_mut() {
             if let Some(bytes) = grammar_token_bytes.get(step.next_token_id as usize) {
                 for &b in bytes {
-                    let _ = state.advance(b);
+                    // The mask guaranteed every byte of the chosen token is acceptable.
+                    // Advance in all builds (the grammar must consume the emitted bytes)
+                    // and assert acceptance in debug, so a mask/advance divergence fails
+                    // a test instead of silently emitting invalid output.
+                    let accepted = state.advance(b).is_ok();
+                    debug_assert!(
+                        accepted,
+                        "constrained-decode mask allowed a token whose bytes the grammar rejects"
+                    );
                 }
             }
             if state.is_done() {
@@ -10534,23 +10631,49 @@ fn build_completion_logprobs(steps: &[StepLogprob]) -> CompletionLogprobs {
     }
 }
 
-/// Interpret OpenAI `response_format`. `Ok(true)` = json_object mode (constrain to
-/// valid JSON), `Ok(false)` = normal decoding (text / absent), `Err` = a typed 400
-/// for shapes Camelid does not support yet (json_schema, unknown types).
-fn json_object_mode_from_response_format(
+/// Interpret OpenAI `response_format` into an optional output constraint.
+/// `Ok(None)` = normal decoding (text / absent); `Ok(Some(_))` = constrained
+/// decoding (`json_object`, or `json_schema` whose schema is inside the supported
+/// subset); `Err` = a typed 400 for an unsupported shape or a schema Camelid cannot
+/// enforce byte-for-byte.
+fn constraint_from_response_format(
     response_format: Option<&serde_json::Value>,
-) -> std::result::Result<bool, Box<Response>> {
+) -> std::result::Result<Option<crate::grammar::ConstraintSpec>, Box<Response>> {
     let Some(value) = response_format.filter(|v| !v.is_null()) else {
-        return Ok(false);
+        return Ok(None);
     };
     match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("json_object") => Ok(true),
-        Some("text") | None => Ok(false),
+        Some("json_object") => Ok(Some(crate::grammar::ConstraintSpec::json_object())),
+        Some("json_schema") => {
+            let schema = value
+                .get("json_schema")
+                .and_then(|json_schema| json_schema.get("schema"))
+                .ok_or_else(|| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "response_format json_schema requires a `json_schema.schema` object"
+                            .to_string(),
+                        Some("response_format"),
+                    ))
+                })?;
+            crate::grammar::ConstraintSpec::from_schema(schema)
+                .map(Some)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_parameter",
+                        format!("response_format json_schema is not supported: {err}"),
+                        Some("response_format"),
+                    ))
+                })
+        }
+        Some("text") | None => Ok(None),
         Some(other) => Err(Box::new(api_error(
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             format!(
-                "response_format type {other:?} is not supported yet; only json_object (and text) are honored"
+                "response_format type {other:?} is not supported; only json_object, json_schema, and text are honored"
             ),
             Some("response_format"),
         ))),
@@ -10561,6 +10684,17 @@ fn json_object_mode_from_response_format(
 /// everything else (auto / required / a specific function / absent) allows.
 fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
     !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
+}
+
+/// Whether the model's raw content should be probed for a tool call.
+/// Constrained output is content by definition: OpenAI allows tools and
+/// response_format together, and a schema that legitimately declares a `name`
+/// property (extremely common) must not have its constrained output
+/// reclassified into a fabricated tool call with emptied content. The tools are
+/// still rendered into the prompt template under a constraint; only this
+/// post-hoc reclassification is disabled.
+fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool {
+    tools_active && !constraint_active
 }
 
 /// Parse a model's tool-call output into OpenAI `tool_calls`. Handles the Llama
@@ -12784,6 +12918,44 @@ mod tests {
     }
 
     #[test]
+    fn receipt_stamp_records_response_format() {
+        // M4 regression: a constrained request's receipt must carry the raw
+        // response_format so replay re-compiles the same constraint -- an
+        // unconstrained replay of a constrained generation deterministically
+        // fails verify-receipt on an honest receipt.
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"schema": {
+                "type": "object", "additionalProperties": false,
+                "properties": {"a": {"type": "integer"}}, "required": ["a"]
+            }}
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "response_format": response_format,
+        }))
+        .expect("chat request parses");
+        let stamp = receipt_request_stamp(&req).expect("stamp");
+        assert_eq!(stamp.response_format, Some(response_format));
+
+        // Unconstrained requests stamp None (the field stays out of the receipt).
+        let plain: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+        }))
+        .expect("chat request parses");
+        assert_eq!(
+            receipt_request_stamp(&plain)
+                .expect("stamp")
+                .response_format,
+            None
+        );
+    }
+
+    #[test]
     fn completion_receipt_stamp_records_prompt_endpoint_and_reproducibility() {
         // Greedy (no temperature/top-p/top-k): records the prompt verbatim under the
         // raw completions endpoint and is reproducible.
@@ -13058,6 +13230,24 @@ mod tests {
     }
 
     #[test]
+    fn constrained_output_is_never_reclassified_as_tool_call() {
+        // M3 regression: a schema that legitimately declares a `name` property
+        // produces output parse_tool_calls would happily match -- under an active
+        // constraint that output is content by definition and must not be
+        // reclassified (content emptied, fabricated ToolCall, finish_reason
+        // "tool_calls"). OpenAI allows tools + response_format together.
+        let constrained_content = r#"{"name":"x","parameters":{}}"#;
+        assert!(
+            parse_tool_calls(constrained_content).is_some(),
+            "the gate, not the parser, is what protects constrained output"
+        );
+        assert!(!should_parse_tool_calls(true, true));
+        assert!(should_parse_tool_calls(true, false));
+        assert!(!should_parse_tool_calls(false, false));
+        assert!(!should_parse_tool_calls(false, true));
+    }
+
+    #[test]
     fn parse_tool_calls_extracts_llama_format() {
         // Llama 3.x: {"name", "parameters"}; arguments becomes a JSON string.
         let tc = parse_tool_calls(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
@@ -13094,19 +13284,42 @@ mod tests {
     }
 
     #[test]
-    fn response_format_interprets_json_object_mode() {
+    fn response_format_maps_to_constraint() {
         use serde_json::json;
-        // json_object turns constrained decoding on; text / absent leave it off.
+        // json_object and a supported json_schema enable constrained decoding;
+        // text / absent leave it off.
         assert!(
-            json_object_mode_from_response_format(Some(&json!({"type": "json_object"}))).unwrap()
+            constraint_from_response_format(Some(&json!({"type": "json_object"})))
+                .unwrap()
+                .is_some()
         );
-        assert!(!json_object_mode_from_response_format(Some(&json!({"type": "text"}))).unwrap());
-        assert!(!json_object_mode_from_response_format(None).unwrap());
-        assert!(!json_object_mode_from_response_format(Some(&json!(null))).unwrap());
-        // json_schema (and other types) are a typed error, not silently ignored.
         assert!(
-            json_object_mode_from_response_format(Some(&json!({"type": "json_schema"}))).is_err()
+            constraint_from_response_format(Some(&json!({"type": "text"})))
+                .unwrap()
+                .is_none()
         );
+        assert!(constraint_from_response_format(None).unwrap().is_none());
+        assert!(constraint_from_response_format(Some(&json!(null)))
+            .unwrap()
+            .is_none());
+        // A supported json_schema compiles.
+        let good = json!({
+            "type": "json_schema",
+            "json_schema": {"name": "x", "schema": {
+                "type": "object", "additionalProperties": false,
+                "properties": {"a": {"type": "string"}}, "required": ["a"]
+            }}
+        });
+        assert!(constraint_from_response_format(Some(&good))
+            .unwrap()
+            .is_some());
+        // A schema outside the subset is a typed error, not silently ignored.
+        let bad = json!({"type": "json_schema", "json_schema": {"schema": {"type": "string"}}});
+        assert!(constraint_from_response_format(Some(&bad)).is_err());
+        // A json_schema without the schema payload is an error.
+        assert!(constraint_from_response_format(Some(&json!({"type": "json_schema"}))).is_err());
+        // Unknown response_format types remain errors.
+        assert!(constraint_from_response_format(Some(&json!({"type": "yaml"}))).is_err());
     }
 
     #[test]
@@ -14438,6 +14651,80 @@ mod tests {
             prepared_for_cache("tiny", "model-b.gguf", vec![1, 2], cached.session);
         different_model.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         assert!(lookup_prompt_prefix_cache(&different_model).is_none());
+    }
+
+    #[test]
+    fn constrained_generation_skips_prompt_prefix_cache_lookup() {
+        // B1 regression: the cache key is (model, path, tokens, sampling) -- the
+        // constraint is NOT in the key. On a warm hit the first token would be
+        // sampled from raw cached logits with no mask and the grammar state never
+        // advanced over it, breaking the response_format guarantee on the second
+        // identical request. Constrained requests must not read the cache.
+        let config = tiny_config();
+        let weights = tiny_weights();
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&unconstrained, &step);
+        assert!(
+            lookup_prompt_prefix_cache(&unconstrained).is_some(),
+            "control: the unconstrained twin hits the warm cache"
+        );
+
+        let mut constrained = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![1, 2],
+            lookup_prompt_prefix_cache(&unconstrained).unwrap().session,
+        );
+        constrained.cached_prompt_prefix = unconstrained.cached_prompt_prefix.clone();
+        constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
+        assert!(
+            lookup_prompt_prefix_cache(&constrained).is_none(),
+            "a constrained request must never read the prompt-prefix cache"
+        );
+    }
+
+    #[test]
+    fn constrained_generation_does_not_store_prompt_prefix_cache() {
+        // Mirror of the lookup test: skipping both directions keeps the invariant
+        // one sentence -- the prompt-prefix cache never interacts with constrained
+        // decoding.
+        let config = tiny_config();
+        let weights = tiny_weights();
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut constrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
+        store_prompt_prefix_cache(&constrained, &step);
+
+        let mut unconstrained = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![1, 2],
+            constrained.session.clone(),
+        );
+        unconstrained.cached_prompt_prefix = constrained.cached_prompt_prefix.clone();
+        assert!(
+            lookup_prompt_prefix_cache(&unconstrained).is_none(),
+            "a constrained request must never write the prompt-prefix cache"
+        );
     }
 
     #[test]
@@ -15904,7 +16191,7 @@ mod tests {
             session,
             sampling: SamplingConfig::default(),
             logprobs_top_n: None,
-            json_object_mode: false,
+            constraint: None,
             stop_sequences: Vec::new(),
             logit_diagnostic_token_ids: Vec::new(),
             collect_dense_diagnostics: false,

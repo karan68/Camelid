@@ -1871,8 +1871,38 @@ async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
 
 #[tokio::test]
 async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
-    // response_format json_object is now supported (JSON-grammar-constrained
-    // decoding); json_schema and other types are still rejected before runtime.
+    // response_format json_object and a supported json_schema are honored (JSON /
+    // JSON-Schema constrained decoding). A json_schema whose schema falls outside
+    // the enforceable subset (here a top-level `string`, which must be an object or
+    // array) is still rejected before runtime with a typed error naming the param.
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"string"}}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "response_format");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_json_schema_without_schema_payload() {
+    // Reinstated alongside the out-of-subset case above (the json_schema PR
+    // replaced this case rather than extending it): a bare
+    // {"type":"json_schema"} with no json_schema.schema payload is a malformed
+    // request, 400 before runtime with the param named.
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -1891,7 +1921,59 @@ async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["code"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "response_format");
+}
+
+#[tokio::test]
+async fn stream_true_with_json_object_is_rejected() {
+    // Constrained decoding is non-streaming only: stream:true + json_object is
+    // a typed 400 before runtime, never a silently unconstrained stream.
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":true,"response_format":{"type":"json_object"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "response_format");
+}
+
+#[tokio::test]
+async fn stream_true_with_json_schema_is_rejected() {
+    // Same invariant for a supported json_schema: the constraint compiles, but
+    // streaming under a constraint is rejected before runtime.
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":true,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","additionalProperties":false,"properties":{"a":{"type":"integer"}},"required":["a"]}}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request_error");
     assert_eq!(body["error"]["param"], "response_format");
 }
 

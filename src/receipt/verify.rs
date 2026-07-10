@@ -1038,6 +1038,7 @@ mod tests {
                 top_k: None,
                 seed: None,
                 stop: vec![],
+                response_format: None,
             },
             reproducible: true,
             result: ReceiptResult {

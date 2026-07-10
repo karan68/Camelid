@@ -311,6 +311,14 @@ pub struct ReceiptRequest {
     pub top_k: Option<u32>,
     pub seed: Option<u64>,
     pub stop: Vec<String>,
+    /// The OpenAI `response_format` of the recorded request (constrained
+    /// decoding), recorded as the raw request value so replay re-compiles it
+    /// exactly as serving did. `None` is skipped entirely from serialization,
+    /// so every existing (unconstrained) receipt keeps a byte-identical
+    /// canonical body and digest — the same legacy-default pattern as
+    /// `execution_lane`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
 }
 
 /// What this Camelid build produced for the request.
@@ -695,6 +703,7 @@ mod tests {
                 top_k: None,
                 seed: None,
                 stop: vec![],
+                response_format: None,
             },
             reproducible: true,
             result: ReceiptResult {
@@ -734,6 +743,42 @@ mod tests {
         receipt
             .verify_self_digest()
             .expect("legacy digest verifies");
+    }
+
+    #[test]
+    fn receipt_request_without_constraint_serializes_unchanged() {
+        // An unconstrained receipt (response_format = None) must serialize WITHOUT
+        // the field, so every receipt written before it existed digests and
+        // verifies byte-for-byte unchanged — and a constrained receipt binds the
+        // constraint into its id (it cannot be stripped to replay unconstrained).
+        let mut receipt = sample_receipt();
+        receipt.seal().expect("seal");
+        let body = receipt.canonical_body().expect("body");
+        assert!(
+            !body.contains("response_format"),
+            "absent response_format must not appear in the canonical body: {body}"
+        );
+        receipt
+            .verify_self_digest()
+            .expect("legacy digest verifies");
+
+        let mut constrained = sample_receipt();
+        constrained.request.response_format = Some(json!({"type": "json_object"}));
+        constrained.seal().expect("seal");
+        assert!(constrained
+            .canonical_body()
+            .expect("body")
+            .contains("response_format"));
+        assert_ne!(
+            constrained.receipt_id, receipt.receipt_id,
+            "the constraint must be digest-bound"
+        );
+        // Round-trips intact.
+        let back: ParityReceipt =
+            serde_json::from_str(&serde_json::to_string(&constrained).unwrap()).unwrap();
+        assert_eq!(back, constrained);
+        back.verify_self_digest()
+            .expect("constrained digest verifies");
     }
 
     #[test]
