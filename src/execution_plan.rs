@@ -978,8 +978,13 @@ fn recognized_row_level(row: &str) -> &'static str {
         "supported_current_gate"
     } else if normalized.contains("llama_3_2_1b_instruct") {
         "supported_exact_row_smoke_512_1024_2048_4096_8192"
-    } else if normalized.contains("llama_3_2_3b_instruct")
-        || normalized.contains("llama_3_8b_instruct")
+    } else if normalized.contains("llama_3_2_3b_instruct") {
+        // Full 512-8192 ladder re-validated on the anchored canonical GGUF
+        // (raw-decode greedy parity vs llama.cpp acd79d603; see the
+        // llama32-3b-context-512-8192-anchored evidence bundle). Split from the
+        // 8B arm below, whose checked packs remain 512/1024/2048.
+        "supported_exact_row_smoke_512_1024_2048_4096_8192"
+    } else if normalized.contains("llama_3_8b_instruct")
         || normalized.contains("meta_llama_3_8b_instruct")
     {
         "supported_exact_row_smoke_512_1024_2048"

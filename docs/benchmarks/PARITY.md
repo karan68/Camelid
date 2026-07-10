@@ -35,7 +35,7 @@ Today Camelid can honestly say:
 
 - **TinyLlama 1.1B Chat Q8_0** is the trusted current gate with parity, template-shape, bounded context, API/WebUI, and RSS/perf evidence.
 - **Llama 3.2 1B Instruct Q8_0** has bounded exact-row parity through checked 512/1024/2048/4096/8192 packs.
-- **Llama 3.2 3B Instruct Q8_0** has bounded exact-row parity through checked 512/1024/2048 packs, plus broader 50-token parity.
+- **Llama 3.2 3B Instruct Q8_0** has bounded exact-row parity through the anchored checked 512/1024/2048/4096/8192 raw-decode ladder on the current canonical GGUF (token+text identical at 50 greedy tokens, fully GPU-resident on the 6 GiB reference card); the May packs and broader 50-token parity remain historical evidence for the prior upload.
 - **Llama 3 8B Instruct Q8_0** has bounded exact-row parity for compact smoke, broader 50-token validation, and checked 512/1024/2048 packs where cited artifacts exist.
 
 That is the public proof surface. Nothing adjacent inherits support.
@@ -46,7 +46,7 @@ That is the public proof surface. Nothing adjacent inherits support.
 | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | Full current gate with broader five-prompt / 50-token parity plus bounded context/template evidence | `qa/evidence-bundles/tinyllama-broader-template-context-perf-rss-20260505T044519Z-head-864e07b51f36/manifest.json` |
 | Llama 3.2 1B Instruct Q8_0 | Exact-row bounded parity through 8192, with 4096/8192 tied to cited source/runtime heads | `qa/evidence-bundles/llama32-1b-context-8192-current-head-20260513T183501Z-head-aaf9207d1669/manifest.json` |
-| Llama 3.2 3B Instruct Q8_0 | Exact-row bounded parity through 2048 plus broader 50-token parity | `qa/evidence-bundles/llama32-3b-context-2048-20260505T105742Z-head-36ec8e492d65/manifest.json` |
+| Llama 3.2 3B Instruct Q8_0 | Exact-row anchored bounded raw-decode parity through the 512/1024/2048/4096/8192 ladder on the current canonical GGUF | `qa/evidence-bundles/llama32-3b-context-512-8192-anchored-20260710T2119-head-6527a770/manifest.json` |
 | Llama 3 8B Instruct Q8_0 | Exact-row bounded 1024/2048 parity plus broader 50-token parity on the named source/runtime head | `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` |
 
 ## The proof ladder
@@ -90,21 +90,27 @@ Why it matters:
 
 ### Llama 3.2 3B Instruct Q8_0
 
-Primary artifacts:
+Primary context artifact:
+
+- `qa/evidence-bundles/llama32-3b-context-512-8192-anchored-20260710T2119-head-6527a770/manifest.json`
+
+Historical artifacts, measured on the prior upload (sha256 `b5607b50…`) and retained as evidence for that file only:
 
 - `qa/evidence-bundles/llama32-3b-context-1024-20260505T094258Z-head-c14e5e7b5692/manifest.json`
 - `qa/evidence-bundles/llama32-3b-context-2048-20260505T105742Z-head-36ec8e492d65/manifest.json`
 - `qa/evidence-bundles/llama32-1b-3b-chat-template-shapes-20260505T060036Z-head-e9f28572e090/manifest.json`
 
-What the 2048 artifact proves:
+What the anchored ladder artifact proves:
 
-- prompt-token parity at `1910` prompt tokens
-- generated token parity for `[34,2735,35,12,7854]`
-- generated text parity for `CMLD-204`
+- raw-decode greedy parity on all five 512/1024/2048/4096/8192 buckets (`408`/`885`/`1893`/`3978`/`8049` llama3 prompt tokens)
+- 50/50 generated tokens and generated text identical to llama.cpp `acd79d603` on every bucket
+- the whole ladder ran fully GPU-resident on the 6 GiB reference card against the current canonical GGUF (sha256 `f34112a1…`) — the same file the June 2026 capability receipts pin
+- this is raw-decode parity evidence only, not chat-template context coverage
 
 Why it matters:
 
 - this is the row closest to the current product target
+- the checked-context claim now rests on a single file identity instead of inheriting May evidence from a prior upload
 - it shows Camelid is not hand-waving about 3B correctness before talking about UX/perf work
 
 ### Llama 3 8B Instruct Q8_0

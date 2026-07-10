@@ -2552,7 +2552,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -2575,7 +2575,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
             SupportItem {
                 id: "Q4_K_M/Q5_K_M/Q3_K_M",
@@ -2619,7 +2619,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
+                notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke standing on the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder for the current canonical GGUF (prior-upload Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 retained as historical); exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
             },
             SupportItem {
                 id: "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
@@ -2889,7 +2889,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke",
                 support_scope: "exact_row_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing",
+                full_support_blockers: "the May-era typed lanes (template shapes, perf/RSS, API/WebUI smoke, broader prompt-pack parity) were measured on the prior upload (sha256 b5607b50...) and await re-anchoring to the canonical file; plus model-native/larger context beyond the anchored 512-8192 ladder, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated_for_compact_and_small_prompt_pack",
                 tensors_load: "validated",
@@ -2898,30 +2898,30 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 performance_measured: "bounded_unique_chat_perf_rss_validated",
                 frontend_load_path_verified: "validated",
                 frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
-                tested_context: "short_api_webui_smoke_with_broader_prompt_pack_parity_plus_first_512_second_1024_and_third_2048_context_packs",
+                tested_context: "short_api_webui_smoke_with_broader_prompt_pack_parity_plus_anchored_raw_decode_512_1024_2048_4096_8192_context_ladder",
                 chat_template_renderer: "metadata_jinja_supported_for_exact_row",
                 chat_template_shape_pack: "validated_bounded_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
-                bounded_context_512_pack: "validated_bounded_pack",
-                bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
+                bounded_context_512_pack: "validated_anchored_raw_decode_ladder",
+                bounded_context_512_pack_id: "llama32-3b-anchored-raw-ladder-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "validated_second_pack",
-                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
+                bounded_context_1024_pack: "validated_anchored_raw_decode_ladder",
+                bounded_context_1024_pack_id: "llama32-3b-anchored-raw-ladder-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "validated_third_pack",
-                bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
+                bounded_context_2048_pack: "validated_anchored_raw_decode_ladder",
+                bounded_context_2048_pack_id: "llama32-3b-anchored-raw-ladder-v1",
                 bounded_context_2048_window: 2048,
-                bounded_context_4096_pack: "not_promoted",
-                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_pack: "validated_anchored_raw_decode_ladder",
+                bounded_context_4096_pack_id: "llama32-3b-anchored-raw-ladder-v1",
                 bounded_context_4096_window: 4096,
-                bounded_context_8192_pack: "not_promoted",
-                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_pack: "validated_anchored_raw_decode_ladder",
+                bounded_context_8192_pack_id: "llama32-3b-anchored-raw-ladder-v1",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "llama3-context-2048-smoke-v1",
+                latest_checked_bucket: "llama32-3b-anchored-raw-ladder-v1",
                 latest_checked_result: "pass",
-                latest_checked_output: "CMLD-204",
-                evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has canonical Ubuntu main-lane API/WebUI support-gate refresh evidence at qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json for source head e9f926ed1a65, plus exact-row load, completion, chat-completion, frontend-smoke, five-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader three-prompt 50-token parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity, bounded compact template-shape coverage, exact-row metadata-Jinja renderer coverage for the recognized Llama 3.2 row template, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support",
-                next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja/template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim",
+                latest_checked_output: "50/50 greedy tokens identical on all five buckets",
+                evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF (sha256 f34112a1..., the file pinned by the June capability-matrix receipts) has a fresh anchored raw-decode context ladder — 512/1024/2048/4096/8192 buckets (408/885/1893/3978/8049 llama3 tokens), token-AND-text identical to pinned llama.cpp acd79d603 at 50 greedy tokens, fully GPU-resident, at qa/evidence-bundles/llama32-3b-context-512-8192-anchored-20260710T2119-head-6527a770/manifest.json — plus June 2026 capability-matrix receipts on the same file. Earlier evidence (canonical Ubuntu API/WebUI refresh at qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json, compact/broader prompt-pack parity, the May 512/1024/2048 template-context packs, template-shape coverage, and bounded unique-chat perf/RSS) was produced against a PRIOR upload of this model name (sha256 b5607b50...) and is retained as historical evidence for that file; it is disclosed, not inherited. Camelid supports exact-row smoke for this row only, not broader/full support",
+                next_step: "preserve exact-row smoke plus the anchored checked 512/1024/2048/4096/8192 raw-decode context ladder while re-anchoring the remaining May-era evidence families (API/WebUI refresh, template shapes, perf/RSS) to the canonical file and normalizing model-native/larger context, broader arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
             },
             // Llama-3.2-3B-Instruct K-quant rows (mixed K-quant + Q6_K, GPU-resident CUDA
             // decode). Filename-anchored ids (`llama_3_2_3b_instruct_q{4,5}_k_m` = normalized
@@ -13530,7 +13530,7 @@ mod tests {
             model_family: "llama".into(),
             quant_type: "Q8_0".into(),
             exact_model_row: "Llama 3.2 3B Instruct".into(),
-            support_level: "supported_exact_row_smoke_512_1024_2048".into(),
+            support_level: "supported_exact_row_smoke_512_1024_2048_4096_8192".into(),
             selected_backend: "cpu_q8_runtime_repack".into(),
             selected_q8_path: "x86_experimental_q8_0_avx2".into(),
             prefill_path: "q8_0_x86_avx2_tiled_gemm_experimental".into(),
@@ -13565,21 +13565,47 @@ mod tests {
         assert_eq!(targets.len(), 2);
         for target in targets {
             assert_eq!(target.status, "supported_exact_row_smoke");
-            assert_eq!(target.bounded_context_512_pack, "validated_bounded_pack");
-            assert_eq!(
-                target.bounded_context_512_pack_id,
-                "llama3-context-512-smoke-v1"
-            );
             assert_eq!(target.bounded_context_window, 512);
-            assert_eq!(target.bounded_context_1024_pack, "validated_second_pack");
-            assert_eq!(
-                target.bounded_context_1024_pack_id,
-                "llama3-context-1024-smoke-v1"
-            );
             assert_eq!(target.bounded_context_1024_window, 1024);
-            assert!(target
-                .evidence
-                .contains("second bounded 1024-context parity"));
+            // The rows no longer share pack lineage: the 1B keeps the May
+            // template-pack ids; the 3B's five buckets were re-validated on its
+            // anchored canonical GGUF via the raw-decode ladder.
+            match target.id {
+                "llama32_1b_instruct_q8_0" => {
+                    assert_eq!(target.bounded_context_512_pack, "validated_bounded_pack");
+                    assert_eq!(
+                        target.bounded_context_512_pack_id,
+                        "llama3-context-512-smoke-v1"
+                    );
+                    assert_eq!(target.bounded_context_1024_pack, "validated_second_pack");
+                    assert_eq!(
+                        target.bounded_context_1024_pack_id,
+                        "llama3-context-1024-smoke-v1"
+                    );
+                    assert!(target
+                        .evidence
+                        .contains("second bounded 1024-context parity"));
+                }
+                "llama32_3b_instruct_q8_0" => {
+                    assert_eq!(
+                        target.bounded_context_512_pack,
+                        "validated_anchored_raw_decode_ladder"
+                    );
+                    assert_eq!(
+                        target.bounded_context_512_pack_id,
+                        "llama32-3b-anchored-raw-ladder-v1"
+                    );
+                    assert_eq!(
+                        target.bounded_context_1024_pack,
+                        "validated_anchored_raw_decode_ladder"
+                    );
+                    assert_eq!(
+                        target.bounded_context_1024_pack_id,
+                        "llama32-3b-anchored-raw-ladder-v1"
+                    );
+                }
+                other => panic!("unexpected row {other}"),
+            }
         }
 
         let one_b = response
@@ -13614,15 +13640,37 @@ mod tests {
             .iter()
             .find(|target| target.id == "llama32_3b_instruct_q8_0")
             .expect("3B row should stay advertised");
-        assert_eq!(three_b.bounded_context_2048_pack, "validated_third_pack");
+        // Anchored raw-decode ladder: all five buckets re-validated on the
+        // current canonical GGUF in one bundle (see the
+        // llama32-3b-context-512-8192-anchored evidence bundle).
+        assert_eq!(
+            three_b.bounded_context_2048_pack,
+            "validated_anchored_raw_decode_ladder"
+        );
         assert_eq!(
             three_b.bounded_context_2048_pack_id,
-            "llama3-context-2048-smoke-v1"
+            "llama32-3b-anchored-raw-ladder-v1"
         );
         assert_eq!(three_b.bounded_context_2048_window, 2048);
-        assert_eq!(three_b.bounded_context_4096_pack, "not_promoted");
-        assert_eq!(three_b.bounded_context_4096_pack_id, "not_selected");
+        assert_eq!(
+            three_b.bounded_context_4096_pack,
+            "validated_anchored_raw_decode_ladder"
+        );
+        assert_eq!(
+            three_b.bounded_context_4096_pack_id,
+            "llama32-3b-anchored-raw-ladder-v1"
+        );
         assert_eq!(three_b.bounded_context_4096_window, 4096);
+        assert_eq!(
+            three_b.bounded_context_8192_pack,
+            "validated_anchored_raw_decode_ladder"
+        );
+        assert_eq!(
+            three_b.latest_checked_bucket,
+            "llama32-3b-anchored-raw-ladder-v1"
+        );
+        assert!(three_b.evidence.contains("sha256 f34112a1"));
+        assert!(three_b.evidence.contains("PRIOR upload"));
 
         let eight_b = response
             .model_compatibility
@@ -13792,7 +13840,7 @@ mod tests {
             "Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs"
         ));
         assert!(response.support_contract.current_gate.contains(
-            "Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs"
+            "Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence)"
         ));
         assert!(response
             .support_contract
@@ -13816,7 +13864,7 @@ mod tests {
             "exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs"
         ));
         assert!(q8.notes.contains(
-            "exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
+            "exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence)"
         ));
         assert!(q8.notes.contains(
             "exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs"
@@ -13833,7 +13881,7 @@ mod tests {
             "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs"
         ));
         assert!(llama_bpe.notes.contains(
-            "exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
+            "exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke standing on the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder for the current canonical GGUF (prior-upload Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 retained as historical)"
         ));
         assert!(llama_bpe.notes.contains(
             "exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs"
