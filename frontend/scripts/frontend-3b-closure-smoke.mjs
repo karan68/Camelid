@@ -34,19 +34,26 @@ const llama32ThreeBTarget = {
   status: 'supported_exact_row_smoke',
   support_scope: 'exact_row_smoke_only',
   full_support_status: 'blocked_pending_normalized_full_support',
-  full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing',
+  full_support_blockers: 'the May-era typed lanes (template shapes, perf/RSS, API/WebUI smoke, broader prompt-pack parity) were measured on the prior upload (sha256 b5607b50...) and await re-anchoring to the canonical file; plus model-native/larger context beyond the anchored 512-8192 ladder, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing',
   frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id',
   chat_template_renderer: 'metadata_jinja_supported_for_exact_row',
   chat_template_shape_pack: 'validated_bounded_pack',
   performance_measured: 'bounded_unique_chat_perf_rss_validated',
-  bounded_context_512_pack: 'validated_first_pack',
-  bounded_context_1024_pack: 'validated_second_pack',
-  bounded_context_2048_pack: 'validated_third_pack',
-  latest_checked_bucket: 'llama3-context-2048-smoke-v1',
+  bounded_context_512_pack: 'validated_anchored_raw_decode_ladder',
+  bounded_context_512_pack_id: 'llama32-3b-anchored-raw-ladder-v1',
+  bounded_context_1024_pack: 'validated_anchored_raw_decode_ladder',
+  bounded_context_1024_pack_id: 'llama32-3b-anchored-raw-ladder-v1',
+  bounded_context_2048_pack: 'validated_anchored_raw_decode_ladder',
+  bounded_context_2048_pack_id: 'llama32-3b-anchored-raw-ladder-v1',
+  bounded_context_4096_pack: 'validated_anchored_raw_decode_ladder',
+  bounded_context_4096_pack_id: 'llama32-3b-anchored-raw-ladder-v1',
+  bounded_context_8192_pack: 'validated_anchored_raw_decode_ladder',
+  bounded_context_8192_pack_id: 'llama32-3b-anchored-raw-ladder-v1',
+  latest_checked_bucket: 'llama32-3b-anchored-raw-ladder-v1',
   latest_checked_result: 'pass',
-  latest_checked_output: 'CMLD-204',
-  evidence: '3B exact-row canonical Ubuntu API/WebUI refresh, load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, third 2048-context, and metadata-Jinja row-template evidence',
-  next_step: 'preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja/template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim',
+  latest_checked_output: '50/50 greedy tokens identical on all five buckets',
+  evidence: 'the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF (sha256 f34112a1..., the file pinned by the June capability-matrix receipts) has a fresh anchored raw-decode context ladder — 512/1024/2048/4096/8192 buckets (408/885/1893/3978/8049 llama3 tokens), token-AND-text identical to pinned llama.cpp acd79d603 at 50 greedy tokens, fully GPU-resident, at qa/evidence-bundles/llama32-3b-context-512-8192-anchored-20260710T2119-head-6527a770/manifest.json — plus June 2026 capability-matrix receipts on the same file. Earlier evidence (canonical Ubuntu API/WebUI refresh at qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json, compact/broader prompt-pack parity, the May 512/1024/2048 template-context packs, template-shape coverage, and bounded unique-chat perf/RSS) was produced against a PRIOR upload of this model name (sha256 b5607b50...) and is retained as historical evidence for that file; it is disclosed, not inherited. Camelid supports exact-row smoke for this row only, not broader/full support',
+  next_step: 'preserve exact-row smoke plus the anchored checked 512/1024/2048/4096/8192 raw-decode context ladder while re-anchoring the remaining May-era evidence families (API/WebUI refresh, template shapes, perf/RSS) to the canonical file and normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim',
 }
 
 const capabilities = {
@@ -236,7 +243,8 @@ assert.equal(getChatGateState(noThreeBRowCapabilities, exactThreeBModel, runtime
 const lanes = exactRowSupportLanes(llama32ThreeBTarget, capabilities.api_features)
 assert.deepEqual(lanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['context', true], ['throughput', false]], '3B template/Jinja and checked-context readiness are row-green while production throughput remains unpromoted')
 const contextLane = lanes.find((lane) => lane.key === 'context')
-assert.match(contextLane.copy, /512 context validated first pack, 1024 context validated second pack, 2048 context validated third pack/, '3B checked-context copy must name the supported exact-row context packs')
+assert.match(contextLane.copy, /512 context validated anchored raw decode ladder, 1024 context validated anchored raw decode ladder, 2048 context validated anchored raw decode ladder, 4096 context validated anchored raw decode ladder, 8192 context validated anchored raw decode ladder/, '3B checked-context copy must name the anchored raw-decode ladder on all five checked buckets, including the newly promoted 4096/8192')
+assert.match(contextLane.copy, /latest checked llama32-3b-anchored-raw-ladder-v1/, '3B checked-context copy must cite the anchored-ladder pack id as the latest checked bucket')
 assert.match(contextLane.copy, /does not promote model-native\/larger context beyond the checked packs/, '3B checked-context copy must keep the larger-context boundary visible')
 const genericThroughputCapabilities = {
   ...capabilities,

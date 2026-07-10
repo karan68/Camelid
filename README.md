@@ -132,7 +132,7 @@ Every row below is a **supported exact row** with committed evidence; the caveat
 | If you want… | Try this row | One command | First-run reality (from STATUS.md) |
 |---|---|---|---|
 | **The fastest "does it work" check** | TinyLlama 1.1B Chat Q8_0 | `camelid pull tinyllama` | The baseline gate — ~1.2 GB, single-node, runs anywhere. This is exactly what `scripts/smoke.sh` exercises. |
-| **A solid single-node default** | Llama 3.2 3B Instruct Q8_0 | `camelid pull llama32_3b` | Exact-row smoke + API/WebUI, single-node Apple Silicon or CPU. Verified context is **bounded to 512/1024/2048** — longer contexts aren't a support claim yet. |
+| **A solid single-node default** | Llama 3.2 3B Instruct Q8_0 | `camelid pull llama32_3b` | Exact-row smoke + API/WebUI (historical, prior upload — pending re-anchor). Verified context is **bounded to the anchored 512/1024/2048/4096/8192 raw-decode ladder** on the row's current canonical GGUF (fully GPU-resident on the 6 GiB reference card) — model-native/longer contexts still aren't a support claim. |
 | **A small Gemma 4** | Gemma 4 E4B-It Q8_0 | `camelid pull gemma4_e4b` | 5/5 greedy parity vs the pinned llama.cpp oracle on the CPU runtime **and** the Metal GPU-resident runtime. Windows NVIDIA CUDA decode is **experimental** (first-token argmax matches the CPU oracle; not token-for-token gated). Multimodal input fails closed by design. |
 
 **Also in `camelid pull`** — curated one-command downloads (resolve by any unique id fragment):
@@ -171,7 +171,7 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 |---|---|---|---|
 | TinyLlama 1.1B Chat | Q8_0 | single-node | Current verified gate |
 | Llama 3.2 1B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→8192 |
-| Llama 3.2 3B Instruct | Q8_0 | single-node | Exact-row smoke + API/WebUI + bounded context |
+| Llama 3.2 3B Instruct | Q8_0 | single-node | Exact-row smoke + anchored bounded context 512→8192 (raw-decode ladder, current canonical GGUF) |
 | **Llama 3.2 3B Instruct** | Q4_K_M | single-node (Windows CUDA GPU-resident) | Exact-row **raw-decode** parity vs llama.cpp `acd79d6` — token+text-identical on 5/8 confident probes at 1/5/50 (incl. code + a ~3.5k-token long-context continuation to depth 50); 3 open-ended probes are documented benign near-ties (same bar as the Q8_0 row). Per-quant API/WebUI/context is a follow-up |
 | **Llama 3.2 3B Instruct** | Q5_K_M | single-node (Windows CUDA GPU-resident) | Exact-row **raw-decode** parity — token+text-identical to llama.cpp `acd79d603` at 1/5/50 (`all_pass`). GGUF not on the dev disk; rests on the committed bundle (captured on an RTX 4060 Laptop) |
 | Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
