@@ -4430,12 +4430,16 @@ struct OffloadState {
 /// layer, joined back to the main stream by events before every dependent read. Every
 /// kernel launches unchanged (same grid, same reduction order) — only the stream an
 /// existing launch is enqueued on changes, so the math is bitwise-identical to the
-/// single-stream path. Constructed in `new` ONLY when the flag is on: instantiating a
-/// second stream flips cudarc into multi-stream mode with per-slice-arg event tracking
-/// on every launch, so the default path must never create these (see the gemma4
-/// `disable_event_tracking` gotcha). The five events are re-recorded every layer;
-/// `cuEventRecord` overwrites and each wait is enqueued (host order) after the record
-/// it consumes, so reuse across layers and tokens is correct — no per-token churn.
+/// single-stream path. Constructed in `new` ONLY when the flag is on: with the flag
+/// off, no side stream or event exists and forward_pass enqueues the byte-identical
+/// launch sequence it always has. (NOTE: the engine's context is ALREADY in cudarc
+/// multi-stream mode either way — `CudaResidentKernels::new` makes the main stream
+/// via `ctx.new_stream()` — so lazy construction buys provable flag-off inertness,
+/// not a mode switch. What `disable_event_tracking` in `new` removes is cudarc's
+/// per-slice-arg event bookkeeping on this context's launches, for the flag-on
+/// engine only.) The five events are re-recorded every layer; `cuEventRecord`
+/// overwrites and each wait is enqueued (host order) after the record it consumes,
+/// so reuse across layers and tokens is correct — no per-token churn.
 struct StreamOverlap {
     side_a: std::sync::Arc<CudaStream>,
     side_b: std::sync::Arc<CudaStream>,
@@ -4797,21 +4801,25 @@ impl CudaResidentDecode {
             .map(|_| s.alloc_zeros::<u16>(kv_width * max_pos))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("kv alloc: {e}"))?;
-        // Phase 6 side streams + join events, ONLY when opted in — creating a second
-        // stream switches cudarc to multi-stream event tracking for the whole context,
-        // so the default path must not construct these (see `StreamOverlap`).
+        // Phase 6 side streams + join events, ONLY when opted in — keeps the default
+        // path provably inert: nothing constructed, byte-identical launch sequence
+        // (see `StreamOverlap` for why this is NOT a multi-stream-mode switch).
         let overlap = if cuda_streams_enabled() {
-            // Rung B: without this, cudarc's multi-stream mode auto-records and drops
-            // a CudaEvent per slice argument on every launch (~600 launches × ~7 args
-            // per token) — measured to cost more than the overlap wins (Rung A
-            // receipts: ON regressed 2.5–9.5%). With tracking off WE own all
-            // cross-stream ordering: the per-layer ev_act/ev_k/ev_v/ev_ffn/ev_up
-            // graph in forward_pass (side streams only run downstream of an ev_act
-            // wait recorded after all prior main-stream work, so load-time uploads
-            // and memsets are ordered transitively), plus the one-time drain in
-            // `enable_offload_scratch` covering the offload copy stream's first
-            // read of main-stream-zeroed scratch. Process-wide and permanent, like
-            // the gemma4 runtime's usage.
+            // Rung B: without this, cudarc auto-records and drops a CudaEvent per
+            // slice argument on every launch (~600 launches × ~7 args per token; the
+            // context is in multi-stream mode regardless of this flag, so flag-off
+            // engines pay it too). Measured effect of removing it was ~nil (Rung A
+            // −9.5%/−2.5% low-ctx vs Rung B −9.0%/−4.2%) — the regression is WDDM
+            // scheduling, not bookkeeping — but tracking-off stays: it is strictly
+            // less host work and the ordering is owned anyway. With tracking off WE
+            // own all cross-stream ordering: the per-layer ev_act/ev_k/ev_v/ev_ffn/
+            // ev_up graph in forward_pass (side streams only run downstream of an
+            // ev_act wait recorded after all prior main-stream work, so load-time
+            // uploads and memsets are ordered transitively), plus the one-time drain
+            // in `enable_offload_scratch` covering the offload copy stream's first
+            // read of main-stream-zeroed scratch. Scope: THIS engine's CudaContext
+            // only (gemma4/dg/runnable lanes build their own contexts), permanent
+            // for the engine's lifetime — unlike gemma4's load-scoped disable.
             unsafe { k.ctx.disable_event_tracking() };
             let side = || {
                 k.ctx
@@ -5095,23 +5103,25 @@ impl CudaResidentDecode {
             copy_done.push(ev()?);
             compute_done.push(ev()?);
         }
+        // One-time load-time drain BEFORE installing the state: the scratch buffers
+        // were zeroed on the main stream, and the FIRST prefetch into each buffer
+        // waits only on a fresh compute_done event (which reads as already-occurred)
+        // — nothing else orders the copy stream's first write after the memset.
+        // cudarc's auto event tracking used to insert that ordering; with
+        // CAMELID_CUDA_STREAMS on, tracking is disabled for this engine's context
+        // (see `new`), so make it explicit here. Draining first means a failed drain
+        // leaves `self.offload` None (no half-armed state). Unconditional: one sync
+        // at load time costs nothing per token.
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|e| format!("offload scratch drain: {e}"))?;
         self.offload = Some(OffloadState {
             scratch,
             copy_stream,
             copy_done,
             compute_done,
         });
-        // One-time load-time drain: the scratch buffers were zeroed on the main
-        // stream, and the FIRST prefetch into each buffer waits only on a fresh
-        // compute_done event (which reads as already-occurred) — nothing else orders
-        // the copy stream's first write after the memset. cudarc's auto event
-        // tracking used to insert that ordering; with CAMELID_CUDA_STREAMS on,
-        // tracking is disabled process-wide (see `new`), so make it explicit here.
-        // Unconditional: one sync at load time costs nothing per token.
-        self.k
-            .ctx
-            .synchronize()
-            .map_err(|e| format!("offload scratch drain: {e}"))?;
         Ok(())
     }
 
@@ -5531,8 +5541,44 @@ impl CudaResidentDecode {
     /// `d_logits` when `compute_logits`. Does NOT sample or sync — the public
     /// wrappers (`forward_token` greedy, `forward_token_logits` sampling) add the
     /// tail they need so the forward body is shared.
+    ///
+    /// Error containment for the Phase 6 overlap: a `?` failure inside the body can
+    /// return with side-stream kernels enqueued but not yet joined to main (the
+    /// joins live after the dispatches). Callers may drop or rebuild the engine on
+    /// error, and with event tracking disabled nothing else orders those in-flight
+    /// side launches against later frees — so on an Err with the overlap armed,
+    /// drain the context (best-effort) before propagating. Zero cost on Ok and on
+    /// the flag-off path.
     #[allow(clippy::too_many_arguments)]
     fn forward_pass(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        compute_logits: bool,
+        graph_capture: bool,
+        device_inputs: bool,
+    ) -> Result<(), String> {
+        let r = self.forward_pass_inner(
+            embedding,
+            cos,
+            sin,
+            position,
+            scale,
+            compute_logits,
+            graph_capture,
+            device_inputs,
+        );
+        if r.is_err() && self.overlap.is_some() {
+            let _ = self.k.ctx.synchronize();
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_pass_inner(
         &mut self,
         embedding: &[f32],
         cos: &[f32],

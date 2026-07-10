@@ -81,9 +81,19 @@ stop_server() { # kill THIS server by PID, wait for exit + port free
   local i
   for i in $(seq 1 30); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1; done
   if kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "  (escalating: taskkill PID $SERVER_WINPID)"
-    [ -n "$SERVER_WINPID" ] && "$TK" //PID "$SERVER_WINPID" //F >/dev/null 2>&1
+    if [ -n "$SERVER_WINPID" ]; then
+      echo "  (escalating: taskkill PID $SERVER_WINPID)"
+      "$TK" //PID "$SERVER_WINPID" //F >/dev/null 2>&1
+    else
+      # WINPID lookup failed at start; last resort is SIGKILL via the MSYS pid.
+      echo "  (escalating: kill -9 $SERVER_PID — no WINPID recorded)"
+      kill -9 "$SERVER_PID" 2>/dev/null
+    fi
     sleep 2
+  fi
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "  !! server PID $SERVER_PID SURVIVED escalation — kill it manually before the next leg"
+    FAILED=1
   fi
   for i in $(seq 1 15); do curl -s -m2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || break; sleep 1; done
   SERVER_PID=""

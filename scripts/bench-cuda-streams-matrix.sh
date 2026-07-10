@@ -115,6 +115,24 @@ bench_leg() { # state(off|on) model-basename model-key ctx-key decode-prompt-tok
   node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1]));console.log(`  decode ${r.decode.tok_s.median} tok/s (min ${r.decode.tok_s.min} max ${r.decode.tok_s.max} sd ${r.decode.tok_s.stddev}), ctx=${r.decode.context_prompt_tokens??0}`)' "$receipt"
 }
 
+# Clean-box preconditions (learned the hard way — a leaked GPU-resident server
+# from another session once dragged 3B decode from ~48 to 6.6 tok/s and voided
+# a whole matrix): refuse to bench if any other process holds the GPU or a
+# cargo/rustc build is running. Known non-compute residents (e.g. a game
+# launcher that registers a context but does no work) can be waived via
+# CAMELID_BENCH_GPU_ALLOWLIST (grep -E pattern).
+ALLOW="${CAMELID_BENCH_GPU_ALLOWLIST:-EpicGamesLauncher}"
+GPU_OTHERS=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -Ev "$ALLOW" | grep -c .)
+if [ "$GPU_OTHERS" != "0" ]; then
+  echo "!! GPU not clean — refusing to bench:"
+  nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader
+  exit 2
+fi
+if [ "$(ps -W 2>/dev/null | grep -ci 'cargo\|rustc')" != "0" ]; then
+  echo "!! cargo/rustc running — refusing to bench under CPU contention"
+  exit 2
+fi
+
 # Per (model, ctx) cell: OFF then ON back-to-back (thermal locality).
 for cell in \
   "Llama-3.2-3B-Instruct-Q8_0.gguf llama3b-q8 lowctx 0" \
@@ -145,4 +163,5 @@ for (const mkey of ['llama3b-q8', 'qwen3-4b-q8']) {
 }
 process.exit(fail ? 1 : 0)
 EOF
+[ $? -eq 0 ] || FAILED=1
 [ "$FAILED" -eq 0 ] && echo "MATRIX COMPLETE" || { echo "MATRIX HAD FAILURES"; exit 1; }

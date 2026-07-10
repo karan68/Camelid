@@ -60,6 +60,10 @@ async function chat(userContent) {
     const req = http.request(
       { hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } },
       (res) => {
+        // setEncoding matters: without it each Buffer chunk decodes separately,
+        // and a multi-byte UTF-8 sequence (the corpus contains emoji) split
+        // across a chunk boundary would corrupt the text and break byte-parity.
+        res.setEncoding('utf8')
         let d = ''
         res.on('data', (c) => (d += c))
         res.on('end', () => resolve({ status: res.statusCode, text: d }))
