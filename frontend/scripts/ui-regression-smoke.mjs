@@ -18,11 +18,42 @@ import {
 import { normalizeStoredConversations } from '../src/lib/conversationStorage.js'
 import { conversationToJson, conversationToMarkdown } from '../src/lib/conversationExport.js'
 import { canonicalStatementLabel, splitCanonicalStatement } from '../src/lib/canonicalStatement.js'
+import { describeExecutionPlan, executionRuntimeFields } from '../src/lib/executionPlan.js'
 
 /* ---- Behavioral asserts: conversation selection + stored-stream recovery ---- */
 const oldChat = { id: 'old-chat', title: 'Old chat', messages: [{ role: 'user', content: 'old prompt' }] }
 const newerChat = { id: 'newer-chat', title: 'Newer chat', messages: [{ role: 'user', content: 'newer prompt' }] }
 const conversations = [newerChat, oldChat]
+
+const healthExecutionPlan = { selected_backend: 'cpu_reference' }
+assert.deepEqual(executionRuntimeFields({ execution_plan: healthExecutionPlan, backend: 'llama' }), {
+  execution_plan: healthExecutionPlan,
+  backend: 'llama',
+}, 'dashboard normalization should preserve health execution plan identity and serving backend')
+assert.deepEqual(executionRuntimeFields(null), { execution_plan: null, backend: 'none' }, 'missing health should fail closed to no plan and no backend')
+
+assert.deepEqual(describeExecutionPlan({ status: 'offline' }), {
+  state: 'offline', device: 'Unavailable', backend: 'Backend offline', summary: 'Execution details are unavailable while the Camelid backend is offline.',
+}, 'offline runtime must not infer an execution device')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: false }).state, 'idle', 'online runtime without a model should report no active plan')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama' }).state, 'unknown', 'generation-ready runtime without plan data should stay neutral')
+assert.deepEqual(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'cpu_q8_runtime_repack' } }), {
+  state: 'cpu', device: 'CPU', backend: 'cpu q8 runtime repack', summary: 'At model load, Camelid selected CPU using cpu q8 runtime repack. Runtime controls may change the effective path afterward.',
+}, 'CPU plan copy should come from selected_backend')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'cuda_resident_q8_runtime', cuda_resident_active: true } }).device, 'CUDA GPU', 'consistent CUDA load plan should select GPU copy')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'cuda_resident_q8_runtime', cuda_resident_active: false } }).state, 'unknown', 'contradictory CUDA plan should fail neutral')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'cpu_reference', cuda_resident_active: true } }).state, 'unknown', 'contradictory CPU plan should fail neutral')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'metal_resident_q8_runtime' } }).device, 'Metal GPU', 'Metal load plan should select GPU copy')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'future_accelerator' } }).state, 'unknown', 'unknown future backends should fail neutral')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'cuda_resident_future', cuda_resident_active: true } }).state, 'unknown', 'unknown CUDA-prefixed backends should fail neutral')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama', execution_plan: { selected_backend: 'metal_resident_future' } }).state, 'unknown', 'unknown Metal-prefixed backends should fail neutral')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: false, backend: 'llama', execution_plan: { selected_backend: 'cpu_reference' } }).state, 'pending', 'non-ready models should not produce execution claims')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'gemma4-runtime', execution_plan: { selected_backend: 'cpu_reference' } }).state, 'specialized', 'specialized serving runtimes should not inherit generic plan device claims')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'runnable-runtime', execution_plan: { selected_backend: 'cpu_reference' } }).state, 'specialized', 'runnable serving runtime should not inherit generic plan device claims')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'diffusion-gemma-runtime', execution_plan: { selected_backend: 'cpu_reference' } }).state, 'specialized', 'DiffusionGemma serving runtime should not inherit generic plan device claims')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'none', execution_plan: { selected_backend: 'cpu_reference' } }).state, 'unknown', 'ready payload with no serving backend should fail neutral')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'future-runtime', execution_plan: { selected_backend: 'cpu_reference' } }).state, 'unknown', 'unknown serving backends should fail neutral')
+assert.equal(describeExecutionPlan({ status: 'online', loaded_now: true, generation_ready: true, backend: 'llama' }, { execution_plan: { selected_backend: 'cpu_reference' } }).state, 'unknown', 'capabilities must not resurrect a plan missing from health')
 
 const canonicalStatementSample = 'Current exact-row support: Alpha (detail; retained); Beta evidence. These are exact bounded lanes only.'
 const canonicalStatementParts = splitCanonicalStatement(canonicalStatementSample)
@@ -79,6 +110,7 @@ const chatWorkspaceSource = read('../src/views/ChatWorkspace.jsx')
 const messageTurnSource = read('../src/components/chat/MessageTurn.jsx')
 const markdownSource = read('../src/lib/markdown.jsx')
 const dashboardHookSource = read('../src/hooks/useDashboardData.js')
+const executionPlanSource = read('../src/lib/executionPlan.js')
 const loadedModelDisplaySource = read('../src/lib/loadedModelDisplay.js')
 const apiViewSource = read('../src/views/ApiView.jsx')
 const systemViewSource = read('../src/views/SystemView.jsx')
@@ -220,6 +252,10 @@ assert.doesNotMatch(systemViewSource, /supported_quantization|planned_quantizati
 assert.match(systemViewSource, /displayCapabilityId\(feature\.id\)/, 'System view should not render raw provider-scoped API feature ids')
 assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
 assert.match(systemViewSource, /<EvidenceChip/, 'System contract rows should render their status claims through the Evidence Chip')
+assert.match(dashboardHookSource, /\.\.\.executionRuntimeFields\(health\)/, 'dashboard runtime state should use the tested health execution-field mapper')
+assert.match(systemViewSource, /describeExecutionPlan\(runtime\)/, 'System execution copy should come only from the health-derived runtime snapshot')
+assert.doesNotMatch(systemViewSource, /GPU acceleration remains future work|local CPU generation path today/, 'System must not retain static backend execution claims')
+assert.match(executionPlanSource, /CUDA_BACKENDS\.has\(selectedBackend\)[\s\S]*METAL_BACKENDS\.has\(selectedBackend\)/, 'execution-plan presenter should classify only explicitly known CUDA and Metal backends')
 assert.match(compatibilityViewSource, /<CanonicalStatement text=\{displayCapabilityCopy\(supportContract\.current_gate\)\}/, 'Compatibility should render the complete gate through the shared structured canonical statement')
 assert.match(canonicalStatementSource, /View as one canonical paragraph/, 'the structured disclosure should retain one-click access to the unbroken canonical paragraph')
 assert.match(compatibilityViewSource, /if \(query \|\| posture !== 'all'\)[\s\S]*setQuery\(''\)[\s\S]*setPosture\('all'\)/, 'ledger deep-links should clear filters before resolving their target row')

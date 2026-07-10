@@ -285,7 +285,8 @@ pub struct HealthResponse {
     pub active_model_id: Option<String>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
-    /// Which backend serves the active model: "gemma4-runtime", "llama", or "none".
+    /// Which backend serves the active model: "gemma4-runtime", "runnable-runtime",
+    /// "diffusion-gemma-runtime", "llama", or "none".
     pub backend: &'static str,
     /// Model family of the active model ("gemma4", "llama-family", ...), if loaded.
     pub model_family: Option<&'static str>,
@@ -1796,26 +1797,24 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         None => false,
     };
     let model_family = model.map(|m| model_family(&m.gguf));
-    let backend = if gemma4_available {
-        "gemma4-runtime"
-    } else if model.is_some() {
-        "llama"
-    } else {
-        "none"
+    // Specialized serve lanes are ready only when their active runtime instance exists.
+    // Model load inserts the generic metadata before initializing these runtimes, and a
+    // failed initialization leaves the model visible but intentionally not ready. Health
+    // must agree with request routing, which also requires the runtime-map entry.
+    let runnable_serve_ready = match active_id_lock.as_ref() {
+        Some(id) => state.runnable_runtimes.read().await.contains_key(id),
+        None => false,
     };
-    // The gemma4 runtime (Q8-resident) is ready as soon as it is loaded; the Llama
-    // f32-budget check does not apply to it. Likewise, a model served by the runnable
-    // lane (CAMELID_RUNNABLE_SERVE + a runnable-served arch, e.g. qwen35/Ornith) is
-    // generation-ready once loaded â€” the runnable serve runtime is built lazily on the
-    // first chat, so gate on "runnable-serve enabled + runnable arch + loaded" rather
-    // than the lazy runtime map (otherwise chat stays locked until you chat â†’ deadlock).
-    let runnable_serve_ready = runnable_serve_enabled()
-        && model.is_some_and(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()));
-    // Same shape for the DiffusionGemma serve bridge: ready once the model is
-    // loaded with the lane enabled (the runtime loads eagerly at model load,
-    // but gate on enabled + arch so a heal-path gap cannot lock the UI).
-    let dg_serve_ready = dg_serve_enabled()
-        && model.is_some_and(|m| is_dg_serve_arch(m.gguf.architecture().unwrap_or_default()));
+    let dg_serve_ready = match active_id_lock.as_ref() {
+        Some(id) => state.dg_runtimes.read().await.contains_key(id),
+        None => false,
+    };
+    let backend = health_backend(
+        gemma4_available,
+        runnable_serve_ready,
+        dg_serve_ready,
+        model.is_some(),
+    );
     let generation_ready = gemma4_available
         || runnable_serve_ready
         || dg_serve_ready
@@ -1838,6 +1837,25 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         gemma4_available,
         engine_queue_depth: state.engine.depth(),
     })
+}
+
+fn health_backend(
+    gemma4_available: bool,
+    runnable_serve_ready: bool,
+    dg_serve_ready: bool,
+    model_loaded: bool,
+) -> &'static str {
+    if gemma4_available {
+        "gemma4-runtime"
+    } else if runnable_serve_ready {
+        "runnable-runtime"
+    } else if dg_serve_ready {
+        "diffusion-gemma-runtime"
+    } else if model_loaded {
+        "llama"
+    } else {
+        "none"
+    }
 }
 
 async fn llama_server_models(
@@ -6231,6 +6249,7 @@ async fn unload_model(
         state.loaded_models.write().await.clear();
         state.gemma4_runtimes.write().await.clear();
         state.runnable_runtimes.write().await.clear();
+        state.dg_runtimes.write().await.clear();
         state.execution_plans.write().await.clear();
         state.cached_weights.write().await.clear();
         state.model_last_used.write().await.clear();
@@ -12595,6 +12614,22 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn health_backend_reports_the_effective_serving_lane() {
+        assert_eq!(health_backend(false, false, false, false), "none");
+        assert_eq!(health_backend(false, false, false, true), "llama");
+        assert_eq!(health_backend(false, true, false, true), "runnable-runtime");
+        assert_eq!(
+            health_backend(false, false, true, true),
+            "diffusion-gemma-runtime"
+        );
+        assert_eq!(
+            health_backend(true, true, true, true),
+            "gemma4-runtime",
+            "the eagerly loaded Gemma4 runtime has highest precedence"
+        );
+    }
 
     // ---------------------------------------------------------------------
     // Engine-inversion orphan-decode harness (P0-T1 / P0-T2 / P0-T3).

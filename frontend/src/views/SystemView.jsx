@@ -1,6 +1,7 @@
 import { displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportNextStepCopy } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getRuntimeRequestModelId } from '../lib/modelState'
+import { describeExecutionPlan } from '../lib/executionPlan'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { CanonicalStatement } from '../components/ui/CanonicalStatement'
@@ -28,6 +29,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const supportContract = capabilities?.support_contract
   const supportContractCurrentGate = frontendSupportContractCopy(capabilities)
   const compatibilityTargets = capabilities?.model_compatibility || []
+  const execution = describeExecutionPlan(runtime)
   const supportedCompatibilityCount = compatibilityTargets.filter((target) => isSupportedCapabilityStatus(target.status)).length
   const apiFeatures = capabilities?.api_features || []
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
@@ -74,7 +76,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
     ? `${q8Runtime.policy}${Number.isFinite(q8Runtime.file_cache_bytes) ? ` · cache ${q8Runtime.file_cache_bytes} bytes` : ''}`
     : 'Start the local runtime to inspect Q8 storage policy.'
 
-  const runtimeState = runtime?.generation_ready ? 'Ready' : runtime?.loaded_now ? 'Loaded' : 'Offline'
+  const runtimeState = runtime?.generation_ready ? 'Ready' : runtime?.loaded_now ? 'Loaded' : runtime?.status === 'offline' ? 'Offline' : 'Idle'
   const runtimeTone = runtime?.generation_ready ? 'ready' : runtime?.loaded_now ? 'warn' : 'neutral'
   const gateStat = selectedExactRowReady ? 'Ready' : selectedChatGate.runtimeReady ? 'Gated' : 'Blocked'
   const gateStatSub = selectedExactRowReady ? 'chat + API unlocked' : selectedChatGate.runtimeReady ? 'runtime ready, support gated' : 'exact row required'
@@ -113,10 +115,12 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
         <section className="cxv-card cxv-panel">
           <div className="cxv-section__head"><h2>Runtime</h2><span className="cxv-section__count">local engine</span></div>
           <div className="sys-defs">
-            <div><span>Runtime state</span><strong>{runtime?.generation_ready ? 'Generation-ready' : runtime?.loaded_now ? 'Loaded, not generation-ready' : 'No generation-ready model'}</strong></div>
+            <div><span>Runtime state</span><strong>{runtime?.generation_ready ? 'Generation-ready' : runtime?.loaded_now ? 'Loaded, not generation-ready' : runtime?.status === 'offline' ? 'Backend offline' : 'Online, no model loaded'}</strong></div>
             <div><span>Local engine</span><strong>{runtime?.engine || 'Unknown'}</strong></div>
             <div><span>Loaded model</span><strong>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</strong></div>
             <div><span>Generation ready</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong></div>
+            <div><span>Selected device at load</span><strong>{execution.device}</strong></div>
+            <div><span>Selected backend at load</span><strong>{execution.backend}</strong></div>
             <div><span>Selected exact-row gate</span><strong>{selectedExactRowReady ? 'Ready for chat/API' : selectedChatGate.runtimeReady ? 'Runtime ready; support gated' : selectedChatGate.label}</strong></div>
             <div><span>Q8 storage</span><strong>{q8RuntimeLabel}</strong></div>
             <div><span>Next chat selection</span><strong>{selectedModelName}</strong></div>
@@ -129,7 +133,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
           <ul className="sys-feed">
             <li>Persistent conversations are already available from local storage.</li>
             <li>Saved memory remains on-device and can be recalled in later chats.</li>
-            <li>Camelid is using the local CPU generation path today; GPU acceleration remains future work.</li>
+            <li>{execution.summary}</li>
             <li>Q8 runtime policy: {q8RuntimeDetail}. {q8Runtime?.note || ''}</li>
             <li>Current next-chat model state: {describeModelState(selectedModel)}</li>
             <li>Chat stays blocked until loaded_now=true, generation_ready=true, active_model_id matches the selected local GGUF, and COMPATIBILITY.md plus /api/capabilities expose an exact supported row.</li>
@@ -158,7 +162,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
           <div className="sys-endpoint">
             <div className="sys-endpoint__head"><strong>Health</strong><span className="cxv-tag">GET</span></div>
             <code>{runtime?.api_base ? `${runtime.api_base}/v1/health` : 'Unavailable until the local API is running'}</code>
-            <p>Source of truth for active_model_id and generation_ready.</p>
+            <p>Source of truth for active_model_id, generation_ready, and the selected load-time execution plan.</p>
           </div>
           <div className="sys-endpoint">
             <div className="sys-endpoint__head"><strong>Capabilities</strong><span className="cxv-tag">GET</span></div>
