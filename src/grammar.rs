@@ -1838,6 +1838,14 @@ mod tests {
             "properties": {"k": {"enum": ["a", "b"], "type": "integer"}}, "required": ["k"]
         }))
         .is_err());
+        // The review's exact M1 repro, {"type":"integer","enum":["a"]}: pinned
+        // explicitly with `type` written first (the fix must not depend on
+        // keyword order).
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"k": {"type": "integer", "enum": ["a"]}}, "required": ["k"]
+        }))
+        .is_err());
         // A redundant but consistent `type: "string"` is accepted.
         let s = schema(json!({
             "type": "object", "additionalProperties": false,

@@ -467,10 +467,13 @@ pub struct ChatCompletionRequest {
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
     pub parallel_tool_calls: Option<bool>,
-    /// OpenAI `response_format`. Only `{"type":"json_object"}` is honored â€” it turns
-    /// on JSON-grammar-constrained decoding so the output is guaranteed valid JSON.
-    /// `{"type":"text"}`/absent is normal decoding; other shapes (json_schema) are
-    /// rejected. Declared here so it is not in `unsupported_fields`.
+    /// OpenAI `response_format`. `{"type":"json_object"}` turns on JSON-grammar-
+    /// constrained decoding (output guaranteed valid JSON). `{"type":"json_schema",
+    /// "json_schema":{"schema":{...}}}` constrains the output to a supported JSON
+    /// Schema subset -- see `docs/architecture/STRUCTURED_OUTPUTS.md` for the exact
+    /// contract; schemas outside the subset are a typed 400 naming the keyword.
+    /// `{"type":"text"}`/absent is normal decoding; other types are rejected.
+    /// Non-streaming only. Declared here so it is not in `unsupported_fields`.
     pub response_format: Option<serde_json::Value>,
     /// OpenAI `stream_options`. The only honored subfield is `include_usage`
     /// (bool); any other shape or subfield is tolerated silently and ignored,
@@ -9198,7 +9201,10 @@ fn validate_unsupported_generation_fields(
             "the camelid parse_tool_calls control is not supported on this route yet"
         }
         "response_format" | "json_schema" | "schema" | "grammar" => {
-            "JSON/schema/grammar constrained generation is not supported yet"
+            // Only the raw-completions / llama-server compatibility routes flatten
+            // these keys into unsupported_fields; the chat route declares
+            // response_format and enforces it.
+            "constrained generation is supported on /v1/chat/completions via response_format; this route does not support json_schema/grammar fields"
         }
         "stream_options" => {
             "OpenAI stream_options are not supported yet; Camelid streams plain SSE chunks"
