@@ -7469,11 +7469,33 @@ async fn chat_completions(
             return response;
         }
     }
+    // response_format -> constrained decoding (json_object / json_schema,
+    // non-streaming). Parsed BEFORE lane dispatch -- it is pure request-shape
+    // validation with no model access -- so a malformed schema 400s uniformly on
+    // every lane, and the env-gated serve lanes below (which do not enforce
+    // constraints) can reject a constrained request instead of silently
+    // returning unconstrained output with a 200.
+    let constraint = match constraint_from_response_format(req.response_format.as_ref()) {
+        Ok(constraint) => constraint,
+        Err(response) => return *response,
+    };
+    let constraint_unsupported_on_lane = || {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "response_format constrained decoding is not supported on this model's serve lane yet"
+                .to_string(),
+            Some("response_format"),
+        )
+    };
     // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE). Short-circuits
     // if this request targets a loaded gemma4 runtime; otherwise falls through to
     // the existing Llama/3B path unchanged.
     match resolve_gemma4_runtime(&state, &req).await {
         Ok(Some((id, runtime))) => {
+            if constraint.is_some() {
+                return constraint_unsupported_on_lane();
+            }
             return if req.stream.unwrap_or(false) {
                 gemma4_chat_streaming(id, runtime, &req).await
             } else {
@@ -7488,6 +7510,9 @@ async fn chat_completions(
     // chunk shape with think tokens as `reasoning_content` deltas.
     match resolve_runnable_runtime(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
+            if constraint.is_some() {
+                return constraint_unsupported_on_lane();
+            }
             if req.stream.unwrap_or(false) {
                 return runnable_chat_streaming(id, runtime, &req).await;
             }
@@ -7501,6 +7526,9 @@ async fn chat_completions(
     // (block-level SSE; a denoise block is minutes of compute).
     match resolve_dg_runtime(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
+            if constraint.is_some() {
+                return constraint_unsupported_on_lane();
+            }
             if req.stream.unwrap_or(false) {
                 return dg_chat_streaming(id, runtime, &req).await;
             }
@@ -7570,12 +7598,11 @@ async fn chat_completions(
     // request supplied tools and tool_choice is not "none".
     let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
-    // response_format -> constrained decoding (json_object / json_schema, non-streaming).
-    let constraint = match constraint_from_response_format(req.response_format.as_ref()) {
-        Ok(constraint) => constraint,
-        Err(response) => return *response,
-    };
-    if constraint.is_some() && req.stream.unwrap_or(false) {
+    // The constraint itself was parsed before lane dispatch (see above); this
+    // captures whether one is active before `constraint` moves into the
+    // generation request, for the tool-call parse gate below.
+    let constraint_active = constraint.is_some();
+    if constraint_active && req.stream.unwrap_or(false) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -7696,7 +7723,7 @@ async fn chat_completions(
             // Parse the model's tool-call output into structured tool_calls when the
             // request supplied tools and tool_choice permits it. On a tool call,
             // content is emptied and finish_reason flips to "tool_calls".
-            let tool_calls = if tools_active {
+            let tool_calls = if should_parse_tool_calls(tools_active, constraint_active) {
                 parse_tool_calls(&content)
             } else {
                 None
@@ -10634,6 +10661,17 @@ fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
     !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
 }
 
+/// Whether the model's raw content should be probed for a tool call.
+/// Constrained output is content by definition: OpenAI allows tools and
+/// response_format together, and a schema that legitimately declares a `name`
+/// property (extremely common) must not have its constrained output
+/// reclassified into a fabricated tool call with emptied content. The tools are
+/// still rendered into the prompt template under a constraint; only this
+/// post-hoc reclassification is disabled.
+fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool {
+    tools_active && !constraint_active
+}
+
 /// Parse a model's tool-call output into OpenAI `tool_calls`. Handles the Llama
 /// 3.x form `{"name": <fn>, "parameters": {...}}` (also `"arguments"`), optionally
 /// `<|python_tag|>`-prefixed, and tolerates trailing junk small models emit.
@@ -13126,6 +13164,24 @@ mod tests {
         }))
         .expect("deserialize");
         assert!(validate_choice_and_logprob_fields(&oob).is_err());
+    }
+
+    #[test]
+    fn constrained_output_is_never_reclassified_as_tool_call() {
+        // M3 regression: a schema that legitimately declares a `name` property
+        // produces output parse_tool_calls would happily match -- under an active
+        // constraint that output is content by definition and must not be
+        // reclassified (content emptied, fabricated ToolCall, finish_reason
+        // "tool_calls"). OpenAI allows tools + response_format together.
+        let constrained_content = r#"{"name":"x","parameters":{}}"#;
+        assert!(
+            parse_tool_calls(constrained_content).is_some(),
+            "the gate, not the parser, is what protects constrained output"
+        );
+        assert!(!should_parse_tool_calls(true, true));
+        assert!(should_parse_tool_calls(true, false));
+        assert!(!should_parse_tool_calls(false, false));
+        assert!(!should_parse_tool_calls(false, true));
     }
 
     #[test]
