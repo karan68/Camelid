@@ -332,6 +332,40 @@ async fn llama_server_models_load_alias_redacts_failed_local_path() {
 }
 
 #[tokio::test]
+async fn llama_server_models_load_alias_redacts_relative_path_on_every_platform() {
+    // Relative on Windows AND Unix, so it walks the models-dir resolver's
+    // attempted-locations error (which names paths) on every CI platform —
+    // the alias's redaction must scrub all of it, not just the top-level path.
+    let private_relative = "example-private/missing-model.gguf";
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model": private_relative}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let serialized = body.to_string();
+    assert_eq!(body["error"]["param"], "model");
+    assert!(!serialized.contains(private_relative));
+    assert!(!serialized.contains("example-private"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("failed to load requested local GGUF path"));
+}
+
+#[tokio::test]
 async fn llama_server_models_load_alias_requires_model_or_path() {
     let app = camelid::api::router();
     let response = app

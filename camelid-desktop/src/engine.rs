@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -132,8 +132,9 @@ pub fn pick_ephemeral_port() -> Result<u16, EngineError> {
     Ok(port)
 }
 
-/// Spawn `camelid serve --addr 127.0.0.1:<port> --no-open`, bound to loopback only, and
-/// health-gate it. Returns a running [`Engine`] or an [`EngineError`] carrying engine stderr.
+/// Spawn `camelid serve --addr 127.0.0.1:<port> --no-open --models-dir <abs>`, bound to
+/// loopback only, and health-gate it. Returns a running [`Engine`] or an [`EngineError`]
+/// carrying engine stderr.
 pub fn spawn(engine_path: &PathBuf) -> Result<Engine, EngineError> {
     let port = pick_ephemeral_port()?;
     let addr = format!("127.0.0.1:{port}");
@@ -143,7 +144,17 @@ pub fn spawn(engine_path: &PathBuf) -> Result<Engine, EngineError> {
         .arg("serve")
         .arg("--addr")
         .arg(&addr)
-        .arg("--no-open")
+        .arg("--no-open");
+    // The desktop's model store is the `models/` folder beside the engine binary (the
+    // installed layout: camelid.exe and models/ side by side; NSIS upgrades preserve that
+    // folder). The sidecar inherits an arbitrary launch-context CWD (Explorer, a shortcut,
+    // the shell), so pin the directory explicitly as an ABSOLUTE path — otherwise the
+    // engine's local-models scan, catalog downloads, and relative /api/models/load paths
+    // resolve against whatever directory Windows happened to launch the app from.
+    if let Some(models_dir) = sidecar_models_dir(engine_path) {
+        command.arg("--models-dir").arg(models_dir);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -175,6 +186,23 @@ pub fn spawn(engine_path: &PathBuf) -> Result<Engine, EngineError> {
             let _ = child.wait();
             Err(EngineError::with_stderr(err.message, stderr.or(err.stderr)))
         }
+    }
+}
+
+/// The desktop's models directory: the `models/` folder beside the engine binary, as an
+/// absolute path. `None` when the engine was resolved as a bare `PATH` name (the developer
+/// fallback in `resolve_engine_path`), where the engine's own exe-relative default is the
+/// right authority. The directory deliberately does NOT need to exist yet — on a fresh
+/// install it is created by the engine's first catalog download.
+fn sidecar_models_dir(engine_path: &Path) -> Option<PathBuf> {
+    let parent = engine_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())?;
+    let models_dir = parent.join("models");
+    if models_dir.is_absolute() {
+        Some(models_dir)
+    } else {
+        std::path::absolute(&models_dir).ok()
     }
 }
 
@@ -310,5 +338,30 @@ impl Drop for JobObject {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sidecar_models_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn models_dir_sits_beside_an_absolute_engine_path() {
+        let engine = if cfg!(windows) {
+            PathBuf::from(r"C:\Apps\Camelid\camelid.exe")
+        } else {
+            PathBuf::from("/opt/camelid/camelid")
+        };
+        let dir = sidecar_models_dir(&engine).expect("absolute engine path yields a models dir");
+        assert!(dir.is_absolute());
+        assert_eq!(dir, engine.parent().unwrap().join("models"));
+    }
+
+    #[test]
+    fn bare_path_engine_name_yields_no_models_dir() {
+        // The PATH-resolution fallback: no directory to anchor to, so the engine's own
+        // exe-relative default must stay in charge.
+        assert_eq!(sidecar_models_dir(Path::new("camelid.exe")), None);
     }
 }
