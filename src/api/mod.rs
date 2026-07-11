@@ -2207,7 +2207,14 @@ fn llama_server_models_load_error(err: BackendError) -> Response {
     let code = backend_error_code(&err);
     let message = match err {
         BackendError::Io { source, .. } => {
-            format!("failed to load requested local GGUF path: {source}")
+            // Redaction contract for this llama-server alias: never echo local
+            // path detail. The resolver's io source now enumerates every
+            // attempted location (useful on the native endpoint), so only the
+            // pathless error kind may pass through here.
+            format!(
+                "failed to load requested local GGUF path: {}",
+                source.kind()
+            )
         }
         other => other.to_string(),
     };
