@@ -118,6 +118,13 @@ pub struct AppState {
     /// explicit value in the request always wins. Off by default so the
     /// parity-locked thinking-DISABLED rendering stays the default.
     default_enable_thinking: bool,
+    /// The models directory (`serve --models-dir` / `CAMELID_MODELS_DIR`),
+    /// resolved to an absolute path once at startup: scanned by
+    /// `/api/models/local`, the catalog download target, and the fallback base
+    /// for RELATIVE model paths sent to the load endpoints. Absolute request
+    /// paths never touch it, and a relative path that exists against the
+    /// process CWD keeps its historical meaning — this only adds a fallback.
+    models_dir: PathBuf,
 }
 
 impl Default for AppState {
@@ -137,6 +144,7 @@ impl Default for AppState {
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
             default_enable_thinking: false,
+            models_dir: resolve_models_dir(None),
         }
     }
 }
@@ -155,6 +163,16 @@ impl AppState {
     /// is silent.
     pub fn with_default_enable_thinking(mut self, default_enable_thinking: bool) -> Self {
         self.default_enable_thinking = default_enable_thinking;
+        self
+    }
+
+    /// Set the models directory (`serve --models-dir` / `CAMELID_MODELS_DIR`).
+    /// `None` keeps the default: the first existing of `<exe dir>/models` or
+    /// `./models` (mirroring `auto_select_model`'s shipped-layout precedent),
+    /// falling back to `./models`. The value is resolved to an absolute path
+    /// here, once, so it stays stable however the process was launched.
+    pub fn with_models_dir(mut self, models_dir: Option<PathBuf>) -> Self {
+        self.models_dir = resolve_models_dir(models_dir);
         self
     }
 
@@ -1555,6 +1573,195 @@ pub struct ErrorBody {
     pub param: Option<&'static str>,
 }
 
+/// The models directory used when `serve` gets no `--models-dir`: the first
+/// existing of `<exe dir>/models` (the shipped layout — `camelid.exe` beside a
+/// `models/` folder, the same precedent `auto_select_model` follows) then
+/// `./models`, falling back to `./models` when neither exists yet.
+fn default_models_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join("models");
+            if beside.is_dir() {
+                return beside;
+            }
+        }
+    }
+    PathBuf::from("models")
+}
+
+/// Resolve the configured (or defaulted) models directory to an absolute path
+/// once at startup, so it stays stable regardless of the launch-context CWD.
+/// Uses `std::path::absolute`, NOT `fs::canonicalize`, deliberately: it does
+/// not require the directory to exist yet (a fresh install has no models/ until
+/// the first download) and never produces the Windows `\\?\` verbatim prefix in
+/// user-facing strings.
+fn resolve_models_dir(configured: Option<PathBuf>) -> PathBuf {
+    let dir = configured.unwrap_or_else(default_models_dir);
+    if dir.is_absolute() {
+        dir
+    } else {
+        std::path::absolute(&dir).unwrap_or(dir)
+    }
+}
+
+/// Resolve a model path from an API request against the configured models
+/// directory. Order (first hit wins; nothing is ever rewritten once found):
+///
+/// 1. An ABSOLUTE path is used exactly as given (unchanged behavior).
+/// 2. A relative path keeps its exact historical meaning first: as given,
+///    against the process CWD.
+/// 3. Otherwise `<models_dir>/<path>` — the fallback that makes relative loads
+///    work when the server's CWD is arbitrary (the desktop sidecar case).
+/// 4. Otherwise, when the request already leads with the models dir's own
+///    folder name (e.g. `models/foo.gguf` against a configured `...\models`),
+///    the duplicated leading component is stripped: `<models_dir>/foo.gguf`.
+///
+/// When nothing exists the typed I/O error names every attempted location, so
+/// the 400 tells the caller exactly where the server looked.
+fn resolve_request_model_path(
+    models_dir: &std::path::Path,
+    requested: PathBuf,
+) -> Result<PathBuf, BackendError> {
+    if requested.is_absolute() || requested.exists() {
+        return Ok(requested);
+    }
+    let mut attempted = vec![format!(
+        "'{}' (relative to the server working directory)",
+        requested.display()
+    )];
+    let joined = models_dir.join(&requested);
+    if joined.exists() {
+        return Ok(joined);
+    }
+    attempted.push(format!(
+        "'{}' (under the configured models directory)",
+        joined.display()
+    ));
+    if let (Some(first), Some(dir_name)) = (requested.components().next(), models_dir.file_name()) {
+        if first.as_os_str() == dir_name {
+            let stripped: PathBuf = requested.components().skip(1).collect();
+            if !stripped.as_os_str().is_empty() {
+                let candidate = models_dir.join(&stripped);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+                attempted.push(format!(
+                    "'{}' (under the configured models directory)",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(BackendError::Io {
+        path: requested,
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("model file not found; tried {}", attempted.join(" and ")),
+        ),
+    })
+}
+
+#[cfg(test)]
+mod models_dir_resolution_tests {
+    use super::{resolve_models_dir, resolve_request_model_path};
+    use crate::BackendError;
+    use std::path::PathBuf;
+
+    /// A models dir whose final component is literally `models`, holding one
+    /// GGUF — the shipped/desktop layout the resolver's fallbacks target.
+    fn models_dir_with(filename: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("create models dir");
+        std::fs::write(models_dir.join(filename), b"gguf-stub").expect("write stub");
+        (tmp, models_dir)
+    }
+
+    #[test]
+    fn absolute_path_passes_through_even_when_missing() {
+        let (_tmp, models_dir) = models_dir_with("present.gguf");
+        let requested = if cfg!(windows) {
+            PathBuf::from(r"C:\definitely\missing\model.gguf")
+        } else {
+            PathBuf::from("/definitely/missing/model.gguf")
+        };
+        let resolved = resolve_request_model_path(&models_dir, requested.clone())
+            .expect("absolute paths are never rewritten");
+        assert_eq!(resolved, requested);
+    }
+
+    #[test]
+    fn relative_path_that_exists_in_cwd_stays_as_given() {
+        // `cargo test` runs with the crate root as CWD, where Cargo.toml always
+        // exists — the exact historical CWD-relative behavior must win even
+        // though a models dir is configured.
+        let (_tmp, models_dir) = models_dir_with("present.gguf");
+        let resolved = resolve_request_model_path(&models_dir, PathBuf::from("Cargo.toml"))
+            .expect("CWD-relative hit resolves");
+        assert_eq!(resolved, PathBuf::from("Cargo.toml"));
+    }
+
+    #[test]
+    fn relative_path_falls_back_to_the_configured_models_dir() {
+        let name = "camelid-models-dir-resolution-test.gguf";
+        let (_tmp, models_dir) = models_dir_with(name);
+        let resolved = resolve_request_model_path(&models_dir, PathBuf::from(name))
+            .expect("bare filename falls back to the models dir");
+        assert_eq!(resolved, models_dir.join(name));
+    }
+
+    #[test]
+    fn duplicated_models_component_is_stripped_against_the_models_dir() {
+        // The live desktop repro: the client says "models/<file>" while the
+        // configured dir already IS ".../models" — the duplicated leading
+        // component is stripped rather than looking in ".../models/models/".
+        let name = "camelid-models-dir-resolution-test.gguf";
+        let (_tmp, models_dir) = models_dir_with(name);
+        let resolved = resolve_request_model_path(&models_dir, PathBuf::from("models").join(name))
+            .expect("models/-prefixed request resolves into the models dir");
+        assert_eq!(resolved, models_dir.join(name));
+    }
+
+    #[test]
+    fn missing_everywhere_error_names_every_attempted_location() {
+        let (_tmp, models_dir) = models_dir_with("present.gguf");
+        let requested = PathBuf::from("models").join("camelid-models-dir-missing.gguf");
+        let err = resolve_request_model_path(&models_dir, requested.clone())
+            .expect_err("nothing exists anywhere");
+        assert!(matches!(err, BackendError::Io { .. }));
+        let message = err.to_string();
+        assert!(
+            message.contains(&requested.display().to_string()),
+            "error must name the CWD-relative attempt: {message}"
+        );
+        assert!(
+            message.contains(&models_dir.join(&requested).display().to_string()),
+            "error must name the models-dir attempt: {message}"
+        );
+        assert!(
+            message.contains(
+                &models_dir
+                    .join("camelid-models-dir-missing.gguf")
+                    .display()
+                    .to_string()
+            ),
+            "error must name the stripped-component attempt: {message}"
+        );
+    }
+
+    #[test]
+    fn resolve_models_dir_is_absolute_for_default_and_relative_configs() {
+        assert!(resolve_models_dir(None).is_absolute());
+        assert!(resolve_models_dir(Some(PathBuf::from("models"))).is_absolute());
+        let explicit = if cfg!(windows) {
+            PathBuf::from(r"C:\somewhere\models")
+        } else {
+            PathBuf::from("/somewhere/models")
+        };
+        assert_eq!(resolve_models_dir(Some(explicit.clone())), explicit);
+    }
+}
+
 pub fn router() -> Router {
     router_with_state(AppState::default())
 }
@@ -1635,9 +1842,11 @@ pub async fn serve(
     initial_model: Option<PathBuf>,
     open_ui: bool,
     default_enable_thinking: bool,
+    models_dir: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let state = AppState::with_configured_threads(configured_threads)
-        .with_default_enable_thinking(default_enable_thinking);
+        .with_default_enable_thinking(default_enable_thinking)
+        .with_models_dir(models_dir);
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
             tracing::error!(error=%err, "failed to load startup model");
@@ -3897,6 +4106,19 @@ fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
 }
 
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
+    // Resolve relative request paths against the configured models dir BEFORE
+    // the fit guard, so the guard sizes the file that will actually be loaded.
+    let path = match resolve_request_model_path(&state.models_dir, req.path) {
+        Ok(path) => path,
+        Err(err) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                backend_error_code(&err),
+                err.to_string(),
+                Some("path"),
+            )
+        }
+    };
     // Advisory fail-fast (fit axis, never a support claim): steer away from a
     // near-certain OOM before the expensive load. Overridable via
     // CAMELID_SKIP_FIT_CHECK=1; only fires on a WontFit verdict from a probed host.
@@ -3906,13 +4128,13 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // it on a blocking thread rather than stalling the async worker — consistent with
     // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
     // fall through to the load, where VramShortfall/KvCache remain the hard net.
-    let guard_path = req.path.clone();
+    let guard_path = path.clone();
     if let Ok(Some(resp)) =
         tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path)).await
     {
         return resp;
     }
-    match load_model_from_path(&state, req.path, req.id).await {
+    match load_model_from_path(&state, path, req.id).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
@@ -3966,7 +4188,23 @@ struct InspectModelResponse {
 /// `POST /api/models/inspect` â€” source-level readiness inspection. GGUF files keep
 /// the existing header-only lane prediction. Hugging Face SafeTensors directories
 /// return descriptor/readiness facts only and never become generation-ready here.
-async fn inspect_model(Json(req): Json<InspectModelRequest>) -> Response {
+async fn inspect_model(
+    State(state): State<AppState>,
+    Json(req): Json<InspectModelRequest>,
+) -> Response {
+    // Same request-path resolution as the load endpoints, so inspect and load
+    // agree about which file a relative path names.
+    let req = match resolve_request_model_path(&state.models_dir, req.path) {
+        Ok(path) => InspectModelRequest { path },
+        Err(err) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                backend_error_code(&err),
+                err.to_string(),
+                Some("path"),
+            )
+        }
+    };
     match inspect_model_source(&req.path) {
         Ok(source) if source.manifest.kind == ModelSourceKind::HuggingFaceSafeTensors => {
             return (
@@ -5999,6 +6237,12 @@ async fn load_model_from_path_with_activation(
     id: Option<String>,
     set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
+    // Every load funnels through here, so resolve relative paths against the
+    // configured models dir at this one chokepoint (absolute paths and
+    // CWD-relative hits pass through untouched — see resolve_request_model_path).
+    // Resolution runs BEFORE the idempotent fast path so a repeated relative
+    // request compares equal to the resolved path the first load stored.
+    let path = resolve_request_model_path(&state.models_dir, path)?;
     // Idempotent fast path: the same id already loaded from the same file
     // returns the existing record instead of re-running the full load pipeline
     // (an 8 GB row re-reads the whole file for its receipt otherwise; repeat
@@ -6384,7 +6628,7 @@ async fn get_or_load_model(
     }
 
     // Check if the model can be loaded from disk
-    let path = resolve_model_path(&target_id);
+    let path = resolve_model_path(&state.models_dir, &target_id);
     if let Some(path) = path {
         if path.exists() {
             drop(loaded_models);
@@ -6420,25 +6664,25 @@ async fn get_or_load_model(
     ))
 }
 
-fn resolve_model_path(model_id: &str) -> Option<PathBuf> {
+fn resolve_model_path(models_dir: &std::path::Path, model_id: &str) -> Option<PathBuf> {
     let path = PathBuf::from(model_id);
     if path.exists() {
         return Some(path);
     }
 
-    let local_path = PathBuf::from("models").join(model_id);
+    let local_path = models_dir.join(model_id);
     if local_path.exists() {
         return Some(local_path);
     }
 
     for item in curated_catalog() {
         if item.catalog_id == model_id || item.filename == model_id {
-            let cat_path = PathBuf::from("models").join(item.filename);
+            let cat_path = models_dir.join(item.filename);
             return Some(cat_path);
         }
     }
 
-    if let Ok(entries) = std::fs::read_dir("models") {
+    if let Ok(entries) = std::fs::read_dir(models_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() {
@@ -17015,7 +17259,11 @@ pub struct LocalModelEntry {
 
 #[derive(Debug, serde::Serialize)]
 pub struct LocalModelsResponse {
-    /// Repo-relative models directory the scan covered.
+    /// The configured models directory the scan covered (`serve --models-dir` /
+    /// `CAMELID_MODELS_DIR`, default exe-adjacent or CWD `models`), as the
+    /// display form of the absolute path resolved at startup. The frontend
+    /// builds load paths from this, so they stay valid whatever CWD the server
+    /// process inherited.
     pub models_dir: String,
     pub models: Vec<LocalModelEntry>,
 }
@@ -17055,10 +17303,11 @@ fn runnable_smoke_receipt_path(filename: &str) -> PathBuf {
         .join(format!("{stem}.json"))
 }
 
-/// `GET /api/models/local` â€” enumerate `models/*.gguf` with per-model lane facts.
-/// Membership is derived downstream from these facts; nothing here is hand-authored.
-async fn local_models() -> Json<LocalModelsResponse> {
-    let dir = PathBuf::from("models");
+/// `GET /api/models/local` â€” enumerate `<models_dir>/*.gguf` with per-model lane
+/// facts. Membership is derived downstream from these facts; nothing here is
+/// hand-authored.
+async fn local_models(State(state): State<AppState>) -> Json<LocalModelsResponse> {
+    let dir = state.models_dir.clone();
     let mut models = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let mut paths: Vec<PathBuf> = entries
@@ -17162,7 +17411,7 @@ async fn local_models() -> Json<LocalModelsResponse> {
         }
     }
     Json(LocalModelsResponse {
-        models_dir: "models".to_string(),
+        models_dir: dir.display().to_string(),
         models,
     })
 }
@@ -17214,7 +17463,10 @@ struct RunnableSmokeRequest {
 /// model (admit -> load -> forward sanity -> coherence), cache + return the runnable
 /// receipt on pass. User-initiated; the model joins the Compatible section after.
 /// CPU-heavy (~minute) so it runs on a blocking thread.
-async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
+async fn run_runnable_smoke(
+    State(state): State<AppState>,
+    Json(req): Json<RunnableSmokeRequest>,
+) -> Response {
     let filename = req.filename;
     if filename.is_empty()
         || filename.contains('/')
@@ -17224,16 +17476,20 @@ async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_filename",
-            "filename must be a bare GGUF name resolved under models/".to_string(),
+            "filename must be a bare GGUF name resolved under the configured models directory"
+                .to_string(),
             None,
         );
     }
-    let path = PathBuf::from("models").join(&filename);
+    let path = state.models_dir.join(&filename);
     if !path.exists() {
         return api_error(
             StatusCode::NOT_FOUND,
             "model_not_found",
-            format!("{filename} is not present in models/"),
+            format!(
+                "{filename} is not present in {}",
+                state.models_dir.display()
+            ),
             None,
         );
     }
@@ -17499,14 +17755,20 @@ fn active_downloads_map() -> &'static Mutex<HashMap<String, ActiveDownload>> {
     ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Response {
+async fn install_catalog_model(
+    State(state): State<AppState>,
+    Json(req): Json<InstallCatalogRequest>,
+) -> Response {
     let mut map = active_downloads_map().lock().unwrap();
     if map.contains_key(&req.catalog_id) {
         return (StatusCode::BAD_REQUEST, "Download already running").into_response();
     }
 
-    std::fs::create_dir_all("models").ok();
-    let dest_path = format!("models/{}", req.filename);
+    // Download into the configured models dir — the same directory the
+    // local-models scan reads — so an installed model is visible to the scan
+    // whatever CWD the server process inherited.
+    std::fs::create_dir_all(&state.models_dir).ok();
+    let dest_path = state.models_dir.join(&req.filename).display().to_string();
     // Download into a `.part` file and only promote it to the final path once curl
     // exits successfully. The loadable GGUF therefore never exists until the
     // download is genuinely complete, so a half-downloaded model cannot be loaded.
@@ -17599,7 +17861,7 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
     }
 }
 
-async fn get_catalog_downloads() -> Json<Vec<ActiveDownload>> {
+async fn get_catalog_downloads(State(state): State<AppState>) -> Json<Vec<ActiveDownload>> {
     let mut map = active_downloads_map().lock().unwrap();
     let mut to_remove = Vec::new();
     for (id, dl) in map.iter_mut() {
@@ -17612,7 +17874,7 @@ async fn get_catalog_downloads() -> Json<Vec<ActiveDownload>> {
         // ONLY by curl's exit code (set in the spawn task above), never by a size
         // comparison against the catalog's approximate `size_bytes`, which could
         // flip a download to "completed" before it actually finished.
-        let part_path = format!("models/{}.part", dl.filename);
+        let part_path = format!("{}.part", state.models_dir.join(&dl.filename).display());
         if let Ok(metadata) = std::fs::metadata(&part_path) {
             dl.bytes_downloaded = metadata.len();
         }

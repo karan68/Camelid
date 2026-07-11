@@ -80,6 +80,7 @@ fn default_launch_command() -> Command {
         no_open: false,
         deterministic: false,
         enable_thinking: false,
+        models_dir: std::env::var_os("CAMELID_MODELS_DIR").map(PathBuf::from),
     }
 }
 
@@ -322,6 +323,15 @@ enum Command {
         /// `camelid_enable_thinking` explicitly always wins over this default.
         #[arg(long, env = "CAMELID_ENABLE_THINKING", default_value_t = false)]
         enable_thinking: bool,
+        /// Directory holding local GGUF models: scanned by the Models page
+        /// (`/api/models/local`), the catalog download target, and the fallback
+        /// base for RELATIVE model paths sent to the load endpoints (absolute
+        /// paths, and relative paths that exist against the working directory,
+        /// are used as given). Defaults to the first existing of
+        /// `<exe dir>/models` or `./models` — the shipped layout — falling back
+        /// to `./models`.
+        #[arg(long, env = "CAMELID_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
     },
     /// Interactive terminal chat REPL over the local Camelid API.
     ///
@@ -1144,6 +1154,7 @@ async fn main() -> anyhow::Result<()> {
             no_open,
             deterministic,
             enable_thinking,
+            models_dir,
         } => {
             configure_rayon_threads(threads)?;
             camelid::capability::HardwareProfile::detect().log();
@@ -1172,7 +1183,7 @@ async fn main() -> anyhow::Result<()> {
             let model = model.or_else(auto_select_model);
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
-            api::serve(addr, threads, model, open_ui, enable_thinking).await?
+            api::serve(addr, threads, model, open_ui, enable_thinking, models_dir).await?
         }
         Command::Chat {
             model,
@@ -1320,7 +1331,7 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
                 }
-                api::serve(addr, threads, Some(model), false, false).await?
+                api::serve(addr, threads, Some(model), false, false, None).await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
