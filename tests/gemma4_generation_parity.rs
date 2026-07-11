@@ -124,13 +124,24 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
     assert_eq!(oracle.pack_id, pack.pack_id, "oracle pack mismatch");
 
     let use_gpu = std::env::var("CAMELID_GEMMA4_GPU").is_ok_and(|v| v == "1");
+    // Windows CUDA-resident lane: strict full-budget parity vs the same committed
+    // oracle (no frontier relaxation — basic_v1 carries no cpu_known_frontier, so
+    // the harness's default is already token-for-token). Feature-gated because
+    // `Gemma4CudaResident` only compiles under `--features cuda`.
+    let use_cuda = std::env::var("CAMELID_GEMMA4_CUDA").is_ok_and(|v| v == "1");
     eprintln!(
         "row {row}: {} prompts, runtime = {}",
         pack.prompts.len(),
-        if use_gpu { "gpu-resident" } else { "cpu" }
+        if use_cuda {
+            "cuda-resident"
+        } else if use_gpu {
+            "gpu-resident"
+        } else {
+            "cpu"
+        }
     );
 
-    let cpu_runtime = if use_gpu {
+    let cpu_runtime = if use_gpu || use_cuda {
         None
     } else {
         Some(Gemma4Runtime::load(&model).expect("load gemma4 runtime"))
@@ -158,6 +169,30 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
         panic!("CAMELID_GEMMA4_GPU=1 requires macOS/Metal");
     }
 
+    // CUDA-resident runtime (Windows/NVIDIA). KV capacity: the pack's declared
+    // window, else the longest prompt + budget with headroom — same sizing as the
+    // Metal branch.
+    #[cfg(feature = "cuda")]
+    let mut cuda_runtime = if use_cuda {
+        let max_positions = pack.target_context_window.unwrap_or_else(|| {
+            pack.prompts
+                .iter()
+                .map(|p| p.text.len() / 2 + p.max_new_tokens)
+                .max()
+                .unwrap_or(192)
+        }) + 64;
+        Some(
+            camelid::gemma4_runtime::Gemma4CudaResident::load(&model, max_positions)
+                .expect("load gemma4 cuda runtime"),
+        )
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cuda"))]
+    if use_cuda {
+        panic!("CAMELID_GEMMA4_CUDA=1 requires a --features cuda build");
+    }
+
     let mut failures = Vec::new();
     for prompt in &pack.prompts {
         let expected = oracle
@@ -167,19 +202,30 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
             .unwrap_or_else(|| panic!("oracle missing prompt {}", prompt.id));
 
         // Prompt-token parity (BOS + plain text, no special parsing of body).
-        let runtime_tokenizer = if let Some(rt) = cpu_runtime.as_ref() {
-            rt.tokenizer()
-        } else {
-            #[cfg(target_os = "macos")]
-            {
-                gpu_runtime.as_ref().unwrap().tokenizer()
-            }
-            #[cfg(not(target_os = "macos"))]
-            unreachable!()
+        // The tokenizer borrow is scoped here so it releases before the CUDA
+        // runtime's `&mut self` generate below.
+        let prompt_tokens = {
+            let runtime_tokenizer = if let Some(rt) = cpu_runtime.as_ref() {
+                rt.tokenizer()
+            } else if use_cuda {
+                #[cfg(feature = "cuda")]
+                {
+                    cuda_runtime.as_ref().unwrap().tokenizer()
+                }
+                #[cfg(not(feature = "cuda"))]
+                unreachable!()
+            } else {
+                #[cfg(target_os = "macos")]
+                {
+                    gpu_runtime.as_ref().unwrap().tokenizer()
+                }
+                #[cfg(not(target_os = "macos"))]
+                unreachable!()
+            };
+            runtime_tokenizer
+                .encode(&prompt.text, true, true)
+                .expect("encode prompt")
         };
-        let prompt_tokens = runtime_tokenizer
-            .encode(&prompt.text, true, true)
-            .expect("encode prompt");
         if prompt_tokens != expected.prompt_tokens {
             failures.push(format!(
                 "{}: prompt tokens diverge\n  camelid: {prompt_tokens:?}\n  oracle:  {:?}",
@@ -191,6 +237,17 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
         let (text, generated) = if let Some(rt) = cpu_runtime.as_ref() {
             rt.generate_greedy(&prompt.text, prompt.max_new_tokens)
                 .expect("generate")
+        } else if use_cuda {
+            #[cfg(feature = "cuda")]
+            {
+                cuda_runtime
+                    .as_mut()
+                    .unwrap()
+                    .generate_greedy(&prompt.text, prompt.max_new_tokens)
+                    .expect("generate (cuda)")
+            }
+            #[cfg(not(feature = "cuda"))]
+            unreachable!()
         } else {
             #[cfg(target_os = "macos")]
             {
@@ -204,14 +261,17 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
             unreachable!()
         };
 
-        // A recorded CPU knife-edge frontier bounds the CPU assertion to its
-        // measured prefix; the GPU runtime always asserts the full budget.
+        // A recorded knife-edge frontier bounds the CPU assertion to its measured
+        // prefix. The GPU lanes (Metal and CUDA) only honor a frontier the oracle
+        // marks `applies_to_gpu` (or that carries a GPU-specific prefix); a CPU-only
+        // frontier does NOT relax the GPU/CUDA assertion, which then stays strict.
+        let gpu_lane = use_gpu || use_cuda;
         let frontier_active = expected
             .cpu_known_frontier
             .as_ref()
-            .filter(|f| !use_gpu || f.applies_to_gpu || f.gpu_parity_prefix_tokens.is_some());
+            .filter(|f| !gpu_lane || f.applies_to_gpu || f.gpu_parity_prefix_tokens.is_some());
         if let Some(frontier) = frontier_active {
-            let n = if use_gpu {
+            let n = if gpu_lane {
                 frontier
                     .gpu_parity_prefix_tokens
                     .unwrap_or(frontier.parity_prefix_tokens)
