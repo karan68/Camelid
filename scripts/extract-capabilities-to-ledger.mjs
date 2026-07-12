@@ -14,10 +14,10 @@
 // validated by scripts/check-ledger-schema.mjs.
 import { readFile, writeFile, mkdir, access } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { execSync } from 'node:child_process'
 
 const ROOT = resolve('.')
-const MODRS = join(ROOT, 'src', 'api', 'mod.rs')
 const OUT = join(ROOT, 'ledger', 'camelid-ledger.json')
 
 // --- extract the balanced CapabilitiesResponse { ... } block ---------------
@@ -102,8 +102,8 @@ const RECEIPT_RE = /qa\/evidence-bundles\/[A-Za-z0-9._/-]+?\/(?:manifest\.json|S
 
 async function exists(p) { try { await access(p); return true } catch { return false } }
 
-async function main() {
-  const src = await readFile(MODRS, 'utf8')
+export async function buildLedger(root = ROOT) {
+  const src = await readFile(join(root, 'src', 'api', 'mod.rs'), 'utf8')
   const marker = 'CapabilitiesResponse {'
   const fnPos = src.indexOf('fn capabilities_response_with_plan')
   // The fn signature ends `-> CapabilitiesResponse {` (the fn body brace); the
@@ -137,7 +137,7 @@ async function main() {
       const path = m[0]
       if (seen.has(path)) continue
       seen.add(path)
-      if (await exists(join(ROOT, path))) receipts.push({ path })
+      if (await exists(join(root, path))) receipts.push({ path })
       else receiptWarnings.push(`${contract.id}: receipt ${path} does not resolve on disk (omitted)`)
     }
     const row = { identity, contract }
@@ -165,27 +165,33 @@ async function main() {
   }
 
   let head = 'unknown'
-  try { head = execSync('git rev-parse --short HEAD', { cwd: ROOT }).toString().trim() } catch {}
+  try { head = execSync('git rev-parse --short HEAD', { cwd: root }).toString().trim() } catch {}
 
   const ledger = {
     ledger_version: 'camelid.ledger/v1',
     provenance: {
       source_head: head,
-      note: 'Bootstrapped by scripts/extract-capabilities-to-ledger.mjs from the static CapabilitiesResponse literal in src/api/mod.rs (CAIRN Phase 2). Contract fields are byte-faithful (plain serde Serialize, no renames). surfaces (README/COMPAT/STATUS cells) are populated in Phase 3 where the generators byte-check them.',
+      note: 'Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded).',
     },
     capabilities,
     model_rows,
   }
 
+  return { ledger, receiptWarnings, fieldCount: Object.keys(rows[0]).length }
+}
+
+async function main() {
+  const { ledger, receiptWarnings, fieldCount } = await buildLedger(ROOT)
   await mkdir(join(ROOT, 'ledger'), { recursive: true })
   await writeFile(OUT, JSON.stringify(ledger, null, 2) + '\n')
-
-  // report
-  console.log(`extracted ${model_rows.length} model row(s); each contract has ${Object.keys(rows[0]).length} fields`)
-  console.log(`envelope: ${capabilities.supported_quantization.length} supported_quant, ${capabilities.planned_quantization.length} planned_quant, ${capabilities.supported_model_families.length} supported_fam, ${capabilities.planned_model_families.length} planned_fam, ${capabilities.api_features.length} api_features, ${capabilities.notes.length} notes`)
-  console.log(`receipts attached: ${model_rows.reduce((n, r) => n + (r.receipts?.length || 0), 0)} (resolved on disk)`)
+  const c = ledger.capabilities
+  console.log(`extracted ${ledger.model_rows.length} model row(s); each contract has ${fieldCount} fields`)
+  console.log(`envelope: ${c.supported_quantization.length} supported_quant, ${c.planned_quantization.length} planned_quant, ${c.supported_model_families.length} supported_fam, ${c.planned_model_families.length} planned_fam, ${c.api_features.length} api_features, ${c.notes.length} notes`)
+  console.log(`receipts attached: ${ledger.model_rows.reduce((n, r) => n + (r.receipts?.length || 0), 0)} (resolved on disk)`)
   if (receiptWarnings.length) { console.log('receipt notes:'); receiptWarnings.forEach((w) => console.log('  - ' + w)) }
   console.log(`wrote ${OUT}`)
 }
 
-main().catch((e) => { console.error(e); process.exit(1) })
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  main().catch((e) => { console.error(e); process.exit(1) })
+}

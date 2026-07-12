@@ -1,8 +1,8 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "4e725058",
-    "note": "Bootstrapped by scripts/extract-capabilities-to-ledger.mjs from the static CapabilitiesResponse literal in src/api/mod.rs (CAIRN Phase 2). Contract fields are byte-faithful (plain serde Serialize, no renames). surfaces (README/COMPAT/STATUS cells) are populated in Phase 3 where the generators byte-check them."
+    "source_head": "32bef842",
+    "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
     "engine": "camelid",
