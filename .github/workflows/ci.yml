@@ -146,6 +146,9 @@ jobs:
       - name: Check ledger schema (camelid.ledger/v1)
         run: node scripts/check-ledger-schema.mjs
 
+      - name: Check ledger drift (ledger == code contract; surfaces consistent)
+        run: node scripts/check-ledger-drift.mjs
+
       - name: Check CUDA batched-prefill parity gate wiring
         run: node scripts/check-cuda-prefill-parity-gate.mjs
 
