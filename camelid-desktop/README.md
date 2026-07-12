@@ -20,7 +20,8 @@ parity contract, or the `camelid` server binary. **The web path remains the cano
 - **Identical GPU acceleration.** Because the sidecar *is* the shipped `camelid` engine, it
   uses the engine's GPU path unchanged: on a machine with an NVIDIA GPU it auto-engages the
   bundled CUDA runtime (the same Windows CUDA-resident decode path the engine validates — the
-  Qwen3 Q8_0 rows and the Gemma 4 E4B-It Q8_0 row), and falls back to the CPU otherwise. The
+  Qwen3 Q8_0 rows), and falls back to the CPU otherwise. The Gemma 4 E4B-It Q8_0 CUDA lane is
+  opt-in behind `CAMELID_GEMMA4_CUDA=1`, not auto-engaged. The
   app adds no GPU code and makes no separate performance claim; the authoritative supported-row
   and GPU list is the engine's [`README.md`](../README.md) (*Windows CUDA*).
 - **No fabricated metrics.** Any tokens/sec or status readout is sourced from the same real
