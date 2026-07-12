@@ -196,6 +196,23 @@ async function checkSha256(committed) {
   info(`sha256 cross-surface agreement: ${verified} correct filename+sha co-occurrence(s) across surfaces, ${canonicalByFile.size} anchored file(s)`)
 }
 
+// --- Check E: durable evidence anchors have a single home ------------------
+// CAIRN Phase 5 made STATUS.md the canonical anchor index and collapsed the
+// COMPATIBILITY.md section to a pointer. Keep it that way: the anchor bundle
+// list must not be re-duplicated into COMPATIBILITY.md.
+async function checkAnchorsSingleHome() {
+  const p = join(ROOT, 'COMPATIBILITY.md')
+  if (!(await exists(p))) return
+  const md = (await readFile(p, 'utf8')).split('\n')
+  const s = md.findIndex((l) => l.trim() === '## Durable evidence anchors')
+  if (s < 0) { info('anchors single-home: COMPATIBILITY.md has no anchors section'); return }
+  let e = md.length
+  for (let i = s + 1; i < md.length; i++) if (/^## /.test(md[i])) { e = i; break }
+  const count = (md.slice(s, e).join('\n').match(/qa\/evidence-bundles/g) || []).length
+  if (count > 0) fail(`COMPATIBILITY.md "Durable evidence anchors" re-lists ${count} evidence bundle(s); the canonical index is STATUS.md — keep it a pointer (CAIRN Phase 5)`)
+  else info('anchors single-home: COMPATIBILITY.md anchors is a pointer; the index lives only in STATUS.md')
+}
+
 // ---------------------------------------------------------------------------
 async function main() {
   const ledgerPath = join(ROOT, 'ledger', 'camelid-ledger.json')
@@ -206,6 +223,7 @@ async function main() {
   await checkSupportedTables(committed)
   await checkFrontendCatalog(committed)
   await checkSha256(committed)
+  await checkAnchorsSingleHome()
 
   if (failures.length) {
     console.error(`\nledger drift check FAILED (${failures.length}):`)
