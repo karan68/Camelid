@@ -139,6 +139,63 @@ async function checkSupportedTables(committed) {
   }
 }
 
+// --- Check C: frontend catalog consistency ---------------------------------
+// The frontend download catalog keys entries by the exact contract id, so this
+// is an id-exact membership check: a catalog entry with no contract row is drift.
+async function checkFrontendCatalog(committed) {
+  const contractIds = new Set(committed.model_rows.map((r) => r.contract.id))
+  const p = join(ROOT, 'frontend', 'src', 'lib', 'supportedModels.js')
+  if (!(await exists(p))) { info('frontend catalog: supportedModels.js not present, skipped'); return }
+  const catalogIds = [...(await readFile(p, 'utf8')).matchAll(/catalog_id:\s*'([a-z0-9_]+)'/g)].map((m) => m[1])
+  if (!catalogIds.length) { fail('no catalog_id entries parsed from frontend/src/lib/supportedModels.js'); return }
+  let ok = 0
+  for (const cid of catalogIds) {
+    if (contractIds.has(cid)) ok++
+    else fail(`frontend catalog lists catalog_id "${cid}" with no matching /api/capabilities contract row`)
+  }
+  info(`frontend catalog: ${ok}/${catalogIds.length} catalog_id(s) resolve to a contract row`)
+}
+
+// --- Check D: sha256 cross-surface agreement -------------------------------
+// For each ledger-anchored (gguf_filename -> sha256), any surface line that names
+// that file AND states a full sha must state the ledger's sha. A full sha that is
+// some OTHER known file's sha (co-occurring on the same line) is ignored, so this
+// only fires on a genuinely wrong/stale hash — no false positives.
+const SHA256 = /\b[a-f0-9]{64}\b/g
+function shaFindings(rel, text, canonicalByFile, knownShas) {
+  const findings = []
+  let verified = 0
+  text.split('\n').forEach((line, i) => {
+    const shas = line.match(SHA256)
+    if (!shas) return
+    for (const [fname, canon] of canonicalByFile) {
+      if (!line.includes(fname)) continue
+      for (const sha of shas) {
+        if (sha === canon.sha) verified++
+        else if (!knownShas.has(sha)) findings.push(`${rel}:${i + 1} states sha256 ${sha.slice(0, 12)}… for ${fname}, but the ledger records ${canon.sha.slice(0, 12)}… (row ${canon.id})`)
+      }
+    }
+  })
+  return { verified, findings }
+}
+async function checkSha256(committed) {
+  const canonicalByFile = new Map()
+  for (const r of committed.model_rows) {
+    if (r.identity.sha256 && r.identity.gguf_filename) canonicalByFile.set(r.identity.gguf_filename, { sha: r.identity.sha256, id: r.contract.id })
+  }
+  if (!canonicalByFile.size) { info('sha256 agreement: no ledger-anchored full sha256 to check'); return }
+  const knownShas = new Set([...canonicalByFile.values()].map((v) => v.sha))
+  let verified = 0
+  for (const rel of ['README.md', 'COMPATIBILITY.md', 'STATUS.md', join('src', 'api', 'mod.rs')]) {
+    const p = join(ROOT, rel)
+    if (!(await exists(p))) continue
+    const { verified: v, findings } = shaFindings(rel, await readFile(p, 'utf8'), canonicalByFile, knownShas)
+    verified += v
+    findings.forEach(fail)
+  }
+  info(`sha256 cross-surface agreement: ${verified} correct filename+sha co-occurrence(s) across surfaces, ${canonicalByFile.size} anchored file(s)`)
+}
+
 // ---------------------------------------------------------------------------
 async function main() {
   const ledgerPath = join(ROOT, 'ledger', 'camelid-ledger.json')
@@ -147,6 +204,8 @@ async function main() {
 
   await checkFreshness(committed)
   await checkSupportedTables(committed)
+  await checkFrontendCatalog(committed)
+  await checkSha256(committed)
 
   if (failures.length) {
     console.error(`\nledger drift check FAILED (${failures.length}):`)
@@ -156,7 +215,7 @@ async function main() {
   console.log('\nledger drift check passed: ledger == code contract, and no surface contradicts it')
 }
 
-export { firstDiff, canon, norm, fillerKey, parseTable, isSupported }
+export { firstDiff, canon, norm, fillerKey, parseTable, isSupported, shaFindings }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main().catch((e) => { console.error(e); process.exit(1) })
