@@ -1,9 +1,11 @@
 # SIROCCO — Lane K (kernel campaign)
 
 **Machine:** RTX 3060 Laptop GPU (GA106, CC 8.6, 30 SM), 6 GB GDDR6, driver 576.83, CUDA 12.9, **WDDM** · Win11
-**Target:** Llama-3.2-1B decode, Windows/CUDA · **Status:** two clean, correctness-preserving wins **shipped** (`uint4` attention K-read, [PR #440](https://github.com/timtoole02/Camelid/pull/440); `SPLITK_MAX` uncap, this PR). Remaining upside is gated behind a precision-policy decision, not more engineering.
+**Target:** Llama-3.2-1B decode, Windows/CUDA · **Status:** three clean, correctness-preserving wins **shipped** (`uint4` decode-attn K-read [PR #440]; `SPLITK_MAX` uncap [PR #442]; **`uint4` prefill-attn K-read, +17–19% prefill, this PR**). The decode budget is exhausted; the newly-measured **prefill** regime (99% of long-context wall time) is the open frontier.
 
-> **One-line result:** nine kernel experiments, **two shipped** (byte-identical `uint4` attention K-read, +~10% long-context; token-identical `SPLITK_MAX` uncap, +~6% e2e measured at ctx 8k, larger at longer ctx by the byte-share model), **seven rejected on measured evidence**. `main` only ever moved for a change that measurably earned it and cleared the bit-identical spec-verify gate.
+> **One-line result:** ten kernel experiments, **three shipped** (byte-identical `uint4` decode-attn K-read, +~10% long-ctx; token-identical `SPLITK_MAX` uncap, +~6% e2e @8k; **byte-identical `uint4` prefill-attn K-read, +17–19% prefill**), **seven rejected on measured evidence**. `main` only ever moved for a change that measurably earned it and cleared the bit-identical spec-verify gate.
+
+> **⚠ REFRAME (2026-07-13): the campaign optimized the wrong 1%.** Direct measurement — Llama-3.2-1B Q8_0, ctx 8802: **prefill = 152.8 s (99.2%)**, decode-64 = 1.2 s. The whole Lane K decode campaign (#1–#9) tuned the ~1% decode tail of a long-context request. **Prefill is the other 99%**, and its attention (`attention_batched`) was still doing the scalar f16 K read that win #1 replaced everywhere on the decode path — hence experiment #10 below (a verbatim transplant, +17–19% prefill, byte-identical). See [SIROCCO Phase P bundle](qa/evidence-bundles/sirocco-prefill-attn-kread-20260713/README.md).
 
 ---
 
@@ -48,6 +50,7 @@ A follow-up decode-loop analysis (261 kernel launches/token; 148 non-GEMV moving
 | 7 | Bit-exact dp4a `q6k_gemv` | Q4 models | ❌ regresses 0.34–0.68× (2-lane cap) | microbench, byte-identical |
 | 8 | Token-parity (4-lane) dp4a `q6k` | Q4 models | ❌ fails token-parity (8/8 prompts diverge) | real-model verification |
 | **9** | **`SPLITK_MAX` uncap 16→32** | long-ctx Q8 | ✅ **SHIPPED** — +~6% e2e measured @8k (V-read +19% micro @32k; larger at longer ctx by byte-share, not A/B'd); token-identical to oracle **and** bit-identical spec-verify | [bundle](qa/evidence-bundles/sirocco-laneK-splitk-uncap-20260713/README.md) |
+| **10** | **`uint4` K-read → `attention_batched` (PREFILL)** | long-ctx **prefill** | ✅ **SHIPPED** — **+17–19% prefill** (2k/4k/6.6k interleaved), byte-identical (6 parity gates + 48/48 e2e). Win #1's read, applied to the prefill/verify attention it never reached — which is 99% of long-ctx wall | [bundle](qa/evidence-bundles/sirocco-prefill-attn-kread-20260713/README.md) |
 
 > **#9 is the occupancy counterpart to the rejected #6.** #6 *vectorized* the split-K V read and lost by dropping threads to a quarter-warp; #9 keeps the kernel and adds split **blocks**, curing the same under-utilization from the other side. The V read at `attn_sk_partial` uses only `head_dim`=64 of 256 block threads, so it is occupancy- (not coalescing-) limited: 92→110 GB/s (+19%) going 16→32 splits. 32 is the knee — the K read is already optimal at 16 and regresses beyond it.
 
@@ -99,8 +102,9 @@ It **strictly dominates** the previously-shipped opt-in coalesced kernel — fas
 
 ## 7. Current state & what remains
 
-- **In `main`:** (1) the `uint4` attention K-read (PR #440) — byte-identical, lossless-spec-preserving, +~10% long-context decode; (2) the `SPLITK_MAX` uncap 16→32 (this PR) — token-identical (oracle + bit-identical spec-verify), +~6% e2e measured at ctx 8k (expected larger at longer ctx by the byte-share model, not A/B'd across contexts), no-op below ctx 512.
-- **Exhausted:** the clean, correctness-preserving Lane K gains on this GPU. ctx≈0 Q8 is at the wall; the attention **V-read via vectorization** is a proven dead end (but the **V-read via occupancy** — #9 — was the sleeper win that same analysis pointed at).
+- **In `main`:** (1) the `uint4` decode-attn K-read (PR #440) — byte-identical, lossless-spec-preserving, +~10% long-context decode; (2) the `SPLITK_MAX` uncap 16→32 (PR #442) — token-identical, +~6% e2e measured at ctx 8k; (3) the `uint4` **prefill**-attn K-read (this PR) — byte-identical, **+17–19% prefill**.
+- **Exhausted (decode):** the clean, correctness-preserving Lane K *decode* gains on this GPU. ctx≈0 Q8 is at the wall; the attention **V-read via vectorization** is a proven dead end (but the **V-read via occupancy** — #9 — was the sleeper win that same analysis pointed at).
+- **OPEN FRONTIER — prefill (SIROCCO Phase P):** prefill is **99% of long-context wall time** and was never on the decode roofline. Experiment #10 took the first, free, byte-identical bite (uint4 K-read, +17–19%). Remaining prefill levers (measured, not yet built): the prefill **V-read is also scalar**; the batch chunk is only `MAX_VERIFY_K`=8 tokens so weights are re-read ~n/8 times (a **larger prefill block** would amortize the linear term); and the O(n²) `attention_batched` is a **naive per-position kernel, not flash-tiled**. This is where the real long-context wall time lives.
 - **Gated (not blocked by engineering):** the K-quant lm_head dp4a is a real ~1.74× kernel win, but capturing it requires **retiring the K-quant byte-exact-vs-oracle Runnable invariant** (or restricting to a probabilistic lm_head-only variant). That is a **precision-policy decision**, not a kernel tweak — and having built and measured both, the recommendation is that it is not worth trading greedy determinism for.
 
 ---
@@ -110,6 +114,7 @@ It **strictly dominates** the previously-shipped opt-in coalesced kernel — fas
 - **Phase 0 / G0:** [`qa/evidence-bundles/sirocco-phase0-roofline-20260712/`](qa/evidence-bundles/sirocco-phase0-roofline-20260712/README.md) — `roofline-receipt.json`, `triad.cu`, all three sweeps.
 - **Shipped win #1 (`uint4` K-read):** [`qa/evidence-bundles/sirocco-laneK-attn-kvec-uint4-20260712/`](qa/evidence-bundles/sirocco-laneK-attn-kvec-uint4-20260712/README.md) — diff, `splitk_spec_verify` log, A/B, the design workflow.
 - **Shipped win #2 (`SPLITK_MAX` uncap):** [`qa/evidence-bundles/sirocco-laneK-splitk-uncap-20260713/`](qa/evidence-bundles/sirocco-laneK-splitk-uncap-20260713/README.md) — `micro-splitk.cu` n_splits sweep, the three correctness gates, the interleaved A/B (+5.96%).
+- **Shipped win #3 (`uint4` prefill K-read, Phase P):** [`qa/evidence-bundles/sirocco-prefill-attn-kread-20260713/`](qa/evidence-bundles/sirocco-prefill-attn-kread-20260713/README.md) — the prefill-vs-decode wall-time reframe, the interleaved prefill A/B (+17–19%), the six parity gates + 48/48 e2e.
 - **Coalesced investigation:** [`qa/evidence-bundles/sirocco-laneK-coalesced-attn-20260712/`](qa/evidence-bundles/sirocco-laneK-coalesced-attn-20260712/README.md).
 - **Kernels:** `src/cuda_resident.rs` — `q8_gemv` @230, `q4k_gemv` @455, `q6k_gemv` @779, `attention_decode` @1371, `attn_sk_scores` @2089 (`attn_sk_partial` @2207). Correctness gate: `splitk_spec_verify_bit_identical` (`src/cuda_resident/tests.rs`), `--ignored`, requires a CUDA device (does **not** run in CI).
 

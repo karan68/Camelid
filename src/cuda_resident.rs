@@ -1798,10 +1798,25 @@ extern "C" __global__ void attention_batched(
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
+    // SIROCCO prefill lever: uint4 (128-bit, 8 keys/load) f16 K read, same d-order accumulation ->
+    // BYTE-IDENTICAL (fmad=false), mirroring attention_decode / attn_sk_scores (win #1). This is the
+    // resident-prefill + spec-verify attention (the O(n^2) dominant term of long-context prompt
+    // processing); the scalar read never got #1's treatment. splitk_spec_verify_bit_identical still
+    // passes (uint4 == scalar bitwise, already proven by #1). Non-mult-of-8 head_dim -> scalar tail.
+    int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;
     for (int p = tid; p < position_count; p += blockDim.x) {
         const unsigned short* kp = kbase + (long)p * head_dim;
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        int d = 0;
+        for (; d < kd8; d += 8) {
+            uint4 kv = *reinterpret_cast<const uint4*>(kp + d);
+            const unsigned short* k8 = reinterpret_cast<const unsigned short*>(&kv);
+            dot += qsh[d + 0] * f16_bits_to_f32(k8[0]); dot += qsh[d + 1] * f16_bits_to_f32(k8[1]);
+            dot += qsh[d + 2] * f16_bits_to_f32(k8[2]); dot += qsh[d + 3] * f16_bits_to_f32(k8[3]);
+            dot += qsh[d + 4] * f16_bits_to_f32(k8[4]); dot += qsh[d + 5] * f16_bits_to_f32(k8[5]);
+            dot += qsh[d + 6] * f16_bits_to_f32(k8[6]); dot += qsh[d + 7] * f16_bits_to_f32(k8[7]);
+        }
+        for (; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
         scores[p] = dot * scale;
     }
     __syncthreads();
@@ -1964,10 +1979,22 @@ extern "C" __global__ void attention_tree_batched(
     }
     __syncthreads();
     int count = s_count;
+    // SIROCCO prefill lever: uint4 f16 K read, same d-order accumulation -> BYTE-IDENTICAL (mirrors
+    // attention_batched above and win #1). Gathered row slots[i]*head_dim stays 16B-aligned (head_dim=64).
+    int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;
     for (int i = tid; i < count; i += blockDim.x) {
         const unsigned short* kp = kbase + (long)slots[i] * head_dim;
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        int d = 0;
+        for (; d < kd8; d += 8) {
+            uint4 kv = *reinterpret_cast<const uint4*>(kp + d);
+            const unsigned short* k8 = reinterpret_cast<const unsigned short*>(&kv);
+            dot += qsh[d + 0] * f16_bits_to_f32(k8[0]); dot += qsh[d + 1] * f16_bits_to_f32(k8[1]);
+            dot += qsh[d + 2] * f16_bits_to_f32(k8[2]); dot += qsh[d + 3] * f16_bits_to_f32(k8[3]);
+            dot += qsh[d + 4] * f16_bits_to_f32(k8[4]); dot += qsh[d + 5] * f16_bits_to_f32(k8[5]);
+            dot += qsh[d + 6] * f16_bits_to_f32(k8[6]); dot += qsh[d + 7] * f16_bits_to_f32(k8[7]);
+        }
+        for (; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
         scores[i] = dot * scale;
     }
     __syncthreads();
