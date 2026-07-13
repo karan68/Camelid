@@ -1,9 +1,9 @@
 # SIROCCO — Lane K (kernel campaign)
 
 **Machine:** RTX 3060 Laptop GPU (GA106, CC 8.6, 30 SM), 6 GB GDDR6, driver 576.83, CUDA 12.9, **WDDM** · Win11
-**Target:** Llama-3.2-1B decode, Windows/CUDA · **Status:** the clean, correctness-preserving win is **shipped** ([PR #440](https://github.com/timtoole02/Camelid/pull/440), `main` @ `00569168`). Remaining upside is gated behind a precision-policy decision, not more engineering.
+**Target:** Llama-3.2-1B decode, Windows/CUDA · **Status:** two clean, correctness-preserving wins **shipped** (`uint4` attention K-read, [PR #440](https://github.com/timtoole02/Camelid/pull/440); `SPLITK_MAX` uncap, this PR). Remaining upside is gated behind a precision-policy decision, not more engineering.
 
-> **One-line result:** eight kernel experiments, **one shipped** (byte-identical `uint4` attention K-read, +~10% long-context), **seven rejected on measured evidence**. `main` only ever moved for the change that measurably earned it, byte-identically.
+> **One-line result:** nine kernel experiments, **two shipped** (byte-identical `uint4` attention K-read, +~10% long-context; token-identical `SPLITK_MAX` uncap, +~6% e2e measured at ctx 8k, larger at longer ctx by the byte-share model), **seven rejected on measured evidence**. `main` only ever moved for a change that measurably earned it and cleared the bit-identical spec-verify gate.
 
 ---
 
@@ -47,6 +47,9 @@ A follow-up decode-loop analysis (261 kernel launches/token; 148 non-GEMV moving
 | 6 | `uint4` split-K V (`attn_sk_partial`) | long-ctx | ❌ −18% (1/4-warp utilization) | git-stash A/B |
 | 7 | Bit-exact dp4a `q6k_gemv` | Q4 models | ❌ regresses 0.34–0.68× (2-lane cap) | microbench, byte-identical |
 | 8 | Token-parity (4-lane) dp4a `q6k` | Q4 models | ❌ fails token-parity (8/8 prompts diverge) | real-model verification |
+| **9** | **`SPLITK_MAX` uncap 16→32** | long-ctx Q8 | ✅ **SHIPPED** — +~6% e2e measured @8k (V-read +19% micro @32k; larger at longer ctx by byte-share, not A/B'd); token-identical to oracle **and** bit-identical spec-verify | [bundle](qa/evidence-bundles/sirocco-laneK-splitk-uncap-20260713/README.md) |
+
+> **#9 is the occupancy counterpart to the rejected #6.** #6 *vectorized* the split-K V read and lost by dropping threads to a quarter-warp; #9 keeps the kernel and adds split **blocks**, curing the same under-utilization from the other side. The V read at `attn_sk_partial` uses only `head_dim`=64 of 256 block threads, so it is occupancy- (not coalescing-) limited: 92→110 GB/s (+19%) going 16→32 splits. 32 is the knee — the K read is already optimal at 16 and regresses beyond it.
 
 ---
 
@@ -88,7 +91,7 @@ It **strictly dominates** the previously-shipped opt-in coalesced kernel — fas
 
 1. **Fix the denominator before optimizing.** Phase 0's `C≈0` + MBU 0.615 measurement redirected the whole campaign from the (empty) host-overhead lane to the kernel lane. Running the wrong lane is worse than running no lane.
 2. **A perf-prototype that isn't parity-preserving over-states the win.** The dp4a `q6k` "1.74×" evaporated (or went negative) once the byte-identical / token-parity versions were actually built. Build the correctness-preserving kernel *before* trusting the number.
-3. **Vectorize *within* a thread, not by dropping threads.** Widening a per-element read that is already coalesced trades away the parallelism that hides memory latency.
+3. **Vectorize *within* a thread, not by dropping threads — and if a read is thread-starved, add blocks instead.** Widening a per-element read that is already coalesced trades away the parallelism that hides latency (#5, #6). The *same* under-utilized `attn_sk_partial` V read that killed the vectorization attempt was cured from the other side by raising the split count (#9): more blocks → more resident warps → +19% on the exact read that lost 18% when vectorized. Diagnose whether a slow read is coalescing-bound or occupancy-bound *before* picking the lever.
 4. **Greedy token-identity ≠ bit-identity.** For any change touching the spec-verify / split-K path, the device-side `splitk_spec_verify_bit_identical` gate is the real backstop; the runtime greedy probe is blind above ctx~23 / G=1.
 5. **Prove correctness at the level the invariant lives.** Byte-exact-vs-oracle (Runnable lane) is stronger than token-parity; token-parity is stronger than "usually identical." Don't silently downgrade the contract.
 
@@ -96,17 +99,17 @@ It **strictly dominates** the previously-shipped opt-in coalesced kernel — fas
 
 ## 7. Current state & what remains
 
-- **In `main`:** the `uint4` attention K-read (PR #440). Byte-identical, lossless-spec-preserving, +~10% long-context decode.
-- **Exhausted:** the clean, correctness-preserving Lane K gains on this GPU. ctx≈0 Q8 is at the wall; the attention V-read avenue is a proven dead end.
+- **In `main`:** (1) the `uint4` attention K-read (PR #440) — byte-identical, lossless-spec-preserving, +~10% long-context decode; (2) the `SPLITK_MAX` uncap 16→32 (this PR) — token-identical (oracle + bit-identical spec-verify), +~6% e2e measured at ctx 8k (expected larger at longer ctx by the byte-share model, not A/B'd across contexts), no-op below ctx 512.
+- **Exhausted:** the clean, correctness-preserving Lane K gains on this GPU. ctx≈0 Q8 is at the wall; the attention **V-read via vectorization** is a proven dead end (but the **V-read via occupancy** — #9 — was the sleeper win that same analysis pointed at).
 - **Gated (not blocked by engineering):** the K-quant lm_head dp4a is a real ~1.74× kernel win, but capturing it requires **retiring the K-quant byte-exact-vs-oracle Runnable invariant** (or restricting to a probabilistic lm_head-only variant). That is a **precision-policy decision**, not a kernel tweak — and having built and measured both, the recommendation is that it is not worth trading greedy determinism for.
-- **Untried (moderate, corner):** uncap `SPLITK_MAX` for long-context occupancy (+15–30% at 2–8k). Bit-safe by construction if the verify emulation's `n_splits` formula is mirrored in lockstep.
 
 ---
 
 ## 8. Reproduction
 
 - **Phase 0 / G0:** [`qa/evidence-bundles/sirocco-phase0-roofline-20260712/`](qa/evidence-bundles/sirocco-phase0-roofline-20260712/README.md) — `roofline-receipt.json`, `triad.cu`, all three sweeps.
-- **Shipped win:** [`qa/evidence-bundles/sirocco-laneK-attn-kvec-uint4-20260712/`](qa/evidence-bundles/sirocco-laneK-attn-kvec-uint4-20260712/README.md) — diff, `splitk_spec_verify` log, A/B, the design workflow.
+- **Shipped win #1 (`uint4` K-read):** [`qa/evidence-bundles/sirocco-laneK-attn-kvec-uint4-20260712/`](qa/evidence-bundles/sirocco-laneK-attn-kvec-uint4-20260712/README.md) — diff, `splitk_spec_verify` log, A/B, the design workflow.
+- **Shipped win #2 (`SPLITK_MAX` uncap):** [`qa/evidence-bundles/sirocco-laneK-splitk-uncap-20260713/`](qa/evidence-bundles/sirocco-laneK-splitk-uncap-20260713/README.md) — `micro-splitk.cu` n_splits sweep, the three correctness gates, the interleaved A/B (+5.96%).
 - **Coalesced investigation:** [`qa/evidence-bundles/sirocco-laneK-coalesced-attn-20260712/`](qa/evidence-bundles/sirocco-laneK-coalesced-attn-20260712/README.md).
 - **Kernels:** `src/cuda_resident.rs` — `q8_gemv` @230, `q4k_gemv` @455, `q6k_gemv` @779, `attention_decode` @1371, `attn_sk_scores` @2089 (`attn_sk_partial` @2207). Correctness gate: `splitk_spec_verify_bit_identical` (`src/cuda_resident/tests.rs`), `--ignored`, requires a CUDA device (does **not** run in CI).
 
