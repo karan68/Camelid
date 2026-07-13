@@ -1123,7 +1123,15 @@ fn splitk_spec_verify_bit_identical() {
     let n_heads = 8usize;
     let n_kv = 2usize;
     let head_dim = 128usize;
-    let max_pos = 4096usize;
+    // SIROCCO Lane K: raised 4096 -> 5632 so the sweep can cross the old SPLITK_MAX=16 cap and
+    // exercise the new 17..=22 split regime. The ceiling is the TREE emulation, not the real path:
+    // attention_tree_batched holds all scores+slots in dynamic shared = (head_dim + 2*(pc-1+k) +
+    // max_groups*head_dim)*4 bytes, which crosses the 48KB opt-out limit at pc>=5569 (n_splits 23+).
+    // The real split-K decode (launch_attention_splitk) streams positions and has no such limit --
+    // it runs to 32k. Split counts 23..=32 and the ceil>32->32 clamp are code-identical by
+    // construction (n_splits only bounds the grid.y/reduction loop; no value-dependent branch) and
+    // are covered empirically by the end-to-end greedy-token-parity check at ctx>=6602 / >=8193.
+    let max_pos = 5632usize;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut rng = Lcg(20240626);
     let q: Vec<f32> = (0..n_heads * head_dim).map(|_| rng.next_f32()).collect();
@@ -1149,9 +1157,14 @@ fn splitk_spec_verify_bit_identical() {
 
     let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
     let outlen = n_heads * head_dim;
-    // 512/513: strict-`>` boundary. 768/769, 1024: n_splits = ceil(pc/256) steps.
-    // 3840/3841: clamp(_, SPLITK_MAX=16) saturation edge. 4096: max.
-    let sweep = [512usize, 513, 768, 769, 1024, 2000, 3840, 3841, 4096];
+    // 512/513: strict-`>` boundary. 768/769, 1024: n_splits = ceil(pc/256) steps. 3840/3841: the
+    // OLD ceil==15/16 step. 4096/4097: crosses the OLD SPLITK_MAX=16 cap (4097 -> ceil 17, first
+    // split count the old build could never reach). 4864 -> 19, 5504 -> 22: the new 17..=22 regime,
+    // topping out just under the tree emulation's 48KB shared ceiling (pc<=5568). Higher split
+    // counts are argued by construction + the end-to-end token-parity gate (see max_pos note).
+    let sweep = [
+        512usize, 513, 768, 769, 1024, 2000, 3840, 3841, 4096, 4097, 4864, 5504,
+    ];
 
     for &pc in &sweep {
         let dpos = k.stream.clone_htod(&[(pc - 1) as i32]).unwrap();

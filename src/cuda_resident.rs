@@ -1827,7 +1827,7 @@ extern "C" __global__ void attention_batched(
         // Rust's position_count.div_ceil(256).clamp(2, SPLITK_MAX) (launch_attention_splitk).
         int n_splits = (position_count + 255) / 256;
         if (n_splits < 2) n_splits = 2;
-        if (n_splits > 16) n_splits = 16;          // SPLITK_MAX
+        if (n_splits > 32) n_splits = 32;          // SPLITK_MAX (mirror src const)
         if (tid == 0) {
             float total = 0.0f;                    // denom: per-chunk fresh-0 p-sum, then sp-order combine
             for (int sp = 0; sp < n_splits; sp++) {
@@ -1987,7 +1987,7 @@ extern "C" __global__ void attention_tree_batched(
     if (splitk_active && count > 512) {            // 512 == SPLITK_THRESHOLD
         int n_splits = (count + 255) / 256;        // == count.div_ceil(256).clamp(2, SPLITK_MAX)
         if (n_splits < 2) n_splits = 2;
-        if (n_splits > 16) n_splits = 16;
+        if (n_splits > 32) n_splits = 32;          // SPLITK_MAX (mirror src const)
         if (tid == 0) {
             float total = 0.0f;
             for (int sp = 0; sp < n_splits; sp++) {
@@ -4005,7 +4005,11 @@ pub(crate) fn launch_kv_scatter(
 // sized to this), and the context length above which it is used. Below the threshold the
 // one-block-per-head `launch_attention` is cheaper (one launch, no scratch round-trip);
 // above it, split-K's n_heads x n_splits grid is needed to fill the SMs.
-const SPLITK_MAX: usize = 16;
+// SIROCCO Lane K: raised 16 -> 32. The split-K V read (attn_sk_partial) uses only head_dim
+// of 256 block threads, so it is occupancy-limited by the split count at long context; n_splits=32
+// lifts the V-read bandwidth ~+19% (microbench) where the cap of 16 pinned it. MUST stay in lockstep
+// with the two CUDA verify emulations (attention_batched, attention_tree_batched) or decode != verify.
+const SPLITK_MAX: usize = 32;
 const SPLITK_THRESHOLD: usize = 512;
 
 /// Whether spec-verify must EMULATE the split-K attention reduction to stay token-identical to
