@@ -36,8 +36,10 @@ const checks = [
   {
     file: 'src/cuda_resident.rs',
     label: 'verify_batch reuses the shared stack (single source of truth)',
-    // verify_batch must call the shared helper, not carry its own divergent copy.
-    needs: ['self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale)'],
+    // verify_batch must call the shared helper, not carry its own divergent copy. The trailing
+    // `false` is the SIROCCO Phase P M1 flash_ok flag: verify MUST pass false so it stays on the
+    // bit-identical attention_batched path (flash prefill is opt-in, prefill-only, token-parity).
+    needs: ['self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale, false)'],
   },
   {
     file: 'src/inference.rs',

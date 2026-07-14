@@ -2289,6 +2289,126 @@ extern "C" __global__ void attn_sk_combine(
     }
 }
 
+// ---- SIROCCO Phase P M1: flash prefill attention (opt-in CAMELID_FLASH_PREFILL) -------------
+// The prefill bottleneck (99% of long-ctx wall) is attention_batched running ONE block per
+// (query-token, head), each re-streaming the full prefix K/V -> a k_tokens x GQA re-read. These two
+// kernels are the split-K decode passes (attn_sk_scores/partial) EXTENDED to the whole k_tokens query
+// chunk: for each key p, K[p]/V[p] is loaded and dequantized ONCE and reused across all k_tokens dots
+// (the query-reuse axis, ~k_tokens x less K/V DRAM traffic). Buffers are laid out flat by
+// (t*n_heads+head) so attn_sk_combine is reused UNCHANGED (called with n_heads = k_tokens*n_heads).
+// Per-token causal mask: token t (at position base+t) attends [0, base+t]; masked score = -inf ->
+// exp = 0. Reduction is the split-K reassociation (n_splits from the chunk's full length base+k),
+// so this is TOKEN-PARITY (gated by the multi-prompt oracle), not byte-identical. Prefill-only:
+// verify_batch stays on attention_batched and its bit-identity contract. MAX_BQ bounds the per-thread
+// token arrays (k_tokens <= MAX_VERIFY_K = 8).
+#define FLASH_MAX_BQ 16
+// Pass 1: per (head, split), compute all k_tokens scores for the split (K[p] dequant reused across
+// tokens) into scores_buf[(t*n_heads+head)*max_pos + p] and per-token chunk max into chunkmax_buf.
+extern "C" __global__ void flash_pref_scores(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    float* __restrict__ scores_buf, float* __restrict__ chunkmax_buf,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int k_tokens,
+    int q_per_token, int max_pos, float scale, int n_splits, int position_count
+) {
+    int head = blockIdx.x, sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads, kv_head = head / repeats;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+    extern __shared__ float qsh[];                 // k_tokens * head_dim (all query rows of this head)
+    int tid = threadIdx.x;
+    for (int i = tid; i < k_tokens * head_dim; i += blockDim.x)
+        qsh[i] = q[(long)(i / head_dim) * q_per_token + (long)head * head_dim + (i % head_dim)];
+    __syncthreads();
+    int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;
+    float local_max[FLASH_MAX_BQ];
+    for (int t = 0; t < k_tokens; t++) local_max[t] = -3.4e38f;
+    for (int p = p_lo + tid; p < p_hi; p += blockDim.x) {
+        const unsigned short* kp = kbase + (long)p * head_dim;
+        float dot[FLASH_MAX_BQ];
+        for (int t = 0; t < k_tokens; t++) dot[t] = 0.0f;
+        int d = 0;
+        for (; d < kd8; d += 8) {                  // load + dequant K[p] chunk ONCE, reuse across tokens
+            uint4 kv = *reinterpret_cast<const uint4*>(kp + d);
+            const unsigned short* k8 = reinterpret_cast<const unsigned short*>(&kv);
+            float kf0 = f16_bits_to_f32(k8[0]), kf1 = f16_bits_to_f32(k8[1]);
+            float kf2 = f16_bits_to_f32(k8[2]), kf3 = f16_bits_to_f32(k8[3]);
+            float kf4 = f16_bits_to_f32(k8[4]), kf5 = f16_bits_to_f32(k8[5]);
+            float kf6 = f16_bits_to_f32(k8[6]), kf7 = f16_bits_to_f32(k8[7]);
+            for (int t = 0; t < k_tokens; t++) {
+                const float* qt = qsh + (long)t * head_dim;
+                dot[t] += qt[d + 0] * kf0; dot[t] += qt[d + 1] * kf1;
+                dot[t] += qt[d + 2] * kf2; dot[t] += qt[d + 3] * kf3;
+                dot[t] += qt[d + 4] * kf4; dot[t] += qt[d + 5] * kf5;
+                dot[t] += qt[d + 6] * kf6; dot[t] += qt[d + 7] * kf7;
+            }
+        }
+        for (; d < head_dim; d++) {
+            float kf = f16_bits_to_f32(kp[d]);
+            for (int t = 0; t < k_tokens; t++) dot[t] += qsh[(long)t * head_dim + d] * kf;
+        }
+        for (int t = 0; t < k_tokens; t++) {
+            float sc = (p <= base_position + t) ? dot[t] * scale : -3.4e38f;   // causal mask
+            scores_buf[((long)t * n_heads + head) * max_pos + p] = sc;
+            local_max[t] = fmaxf(local_max[t], sc);
+        }
+    }
+    __shared__ float red[256];                     // block_dim == 256
+    for (int t = 0; t < k_tokens; t++) {
+        red[tid] = local_max[t];
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+            __syncthreads();
+        }
+        if (tid == 0) chunkmax_buf[((long)t * n_heads + head) * n_splits + sp] = red[0];
+        __syncthreads();
+    }
+}
+
+// Pass 2: per (head, split), for each token read the exact global max over splits, exp its split in
+// place, write the split's exp-sum (lsum) and unnormalized weighted-V (acc). V[p] dequant reused
+// across tokens. Masked positions have score -inf -> exp 0 -> contribute nothing.
+extern "C" __global__ void flash_pref_partial(
+    const unsigned short* __restrict__ cache_v, float* __restrict__ scores_buf,
+    const float* __restrict__ chunkmax_buf, float* __restrict__ lsum_buf, float* __restrict__ acc_buf,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int k_tokens,
+    int max_pos, int n_splits, int position_count
+) {
+    int head = blockIdx.x, sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads, kv_head = head / repeats;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+    int tid = threadIdx.x;
+    for (int t = 0; t < k_tokens; t++) {
+        float* sc_t = scores_buf + ((long)t * n_heads + head) * max_pos;
+        float gmax = -3.4e38f;
+        for (int i = 0; i < n_splits; i++) gmax = fmaxf(gmax, chunkmax_buf[((long)t * n_heads + head) * n_splits + i]);
+        for (int p = p_lo + tid; p < p_hi; p += blockDim.x) sc_t[p] = expf(sc_t[p] - gmax);
+        __syncthreads();
+        if (tid == 0) {
+            float ls = 0.0f;
+            for (int p = p_lo; p < p_hi; p++) ls += sc_t[p];
+            lsum_buf[((long)t * n_heads + head) * n_splits + sp] = ls;
+        }
+        __syncthreads();
+    }
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float a[FLASH_MAX_BQ];
+        for (int t = 0; t < k_tokens; t++) a[t] = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) {
+            float vv = f16_bits_to_f32(vbase[(long)p * head_dim + d]);   // V[p][d] read once, reuse across tokens
+            for (int t = 0; t < k_tokens; t++)
+                a[t] += scores_buf[((long)t * n_heads + head) * max_pos + p] * vv;
+        }
+        for (int t = 0; t < k_tokens; t++)
+            acc_buf[((((long)t * n_heads + head) * n_splits + sp) * head_dim) + d] = a[t];
+    }
+}
+
 // =====================================================================
 // qwen35 (Ornith) hybrid gated-delta-net (SSM) kernels.
 // Mirror the CPU reference in src/runnable/model.rs::qwen35_ssm_compute,
@@ -2646,6 +2766,8 @@ pub struct CudaResidentKernels {
     pub(crate) attn_sk_scores_coalesced: CudaFunction,
     pub(crate) attn_sk_partial: CudaFunction,
     pub(crate) attn_sk_combine: CudaFunction,
+    pub(crate) flash_pref_scores: CudaFunction,
+    pub(crate) flash_pref_partial: CudaFunction,
     // qwen35 (Ornith) gated-delta-net SSM kernels.
     pub(crate) ssm_l2_norm_per_head: CudaFunction,
     pub(crate) ssm_conv1d: CudaFunction,
@@ -2734,6 +2856,8 @@ impl CudaResidentKernels {
             attn_sk_scores_coalesced: f("attn_sk_scores_coalesced")?,
             attn_sk_partial: f("attn_sk_partial")?,
             attn_sk_combine: f("attn_sk_combine")?,
+            flash_pref_scores: f("flash_pref_scores")?,
+            flash_pref_partial: f("flash_pref_partial")?,
             ssm_l2_norm_per_head: f("ssm_l2_norm_per_head")?,
             ssm_conv1d: f("ssm_conv1d")?,
             ssm_delta_rule: f("ssm_delta_rule")?,
@@ -4157,6 +4281,120 @@ pub(crate) fn launch_attention_splitk(
     Ok(())
 }
 
+fn flash_prefill_enabled() -> bool {
+    std::env::var("CAMELID_FLASH_PREFILL").is_ok_and(|v| v != "0")
+}
+
+/// SIROCCO Phase P M1: flash prefill attention (opt-in). The split-K decode reduction extended to
+/// the whole `k_tokens` query chunk so each key's K/V is loaded/dequantized ONCE and reused across
+/// all query rows of the head (~k_tokens x less K/V DRAM traffic than attention_batched, which uses
+/// one block per (query-token, head)). Buffers are flat by (t*n_heads+head) so Pass 3 reuses
+/// attn_sk_combine unchanged with n_heads = k_tokens*n_heads. TOKEN-PARITY (split-K reassociation
+/// over the chunk length) -- gated by the multi-prompt oracle; prefill-only (verify untouched).
+/// Requires q_per_token == n_heads*head_dim (the combine writes out[(t*n_heads+head)*head_dim+d]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_attention_flash_prefill(
+    s: &Arc<CudaStream>,
+    k: &CudaResidentKernels,
+    q: &CudaSlice<f32>,
+    cache_k: &CudaSlice<u16>,
+    cache_v: &CudaSlice<u16>,
+    out: &mut CudaSlice<f32>,
+    scores_buf: &mut CudaSlice<f32>,
+    chunkmax_buf: &mut CudaSlice<f32>,
+    lsum_buf: &mut CudaSlice<f32>,
+    acc_buf: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    base_position: usize,
+    k_tokens: usize,
+    q_per_token: usize,
+    max_pos: usize,
+    scale: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    // Chunk length = full range every token could attend; per-token causal mask lives in the kernel.
+    let position_count = base_position + k_tokens;
+    let n_splits = position_count.div_ceil(256).clamp(2, SPLITK_MAX);
+    let (nh, nkv, hd, bp, kt, qpt, mp, ns) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        base_position as i32,
+        k_tokens as i32,
+        q_per_token as i32,
+        max_pos as i32,
+        n_splits as i32,
+    );
+    let pc = position_count as i32;
+    let block: u32 = 256;
+    // Pass 1: per (head, split), all k_tokens scores (K[p] dequant reused). shared = k_tokens*head_dim.
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, n_splits as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: (k_tokens * head_dim) as u32 * 4,
+        };
+        let mut b = s.launch_builder(&k.flash_pref_scores);
+        b.arg(q)
+            .arg(cache_k)
+            .arg(&mut *scores_buf)
+            .arg(&mut *chunkmax_buf)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(&bp)
+            .arg(&kt)
+            .arg(&qpt)
+            .arg(&mp)
+            .arg(&scale)
+            .arg(&ns)
+            .arg(&pc);
+        unsafe { b.launch(cfg) }?;
+    }
+    // Pass 2: per (head, split), per-token exp(global max) + exp-sum + unnormalized weighted-V (V reuse).
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, n_splits as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = s.launch_builder(&k.flash_pref_partial);
+        b.arg(cache_v)
+            .arg(&mut *scores_buf)
+            .arg(&mut *chunkmax_buf)
+            .arg(&mut *lsum_buf)
+            .arg(&mut *acc_buf)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(&bp)
+            .arg(&kt)
+            .arg(&mp)
+            .arg(&ns)
+            .arg(&pc);
+        unsafe { b.launch(cfg) }?;
+    }
+    // Pass 3: ordered combine (REUSED attn_sk_combine), one block per (token,head) = k_tokens*n_heads.
+    {
+        let fh = (k_tokens * n_heads) as i32;
+        let cfg = LaunchConfig {
+            grid_dim: ((k_tokens * n_heads) as u32, 1, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = s.launch_builder(&k.attn_sk_combine);
+        b.arg(&mut *lsum_buf)
+            .arg(&mut *acc_buf)
+            .arg(out)
+            .arg(&fh)
+            .arg(&hd)
+            .arg(&ns);
+        unsafe { b.launch(cfg) }?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_attention(
     s: &Arc<CudaStream>,
@@ -4695,6 +4933,13 @@ pub struct CudaResidentDecode {
     d_sk_chunkmax: CudaSlice<f32>, // n_heads * SPLITK_MAX
     d_sk_lsum: CudaSlice<f32>,     // n_heads * SPLITK_MAX
     d_sk_acc: CudaSlice<f32>,      // n_heads * SPLITK_MAX * head_dim
+    // SIROCCO Phase P M1 flash prefill scratch: k_tokens-major (flat (t*n_heads+head)), sized for
+    // MAX_VERIFY_K query tokens so attn_sk_combine reuses these with n_heads = k*n_heads. Only
+    // allocated/used when CAMELID_FLASH_PREFILL is on.
+    d_flash_scores: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * max_pos
+    d_flash_chunkmax: CudaSlice<f32>, // MAX_VERIFY_K * n_heads * SPLITK_MAX
+    d_flash_lsum: CudaSlice<f32>,   // MAX_VERIFY_K * n_heads * SPLITK_MAX
+    d_flash_acc: CudaSlice<f32>,    // MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
     d_proj: CudaSlice<f32>,
     d_gate: CudaSlice<f32>,
     d_up: CudaSlice<f32>,
@@ -4954,6 +5199,27 @@ impl CudaResidentDecode {
             d_sk_chunkmax: alloc_f(n_heads * SPLITK_MAX)?,
             d_sk_lsum: alloc_f(n_heads * SPLITK_MAX)?,
             d_sk_acc: alloc_f(n_heads * SPLITK_MAX * head_dim)?,
+            // Flash-prefill scratch: k_tokens-major, allocated only when opt-in (else 1-elem stub).
+            d_flash_scores: alloc_f(if flash_prefill_enabled() {
+                MAX_VERIFY_K * n_heads * max_pos
+            } else {
+                1
+            })?,
+            d_flash_chunkmax: alloc_f(if flash_prefill_enabled() {
+                MAX_VERIFY_K * n_heads * SPLITK_MAX
+            } else {
+                1
+            })?,
+            d_flash_lsum: alloc_f(if flash_prefill_enabled() {
+                MAX_VERIFY_K * n_heads * SPLITK_MAX
+            } else {
+                1
+            })?,
+            d_flash_acc: alloc_f(if flash_prefill_enabled() {
+                MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
+            } else {
+                1
+            })?,
             d_proj: alloc_f(hidden)?,
             d_gate: alloc_f(ffn_dim)?,
             d_up: alloc_f(ffn_dim)?,
@@ -7052,7 +7318,7 @@ impl CudaResidentDecode {
         s.memcpy_htod(&sin_all[..k * half], &mut sc.vsin.slice_mut(0..k * half))
             .map_err(map)?;
 
-        self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale)?;
+        self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale, false)?;
         launch_rms_norm_batched(
             &s,
             &self.k.rms_norm_batched,
@@ -7177,6 +7443,7 @@ impl CudaResidentDecode {
         base_position: usize,
         k: usize,
         scale: f32,
+        flash_ok: bool, // SIROCCO Phase P M1: prefill passes true (opt-in flash); verify passes false.
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda batched layers: {e}");
         // Own the Arc locally so each per-launch `&s` is `&Arc<CudaStream>` (what the
@@ -7331,24 +7598,55 @@ impl CudaResidentDecode {
                 k,
             )
             .map_err(map)?;
-            launch_attention_batched(
-                &s,
-                &self.k.attention_batched,
-                &sc.vq,
-                &self.cache_k[li],
-                &self.cache_v[li],
-                &mut sc.vattn,
-                n_heads,
-                n_kv,
-                head_dim,
-                base_position,
-                max_pos,
-                scale,
-                q_width,
-                k,
-                if splitk_verify_active() { 1 } else { 0 },
-            )
-            .map_err(map)?;
+            if flash_ok
+                && flash_prefill_enabled()
+                && q_width == n_heads * head_dim
+                && k <= MAX_VERIFY_K
+                && base_position + k > SPLITK_THRESHOLD
+            {
+                // SIROCCO Phase P M1: flash prefill attention (opt-in). K/V read once per key, reused
+                // across the k query rows of the head. Token-parity (gated by the oracle); prefill-only.
+                launch_attention_flash_prefill(
+                    &s,
+                    &self.k,
+                    &sc.vq,
+                    &self.cache_k[li],
+                    &self.cache_v[li],
+                    &mut sc.vattn,
+                    &mut self.d_flash_scores,
+                    &mut self.d_flash_chunkmax,
+                    &mut self.d_flash_lsum,
+                    &mut self.d_flash_acc,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    base_position,
+                    k,
+                    q_width,
+                    max_pos,
+                    scale,
+                )
+                .map_err(map)?;
+            } else {
+                launch_attention_batched(
+                    &s,
+                    &self.k.attention_batched,
+                    &sc.vq,
+                    &self.cache_k[li],
+                    &self.cache_v[li],
+                    &mut sc.vattn,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    base_position,
+                    max_pos,
+                    scale,
+                    q_width,
+                    k,
+                    if splitk_verify_active() { 1 } else { 0 },
+                )
+                .map_err(map)?;
+            }
             launch_quantize(
                 &s,
                 &self.k.quantize,
@@ -8007,7 +8305,7 @@ impl CudaResidentDecode {
             .map_err(map)?;
             // Same stream → the next chunk's stage waits for this chunk's reads; no
             // explicit per-chunk sync needed (matches the serial prefill's one-sync-at-end).
-            self.run_batched_layer_stack(&mut sc, &s, base, kk, scale)?;
+            self.run_batched_layer_stack(&mut sc, &s, base, kk, scale, true)?;
             base += kk;
         }
         self.k
