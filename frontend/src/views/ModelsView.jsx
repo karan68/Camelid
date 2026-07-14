@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ModelInspector } from '../components/models/ModelInspector'
 import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
 import { ActiveModelBar } from '../components/models/ActiveModelBar'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
 import { DownloadsPanel } from '../components/models/DownloadsPanel'
 import { UnsupportedBlocker } from '../components/models/UnsupportedBlocker'
-import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow } from '../components/models/LaneRows'
+import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow, prettySize } from '../components/models/LaneRows'
+import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { useModelsPageData } from '../hooks/useModelsPageData'
 import { bucketByLane } from '../lib/modelLanes'
+import { modelDeleteBlockedReason } from '../lib/modelDeletion'
 import { IconModels } from '../components/ui/icons'
 
 /* The Models page: one scroll, five zones.
@@ -25,6 +27,7 @@ export default function ModelsView({
   runtime,
   capabilities,
   refreshDashboard,
+  onOpenChat,
   unloadCurrentModel,
   loadingModelId,
   registerForm,
@@ -49,8 +52,14 @@ export default function ModelsView({
   const [blocker, setBlocker] = useState(null)
   const [laneError, setLaneError] = useState('')
   const [cancelingDownloads, setCancelingDownloads] = useState(new Set())
+  const [canceledCatalogIds, setCanceledCatalogIds] = useState(new Set())
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [pendingDeleteEntry, setPendingDeleteEntry] = useState(null)
+  const [deletingFilename, setDeletingFilename] = useState('')
+  const [deleteNotice, setDeleteNotice] = useState('')
+  const [catalogOperations, setCatalogOperations] = useState(new Set())
+  const loadInFlightRef = useRef('')
 
   const laneBuckets = useMemo(
     () => (spine.local ? bucketByLane(spine.local.models, capabilities) : null),
@@ -63,30 +72,64 @@ export default function ModelsView({
   const experimentalRows = laneBuckets
     ? [...laneBuckets.compatible, ...laneBuckets.eligible, ...laneBuckets.not_anchored]
     : []
+  const deleteBlockedReason = modelDeleteBlockedReason({
+    activeFilename: spine.activeFilename,
+    downloads: spine.downloads,
+    loading: Boolean(usingFilename || loadingModelId || importing || unloading),
+    smoking: Object.values(smokeBusy).some(Boolean) || catalogOperations.size > 0,
+  })
+
+  const setCatalogOperationBusy = useCallback((catalogId, busy) => {
+    setCatalogOperations((current) => {
+      const next = new Set(current)
+      if (busy) next.add(catalogId)
+      else next.delete(catalogId)
+      return next
+    })
+  }, [])
+
+  const filenameFromPath = (value) => String(value || '').split(/[\\/]/).pop() || ''
 
   // Load a local model into the chat backend. First predict the lane with a
   // header-only inspect (no multi-GB read): if the architecture is not implemented,
   // surface the exact typed blocker and stop — never attempt to run it. Implemented
   // architectures (supported or experimental) load as before.
-  const loadModelForChat = async (filename) => {
+  const loadModelForChat = async (filename, { onStage } = {}) => {
+    if (loadInFlightRef.current) {
+      const message = loadInFlightRef.current === filename
+        ? `${filename} is already loading.`
+        : `Wait for ${loadInFlightRef.current} to finish loading, then retry.`
+      setLaneError(message)
+      return { ok: false, stage: 'loading', message }
+    }
+    loadInFlightRef.current = filename
     setUsingFilename(filename)
     setLaneError('')
     setBlocker(null)
     const path = `${spine.local?.models_dir || 'models'}/${filename}`
+    let activeStage = 'checking'
     try {
+      onStage?.('checking')
       const inspectRes = await fetch(`${spine.base}/api/models/inspect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),
       })
-      if (inspectRes.ok) {
-        const inspect = await inspectRes.json()
-        if (inspect?.blocker) {
-          setBlocker(inspect.blocker)
-          return
-        }
+      const inspect = await inspectRes.json().catch(() => ({}))
+      if (!inspectRes.ok) {
+        const message = inspect?.error?.message || `model inspection failed (HTTP ${inspectRes.status})`
+        if (inspect?.error?.code) setBlocker({ code: inspect.error.code, message })
+        setLaneError(message)
+        return { ok: false, stage: 'checking', message }
       }
-      // Implemented (or inspect unavailable) → attempt the real load.
+      if (inspect?.blocker) {
+        setBlocker(inspect.blocker)
+        setLaneError(inspect.blocker.message)
+        return { ok: false, stage: 'checking', message: inspect.blocker.message }
+      }
+      // Only an inspected, implemented model reaches the authoritative load.
+      activeStage = 'loading'
+      onStage?.('loading')
       const res = await fetch(`${spine.base}/api/models/load`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -97,15 +140,30 @@ export default function ModelsView({
         // A typed fail-closed load error (e.g. invalid metadata) becomes a blocker.
         if (body?.error?.code && body.error.code !== 'invalid_model') {
           setBlocker({ code: body.error.code, message: body.error.message })
-          return
+          return { ok: false, stage: 'loading', message: body.error.message }
         }
         throw new Error(body?.error?.message || `load failed (HTTP ${res.status})`)
       }
-      await spine.refreshCurrent()
-      refreshDashboard?.({ silent: true })
+      const current = await spine.refreshCurrent()
+      if (filenameFromPath(current?.path) !== filename) {
+        throw new Error(`Camelid loaded the request but did not confirm ${filename} as the active model.`)
+      }
+      const healthRes = await fetch(`${spine.base}/v1/health`)
+      const health = await healthRes.json().catch(() => ({}))
+      if (!healthRes.ok) {
+        throw new Error(health?.error?.message || `readiness check failed (HTTP ${healthRes.status})`)
+      }
+      if (!health.loaded_now || !health.generation_ready || health.active_model_id !== filename) {
+        throw new Error(`Camelid loaded ${filename}, but it is not generation-ready yet.`)
+      }
+      await refreshDashboard?.({ silent: true })
+      return { ok: true }
     } catch (err) {
-      setLaneError(String(err?.message || err))
+      const message = String(err?.message || err)
+      setLaneError(message)
+      return { ok: false, stage: activeStage, message }
     } finally {
+      if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
       setUsingFilename('')
     }
   }
@@ -123,13 +181,69 @@ export default function ModelsView({
   const cancelDownloadById = async (id) => {
     setCancelingDownloads((s) => new Set([...s, id]))
     try {
-      await spine.cancelDownload(id)
+      const canceled = await spine.cancelDownload(id)
+      if (canceled) {
+        setCanceledCatalogIds((current) => new Set([...current, id]))
+      }
     } finally {
       setCancelingDownloads((s) => {
         const next = new Set(s)
         next.delete(id)
         return next
       })
+    }
+  }
+
+  const clearCanceledDownload = (catalogId) => {
+    setCanceledCatalogIds((current) => {
+      if (!current.has(catalogId)) return current
+      const next = new Set(current)
+      next.delete(catalogId)
+      return next
+    })
+  }
+
+  const requestDeleteModel = (entry) => {
+    if (deleteBlockedReason) {
+      setLaneError(deleteBlockedReason)
+      return
+    }
+    setLaneError('')
+    setDeleteNotice('')
+    setPendingDeleteEntry(entry)
+  }
+
+  useEffect(() => {
+    if (pendingDeleteEntry && deleteBlockedReason && !deletingFilename) {
+      setPendingDeleteEntry(null)
+      setLaneError(deleteBlockedReason)
+    }
+  }, [deleteBlockedReason, deletingFilename, pendingDeleteEntry])
+
+  const deleteModelFromDisk = async () => {
+    if (!pendingDeleteEntry || deletingFilename) return
+    if (deleteBlockedReason) {
+      setPendingDeleteEntry(null)
+      setLaneError(deleteBlockedReason)
+      return
+    }
+    const entry = pendingDeleteEntry
+    setDeletingFilename(entry.filename)
+    setLaneError('')
+    try {
+      const result = await spine.deleteLocalModel(entry)
+      setReceipts((current) => {
+        const next = { ...current }
+        delete next[entry.filename]
+        return next
+      })
+      setPendingDeleteEntry(null)
+      setDeleteNotice(`Deleted ${entry.filename} and freed ${prettySize(result.bytes_freed)}.`)
+    } catch (error) {
+      setPendingDeleteEntry(null)
+      setLaneError(String(error?.message || error))
+    } finally {
+      setDeletingFilename('')
     }
   }
 
@@ -219,6 +333,10 @@ export default function ModelsView({
         onUnload={handleUnload}
       />
       {laneError ? <p className="lane-error">{laneError}</p> : null}
+      {deleteNotice ? <p className="lane-delete-success" role="status">{deleteNotice}</p> : null}
+      {deleteBlockedReason ? (
+        <p className="lane-delete-guard" id="model-delete-guard">{deleteBlockedReason}</p>
+      ) : null}
       {spine.localError && !spine.local ? (
         <p className="lane-empty">Could not list local models: {spine.localError}</p>
       ) : null}
@@ -240,7 +358,10 @@ export default function ModelsView({
               entry={m}
               active={m.filename === spine.activeFilename}
               busy={usingFilename === m.filename}
+              deleteBusy={deletingFilename === m.filename}
+              blockedReason={deleteBlockedReason}
               onUse={() => loadModelForChat(m.filename)}
+              onDelete={requestDeleteModel}
             />
           ))
         ) : (
@@ -262,14 +383,24 @@ export default function ModelsView({
         ) : experimentalRows.length ? (
           <>
             {laneBuckets.compatible.map((m) => (
-              <CompatibleRow key={m.filename} entry={m} receipt={receipts[m.filename]} />
+              <CompatibleRow
+                key={m.filename}
+                entry={m}
+                receipt={receipts[m.filename]}
+                deleteBusy={deletingFilename === m.filename}
+                blockedReason={deleteBlockedReason}
+                onDelete={requestDeleteModel}
+              />
             ))}
             {laneBuckets.eligible.map((m) => (
               <EligibleRow
                 key={m.filename}
                 entry={m}
                 busy={Boolean(smokeBusy[m.filename])}
+                deleteBusy={deletingFilename === m.filename}
+                blockedReason={deleteBlockedReason}
                 onRun={() => runSmoke(m.filename)}
+                onDelete={requestDeleteModel}
               />
             ))}
             {laneBuckets.not_anchored.map((m) => (
@@ -277,7 +408,10 @@ export default function ModelsView({
                 key={m.filename}
                 entry={m}
                 busy={usingFilename === m.filename}
+                deleteBusy={deletingFilename === m.filename}
+                blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
+                onDelete={requestDeleteModel}
               />
             ))}
           </>
@@ -306,7 +440,13 @@ export default function ModelsView({
             : 'The backend does not advertise a catalog-install capability, so downloads stay disabled.'
         }
         onInstallStarted={spine.kickDownloadsPoll}
-        onAcquired={() => spine.refreshLocal()}
+        onDownloadAcknowledged={spine.refreshDownloads}
+        onAcquired={spine.refreshLocal}
+        canceledCatalogIds={canceledCatalogIds}
+        onDownloadRetry={clearCanceledDownload}
+        onStartModel={loadModelForChat}
+        onModelStarted={onOpenChat}
+        onOperationBusy={setCatalogOperationBusy}
       />
 
       {/* Diagnostics — operator tools, collapsed by default. Import-by-path lives
@@ -361,6 +501,18 @@ export default function ModelsView({
       {inspectorOpen && (
         <ModelInspector apiBase={catalogApiBase || apiBase} onClose={() => setInspectorOpen(false)} />
       )}
+
+      <ConfirmDialog
+        open={Boolean(pendingDeleteEntry)}
+        title="Delete model from disk?"
+        detail={pendingDeleteEntry
+          ? `${pendingDeleteEntry.filename} (${prettySize(pendingDeleteEntry.size_bytes)}; ${pendingDeleteEntry.size_bytes.toLocaleString()} bytes) will be permanently removed. This cannot be undone.`
+          : ''}
+        confirmLabel="Delete from disk"
+        busy={Boolean(deletingFilename)}
+        onCancel={() => { if (!deletingFilename) setPendingDeleteEntry(null) }}
+        onConfirm={deleteModelFromDisk}
+      />
     </section>
   )
 }

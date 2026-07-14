@@ -1,4 +1,5 @@
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { IconTrash } from '../ui/icons'
 import { ParityReceiptCard } from '../chat/render/ParityReceipt'
 
 /* Lane row components for the Models page — moved verbatim from
@@ -61,7 +62,24 @@ export function Section({ title, subtitle, count, children }) {
   )
 }
 
-export function SupportedRow({ entry, active, busy, onUse }) {
+function DeleteModelButton({ entry, busy, blockedReason, onDelete }) {
+  if (!entry.delete_token) return null
+  return (
+    <button
+      type="button"
+      className="lane-row-delete"
+      onClick={() => onDelete(entry)}
+      disabled={busy || Boolean(blockedReason)}
+      aria-label={`Delete ${entry.filename} from disk`}
+      aria-describedby={blockedReason ? 'model-delete-guard' : undefined}
+      title={blockedReason || 'Delete from disk'}
+    >
+      <IconTrash size={18} />
+    </button>
+  )
+}
+
+export function SupportedRow({ entry, active, busy, deleteBusy, blockedReason, onUse, onDelete }) {
   return (
     <article
       className={`lane-row lane-row--supported${active ? ' lane-row--active' : ''}`}
@@ -78,15 +96,18 @@ export function SupportedRow({ entry, active, busy, onUse }) {
       {active ? (
         <p className="lane-row-loaded">● Loaded — this is the active chat model.</p>
       ) : (
-        <button type="button" className="lane-row-action" onClick={onUse} disabled={busy}>
-          {busy ? 'Loading…' : 'Use for chat'}
-        </button>
+        <div className="lane-row-actions">
+          <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
+            {busy ? 'Loading…' : 'Use for chat'}
+          </button>
+          <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
+        </div>
       )}
     </article>
   )
 }
 
-export function CompatibleRow({ entry, receipt }) {
+export function CompatibleRow({ entry, receipt, deleteBusy, blockedReason, onDelete }) {
   return (
     <article className="lane-row lane-row--runnable" aria-label={`Compatible model ${entry.filename}`}>
       <div className="lane-row-head">
@@ -107,11 +128,14 @@ export function CompatibleRow({ entry, receipt }) {
         (<code>camelid runnable-smoke</code>). No HTTP serve endpoint yet, so there is no
         in-app “Use for chat” for the runnable lane.
       </p>
+      <div className="lane-row-actions">
+        <DeleteModelButton entry={entry} busy={deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
+      </div>
     </article>
   )
 }
 
-export function EligibleRow({ entry, busy, onRun }) {
+export function EligibleRow({ entry, busy, deleteBusy, blockedReason, onRun, onDelete }) {
   return (
     <article className="lane-row lane-row--runnable" aria-label={`Smoke-eligible model ${entry.filename}`}>
       <div className="lane-row-head">
@@ -122,14 +146,17 @@ export function EligibleRow({ entry, busy, onRun }) {
         <EvidenceChip state="runnable" asText>Oracle-qualified</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
-      <button type="button" className="lane-row-action" onClick={onRun} disabled={busy}>
-        {busy ? 'Running smoke-admission…' : 'Run smoke-admission'}
-      </button>
+      <div className="lane-row-actions">
+        <button type="button" className="lane-row-action" onClick={onRun} disabled={busy || deleteBusy}>
+          {busy ? 'Running smoke-admission…' : 'Run smoke-admission'}
+        </button>
+        <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
+      </div>
     </article>
   )
 }
 
-export function NotAnchoredRow({ entry, busy, onUse }) {
+export function NotAnchoredRow({ entry, busy, deleteBusy, blockedReason, onUse, onDelete }) {
   return (
     <article className="lane-row lane-row--blocked" aria-label={`Experimental model ${entry.filename}`}>
       <div className="lane-row-head">
@@ -145,9 +172,12 @@ export function NotAnchoredRow({ entry, busy, onUse }) {
         fits), but its output is not cross-validated against the reference. For
         experimentation only.
       </p>
-      <button type="button" className="lane-row-action" onClick={onUse} disabled={busy}>
-        {busy ? 'Loading…' : 'Use for chat (experimental)'}
-      </button>
+      <div className="lane-row-actions">
+        <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
+          {busy ? 'Loading…' : 'Use for chat (experimental)'}
+        </button>
+        <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
+      </div>
     </article>
   )
 }

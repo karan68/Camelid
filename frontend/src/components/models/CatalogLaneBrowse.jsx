@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
+import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition, reserveCatalogAcquisition } from '../../lib/catalogActivation'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
 import { EvidenceChip } from '../ui/EvidenceChip'
 
@@ -86,73 +87,166 @@ function CatalogRow({
   item,
   capabilities,
   installed,
-  downloading,
+  activeDownload,
   apiBase,
   installAvailable,
   installBlockedReason,
   onInstallStarted,
+  onDownloadAcknowledged,
   onAcquired,
+  canceled,
+  onDownloadRetry,
+  acquisitionLocked,
+  onAcquisitionPending,
+  onAcquisitionSettled,
+  onStartModel,
+  onModelStarted,
+  onOperationBusy,
 }) {
-  // phase: idle | confirm | starting | waiting | smoking | done
+  // phase: idle | confirm | starting | waiting | checking | loading | failed | done
   const [phase, setPhase] = useState('idle')
   const [message, setMessage] = useState('')
   const [isError, setIsError] = useState(false)
+  const [failedStage, setFailedStage] = useState('')
+  const [settlementTick, setSettlementTick] = useState(0)
   const sawDownloadRef = useRef(false)
   const startedAtRef = useRef(0)
+  const settledAtRef = useRef(0)
+  const acquisitionModeRef = useRef('download')
+  const acquisitionItemRef = useRef(item)
+  const settlementInFlightRef = useRef(false)
   const lane = predictedLane(item, capabilities)
   const decoration = item.group === 'experimental' ? null : CURATED_DECORATION.get(item.catalog_id)
+  const downloadAndStart = lane === 'supported' && item.fit !== 'wont_fit'
+  const smokeAfterDownload = item.group !== 'experimental'
+    && item.fit !== 'wont_fit'
+    && !downloadAndStart
+    && item.oracle_qualified
+  const acquisitionMode = downloadAndStart ? 'start' : smokeAfterDownload ? 'smoke' : 'download'
+  const downloading = activeDownload?.status === 'downloading'
+  const rejoinableDownload = downloading || activeDownload?.status === 'completed'
+  const operationBusy = phase === 'checking' || phase === 'loading'
+
+  useEffect(() => {
+    onOperationBusy?.(item.catalog_id, operationBusy)
+    return () => {
+      if (operationBusy) onOperationBusy?.(item.catalog_id, false)
+    }
+  }, [item.catalog_id, onOperationBusy, operationBusy])
+
+  useEffect(() => {
+    if (phase !== 'idle' || !rejoinableDownload || acquisitionLocked) return
+    if (onAcquisitionPending?.(item) === false) return
+    sawDownloadRef.current = true
+    startedAtRef.current = Date.now()
+    settledAtRef.current = 0
+    acquisitionModeRef.current = activeDownload?.continuation_mode || acquisitionMode
+    acquisitionItemRef.current = item
+    settlementInFlightRef.current = false
+    setMessage('Rejoined the active download.')
+    setIsError(false)
+    setPhase('waiting')
+  }, [acquisitionLocked, acquisitionMode, activeDownload?.continuation_mode, item, onAcquisitionPending, phase, rejoinableDownload])
 
   const finishLanded = useCallback(async () => {
-    // After download: smoke-admission only applies to oracle-qualified combos. For
-    // everything else the file just lands on disk — a machine with the right
-    // support lane can still run it; we don't gate the download on local hardware.
-    if (item.oracle_qualified) {
-      setPhase('smoking')
-      try {
-        const smoke = await fetch(`${apiBase}/api/models/runnable-smoke`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filename: item.filename }),
-        })
-        const body = await smoke.json().catch(() => ({}))
-        setMessage(
-          smoke.ok && body.passed
-            ? 'Downloaded and smoke-admitted — see it above in its section.'
-            : body?.error?.message
-              ? `Downloaded. Smoke-admission did not pass here: ${body.error.message}`
-              : 'Downloaded. Smoke-admission did not pass on this machine — the file is on disk.',
-        )
-      } catch (err) {
-        setMessage(`Downloaded. Smoke-admission could not run: ${String(err?.message || err)}`)
-      }
-    } else {
-      setMessage('Downloaded — see it above in its section.')
-    }
-    setPhase('done')
+    if (!beginCatalogSettlement(settlementInFlightRef)) return
     setIsError(false)
+    setFailedStage('')
     onAcquired?.()
-  }, [apiBase, item.filename, item.oracle_qualified, onAcquired])
+    const result = await completeCatalogAcquisition({
+      item: acquisitionItemRef.current,
+      mode: acquisitionModeRef.current,
+      apiBase,
+      loadModelForChat: onStartModel,
+      onStage: setPhase,
+    })
+    setMessage(result.message)
+    if (!result.ok) {
+      setFailedStage(result.stage)
+      setIsError(true)
+      setPhase('failed')
+      onAcquisitionSettled?.(item.catalog_id)
+      return
+    }
+    await onAcquired?.()
+    try {
+      const ack = await fetch(`${apiBase}/api/models/catalog/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: item.catalog_id }),
+      })
+      if (!ack.ok) throw new Error(`acknowledgement failed (HTTP ${ack.status})`)
+    } catch (error) {
+      setFailedStage(result.started ? 'loading' : 'checking')
+      setIsError(true)
+      setMessage(`The model is ready, but Camelid could not finalize the download state: ${String(error?.message || error)}`)
+      setPhase('failed')
+      onAcquisitionSettled?.(item.catalog_id)
+      return
+    }
+    await onDownloadAcknowledged?.()
+    setPhase('done')
+    onAcquisitionSettled?.(item.catalog_id)
+    if (result.started) onModelStarted?.()
+  }, [apiBase, item, onAcquired, onAcquisitionSettled, onDownloadAcknowledged, onModelStarted, onStartModel])
+
+  const retryAcquisition = () => {
+    if (onAcquisitionPending?.(item) === false) {
+      setMessage('Wait for the current model acquisition to finish, then retry.')
+      return
+    }
+    settlementInFlightRef.current = false
+    finishLanded()
+  }
 
   // The row watches the SHARED downloads poll + local scan instead of polling
   // itself: downloading -> (gone + on disk) = landed; (gone + not on disk after
   // having been seen) = failed or canceled.
   useEffect(() => {
+    if (phase !== 'waiting') return undefined
+    let refreshing = false
+    const refreshSettlement = async () => {
+      if (refreshing) return
+      refreshing = true
+      await onAcquired?.()
+      setSettlementTick((value) => value + 1)
+      refreshing = false
+    }
+    refreshSettlement()
+    const timer = setInterval(refreshSettlement, 1000)
+    return () => clearInterval(timer)
+  }, [phase, onAcquired])
+
+  useEffect(() => {
     if (phase !== 'waiting') return
-    if (downloading) {
-      sawDownloadRef.current = true
+    if (canceled) {
+      settlementInFlightRef.current = false
+      setPhase('idle')
+      setIsError(true)
+      setMessage('Download canceled. It can be retried.')
+      onAcquisitionSettled?.(item.catalog_id)
       return
     }
-    if (installed) {
+    const settlement = catalogDownloadSettlement({
+      downloading,
+      installed,
+      sawDownload: sawDownloadRef.current,
+      settledAt: settledAtRef.current,
+      startedAt: startedAtRef.current,
+    })
+    sawDownloadRef.current = settlement.sawDownload
+    settledAtRef.current = settlement.settledAt
+    if (settlement.action === 'landed') {
       finishLanded()
       return
     }
-    const waitedMs = Date.now() - startedAtRef.current
-    if (sawDownloadRef.current || waitedMs > 20000) {
+    if (settlement.action === 'failed') {
       setPhase('idle')
       setIsError(true)
       setMessage('Download did not complete (canceled or failed). It can be retried.')
+      onAcquisitionSettled?.(item.catalog_id)
     }
-  }, [phase, downloading, installed, finishLanded])
+  }, [phase, downloading, installed, canceled, settlementTick, finishLanded, item.catalog_id, onAcquisitionSettled])
 
   const confirmDownload = async () => {
     setPhase('starting')
@@ -160,6 +254,11 @@ function CatalogRow({
     setIsError(false)
     sawDownloadRef.current = false
     startedAtRef.current = Date.now()
+    settledAtRef.current = 0
+    acquisitionModeRef.current = acquisitionMode
+    acquisitionItemRef.current = item
+    settlementInFlightRef.current = false
+    onDownloadRetry?.(item.catalog_id)
     try {
       const res = await fetch(`${apiBase}/api/models/catalog/install`, {
         method: 'POST',
@@ -169,11 +268,14 @@ function CatalogRow({
           repo_id: item.repo_id,
           filename: item.filename,
           size_bytes: item.size_bytes,
+          continuation_mode: acquisitionMode,
         }),
       })
-      if (!res.ok && res.status !== 409) {
-        const text = await res.text()
-        throw new Error(text || `download failed (HTTP ${res.status})`)
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        if (res.status !== 409 || body?.error?.code !== 'download_already_running') {
+          throw new Error(body?.error?.message || `download failed (HTTP ${res.status})`)
+        }
       }
       setPhase('waiting')
       onInstallStarted?.()
@@ -181,8 +283,17 @@ function CatalogRow({
       setPhase('idle')
       setIsError(true)
       setMessage(String(err?.message || err))
+      onAcquisitionSettled?.(item.catalog_id)
     }
   }
+
+  const openConfirmation = () => {
+    if (onAcquisitionPending?.(item) === false) return
+    setPhase('confirm')
+  }
+
+  const activeStage = phase === 'checking' ? 1 : phase === 'loading' ? 2 : 0
+  const showProgress = ['starting', 'waiting', 'checking', 'loading'].includes(phase)
 
   return (
     <article className={`catalog-row${lane === 'not_anchored' ? ' catalog-row--advisory' : ''}`}>
@@ -229,7 +340,48 @@ function CatalogRow({
       ) : null}
       {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
 
-      {installed ? (
+      {showProgress ? (
+        <div className="catalog-start" role="status" aria-live="polite">
+          {downloadAndStart ? (
+            <ol className="catalog-start-steps" aria-label="Download and start progress">
+              {['Download', 'Check', 'Load'].map((label, index) => (
+                <li key={label} className={index < activeStage ? 'is-done' : index === activeStage ? 'is-active' : ''}>
+                  <span>{index < activeStage ? '✓' : index + 1}</span>
+                  {label}
+                </li>
+              ))}
+            </ol>
+          ) : smokeAfterDownload ? (
+            <ol className="catalog-start-steps catalog-start-steps--two" aria-label="Download and check progress">
+              {['Download', 'Check'].map((label, index) => (
+                <li key={label} className={index < activeStage ? 'is-done' : index === activeStage ? 'is-active' : ''}>
+                  <span>{index < activeStage ? '✓' : index + 1}</span>
+                  {label}
+                </li>
+              ))}
+            </ol>
+          ) : null}
+          <p className="catalog-row-faint">
+            {phase === 'checking'
+              ? 'Download complete — checking the model…'
+              : phase === 'loading'
+                ? 'Check passed — loading the model for Chat…'
+                : downloading
+                  ? 'Downloading — live progress is shown above.'
+                  : 'Starting download…'}
+          </p>
+        </div>
+      ) : phase === 'failed' ? (
+        <div className="catalog-start-failure" role="alert">
+          <p className="catalog-row-error">{message}</p>
+          <p className="catalog-row-faint">The file is still on disk. Camelid has not opened Chat.</p>
+          <button type="button" className="catalog-row-action" onClick={retryAcquisition}>
+            {failedStage === 'checking' ? 'Retry check' : 'Retry start'}
+          </button>
+        </div>
+      ) : phase === 'done' ? (
+        <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p>
+      ) : installed ? (
         <p className="catalog-row-faint">Already on disk — shown in its section above.</p>
       ) : phase === 'idle' ? (
         <>
@@ -247,8 +399,14 @@ function CatalogRow({
           ) : null}
           {message ? <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p> : null}
           {installAvailable ? (
-            <button type="button" className="catalog-row-action" onClick={() => setPhase('confirm')}>
-              Download…
+            <button
+              type="button"
+              className="catalog-row-action"
+              onClick={openConfirmation}
+              disabled={acquisitionLocked}
+              title={acquisitionLocked ? 'Wait for the current model acquisition to finish' : undefined}
+            >
+              {downloadAndStart ? 'Download and start…' : 'Download…'}
             </button>
           ) : (
             <>
@@ -264,25 +422,25 @@ function CatalogRow({
           <p>
             Download <strong>{item.filename}</strong> from <code>{item.repo_id}</code> (
             {prettySize(item.size_bytes)})? This pulls from HuggingFace into your local models folder.
+            {downloadAndStart ? ' Camelid will check it, load it, and open Chat after the download.' : ''}
           </p>
           <div className="catalog-confirm-actions">
             <button type="button" className="catalog-row-action" onClick={confirmDownload}>
               Confirm download
             </button>
-            <button type="button" className="catalog-row-cancel" onClick={() => setPhase('idle')}>
+            <button
+              type="button"
+              className="catalog-row-cancel"
+              onClick={() => {
+                setPhase('idle')
+                onAcquisitionSettled?.(item.catalog_id)
+              }}
+            >
               Cancel
             </button>
           </div>
         </div>
-      ) : phase === 'starting' || phase === 'waiting' ? (
-        <p className="catalog-row-faint">
-          {downloading ? 'Downloading — live progress in Downloads above.' : 'Starting download…'}
-        </p>
-      ) : phase === 'smoking' ? (
-        <p className="catalog-row-faint">Download complete — running smoke-admission…</p>
-      ) : (
-        <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p>
-      )}
+      ) : null}
     </article>
   )
 }
@@ -320,7 +478,13 @@ export function CatalogLaneBrowse({
   installAvailable = true,
   installBlockedReason = '',
   onInstallStarted,
+  onDownloadAcknowledged,
   onAcquired,
+  canceledCatalogIds = new Set(),
+  onDownloadRetry,
+  onStartModel,
+  onModelStarted,
+  onOperationBusy,
 }) {
   const base = (apiBase || '').replace(/\/$/, '')
   const [items, setItems] = useState(null)
@@ -329,6 +493,10 @@ export function CatalogLaneBrowse({
   const [nextCursor, setNextCursor] = useState(null)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
+  const [pendingCatalogId, setPendingCatalogId] = useState('')
+  const [pendingItem, setPendingItem] = useState(null)
+  const pendingCatalogIdRef = useRef('')
+  const requestSequenceRef = useRef(0)
 
   // Debounce the query so each keystroke doesn't fire a live Hugging Face search.
   useEffect(() => {
@@ -337,15 +505,18 @@ export function CatalogLaneBrowse({
   }, [query])
 
   const load = useCallback(async () => {
+    const sequence = ++requestSequenceRef.current
     setError('')
     try {
       const params = debouncedQuery ? `?query=${encodeURIComponent(debouncedQuery)}` : ''
       const res = await fetch(`${base}/api/models/catalog${params}`)
       if (!res.ok) throw new Error(`catalog HTTP ${res.status}`)
       const body = await res.json()
+      if (sequence !== requestSequenceRef.current) return
       setItems(body.items || [])
       setNextCursor(body.next_cursor || null)
     } catch (err) {
+      if (sequence !== requestSequenceRef.current) return
       setError(String(err?.message || err))
     }
   }, [base, debouncedQuery])
@@ -354,15 +525,34 @@ export function CatalogLaneBrowse({
     load()
   }, [load])
 
+  const reserveAcquisition = useCallback((item) => {
+    const catalogId = item.catalog_id
+    const reservation = reserveCatalogAcquisition(pendingCatalogIdRef.current, catalogId)
+    if (!reservation.accepted) return false
+    pendingCatalogIdRef.current = reservation.catalogId
+    setPendingCatalogId(catalogId)
+    setPendingItem(item)
+    return true
+  }, [])
+
+  const settleAcquisition = useCallback((catalogId) => {
+    if (pendingCatalogIdRef.current !== catalogId) return
+    pendingCatalogIdRef.current = ''
+    setPendingCatalogId('')
+    setPendingItem(null)
+  }, [])
+
   // Append the next page of experimental (Hugging Face) results.
   const loadMore = useCallback(async () => {
     if (!nextCursor || !debouncedQuery) return
+    const sequence = requestSequenceRef.current
     setLoadingMore(true)
     try {
       const params = `?query=${encodeURIComponent(debouncedQuery)}&cursor=${encodeURIComponent(nextCursor)}`
       const res = await fetch(`${base}/api/models/catalog${params}`)
       if (!res.ok) throw new Error(`catalog HTTP ${res.status}`)
       const body = await res.json()
+      if (sequence !== requestSequenceRef.current) return
       const more = (body.items || []).filter((it) => it.group === 'experimental')
       setItems((prev) => {
         const seen = new Set((prev || []).map((it) => it.catalog_id))
@@ -370,32 +560,42 @@ export function CatalogLaneBrowse({
       })
       setNextCursor(body.next_cursor || null)
     } catch (err) {
+      if (sequence !== requestSequenceRef.current) return
       setError(String(err?.message || err))
     } finally {
       setLoadingMore(false)
     }
   }, [base, debouncedQuery, nextCursor])
 
-  const downloadingNames = new Set(
-    downloads.filter((d) => d.status === 'downloading').map((d) => d.filename),
-  )
   const renderRow = (item) => (
     <CatalogRow
       key={item.catalog_id}
       item={item}
       capabilities={capabilities}
       installed={localFilenames.has(item.filename)}
-      downloading={downloadingNames.has(item.filename)}
+      activeDownload={downloads.find((download) => download.id === item.catalog_id)}
       apiBase={base}
       installAvailable={installAvailable}
       installBlockedReason={installBlockedReason}
       onInstallStarted={onInstallStarted}
+      onDownloadAcknowledged={onDownloadAcknowledged}
       onAcquired={onAcquired}
+      canceled={canceledCatalogIds.has(item.catalog_id)}
+      onDownloadRetry={onDownloadRetry}
+      acquisitionLocked={Boolean(pendingCatalogId && pendingCatalogId !== item.catalog_id)}
+      onAcquisitionPending={reserveAcquisition}
+      onAcquisitionSettled={settleAcquisition}
+      onStartModel={onStartModel}
+      onModelStarted={onModelStarted}
+      onOperationBusy={onOperationBusy}
     />
   )
 
-  const curated = (items || []).filter((it) => it.group !== 'experimental')
-  const experimental = (items || []).filter((it) => it.group === 'experimental')
+  const visibleItems = pendingItem && !(items || []).some((item) => item.catalog_id === pendingItem.catalog_id)
+    ? [pendingItem, ...(items || [])]
+    : (items || [])
+  const curated = visibleItems.filter((it) => it.group !== 'experimental')
+  const experimental = visibleItems.filter((it) => it.group === 'experimental')
   const searching = debouncedQuery.length >= 2
 
   return (
@@ -411,8 +611,10 @@ export function CatalogLaneBrowse({
       </p>
       <input
         className="catalog-search"
+        aria-label="Search model catalog"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
+        disabled={Boolean(pendingCatalogId)}
         placeholder="Search curated picks and live Hugging Face GGUFs (name, repo, filename)"
       />
       {error ? (
@@ -446,7 +648,7 @@ export function CatalogLaneBrowse({
               type="button"
               className="catalog-row-action"
               onClick={loadMore}
-              disabled={loadingMore}
+              disabled={loadingMore || Boolean(pendingCatalogId)}
             >
               {loadingMore ? 'Loading…' : 'Load more from Hugging Face'}
             </button>

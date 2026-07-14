@@ -49,6 +49,7 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
+  const [modelsVisited, setModelsVisited] = useState(false)
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined
@@ -75,6 +76,10 @@ function App() {
   } = dash
 
   const backend = useBackendLauncher({ showNotice, loadDashboard })
+
+  useEffect(() => {
+    if (tab === 'library') setModelsVisited(true)
+  }, [tab])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -313,18 +318,21 @@ function App() {
             />
           )}
 
-          {tab === 'library' && (
-            <ModelsView
-              runtime={runtime}
-              capabilities={dashboard?.capabilities}
-              refreshDashboard={loadDashboard}
-              unloadCurrentModel={unloadCurrentModel}
-              loadingModelId={loadingModelId}
-              registerForm={registerForm}
-              setRegisterForm={setRegisterForm}
-              registerModel={registerModel}
-              apiBase={apiBase}
-            />
+          {modelsVisited && (
+            <div hidden={tab !== 'library'}>
+              <ModelsView
+                runtime={runtime}
+                capabilities={dashboard?.capabilities}
+                refreshDashboard={loadDashboard}
+                onOpenChat={() => navigateTab('chat')}
+                unloadCurrentModel={unloadCurrentModel}
+                loadingModelId={loadingModelId}
+                registerForm={registerForm}
+                setRegisterForm={setRegisterForm}
+                registerModel={registerModel}
+                apiBase={apiBase}
+              />
+            </div>
           )}
 
           {tab === 'api' && <ApiView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
