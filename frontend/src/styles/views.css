@@ -1199,7 +1199,7 @@
 .models-active-bar__name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .models-active-bar__name strong { overflow-wrap: anywhere; }
 .models-active-bar__name span { font-size: var(--text-xs); color: var(--color-text-muted); }
-.models-active-bar__actions { display: flex; align-items: center; gap: var(--space-3); }
+.models-active-bar__actions { display: flex; align-items: center; gap: var(--space-2) var(--space-3); flex-wrap: wrap; max-width: 100%; }
 .models-active-bar__actions .lane-row-action { margin-top: 0; }
 
 /* ---- Models tab: local models by lane (derived sections) ---- */

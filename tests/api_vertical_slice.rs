@@ -28,6 +28,24 @@ async fn health_reports_not_generation_ready() {
 }
 
 #[tokio::test]
+async fn verify_without_an_active_model_fails_closed() {
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/models/verify")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "model_not_loaded");
+}
+
+#[tokio::test]
 async fn capabilities_public_contract_omits_local_private_paths() {
     let app = camelid::api::router();
     let response = app
@@ -43,6 +61,27 @@ async fn capabilities_public_contract_omits_local_private_paths() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let verify = body["api_features"]
+        .as_array()
+        .and_then(|features| {
+            features
+                .iter()
+                .find(|feature| feature["id"] == "camelid_verify")
+        })
+        .expect("capabilities must advertise the bounded Camelid Verify surface");
+    assert_eq!(verify["status"], "partial");
+    assert!(verify["notes"]
+        .as_str()
+        .unwrap()
+        .contains("exact-GGUF-hash"));
+    assert!(verify["notes"]
+        .as_str()
+        .unwrap()
+        .contains("not a digital signature"));
+    assert!(verify["notes"]
+        .as_str()
+        .unwrap()
+        .contains("support promotion"));
     let serialized = body.to_string();
     for forbidden in [
         "/Users/",
