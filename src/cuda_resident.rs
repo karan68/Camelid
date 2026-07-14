@@ -2409,6 +2409,126 @@ extern "C" __global__ void flash_pref_partial(
     }
 }
 
+// SIROCCO Compute M-C3: byte-identical const-k=8 twins of the two flash kernels for the common
+// k_tokens==8 prefill chunk. Same ops in the same order (bit-identical output), but the token loops
+// are compile-time-bounded (FLASH_KT8) + #pragma unroll so ptxas promotes the per-row dot/local_max/a
+// accumulators from LOCAL memory (128B/64B stack frames -> ptxas -v) to REGISTERS (0B). The runtime
+// k_tokens loop bound (flash_pref_scores/partial) blocks this unroll, forcing local-mem traffic that
+// gates occupancy -- confirmed the binder (M2b: FLASH_MAX_BQ 16->32 regressed even k=8). Dispatched by
+// launch_attention_flash_prefill only when k_tokens==8; other chunk sizes use the runtime kernels.
+#define FLASH_KT8 8
+extern "C" __global__ void flash_pref_scores_k8(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    float* __restrict__ scores_buf, float* __restrict__ chunkmax_buf,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int k_tokens,
+    int q_per_token, int max_pos, float scale, int n_splits, int position_count
+) {
+    int head = blockIdx.x, sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads, kv_head = head / repeats;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+    extern __shared__ float qsh[];
+    int tid = threadIdx.x;
+    for (int i = tid; i < FLASH_KT8 * head_dim; i += blockDim.x)
+        qsh[i] = q[(long)(i / head_dim) * q_per_token + (long)head * head_dim + (i % head_dim)];
+    __syncthreads();
+    int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;
+    float local_max[FLASH_KT8];
+    #pragma unroll
+    for (int t = 0; t < FLASH_KT8; t++) local_max[t] = -3.4e38f;
+    for (int p = p_lo + tid; p < p_hi; p += blockDim.x) {
+        const unsigned short* kp = kbase + (long)p * head_dim;
+        float dot[FLASH_KT8];
+        #pragma unroll
+        for (int t = 0; t < FLASH_KT8; t++) dot[t] = 0.0f;
+        int d = 0;
+        for (; d < kd8; d += 8) {
+            uint4 kv = *reinterpret_cast<const uint4*>(kp + d);
+            const unsigned short* k8 = reinterpret_cast<const unsigned short*>(&kv);
+            float kf0 = f16_bits_to_f32(k8[0]), kf1 = f16_bits_to_f32(k8[1]);
+            float kf2 = f16_bits_to_f32(k8[2]), kf3 = f16_bits_to_f32(k8[3]);
+            float kf4 = f16_bits_to_f32(k8[4]), kf5 = f16_bits_to_f32(k8[5]);
+            float kf6 = f16_bits_to_f32(k8[6]), kf7 = f16_bits_to_f32(k8[7]);
+            #pragma unroll
+            for (int t = 0; t < FLASH_KT8; t++) {
+                const float* qt = qsh + (long)t * head_dim;
+                dot[t] += qt[d + 0] * kf0; dot[t] += qt[d + 1] * kf1;
+                dot[t] += qt[d + 2] * kf2; dot[t] += qt[d + 3] * kf3;
+                dot[t] += qt[d + 4] * kf4; dot[t] += qt[d + 5] * kf5;
+                dot[t] += qt[d + 6] * kf6; dot[t] += qt[d + 7] * kf7;
+            }
+        }
+        for (; d < head_dim; d++) {
+            float kf = f16_bits_to_f32(kp[d]);
+            #pragma unroll
+            for (int t = 0; t < FLASH_KT8; t++) dot[t] += qsh[(long)t * head_dim + d] * kf;
+        }
+        #pragma unroll
+        for (int t = 0; t < FLASH_KT8; t++) {
+            float sc = (p <= base_position + t) ? dot[t] * scale : -3.4e38f;
+            scores_buf[((long)t * n_heads + head) * max_pos + p] = sc;
+            local_max[t] = fmaxf(local_max[t], sc);
+        }
+    }
+    __shared__ float red[256];
+    #pragma unroll 1
+    for (int t = 0; t < FLASH_KT8; t++) {
+        red[tid] = local_max[t];
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+            __syncthreads();
+        }
+        if (tid == 0) chunkmax_buf[((long)t * n_heads + head) * n_splits + sp] = red[0];
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void flash_pref_partial_k8(
+    const unsigned short* __restrict__ cache_v, float* __restrict__ scores_buf,
+    const float* __restrict__ chunkmax_buf, float* __restrict__ lsum_buf, float* __restrict__ acc_buf,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int k_tokens,
+    int max_pos, int n_splits, int position_count
+) {
+    int head = blockIdx.x, sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads, kv_head = head / repeats;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+    int tid = threadIdx.x;
+    #pragma unroll 1
+    for (int t = 0; t < FLASH_KT8; t++) {
+        float* sc_t = scores_buf + ((long)t * n_heads + head) * max_pos;
+        float gmax = -3.4e38f;
+        for (int i = 0; i < n_splits; i++) gmax = fmaxf(gmax, chunkmax_buf[((long)t * n_heads + head) * n_splits + i]);
+        for (int p = p_lo + tid; p < p_hi; p += blockDim.x) sc_t[p] = expf(sc_t[p] - gmax);
+        __syncthreads();
+        if (tid == 0) {
+            float ls = 0.0f;
+            for (int p = p_lo; p < p_hi; p++) ls += sc_t[p];
+            lsum_buf[((long)t * n_heads + head) * n_splits + sp] = ls;
+        }
+        __syncthreads();
+    }
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float a[FLASH_KT8];
+        #pragma unroll
+        for (int t = 0; t < FLASH_KT8; t++) a[t] = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) {
+            float vv = f16_bits_to_f32(vbase[(long)p * head_dim + d]);
+            #pragma unroll
+            for (int t = 0; t < FLASH_KT8; t++)
+                a[t] += scores_buf[((long)t * n_heads + head) * max_pos + p] * vv;
+        }
+        #pragma unroll
+        for (int t = 0; t < FLASH_KT8; t++)
+            acc_buf[((((long)t * n_heads + head) * n_splits + sp) * head_dim) + d] = a[t];
+    }
+}
+
 // =====================================================================
 // qwen35 (Ornith) hybrid gated-delta-net (SSM) kernels.
 // Mirror the CPU reference in src/runnable/model.rs::qwen35_ssm_compute,
@@ -2768,6 +2888,8 @@ pub struct CudaResidentKernels {
     pub(crate) attn_sk_combine: CudaFunction,
     pub(crate) flash_pref_scores: CudaFunction,
     pub(crate) flash_pref_partial: CudaFunction,
+    pub(crate) flash_pref_scores_k8: CudaFunction,
+    pub(crate) flash_pref_partial_k8: CudaFunction,
     // qwen35 (Ornith) gated-delta-net SSM kernels.
     pub(crate) ssm_l2_norm_per_head: CudaFunction,
     pub(crate) ssm_conv1d: CudaFunction,
@@ -2858,6 +2980,8 @@ impl CudaResidentKernels {
             attn_sk_combine: f("attn_sk_combine")?,
             flash_pref_scores: f("flash_pref_scores")?,
             flash_pref_partial: f("flash_pref_partial")?,
+            flash_pref_scores_k8: f("flash_pref_scores_k8")?,
+            flash_pref_partial_k8: f("flash_pref_partial_k8")?,
             ssm_l2_norm_per_head: f("ssm_l2_norm_per_head")?,
             ssm_conv1d: f("ssm_conv1d")?,
             ssm_delta_rule: f("ssm_delta_rule")?,
@@ -4335,7 +4459,13 @@ pub(crate) fn launch_attention_flash_prefill(
             block_dim: (block, 1, 1),
             shared_mem_bytes: (k_tokens * head_dim) as u32 * 4,
         };
-        let mut b = s.launch_builder(&k.flash_pref_scores);
+        // M-C3: byte-identical const-k=8 unroll for the common chunk (registers, not local mem).
+        let scores_fn = if k_tokens == 8 {
+            &k.flash_pref_scores_k8
+        } else {
+            &k.flash_pref_scores
+        };
+        let mut b = s.launch_builder(scores_fn);
         b.arg(q)
             .arg(cache_k)
             .arg(&mut *scores_buf)
@@ -4359,7 +4489,12 @@ pub(crate) fn launch_attention_flash_prefill(
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut b = s.launch_builder(&k.flash_pref_partial);
+        let partial_fn = if k_tokens == 8 {
+            &k.flash_pref_partial_k8
+        } else {
+            &k.flash_pref_partial
+        };
+        let mut b = s.launch_builder(partial_fn);
         b.arg(cache_v)
             .arg(&mut *scores_buf)
             .arg(&mut *chunkmax_buf)
