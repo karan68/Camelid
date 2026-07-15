@@ -5419,7 +5419,11 @@ fn decode_iq4_nl_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> R
     Ok(out)
 }
 
-fn decode_iq4_xs_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_iq4_xs_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
     let blocks = decode_iq4_xs_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);

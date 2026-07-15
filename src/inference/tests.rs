@@ -12454,6 +12454,80 @@ fn q5_k_block_dot_matches_decode_on_real_model() {
     assert!(tested > 0, "no 2-D Q5_K linears found in {path:?}");
 }
 
+/// Real-weight IQ4_XS parity: for each 2-D IQ4_XS linear in a downloaded GGUF, the CPU
+/// streaming block-dot (`iq4_xs_block_dot_core`, which quantises the activation to Q8_K)
+/// must match an independent f32 reference — the tensor-layer decoder (`decode_iq4_xs_tensor`)
+/// dotted against the SAME Q8_K-dequantised activation. Exercises the real load + block-dot
+/// wiring on real model weights. Skips unless `CAMELID_IQ4XS_GGUF` points to an IQ4_XS GGUF.
+#[test]
+fn iq4_xs_block_dot_matches_decode_on_real_model() {
+    let Some(path) = std::env::var_os("CAMELID_IQ4XS_GGUF") else {
+        eprintln!(
+            "skipping iq4_xs block-dot real-model parity: set CAMELID_IQ4XS_GGUF to an IQ4_XS gguf"
+        );
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let gguf = crate::gguf::read_metadata(&path).expect("read gguf metadata");
+    let store = crate::tensor::TensorStore::open(&path, &gguf);
+
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    };
+
+    let mut tested = 0usize;
+    for desc in &gguf.tensors {
+        if desc.tensor_type != crate::gguf::GgufTensorType::IQ4XS || desc.dimensions.len() != 2 {
+            continue;
+        }
+        let in_dim = desc.dimensions[0] as usize;
+        let out_dim = desc.dimensions[1] as usize;
+        if !in_dim.is_multiple_of(256) {
+            continue;
+        }
+        let wire = store.tensor_bytes(&desc.name).expect("wire bytes");
+        let f32w = crate::tensor::decode_iq4_xs_tensor(&desc.name, &wire, in_dim * out_dim)
+            .expect("decode iq4_xs tensor");
+
+        let n_rows = 2usize;
+        let input_data: Vec<f32> = (0..n_rows * in_dim).map(|_| next_f32()).collect();
+        let input =
+            crate::tensor::CpuTensor::from_f32("iq4_in", vec![n_rows, in_dim], input_data.clone())
+                .expect("input tensor");
+
+        let out_bd = super::iq4_xs_block_dot_core(&input, &wire, out_dim, in_dim, "iq4_bd")
+            .expect("iq4_xs block dot");
+
+        for r in 0..n_rows {
+            let xq = super::quantize_q8_k_blocks(&input_data[r * in_dim..(r + 1) * in_dim]);
+            for o in 0..out_dim {
+                let mut reference = 0f64;
+                for (blk, y) in xq.iter().enumerate() {
+                    for l in 0..256 {
+                        let k = blk * 256 + l;
+                        reference += f32w[o * in_dim + k] as f64 * (y.d as f64 * y.qs[l] as f64);
+                    }
+                }
+                let got = out_bd.data[r * out_dim + o] as f64;
+                assert!(
+                    (got - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
+                    "iq4_xs block-dot mismatch in {} row {r} out {o}: got {got} ref {reference}",
+                    desc.name
+                );
+            }
+        }
+        tested += 1;
+        if tested >= 3 {
+            break;
+        }
+    }
+    assert!(tested > 0, "no 2-D IQ4_XS linears found in {path:?}");
+}
+
 /// Q5_0: the wire-row dot must agree with an f64 dot of the tensor-layer
 /// dequant (`Q5_0Block`) against the dequantized Q8_0 activations.
 /// (DiffusionGemma lane.)
