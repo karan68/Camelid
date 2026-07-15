@@ -1,4 +1,4 @@
-﻿//! Ghost (layer-streaming) mode: the `.cghost` container format and its reader/writer.
+//! Ghost (layer-streaming) mode: the `.cghost` container format and its reader/writer.
 //!
 //! Standard GGUF files scatter a transformer block's tensors across the file, which turns a
 //! layer-by-layer streaming pass into random reads. A `.cghost` file is a pure re-layout of
@@ -227,6 +227,16 @@ pub fn write_cghost(
 pub struct GhostFile {
     pub index: CghostIndex,
     file: File,
+    /// Windows strict-ceiling mode: a second handle to the same file opened with
+    /// `FILE_FLAG_NO_BUFFERING`, so streamed group reads bypass the OS page cache and hit
+    /// the device — the equivalent of macOS `F_NOCACHE`, which Windows cannot toggle on an
+    /// already-open handle. `None` unless `--evict-page-cache` requested it and the open
+    /// succeeded; the read path falls back to the buffered `file` handle otherwise. Behind a
+    /// `Mutex` because `GhostFile` is shared across the prefetch worker via `Arc` (needs
+    /// `Sync`) and the aligned scratch buffer is interior-mutable; reads are single-threaded
+    /// per file so the lock is uncontended.
+    #[cfg(windows)]
+    uncached: Option<std::sync::Mutex<UncachedReader>>,
 }
 
 impl GhostFile {
@@ -236,10 +246,24 @@ impl GhostFile {
     /// targets, the cache can only thrash and the OS must not accumulate the file's pages.
     /// (`posix_madvise(DONTNEED)` does not apply here â€” that is for mmap'd ranges, and the
     /// streamer uses positioned reads.)
+    /// (Windows: `evict_page_cache` opens a second `FILE_FLAG_NO_BUFFERING` handle so streamed
+    /// group reads bypass the page cache and hit the device -- Windows cannot toggle
+    /// no-buffering on an already-open handle, and the macOS `F_NOCACHE` fcntl is a no-op here.
+    /// This makes cold-disk streaming cost MEASURABLE on a box where the model would otherwise
+    /// cache in RAM. Falls back to buffered reads if the unbuffered open fails.)
+    #[cfg_attr(not(windows), allow(unused_mut))]
     pub fn open_with_options(path: &Path, evict_page_cache: bool) -> Result<Self> {
-        let this = Self::open(path)?;
+        let mut this = Self::open(path)?;
         if evict_page_cache {
             crate::tensor::disable_file_cache_best_effort(&this.file);
+            #[cfg(windows)]
+            match UncachedReader::open(path, this.max_layer_span()) {
+                Ok(reader) => this.uncached = Some(std::sync::Mutex::new(reader)),
+                Err(e) => eprintln!(
+                    "[ghost] --evict-page-cache: unbuffered (FILE_FLAG_NO_BUFFERING) open failed \
+                     ({e}); falling back to buffered reads (page cache active)"
+                ),
+            }
         }
         Ok(this)
     }
@@ -270,7 +294,12 @@ impl GhostFile {
                 index.version
             )));
         }
-        Ok(Self { index, file })
+        Ok(Self {
+            index,
+            file,
+            #[cfg(windows)]
+            uncached: None,
+        })
     }
 
     fn group(&self, id: &str) -> Result<&CghostGroup> {
@@ -291,6 +320,21 @@ impl GhostFile {
         let group = self.group(id)?;
         let (start, len) = group.span();
         buf.resize(len as usize, 0);
+        // Strict-ceiling mode (Windows): serve the read from the unbuffered handle so it
+        // bypasses the page cache. read_into returns false when it declines (a group that is
+        // not sector-aligned or whose aligned span would pass EOF -- never for a v1 .cghost's
+        // 16 KiB-aligned blk groups), in which case we fall through to the buffered read.
+        #[cfg(windows)]
+        if let Some(uncached) = &self.uncached {
+            let served = uncached
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .read_into(start, len, &mut buf[..])
+                .map_err(|e| io_err(Path::new("<cghost>"), e))?;
+            if served {
+                return Ok((group, start));
+            }
+        }
         read_exact_at(&self.file, buf, start).map_err(|e| io_err(Path::new("<cghost>"), e))?;
         Ok((group, start))
     }
@@ -306,27 +350,60 @@ impl GhostFile {
     }
 
     /// Stream one transformer block's weights: one sequential read + decode to the same
-    /// in-RAM storage the resident loader produces. Returns the bytes read from disk.
+    /// in-RAM storage the resident loader produces. Returns `(weights, bytes, read_us,
+    /// decode_us)` — the read (positioned I/O, served from disk or page cache) and decode
+    /// (dequant to the resident CpuTensor layout) times are split so a WRAITH Phase-0
+    /// receipt can tell a disk-bound stall from a decode-bound one. Measurement-only: the
+    /// two `Instant`s add no work to the streaming path.
     pub fn read_layer(
         &self,
         layer_idx: usize,
         buf: &mut Vec<u8>,
-    ) -> Result<(LlamaLayerWeights, u64)> {
+    ) -> Result<(LlamaLayerWeights, u64, u128, u128)> {
+        let (span_len, read_us) = self.read_layer_bytes(layer_idx, buf)?;
+        let (weights, _span, decode_us) = self.decode_layer(layer_idx, &buf[..])?;
+        Ok((weights, span_len, read_us, decode_us))
+    }
+
+    /// The READ stage of `read_layer`, split out for the stage-split pipeline: one positioned
+    /// read of the blk group's payload into `buf`. Returns `(span_bytes, read_us)`. Pair with
+    /// `decode_layer` on the SAME `layer_idx` and the resulting `buf` to reconstruct exactly
+    /// what `read_layer` produces (the two are byte-identical by construction).
+    pub fn read_layer_bytes(&self, layer_idx: usize, buf: &mut Vec<u8>) -> Result<(u64, u128)> {
         let id = format!("blk.{layer_idx}");
-        let (group, start) = self.read_group_payload(&id, buf)?;
+        let read_started = std::time::Instant::now();
+        let (group, _start) = self.read_group_payload(&id, buf)?;
+        let read_us = read_started.elapsed().as_micros();
+        let (_, span_len) = group.span();
+        Ok((span_len, read_us))
+    }
+
+    /// The DECODE stage of `read_layer`: dequant the blk group payload already read into `buf`
+    /// (by `read_layer_bytes` for the same `layer_idx`) into the resident `LlamaLayerWeights`
+    /// layout. Returns `(weights, span_bytes, decode_us)`. Pure over `buf` — no file I/O — so a
+    /// reader thread can be filling layer N+1's buffer while this runs on layer N.
+    pub fn decode_layer(
+        &self,
+        layer_idx: usize,
+        buf: &[u8],
+    ) -> Result<(LlamaLayerWeights, u64, u128)> {
+        let id = format!("blk.{layer_idx}");
+        let group = self.group(&id)?;
+        let (start, span_len) = group.span();
+        let decode_started = std::time::Instant::now();
         let mut by_role: Vec<Option<CpuTensor>> = vec![None; LAYER_ROLES.len()];
         for tensor in &group.tensors {
             if let Some(slot) = LAYER_ROLES.iter().position(|r| *r == tensor.role) {
                 by_role[slot] = Some(Self::decode_group_tensor(tensor, start, buf)?);
             }
         }
+        let decode_us = decode_started.elapsed().as_micros();
         let mut take = |role: &str| -> Result<CpuTensor> {
             let slot = LAYER_ROLES.iter().position(|r| *r == role).unwrap();
             by_role[slot]
                 .take()
                 .ok_or_else(|| invalid(format!("group {id} is missing role \"{role}\"")))
         };
-        let (_, span_len) = group.span();
         Ok((
             LlamaLayerWeights {
                 attention_norm: take("attn_norm")?,
@@ -348,6 +425,7 @@ impl GhostFile {
                 decode_bindings: DecodeLinearBindings::default(),
             },
             span_len,
+            decode_us,
         ))
     }
 
@@ -363,6 +441,83 @@ impl GhostFile {
     }
 }
 
+/// Windows unbuffered (`FILE_FLAG_NO_BUFFERING`) reader for the strict-ceiling / cold-disk
+/// measurement mode. Windows sets no-buffering at `CreateFile` time (not toggleable on an
+/// open handle like macOS `F_NOCACHE`), so this owns a second handle to the same `.cghost`.
+/// No-buffering imposes sector alignment on every read: the file offset, the transfer length,
+/// and the destination buffer address must all be sector-aligned. `.cghost` blk-group offsets
+/// are 16 KiB-aligned by the writer (a superset of the 4 KiB sector requirement), so only the
+/// length (rounded up to a sector multiple, over-reading harmlessly into the following group)
+/// and the scratch buffer (an aligned sub-slice) need handling here.
+#[cfg(windows)]
+struct UncachedReader {
+    file: File,
+    /// Over-allocated so a `SECTOR`-aligned sub-slice of the largest (rounded-up) group span
+    /// always fits; sized once at open and never grown (growing would move the base pointer).
+    scratch: Vec<u8>,
+    file_len: u64,
+}
+
+#[cfg(windows)]
+impl UncachedReader {
+    /// 4 KiB covers both 512e and 4Kn NVMe logical sectors; a 4 KiB-aligned offset/length is
+    /// also 512-aligned, so this is a safe universal alignment for `FILE_FLAG_NO_BUFFERING`.
+    const SECTOR: usize = 4096;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+
+    fn open(path: &Path, max_layer_span: u64) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(Self::FILE_FLAG_NO_BUFFERING)
+            .open(path)?;
+        let file_len = file.metadata()?.len();
+        let cap = (max_layer_span as usize).next_multiple_of(Self::SECTOR) + Self::SECTOR;
+        Ok(Self {
+            file,
+            scratch: vec![0u8; cap],
+            file_len,
+        })
+    }
+
+    /// Fill `out` (already sized to `len`) with `file[start..start+len]` via cache-bypassing
+    /// reads. Returns `Ok(true)` when served unbuffered, `Ok(false)` when it declines (offset
+    /// not sector-aligned, or the aligned span would pass EOF, or the scratch can't hold it)
+    /// so the caller uses the buffered handle instead. `Err` is a real I/O failure.
+    fn read_into(&mut self, start: u64, len: u64, out: &mut [u8]) -> std::io::Result<bool> {
+        use std::os::windows::fs::FileExt;
+        let len = len as usize;
+        let aligned_len = len.next_multiple_of(Self::SECTOR);
+        // Locate a sector-aligned window inside the over-allocated scratch.
+        let base = self.scratch.as_ptr() as usize;
+        let pad = (Self::SECTOR - (base % Self::SECTOR)) % Self::SECTOR;
+        if !start.is_multiple_of(Self::SECTOR as u64)
+            || start + aligned_len as u64 > self.file_len
+            || pad + aligned_len > self.scratch.len()
+        {
+            return Ok(false);
+        }
+        let region = &mut self.scratch[pad..pad + aligned_len];
+        let mut filled = 0usize;
+        while filled < aligned_len {
+            // NO_BUFFERING transfers whole sectors, so `filled` stays sector-aligned and each
+            // subsequent positioned read keeps its aligned-offset contract.
+            let n = self
+                .file
+                .seek_read(&mut region[filled..], start + filled as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unbuffered .cghost read hit EOF before filling the sector-aligned span",
+                ));
+            }
+            filled += n;
+        }
+        out.copy_from_slice(&self.scratch[pad..pad + len]);
+        Ok(true)
+    }
+}
+
 /// One layer's weights, read + decoded off the critical path by [`GhostPrefetcher`].
 pub struct PrefetchedLayer {
     pub layer_idx: usize,
@@ -372,6 +527,11 @@ pub struct PrefetchedLayer {
     /// Wall time the worker spent reading + decoding (overlapped with the main thread's
     /// forward, so it only shows up in token latency when it exceeds the compute time).
     pub worker_us: u128,
+    /// Split of `worker_us`: positioned-read I/O time (disk or page cache) ...
+    pub read_us: u128,
+    /// ... and dequant-to-CpuTensor decode time. WRAITH Phase-0 uses the split to attribute
+    /// the streaming stall to disk vs decode.
+    pub decode_us: u128,
 }
 
 /// Double-buffered streaming: a background worker reads + decodes layer N+1 from the
@@ -398,14 +558,16 @@ impl GhostPrefetcher {
                 let mut buf: Vec<u8> = Vec::with_capacity(ghost.max_layer_span() as usize);
                 while let Ok(layer_idx) = request_rx.recv() {
                     let started = std::time::Instant::now();
-                    let result = ghost
-                        .read_layer(layer_idx, &mut buf)
-                        .map(|(weights, bytes)| PrefetchedLayer {
+                    let result = ghost.read_layer(layer_idx, &mut buf).map(
+                        |(weights, bytes, read_us, decode_us)| PrefetchedLayer {
                             layer_idx,
                             weights,
                             bytes,
                             worker_us: started.elapsed().as_micros(),
-                        });
+                            read_us,
+                            decode_us,
+                        },
+                    );
                     // The receiver dropping mid-stream (generation ended) is a normal exit.
                     if result_tx.send(result).is_err() {
                         break;
@@ -449,6 +611,143 @@ impl Drop for GhostPrefetcher {
         drop(self.result_rx.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+    }
+}
+
+/// Two-stage streaming prefetcher (WRAITH Phase-2 read‖decode stage-split): a READER thread
+/// fills layer N+1's raw buffer while a DECODER thread dequants layer N, so a layer's disk
+/// read overlaps the previous layer's CPU dequant. The single-worker [`GhostPrefetcher`] does
+/// read-then-decode serially, so its per-layer throughput is `read + decode`; this pipeline's
+/// is `max(read, decode)` — the win is largest when read and decode are comparable (the
+/// cold-NVMe regime). Same strict in-order handoff to the main thread and the same rendezvous
+/// bound on decoded windows; the extra footprint is a small pool of raw byte buffers
+/// (`read_ahead + 1` layer spans) that the ceiling accounting must include. Parity-identical
+/// to the single-worker path by construction — same bytes read, same decode. Opt-in via
+/// ghost-run `--stage-split`.
+pub struct GhostPipelinePrefetcher {
+    request_tx: Option<std::sync::mpsc::Sender<usize>>,
+    result_rx: Option<std::sync::mpsc::Receiver<Result<PrefetchedLayer>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    decoder: Option<std::thread::JoinHandle<()>>,
+}
+
+impl GhostPipelinePrefetcher {
+    pub fn spawn(ghost: std::sync::Arc<GhostFile>, read_ahead: usize) -> Self {
+        use std::sync::mpsc::{channel, sync_channel};
+        let read_ahead = read_ahead.max(1);
+        let (request_tx, request_rx) = channel::<usize>();
+        // reader -> decoder: (layer_idx, filled buffer, Ok(read_us) | Err). Bounded so the
+        // reader runs at most `read_ahead` layers ahead of the decoder (backpressure).
+        let (stage_tx, stage_rx) = sync_channel::<(usize, Vec<u8>, Result<u128>)>(read_ahead);
+        // decoder -> reader: drained buffers returned for reuse (bounds raw-buffer memory).
+        let (free_tx, free_rx) = channel::<Vec<u8>>();
+        // decoder -> main: rendezvous (capacity 0) — at most two decoded windows exist at once.
+        let (result_tx, result_rx) = sync_channel::<Result<PrefetchedLayer>>(0);
+
+        // Prime the raw-buffer pool (read_ahead + 1 spans) before moving free_tx to the decoder.
+        let span_cap = ghost.max_layer_span() as usize;
+        for _ in 0..(read_ahead + 1) {
+            let _ = free_tx.send(Vec::with_capacity(span_cap));
+        }
+
+        let reader_ghost = std::sync::Arc::clone(&ghost);
+        let reader = std::thread::Builder::new()
+            .name("ghost-read".to_string())
+            .spawn(move || {
+                while let Ok(layer_idx) = request_rx.recv() {
+                    // Reuse a pooled buffer; recv only blocks when the decoder is `read_ahead`
+                    // layers behind (backpressure), or errors when the decoder has gone away.
+                    let mut buf = match free_rx.recv() {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    let outcome = reader_ghost
+                        .read_layer_bytes(layer_idx, &mut buf)
+                        .map(|(_span, read_us)| read_us);
+                    let read_failed = outcome.is_err();
+                    if stage_tx.send((layer_idx, buf, outcome)).is_err() {
+                        break;
+                    }
+                    if read_failed {
+                        break; // terminal read error already forwarded to the decoder
+                    }
+                }
+            })
+            .expect("failed to spawn ghost-read thread");
+
+        let decoder_ghost = ghost;
+        let decoder = std::thread::Builder::new()
+            .name("ghost-decode".to_string())
+            .spawn(move || {
+                while let Ok((layer_idx, buf, read_outcome)) = stage_rx.recv() {
+                    let result = match read_outcome {
+                        Ok(read_us) => decoder_ghost.decode_layer(layer_idx, &buf).map(
+                            |(weights, span, decode_us)| PrefetchedLayer {
+                                layer_idx,
+                                weights,
+                                bytes: span,
+                                worker_us: read_us + decode_us,
+                                read_us,
+                                decode_us,
+                            },
+                        ),
+                        Err(e) => Err(e),
+                    };
+                    let failed = result.is_err();
+                    // Return the buffer to the pool BEFORE the (possibly blocking) rendezvous
+                    // handoff, so the reader keeps working ahead while main consumes this layer.
+                    let _ = free_tx.send(buf);
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                    if failed {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn ghost-decode thread");
+
+        Self {
+            request_tx: Some(request_tx),
+            result_rx: Some(result_rx),
+            reader: Some(reader),
+            decoder: Some(decoder),
+        }
+    }
+
+    /// Queue a layer for the reader; fulfilled strictly in order (matches [`GhostPrefetcher`]).
+    pub fn request(&self, layer_idx: usize) -> Result<()> {
+        self.request_tx
+            .as_ref()
+            .expect("pipeline prefetcher closed")
+            .send(layer_idx)
+            .map_err(|_| invalid("ghost stage-split reader exited unexpectedly".to_string()))
+    }
+
+    /// Block until the next layer is decoded and handed off.
+    pub fn next(&self) -> Result<PrefetchedLayer> {
+        self.result_rx
+            .as_ref()
+            .expect("pipeline prefetcher closed")
+            .recv()
+            .map_err(|_| invalid("ghost stage-split decoder exited unexpectedly".to_string()))?
+    }
+}
+
+impl Drop for GhostPipelinePrefetcher {
+    fn drop(&mut self) {
+        // Cascade shutdown: dropping request_tx ends an idle reader; dropping result_rx frees a
+        // decoder blocked on the rendezvous send. A decoder exit drops its stage_rx + free_tx,
+        // releasing a reader blocked on stage_tx.send (full) or free_rx.recv (empty); a reader
+        // exit drops stage_tx, releasing a decoder blocked on stage_rx.recv — so both unwind.
+        drop(self.request_tx.take());
+        drop(self.result_rx.take());
+        if let Some(decoder) = self.decoder.take() {
+            let _ = decoder.join();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
