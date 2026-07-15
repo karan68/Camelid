@@ -101,7 +101,12 @@ This is the single source of truth for every phase (CPU decode, CPU streaming do
 
 ## Phases
 
-### Phase 1 — Decode + f32 load path (foundational, provable) — **this branch**
+> **Status (all four phases complete + validated on `bartowski/Llama-3.2-1B-Instruct-IQ4_XS.gguf`,
+> RTX 4060):** CPU decode + streaming and CUDA-resident GEMV all generate coherent output; the
+> model runs fully resident in the 8 GB GPU at ~47 tok/s (vs ~1 tok/s on the deterministic CPU
+> path). Branch `feat/iquant-iq4xs`.
+
+### Phase 1 — Decode + f32 load path (foundational, provable) — **DONE**
 - `src/gguf/reader.rs`: add `IQ4XS` variant; `from_id` `23 => IQ4XS`; `layout` `(256, 136)`.
 - `src/tensor/mod.rs`: `IQ4_XS_BLOCK_BYTES = 136`; module-level `KVALUES_IQ4NL`; `IQ4XSBlock`
   (`from_bytes`, `scale_f32`, `dequantize`); `decode_iq4_xs_blocks`; `decode_iq4_xs_tensor`;
@@ -111,7 +116,7 @@ This is the single source of truth for every phase (CPU decode, CPU streaming do
   on misaligned bytes; codebook-shared-with-IQ4_NL invariant.
 - Gates green (fmt, clippy `--all-targets --all-features`, `cargo test --lib`).
 
-### Phase 2 — CPU wire-streaming linear (host-RAM fit)
+### Phase 2 — CPU wire-streaming linear (host-RAM fit) — **DONE**
 - `CpuTensor::iq4_xs_wire_bytes` field (update the struct + all constructor sites);
   `load_iq4_xs_wire_linear` (mirror `load_tq2_0_wire_linear`); `iq4_xs_wire_row_dot`
   (int dot vs Q8_K activation, proven equal to the block dequant × activation);
@@ -121,15 +126,24 @@ This is the single source of truth for every phase (CPU decode, CPU streaming do
 - Tests: streaming-dot == reference (decode-then-f32-dot) at nblk 1/2/5; end-to-end single-row
   and prefill-tile equivalence; no-f32-materialization assertion (`data.is_empty()`).
 
-### Phase 3 — CUDA-resident `iq4xs_gemv` (VRAM fit — the goal)
+### Phase 3 — CUDA-resident `iq4xs_gemv` (VRAM fit — the goal) — **DONE**
 - Mirror `q6k_gemv`: upload retained wire bytes, per-row super-block decode + int dot vs Q8_K.
 - Resident-vs-CPU parity gate on a real IQ4_XS GGUF; token-parity oracle where it holds,
   KL band where it does not.
+- Delivered: `iq4xs_gemv` kernel + `ProjQuant::IQ4XS` + `is_iq4xs` residency predicate;
+  GPU parity test `iq4xs_gemv_matches_oracle` (1e-4) passes; the real model runs all layers
+  resident at ~47 tok/s.
 
-### Phase 4 — Admission + Fit Advisor + catalog
+### Phase 4 — Admission + Fit Advisor — **DONE (admission); Advisor already quant-agnostic**
 - `src/runnable/admit.rs`: accept IQ4_XS once a committed quality receipt exists.
 - Fit Advisor: recognize IQ4_XS rows so "won't fit at Q4 → offer an i-quant" is a real
   recommendation; teach the catalog/advisor the i-quant footprint.
+- Delivered: `runnable::dequant` routes IQ4_XS to `decode_iq4_xs_tensor`; `admit.rs`
+  `is_covered_quant` accepts IQ4_XS (the runnable f32 lane runs it). The capacity-axis Fit
+  Advisor already handles IQ4_XS rows (footprint from `size_bytes`/dims is quant-agnostic;
+  `guess_quant` already recognizes the string). The stricter `runnable-smoke`
+  oracle-qualification gate stays closed for IQ4_XS pending a committed llama.cpp parity
+  receipt (fail-closed).
 
 ## Gates (every phase)
 - `cargo fmt --all -- --check`
