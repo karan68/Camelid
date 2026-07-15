@@ -2808,6 +2808,92 @@ fn q6k_gemv_matches_oracle() {
     );
 }
 
+fn synth_iq4xs_wire(rows: usize, n_sb: usize, rng: &mut Lcg) -> Vec<u8> {
+    const WIRE: usize = 136;
+    let mut out = vec![0u8; rows * n_sb * WIRE];
+    for sb in 0..rows * n_sb {
+        let blk = &mut out[sb * WIRE..(sb + 1) * WIRE];
+        // Random scales_h (+2), scales_l (+4), and qs (+8) exercise every sub-block
+        // scale split and codebook index; d (+0) is a sane f16 super-block scale.
+        for b in blk.iter_mut().skip(2) {
+            *b = rng.next_u8();
+        }
+        let d = (rng.next_f32().abs() * 0.03 + 0.001).min(0.1);
+        let db = crate::inference::f32_to_f16_bits(d).to_le_bytes();
+        blk[0] = db[0];
+        blk[1] = db[1];
+    }
+    out
+}
+
+// Parity receipt for the IQ4_XS resident decode GEMV. Generates synthetic IQ4_XS
+// wire bytes + a Q8_K activation, runs iq4xs_gemv on the GPU, and asserts each output
+// row reproduces the validated CPU oracle `iq4_xs_wire_row_dot` on the SAME bytes,
+// within the same 1e-4 relative tolerance as the other resident K-quant lanes (the
+// integer sub-block dots are exact; only the warp-reduce f32 order differs).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn iq4xs_gemv_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let n_sb = 3usize; // contraction dim = 3*256 = 768
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x1a4_5eed_u64);
+
+    let wire = synth_iq4xs_wire(rows, n_sb, &mut rng);
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let q8k = crate::inference::quantize_q8_k_blocks(&act);
+    assert_eq!(q8k.len(), n_sb);
+    let in_scales: Vec<f32> = q8k.iter().map(|b| b.d).collect();
+    let mut in_quants = vec![0i8; kdim];
+    for (b, blk) in q8k.iter().enumerate() {
+        in_quants[b * 256..(b + 1) * 256].copy_from_slice(&blk.qs);
+    }
+
+    const WIRE: usize = 136;
+    let row_bytes = n_sb * WIRE;
+    let mut expected = vec![0f32; rows];
+    for (r, slot) in expected.iter_mut().enumerate() {
+        let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+        *slot = crate::inference::iq4_xs_wire_row_dot(row_wire, &q8k);
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    // IQ4_XS uploads the RAW 136-byte wire (repack_for_lane passes it through).
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_iq4xs_gemv(
+        &k.stream,
+        &k.iq4xs_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wire.len()),
+        rows,
+        n_sb,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let mut worst = 0f32;
+    for (g, e) in got.iter().zip(&expected) {
+        let d = (g - e).abs() / e.abs().max(1.0);
+        if d > worst {
+            worst = d;
+        }
+    }
+    assert!(
+        close(&got, &expected, 1e-4),
+        "iq4xs_gemv diverged from iq4_xs_wire_row_dot oracle (worst rel {worst:.3e})"
+    );
+}
+
 // ---- qwen35 (Ornith) gated-delta-net SSM kernels ---------------------------
 
 #[test]

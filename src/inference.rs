@@ -2203,10 +2203,20 @@ impl LlamaInferenceSession {
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
+        // IQ4_XS residency: 136-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks (the iq4xs_gemv
+        // kernel reads the wire bytes a super-block at a time). An IQ4_XS model keeps
+        // token_embd/output at a higher K-quant, so it mixes IQ4_XS with Q5_K/Q6_K.
+        let is_iq4xs = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::IQ4XS)
+                && t.iq4_xs_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
         // A projection is resident-eligible if it is plain Q8_0 OR a K-quant lane
-        // (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K). Q8_0 behavior is byte-identical to before.
+        // (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K / IQ4_XS). Q8_0 behavior is byte-identical to before.
         let is_resident_quant = |t: &CpuTensor| {
-            is_q8(t) || is_q4k(t) || is_q5k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t)
+            is_q8(t) || is_q4k(t) || is_q5k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t) || is_iq4xs(t)
         };
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
@@ -11085,6 +11095,11 @@ fn build_resident_cuda_engine(
                 return Some(w.as_slice());
             }
         }
+        if t.source_type == Some(GgufTensorType::IQ4XS) {
+            if let Some(w) = t.iq4_xs_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
         None
     }
     // The resident GEMV lane a projection dispatches on (drives the upload repack and
@@ -11096,6 +11111,7 @@ fn build_resident_cuda_engine(
             Some(GgufTensorType::Q6K) if t.q6_k_wire_bytes.is_some() => ProjQuant::Q6K,
             Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
             Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
+            Some(GgufTensorType::IQ4XS) if t.iq4_xs_wire_bytes.is_some() => ProjQuant::IQ4XS,
             _ => ProjQuant::Q8_0,
         }
     }
