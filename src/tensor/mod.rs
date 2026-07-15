@@ -1184,6 +1184,11 @@ pub struct CpuTensor {
     /// quantized weights instead of materialising f32 (a 4B model fully decoded to f32 is
     /// ~16 GB and OOMs). Populated by `load_tq2_0_wire_linear`; `None` otherwise.
     pub tq2_0_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// IQ4_XS wire bytes (136 bytes/256-weight super-block, row-major), retained when the
+    /// tensor's `source_type` is `IQ4XS` so the CPU i-quant block-dot streams the quantized
+    /// weights instead of materialising f32. Populated by `load_iq4_xs_wire_linear`; `None`
+    /// otherwise.
+    pub iq4_xs_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     pub data: Vec<f32>,
 }
 
@@ -1342,6 +1347,7 @@ impl Q8_0TensorBlocks {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data,
         })
     }
@@ -1424,6 +1430,7 @@ impl CpuTensor {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data,
         })
     }
@@ -1514,6 +1521,7 @@ impl CpuTensor {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data: Vec::new(),
         })
     }
@@ -1548,6 +1556,7 @@ impl CpuTensor {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1577,6 +1586,7 @@ impl CpuTensor {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1606,6 +1616,7 @@ impl CpuTensor {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -3711,6 +3722,7 @@ impl TensorStore {
             q2_k_wire_bytes,
             q3_k_wire_bytes,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data: Vec::new(),
         })
     }
@@ -3745,6 +3757,42 @@ impl TensorStore {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: Some(std::sync::Arc::new(bytes.to_vec())),
+            iq4_xs_wire_bytes: None,
+            data: Vec::new(),
+        })
+    }
+
+    /// Load an IQ4_XS (i-quant) 2-D linear by retaining its raw wire bytes only — no f32
+    /// materialisation. The CPU i-quant block-dot streams these directly. Mirrors
+    /// `load_tq2_0_wire_linear`. Falls back to f32 for non-IQ4_XS / non-2-D tensors.
+    pub fn load_iq4_xs_wire_linear(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        if !matches!(desc.tensor_type, GgufTensorType::IQ4XS) || shape.dims.len() != 2 {
+            return self.load_cpu_f32(name);
+        }
+        let bytes = self.tensor_bytes(name)?;
+        Ok(CpuTensor {
+            name: name.to_string(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(desc.tensor_type),
+            q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
+            q5_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: Some(std::sync::Arc::new(bytes.to_vec())),
             data: Vec::new(),
         })
     }
@@ -3978,6 +4026,7 @@ impl TensorStore {
             q2_k_wire_bytes,
             q3_k_wire_bytes,
             tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
             data,
         })
     }
@@ -4238,12 +4287,22 @@ pub const IQ4_NL_BLOCK_BYTES: usize = 18;
 pub const IQ4_XS_BLOCK_BYTES: usize = 2 + 2 + (QK_K_BLOCK_SIZE / 64) + (QK_K_BLOCK_SIZE / 2);
 
 /// ggml `kvalues_iq4nl`: the 16-entry non-linear codebook shared by the IQ4_NL and IQ4_XS
-/// formats. Single source of truth — both block decoders index this exact table so their
-/// dequantized magnitudes are identical by construction.
-pub(crate) const KVALUES_IQ4NL: [f32; 16] = [
-    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
-    89.0, 113.0,
+/// formats, as signed integers (the quantized weight magnitudes). Single source of truth.
+pub(crate) const KVALUES_IQ4NL_I8: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
+
+/// f32 view of [`KVALUES_IQ4NL_I8`], derived at compile time so the two can never diverge.
+/// Used by the block decoders; the streaming integer dot uses the i8 table directly.
+pub(crate) const KVALUES_IQ4NL: [f32; 16] = {
+    let mut out = [0.0_f32; 16];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = KVALUES_IQ4NL_I8[i] as f32;
+        i += 1;
+    }
+    out
+};
 
 #[inline(always)]
 pub fn fast_f16_to_f32(bits: u16) -> f32 {
@@ -4880,10 +4939,22 @@ impl IQ4XSBlock {
     /// `scales_l[ib/2]` (even/odd nibble) OR'd with the high 2 bits from `scales_h`, biased -32.
     #[inline]
     fn sub_block_scale(&self, ib: usize) -> f32 {
+        self.scale_f32() * self.sub_block_scale_int(ib) as f32
+    }
+
+    /// Integer part of sub-block `ib`'s scale: `ls - 32` (before the f16 super-scale). The
+    /// streaming integer dot multiplies this by the super-scale and the Q8_K activation scale.
+    #[inline]
+    pub(crate) fn sub_block_scale_int(&self, ib: usize) -> i32 {
         let low = (self.scales_l[ib / 2] >> (4 * (ib & 1))) & 0x0F;
         let high = ((self.scales_h >> (2 * ib)) & 0x3) as u8;
-        let ls = i32::from(low | (high << 4));
-        self.scale_f32() * (ls - 32) as f32
+        i32::from(low | (high << 4)) - 32
+    }
+
+    /// The 128 raw 4-bit codebook-index bytes (two indices per byte).
+    #[inline]
+    pub(crate) fn qs(&self) -> &[u8; QK_K_BLOCK_SIZE / 2] {
+        &self.qs
     }
 
     pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {

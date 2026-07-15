@@ -101,6 +101,7 @@ pub fn deserialize_tensor<R: Read>(reader: &mut R, name: String) -> std::io::Res
         q2_k_wire_bytes: None,
         q3_k_wire_bytes: None,
         tq2_0_wire_bytes: None,
+        iq4_xs_wire_bytes: None,
         data,
     })
 }
