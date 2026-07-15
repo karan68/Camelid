@@ -6,6 +6,31 @@
 use super::{CudaResidentDecode, CudaResidentKernels, ProjQuant};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
+// Pure predicate (no GPU): the device-decode embed-gather allowlist must stay in
+// lockstep with the `embed_gather_*` dispatch in `forward_token_device`. Families
+// without a kernel (Q5_K/Q2_K/IQ4_XS) must be refused at `set_device_decode_tables`
+// so the engine falls back to the host-fed loop instead of failing mid-forward.
+#[test]
+fn device_embed_gather_allowlist_matches_the_gather_dispatch() {
+    for q in [
+        ProjQuant::Q8_0,
+        ProjQuant::Q4K,
+        ProjQuant::Q6K,
+        ProjQuant::Q3K,
+    ] {
+        assert!(
+            q.has_device_embed_gather(),
+            "{q:?} has an embed_gather_* kernel and must be device-decode eligible"
+        );
+    }
+    for q in [ProjQuant::Q5K, ProjQuant::Q2K, ProjQuant::IQ4XS] {
+        assert!(
+            !q.has_device_embed_gather(),
+            "{q:?} has no embed_gather_* kernel and must fall back to the host-fed loop"
+        );
+    }
+}
+
 // f16 round-trip matching the engine.
 fn f16rt(x: f32) -> f32 {
     crate::inference::f16_bits_to_f32(crate::inference::f32_to_f16_bits(x))

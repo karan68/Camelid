@@ -5052,6 +5052,19 @@ impl ProjQuant {
                 | ProjQuant::IQ4XS
         )
     }
+
+    /// Whether a device-side `embed_gather_*` kernel exists for this family. The
+    /// qwen35 device-decode loop gathers the embedding row on the GPU, so a family
+    /// without a gather kernel (Q5_K / Q2_K / IQ4_XS) must NOT be installed for
+    /// device decode — the caller falls back to the host-fed loop (CPU dequant)
+    /// instead. Kept in lockstep with the `embed_gather_*` dispatch in
+    /// `forward_token_device`.
+    pub(crate) fn has_device_embed_gather(self) -> bool {
+        matches!(
+            self,
+            ProjQuant::Q8_0 | ProjQuant::Q4K | ProjQuant::Q6K | ProjQuant::Q3K
+        )
+    }
 }
 
 /// The seven projection quant types of one layer, in q,k,v,o,gate,up,down order.
@@ -7228,6 +7241,15 @@ impl CudaResidentDecode {
         cos_all: &[f32],
         sin_all: &[f32],
     ) -> Result<(), String> {
+        // The device-decode loop gathers the embedding row on the GPU, so it needs an
+        // `embed_gather_*` kernel for `family`. Families without one (Q5_K/Q2_K/IQ4_XS)
+        // MUST fail here so the caller falls back to the host-fed loop (CPU dequant)
+        // instead of installing tables that then error mid-`forward_token_device`.
+        if !family.has_device_embed_gather() {
+            return Err(format!(
+                "device-decode embedding gather not implemented for {family:?}"
+            ));
+        }
         let map = |e: cudarc::driver::DriverError| format!("device decode tables: {e}");
         let s = self.k.stream.clone();
         let table = s.clone_htod(embd_wire).map_err(map)?;
