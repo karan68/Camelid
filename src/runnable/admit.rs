@@ -185,6 +185,7 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::Q4K
             | GgufTensorType::Q3K
             | GgufTensorType::Q4_0
+            | GgufTensorType::IQ4XS
     )
 }
 
@@ -198,7 +199,7 @@ fn check_quants(file: &GgufFile) -> Result<BTreeSet<GgufTensorType>, AdmissionRe
                 tensor: Some(tensor.name.clone()),
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
-                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K",
+                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS",
                     tensor.tensor_type, tensor.name
                 ),
             });
@@ -307,6 +308,17 @@ mod tests {
             file.tensors.push(tensor("blk.0.ffn_down.weight", tt));
             assert!(admit(&file).is_ok(), "covered quant {tt:?} must admit");
         }
+    }
+
+    #[test]
+    fn accepts_iq4_xs_quant() {
+        // IQ4_XS gained a runnable-lane dequant (decode_iq4_xs_tensor); an IQ4_XS model
+        // whose other tensors are covered must now admit. (IQ4_NL remains an explicit gap.)
+        let mut file = base_fixture();
+        file.tensors
+            .push(tensor("blk.0.ffn_down.weight", GgufTensorType::IQ4XS));
+        let ok = admit(&file).expect("IQ4_XS must admit");
+        assert!(ok.quants.contains(&GgufTensorType::IQ4XS));
     }
 
     #[test]
