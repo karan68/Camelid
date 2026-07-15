@@ -491,7 +491,7 @@ impl UncachedReader {
         // Locate a sector-aligned window inside the over-allocated scratch.
         let base = self.scratch.as_ptr() as usize;
         let pad = (Self::SECTOR - (base % Self::SECTOR)) % Self::SECTOR;
-        if start % Self::SECTOR as u64 != 0
+        if !start.is_multiple_of(Self::SECTOR as u64)
             || start + aligned_len as u64 > self.file_len
             || pad + aligned_len > self.scratch.len()
         {

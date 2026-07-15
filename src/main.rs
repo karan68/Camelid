@@ -2362,6 +2362,7 @@ fn ghost_stream_layers(
 /// transformer block at a time from a `.cghost` file. RAM holds the embedding/output ends +
 /// KV cache + the streaming window (one layer sync, two prefetched); everything else stays
 /// on disk.
+#[allow(clippy::too_many_arguments)]
 fn run_ghost(
     model: PathBuf,
     cghost: PathBuf,
