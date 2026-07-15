@@ -3937,11 +3937,12 @@ impl TensorStore {
             }
             GgufTensorType::Q8K => decode_q8_k_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::IQ4NL => decode_iq4_nl_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::IQ4XS => decode_iq4_xs_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq1_0 => decode_tq1_0_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq2_0 => decode_tq2_0_tensor(name, &bytes, expected_elements)?,
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, TQ1_0, TQ2_0"
+                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0"
                 )))
             }
         };
@@ -4233,6 +4234,16 @@ pub const Q5_K_BLOCK_BYTES: usize = 4 + 12 + 32 + 128;
 pub const Q6_K_BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
 pub const Q8_K_BLOCK_BYTES: usize = 292;
 pub const IQ4_NL_BLOCK_BYTES: usize = 18;
+// block_iq4_xs = f16 d(2) + scales_h u16(2) + scales_l[QK_K/64]=4 + qs[QK_K/2]=128 = 136 (4.25 bpw)
+pub const IQ4_XS_BLOCK_BYTES: usize = 2 + 2 + (QK_K_BLOCK_SIZE / 64) + (QK_K_BLOCK_SIZE / 2);
+
+/// ggml `kvalues_iq4nl`: the 16-entry non-linear codebook shared by the IQ4_NL and IQ4_XS
+/// formats. Single source of truth — both block decoders index this exact table so their
+/// dequantized magnitudes are identical by construction.
+pub(crate) const KVALUES_IQ4NL: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    89.0, 113.0,
+];
 
 #[inline(always)]
 pub fn fast_f16_to_f32(bits: u16) -> f32 {
@@ -4825,14 +4836,65 @@ impl IQ4NLBlock {
 
     pub fn dequantize(&self, out: &mut [f32; 32]) {
         let d = self.scale_f32();
-        const KVALUES: [f32; 16] = [
-            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
-            69.0, 89.0, 113.0,
-        ];
         for j in 0..16 {
             let byte = self.qs[j];
-            out[j] = d * KVALUES[(byte & 0x0F) as usize];
-            out[j + 16] = d * KVALUES[(byte >> 4) as usize];
+            out[j] = d * KVALUES_IQ4NL[(byte & 0x0F) as usize];
+            out[j + 16] = d * KVALUES_IQ4NL[(byte >> 4) as usize];
+        }
+    }
+}
+
+/// IQ4_XS super-block (256 weights in 136 bytes, 4.25 bpw). One f16 super-block scale, eight
+/// 6-bit sub-block scales (biased by -32, low nibble in `scales_l`, high 2 bits in `scales_h`),
+/// and 128 bytes of 4-bit codebook indices into [`KVALUES_IQ4NL`]. Bit-for-bit with ggml's
+/// `dequantize_row_iq4_xs`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IQ4XSBlock {
+    d: u16,
+    scales_h: u16,
+    scales_l: [u8; QK_K_BLOCK_SIZE / 64],
+    qs: [u8; QK_K_BLOCK_SIZE / 2],
+}
+
+impl IQ4XSBlock {
+    pub fn from_bytes(bytes: &[u8; IQ4_XS_BLOCK_BYTES]) -> Self {
+        let d = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let scales_h = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let mut scales_l = [0_u8; QK_K_BLOCK_SIZE / 64];
+        scales_l.copy_from_slice(&bytes[4..4 + QK_K_BLOCK_SIZE / 64]);
+        let mut qs = [0_u8; QK_K_BLOCK_SIZE / 2];
+        qs.copy_from_slice(&bytes[4 + QK_K_BLOCK_SIZE / 64..IQ4_XS_BLOCK_BYTES]);
+        Self {
+            d,
+            scales_h,
+            scales_l,
+            qs,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.d)
+    }
+
+    /// Effective f32 scale of sub-block `ib` (0..8): the 6-bit scale is the low nibble from
+    /// `scales_l[ib/2]` (even/odd nibble) OR'd with the high 2 bits from `scales_h`, biased -32.
+    #[inline]
+    fn sub_block_scale(&self, ib: usize) -> f32 {
+        let low = (self.scales_l[ib / 2] >> (4 * (ib & 1))) & 0x0F;
+        let high = ((self.scales_h >> (2 * ib)) & 0x3) as u8;
+        let ls = i32::from(low | (high << 4));
+        self.scale_f32() * (ls - 32) as f32
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {
+        for ib in 0..QK_K_BLOCK_SIZE / 32 {
+            let dl = self.sub_block_scale(ib);
+            let qs = &self.qs[ib * 16..ib * 16 + 16];
+            let base = ib * 32;
+            for j in 0..16 {
+                out[base + j] = dl * KVALUES_IQ4NL[(qs[j] & 0x0F) as usize];
+                out[base + j + 16] = dl * KVALUES_IQ4NL[(qs[j] >> 4) as usize];
+            }
         }
     }
 }
@@ -5021,6 +5083,23 @@ pub fn decode_iq4_nl_blocks(bytes: &[u8]) -> Result<Vec<IQ4NLBlock>> {
         .map(|chunk| {
             let chunk_bytes: &[u8; IQ4_NL_BLOCK_BYTES] = chunk.try_into().unwrap();
             IQ4NLBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_iq4_xs_blocks(bytes: &[u8]) -> Result<Vec<IQ4XSBlock>> {
+    if !bytes.len().is_multiple_of(IQ4_XS_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "IQ4_XS byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            IQ4_XS_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(IQ4_XS_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; IQ4_XS_BLOCK_BYTES] = chunk.try_into().unwrap();
+            IQ4XSBlock::from_bytes(chunk_bytes)
         })
         .collect())
 }
@@ -5269,6 +5348,18 @@ fn decode_iq4_nl_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> R
     Ok(out)
 }
 
+fn decode_iq4_xs_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_iq4_xs_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -5301,6 +5392,157 @@ mod tests {
         // Overflow saturates to inf; tiny values flush toward subnormals/zero.
         assert_eq!(f32_to_f16_bits(1.0e6) & 0x7fff, 0x7c00);
         assert_eq!(f16_bits_to_f32(f32_to_f16_bits(1.0e-8)), 0.0);
+    }
+
+    /// Independent, spec-literal reference for IQ4_XS dequant (a second implementation used
+    /// only to cross-check the optimized [`super::IQ4XSBlock`] decoder). Mirrors ggml's
+    /// `dequantize_row_iq4_xs` field-for-field.
+    fn iq4_xs_reference_dequant(block: &[u8; super::IQ4_XS_BLOCK_BYTES]) -> [f32; 256] {
+        use super::{f16_bits_to_f32, KVALUES_IQ4NL};
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let scales_h = u16::from_le_bytes([block[2], block[3]]);
+        let scales_l = &block[4..8];
+        let qs = &block[8..136];
+        let mut out = [0.0_f32; 256];
+        for ib in 0..8usize {
+            let low = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+            let high = ((scales_h >> (2 * ib)) & 0x3) as u8;
+            let ls = (low | (high << 4)) as i32;
+            let dl = d * (ls - 32) as f32;
+            for j in 0..16usize {
+                let byte = qs[ib * 16 + j];
+                out[ib * 32 + j] = dl * KVALUES_IQ4NL[(byte & 0x0F) as usize];
+                out[ib * 32 + j + 16] = dl * KVALUES_IQ4NL[(byte >> 4) as usize];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn iq4_xs_block_dequant_matches_hand_computed_golden() {
+        use super::{IQ4XSBlock, IQ4_XS_BLOCK_BYTES};
+        // d = 1.0 (f16 0x3C00). Sub-block scales chosen so dl = ls - 32 is exact per sub-block:
+        //   ib:  0   1   2    3    4    5   6    7
+        //   ls: 33  32  63    0   24    2  36   26
+        //   dl:  1   0  31  -32   -8  -30   4   -6
+        // scales_l nibbles (even ib -> low, odd ib -> high of scales_l[ib/2]):
+        //   [0]=(ib0 low=1, ib1 high=0)=0x01  [1]=(ib2=15, ib3=0)=0x0F
+        //   [2]=(ib4=8,  ib5 high=2)=0x28     [3]=(ib6=4,  ib7 high=10)=0xA4
+        // scales_h (2 bits/sub-block): highs 2,2,3,0,1,0,2,1 -> 0x613A.
+        let mut bytes = [0_u8; IQ4_XS_BLOCK_BYTES];
+        bytes[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&0x613Au16.to_le_bytes());
+        bytes[4..8].copy_from_slice(&[0x01, 0x0F, 0x28, 0xA4]);
+        // Every quant byte = 0x80: low nibble 0 -> kv[0]=-127, high nibble 8 -> kv[8]=1.
+        for b in bytes[8..136].iter_mut() {
+            *b = 0x80;
+        }
+        let mut out = [0.0_f32; 256];
+        IQ4XSBlock::from_bytes(&bytes).dequantize(&mut out);
+
+        let dl = [1.0, 0.0, 31.0, -32.0, -8.0, -30.0, 4.0, -6.0];
+        for (ib, &d) in dl.iter().enumerate() {
+            for j in 0..16 {
+                assert_eq!(out[ib * 32 + j], d * -127.0, "ib{ib} j{j} low half");
+                assert_eq!(out[ib * 32 + j + 16], d * 1.0, "ib{ib} j{j} high half");
+            }
+        }
+        // And the optimized decoder equals the spec-literal reference on this block.
+        assert_eq!(out, iq4_xs_reference_dequant(&bytes));
+    }
+
+    #[test]
+    fn iq4_xs_block_dequant_matches_reference_over_deterministic_blocks() {
+        use super::{IQ4XSBlock, IQ4_XS_BLOCK_BYTES};
+        // Deterministic LCG fills exercise every codebook index, scale split, and nibble.
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        for _ in 0..64 {
+            let mut bytes = [0_u8; IQ4_XS_BLOCK_BYTES];
+            for b in bytes.iter_mut() {
+                *b = next();
+            }
+            let mut out = [0.0_f32; 256];
+            IQ4XSBlock::from_bytes(&bytes).dequantize(&mut out);
+            let reference = iq4_xs_reference_dequant(&bytes);
+            // Bit-for-bit: random f16 `d` bytes can encode NaN/Inf, so compare raw bits
+            // (NaN != NaN under `==`). The two implementations run identical float ops, so
+            // every lane — finite or not — must match exactly.
+            for i in 0..256 {
+                assert_eq!(
+                    out[i].to_bits(),
+                    reference[i].to_bits(),
+                    "lane {i} differs for block {bytes:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iq4_xs_sub_block_scale_unpacks_low_high_and_minus32_bias() {
+        use super::{IQ4XSBlock, IQ4_XS_BLOCK_BYTES};
+        // d = 1.0. ib0: scales_l low nibble 5 + scales_h high bits 3 -> ls = 5|48 = 53 -> dl = 21.
+        // ib1: low 0 + high 0 -> ls = 0 -> dl = -32. qs byte 0x00 -> both nibbles index kv[0].
+        let mut bytes = [0_u8; IQ4_XS_BLOCK_BYTES];
+        bytes[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&0x0003u16.to_le_bytes());
+        bytes[4] = 0x05;
+        bytes[8] = 0x00;
+        let block = IQ4XSBlock::from_bytes(&bytes);
+        assert_eq!(block.sub_block_scale(0), 21.0);
+        assert_eq!(block.sub_block_scale(1), -32.0);
+        let mut out = [0.0_f32; 256];
+        block.dequantize(&mut out);
+        assert_eq!(out[0], 21.0 * -127.0); // ib0, kv[0]
+        assert_eq!(out[32], -32.0 * -127.0); // ib1, kv[0]
+    }
+
+    #[test]
+    fn iq4_xs_tensor_decode_spans_multiple_blocks_and_rejects_misalignment() {
+        use super::{decode_iq4_xs_tensor, IQ4_XS_BLOCK_BYTES};
+        // Two full super-blocks of distinct constant bytes.
+        let mut bytes = Vec::new();
+        for fill in [0x11u8, 0x22u8] {
+            let mut blk = vec![0u8; IQ4_XS_BLOCK_BYTES];
+            blk[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+            for b in blk[2..].iter_mut() {
+                *b = fill;
+            }
+            bytes.extend_from_slice(&blk);
+        }
+        let decoded = decode_iq4_xs_tensor("blk.iq4xs", &bytes, 512).unwrap();
+        assert_eq!(decoded.len(), 512);
+        let mut b0 = [0u8; IQ4_XS_BLOCK_BYTES];
+        b0.copy_from_slice(&bytes[0..IQ4_XS_BLOCK_BYTES]);
+        assert_eq!(&decoded[0..256], &iq4_xs_reference_dequant(&b0)[..]);
+
+        // One byte short of a block boundary must fail closed, not truncate silently.
+        let err = decode_iq4_xs_tensor("blk.bad", &bytes[..bytes.len() - 1], 512).unwrap_err();
+        assert!(format!("{err}").contains("not aligned"), "got: {err}");
+    }
+
+    #[test]
+    fn iq4_nl_and_iq4_xs_share_the_same_codebook() {
+        use super::{IQ4NLBlock, IQ4_NL_BLOCK_BYTES, KVALUES_IQ4NL};
+        // The shared const carries the exact ggml kvalues_iq4nl table.
+        assert_eq!(
+            KVALUES_IQ4NL,
+            [
+                -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
+                53.0, 69.0, 89.0, 113.0
+            ]
+        );
+        // IQ4_NL still indexes that same table (d = 1.0, qs byte 0xF0 -> kv[0] then kv[15]).
+        let mut bytes = [0u8; IQ4_NL_BLOCK_BYTES];
+        bytes[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        bytes[2] = 0xF0;
+        let mut out = [0.0_f32; 32];
+        IQ4NLBlock::from_bytes(&bytes).dequantize(&mut out);
+        assert_eq!(out[0], KVALUES_IQ4NL[0]);
+        assert_eq!(out[16], KVALUES_IQ4NL[15]);
     }
 
     use super::{
