@@ -896,6 +896,76 @@ extern "C" __global__ void q6k_gemv(
     }
 }
 
+// ---- IQ4_XS GEMV: one warp per output row, fused codebook dequant + integer dot
+// Numerically matches the CPU oracle `iq4_xs_wire_row_dot` (validated to 1e-4,
+// the same tolerance gate as the other resident K-quant lanes). The activation is
+// Q8_K (256-wide blocks). Weights are read STRAIGHT from the 136-byte GGUF wire
+// super-block: d(f16 @0) + scales_h(u16 @2) + scales_l[4] @4 + qs[128] @8. The
+// 16-entry non-linear codebook `kvalues_iq4nl` maps each 4-bit index to a signed
+// weight; each of the 8 sub-blocks has a 6-bit scale `ls` (low nibble in scales_l,
+// high 2 bits in scales_h) biased by -32. Per super-block b: d4d8 = d_w * d_act;
+// per sub-block ib: sumi = Σ kv[qs nibble]·q8 (exact integer), then the f32 term
+// `d4d8 * ls * sumi` (matching the oracle's per-ib association). Each lane owns a
+// strided set of super-blocks; the final warp-reduce over f32 partials is what the
+// 1e-4 tolerance absorbs (integer sumi/ls are exact).
+extern "C" __global__ void iq4xs_gemv(
+    const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
+    const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
+    const unsigned char* __restrict__ weight_bytes, // raw 136-byte IQ4_XS wire, row-major
+    int rows, int n_sb, float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem_iq4[];
+    signed char* s_iq = (signed char*)smem_iq4;              // n_sb*256 i8 staged input
+    float* s_is = (float*)(smem_iq4 + (long)n_sb * 256);     // n_sb f32 staged scales
+    int tid = threadIdx.x;
+    for (int i = tid; i < n_sb * 64; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];     // n_sb*256 bytes as ints
+    for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    const int KV[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+    };
+    const int WIRE = 136;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    if (row >= rows) return;
+    long row_sb0 = (long)row * n_sb;
+    float acc = 0.0f;
+    for (int b = lane; b < n_sb; b += 32) {
+        const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
+        unsigned short d_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
+        float d4d8 = f16_bits_to_f32(d_bits) * s_is[b];
+        unsigned short sh = (unsigned short)block[2] | ((unsigned short)block[3] << 8);
+        const unsigned char* sl = block + 4;
+        const unsigned char* qs = block + 8;
+        const signed char* y256 = s_iq + (long)b * 256;
+        #pragma unroll
+        for (int ib = 0; ib < 8; ib++) {
+            int low = (sl[ib >> 1] >> (4 * (ib & 1))) & 0xF;
+            int high = (sh >> (2 * ib)) & 0x3;
+            int ls = (low | (high << 4)) - 32;
+            const unsigned char* q = qs + ib * 16;
+            const signed char* yy = y256 + ib * 32;
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                int byte = q[j];
+                sumi += KV[byte & 0xF] * (int)yy[j];
+                sumi += KV[byte >> 4] * (int)yy[j + 16];
+            }
+            acc += d4d8 * (float)ls * (float)sumi;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off >= 1; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0)
+        output[row] = residual ? (output[row] + acc) : acc;
+}
+
 // ---- Q2_K GEMV: one warp per output row, fused dequant + integer dot ---------
 // Bit-identical reproduction of the CPU oracle `q2_k_wire_row_dot`
 // (ggml_vec_dot_q2_K_q8_K generic shape). The activation is Q8_K (256-wide
@@ -2857,6 +2927,7 @@ pub struct CudaResidentKernels {
     pub(crate) q6k_gemv: CudaFunction,
     pub(crate) q2k_gemv: CudaFunction,
     pub(crate) q3k_gemv: CudaFunction,
+    pub(crate) iq4xs_gemv: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
     pub(crate) rms_norm_quantize_q8k: CudaFunction,
     pub(crate) silu_mul_quantize_q8k: CudaFunction,
@@ -2948,6 +3019,7 @@ impl CudaResidentKernels {
             q5k_gemv: f("q5k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
             q2k_gemv: f("q2k_gemv")?,
+            iq4xs_gemv: f("iq4xs_gemv")?,
             q3k_gemv: f("q3k_gemv")?,
             quantize_q8k: f("quantize_q8k")?,
             rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
@@ -3058,6 +3130,9 @@ fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
         ProjQuant::Q6K => pad_q6k_blocks(bytes),
         ProjQuant::Q4K => swz_q4k_blocks(bytes),
         ProjQuant::Q5K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
+        // IQ4_XS is read straight from the 136-byte GGUF wire (raw passthrough, like
+        // Q5_K/Q2_K/Q3_K): the kernel unpacks nibbles/codebook on the fly.
+        ProjQuant::IQ4XS => bytes.to_vec(),
     }
 }
 
@@ -3274,6 +3349,43 @@ pub(crate) fn launch_q4k_gemv(
         block_dim: (block, 1, 1),
         // staged input: n_sb*256 i8 + n_sb*4 f32; per-warp scratch: n_sb*9 i32.
         shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4 + warps_per_block * n_sb_u * 9 * 4,
+    };
+    let (r, nb) = (rows as i32, n_sb as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// IQ4_XS GEMV launch: same warp-per-row geometry as `launch_q6k_gemv`, but the
+/// kernel accumulates f32 partials in registers (no per-warp integer scratch), so
+/// shared memory is just the staged Q8_K activation. Weight is the RAW 136-byte
+/// IQ4_XS wire (raw passthrough upload; the kernel unpacks the codebook on the fly).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_iq4xs_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    n_sb: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let n_sb_u = n_sb as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged input only: n_sb*256 i8 + n_sb*4 f32 (partials live in registers).
+        shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4,
     };
     let (r, nb) = (rows as i32, n_sb as i32);
     let mut b = s.launch_builder(f);
@@ -3604,6 +3716,17 @@ fn dispatch_gemv(
         ProjQuant::Q3K => launch_q3k_gemv(
             s,
             &kern.q3k_gemv,
+            q8k_scales,
+            q8k_quants,
+            weight,
+            rows,
+            cols / 256,
+            out,
+            residual,
+        ),
+        ProjQuant::IQ4XS => launch_iq4xs_gemv(
+            s,
+            &kern.iq4xs_gemv,
             q8k_scales,
             q8k_quants,
             weight,
@@ -4913,6 +5036,7 @@ pub enum ProjQuant {
     Q6K,
     Q2K,
     Q3K,
+    IQ4XS,
 }
 
 impl ProjQuant {
@@ -4920,7 +5044,25 @@ impl ProjQuant {
     fn needs_q8k(self) -> bool {
         matches!(
             self,
-            ProjQuant::Q4K | ProjQuant::Q5K | ProjQuant::Q6K | ProjQuant::Q2K | ProjQuant::Q3K
+            ProjQuant::Q4K
+                | ProjQuant::Q5K
+                | ProjQuant::Q6K
+                | ProjQuant::Q2K
+                | ProjQuant::Q3K
+                | ProjQuant::IQ4XS
+        )
+    }
+
+    /// Whether a device-side `embed_gather_*` kernel exists for this family. The
+    /// qwen35 device-decode loop gathers the embedding row on the GPU, so a family
+    /// without a gather kernel (Q5_K / Q2_K / IQ4_XS) must NOT be installed for
+    /// device decode — the caller falls back to the host-fed loop (CPU dequant)
+    /// instead. Kept in lockstep with the `embed_gather_*` dispatch in
+    /// `forward_token_device`.
+    pub(crate) fn has_device_embed_gather(self) -> bool {
+        matches!(
+            self,
+            ProjQuant::Q8_0 | ProjQuant::Q4K | ProjQuant::Q6K | ProjQuant::Q3K
         )
     }
 }
@@ -7099,6 +7241,15 @@ impl CudaResidentDecode {
         cos_all: &[f32],
         sin_all: &[f32],
     ) -> Result<(), String> {
+        // The device-decode loop gathers the embedding row on the GPU, so it needs an
+        // `embed_gather_*` kernel for `family`. Families without one (Q5_K/Q2_K/IQ4_XS)
+        // MUST fail here so the caller falls back to the host-fed loop (CPU dequant)
+        // instead of installing tables that then error mid-`forward_token_device`.
+        if !family.has_device_embed_gather() {
+            return Err(format!(
+                "device-decode embedding gather not implemented for {family:?}"
+            ));
+        }
         let map = |e: cudarc::driver::DriverError| format!("device decode tables: {e}");
         let s = self.k.stream.clone();
         let table = s.clone_htod(embd_wire).map_err(map)?;
@@ -7190,6 +7341,7 @@ impl CudaResidentDecode {
                 ProjQuant::Q8_0 => &this.k.embed_gather_q8_0,
                 ProjQuant::Q5K => return Err("q5_K embedding gather not implemented".into()),
                 ProjQuant::Q2K => return Err("q2_K embedding gather not implemented".into()),
+                ProjQuant::IQ4XS => return Err("iq4_xs embedding gather not implemented".into()),
             };
             let dim = this.hidden;
             launch_embed_gather(&s, f, table, &tok_view, dim, &mut this.d_hidden).map_err(map)?;

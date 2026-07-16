@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "ac2df92f",
+    "source_head": "ed1a3a4d",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -54,6 +54,11 @@
         "id": "TQ2_0",
         "status": "supported_named_exact_rows_only",
         "notes": "ternary_bonsai_4b_tq2_0 only: single-node CPU completion smoke (receipt qa/ternary/tq2_0-bonsai-parity-receipt.json). Other TQ2_0 files load to the unverified experimental lane only; no ternary-wide claim."
+      },
+      {
+        "id": "IQ4_XS",
+        "status": "supported_named_exact_rows_only",
+        "notes": "i-quants are certified per exact row only: llama3_2_1b_instruct_iq4_xs (IQ4_XS 4.25bpw linears + K-quant tied embed/lm_head) is supported_exact_row_smoke scoped to GPU-resident/CPU raw-completion parity smoke, with its receipt cited on the model_compatibility row (qa/iquant/iq4xs-llama3.2-1b-parity-receipt.json). Other IQ4_XS files load to the unverified experimental lane only (runnable-lane admission covers the format; no parity claim); other i-quant formats (IQ3_XXS, IQ2_*, IQ1_*) are unimplemented and fail closed. No i-quant-wide claim."
       }
     ],
     "planned_quantization": [
@@ -897,6 +902,57 @@
         "latest_checked_output": "Paris",
         "evidence": "Ternary-Bonsai-4B-TQ2_0.gguf (sha256 b85dcbaa6f57a9c71252371c97f4c68602c2c5fc61a9e1ce74d963d6fee5047c, general.architecture=qwen3, 36 layers, TQ2_0 2.06bpw ternary linears + Q6_K tied embed/lm_head, yarn rope factor 4) runs end-to-end on a single i7-11800H CPU (CUDA hidden), streaming the TQ2_0 wire blocks and the Q6_K head so the 4B model fits in 3.09GB RSS instead of ~16GB f32. Greedy parity vs llama.cpp acd79d6 (llama-server -ngl 0, /completion temp 0 top_k 1): 3/4 probe prompts token-identical for 24 tokens (capital-of-France, once-upon-a-time, quick-brown-fox), 1 diverges at a near-tie (2+2= continuation, camelid '2' vs llama '4' after both emit the correct '= 4,'). Decode 11.34 tok/s = 0.53x llama.cpp (21.25), the general forward gap. Receipt: qa/ternary/tq2_0-bonsai-parity-receipt.json. Camelid supports exact-row CPU completion smoke for this row only; no bounded-context, performance, serve/WebUI, GPU, or full support is implied",
         "next_step": "formal bounded-context + serve/WebUI parity closure, a perf/RSS gate, and a curated current-head refresh before any wider ternary claim; an AVX2 Q6_K head and last-position-only prefill would lift throughput further"
+      }
+    },
+    {
+      "identity": {
+        "id": "llama3_2_1b_instruct_iq4_xs",
+        "family": "llama_bpe_iq4_xs_resident",
+        "quantization": "IQ4_XS",
+        "gguf_filename": "Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+        "sha256": "69e85c871a13a99e4008c09916a957d170e4e5623a5b2e06be46408029a7afba"
+      },
+      "contract": {
+        "id": "llama3_2_1b_instruct_iq4_xs",
+        "tool_capable": false,
+        "family": "llama_bpe_iq4_xs_resident",
+        "quantization": "IQ4_XS",
+        "status": "supported_exact_row_smoke",
+        "support_scope": "exact_row_gpu_resident_raw_decode_parity_smoke_only",
+        "full_support_status": "blocked_pending_normalized_full_support",
+        "full_support_blockers": "raw-completion greedy parity only (no chat-template/serve/WebUI closure); greedy flips at low-bit near-ties (GPU-resident 2/4 probe prompts 24-token identical, 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie where the reference token is camelid's immediate #2); CPU-deterministic path 1/4 identical; no bounded-context bucket, perf/RSS gate, runnable-smoke oracle qualification, or curated-catalog entry yet; the model is community-sourced (bartowski/Llama-3.2-1B-Instruct-GGUF), not a canonical row",
+        "metadata_parses": "validated_llama_arch",
+        "tokenizer_works": "validated_llama3_bpe_128k_bos_128000",
+        "tensors_load": "validated_streaming_iq4_xs_136b_wire_superblocks_no_f32_materialisation_gpu_resident_and_cpu_plus_kquant_tied_head",
+        "generation_runs": "gpu_resident_all_16_layers_bench_generate_coherent_2_35gb_vram_and_cpu_streaming_2_05gb",
+        "parity_audited": "four_prompt_24_token_greedy_vs_llamacpp_acd79d6_gpu_two_token_identical_two_prefix_then_near_tie_at_index_1",
+        "performance_measured": "gpu_resident_about_47_tok_s_cpu_about_1_tok_s_recorded_not_a_perf_claim",
+        "frontend_load_path_verified": "not_verified",
+        "frontend_readiness_gate": "not gated for the frontend; this row is a GPU-resident/CPU completion-smoke lane only (no WebUI/serve closure committed)",
+        "tested_context": "short_gpu_resident_and_cpu_raw_completion_smoke",
+        "chat_template_renderer": "not_promoted",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "gpu_resident_raw_completion_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "Paris",
+        "evidence": "Llama-3.2-1B-Instruct-IQ4_XS.gguf (sha256 69e85c871a13a99e4008c09916a957d170e4e5623a5b2e06be46408029a7afba, 743,141,504 bytes, general.architecture=llama, IQ4_XS 4.25bpw linears + K-quant tied embed/lm_head) runs end-to-end both as an all-16-layer GPU-resident model on an RTX 4060 (iq4xs_gemv kernel, ~2.35GB VRAM, ~47 tok/s) and as a CPU wire-streamed model (~2.05GB RSS), streaming the 136-byte IQ4_XS super-blocks with no f32 materialisation. Greedy parity vs llama.cpp acd79d6 (llama-server -ngl 0, /completion temp 0 top_k 1 seed 0): GPU-resident 2/4 probe prompts token-identical for 24 tokens (capital-of-France, first-three-primes), 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie at index 1 (e.g. water/hydrogen: reference '.' logprob -1.211 vs camelid ' atoms' -1.449, the reference token is camelid's immediate #2). Prompt tokenization identical on all 4. The GPU kernel matches the CPU oracle within 1e-4 (iq4xs_gemv_matches_oracle). Receipt: qa/iquant/iq4xs-llama3.2-1b-parity-receipt.json. Camelid supports exact-row GPU-resident/CPU raw-completion parity smoke for this row only; no chat-template, bounded-context, performance, serve/WebUI, or full support is implied",
+        "next_step": "chat-template + serve/WebUI parity closure, bounded-context buckets, a perf/RSS gate, and a runnable-smoke oracle qualification before any wider IQ4_XS claim; extending the resident lane to IQ2/IQ1 i-quants is the next compression bite"
       }
     },
     {

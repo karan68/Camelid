@@ -20,7 +20,7 @@ use camelid::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
     gguf::{read_metadata, GgufTensorType},
-    ghost::{GhostFile, GhostPrefetcher},
+    ghost::{GhostFile, GhostPipelinePrefetcher, GhostPrefetcher},
     inference::{
         speculative::{
             accepted_draft_prefix, ModelDrafter, NGramDrafter, SpeculativeDrafter,
@@ -1033,7 +1033,7 @@ enum Command {
     /// a time, streaming each block's weights from a layer-contiguous `.cghost` file
     /// (see the `repack-ghost` tool) and holding only a one-layer working window plus the
     /// embedding/output ends in RAM. Trades throughput for a strict memory ceiling.
-    /// Synchronous v1: each layer's read blocks the forward (no prefetch yet).
+    /// Double-buffered prefetch by default; `--sync-stream` forces the v1 serial read.
     GhostRun {
         /// GGUF model path (metadata, tokenizer, and resident embedding/output ends).
         model: PathBuf,
@@ -1053,9 +1053,30 @@ enum Command {
         /// on the critical path (the v1 behavior; useful for A/B comparison).
         #[arg(long, default_value_t = false)]
         sync_stream: bool,
-        /// Strict memory ceiling mode: bypass the OS page cache for `.cghost` reads
-        /// (F_NOCACHE) so streamed pages never accumulate. Leave off when the model fits
-        /// in RAM — the cache is a free win there.
+        /// Stage-split streaming (WRAITH Phase 2): run read and decode on separate threads so
+        /// layer N+1's disk read overlaps layer N's dequant. Parity-identical; biggest win in
+        /// the cold-NVMe regime where read and decode are comparable. Overrides the default
+        /// single-worker prefetch. Mutually exclusive with `--sync-stream`.
+        #[arg(long, default_value_t = false)]
+        stage_split: bool,
+        /// Stage-split read-ahead: how many layers the reader may run ahead of the decoder
+        /// (raw-buffer pool = read_ahead + 1 layer spans; folds into the memory ceiling).
+        #[arg(long, default_value_t = 2)]
+        read_ahead: usize,
+        /// Speculative decode (WRAITH Phase 3): draft L tokens with a resident zero-weight
+        /// n-gram, verify all L+1 in ONE streamed sweep, accept the greedy-identical prefix.
+        /// Lossless — accepted output is byte-identical to non-spec greedy. Amortizes the fixed
+        /// per-layer disk read across the accepted tokens; biggest win on repetitive text.
+        #[arg(long, default_value_t = false)]
+        spec: bool,
+        /// Speculative draft length L (n-gram tokens proposed per verify sweep). Capped at 7.
+        #[arg(long, default_value_t = 5)]
+        draft_len: usize,
+        /// Strict memory ceiling mode: bypass the OS page cache for `.cghost` reads so
+        /// streamed pages never accumulate (macOS F_NOCACHE; Windows FILE_FLAG_NO_BUFFERING).
+        /// Leave off when the model fits in RAM and you want throughput (the cache is a free
+        /// win there); turn ON to measure true cold-disk streaming cost even on a box where
+        /// the model would otherwise cache.
         #[arg(long, default_value_t = false)]
         evict_page_cache: bool,
     },
@@ -2034,6 +2055,10 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             threads,
             sync_stream,
+            stage_split,
+            read_ahead,
+            spec,
+            draft_len,
             evict_page_cache,
         } => {
             run_ghost(
@@ -2043,6 +2068,10 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 threads,
                 sync_stream,
+                stage_split,
+                read_ahead,
+                spec,
+                draft_len,
                 evict_page_cache,
             )?;
         }
@@ -2146,6 +2175,9 @@ enum GhostStreamerKind {
     /// forward runs; the reported time is only the STALL waiting for the handoff. The
     /// rendezvous handoff bounds the weight working set to two layer windows.
     Prefetched { prefetcher: GhostPrefetcher },
+    /// v3 stage-split (`--stage-split`): read and decode run on SEPARATE threads, so the read
+    /// of layer N+1 overlaps the dequant of layer N (v2's single worker serializes them).
+    Pipelined { prefetcher: GhostPipelinePrefetcher },
 }
 
 impl GhostStreamer {
@@ -2168,12 +2200,33 @@ impl GhostStreamer {
         }
     }
 
-    /// Queue the first chunk's layer reads (prefetched mode; no-op for sync).
+    fn new_pipelined(
+        ghost: Arc<GhostFile>,
+        range: std::ops::Range<usize>,
+        read_ahead: usize,
+    ) -> Self {
+        Self {
+            range,
+            kind: GhostStreamerKind::Pipelined {
+                prefetcher: GhostPipelinePrefetcher::spawn(ghost, read_ahead),
+            },
+        }
+    }
+
+    /// Queue the first chunk's layer reads (prefetched / stage-split modes; no-op for sync).
     fn prime(&self) -> anyhow::Result<()> {
-        if let GhostStreamerKind::Prefetched { prefetcher } = &self.kind {
-            for layer_idx in self.range.clone() {
-                prefetcher.request(layer_idx)?;
+        match &self.kind {
+            GhostStreamerKind::Prefetched { prefetcher } => {
+                for layer_idx in self.range.clone() {
+                    prefetcher.request(layer_idx)?;
+                }
             }
+            GhostStreamerKind::Pipelined { prefetcher } => {
+                for layer_idx in self.range.clone() {
+                    prefetcher.request(layer_idx)?;
+                }
+            }
+            GhostStreamerKind::Sync { .. } => {}
         }
         Ok(())
     }
@@ -2185,17 +2238,27 @@ impl GhostStreamer {
     /// node's compute and the network hops. The trailing chunk queued after the final token
     /// is never consumed — the worker reads at most one extra layer, blocks on the
     /// rendezvous, and is released by Drop.
+    /// Returns `(weights, bytes, blocked_us, read_us, decode_us)`. `blocked_us` is the stall
+    /// charged to the streaming path (the whole critical-path read+decode in sync mode; only
+    /// the handoff wait in prefetched mode). `read_us`/`decode_us` are the worker's actual
+    /// I/O-vs-dequant split (Phase-0 attribution), independent of how much of it overlapped.
     fn fetch(
         &mut self,
         layer_idx: usize,
         last_in_chunk: bool,
-    ) -> anyhow::Result<(LlamaLayerWeights, u64, u128)> {
+    ) -> anyhow::Result<(LlamaLayerWeights, u64, u128, u128, u128)> {
         let range = self.range.clone();
         match &mut self.kind {
             GhostStreamerKind::Sync { ghost, buf } => {
                 let started = Instant::now();
-                let (layer, span) = ghost.read_layer(layer_idx, buf)?;
-                Ok((layer, span, started.elapsed().as_micros()))
+                let (layer, span, read_us, decode_us) = ghost.read_layer(layer_idx, buf)?;
+                Ok((
+                    layer,
+                    span,
+                    started.elapsed().as_micros(),
+                    read_us,
+                    decode_us,
+                ))
             }
             GhostStreamerKind::Prefetched { prefetcher } => {
                 if last_in_chunk {
@@ -2214,6 +2277,29 @@ impl GhostStreamer {
                     prefetched.weights,
                     prefetched.bytes,
                     started.elapsed().as_micros(),
+                    prefetched.read_us,
+                    prefetched.decode_us,
+                ))
+            }
+            GhostStreamerKind::Pipelined { prefetcher } => {
+                if last_in_chunk {
+                    for next_idx in range {
+                        prefetcher.request(next_idx)?;
+                    }
+                }
+                let started = Instant::now();
+                let prefetched = prefetcher.next()?;
+                anyhow::ensure!(
+                    prefetched.layer_idx == layer_idx,
+                    "stage-split returned layer {} but layer {layer_idx} was expected",
+                    prefetched.layer_idx
+                );
+                Ok((
+                    prefetched.weights,
+                    prefetched.bytes,
+                    started.elapsed().as_micros(),
+                    prefetched.read_us,
+                    prefetched.decode_us,
                 ))
             }
         }
@@ -2263,14 +2349,17 @@ fn ghost_stream_layers(
     pos: usize,
     seq_len: usize,
     log_layers: bool,
-) -> anyhow::Result<(CpuTensor, u64, u128, u128)> {
+) -> anyhow::Result<(CpuTensor, u64, u128, u128, u128, u128)> {
     let range = streamer.range.clone();
     let mut hidden = hidden;
     let mut bytes_total = 0u64;
     let mut wait_us_total = 0u128;
     let mut forward_us_total = 0u128;
+    let mut read_us_total = 0u128;
+    let mut decode_us_total = 0u128;
     for layer_idx in range.clone() {
-        let (layer, span, wait_us) = streamer.fetch(layer_idx, layer_idx + 1 == range.end)?;
+        let (layer, span, wait_us, read_us, decode_us) =
+            streamer.fetch(layer_idx, layer_idx + 1 == range.end)?;
         Arc::make_mut(&mut session.weights).layers[layer_idx] = layer;
         let forward_started = Instant::now();
         hidden = session.ghost_forward_one_layer(&hidden, layer_idx, pos, seq_len)?;
@@ -2280,23 +2369,38 @@ fn ghost_stream_layers(
         bytes_total += span;
         wait_us_total += wait_us;
         forward_us_total += forward_us;
+        read_us_total += read_us;
+        decode_us_total += decode_us;
         if log_layers {
+            // read/decode is the worker's true I/O-vs-dequant split; wait is the main
+            // thread's stall (only the unhidden remainder after prefetch overlap).
             eprintln!(
-                "[ghost] layer {layer_idx:>3}: wait {:7.1} ms ({:6.1} MiB)  forward {:7.1} ms",
+                "[ghost] layer {layer_idx:>3}: wait {:7.1} ms | read {:7.1} decode {:7.1} \
+                 ({:6.1} MiB) | forward {:7.1} ms",
                 wait_us as f64 / 1000.0,
+                read_us as f64 / 1000.0,
+                decode_us as f64 / 1000.0,
                 span as f64 / (1024.0 * 1024.0),
                 forward_us as f64 / 1000.0,
             );
         }
     }
     session.ghost_advance_position(seq_len);
-    Ok((hidden, bytes_total, wait_us_total, forward_us_total))
+    Ok((
+        hidden,
+        bytes_total,
+        wait_us_total,
+        forward_us_total,
+        read_us_total,
+        decode_us_total,
+    ))
 }
 
 /// EXPERIMENTAL ghost (layer-streaming) mode: greedy generation with the model executed one
 /// transformer block at a time from a `.cghost` file. RAM holds the embedding/output ends +
 /// KV cache + the streaming window (one layer sync, two prefetched); everything else stays
 /// on disk.
+#[allow(clippy::too_many_arguments)]
 fn run_ghost(
     model: PathBuf,
     cghost: PathBuf,
@@ -2304,8 +2408,16 @@ fn run_ghost(
     max_tokens: usize,
     threads: Option<usize>,
     sync_stream: bool,
+    stage_split: bool,
+    read_ahead: usize,
+    spec: bool,
+    draft_len: usize,
     evict_page_cache: bool,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(sync_stream && stage_split),
+        "--sync-stream and --stage-split are mutually exclusive"
+    );
     configure_rayon_threads(threads)?;
     let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 
@@ -2332,8 +2444,17 @@ fn run_ghost(
     let placeholder = session.weights.layers[0].clone();
     let mut streamer = if sync_stream {
         GhostStreamer::new_sync(Arc::clone(&ghost), 0..n_layers)
+    } else if stage_split {
+        GhostStreamer::new_pipelined(Arc::clone(&ghost), 0..n_layers, read_ahead)
     } else {
         GhostStreamer::new_prefetched(Arc::clone(&ghost), 0..n_layers)
+    };
+    let mode_label = if sync_stream {
+        "sync".to_string()
+    } else if stage_split {
+        format!("stage-split (read\u{2016}decode, read-ahead {read_ahead})")
+    } else {
+        "double-buffered prefetch".to_string()
     };
     println!(
         "[ghost] resident ends loaded in {:.1}s; {} layers x {:.1} MiB max streaming window \
@@ -2341,12 +2462,8 @@ fn run_ghost(
         load_started.elapsed().as_secs_f64(),
         n_layers,
         ghost.max_layer_span() as f64 / (1024.0 * 1024.0),
-        if sync_stream {
-            "sync"
-        } else {
-            "double-buffered prefetch"
-        },
-        if evict_page_cache { "evicted" } else { "on" },
+        mode_label,
+        if evict_page_cache { "bypassed" } else { "on" },
         gib(phys_footprint_bytes()),
     );
 
@@ -2360,7 +2477,7 @@ fn run_ghost(
         .weights
         .token_embedding
         .embedding_lookup(&token_ids, "token_embedding_ghost")?;
-    let (mut hidden, bytes, wait_us, forward_us) = ghost_stream_layers(
+    let (mut hidden, bytes, wait_us, forward_us, read_us, dec_us) = ghost_stream_layers(
         &mut session,
         &mut streamer,
         &placeholder,
@@ -2371,80 +2488,284 @@ fn run_ghost(
     )?;
     pos += token_ids.len();
     println!(
-        "[ghost] prefill: {:.1}s ({:.2} GiB streamed, blocked {:.1}s, forward {:.1}s); \
-         footprint {:.2} GiB",
+        "[ghost] prefill: {:.1}s ({:.2} GiB streamed, blocked {:.1}s | read {:.1}s decode \
+         {:.1}s | forward {:.1}s); footprint {:.2} GiB",
         prefill_started.elapsed().as_secs_f64(),
         gib(bytes),
         wait_us as f64 / 1_000_000.0,
+        read_us as f64 / 1_000_000.0,
+        dec_us as f64 / 1_000_000.0,
         forward_us as f64 / 1_000_000.0,
         gib(phys_footprint_bytes()),
     );
 
-    let mut generated: Vec<u32> = Vec::new();
-    let mut decode_us_total: u128 = 0;
-    for step in 0..max_tokens {
-        let logits = session.forward_final_norm_and_logits(&hidden)?;
-        let vocab = logits.dim(1)?;
-        let rows = logits.dim(0)?;
-        let last_row_start = (rows - 1) * vocab;
-        let last_row = CpuTensor::from_f32(
-            "ghost_last_logits",
-            vec![1, vocab],
-            logits.data[last_row_start..last_row_start + vocab].to_vec(),
-        )?;
-        let token = LlamaSampler::Greedy.sample(&last_row)?;
-        generated.push(token);
-        print!("{}", tokenizer.decode(&[token], true)?);
-        std::io::stdout().flush()?;
-        if tokenizer.special.eos == Some(token) || tokenizer.special.eot == Some(token) {
-            break;
-        }
-        if step + 1 == max_tokens {
-            break;
-        }
-        let token_started = Instant::now();
-        let embedding = session
-            .weights
-            .token_embedding
-            .embedding_lookup(&[token], "token_embedding_ghost")?;
-        let (next_hidden, bytes, wait_us, forward_us) = ghost_stream_layers(
+    if spec {
+        ghost_spec_decode(
             &mut session,
             &mut streamer,
             &placeholder,
-            embedding,
-            pos,
-            1,
-            false,
+            &tokenizer,
+            hidden,
+            &token_ids,
+            max_tokens,
+            draft_len,
         )?;
-        hidden = next_hidden;
-        pos += 1;
-        let token_us = token_started.elapsed().as_micros();
-        decode_us_total += token_us;
-        eprintln!(
-            "[ghost] token {:>3}: {:6.0} ms ({:.2} GiB streamed, blocked {:5.0} ms, forward \
-             {:5.0} ms)",
-            step + 1,
-            token_us as f64 / 1000.0,
-            gib(bytes),
-            wait_us as f64 / 1000.0,
-            forward_us as f64 / 1000.0,
-        );
-    }
-    println!();
+    } else {
+        let mut generated: Vec<u32> = Vec::new();
+        let mut decode_us_total: u128 = 0;
+        for step in 0..max_tokens {
+            let logits = session.forward_final_norm_and_logits(&hidden)?;
+            let vocab = logits.dim(1)?;
+            let rows = logits.dim(0)?;
+            let last_row_start = (rows - 1) * vocab;
+            let last_row = CpuTensor::from_f32(
+                "ghost_last_logits",
+                vec![1, vocab],
+                logits.data[last_row_start..last_row_start + vocab].to_vec(),
+            )?;
+            let token = LlamaSampler::Greedy.sample(&last_row)?;
+            generated.push(token);
+            print!("{}", tokenizer.decode(&[token], true)?);
+            std::io::stdout().flush()?;
+            if tokenizer.special.eos == Some(token) || tokenizer.special.eot == Some(token) {
+                break;
+            }
+            if step + 1 == max_tokens {
+                break;
+            }
+            let token_started = Instant::now();
+            let embedding = session
+                .weights
+                .token_embedding
+                .embedding_lookup(&[token], "token_embedding_ghost")?;
+            let (next_hidden, bytes, wait_us, forward_us, read_us, dec_us) = ghost_stream_layers(
+                &mut session,
+                &mut streamer,
+                &placeholder,
+                embedding,
+                pos,
+                1,
+                false,
+            )?;
+            hidden = next_hidden;
+            pos += 1;
+            let token_us = token_started.elapsed().as_micros();
+            decode_us_total += token_us;
+            eprintln!(
+                "[ghost] token {:>3}: {:6.0} ms ({:.2} GiB streamed, blocked {:5.0} ms | read \
+                 {:5.0} decode {:5.0} | forward {:5.0} ms)",
+                step + 1,
+                token_us as f64 / 1000.0,
+                gib(bytes),
+                wait_us as f64 / 1000.0,
+                read_us as f64 / 1000.0,
+                dec_us as f64 / 1000.0,
+                forward_us as f64 / 1000.0,
+            );
+        }
+        println!();
 
-    let streamed_tokens = generated.len().saturating_sub(1);
-    if streamed_tokens > 0 {
-        println!(
-            "[ghost] decode: {} tokens in {:.1}s = {:.3} tok/s",
-            streamed_tokens,
-            decode_us_total as f64 / 1_000_000.0,
-            streamed_tokens as f64 / (decode_us_total as f64 / 1_000_000.0),
-        );
+        let streamed_tokens = generated.len().saturating_sub(1);
+        if streamed_tokens > 0 {
+            println!(
+                "[ghost] decode: {} tokens in {:.1}s = {:.3} tok/s",
+                streamed_tokens,
+                decode_us_total as f64 / 1_000_000.0,
+                streamed_tokens as f64 / (decode_us_total as f64 / 1_000_000.0),
+            );
+        }
     }
     println!(
         "[ghost] final footprint {:.2} GiB, peak RSS {:.2} GiB",
         gib(phys_footprint_bytes()),
         gib(peak_rss_bytes()),
+    );
+    Ok(())
+}
+
+/// WRAITH Phase-3 speculative ghost decode. Draft L tokens with a resident zero-weight n-gram,
+/// verify `[anchor, draft_1..draft_L]` in ONE streamed sweep (each layer read once, applied to
+/// all L+1 positions), accept the greedy-identical prefix, then roll the KV cache position back
+/// over the rejected tail. Because a single causal `position` cursor bounds every attention
+/// read, that rollback alone makes the rejected slots unreadable — no buffer truncation — so the
+/// accepted stream is byte-identical to non-spec ghost greedy. A ghost sweep's cost is dominated
+/// by the fixed per-layer disk read, so amortizing it across `1 + accepted` committed tokens is
+/// the win. An EMA auto-disable drops drafting to single-token sweeps when acceptance collapses
+/// (novel text) and re-probes periodically, so spec never badly regresses a non-repetitive load.
+#[allow(clippy::too_many_arguments)]
+fn ghost_spec_decode(
+    session: &mut LlamaInferenceSession,
+    streamer: &mut GhostStreamer,
+    placeholder: &LlamaLayerWeights,
+    tokenizer: &Tokenizer,
+    prefill_hidden: CpuTensor,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    draft_len: usize,
+) -> anyhow::Result<()> {
+    use camelid::inference::speculative::{accepted_draft_prefix, NGramDrafter};
+
+    let draft_len = draft_len.min(7); // verify-batch width cap (MAX_VERIFY_K - 1)
+    let drafter = NGramDrafter::default();
+    let mut history: Vec<u32> = prompt_ids.to_vec();
+    let is_stop = |t: u32| tokenizer.special.eos == Some(t) || tokenizer.special.eot == Some(t);
+
+    // Per-row greedy argmax via the SAME sampler the non-spec path uses, so tie-breaking (and
+    // therefore the accepted token stream) is identical.
+    let greedy_rows = |logits: &CpuTensor| -> anyhow::Result<Vec<u32>> {
+        let rows = logits.dim(0)?;
+        let vocab = logits.dim(1)?;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let start = r * vocab;
+            let row = CpuTensor::from_f32(
+                "ghost_spec_logits",
+                vec![1, vocab],
+                logits.data[start..start + vocab].to_vec(),
+            )?;
+            out.push(LlamaSampler::Greedy.sample(&row)?);
+        }
+        Ok(out)
+    };
+
+    // The first token comes free from the prefill hidden (no sweep), exactly as non-spec does:
+    // argmax the LAST prefill row only (not all N prompt rows).
+    let ttft = {
+        let logits = session.forward_final_norm_and_logits(&prefill_hidden)?;
+        let vocab = logits.dim(1)?;
+        let rows = logits.dim(0)?;
+        let last = (rows - 1) * vocab;
+        let row = CpuTensor::from_f32(
+            "ghost_spec_ttft",
+            vec![1, vocab],
+            logits.data[last..last + vocab].to_vec(),
+        )?;
+        LlamaSampler::Greedy.sample(&row)?
+    };
+    let mut generated: Vec<u32> = vec![ttft];
+    print!("{}", tokenizer.decode(&[ttft], true)?);
+    std::io::stdout().flush()?;
+    history.push(ttft);
+    let mut current = ttft;
+
+    let decode_started = Instant::now();
+    let mut sweeps = 0usize;
+    let mut drafted_total = 0usize;
+    let mut accepted_total = 0usize;
+    // Rounds where at least one drafted token was REJECTED — i.e. the KV rollback discarded a
+    // non-empty rejected tail. If rejected KV leaked, parity vs non-spec would break; a run with
+    // rejected_rounds > 0 that stays byte-identical is the rejected-KV isolation proof.
+    let mut rejected_rounds = 0usize;
+    let mut ema_accepted = draft_len as f64; // optimistic start; drives auto-disable
+    let mut since_probe = 0usize;
+    let mut auto_disabled_ever = false;
+
+    'outer: while generated.len() < max_tokens && !is_stop(current) {
+        // Auto-disable: when recent acceptance collapses, stop drafting (single-token sweeps)
+        // and re-probe every 64 rounds so a return to repetitive text is picked back up.
+        let drafting_on = ema_accepted >= 0.5 || since_probe >= 64;
+        if drafting_on {
+            since_probe = 0;
+        } else {
+            since_probe += 1;
+            auto_disabled_ever = true;
+        }
+        let room = max_tokens - generated.len();
+        let budget = if drafting_on {
+            draft_len.min(room.saturating_sub(1))
+        } else {
+            0
+        };
+        let drafts = if budget > 0 {
+            drafter.draft(&history, budget)
+        } else {
+            Vec::new()
+        };
+        drafted_total += drafts.len();
+
+        // Verify batch = [anchor, draft_1..draft_L]; ONE streamed sweep over all layers writes
+        // KV for positions [base, base+len) and yields per-position greedy predictions.
+        let base = session.kv_position();
+        let mut batch = Vec::with_capacity(1 + drafts.len());
+        batch.push(current);
+        batch.extend_from_slice(&drafts);
+        let embedding = session
+            .weights
+            .token_embedding
+            .embedding_lookup(&batch, "token_embedding_ghost_spec")?;
+        let (rows_hidden, _bytes, _wait, _fwd, _read, _dec) = ghost_stream_layers(
+            session,
+            streamer,
+            placeholder,
+            embedding,
+            base,
+            batch.len(),
+            false,
+        )?;
+        sweeps += 1;
+        let logits = session.forward_final_norm_and_logits(&rows_hidden)?;
+        let predictions = greedy_rows(&logits)?;
+        let accepted = accepted_draft_prefix(&drafts, &predictions);
+        accepted_total += accepted;
+        if accepted < drafts.len() {
+            rejected_rounds += 1; // a non-empty rejected tail was rolled back this round
+        }
+        ema_accepted = 0.85 * ema_accepted + 0.15 * accepted as f64;
+
+        // Commit the anchor (position `base`) + `accepted` drafts; roll the position back over
+        // the rest so rejected KV at [base+1+accepted .. base+len) is causally unreadable.
+        session.rollback_to_position(base + 1 + accepted)?;
+
+        // Emit predictions[0..=accepted] = the accepted drafts plus one correction token.
+        for &token in &predictions[..=accepted] {
+            if generated.len() >= max_tokens {
+                break;
+            }
+            generated.push(token);
+            history.push(token);
+            print!("{}", tokenizer.decode(&[token], true)?);
+            std::io::stdout().flush()?;
+            current = token;
+            if is_stop(token) {
+                break 'outer;
+            }
+        }
+    }
+    println!();
+
+    let secs = decode_started.elapsed().as_secs_f64();
+    let decoded = generated.len().saturating_sub(1); // the TTFT was free
+    let accept_rate = if drafted_total > 0 {
+        accepted_total as f64 / drafted_total as f64
+    } else {
+        0.0
+    };
+    println!(
+        "[ghost] spec decode: {decoded} tokens in {secs:.1}s = {:.3} tok/s | {sweeps} sweeps \
+         ({:.2} tok/sweep) | draft_len {draft_len}, drafted {drafted_total}, accepted \
+         {accepted_total} ({:.0}%), rejected-tail rounds {rejected_rounds}, mean {:.2}/round, \
+         auto-disable {}",
+        if secs > 0.0 {
+            decoded as f64 / secs
+        } else {
+            0.0
+        },
+        if sweeps > 0 {
+            decoded as f64 / sweeps as f64
+        } else {
+            0.0
+        },
+        accept_rate * 100.0,
+        if sweeps > 0 {
+            accepted_total as f64 / sweeps as f64
+        } else {
+            0.0
+        },
+        if auto_disabled_ever {
+            "fired"
+        } else {
+            "not fired"
+        },
     );
     Ok(())
 }
@@ -4739,7 +5060,7 @@ async fn run_distribute_worker(
 
         let forward_started = Instant::now();
         let out_hidden = if let Some((streamer, placeholder)) = ghost_ctx.as_mut() {
-            let (out, _bytes, _wait_us, _forward_us) = ghost_stream_layers(
+            let (out, _bytes, _wait_us, _forward_us, _read_us, _decode_us) = ghost_stream_layers(
                 &mut session,
                 streamer,
                 placeholder,
