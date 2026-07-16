@@ -22,10 +22,12 @@ in the bundle. One incident occurred and is receipted: `incident-20260716-hard-h
    keep-list exactly, which upgraded the eval design to a format-isolated comparison
    (`basalt_eval_protocol.md` §1).
 2. **The wire format differs from the conductor's §3 in load-bearing ways** (§2): a 64-element
-   36-byte superblock (not a bare 16-element block), an *unsigned* E4M3 scale with NaN
-   sentinels that the pin silently flushes to 0.0, a doubled element LUT paired with a ×0.5
-   scale decode, and **no in-block per-tensor scale** — the per-tensor scale is an *optional
-   sidecar tensor* mechanism used only by Python-converted ModelOpt checkpoints.
+   36-byte superblock (not a bare 16-element block), an *unsigned* E4M3 scale whose `0x7F`
+   NaN sentinel the pin CPU silently flushes to 0.0 (**`0xFF` decodes to 240.0 — the pin's
+   CPU and CUDA backends disagree on it; §1 [G1 errata]**), a doubled element LUT paired
+   with the scale convention (the pair rule), and **no in-block per-tensor scale** — the
+   per-tensor scale is an *optional sidecar tensor* mechanism used only by Python-converted
+   ModelOpt checkpoints.
 3. **The 6 GB full-residency motivation is refuted for this pilot** (§7): projected NVFP4
    resident weights are **6.204 GB** (not ~4.2 GB), because 3.71 GB of embeddings
    (`per_layer_token_embd` + tied `token_embd`) are kept at Q8_0 by every known production
@@ -58,11 +60,18 @@ Arbiter: pin `acd79d603` build 9632 source. Full receipts with file:line and hea
   `{0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12}` — E2M1 magnitudes **doubled**; nibble bit 3 =
   sign. Value = `kvalues[nibble] * ue4m3_to_fp32(d[s])`.
 - **Scale format is UE4M3 — unsigned E4M3** (`ggml-impl.h:500-553`): bit 7 stripped (`&0x7F`),
-  bias 7, subnormals `man·2⁻⁹`; decode returns `raw * 0.5` (**the pair rule**: doubled LUT ×
-  half-scale — a reimplementation must keep both conventions together or every value is off
-  by 2× or 0.5×). Byte `0x00` → 0.0; NaN sentinels `0x7F`/`0xFF` → **flushed to 0.0**, not an
-  error (see errata E3 and open item T5). Encoder clamps input to 448.0, rounds half-up,
-  saturates at code `0x7E` (max decoded scale = 112.0); quantizer feeds `amax(sub-block)/6.0`.
+  bias 7, subnormals. **[G1 errata, fixture-arbitrated]** Two Phase 0 prose claims were wrong
+  and are corrected by the pin-generated golden vectors (2.17 M assertions, Phase 1 bundle):
+  (i) the CPU decode's sentinel check is on the **raw byte `0x7F` only** — `0x00` → 0.0,
+  `0x7F` → 0.0, but **`0xFF` decodes through exp/man to 240.0**; the pin's CUDA mirror
+  flushes both, i.e. **the pin's own backends disagree on `0xFF`**, which strengthens the
+  D17/T5 admission refusal of both bytes (Camelid decode is pin-CPU-bitwise; admission
+  refuses files containing either). (ii) `decode(0x7E)` = **224.0**, not 112.0; the encoder
+  saturates every input ≥ 248 to `0x7E`, so bytes `0x78..0x7D` are decodable but
+  encoder-unreachable. The doubled-LUT/scale-convention **pair rule** stands as the headline
+  hazard (12 × 224 = 2688 = the true 6 × 448 max — the factor-of-two lives across the pair);
+  the committed fixtures, not prose, are the normative statement of both conventions.
+  Encoder clamps input to 448.0, rounds half-up; quantizer feeds `amax(sub-block)/6.0`.
 - **Element rounding** = exhaustive nearest-LUT search (`best_index_mxfp4`,
   `ggml-quants.c:299-310`), first-wins ties — **not** IEEE round-nearest-even.
 - **Per-tensor scale**: no in-block or GGUF-KV tensor-level factor exists. The mechanism is
@@ -96,7 +105,7 @@ Arbiter: pin `acd79d603` build 9632 source. Full receipts with file:line and hea
 |---|---|---|
 | E1 | §3.2: 16 elems + 1 scale byte = 9-byte block | 64-elem, 36-byte superblock `{d[4], qs[32]}`; 9 B/16 elems is the *density*, not the struct |
 | E2 | §3.2: scale is (signed) E4M3, NaN = S.1111.111 | **Unsigned** E4M3, bit 7 stripped; NaN sentinel `0x7F` |
-| E3 | §3.2: NaN/zero scale byte = load-time error | Pin **flushes NaN to 0.0** silently; zero scale is a *legitimate* all-zero block, not an error → open item T5 |
+| E3 | §3.2: NaN/zero scale byte = load-time error | Pin CPU **flushes raw `0x7F` to 0.0** silently; **[G1 errata]** `0xFF` decodes to 240.0 on CPU while the CUDA mirror flushes it — pin backends disagree; zero scale is a *legitimate* all-zero block, not an error → open item T5 |
 | E4 | §3.3: two-level scaling with `s_tensor` in the format | No in-block tensor scale; optional **sidecar tensors** applied post-matmul; `llama-quantize` files have none |
 | E5 | §3.3: element quantization rounding `nearest_e2m1` | Exhaustive nearest-LUT search, first-wins ties (not RNE); scale rounding = half-up |
 | E6 | §1: ~4.2 GB NVFP4 projection | 6.204 GB (embeddings kept Q8_0); see §7 |
@@ -120,7 +129,8 @@ Pilot (confirmed identity for open item T2): `gemma-4-E4B-it-Q8_0.gguf` from
 `unsloth/gemma-4-E4B-it-GGUF`, sha256 `a2232a64…` (full value in
 `basalt_eval_protocol.md` §1), 8,192,951,456 B — byte-matched between the HF LFS oid and the
 two committed evidence-bundle manifests. Currently **not on disk**; Phase 2 re-downloads it
-plus the BF16 sibling (`21eb0c95…`, 15.05 GB, quantization source) and the upstream imatrix.
+plus the BF16 sibling (`21eb0c95…`, 15.05 GB — archival source only per protocol
+Amendment 2; produced rows quantize from the Q8_0 baseline) and the upstream imatrix.
 
 Inventory (from the 64 MiB header fetch; parser + raw dump in the bundle): GGUF v3,
 `arch=gemma4`, 720 tensors — 296 Q8_0, 423 F32, 1 BF16. Key KVs: 42 blocks, d_model 2560,
@@ -295,11 +305,13 @@ in the scout lane transcript, distilled here:
   vs pin-generated golden vectors. Note: gguf-py's NVFP4 class is **decode-only** (no
   `quantize_blocks`), so golden vectors come from the pin's C reference via a small generator
   harness (checked into `tools/`/`scripts/` with provenance, per conductor).
-- **Phase 2**: downloads (Q8_0 8.2 GB + BF16 15.05 GB + imatrix 4.4 MB; ~45 GB with produced
-  rows, disk is fine); produce the five protocol rows (`NVFP4-mm`, `Q4K-mm`, `Q4_K_M-df`,
-  `Q4_K_M-im`, `NVFP4-all`) with ×2 determinism sha checks; capture observed per-tensor logs
-  (incl. how `inp_gate`/`proj` 2-D F32 tensors fare under the positional ftype — unknown
-  until observed) vs §7; assert sidecar-absence; pin-load sanity via `llama-completion`;
+- **Phase 2**: downloads (Q8_0 8.2 GB + BF16 15.05 GB + imatrix 4.4 MB; ~40 GB with produced
+  rows, disk is fine); produce the **four** producible protocol rows (`NVFP4-mm`, `Q4K-mm`,
+  `Q4_K_M-df`, `Q4_K_M-im`) from the Q8_0 baseline per protocol Amendment 2 (`NVFP4-all` is
+  BLOCKED-HOST — whole-tensor f32 staging of `per_layer_token_embd` needs ~22.5 GB commit)
+  with ×2 determinism sha checks; capture observed per-tensor logs (observed: the 84
+  `inp_gate`/`proj` 2-D F32 tensors convert to Q8_0 in every row, identically across the
+  `-mm` pair) vs §7; assert sidecar-absence; pin-load sanity via `llama-completion`;
   measured size table replaces §7. Verify pin loads `arch=gemma4` before anything else.
   Optional interop leg: the wild `FreedomAISVR` E4B NVFP4 GGUF (§8) as a
   load-or-refuse-cleanly test case, unknown-provenance, no claims.
@@ -338,7 +350,10 @@ in the scout lane transcript, distilled here:
   match the pin bit-for-bit (parity math), **and** Camelid's admission layer scans NVFP4
   tensors and refuses files containing NaN scale sentinels (`0x7F`/`0xFF`); zero scale bytes
   admit (they are real all-zero blocks). This honors both the arbiter rule and the
-  fail-closed posture without inventing decode semantics.
+  fail-closed posture without inventing decode semantics. **[G1 errata: the premise was
+  half-wrong — pin CPU flushes only raw `0x7F`, while `0xFF` decodes to 240.0 and the pin's
+  CUDA mirror flushes it (backend disagreement). The accepted posture is unchanged and
+  strengthened; see §1 [G1 errata] and DECISIONS.md D17 addendum.]**
 - **T6 (new)** Campaign grounds after E6/§7: fully-CUDA-resident on 6 GB is refuted for this
   pilot. Recommendation: proceed — the decode-bandwidth lever (1.889× on matmul reads) and
   the ~2.44 GB partial-residency option are the real payoff; Phase 4 measures, nothing is

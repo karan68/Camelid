@@ -5435,6 +5435,667 @@ pub(crate) fn decode_iq4_xs_tensor(
     Ok(out)
 }
 
+// ---- NVFP4 (BASALT Phase 1) — pin-layout format core ------------------------------------
+//
+// Wire layout (DECISIONS.md D17 / D-B1: the pin's `block_nvfp4` byte-for-byte, llama.cpp
+// acd79d603 / GGML_TYPE_NVFP4 = 40): 36 bytes per 64 elements — `d[4]` UE4M3 sub-block
+// scales (one per 16 elements) FIRST, then `qs[32]` packed E2M1 nibbles. Sub-block `s`
+// (0..3) owns `qs[s*8 .. s*8+7]`; the LOW nibble of byte `s*8+j` is element `s*16+j`, the
+// HIGH nibble element `s*16+8+j` (the MXFP4-style half/half split, not adjacent pairing).
+//
+// WHY TWO DECODE SEMANTICS COEXIST (D17 / open item T5):
+// - Per-block dequant ([`crate::inference::nvfp4_wire_block_dequant`] and the block loop
+//   inside [`decode_nvfp4_tensor`]) is PIN-BITWISE: scale byte 0x7F is the pin's NaN
+//   sentinel and FLUSHES to d = 0.0 silently, exactly like `dequantize_row_nvfp4`. This
+//   keeps every decoded value bit-identical to the oracle for parity receipts, whatever
+//   the bytes say.
+// - The LOAD path ([`decode_nvfp4_tensor`]) FAILS CLOSED first: it scans every block's
+//   `d[4]` and refuses tensors carrying a NaN-sentinel scale byte (0x7F or 0xFF) with a
+//   machine-readable error, because a sentinel in a weight file means the quantizer saw
+//   garbage and silently zeroing 16 weights per hit would be quiet model corruption.
+//   Files that pass admission therefore never contain sentinels, so both semantics agree
+//   on every tensor Camelid actually runs; the pin-bitwise flush only ever fires in
+//   fixture/parity harnesses that feed crafted blocks below the load path.
+//
+// Sentinel subtlety the golden fixtures lock in (`nvfp4_ue4m3_table.json`): the pin's CPU
+// decode checks the RAW byte (`x == 0x7F`), so 0xFF is NOT flushed — it decodes through
+// exp/man extraction to 240.0. The pin's CUDA mirror flushes both 0x7F and 0xFF, which is
+// exactly why the load path refuses both bytes: the two pin backends disagree on 0xFF, and
+// refusing at admission keeps Camelid out of that ambiguity entirely (D17/T5).
+
+/// NVFP4 values per wire super-block (pin `QK_NVFP4`).
+pub const NVFP4_VALUES_PER_BLOCK: usize = 64;
+
+/// NVFP4 wire bytes per super-block: `d[4]` UE4M3 scales then `qs[32]` nibbles
+/// (pin `block_nvfp4`, `static_assert sizeof == 36`).
+pub const NVFP4_WIRE_BYTES_PER_BLOCK: usize = 36;
+
+/// NVFP4 sub-block width (pin `QK_NVFP4_SUB`): one UE4M3 scale byte per 16 elements.
+pub const NVFP4_SUB_BLOCK_VALUES: usize = 16;
+
+/// ggml `kvalues_mxfp4` (ggml-common.h): the E2M1 element magnitudes DOUBLED (true
+/// magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6); nibble bit 3 selects the sign half.
+/// THE PAIR RULE: this doubling is paired with the extra 0.5 factor baked into
+/// [`UE4M3_TO_F32`] — the two conventions must always travel together, or every
+/// decoded value is off by 2x or 0.5x.
+pub const KVALUES_MXFP4_I8: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// f32 view of [`KVALUES_MXFP4_I8`], derived at compile time so the two can never
+/// diverge (same idiom as [`KVALUES_IQ4NL`]).
+pub const KVALUES_MXFP4: [f32; 16] = {
+    let mut out = [0.0_f32; 16];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = KVALUES_MXFP4_I8[i] as f32;
+        i += 1;
+    }
+    out
+};
+
+/// One UE4M3 scale byte -> f32, mirroring the pin's `ggml_ue4m3_to_fp32`
+/// (ggml-impl.h) bit-for-bit: raw bytes 0x00 and 0x7F return 0.0 (0x7F is the NaN
+/// sentinel, FLUSHED — and the check is on the raw byte, so 0xFF is NOT flushed and
+/// decodes to 240.0; see the module comment above). Otherwise exp = bits 6..3
+/// (bias 7), man = bits 2..0; exp == 0 is subnormal `man * 2^-9`, else
+/// `(1 + man/8) * 2^(exp-7)`; the result carries the extra 0.5 pair-rule factor.
+/// Every step multiplies exact values by powers of two, so const evaluation cannot
+/// round differently from the pin's `ldexpf` path.
+const fn ue4m3_to_f32_const(byte: u8) -> f32 {
+    if byte == 0x00 || byte == 0x7F {
+        return 0.0;
+    }
+    let exp = ((byte >> 3) & 0xF) as i32;
+    let man = (byte & 0x7) as f32;
+    let raw = if exp == 0 {
+        // subnormal: man * 2^-9
+        man * f32::from_bits((127 - 9) << 23)
+    } else {
+        // normal: (1 + man/8) * 2^(exp-7); exp-7 in -6..=8 so the power is a
+        // normal f32 built directly from its biased exponent
+        (1.0 + man / 8.0) * f32::from_bits(((exp - 7 + 127) as u32) << 23)
+    };
+    raw * 0.5
+}
+
+/// Precomputed 256-entry UE4M3 decode table (see [`ue4m3_to_f32_const`]); anchored
+/// bit-exactly to the pin-generated `tests/fixtures/dequant/nvfp4_ue4m3_table.json`.
+pub const UE4M3_TO_F32: [f32; 256] = {
+    let mut out = [0.0_f32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        out[b] = ue4m3_to_f32_const(b as u8);
+        b += 1;
+    }
+    out
+};
+
+/// Scan NVFP4 wire bytes for NaN-sentinel UE4M3 scale bytes (0x7F / 0xFF) in any
+/// block's `d[4]`, returning the FIRST offending block index. This is the single
+/// definition of load-time sentinel refusal, shared by [`decode_nvfp4_tensor`] and
+/// (Phase 2) runnable-lane admission. Scans whole 36-byte blocks only; callers
+/// validate total length separately.
+pub fn nvfp4_find_nan_scale(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .chunks_exact(NVFP4_WIRE_BYTES_PER_BLOCK)
+        .position(|block| block[..4].iter().any(|&b| b == 0x7F || b == 0xFF))
+}
+
+/// Decode one 36-byte NVFP4 wire block into 64 f32 values, pin-bitwise
+/// (`dequantize_row_nvfp4` order): per sub-block `s`, `d = UE4M3_TO_F32[d[s]]`, low
+/// nibble of `qs[s*8+j]` -> element `s*16+j`, high nibble -> element `s*16+8+j`,
+/// value = `KVALUES_MXFP4[nibble] * d`. Negative codes (9..15) under a zero scale
+/// produce -0.0 (the i8-derived f32 sign survives the multiply), matching the pin.
+fn nvfp4_block_decode_into(out: &mut [f32], block: &[u8]) {
+    debug_assert_eq!(block.len(), NVFP4_WIRE_BYTES_PER_BLOCK);
+    debug_assert_eq!(out.len(), NVFP4_VALUES_PER_BLOCK);
+    for s in 0..4 {
+        let d = UE4M3_TO_F32[block[s] as usize];
+        for j in 0..8 {
+            let byte = block[4 + s * 8 + j];
+            out[s * NVFP4_SUB_BLOCK_VALUES + j] = KVALUES_MXFP4[(byte & 0x0F) as usize] * d;
+            out[s * NVFP4_SUB_BLOCK_VALUES + 8 + j] = KVALUES_MXFP4[(byte >> 4) as usize] * d;
+        }
+    }
+}
+
+/// Flat NVFP4 tensor dequantization for the LOAD path — mirrors
+/// [`decode_q4_k_tensor`]'s shape, plus the D17/T5 fail-closed sentinel scan (see
+/// the module comment above for why this deliberately diverges from the pin-bitwise
+/// per-block seam on sentinel-bearing bytes).
+pub fn decode_nvfp4_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    if !expected_elements.is_multiple_of(NVFP4_VALUES_PER_BLOCK) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: NVFP4 element count {expected_elements} is not a multiple of \
+             {NVFP4_VALUES_PER_BLOCK}"
+        )));
+    }
+    let blocks = expected_elements / NVFP4_VALUES_PER_BLOCK;
+    let expected_bytes = blocks * NVFP4_WIRE_BYTES_PER_BLOCK;
+    if bytes.len() != expected_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: NVFP4 wire length {} != {blocks} blocks * {NVFP4_WIRE_BYTES_PER_BLOCK} \
+             bytes = {expected_bytes}",
+            bytes.len()
+        )));
+    }
+    // D17/T5 fail-closed: refuse NaN-sentinel scale bytes at load. A file that
+    // admits never reaches the pin-bitwise flush below.
+    if let Some(block_idx) = nvfp4_find_nan_scale(bytes) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: NVFP4 block {block_idx} carries a NaN-sentinel UE4M3 scale byte \
+             (0x7F/0xFF) — refusing per D17/T5 (fail closed at load; per-block dequant \
+             stays pin-bitwise)"
+        )));
+    }
+    let mut out = vec![0.0_f32; expected_elements];
+    for (i, block) in bytes.chunks_exact(NVFP4_WIRE_BYTES_PER_BLOCK).enumerate() {
+        nvfp4_block_decode_into(
+            &mut out[i * NVFP4_VALUES_PER_BLOCK..(i + 1) * NVFP4_VALUES_PER_BLOCK],
+            block,
+        );
+    }
+    Ok(out)
+}
+
+/// Pin `ggml_fp32_to_ue4m3` port — TEST-ANCHORING ONLY. Quantizer ownership is
+/// pin-tool-only for v1 (D17/D-B5); this exists so the encode golden vectors and
+/// round-trip property tests can reproduce the pin's wire bytes, and is not a
+/// Camelid quantizer surface. Semantics locked by `nvfp4_encode_vectors.json`:
+/// NaN/<=0 -> 0x00; input domain clamps at 448.0; normal path rounds HALF-UP on the
+/// 4th mantissa bit (with carry into the exponent); exp >= 15 saturates to 0x7E
+/// (the encoder never emits 0x78..0x7D, 0x7F, or any byte with bit 7 set);
+/// subnormal path rounds half-up via `(x * 512 + 0.5)` truncation.
+#[cfg(test)]
+pub(crate) fn fp32_to_ue4m3(x: f32) -> u8 {
+    // The pin writes `if (!(x > 0.0f)) return 0;` — NaN and every x <= 0 land here.
+    if x.is_nan() || x <= 0.0 {
+        return 0;
+    }
+    let x = if x > 448.0 { 448.0 } else { x };
+    let bits = x.to_bits();
+    let fp32_exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let fp32_man = ((bits >> 20) & 0x7) as i32;
+    let mut ue_exp = fp32_exp + 7;
+    if ue_exp <= 0 {
+        // subnormal: round-half-up on man * 512 (truncation of positive value)
+        let man = ((x * 512.0 + 0.5) as i32).min(7);
+        if man < 1 {
+            return 0;
+        }
+        return man as u8;
+    }
+    if ue_exp >= 15 {
+        return 0x7E; // saturate to max finite code
+    }
+    let round_bit = ((bits >> 19) & 1) as i32;
+    let mut ue_man = fp32_man + round_bit;
+    if ue_man > 7 {
+        ue_man = 0;
+        ue_exp += 1;
+        if ue_exp >= 15 {
+            return 0x7E;
+        }
+    }
+    ((ue_exp << 3) | ue_man) as u8
+}
+
+/// Pin `best_index_mxfp4` port — TEST-ANCHORING ONLY (see [`fp32_to_ue4m3`]).
+/// Exhaustive nearest search over `KVALUES_MXFP4[i] * d`, strict `<` so the FIRST
+/// index wins exact ties (scan order 0..15) — not IEEE round-nearest-even. NaN
+/// inputs never beat the initial candidate, so they quantize to code 0.
+#[cfg(test)]
+fn nvfp4_best_index(x: f32, d: f32) -> u8 {
+    let mut best_index = 0usize;
+    let mut best_err = (KVALUES_MXFP4[0] * d - x).abs();
+    for (i, kv) in KVALUES_MXFP4.iter().enumerate().skip(1) {
+        let err = (kv * d - x).abs();
+        if err < best_err {
+            best_index = i;
+            best_err = err;
+        }
+    }
+    best_index as u8
+}
+
+/// Encode one 64-element row into a 36-byte NVFP4 wire block — TEST-ANCHORING ONLY
+/// (D17/D-B5: v1 is consume-side; the golden quantizer is the pin's tool). Mirrors
+/// `quantize_row_nvfp4_ref` exactly: per sub-block amax via a NaN-insensitive `<`
+/// comparison (all-NaN rows therefore encode to an all-zero wire, and +/-Inf rows
+/// saturate the scale to 0x7E while `best_index` leaves every element at code 0),
+/// scale byte = `fp32_to_ue4m3(amax / 6)`, elements quantized against the DECODED
+/// scale via first-wins nearest-LUT search.
+#[cfg(test)]
+pub(crate) fn encode_nvfp4_block(
+    x: &[f32; NVFP4_VALUES_PER_BLOCK],
+) -> [u8; NVFP4_WIRE_BYTES_PER_BLOCK] {
+    let mut wire = [0u8; NVFP4_WIRE_BYTES_PER_BLOCK];
+    for s in 0..4 {
+        let xb = &x[s * NVFP4_SUB_BLOCK_VALUES..(s + 1) * NVFP4_SUB_BLOCK_VALUES];
+        let mut amax = 0.0_f32;
+        for &v in xb {
+            if amax < v.abs() {
+                amax = v.abs();
+            }
+        }
+        let ue = fp32_to_ue4m3(amax / 6.0);
+        wire[s] = ue;
+        let d = UE4M3_TO_F32[ue as usize];
+        for j in 0..8 {
+            let lo = nvfp4_best_index(xb[j], d);
+            let hi = nvfp4_best_index(xb[8 + j], d);
+            wire[4 + s * 8 + j] = lo | (hi << 4);
+        }
+    }
+    wire
+}
+
+/// BASALT Phase 1 encode-side anchoring + property loops. The decode-side golden
+/// suites (ue4m3 table, 4096-pair decode table, nibble probes, 10k random + real
+/// GGUF blocks, fail-closed seam) live in `tests/nvfp4_format.rs`; these unit tests
+/// stay inline because [`encode_nvfp4_block`] / [`fp32_to_ue4m3`] are deliberately
+/// not exported (D17/D-B5: v1 is consume-side, quantizer ownership is pin-tool-only).
+#[cfg(test)]
+mod nvfp4_tests {
+    use super::{
+        decode_nvfp4_tensor, encode_nvfp4_block, fp32_to_ue4m3, nvfp4_block_decode_into,
+        KVALUES_MXFP4, NVFP4_VALUES_PER_BLOCK, NVFP4_WIRE_BYTES_PER_BLOCK, UE4M3_TO_F32,
+    };
+
+    fn fixture_json(name: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("dequant")
+            .join(name);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name} parses: {e}"));
+        assert_eq!(
+            v["provenance"]["pin_sha"].as_str(),
+            Some("acd79d603"),
+            "{name}: fixture provenance pin mismatch"
+        );
+        v
+    }
+
+    fn hex_u32(h: &str) -> u32 {
+        u32::from_str_radix(h, 16).unwrap_or_else(|e| panic!("bad hex u32 {h:?}: {e}"))
+    }
+
+    fn hex_row_bits(h: &str) -> Vec<u32> {
+        assert!(h.len().is_multiple_of(8));
+        (0..h.len())
+            .step_by(8)
+            .map(|i| hex_u32(&h[i..i + 8]))
+            .collect()
+    }
+
+    /// Minimal RFC 4648 base64 decoder (fixtures only; no base64 dependency).
+    fn b64_decode(s: &str) -> Vec<u8> {
+        let mut table = [255u8; 256];
+        for (i, c) in (b'A'..=b'Z').enumerate() {
+            table[c as usize] = i as u8;
+        }
+        for (i, c) in (b'a'..=b'z').enumerate() {
+            table[c as usize] = 26 + i as u8;
+        }
+        for (i, c) in (b'0'..=b'9').enumerate() {
+            table[c as usize] = 52 + i as u8;
+        }
+        table[b'+' as usize] = 62;
+        table[b'/' as usize] = 63;
+        let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+        let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+        for chunk in bytes.chunks(4) {
+            let mut acc = 0u32;
+            for (k, &b) in chunk.iter().enumerate() {
+                let v = table[b as usize];
+                assert_ne!(v, 255, "bad base64 byte {b}");
+                acc |= u32::from(v) << (18 - 6 * k);
+            }
+            out.push((acc >> 16) as u8);
+            if chunk.len() > 2 {
+                out.push((acc >> 8) as u8);
+            }
+            if chunk.len() > 3 {
+                out.push(acc as u8);
+            }
+        }
+        out
+    }
+
+    fn decode_block_via_tensor_path(wire: &[u8]) -> [f32; NVFP4_VALUES_PER_BLOCK] {
+        let out = decode_nvfp4_tensor("nvfp4-unit-test", wire, NVFP4_VALUES_PER_BLOCK)
+            .expect("clean block decodes");
+        let mut arr = [0.0_f32; NVFP4_VALUES_PER_BLOCK];
+        arr.copy_from_slice(&out);
+        arr
+    }
+
+    fn assert_bits(got: &[f32], want_bits: &[u32], ctx: &str) {
+        assert_eq!(got.len(), want_bits.len(), "{ctx}: length");
+        for (j, (g, w)) in got.iter().zip(want_bits.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                *w,
+                "{ctx}: element {j} got {:#010x} want {w:#010x}",
+                g.to_bits()
+            );
+        }
+    }
+
+    /// All 27 pin-generated encode vectors reproduce byte-exactly, including the
+    /// pathological rows (golden truth, not judged): all-NaN input -> all-zero
+    /// wire; +/-Inf rows -> scale 0x7E with every element code 0 (decode +0.0);
+    /// exact LUT midpoints -> LOWER index; -0.0; subnormals; saturation.
+    #[test]
+    fn encode_vectors_reproduce_pin_wire_bytes_and_dequant() {
+        let fx = fixture_json("nvfp4_encode_vectors.json");
+        let vectors = fx["vectors"].as_array().expect("vectors");
+        assert_eq!(vectors.len(), 27);
+        let mut seen_spotlock_tags = std::collections::BTreeSet::new();
+        for vec in vectors {
+            let tag = vec["tag"].as_str().expect("tag");
+            let input_hex = vec["input"].as_array().expect("input");
+            assert_eq!(input_hex.len(), NVFP4_VALUES_PER_BLOCK, "{tag}: input len");
+            let mut x = [0.0_f32; NVFP4_VALUES_PER_BLOCK];
+            for (j, h) in input_hex.iter().enumerate() {
+                x[j] = f32::from_bits(hex_u32(h.as_str().expect("hex")));
+            }
+            let want_wire = b64_decode(vec["wire"].as_str().expect("wire"));
+            assert_eq!(
+                want_wire.len(),
+                NVFP4_WIRE_BYTES_PER_BLOCK,
+                "{tag}: wire len"
+            );
+            let got_wire = encode_nvfp4_block(&x);
+            assert_eq!(
+                got_wire.as_slice(),
+                want_wire.as_slice(),
+                "{tag}: wire bytes"
+            );
+
+            let want_bits = hex_row_bits(vec["dequant"].as_str().expect("dequant"));
+            let got = decode_block_via_tensor_path(&got_wire);
+            assert_bits(&got, &want_bits, tag);
+
+            // Spot-lock the pathological semantics by tag so a future regression
+            // fails with a readable message, not just a byte diff. Every tag the
+            // arms name must actually occur in the fixture — a silent `_` arm
+            // would let a fixture-tag rename disable these locks unnoticed.
+            match tag {
+                "path-all-qnan" | "path-all-neg-qnan" | "path-all-negzero" | "negzero-single" => {
+                    assert_eq!(got_wire, [0u8; 36], "{tag}: expected all-zero wire");
+                    seen_spotlock_tags.insert(tag.to_string());
+                }
+                "path-all-pinf" | "path-all-ninf" | "path-inf-alt" => {
+                    assert!(
+                        got_wire[..4].iter().all(|&b| b == 0x7E),
+                        "{tag}: scale 0x7E"
+                    );
+                    assert!(got_wire[4..].iter().all(|&b| b == 0), "{tag}: all code 0");
+                    seen_spotlock_tags.insert(tag.to_string());
+                }
+                "sat-exact-448" | "sat-448-plus-ulp" | "sat-1e4" | "sat-fltmax" => {
+                    assert!(
+                        got_wire[..4].iter().all(|&b| b == 0x7E),
+                        "{tag}: scale 0x7E"
+                    );
+                    seen_spotlock_tags.insert(tag.to_string());
+                }
+                _ => {}
+            }
+        }
+        for expected in [
+            "path-all-qnan",
+            "path-all-neg-qnan",
+            "path-all-negzero",
+            "negzero-single",
+            "path-all-pinf",
+            "path-all-ninf",
+            "path-inf-alt",
+            "sat-exact-448",
+            "sat-448-plus-ulp",
+            "sat-1e4",
+            "sat-fltmax",
+        ] {
+            assert!(
+                seen_spotlock_tags.contains(expected),
+                "fixture is missing spot-lock tag {expected}: the semantic lock never ran"
+            );
+        }
+    }
+
+    /// Every pin-quantized PRNG/edge input row reproduces the pin's wire bytes
+    /// through the Rust encoder — 10031 diverse encode anchors on top of the 27
+    /// curated vectors.
+    #[test]
+    fn random_blocks_encode_reproduces_pin_wire_bytes() {
+        let fx = fixture_json("nvfp4_random_blocks.json");
+        let blocks = fx["blocks"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 10031);
+        for (i, blk) in blocks.iter().enumerate() {
+            let tag = blk["tag"].as_str().expect("tag");
+            let input = b64_decode(blk["i"].as_str().expect("input"));
+            assert_eq!(input.len(), 256, "block {i} ({tag}): input bytes");
+            let mut x = [0.0_f32; NVFP4_VALUES_PER_BLOCK];
+            for (j, chunk) in input.chunks_exact(4).enumerate() {
+                x[j] = f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            let want_wire = b64_decode(blk["w"].as_str().expect("wire"));
+            let got_wire = encode_nvfp4_block(&x);
+            assert_eq!(
+                got_wire.as_slice(),
+                want_wire.as_slice(),
+                "block {i} ({tag}): wire bytes"
+            );
+        }
+    }
+
+    /// Representable-value round-trip: x = KVALUES_MXFP4[c] * UE4M3_TO_F32[s] for
+    /// every scale byte with a nonzero decoded scale and all 16 codes. For every
+    /// ENCODER-REACHABLE scale (masked 0x01..=0x77 and 0x7E) the round trip is
+    /// bit-exact and the stored scale byte equals the masked input byte. Masked
+    /// 0x78..0x7D (raw >= 256 saturates to 0x7E before mantissa rounding) and 0xFF
+    /// (raw 480 exceeds the 448 input clamp) are unreachable from the pin encoder
+    /// BY DESIGN — for those the encoder must emit 0x7E, and the quantized VALUE
+    /// set must be a fixed point of a second quantize->dequantize pass. (The WIRE
+    /// is deliberately not asserted stable: at masked 0x78 the pin itself re-tightens
+    /// the scale on a second pass — amax of the first-pass output drops to 1344,
+    /// whose amax/6 leaves the exp>=15 saturation region and re-encodes as 0x76 —
+    /// while the decoded values stay bit-identical.)
+    #[test]
+    fn representable_value_round_trip_all_scales_all_codes() {
+        for (s, &d) in UE4M3_TO_F32.iter().enumerate() {
+            if d.to_bits() == 0 {
+                continue; // 0x00 (zero), 0x7F (sentinel flush), 0x80 (masked zero)
+            }
+            let mut x = [0.0_f32; NVFP4_VALUES_PER_BLOCK];
+            for sub in 0..4 {
+                for (c, kv) in KVALUES_MXFP4.iter().enumerate() {
+                    x[sub * 16 + c] = kv * d;
+                }
+            }
+            let wire = encode_nvfp4_block(&x);
+            let masked = (s as u8) & 0x7F;
+            let encodable = (0x01..=0x77).contains(&masked) || masked == 0x7E;
+            if encodable {
+                assert!(
+                    wire[..4].iter().all(|&b| b == masked),
+                    "scale {s:#04x}: stored scale byte {:#04x} != masked {masked:#04x}",
+                    wire[0]
+                );
+                let y = decode_block_via_tensor_path(&wire);
+                for (j, (got, want)) in y.iter().zip(x.iter()).enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "scale {s:#04x} element {j}: round trip not bit-exact"
+                    );
+                }
+            } else {
+                assert!(
+                    wire[..4].iter().all(|&b| b == 0x7E),
+                    "scale {s:#04x}: unreachable scale must saturate to 0x7E, got {:#04x}",
+                    wire[0]
+                );
+                // Value-level fixed point: re-quantizing the quantized values
+                // reproduces them bit-exactly (even where the wire scale byte
+                // legitimately re-tightens, e.g. masked 0x78).
+                let y = decode_block_via_tensor_path(&wire);
+                let y2 = decode_block_via_tensor_path(&encode_nvfp4_block(&y));
+                for (j, (a, b)) in y.iter().zip(y2.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "scale {s:#04x} element {j}: quantized values not a fixed point"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_block_round_trip_and_negative_zero_encode() {
+        // All +0.0: zero wire, all +0.0 back.
+        let x = [0.0_f32; NVFP4_VALUES_PER_BLOCK];
+        let wire = encode_nvfp4_block(&x);
+        assert_eq!(wire, [0u8; NVFP4_WIRE_BYTES_PER_BLOCK]);
+        let y = decode_block_via_tensor_path(&wire);
+        for v in &y {
+            assert_eq!(v.to_bits(), 0x0000_0000);
+        }
+        // All -0.0 encodes IDENTICALLY (pin semantics: amax stays 0 because
+        // `0.0 < |-0.0|` is false, and best_index's initial candidate 0 survives
+        // every tie) — the -0.0 sign does NOT survive the encode side. Sign
+        // survival on the DECODE side is covered below.
+        let neg = [f32::from_bits(0x8000_0000); NVFP4_VALUES_PER_BLOCK];
+        let wire = encode_nvfp4_block(&neg);
+        assert_eq!(wire, [0u8; NVFP4_WIRE_BYTES_PER_BLOCK]);
+    }
+
+    /// Decode-side -0.0 sign survival: negative codes (9..15) under a ZERO decoded
+    /// scale (byte 0x00, and the flushed sentinel 0x7F) multiply to -0.0
+    /// (bit pattern 0x80000000), positive codes and code 8 to +0.0 — matching the
+    /// golden decode-table rows bit-for-bit.
+    #[test]
+    fn negative_codes_times_zero_scale_decode_to_negative_zero() {
+        let mut wire = [0u8; NVFP4_WIRE_BYTES_PER_BLOCK];
+        wire[..4].copy_from_slice(&[0x00, 0x7F, 0x00, 0x7F]);
+        // sub 0: code 9 everywhere; sub 1: code 15; sub 2: code 0; sub 3: code 8.
+        wire[4..12].fill(0x99);
+        wire[12..20].fill(0xFF);
+        wire[20..28].fill(0x00);
+        wire[28..36].fill(0x88);
+        let mut out = [0.0_f32; NVFP4_VALUES_PER_BLOCK];
+        nvfp4_block_decode_into(&mut out, &wire);
+        for j in 0..16 {
+            assert_eq!(out[j].to_bits(), 0x8000_0000, "sub 0 (code 9 x 0.0): -0.0");
+            assert_eq!(
+                out[16 + j].to_bits(),
+                0x8000_0000,
+                "sub 1 (code 15 x 0x7F): -0.0"
+            );
+            assert_eq!(out[32 + j].to_bits(), 0x0000_0000, "sub 2 (code 0): +0.0");
+            assert_eq!(out[48 + j].to_bits(), 0x0000_0000, "sub 3 (code 8): +0.0");
+        }
+    }
+
+    /// First-wins ties: at d = 0.5 (scale byte 0x38, anchored by a 6.0 element)
+    /// every exact midpoint between adjacent representable magnitudes resolves to
+    /// the LOWER LUT index, for both signs — strict `<` in the nearest search, not
+    /// round-nearest-even. Expected codes are hand-derived from the LUT scan order
+    /// and cross-checked against the pin via the `tie-mid-d0.5` golden vectors.
+    #[test]
+    fn exact_midpoint_ties_resolve_to_first_lut_index() {
+        // Representable true values at d=0.5: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+        let sub: [f32; 16] = [
+            6.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, // low nibbles
+            -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, -5.0, 0.0, // high nibbles
+        ];
+        let mut x = [0.0_f32; NVFP4_VALUES_PER_BLOCK];
+        for s in 0..4 {
+            x[s * 16..(s + 1) * 16].copy_from_slice(&sub);
+        }
+        let wire = encode_nvfp4_block(&x);
+        assert!(wire[..4].iter().all(|&b| b == 0x38), "anchor scale 0.5");
+        // Expected codes: lows [7,0,1,2,3,4,5,6]; highs [0,9,10,11,12,13,14,0].
+        // (-0.25 ties +0.0 at index 0 BEFORE -0.5 at index 9, so it goes positive-zero.)
+        let expected_qs: [u8; 8] = [0x07, 0x90, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0x06];
+        for s in 0..4 {
+            assert_eq!(
+                &wire[4 + s * 8..4 + (s + 1) * 8],
+                &expected_qs,
+                "sub-block {s} tie codes"
+            );
+        }
+    }
+
+    /// Scale saturation boundary around 448 x 6: the largest encoder-reachable
+    /// sub-block scale is 0x7E (decoded 224, raw 448); the largest NON-saturating
+    /// scale is 0x77 (decoded 120, raw 240). amax = 2688 = 12 x 224 = 448 x 6 hits
+    /// 0x7E exactly and round-trips; one ULP either side stays at 0x7E (clamp /
+    /// exponent saturation); amax = 6 x 248 carries past raw 240 into saturation.
+    #[test]
+    fn scale_saturation_boundary_at_448_by_6() {
+        let cases: [(f32, u8); 5] = [
+            (2688.0, 0x7E),                 // amax/6 == 448 exactly
+            (2688.0_f32.next_up(), 0x7E),   // just over: clamps to 448
+            (2688.0_f32.next_down(), 0x7E), // just under: exp path still saturates
+            (6.0 * 240.0, 0x77),            // largest non-saturating: raw 240
+            (6.0 * 248.0, 0x7E),            // round-half-up carry into exp 15
+        ];
+        for (amax, want_scale) in cases {
+            let x = [amax; NVFP4_VALUES_PER_BLOCK];
+            let wire = encode_nvfp4_block(&x);
+            assert!(
+                wire[..4].iter().all(|&b| b == want_scale),
+                "amax {amax}: scale {:#04x} want {want_scale:#04x}",
+                wire[0]
+            );
+        }
+        // Exact round trip at the boundary: 2688 = code 7 x 224.
+        let x = [2688.0_f32; NVFP4_VALUES_PER_BLOCK];
+        let y = decode_block_via_tensor_path(&encode_nvfp4_block(&x));
+        for v in &y {
+            assert_eq!(v.to_bits(), 2688.0_f32.to_bits());
+        }
+        // 1440 = code 7 x 120 round-trips through the last non-saturating scale.
+        let x = [1440.0_f32; NVFP4_VALUES_PER_BLOCK];
+        let y = decode_block_via_tensor_path(&encode_nvfp4_block(&x));
+        for v in &y {
+            assert_eq!(v.to_bits(), 1440.0_f32.to_bits());
+        }
+    }
+
+    /// The UE4M3 encoder in isolation: exact grid values, half-up rounding, the
+    /// subnormal path, the 448 clamp, and the NaN/non-positive zero returns.
+    #[test]
+    fn fp32_to_ue4m3_semantics() {
+        assert_eq!(fp32_to_ue4m3(f32::NAN), 0x00);
+        assert_eq!(fp32_to_ue4m3(0.0), 0x00);
+        assert_eq!(fp32_to_ue4m3(-1.0), 0x00);
+        assert_eq!(fp32_to_ue4m3(f32::from_bits(0x8000_0000)), 0x00); // -0.0
+        assert_eq!(fp32_to_ue4m3(f32::INFINITY), 0x7E); // clamp then saturate
+        assert_eq!(fp32_to_ue4m3(448.0), 0x7E);
+        assert_eq!(fp32_to_ue4m3(1.0), 0x38); // raw 1.0 -> exp 7, man 0
+        assert_eq!(fp32_to_ue4m3(240.0), 0x77); // largest non-saturating grid point
+        assert_eq!(fp32_to_ue4m3(248.0), 0x7E); // half-up carry into exp 15
+        assert_eq!(fp32_to_ue4m3(1.0 / 512.0), 0x01); // subnormal grid
+        assert_eq!(fp32_to_ue4m3(0.9 / 512.0), 0x01); // rounds half-up to man 1
+        assert_eq!(fp32_to_ue4m3(0.4 / 512.0), 0x00); // below the subnormal floor
+                                                      // Every encoder-reachable byte decodes back to a value that re-encodes to
+                                                      // itself (grid fixed points).
+        for b in 0x01..=0x77u8 {
+            let raw = UE4M3_TO_F32[b as usize] * 2.0; // undo the pair-rule half
+            assert_eq!(fp32_to_ue4m3(raw), b, "grid fixed point {b:#04x}");
+        }
+        let raw_7e = UE4M3_TO_F32[0x7E] * 2.0;
+        assert_eq!(fp32_to_ue4m3(raw_7e), 0x7E);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

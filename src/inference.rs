@@ -19216,6 +19216,35 @@ pub(crate) fn q4_0_wire_block_dequant(block_bytes: &[u8]) -> [f32; 32] {
     out
 }
 
+/// Dequantize a single NVFP4 wire super-block (36 bytes: `d[4]` UE4M3 sub-block
+/// scales then `qs[32]` packed E2M1 nibbles) into 64 f32 values — the hot-path twin
+/// of the pin's `dequantize_row_nvfp4` (llama.cpp acd79d603), PIN-BITWISE for any
+/// byte pattern. Deliberately NO NaN-sentinel scan here: scale byte 0x7F flushes to
+/// d = 0.0 exactly like the pin (and raw 0xFF decodes to 240.0 — the pin's CPU
+/// sentinel check is on the raw byte); the LOAD path
+/// ([`crate::tensor::decode_nvfp4_tensor`]) is the seam that fails closed on
+/// sentinel bytes per DECISIONS.md D17/T5 — see the NVFP4 section in
+/// `crate::tensor` for why the two semantics coexist. Sub-block `s` owns
+/// `qs[s*8..s*8+7]`; LOW nibble of byte `s*8+j` is element `s*16+j`, HIGH nibble is
+/// element `s*16+8+j`; value = `KVALUES_MXFP4[nibble] * UE4M3_TO_F32[d[s]]` (the
+/// doubled-LUT x half-scale pair rule).
+pub fn nvfp4_wire_block_dequant(
+    block_bytes: &[u8],
+) -> [f32; crate::tensor::NVFP4_VALUES_PER_BLOCK] {
+    use crate::tensor::{KVALUES_MXFP4, NVFP4_WIRE_BYTES_PER_BLOCK, UE4M3_TO_F32};
+    debug_assert_eq!(block_bytes.len(), NVFP4_WIRE_BYTES_PER_BLOCK);
+    let mut out = [0f32; crate::tensor::NVFP4_VALUES_PER_BLOCK];
+    for s in 0..4 {
+        let d = UE4M3_TO_F32[block_bytes[s] as usize];
+        for j in 0..8 {
+            let byte = block_bytes[4 + s * 8 + j];
+            out[s * 16 + j] = KVALUES_MXFP4[(byte & 0x0F) as usize] * d;
+            out[s * 16 + 8 + j] = KVALUES_MXFP4[(byte >> 4) as usize] * d;
+        }
+    }
+    out
+}
+
 pub(crate) const Q4_K_WIRE_BYTES_PER_BLOCK: usize = 144;
 pub(crate) const Q5_K_WIRE_BYTES_PER_BLOCK: usize = 176;
 pub(crate) const Q5_0_WIRE_BYTES_PER_BLOCK: usize = 22;
