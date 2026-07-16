@@ -1,6 +1,8 @@
 # Camelid Status
 
-Last updated: 2026-07-10
+Last updated: 2026-07-15
+
+MUSTER note (2026-07-15): the MUSTER campaign (experimental-lane clearance — every chip-rendering model row exits via a promoted supported exact-row contract entry or a committed HOLD receipt; see `MUSTER_CONDUCTOR.md`) opened Phase 0 at head `cd528cac`. The proposed roster is committed in `MUSTER_ROSTER.md` (Wave A: gemma3-1b-it Q8_0, Phi-3-mini-4k Q8_0; Wave B: Llama-3.2-1B Q4_K_M, Ornith Q6_K/IQ4_XS/BF16/IQ3_XXS, Qwen2.5-0.5B Q4_0) with the environment fingerprint and live-enumeration cross-checks. **Gate 0 is open: no support claim moves, no code changes, no row enters recon until the roster is signed.** Sign-off will be recorded here.
 
 Serving-engine note (2026-07-09): the API's decode ownership was inverted (DECISIONS.md D16). One engine worker thread now executes every decode behind a bounded queue; `generation_lock` is gone, client disconnects and timeouts can no longer orphan compute against shared GPU state, and backpressure is a typed 503 with an observable queue depth. Supported-row outputs are receipt-proven byte-identical across the change (`qa/evidence-bundles/engine-inversion-gate*`), so no support claim moves; this is a correctness/ownership change only.
 
