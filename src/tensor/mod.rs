@@ -5794,6 +5794,7 @@ mod nvfp4_tests {
         let fx = fixture_json("nvfp4_encode_vectors.json");
         let vectors = fx["vectors"].as_array().expect("vectors");
         assert_eq!(vectors.len(), 27);
+        let mut seen_spotlock_tags = std::collections::BTreeSet::new();
         for vec in vectors {
             let tag = vec["tag"].as_str().expect("tag");
             let input_hex = vec["input"].as_array().expect("input");
@@ -5820,10 +5821,13 @@ mod nvfp4_tests {
             assert_bits(&got, &want_bits, tag);
 
             // Spot-lock the pathological semantics by tag so a future regression
-            // fails with a readable message, not just a byte diff.
+            // fails with a readable message, not just a byte diff. Every tag the
+            // arms name must actually occur in the fixture — a silent `_` arm
+            // would let a fixture-tag rename disable these locks unnoticed.
             match tag {
                 "path-all-qnan" | "path-all-neg-qnan" | "path-all-negzero" | "negzero-single" => {
                     assert_eq!(got_wire, [0u8; 36], "{tag}: expected all-zero wire");
+                    seen_spotlock_tags.insert(tag.to_string());
                 }
                 "path-all-pinf" | "path-all-ninf" | "path-inf-alt" => {
                     assert!(
@@ -5831,15 +5835,35 @@ mod nvfp4_tests {
                         "{tag}: scale 0x7E"
                     );
                     assert!(got_wire[4..].iter().all(|&b| b == 0), "{tag}: all code 0");
+                    seen_spotlock_tags.insert(tag.to_string());
                 }
                 "sat-exact-448" | "sat-448-plus-ulp" | "sat-1e4" | "sat-fltmax" => {
                     assert!(
                         got_wire[..4].iter().all(|&b| b == 0x7E),
                         "{tag}: scale 0x7E"
                     );
+                    seen_spotlock_tags.insert(tag.to_string());
                 }
                 _ => {}
             }
+        }
+        for expected in [
+            "path-all-qnan",
+            "path-all-neg-qnan",
+            "path-all-negzero",
+            "negzero-single",
+            "path-all-pinf",
+            "path-all-ninf",
+            "path-inf-alt",
+            "sat-exact-448",
+            "sat-448-plus-ulp",
+            "sat-1e4",
+            "sat-fltmax",
+        ] {
+            assert!(
+                seen_spotlock_tags.contains(expected),
+                "fixture is missing spot-lock tag {expected}: the semantic lock never ran"
+            );
         }
     }
 
