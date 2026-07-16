@@ -12277,6 +12277,105 @@ fn q5_k_wire_dot_consistent_with_tensor_dequant() {
     );
 }
 
+/// IQ4_XS: the streaming wire-row dot must equal the tensor-layer decode dotted against
+/// the SAME Q8_K-dequantised activation. `iq4_xs_wire_row_dot` accumulates integers per
+/// sub-block; the reference decodes to f32 and dots in f64 — they agree within f32 rounding.
+#[test]
+fn iq4_xs_wire_dot_consistent_with_tensor_dequant() {
+    let blocks = 3usize;
+    let mut wire = vec![0u8; blocks * crate::tensor::IQ4_XS_BLOCK_BYTES];
+    for (i, b) in wire.iter_mut().enumerate() {
+        *b = ((i * 131 + 17) % 256) as u8;
+    }
+    // Sane f16 super-block scale `d` at byte offset 0 of each super-block (leave scales_h,
+    // scales_l, qs as the pseudo-random fill to exercise all 8 sub-block scales + codebook).
+    for blk in wire.chunks_exact_mut(crate::tensor::IQ4_XS_BLOCK_BYTES) {
+        blk[0..2].copy_from_slice(&super::f32_to_f16_bits(0.0173).to_le_bytes());
+    }
+
+    let activation: Vec<f32> = (0..blocks * 256)
+        .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+        .collect();
+    let xq = super::quantize_q8_k_blocks(&activation);
+
+    let dot = super::iq4_xs_wire_row_dot(&wire, &xq);
+
+    let decoded = crate::tensor::decode_iq4_xs_blocks(&wire).expect("decode iq4_xs blocks");
+    let mut reference = 0f64;
+    let mut vals = [0f32; 256];
+    for (bi, block) in decoded.iter().enumerate() {
+        block.dequantize(&mut vals);
+        let y = &xq[bi];
+        for (l, &w) in vals.iter().enumerate() {
+            reference += w as f64 * (y.d as f64 * y.qs[l] as f64);
+        }
+    }
+    assert!(
+        (dot as f64 - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
+        "iq4_xs dot {dot} vs tensor dequant reference {reference}"
+    );
+}
+
+/// IQ4_XS prefill linear: `iq4_xs_block_dot_core` (multi-row, rayon over output) must equal
+/// the per-(row, output) `iq4_xs_wire_row_dot` oracle exactly — same kernel, so the tiling
+/// is bit-identical, not merely close.
+#[test]
+fn iq4_xs_block_dot_core_matches_row_dot_oracle() {
+    let (in_dim, out_dim, n_rows) = (512usize, 5usize, 4usize);
+    let sb = in_dim / 256;
+    let mut wire = vec![0u8; out_dim * sb * crate::tensor::IQ4_XS_BLOCK_BYTES];
+    for (i, b) in wire.iter_mut().enumerate() {
+        *b = ((i * 191 + 7) % 256) as u8;
+    }
+    for blk in wire.chunks_exact_mut(crate::tensor::IQ4_XS_BLOCK_BYTES) {
+        blk[0..2].copy_from_slice(&super::f32_to_f16_bits(0.021).to_le_bytes());
+    }
+    let input_data: Vec<f32> = (0..n_rows * in_dim)
+        .map(|i| ((i as f32) * 0.017).cos() * 2.5)
+        .collect();
+    let input = super::CpuTensor::from_f32("in", vec![n_rows, in_dim], input_data.clone()).unwrap();
+
+    let out = super::iq4_xs_block_dot_core(&input, &wire, out_dim, in_dim, "iq4xs").unwrap();
+    assert_eq!(out.shape.dims, vec![n_rows, out_dim]);
+
+    let row_bytes = sb * crate::tensor::IQ4_XS_BLOCK_BYTES;
+    for r in 0..n_rows {
+        let xq = super::quantize_q8_k_blocks(&input_data[r * in_dim..(r + 1) * in_dim]);
+        for o in 0..out_dim {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            let want = super::iq4_xs_wire_row_dot(w_row, &xq);
+            assert_eq!(
+                out.data[r * out_dim + o].to_bits(),
+                want.to_bits(),
+                "row {r} col {o}"
+            );
+        }
+    }
+}
+
+/// IQ4_XS decode (single-row) path must equal the first row of the prefill core.
+#[test]
+fn iq4_xs_decode_row_matches_block_dot_core() {
+    let (in_dim, out_dim) = (256usize, 6usize);
+    let sb = in_dim / 256;
+    let mut wire = vec![0u8; out_dim * sb * crate::tensor::IQ4_XS_BLOCK_BYTES];
+    for (i, b) in wire.iter_mut().enumerate() {
+        *b = ((i * 53 + 29) % 256) as u8;
+    }
+    for blk in wire.chunks_exact_mut(crate::tensor::IQ4_XS_BLOCK_BYTES) {
+        blk[0..2].copy_from_slice(&super::f32_to_f16_bits(0.031).to_le_bytes());
+    }
+    let input_row: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.05).sin()).collect();
+    let input = super::CpuTensor::from_f32("in", vec![1, in_dim], input_row.clone()).unwrap();
+
+    let prefill = super::iq4_xs_block_dot_core(&input, &wire, out_dim, in_dim, "iq4xs").unwrap();
+    let mut decode = vec![0f32; out_dim];
+    super::accumulate_transposed_linear_row_iq4_xs(&input_row, &wire, &mut decode);
+    for (o, &d) in decode.iter().enumerate() {
+        assert_eq!(prefill.data[o].to_bits(), d.to_bits(), "col {o}");
+    }
+}
+
 /// Real-weight Q5_K parity: for each 2-D Q5_K linear in a downloaded Q5_K_M GGUF,
 /// the CPU block-dot (`q5_k_block_dot_core`, which quantises the activation to Q8_K)
 /// must match an independent f32 reference — the tensor-layer decoder
@@ -12353,6 +12452,80 @@ fn q5_k_block_dot_matches_decode_on_real_model() {
         }
     }
     assert!(tested > 0, "no 2-D Q5_K linears found in {path:?}");
+}
+
+/// Real-weight IQ4_XS parity: for each 2-D IQ4_XS linear in a downloaded GGUF, the CPU
+/// streaming block-dot (`iq4_xs_block_dot_core`, which quantises the activation to Q8_K)
+/// must match an independent f32 reference — the tensor-layer decoder (`decode_iq4_xs_tensor`)
+/// dotted against the SAME Q8_K-dequantised activation. Exercises the real load + block-dot
+/// wiring on real model weights. Skips unless `CAMELID_IQ4XS_GGUF` points to an IQ4_XS GGUF.
+#[test]
+fn iq4_xs_block_dot_matches_decode_on_real_model() {
+    let Some(path) = std::env::var_os("CAMELID_IQ4XS_GGUF") else {
+        eprintln!(
+            "skipping iq4_xs block-dot real-model parity: set CAMELID_IQ4XS_GGUF to an IQ4_XS gguf"
+        );
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let gguf = crate::gguf::read_metadata(&path).expect("read gguf metadata");
+    let store = crate::tensor::TensorStore::open(&path, &gguf);
+
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    };
+
+    let mut tested = 0usize;
+    for desc in &gguf.tensors {
+        if desc.tensor_type != crate::gguf::GgufTensorType::IQ4XS || desc.dimensions.len() != 2 {
+            continue;
+        }
+        let in_dim = desc.dimensions[0] as usize;
+        let out_dim = desc.dimensions[1] as usize;
+        if !in_dim.is_multiple_of(256) {
+            continue;
+        }
+        let wire = store.tensor_bytes(&desc.name).expect("wire bytes");
+        let f32w = crate::tensor::decode_iq4_xs_tensor(&desc.name, &wire, in_dim * out_dim)
+            .expect("decode iq4_xs tensor");
+
+        let n_rows = 2usize;
+        let input_data: Vec<f32> = (0..n_rows * in_dim).map(|_| next_f32()).collect();
+        let input =
+            crate::tensor::CpuTensor::from_f32("iq4_in", vec![n_rows, in_dim], input_data.clone())
+                .expect("input tensor");
+
+        let out_bd = super::iq4_xs_block_dot_core(&input, &wire, out_dim, in_dim, "iq4_bd")
+            .expect("iq4_xs block dot");
+
+        for r in 0..n_rows {
+            let xq = super::quantize_q8_k_blocks(&input_data[r * in_dim..(r + 1) * in_dim]);
+            for o in 0..out_dim {
+                let mut reference = 0f64;
+                for (blk, y) in xq.iter().enumerate() {
+                    for l in 0..256 {
+                        let k = blk * 256 + l;
+                        reference += f32w[o * in_dim + k] as f64 * (y.d as f64 * y.qs[l] as f64);
+                    }
+                }
+                let got = out_bd.data[r * out_dim + o] as f64;
+                assert!(
+                    (got - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
+                    "iq4_xs block-dot mismatch in {} row {r} out {o}: got {got} ref {reference}",
+                    desc.name
+                );
+            }
+        }
+        tested += 1;
+        if tested >= 3 {
+            break;
+        }
+    }
+    assert!(tested > 0, "no 2-D IQ4_XS linears found in {path:?}");
 }
 
 /// Q5_0: the wire-row dot must agree with an f64 dot of the tensor-layer

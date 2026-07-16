@@ -7,15 +7,15 @@
 //! anchored externally against ggml reference fixtures (Gate 2), not trusted from the
 //! internal paths it reuses.
 //!
-//! Covered v1 set: `F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K`. Anything else is refused
-//! — admission (`super::admit`) should already have rejected it, but dequant fails
-//! closed regardless.
+//! Covered v1 set: `F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS`. Anything else is
+//! refused — admission (`super::admit`) should already have rejected it, but dequant
+//! fails closed regardless.
 
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
 use crate::tensor::{
-    decode_q3_k_tensor, decode_q4_0_tensor, decode_q4_k_tensor, decode_q5_k_tensor,
-    decode_q6_k_tensor, decode_q8_0_tensor, f16_bits_to_f32,
+    decode_iq4_xs_tensor, decode_q3_k_tensor, decode_q4_0_tensor, decode_q4_k_tensor,
+    decode_q5_k_tensor, decode_q6_k_tensor, decode_q8_0_tensor, f16_bits_to_f32,
 };
 
 /// Dequantize one tensor's wire bytes to a flat row-major `Vec<f32>` of
@@ -35,9 +35,10 @@ pub fn dequantize(
         GgufTensorType::Q4K => decode_q4_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q5K => decode_q5_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q6K => decode_q6_k_tensor(tensor_name, bytes, n_elements),
+        GgufTensorType::IQ4XS => decode_iq4_xs_tensor(tensor_name, bytes, n_elements),
         other => Err(BackendError::UnsupportedTensorType(format!(
             "tensor {tensor_name} is {other:?}; runnable dequant covers \
-             F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K"
+             F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS"
         ))),
     }
 }
