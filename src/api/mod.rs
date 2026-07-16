@@ -3018,6 +3018,55 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the runnable lane is correct but slow vs an optimized SIMD/CUDA kernel).",
                 next_step: "preserve the parity-certified runnable lane + the read/list/write agent capability for this exact row; an optimized-lane qwen35 kernel for production throughput, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
             },
+            // MUSTER M-A1 (2026-07-16): gemma3 1B promoted on the runnable serve lane
+            // (the only lane with a correct gemma3 forward — the optimized dense binder
+            // silently drops gemma3's norms and has no GeGLU, so it stays fail-closed
+            // for chat via is_runnable_serve_arch). Filename-anchored id
+            // (`gemma_3_1b_it_q8_0` = normalized GGUF filename) so the frontend
+            // exact-row identity matcher resolves the local file; the catalog entry
+            // `gemma3_1b_it_q8_0` resolves via the filename/name match.
+            ModelCompatibilityTarget {
+                id: "gemma_3_1b_it_q8_0",
+                tool_capable: false,
+                family: "gemma3_runnable_decoder",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "strict all-leg parity (one documented 50-token near-tie at a 0.3416-nat gap — ABOVE the Ornith 0.33-nat soft-position line, attributed only under the Llama-3.2-3B gaps-stated precedent), context above the 512-token sliding window (the runnable lane implements no window mask, so longer sequences are mathematically wrong by construction), bounded-context packs, perf (observed ~5 s/token on the pure-f32 runnable CPU lane — recorded, not a claim), tool capability (tools fail closed with a typed 422), GPU lane (runnable CUDA is qwen35-gated), portability, and durable repeated current-head bundles remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_cross_engine_prompt_tokenization_identical_5_of_5_spm_llama_262k_vocab",
+                tensors_load: "validated_183_q8_0_plus_157_f32_tied_embedding_runnable_resident",
+                generation_runs: "runnable_serve_cpu_chat_greedy_with_eog_stop",
+                parity_audited: "gemma3_marker_chat_token_and_text_parity_1_5_50_four_of_five_prompts_all_depths_fifth_identical_at_1_5_single_flip_at_50_index_16_gap_stated_vs_llamacpp_acd79d6",
+                performance_measured: "observed_about_5_s_per_token_cpu_runnable_recorded_not_a_perf_claim",
+                frontend_load_path_verified: "not_promoted",
+                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1",
+                tested_context: "gemma3_marker_chat_1_5_50_smoke_total_sequence_well_under_the_512_token_sliding_window",
+                chat_template_renderer: "gemma3_marker_native_byte_locked_by_shapes_pack",
+                chat_template_shape_pack: "validated_in_src_pack_lock_test",
+                chat_template_shape_pack_id: "gemma3-chat-template-shapes-v1",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "runnable_serve_gemma3_chat_parity",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb/README.md",
+                evidence: "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding, served via the runnable lane (CAMELID_RUNNABLE_SERVE=1, CPU) with the new gemma3 marker renderer — byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test — and EOG-stopping dense decode. Greedy chat parity vs pinned llama.cpp acd79d603 (build 9632, CPU llama-server /completion -ngl 0), committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at 1/5/50: 4/5 prompts token-AND-text identical at every depth (incl. a natural early-stop leg proving stop semantics); the fifth is identical at 1/5 and diverges at position 16 of the 50-token leg — probed in solo oracle sessions: camelid's token is the oracle's immediate #2 at a 0.3416-nat top-2 gap, with the oracle BIT-STABLE across thread-count (default/4/2) and runtime-repack kernel controls. DISCLOSED PLAINLY: that gap exceeds the Ornith <=0.33-nat soft-position precedent and no oracle-side backend flip exists, so the flip rests on the Llama-3.2-3B 'documented near-ties with gaps stated' precedent — the weakest single attribution in the MUSTER campaign to date. Cross-engine prompt tokenization identical on 5/5 prompts (llama /tokenize vs camelid encode, incl. BOS placement); determinism sanity byte-identical across two independent serve sessions; the pre-existing HF-reference receipt qa/runnable/gemma3-parity.json (all_greedy_match=true, SHA-anchored to this exact file) anchors the engine math independently. Sequences are scoped well under the 512-token sliding window the runnable lane does not mask. Observed decode ~5 s/token on the pure-f32 CPU lane (recorded, NOT a perf claim). Bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb. NOT claimed: strict all-leg parity, any context at or beyond the 512-token window, bounded-context packs, tools (fail closed, typed 422), throughput, GPU residency, neighboring gemma3 sizes/quants, or the gemma4 family.",
+                next_step: "a runnable-lane sliding-window mask (or an optimized-lane gemma3 forward) before any context claim at or beyond 512 tokens; per-row perf work if the ~5 s/token CPU lane matters; agent-eval battery before any tool_capable claim",
+            },
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
                 tool_capable: false,
@@ -4592,7 +4641,10 @@ mod gemma4_template_tests {
         // The expected strings are pinned-oracle truth (llama-server --jinja
         // /apply-template at the standing pin), captured before any parity run.
         assert!(pack.oracle.contains("acd79d603"));
-        assert!(pack.shapes.len() >= 6, "pack must carry the captured shapes");
+        assert!(
+            pack.shapes.len() >= 6,
+            "pack must carry the captured shapes"
+        );
 
         for shape in &pack.shapes {
             let messages: Vec<ChatMessage> = shape
@@ -14531,6 +14583,14 @@ mod tests {
                 // cross-backend control); prompt tokenization 8/8. LOCAL file,
                 // upstream provenance unresolved (SHA-anchored). Raw-decode smoke only.
                 "llama_3_2_1b_instruct_q4_k_m",
+                // gemma3 1B Q8_0 (MUSTER M-A1, filename-anchored id): runnable serve
+                // lane chat parity vs llama.cpp acd79d603 — 4/5 gate-pack prompts
+                // token+text identical at every 1/5/50 depth, fifth identical at 1/5
+                // with a single documented 50-token flip (oracle-#2, 0.3416-nat gap
+                // stated; above the Ornith soft line, disclosed in the evidence);
+                // prompt tokenization 5/5 cross-engine; renderer byte-locked by the
+                // shapes pack. Chat smoke only, <512-token sliding-window scope.
+                "gemma_3_1b_it_q8_0",
                 // Llama-3.2-1B-Instruct IQ4_XS (i-quant, llama BPE): GPU-resident
                 // iq4xs_gemv raw-decode greedy parity vs llama.cpp acd79d6 — 2/4
                 // probe prompts 24-token identical, 2/4 prefix-then-near-tie (the
