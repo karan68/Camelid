@@ -4546,9 +4546,14 @@ mod gemma4_template_tests {
                 content: "Capital of France?".to_string(),
             },
         ];
+        // Oracle-locked semantics (MUSTER M-A2): system renders as its own
+        // <|user|> turn, each user/system turn eagerly followed by the
+        // <|assistant|> header — matching the pinned oracle's /apply-template
+        // output (see phi3-chat-template-shapes-v1.json), NOT the old
+        // <|system|>-headed form this test previously asserted.
         assert_eq!(
             render_phi3_prompt(&messages),
-            "<|system|>\nBe concise.<|end|>\n<|user|>\nCapital of France?<|end|>\n<|assistant|>\n"
+            "<|user|>\nBe concise.<|end|>\n<|assistant|>\n<|user|>\nCapital of France?<|end|>\n<|assistant|>\n"
         );
         // Phi-3's <|end|>-separated template must be detected before TinyLlama's.
         let phi3_tmpl = "<|user|>\n{{content}}<|end|>\n<|assistant|>\n";
@@ -4622,6 +4627,59 @@ mod gemma4_template_tests {
         assert!(!completions_unsupported_for_arch("mistral"));
         assert!(!completions_unsupported_for_arch("gemma4"));
         assert!(!completions_unsupported_for_arch(""));
+    }
+
+    #[test]
+    fn phi3_chat_template_pack_locks_renderer() {
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            messages: Vec<PackMessage>,
+            expected_prompt: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct PackMessage {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            oracle: String,
+            shapes: Vec<Shape>,
+        }
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/phi3-chat-template-shapes-v1.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read phi3 template shapes pack");
+        let pack: Pack = serde_json::from_str(&raw).expect("parse phi3 template shapes pack");
+
+        assert_eq!(pack.pack_id, "phi3-chat-template-shapes-v1");
+        assert!(pack.oracle.contains("acd79d603"));
+        assert!(
+            pack.shapes.len() >= 6,
+            "pack must carry the captured shapes"
+        );
+
+        for shape in &pack.shapes {
+            let messages: Vec<ChatMessage> = shape
+                .messages
+                .iter()
+                .map(|m| ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect();
+            let rendered = render_phi3_prompt(&messages);
+            assert_eq!(
+                rendered, shape.expected_prompt,
+                "shape {} diverges from the pinned-oracle /apply-template rendering",
+                shape.id
+            );
+        }
     }
 
     #[test]
@@ -13007,20 +13065,30 @@ fn agent_call_to_mistral_json(content: &str, id: &str) -> String {
 /// then the `<|assistant|>\n` generation prompt. Mirrors the GGUF jinja template;
 /// `<|end|>` is the end-of-turn marker (and stop token under `parse_special`).
 fn render_phi3_prompt(messages: &[ChatMessage]) -> String {
+    // Byte-faithful to the Phi-3-mini GGUF template AS THE PINNED ORACLE RENDERS
+    // IT (llama-server --jinja /apply-template, locked by
+    // qa/prompt-packs/phi3-chat-template-shapes-v1.json — MUSTER M-A2):
+    // user AND system messages each render as a `<|user|>` turn eagerly followed
+    // by the `<|assistant|>\n` header (the template emits it per user/system
+    // message, not as a separate generation prompt); assistant messages are
+    // HEADERLESS (`{content}<|end|>\n` — the header came from the previous
+    // turn's eager emission), and a TRAILING assistant message keeps no final
+    // `<|end|>` (the oracle strips it: assistant-prefill continuation). Content
+    // is verbatim — the template has no trim filters. No BOS string: the route
+    // encodes with add_special=true, matching llama-server's chat path.
     let mut prompt = String::new();
-    for message in messages {
-        let role = match message.role.trim() {
-            "system" => "system",
-            "assistant" => "assistant",
-            _ => "user",
-        };
-        prompt.push_str("<|");
-        prompt.push_str(role);
-        prompt.push_str("|>\n");
-        prompt.push_str(&message.content);
-        prompt.push_str("<|end|>\n");
+    for (i, message) in messages.iter().enumerate() {
+        if message.role.trim() == "assistant" {
+            prompt.push_str(&message.content);
+            if i + 1 < messages.len() {
+                prompt.push_str("<|end|>\n");
+            }
+        } else {
+            prompt.push_str("<|user|>\n");
+            prompt.push_str(&message.content);
+            prompt.push_str("<|end|>\n<|assistant|>\n");
+        }
     }
-    prompt.push_str("<|assistant|>\n");
     prompt
 }
 

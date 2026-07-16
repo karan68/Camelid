@@ -209,13 +209,19 @@ impl LlamaModelConfig {
             // Qwen3 GGUFs are not weight-permuted (unlike LLaMA conversions), so
             // their RoPE must use NEOX split-half pairing to match llama.cpp.
             // Verified token-identical against the pinned reference for
-            // Qwen3-1.7B Q8_0. Other unpermuted archs (qwen2/gemma3/phi3/…) very
-            // likely need this too but are out of scope and unverified, so we
-            // only flip it for the proven row here.
+            // Qwen3-1.7B Q8_0. phi3 is likewise unpermuted and was PROVEN to need
+            // NEOX during MUSTER M-A2: with adjacent even/odd pairing, long
+            // open-ended generation degenerates within a handful of tokens (the
+            // known 92029b7e limitation), while a CAMELID_ROPE_PAIRING=split_half
+            // probe on the exact Phi-3-mini-4k Q8_0 row produces coherent
+            // long-form output — the runnable lane independently asserts NEOX for
+            // phi3. Other unpermuted archs (qwen2/gemma3/…) very likely need this
+            // too but stay out of scope and unverified until their own rows prove
+            // it (gemma3 serves via the runnable lane, which handles it there).
             // qwen35 full-attention layers are also unpermuted (NEOX split-half),
             // with partial RoPE over the first `rope.dimension_count` (64) of the
             // 256-wide head — handled in the runnable qwen35 path.
-            rope_neox_pairing: architecture == "qwen3" || architecture == "qwen35",
+            rope_neox_pairing: arch_uses_neox_rope_pairing(architecture),
             moe,
             gemma4,
             qwen35,
@@ -673,6 +679,16 @@ impl Qwen35Metadata {
     pub fn is_recurrent_layer(&self, idx: usize) -> bool {
         self.layer_is_recurrent.get(idx).copied().unwrap_or(false)
     }
+}
+
+/// NEOX split-half RoPE pairing per architecture: qwen3/qwen35 (verified
+/// token-identical vs the pinned reference) and phi3 (unpermuted weights;
+/// proven during MUSTER M-A2 — adjacent even/odd degenerates long generation,
+/// split-half restores coherence; the runnable lane independently asserts NEOX
+/// for phi3). Everything else keeps adjacent even/odd (LLaMA-style permuted
+/// conversions). Pure so the gate is unit-testable.
+fn arch_uses_neox_rope_pairing(architecture: &str) -> bool {
+    matches!(architecture, "qwen3" | "qwen35" | "phi3")
 }
 
 fn architecture_key(architecture: &str, suffix: &str) -> String {
@@ -1780,6 +1796,23 @@ pub fn expand_fused_dense_tensors(gguf: &mut GgufFile, config: &LlamaModelConfig
 mod tests {
     use super::validate_output_projection_storage_layout;
     use crate::gguf::{GgufTensorDescriptor, GgufTensorType};
+
+    #[test]
+    fn neox_rope_pairing_covers_exactly_the_proven_archs() {
+        // qwen3/qwen35 verified vs the pinned reference; phi3 proven during
+        // MUSTER M-A2 (adjacent even/odd degenerates long generation on the
+        // exact Phi-3-mini-4k row, split-half restores coherence). Everything
+        // else — including the other unpermuted-but-unproven archs — must stay
+        // on adjacent even/odd until its own row proves the flip.
+        assert!(super::arch_uses_neox_rope_pairing("qwen3"));
+        assert!(super::arch_uses_neox_rope_pairing("qwen35"));
+        assert!(super::arch_uses_neox_rope_pairing("phi3"));
+        assert!(!super::arch_uses_neox_rope_pairing("llama"));
+        assert!(!super::arch_uses_neox_rope_pairing("mistral"));
+        assert!(!super::arch_uses_neox_rope_pairing("qwen2"));
+        assert!(!super::arch_uses_neox_rope_pairing("gemma3"));
+        assert!(!super::arch_uses_neox_rope_pairing("gemma4"));
+    }
 
     #[test]
     fn implemented_architecture_set_is_exactly_the_from_gguf_accept_arm() {
