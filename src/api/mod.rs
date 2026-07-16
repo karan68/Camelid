@@ -4562,6 +4562,58 @@ mod gemma4_template_tests {
     /// guarantee the opt-in thinking lane carries. The parity-locked exact-row
     /// mode stays thinking-DISABLED; this test does not touch that claim.
     #[test]
+    fn gemma3_chat_template_pack_locks_renderer() {
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            messages: Vec<PackMessage>,
+            expected_prompt: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct PackMessage {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            oracle: String,
+            shapes: Vec<Shape>,
+        }
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/gemma3-chat-template-shapes-v1.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read gemma3 template shapes pack");
+        let pack: Pack = serde_json::from_str(&raw).expect("parse gemma3 template shapes pack");
+
+        assert_eq!(pack.pack_id, "gemma3-chat-template-shapes-v1");
+        // The expected strings are pinned-oracle truth (llama-server --jinja
+        // /apply-template at the standing pin), captured before any parity run.
+        assert!(pack.oracle.contains("acd79d603"));
+        assert!(pack.shapes.len() >= 6, "pack must carry the captured shapes");
+
+        for shape in &pack.shapes {
+            let messages: Vec<ChatMessage> = shape
+                .messages
+                .iter()
+                .map(|m| ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect();
+            let rendered = render_gemma3_prompt(&messages);
+            assert_eq!(
+                rendered, shape.expected_prompt,
+                "shape {} diverges from the pinned-oracle /apply-template rendering",
+                shape.id
+            );
+        }
+    }
+
+    #[test]
     fn qwen3_chatml_thinking_template_pack_locks_renderer() {
         #[derive(serde::Deserialize)]
         struct Shape {
@@ -5225,9 +5277,14 @@ fn runnable_serve_enabled() -> bool {
     )
 }
 
-/// True for architectures served through the runnable bridge (qwen35 today).
+/// True for architectures served through the runnable bridge (qwen35, and — since
+/// MUSTER M-A1 — gemma3, whose only correct forward lives in the runnable lane; the
+/// optimized dense binder silently drops gemma3's QK/post norms and has no GeGLU).
+/// Deliberate side effect of listing an arch here: WITHOUT `CAMELID_RUNNABLE_SERVE=1`
+/// its chat requests get a typed 503 instead of falling through to the mis-bound
+/// optimized engine — fail-closed by design.
 fn is_runnable_serve_arch(arch: &str) -> bool {
-    arch == "qwen35"
+    matches!(arch, "qwen35" | "gemma3")
 }
 
 /// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
@@ -5281,6 +5338,56 @@ impl RunnableServeRuntime {
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
+}
+
+/// Render a gemma3 chat prompt byte-faithful to the GGUF `tokenizer.chat_template`
+/// (MUSTER M-A1): `<bos>` + per-turn `<start_of_turn>{role}\n{content|trim}<end_of_turn>\n`
+/// with assistant renamed to "model"; a leading system message is folded into the FIRST
+/// loop turn as a `{system_content}\n\n` prefix inserted after the role header and
+/// before the trimmed content — the prefix itself is NOT trimmed, exactly like the
+/// template's `messages[0]['content'] + '\n\n'`; generation prompt `<start_of_turn>model\n`
+/// unless the last message is an assistant turn. The template's multimodal branch is
+/// unreachable here (string content only; image parts fail closed upstream) and its
+/// user/assistant-alternation `raise_exception` is not re-enforced (the parity packs and
+/// smoke exercise only valid alternating shapes). The rendered string carries NO BOS —
+/// byte-identical to the pinned oracle's `/apply-template` output — and the runnable
+/// bridge encodes gemma3 with `add_special=true` so BOS lands at token level exactly
+/// like llama-server's own chat path (the GGUF declares `add_bos_token=true`, bos=2).
+fn render_gemma3_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    let mut first_user_prefix: Option<&str> = None;
+    let mut loop_messages: &[ChatMessage] = messages;
+    if let Some(first) = messages.first() {
+        if first.role.trim() == "system" {
+            first_user_prefix = Some(first.content.as_str());
+            loop_messages = &messages[1..];
+        }
+    }
+    let mut append_generation_prompt = true;
+    for (i, message) in loop_messages.iter().enumerate() {
+        let trimmed_role = message.role.trim();
+        let role = if trimmed_role == "assistant" {
+            "model"
+        } else {
+            trimmed_role
+        };
+        prompt.push_str("<start_of_turn>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        if i == 0 {
+            if let Some(prefix) = first_user_prefix {
+                prompt.push_str(prefix);
+                prompt.push_str("\n\n");
+            }
+        }
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<end_of_turn>\n");
+        append_generation_prompt = trimmed_role != "assistant";
+    }
+    if append_generation_prompt {
+        prompt.push_str("<start_of_turn>model\n");
+    }
+    prompt
 }
 
 /// Render an Ornith/qwen35 ChatML prompt (no tools). The generation prompt opens the
@@ -5523,12 +5630,25 @@ async fn runnable_chat_nonstreaming(
         .into_iter()
         .map(|t| t.get("function").cloned().unwrap_or(t))
         .collect();
-    let prompt_text = if tools.is_empty() {
+    let prompt_text = if runtime.architecture == "gemma3" {
+        if !tools.is_empty() {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_tools",
+                "the gemma3 runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
+                None,
+            );
+        }
+        render_gemma3_prompt(&messages)
+    } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
         render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
     };
-    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, false, true) {
+    // gemma3 renders carry no BOS string (oracle /apply-template parity) — BOS is
+    // added at token level (add_special=true), matching llama-server's chat path.
+    let add_special = runtime.architecture == "gemma3";
+    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, add_special, true) {
         Ok(ids) => ids,
         Err(e) => {
             return api_error(
@@ -5622,12 +5742,25 @@ async fn runnable_chat_streaming(
         .into_iter()
         .map(|t| t.get("function").cloned().unwrap_or(t))
         .collect();
-    let prompt_text = if tools.is_empty() {
+    let prompt_text = if runtime.architecture == "gemma3" {
+        if !tools.is_empty() {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_tools",
+                "the gemma3 runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
+                None,
+            );
+        }
+        render_gemma3_prompt(&messages)
+    } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
         render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
     };
-    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, false, true) {
+    // gemma3 renders carry no BOS string (oracle /apply-template parity) — BOS is
+    // added at token level (add_special=true), matching llama-server's chat path.
+    let add_special = runtime.architecture == "gemma3";
+    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, add_special, true) {
         Ok(ids) => ids,
         Err(e) => {
             return api_error(

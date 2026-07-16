@@ -1578,9 +1578,29 @@ impl RunnableModel {
         if self.qwen35.is_some() {
             return self.generate_qwen35_streaming(prompt, max_new, stop, on_token);
         }
-        let out = self.generate(prompt, max_new)?;
-        for &t in &out {
-            on_token(t);
+        // Dense/generic path (MUSTER M-A1): the same incremental loop as `generate`
+        // (byte-identical forward sequence when no stop token fires) plus stop-token
+        // handling and true per-token streaming. A stop token ends the turn and is
+        // NOT appended — matching the qwen35 lane and llama.cpp's served output.
+        let mut cache = KvCache::new(self.n_layers);
+        let mut last = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            last = self.forward_step(tok, pos, &mut cache)?;
+        }
+        let mut out = Vec::with_capacity(max_new);
+        let mut pos = prompt.len();
+        let mut next = argmax(&last);
+        while out.len() < max_new {
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            on_token(next);
+            if out.len() < max_new {
+                let logits = self.forward_step(next, pos, &mut cache)?;
+                pos += 1;
+                next = argmax(&logits);
+            }
         }
         Ok(out)
     }
