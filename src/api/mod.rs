@@ -14390,6 +14390,14 @@ mod tests {
                 // (+ documented near-ties), Q5_K_M all_pass. Raw-decode smoke only.
                 "llama_3_2_3b_instruct_q4_k_m",
                 "llama_3_2_3b_instruct_q5_k_m",
+                // Llama-3.2-1B-Instruct Q4_K_M (MUSTER M-B1, filename-anchored id):
+                // GPU-resident CUDA raw-decode parity vs llama.cpp acd79d603 on the
+                // committed 8-prompt pack — 5/8 token+text identical at every 1/5/50
+                // depth (incl. a 1,867-token long-context leg), 3 open-ended flips
+                // attributed benign near-ties (oracle-#2 at <=0.106 nat, CPU-lane
+                // cross-backend control); prompt tokenization 8/8. LOCAL file,
+                // upstream provenance unresolved (SHA-anchored). Raw-decode smoke only.
+                "llama_3_2_1b_instruct_q4_k_m",
                 // Llama-3.2-1B-Instruct IQ4_XS (i-quant, llama BPE): GPU-resident
                 // iq4xs_gemv raw-decode greedy parity vs llama.cpp acd79d6 — 2/4
                 // probe prompts 24-token identical, 2/4 prefix-then-near-tie (the
