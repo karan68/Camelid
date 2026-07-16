@@ -1,7 +1,7 @@
 # BASALT_RECON — Phase 0 recon and pre-registration (Gate G0)
 
 Campaign: BASALT (NVFP4 weight format, pilot Gemma 4 E4B-it). Date: 2026-07-16.
-Status: **G0 REVIEW — awaiting Tim.** Evidence bundle: `qa/evidence-bundles/basalt/phase0/`.
+Status: **G0 SIGNED 2026-07-16 (Tim: T1 no Blackwell; T2–T7 accepted as recommended → DECISIONS.md D17).** Evidence bundle: `qa/evidence-bundles/basalt/phase0/`.
 Conductor: `BASALT_CONDUCTOR.md`. Eval pre-registration: `basalt_eval_protocol.md` (committed
 with this document, before any NVFP4 quality number exists).
 

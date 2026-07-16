@@ -726,3 +726,41 @@ greedy + seeded sampling, stream + non-stream, cache hit + miss, CPU + resident
 CUDA lanes (receipts in the gate bundles). Multi-slot/continuous batching was
 evaluated and KILLED for this hardware class
 (docs/recon/ENGINE_INVERSION_PHASE5_MULTISLOT_RECON.md).
+
+## D17 — BASALT v1 NVFP4 decision set (2026-07-16)
+
+**Signed by Tim at Gate G0 (PR #466): T1 no Blackwell available; T2–T7 accepted as
+recommended.** Full context: `BASALT_RECON.md` §9/§11; eval design:
+`basalt_eval_protocol.md`. The five campaign decisions, as accepted:
+
+- **D-B1 — Wire compatibility:** adopt the pin's (`llama.cpp acd79d603`) `GGML_TYPE_NVFP4`
+  layout byte-for-byte — type id 40, 64-element/36-byte superblock `{d[4] UE4M3, qs[32]}`,
+  MXFP4-style nibble split, doubled-LUT × half-scale decode pair kept together as one
+  convention. No Camelid-private layout.
+- **D-B2 — Per-tensor scale seam (reframed by pin truth):** there is no in-block tensor
+  scale. v1 implements the four in-block UE4M3 sub-scales only and **fails closed at
+  admission on NVFP4 GGUFs carrying `.scale`/`.input_scale` sidecar tensors** (silently
+  ignoring them would compute wrong logits for ModelOpt-converted files). Sidecar
+  application is a follow-on once a sidecar-bearing fixture exists. Folding scales at load
+  remains rejected.
+- **D-B3 — Runnable-lane scope:** pilot-model-only until Gate G3 passes, then lane-wide
+  admission; smoke stays gated on oracle-qualified combos.
+- **D-B4 — Blackwell kernel route:** moot — no sm_100/sm_120 silicon (T1). Phase 5 is
+  BLOCKED-HW; recorded with zero performance claims. Decide NVRTC-vs-precompiled-PTX only
+  if hardware materializes.
+- **D-B5 — Quantizer ownership:** pin-tool-only for v1, via the per-tensor override path
+  (`llama-quantize --allow-requantize --tensor-type '<regex>=nvfp4'
+  --override-kv general.file_type=int:39 <src> <dst> <base-ftype>`), empirically
+  deterministic. Native Camelid quantizer stays optional (Phase 2b), deprioritized.
+
+Also accepted under the same sign-off: **T5** NaN-scale posture (decode semantics match the
+pin bit-for-bit — NaN sentinels flush to 0.0 — while Camelid admission scans NVFP4 tensors
+and refuses files containing `0x7F`/`0xFF` scale bytes; zero scales admit); **T6** the
+campaign proceeds on decode-bandwidth + partial-residency grounds after the 6 GB
+full-residency refutation; **T7** the gated quality comparison is the format-isolated
+`NVFP4-mm` vs `Q4K-mm` pair, with standard Q4_K_M rows and `NVFP4-all` report-only; and the
+two `basalt_eval_protocol.md` §6 amendments (gemma4 lane-native packs; 80% sanity guard).
+
+**Why:** interop with real files over format invention; refusal over silent corruption at
+every ambiguity (sidecars, NaN scales); a controlled experiment over a confounded one for
+the quality gate; and no claims — performance or otherwise — without hardware and receipts.

@@ -9,6 +9,11 @@ act (MUSTER_CONDUCTOR.md:93 discipline applies verbatim).
 Companion: `BASALT_CONDUCTOR.md` §5 (Phase 0 item 5), §6 (defaults). Deviations from the §6
 defaults are marked **[AMENDS §6]** with rationale and require Tim's sign-off at G0.
 
+> **Amendment record — G0 SIGNED 2026-07-16 (Tim):** both §6 deviations accepted (lane-native
+> packs §3; 80% sanity guard §5.2), the §1 format-isolated row design accepted (recon T7),
+> and the D-B decision set accepted as recommended (DECISIONS.md D17). No further changes
+> are permitted except by Tim before Phase 3 runs, via a new amendment note here.
+
 ## 1. Pilot and rows
 
 Pilot model: Gemma 4 E4B-it (`arch=gemma4`, 42 blocks, tied lm_head, SPM tokenizer), the
