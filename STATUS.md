@@ -1,6 +1,8 @@
 # Camelid Status
 
-Last updated: 2026-07-10
+Last updated: 2026-07-15
+
+IQ4_XS docs-sync note (2026-07-15): the `llama3_2_1b_instruct_iq4_xs` contract row (`supported_exact_row_smoke`, scoped `exact_row_gpu_resident_raw_decode_parity_smoke_only`; landed via PR #455) existed in `/api/capabilities` and the ledger but was missing from the public docs tables. This change adds the missing surfaces — the README supported-models row and quant tiers, the COMPATIBILITY.md at-a-glance and quantization-format rows, the SUPPORT_MATRIX_v0.1.md row — plus the contract's own `supported_named_exact_rows_only` IQ4_XS quantization item (the K-quant/TQ2_0 precedent; the axis summary had been skipped), with the ledger regenerated. Docs/contract alignment only — no support claim moves beyond what the #455 row already recorded: raw-completion GPU-resident/CPU parity smoke for the exact file, receipt `qa/iquant/iq4xs-llama3.2-1b-parity-receipt.json`; no chat-template/serve/WebUI closure, no bounded context, no wider i-quant claim.
 
 Serving-engine note (2026-07-09): the API's decode ownership was inverted (DECISIONS.md D16). One engine worker thread now executes every decode behind a bounded queue; `generation_lock` is gone, client disconnects and timeouts can no longer orphan compute against shared GPU state, and backpressure is a typed 503 with an observable queue depth. Supported-row outputs are receipt-proven byte-identical across the change (`qa/evidence-bundles/engine-inversion-gate*`), so no support claim moves; this is a correctness/ownership change only.
 

@@ -2808,6 +2808,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_named_exact_rows_only",
                 notes: "ternary_bonsai_4b_tq2_0 only: single-node CPU completion smoke (receipt qa/ternary/tq2_0-bonsai-parity-receipt.json). Other TQ2_0 files load to the unverified experimental lane only; no ternary-wide claim.",
             },
+            SupportItem {
+                id: "IQ4_XS",
+                status: "supported_named_exact_rows_only",
+                notes: "i-quants are certified per exact row only: llama3_2_1b_instruct_iq4_xs (IQ4_XS 4.25bpw linears + K-quant tied embed/lm_head) is supported_exact_row_smoke scoped to GPU-resident/CPU raw-completion parity smoke, with its receipt cited on the model_compatibility row (qa/iquant/iq4xs-llama3.2-1b-parity-receipt.json). Other IQ4_XS files load to the unverified experimental lane only (runnable-lane admission covers the format; no parity claim); other i-quant formats (IQ3_XXS, IQ2_*, IQ1_*) are unimplemented and fail closed. No i-quant-wide claim.",
+            },
         ],
         planned_quantization: vec![
             SupportItem {
