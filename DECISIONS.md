@@ -764,3 +764,12 @@ two `basalt_eval_protocol.md` §6 amendments (gemma4 lane-native packs; 80% sani
 **Why:** interop with real files over format invention; refusal over silent corruption at
 every ambiguity (sidecars, NaN scales); a controlled experiment over a confounded one for
 the quality gate; and no claims — performance or otherwise — without hardware and receipts.
+
+**D17 addendum (2026-07-16, G1):** the Phase 1 golden vectors (pin-generated, fixture
+arbiter) corrected the T5 premise: the pin's CPU decode flushes only raw `0x7F` to 0.0,
+while `0xFF` decodes to 240.0 — and the pin's CUDA mirror flushes both, so the pin's own
+backends disagree on `0xFF`-scaled blocks. The accepted posture is unchanged and
+strengthened: Camelid decode is pin-CPU-bitwise (`0xFF` → 240.0), and admission refuses
+files containing either sentinel byte — such files cannot even produce a well-defined
+cross-backend oracle. Also fixture-corrected: `decode(0x7E)` = 224.0 (a Phase 0 aside said
+112.0). See BASALT_RECON.md §1 [G1 errata] and the Phase 1 evidence bundle.

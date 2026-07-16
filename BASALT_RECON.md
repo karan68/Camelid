@@ -58,11 +58,18 @@ Arbiter: pin `acd79d603` build 9632 source. Full receipts with file:line and hea
   `{0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12}` — E2M1 magnitudes **doubled**; nibble bit 3 =
   sign. Value = `kvalues[nibble] * ue4m3_to_fp32(d[s])`.
 - **Scale format is UE4M3 — unsigned E4M3** (`ggml-impl.h:500-553`): bit 7 stripped (`&0x7F`),
-  bias 7, subnormals `man·2⁻⁹`; decode returns `raw * 0.5` (**the pair rule**: doubled LUT ×
-  half-scale — a reimplementation must keep both conventions together or every value is off
-  by 2× or 0.5×). Byte `0x00` → 0.0; NaN sentinels `0x7F`/`0xFF` → **flushed to 0.0**, not an
-  error (see errata E3 and open item T5). Encoder clamps input to 448.0, rounds half-up,
-  saturates at code `0x7E` (max decoded scale = 112.0); quantizer feeds `amax(sub-block)/6.0`.
+  bias 7, subnormals. **[G1 errata, fixture-arbitrated]** Two Phase 0 prose claims were wrong
+  and are corrected by the pin-generated golden vectors (2.17 M assertions, Phase 1 bundle):
+  (i) the CPU decode's sentinel check is on the **raw byte `0x7F` only** — `0x00` → 0.0,
+  `0x7F` → 0.0, but **`0xFF` decodes through exp/man to 240.0**; the pin's CUDA mirror
+  flushes both, i.e. **the pin's own backends disagree on `0xFF`**, which strengthens the
+  D17/T5 admission refusal of both bytes (Camelid decode is pin-CPU-bitwise; admission
+  refuses files containing either). (ii) `decode(0x7E)` = **224.0**, not 112.0; the encoder
+  saturates every input ≥ 248 to `0x7E`, so bytes `0x78..0x7D` are decodable but
+  encoder-unreachable. The doubled-LUT/scale-convention **pair rule** stands as the headline
+  hazard (12 × 224 = 2688 = the true 6 × 448 max — the factor-of-two lives across the pair);
+  the committed fixtures, not prose, are the normative statement of both conventions.
+  Encoder clamps input to 448.0, rounds half-up; quantizer feeds `amax(sub-block)/6.0`.
 - **Element rounding** = exhaustive nearest-LUT search (`best_index_mxfp4`,
   `ggml-quants.c:299-310`), first-wins ties — **not** IEEE round-nearest-even.
 - **Per-tensor scale**: no in-block or GGUF-KV tensor-level factor exists. The mechanism is
