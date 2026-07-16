@@ -17255,7 +17255,10 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             name: "Phi-3-mini-4k-instruct Q8_0",
             repo_id: "bartowski/Phi-3-mini-4k-instruct-GGUF",
             filename: "Phi-3-mini-4k-instruct-Q8_0.gguf",
-            size_bytes: 4061222688,
+            // Corrected 2026-07-16 (MUSTER Phase 2 stop-and-amend): verified against the
+            // live HF tree (lfs.size) — bartowski's single 2024-04-29 upload series is
+            // 4,061,221,376 B; the previously baked 4,061,222,688 matched no upload.
+            size_bytes: 4061221376,
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
