@@ -4611,6 +4611,20 @@ mod gemma4_template_tests {
     /// guarantee the opt-in thinking lane carries. The parity-locked exact-row
     /// mode stays thinking-DISABLED; this test does not touch that claim.
     #[test]
+    fn completions_fail_closed_for_runnable_serve_archs() {
+        // Runnable-served archs have no raw-completions bridge: the gate must
+        // reject them (falling through would reach the optimized engine, which
+        // mis-binds gemma3), and must NOT touch the optimized-lane archs.
+        assert!(completions_unsupported_for_arch("qwen35"));
+        assert!(completions_unsupported_for_arch("gemma3"));
+        assert!(!completions_unsupported_for_arch("llama"));
+        assert!(!completions_unsupported_for_arch("qwen3"));
+        assert!(!completions_unsupported_for_arch("mistral"));
+        assert!(!completions_unsupported_for_arch("gemma4"));
+        assert!(!completions_unsupported_for_arch(""));
+    }
+
+    #[test]
     fn gemma3_chat_template_pack_locks_renderer() {
         #[derive(serde::Deserialize)]
         struct Shape {
@@ -5640,6 +5654,50 @@ async fn resolve_runnable_runtime(
         ));
     }
     Ok(None)
+}
+
+/// True when raw `/v1/completions` must fail closed for this architecture: the
+/// runnable-served archs have no completions bridge, and falling through would
+/// reach the optimized engine — which for gemma3 is numerically mis-bound (its
+/// norms are silently dropped and the forward has no GeGLU/dual-RoPE). Their
+/// only served surface is `/v1/chat/completions`. Pure decision half of
+/// [`reject_completions_for_runnable_arch`] so the gate itself is unit-testable.
+fn completions_unsupported_for_arch(arch: &str) -> bool {
+    is_runnable_serve_arch(arch)
+}
+
+/// Fail-closed guard for `/v1/completions` (MUSTER M-A1 follow-up): reject
+/// requests targeting a loaded runnable-served model with a typed error that
+/// points callers at the chat endpoint, instead of silently serving them from
+/// the wrong engine. Returns `Some(response)` when the request must be rejected.
+async fn reject_completions_for_runnable_arch(
+    state: &AppState,
+    model: &Option<String>,
+) -> Option<Response> {
+    let id = match model.clone() {
+        Some(m) => m,
+        None => state.active_model_id.read().await.clone()?,
+    };
+    let unsupported = state
+        .loaded_models
+        .read()
+        .await
+        .get(&id)
+        .map(|m| completions_unsupported_for_arch(m.gguf.architecture().unwrap_or_default()))
+        .unwrap_or(false);
+    if unsupported {
+        return Some(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_completions_lane",
+            format!(
+                "model '{id}' is a runnable-lane architecture served only via \
+                 /v1/chat/completions; raw /v1/completions has no runnable bridge and \
+                 fails closed rather than falling through to the optimized engine"
+            ),
+            None,
+        ));
+    }
+    None
 }
 
 /// Load the runnable serve runtime for a model id (blocking thread; ~9.5 GB read).
@@ -7715,6 +7773,12 @@ async fn completions(
         }
         Ok(None) => {}
         Err(resp) => return resp,
+    }
+    // Runnable-served architectures (qwen35, gemma3) fail closed on raw
+    // completions — chat is their only served surface. This also covers the
+    // multi-choice fan-out below, which is reached only through this handler.
+    if let Some(resp) = reject_completions_for_runnable_arch(&state, &req.model).await {
+        return resp;
     }
     // Multi-choice (n > 1) fans out into independent generations. Validate the
     // count and reject the combinations Camelid does not implement before the
