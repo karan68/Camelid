@@ -25,7 +25,7 @@
  "phase5_smoke": {
   "command": "scripts/model-promotion-smoke-bundle.mjs with --expect-compatibility-row llama_3_2_1b_instruct_q4_k_m --expect-compatibility-status supported_exact_row_smoke --expect-contract-supported true --expect-webui-chat enabled",
   "result": "exit 0; frontend leg exit 0 — all four expectations asserted; WebUI chat gate reports supported exact row smoke / contract_supported=true; streaming + non-streaming chat round-trips green",
-  "notes": "serve ran with CAMELID_SKIP_FIT_CHECK=1 for this leg only: the advisory fit check double-counts available RAM when the same model is already resident from the API leg (fit advisor is advisory-only, never a support surface). Host paths in the copied artifacts are redacted to <repo>/<home> (string redaction only); load.response.json and current-model.json (~10MB model-metadata dumps) are retained in the gitignored run dir, not the bundle."
+  "notes": "serve ran with CAMELID_SKIP_FIT_CHECK=1 for this leg only: the advisory fit check double-counts available RAM when the same model is already resident from the API leg (fit advisor is advisory-only, never a support surface). Host paths in the copied artifacts are redacted to <repo>/<home> (string redaction only); load.response.json and current-model.json (~10MB model-metadata dumps) are retained in the gitignored run dir, not the bundle. Smoke stdout/stderr artifacts are committed with .txt extensions (the repo-root .gitignore excludes *.log from tracking; contents unchanged)."
  },
  "files": {
   "api-webui/capabilities.json": "9e4d710c11e3e86f6ef9fe6784d9aacefb1ebb797248f2a7a06ac828dab821ba",
@@ -34,13 +34,13 @@
   "api-webui/completion.request.json": "e66bf207ec1f476f15532d798052a195455cd0c502fd8ed43ad6440d707becce",
   "api-webui/completion.response.json": "30f18052ea0d01c5d405bb147adda27d3d6be3a29d4905489d08af5d283ad9dd",
   "api-webui/frontend.command.txt": "5832785290daeaa6e8593e51d0baa9027fb9de9e2f630e1a708ce82dc871d32b",
-  "api-webui/frontend.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "api-webui/frontend.stdout.log": "62a1367edb409b8fd291c8e6e1b3558765136891899fcd09431388700c4061c0",
+  "api-webui/frontend.stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "api-webui/frontend.stdout.txt": "62a1367edb409b8fd291c8e6e1b3558765136891899fcd09431388700c4061c0",
   "api-webui/frontend.summary.json": "0b0c92a9883b756b804289681632538f4791ac021cbf3faaa74e104d4c076bfe",
   "api-webui/generation-timings.command.txt": "a20278870217195700679e4e5160531f37f7baf518ebe610a8859d053d473e58",
   "api-webui/generation-timings.run.json": "64e2945b6dfc5f820b6806f5b52bea374974e8621876ae63a21c289163ffc07e",
-  "api-webui/generation-timings.stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "api-webui/generation-timings.stdout.log": "da42f413dce3058fe5e44b91807ec614e076d8a796a8ae4d10fe3c3fb8f6fc4f",
+  "api-webui/generation-timings.stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "api-webui/generation-timings.stdout.txt": "da42f413dce3058fe5e44b91807ec614e076d8a796a8ae4d10fe3c3fb8f6fc4f",
   "api-webui/generation-timings.summary.json": "f7514b92c86a8f925ffbdc38ad7750c170bea9d2f17fa1a2b97b71f8d57b5ac3",
   "api-webui/health-after.json": "40fb1f53532e2bcce7117238179c19ee3d09daf9e0b4b41fcaca85e67b58507d",
   "api-webui/health-before.json": "7d5455d75939041e7bd1b2ad03fe96b348a690362f0e77b5189b4582a9b99b1d",
