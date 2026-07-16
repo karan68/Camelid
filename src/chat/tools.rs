@@ -2037,16 +2037,34 @@ mod tests {
     // Windows CI runner); they are cfg'd out elsewhere because the tools are
     // Windows-only.
 
+    // Serialize the PowerShell-spawning tests: concurrent powershell.exe
+    // cold-starts on a loaded 2-core CI runner (Defender scan + .NET JIT)
+    // compound spawn latency past any reasonable per-test ceiling — four
+    // parallel spawns blew a 30s ceiling on windows-latest.
+    #[cfg(windows)]
+    static PS_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    fn ps_serial() -> std::sync::MutexGuard<'static, ()> {
+        PS_SPAWN_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[cfg(windows)]
     fn win_sandbox(dir: &Path) -> Sandbox {
         // Default `sandboxed` mode: proves run_windows_command runs via its OWN
         // confinement, without the seccomp layer that fails closed off-Linux.
-        Sandbox::new(dir, false, Duration::from_secs(30)).unwrap()
+        // 180s ceiling: a liveness backstop for slow CI runners, never the
+        // subject of these tests — the one test about timeout semantics
+        // (timeout_hard_kills_a_hung_command) requests its own 2s cap.
+        Sandbox::new(dir, false, Duration::from_secs(180)).unwrap()
     }
 
     #[cfg(windows)]
     #[test]
     fn run_windows_command_is_exec_and_runs_under_sandboxed_mode() {
+        let _serial = ps_serial();
         let dir = tempfile::tempdir().unwrap();
         let sb = win_sandbox(dir.path());
         assert_eq!(sb.shell_mode(), ShellSandbox::Sandboxed);
@@ -2066,6 +2084,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn quoting_survives_stdin_transport() {
+        let _serial = ps_serial();
         let dir = tempfile::tempdir().unwrap();
         let sb = win_sandbox(dir.path());
         let cmd = "Write-Output 'sq='' dq=\" bt=` dollar=$ semi=; path=C:\\Program Files'";
@@ -2084,6 +2103,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn multiline_command_survives_stdin() {
+        let _serial = ps_serial();
         let dir = tempfile::tempdir().unwrap();
         let sb = win_sandbox(dir.path());
         let cmd = "Write-Output 'line-alpha'\nWrite-Output 'line-beta'";
@@ -2097,6 +2117,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn timeout_hard_kills_a_hung_command() {
+        let _serial = ps_serial();
         let dir = tempfile::tempdir().unwrap();
         let sb = win_sandbox(dir.path());
         let out = validate(
@@ -2115,6 +2136,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn large_output_is_truncated() {
+        let _serial = ps_serial();
         let dir = tempfile::tempdir().unwrap();
         let sb = win_sandbox(dir.path());
         let out = validate(
@@ -2186,6 +2208,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn large_output_beyond_pipe_buffer_is_captured_not_timed_out() {
+        let _serial = ps_serial();
         // >64 KiB on stdout before exit would wedge a non-draining reader and
         // false-time-out; concurrent draining must let it complete, then clip.
         let dir = tempfile::tempdir().unwrap();
@@ -2193,7 +2216,7 @@ mod tests {
         let out = validate(
             &call(
                 "run_windows_command",
-                json!({"command":"Write-Output ('x' * 100000)","timeout_seconds":20}),
+                json!({"command":"Write-Output ('x' * 100000)","timeout_seconds":120}),
             ),
             &sb,
         )
