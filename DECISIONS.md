@@ -810,6 +810,15 @@ Scope decision — postmortem-and-stop (A) vs continue-to-Phase-4-on-bandwidth-g
 is Tim's; recommendation (A) as the honest default, in the G3 PR. Receipts:
 `qa/evidence-bundles/basalt/phase3/BASALT_G3_SUMMARY.md` + `legs/`.
 
+**RESOLVED — Tim chose Option B (2026-07-17):** continue to Phase 4 on decode-bandwidth
+grounds, treating NVFP4 as a space/speed format, NOT a quality-competitive one. Binding
+consequence (claim-lint, enforced at Phase 6): every user-visible NVFP4 surface — README,
+capability/support matrices, CAIRN ledger rows, Evidence Chip copy — carries the G3 quality
+delta ("behind Q4_K at matched 4.5 bpw on the pilot: 88.5 % vs 92.6 % top-1 agreement,
+0.111 vs 0.065 mean-KL nats, vs the Q8_0 parent"); no NVFP4 surface may imply
+quality-competitiveness. The G3 NO-GO stands as a recorded, receipted result; Option B is a
+forward-scope choice on a different axis, not a reversal of it.
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on

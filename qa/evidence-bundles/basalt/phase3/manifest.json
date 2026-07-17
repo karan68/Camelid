@@ -6,12 +6,12 @@
   "phase": 3,
   "gate": "G3",
   "outcome": "NO-GO",
-  "note": "Phase 3 CPU inference + pre-registered quality eval. G3 = NO-GO per the verbatim §5.2 rule (agreement(NVFP4-mm)=88.5 < agreement(Q4K-mm)-2.0=90.6). All figures vs Q8_0 parent, matched 4.5 bpw (Amendment 3 §4). Includes the engine test log, the S1-closure row re-hash, the consolidated G3 summary, and the eval leg receipts (legs/). Placeholders: <camelid>/<cam-basalt>/<pin-tools>/<home>.",
+  "note": "Phase 3 CPU inference + pre-registered quality eval. G3 = NO-GO per the verbatim §5.2 rule (agreement(NVFP4-mm)=88.5 < agreement(Q4K-mm)-2.0=90.6). All figures vs Q8_0 parent, matched 4.5 bpw (Amendment 3 §4). Includes the engine test log, the S1-closure row re-hash, the consolidated G3 summary, and the eval leg receipts (legs/). Placeholders: <camelid>/<cam-basalt>/<pin-tools>/<home>. [Option B resolved 2026-07-17: continue to Phase 4 on bandwidth grounds, quality delta disclosed.]",
   "files": [
     {
       "file": "BASALT_G3_SUMMARY.md",
-      "sha256": "5edbde2a1c98bb12ee1afe19ddd834a5c9e5cad0e6c7956016cb5ef1a3454902",
-      "size_bytes": 8225
+      "sha256": "f29090a1eadb347a4416c6217ffcb6c57e9e14309dbe34c5c6730be00371c2f6",
+      "size_bytes": 8756
     },
     {
       "file": "basalt_phase3_engine_cargo_test.txt",

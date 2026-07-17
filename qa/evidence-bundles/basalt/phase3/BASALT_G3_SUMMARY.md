@@ -89,7 +89,14 @@ the quality NO-GO is a property of the **format**, not of our implementation of 
 - **The engine work stands**: NVFP4 loads, admits (gemma4-scoped), decodes bit-exact vs the
   pin, and runs a full forward. That is real, receipted capability regardless of the verdict.
 
-## 6. Decision for Tim (scope — I will not choose this silently)
+## 6. Decision — RESOLVED: Option B (Tim, 2026-07-17)
+
+**Tim chose (B): continue to Phase 4 on decode-bandwidth grounds**, with the quality cost
+disclosed on every surface. NVFP4 proceeds as a *space/speed* format, explicitly not a
+quality-competitive one. The G3 NO-GO stands as recorded — Option B is a forward choice on a
+separate axis, not a reversal. Binding disclosure (claim-lint, Phase 6): every user-visible
+NVFP4 surface carries the G3 delta (88.5 % vs 92.6 % top-1 agreement, 0.111 vs 0.065 mean-KL
+nats, vs the Q8_0 parent at matched 4.5 bpw). The original options, for the record:
 
 Per the conductor, a G3 NO-GO "pivots to a postmortem + upstream comparison note, and that
 is a publishable result too." Two honest paths:
