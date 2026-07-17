@@ -601,6 +601,7 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         temperature: 0.0,
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: shell_mode,
+        tool_profile: super::tools::ToolProfile::Full,
     };
     // The parent's approval posture, with the production fail-closed honoured:
     // resolve_policy refuses blanket auto-approve under CAMELID_PRODUCTION, so a

@@ -74,7 +74,7 @@ impl BenchReceipt {
         if let Value::Object(map) = &mut value {
             map.remove("receipt_id");
         }
-        camelid::receipt::sha256_hex(camelid::receipt::canonical_json(&value).as_bytes())
+        crate::receipt::sha256_hex(crate::receipt::canonical_json(&value).as_bytes())
     }
     fn seal(&mut self) {
         self.receipt_id = self.compute_receipt_id();

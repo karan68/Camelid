@@ -184,7 +184,7 @@ fn dispatch(session: &mut Session, rl: &mut DefaultEditor, command: &str) -> any
         "pull" => {
             if arg.is_empty() {
                 println!("usage: /pull <alias>   (e.g. /pull tinyllama)");
-            } else if let Err(err) = camelid::catalog::run_pull(Some(arg), session.models_dir()) {
+            } else if let Err(err) = crate::catalog::run_pull(Some(arg), session.models_dir()) {
                 eprintln!("pull failed: {err}");
             } else {
                 println!("{}", banner::dim("downloaded — use /models to load it"));
@@ -467,7 +467,7 @@ fn select_row(
             if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
                 return Ok(());
             }
-            camelid::catalog::run_pull(Some(item.catalog_id), session.models_dir())?;
+            crate::catalog::run_pull(Some(item.catalog_id), session.models_dir())?;
             load_row(session, row);
         }
     }

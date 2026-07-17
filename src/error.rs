@@ -61,6 +61,9 @@ pub enum BackendError {
     #[error("model is not loaded")]
     ModelNotLoaded,
 
+    #[error("a Workspace session is using the active model; finish or cancel it before loading or unloading a model")]
+    ModelOperationInProgress,
+
     #[error("inference is not implemented yet; current build supports health checks and GGUF metadata inspection only")]
     InferenceNotImplemented,
 }

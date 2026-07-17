@@ -318,10 +318,33 @@ impl Sandbox {
 
 // --- tool registry --------------------------------------------------------
 
+/// The tool surface advertised to and accepted from the model for one agent
+/// loop. The full CLI/TUI profile preserves the existing computer-control
+/// surface. Workspace is deliberately limited to scoped file operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProfile {
+    Full,
+    WorkspaceFiles,
+}
+
+impl ToolProfile {
+    pub fn allows(self, tool: &str) -> bool {
+        self == ToolProfile::Full
+            || matches!(
+                tool,
+                "read_file" | "list_dir" | "search" | "write_file" | "edit_file"
+            )
+    }
+}
+
 /// The tools offered to the model. `http_fetch` is included only when network
 /// access is enabled (`--allow-net`); `run_shell` is omitted entirely when the
 /// shell sandbox is `disabled` (Task 1 — the tool is not registered at all).
 pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
+    specs_for(ToolProfile::Full, allow_net, shell_mode)
+}
+
+pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
     let mut tools = vec![
         ToolSpec {
             name: "read_file",
@@ -354,6 +377,9 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
             params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
         },
     ];
+    if profile == ToolProfile::WorkspaceFiles {
+        return tools;
+    }
     if shell_mode != ShellSandbox::Disabled {
         tools.push(ToolSpec {
             name: "run_shell",
@@ -764,8 +790,15 @@ impl Action {
     /// The full, verbatim approval text — exactly what will happen.
     pub fn approval_detail(&self, sandbox: &Sandbox) -> String {
         match self {
-            Action::WriteFile { path, summary, .. } => {
-                format!("write_file → {}\n{summary}", sandbox.rel(path))
+            Action::WriteFile {
+                path,
+                content,
+                summary,
+            } => {
+                format!(
+                    "write_file → {}\n{summary}\n--- proposed content ---\n{content}",
+                    sandbox.rel(path)
+                )
             }
             Action::EditFile { path, old, new } => format!(
                 "edit_file → {}\n  - {}\n  + {}",
@@ -862,6 +895,20 @@ struct PathArg {
 /// error string (→ tool-error result the model can recover from) rather than
 /// panicking, for unknown tools, bad args, or sandbox escapes.
 pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
+    validate_for(ToolProfile::Full, call, sandbox)
+}
+
+pub fn validate_for(
+    profile: ToolProfile,
+    call: &ToolCall,
+    sandbox: &Sandbox,
+) -> Result<Action, String> {
+    if !profile.allows(&call.name) {
+        return Err(format!(
+            "tool `{}` is not available in this agent mode",
+            call.name
+        ));
+    }
     let args = &call.args;
     let str_arg = |key: &str| -> Result<String, String> {
         args.get(key)
@@ -1756,6 +1803,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_profile_is_exactly_the_scoped_file_tool_set() {
+        let names = specs_for(
+            ToolProfile::WorkspaceFiles,
+            true,
+            ShellSandbox::Unrestricted,
+        )
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["read_file", "list_dir", "search", "write_file", "edit_file"]
+        );
+    }
+
+    #[test]
     fn read_file_happy_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
@@ -1828,6 +1891,23 @@ mod tests {
         assert!(matches!(e.execute(&sb), ToolOutcome::Ok(_)));
         let body = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
         assert!(body.contains("three") && !body.contains("two"));
+    }
+
+    #[test]
+    fn write_approval_discloses_exact_path_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let action = validate(
+            &call(
+                "write_file",
+                json!({"path":"greeting.txt","content":"hello there"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        let detail = action.approval_detail(&sb);
+        assert!(detail.contains("write_file → greeting.txt"));
+        assert!(detail.contains("--- proposed content ---\nhello there"));
     }
 
     #[test]

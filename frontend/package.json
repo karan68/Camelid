@@ -17,6 +17,8 @@
     "smoke:streaming": "node scripts/streaming-parser-smoke.mjs",
     "smoke:capability-readiness": "node scripts/capability-readiness-smoke.mjs",
     "smoke:observatory": "node scripts/observatory-smoke.mjs",
+    "smoke:workspace": "node scripts/workspace-agent-smoke.mjs",
+    "smoke:workspace-visual": "node scripts/workspace-visual-smoke.mjs",
     "smoke:integration": "node scripts/frontend-integration-smoke.mjs",
     "smoke:tiny": "node scripts/smoke.mjs --load-tiny",
     "smoke:warm": "node scripts/smoke.mjs --chat-repeats 3",

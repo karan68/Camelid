@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 mod engine;
+mod workspace;
 
 use crate::{
     execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
@@ -120,6 +121,10 @@ pub struct AppState {
     allow_local_model_delete: bool,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
+    workspace_sessions: workspace::WorkspaceSessionManager,
+    /// Actual listener address. Workspace is disabled when this is non-loopback
+    /// and uses it for the existing local HTTP model driver.
+    serve_addr: SocketAddr,
     /// The engine worker: the single thread where decode compute and
     /// resident-GPU-state mutations execute (see api/engine.rs). This
     /// replaces the old `generation_lock` — serialization is by construction
@@ -162,6 +167,8 @@ impl Default for AppState {
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             verification_reports: Arc::new(RwLock::new(HashMap::new())),
+            workspace_sessions: workspace::WorkspaceSessionManager::default(),
+            serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
             engine: engine::EngineHandle::spawn(),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
@@ -200,6 +207,11 @@ impl AppState {
     /// here, once, so it stays stable however the process was launched.
     pub fn with_models_dir(mut self, models_dir: Option<PathBuf>) -> Self {
         self.models_dir = resolve_models_dir(models_dir);
+        self
+    }
+
+    fn with_serve_addr(mut self, serve_addr: SocketAddr) -> Self {
+        self.serve_addr = serve_addr;
         self
     }
 
@@ -1845,6 +1857,22 @@ pub fn router_with_state(state: AppState) -> Router {
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
         )
+        .route(
+            "/api/agent/workspace/sessions",
+            post(workspace::create_session),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id",
+            get(workspace::session_status).delete(workspace::cancel_session),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/events",
+            get(workspace::session_events),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/decisions",
+            post(workspace::decide),
+        )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
         .route("/api/models/runnable-receipt", get(runnable_receipt))
@@ -1886,7 +1914,8 @@ pub async fn serve(
     let state = AppState::with_configured_threads(configured_threads)
         .with_default_enable_thinking(default_enable_thinking)
         .with_local_model_delete(addr.ip().is_loopback())
-        .with_models_dir(models_dir);
+        .with_models_dir(models_dir)
+        .with_serve_addr(addr);
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
             tracing::error!(error=%err, "failed to load startup model");
@@ -4195,6 +4224,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
             },
             SupportItem {
+                id: "web_workspace",
+                status: "supported_current_gate",
+                notes: "loopback WebUI only: one bounded plan-act-observe session over exactly read_file/list_dir/search/write_file/edit_file inside one canonical workspace root; read-only tools run automatically, every write is approval-gated with the exact target and complete proposed content, SSE disconnect/cancel fails closed, and model load/unload is excluded while active. Available only to supported exact rows with tool_capable=true. Real-model closure: exact Qwen3-4B-Q4_K_M (sha256 7485fe6f...) read/list/search + denied-write + approved-write scenarios and real approval/terminal UI, qa/evidence-bundles/workspace-qwen3-4b-q4km-20260717T165404Z-head-8c2a2b74/. No shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim.",
+            },
+            SupportItem {
                 id: "stream_options.include_usage",
                 status: "supported_current_gate",
                 notes: "chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/.",
@@ -4383,12 +4417,19 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
         // dedicated-lane redirect (e.g. `camelid diffusion-gemma-chat`).
-        Err(err) => api_error(
-            StatusCode::BAD_REQUEST,
-            backend_error_code(&err),
-            err.to_string(),
-            Some("path"),
-        ),
+        Err(err) => {
+            let status = if matches!(err, BackendError::ModelOperationInProgress) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            api_error(
+                status,
+                backend_error_code(&err),
+                err.to_string(),
+                Some("path"),
+            )
+        }
     }
 }
 
@@ -6734,6 +6775,9 @@ async fn load_model_from_path_with_activation(
     id: Option<String>,
     set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
+    if state.workspace_sessions.blocks_model_transition().await {
+        return Err(BackendError::ModelOperationInProgress);
+    }
     let _transition = state.model_transition.lock().await;
     let _reader = state.model_file_lifecycle.read().await;
     // Every load funnels through here, so resolve relative paths against the
@@ -6963,6 +7007,14 @@ async fn unload_model(
     State(state): State<AppState>,
     payload: Option<Json<UnloadModelRequest>>,
 ) -> Response {
+    if state.workspace_sessions.blocks_model_transition().await {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_operation_in_progress",
+            BackendError::ModelOperationInProgress.to_string(),
+            None,
+        );
+    }
     let _transition = state.model_transition.lock().await;
     let _exclusive = state.model_file_lifecycle.write().await;
     let model_id = if let Some(Json(req)) = payload {
@@ -18844,6 +18896,7 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
     ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
     ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
     ("ornith-1.0-9b-Q3_K_M.gguf", "ornith_1_0_9b_q3_k_m"),
+    ("Qwen3-4B-Q4_K_M.gguf", "qwen3_4b_q4_k_m"),
 ];
 
 /// True when `filename` is the exact GGUF artifact of a curated row whose
@@ -18903,6 +18956,7 @@ fn backend_error_code(err: &BackendError) -> &'static str {
         BackendError::UnsupportedTensorType(_) => "unsupported_tensor_type",
         BackendError::InvalidTensorData(_) => "invalid_tensor_data",
         BackendError::Io { .. } => "model_io_error",
+        BackendError::ModelOperationInProgress => "model_operation_in_progress",
         _ => "invalid_model",
     }
 }

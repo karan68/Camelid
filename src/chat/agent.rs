@@ -45,6 +45,9 @@ pub struct AgentConfig {
     pub audit: Box<dyn AuditSink>,
     /// `run_shell` confinement mode (Task 1). Defaults to sandboxed.
     pub shell_sandbox: ShellSandbox,
+    /// The tools this loop may advertise and validate. Existing CLI/TUI agent
+    /// sessions use `Full`; the Web Workspace uses only scoped file tools.
+    pub tool_profile: tools::ToolProfile,
 }
 
 /// What the model produced for one step.
@@ -196,7 +199,7 @@ pub fn run_loop(
     policy: &mut Policy,
     history: &mut Vec<AgentMsg>,
 ) -> LoopEnd {
-    let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
+    let tools = tools::specs_for(cfg.tool_profile, cfg.allow_net, sandbox.shell_mode());
     // Per-call (count, last_result): the no-progress guard is result-aware (see
     // `note_no_progress`).
     let mut call_counts: HashMap<String, (usize, String)> = HashMap::new();
@@ -231,7 +234,7 @@ pub fn run_loop(
                     *ran.entry(call.name.clone()).or_insert(0) += 1;
                     // Validate against schema + sandbox. A bad/unknown/escape call
                     // becomes a tool-error result the model can recover from.
-                    let action = match tools::validate(&call, sandbox) {
+                    let action = match tools::validate_for(cfg.tool_profile, &call, sandbox) {
                         Ok(a) => a,
                         Err(e) => {
                             reporter.tool_call(&format!("{}(?)", call.name));
@@ -509,7 +512,7 @@ impl LiveDriver {
     ) -> Value {
         json!({
             "model": self.model_id,
-            "messages": history_to_messages(history, fold_system),
+            "messages": history_to_messages(history, fold_system, &self.family),
             "tools": tool_defs,
             "stream": stream,
             "max_tokens": self.max_tokens,
@@ -587,11 +590,12 @@ fn is_template_error(msg: &str) -> bool {
         || msg.contains("chat template")
 }
 
-/// Convert agent history to OpenAI-style chat messages (tool results carried as
-/// `role:"tool"`; the model's prior tool calls re-stated as assistant text).
+/// Convert agent history to the serving request shape. Qwen's native template
+/// requires prior calls and results as literal marker blocks; other families
+/// retain the established standard-role history shape.
 /// When `fold_system` is set, the system prompt is merged into the first user
 /// message instead of a standalone `system` role (for templates that reject it).
-fn history_to_messages(history: &[AgentMsg], fold_system: bool) -> Vec<Value> {
+fn history_to_messages(history: &[AgentMsg], fold_system: bool, family: &str) -> Vec<Value> {
     let system: String = history
         .iter()
         .filter_map(|m| match m {
@@ -602,6 +606,7 @@ fn history_to_messages(history: &[AgentMsg], fold_system: bool) -> Vec<Value> {
         .join("\n\n");
     let mut fold_pending = fold_system && !system.is_empty();
     let mut out = Vec::new();
+    let qwen_native_tools = family.eq_ignore_ascii_case("qwen3");
     for msg in history {
         match msg {
             AgentMsg::System(t) => {
@@ -619,15 +624,37 @@ fn history_to_messages(history: &[AgentMsg], fold_system: bool) -> Vec<Value> {
             }
             AgentMsg::Assistant(t) => out.push(json!({"role":"assistant","content":t})),
             AgentMsg::ToolCalls(calls) => {
-                let rendered = calls
-                    .iter()
-                    .map(|c| format!("{}({})", c.name, c.args))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let rendered = if qwen_native_tools {
+                    calls
+                        .iter()
+                        .map(|call| {
+                            let name = serde_json::to_string(&call.name)
+                                .unwrap_or_else(|_| "\"\"".to_string());
+                            format!(
+                                "<tool_call>\n{{\"name\":{name},\"arguments\":{}}}\n</tool_call>",
+                                call.args
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    calls
+                        .iter()
+                        .map(|call| format!("{}({})", call.name, call.args))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 out.push(json!({"role":"assistant","content":rendered}));
             }
             AgentMsg::ToolResult { name, outcome } => {
-                out.push(json!({"role":"tool","name":name,"content":outcome.text()}));
+                if qwen_native_tools {
+                    out.push(json!({
+                        "role":"user",
+                        "content":format!("<tool_response>\n{}\n</tool_response>", outcome.text())
+                    }));
+                } else {
+                    out.push(json!({"role":"tool","name":name,"content":outcome.text()}));
+                }
             }
         }
     }
@@ -983,6 +1010,7 @@ mod tests {
             temperature: 0.0,
             audit: Box::new(audit::NoopSink),
             shell_sandbox: ShellSandbox::Sandboxed,
+            tool_profile: tools::ToolProfile::Full,
         }
     }
 
@@ -991,6 +1019,34 @@ mod tests {
             name: name.into(),
             args,
         }
+    }
+
+    #[test]
+    fn history_serializes_qwen_calls_and_results_in_native_markers() {
+        let history = vec![
+            AgentMsg::User("inspect".into()),
+            AgentMsg::ToolCalls(vec![tc("list_dir", json!({"path":"."}))]),
+            AgentMsg::ToolResult {
+                name: "list_dir".into(),
+                outcome: ToolOutcome::Ok("a.txt".into()),
+            },
+        ];
+        let messages = history_to_messages(&history, false, "qwen3");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(
+            messages[1]["content"],
+            "<tool_call>\n{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}\n</tool_call>"
+        );
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"],
+            "<tool_response>\na.txt\n</tool_response>"
+        );
+
+        let llama = history_to_messages(&history, false, "llama_bpe_decoder");
+        assert_eq!(llama[1]["content"], "list_dir({\"path\":\".\"})");
+        assert_eq!(llama[2]["role"], "tool");
+        assert_eq!(llama[2]["name"], "list_dir");
     }
 
     #[test]

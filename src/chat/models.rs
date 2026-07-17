@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use camelid::api::{curated_catalog, CatalogItem};
+use crate::api::{curated_catalog, CatalogItem};
 
 use super::client::CompatRow;
 

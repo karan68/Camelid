@@ -19,7 +19,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
+const VALID_TABS = new Set(['chat', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
 // Where the UI looks for the camelid API by default:
 //   1. an explicit VITE_CAMELID_API_BASE override always wins;
 //   2. in a production build (served by the camelid binary itself), use the

@@ -15,7 +15,7 @@ extern "C" {
 }
 
 use camelid::{
-    api,
+    api, chat,
     cluster::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
@@ -37,8 +37,6 @@ use camelid::{
 use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
-
-mod chat;
 
 // Prefer the git describe stamped in by build.rs (e.g. "v0.1.1" or
 // "v0.1.1-3-gabcdef-dirty"); fall back to the crate version for builds without

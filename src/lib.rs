@@ -3,6 +3,7 @@ pub mod alloc_gate;
 pub mod api;
 pub mod capability;
 pub mod catalog;
+pub mod chat;
 pub mod cluster;
 pub mod cuda;
 pub mod cuda_parity;

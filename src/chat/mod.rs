@@ -14,7 +14,7 @@
 //! `--model` at an unsupported GGUF is refused with the engine's typed error.
 //! See `DECISIONS.md` D6 and `RECON_CHAT.md`.
 
-mod agent;
+pub(crate) mod agent;
 mod agent_bench;
 mod agent_eval;
 mod agent_orchestration;
@@ -44,6 +44,7 @@ mod win_input;
 mod win_job;
 #[cfg(windows)]
 mod win_uia;
+pub(crate) mod workspace_bridge;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -162,6 +163,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             temperature: opts.temperature,
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
+            tool_profile: tools::ToolProfile::Full,
         };
         // Full-screen TUI agent on a real terminal (default); the line renderer
         // is the fallback for --plain, pipes, and non-TTY runs (smoke/tests).
@@ -189,7 +191,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
 /// identity (posture + agent tool-capable gate).
 fn catalog_label_for(model: &std::path::Path) -> Option<String> {
     let name = model.file_name()?.to_str()?;
-    camelid::api::curated_catalog()
+    crate::api::curated_catalog()
         .into_iter()
         .find(|item| item.filename == name)
         .map(|item| item.catalog_id.to_string())
