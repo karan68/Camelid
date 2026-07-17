@@ -883,6 +883,26 @@ the remaining roofline gap remain open follow-ons, not scheduled. Receipts:
 `qa/evidence-bundles/basalt/phase4/cert/` (perf_table.json `NVFP4mm_cuda_dp4a` row kept beside
 the v1 row; BASALT_G4_SUMMARY.md §2/§3/§4; p4b_dp4a_perf_log.md).
 
+**D17 addendum 8 (2026-07-17, Phase 6 — surface alignment).** Every user-visible surface now
+carries the single honest NVFP4 story, per the Option-B claim-lint binding (addendum 4). NVFP4
+is a **`planned_quantization` axis item only** (`status = planned_beyond_named_certified_rows`
+in the `/api/capabilities` contract + regenerated ledger) — deliberately **no
+`model_compatibility` row and no frontend catalog entry**, which keeps the CAIRN drift gate
+(checks A–E) and the `capabilities_support_statuses_stay_exact_row_allowlisted` tripwire green
+(a supported-row add would have tripped both). The same story lands on README (quant tier +
+Experimental-lanes row), COMPATIBILITY (quantization-formats row), STATUS (durable evidence
+anchors + what-changed), SUPPORT_MATRIX (unsupported/downgraded row, the target of the TK2
+Windows-only error text), CAPABILITY_MATRIX (`load.quant_breadth` note), and the new
+`docs/architecture/NVFP4_FORMAT.md` spec: gemma-4-E4B pilot only, Windows-only; behind Q4_K on
+quality (Gate G3 NO-GO, 88.5% vs 92.6% top-1 agreement, 0.111 vs 0.065 mean-KL nats vs the
+Q8_0 parent at matched 4.5 bpw); narrowly faster than Q8_0 CUDA decode (26.51 vs 25.80 tok/s,
+1.03×) and 2.08 GB lighter VRAM on an RTX 3060 Laptop (Gate G4, decode-only, this box); not a
+supported/certified row, not quality-competitive. **Phase 5 (Blackwell sm_120 tensor cores) is
+recorded BLOCKED-HW** (no Blackwell silicon on the target; no forward-looking perf claim). Still
+pending Tim's signature (carried, non-blocking): **D-B6/TK3** per-tensor sidecar admission
+(draft banked, Option A recommended) and the **§2.4** invariant-matrix-mechanism deviation
+(disclosed above). Surface-alignment only — no support claim moved.
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
