@@ -773,3 +773,83 @@ strengthened: Camelid decode is pin-CPU-bitwise (`0xFF` → 240.0), and admissio
 files containing either sentinel byte — such files cannot even produce a well-defined
 cross-backend oracle. Also fixture-corrected: `decode(0x7E)` = 224.0 (a Phase 0 aside said
 112.0). See BASALT_RECON.md §1 [G1 errata] and the Phase 1 evidence bundle.
+
+**D17 addendum 2 (2026-07-16, G2 signed):** Tim signed Gate G2 (PR #470 merged), which
+included the flagged D-B3 implementation shape: since gemma4 is deliberately outside the
+runnable lane's covered architectures, the pilot scoping is an architecture-axis
+carve-out — a gemma4 GGUF passes that axis iff it carries ≥1 NVFP4 tensor; gemma4 files
+without NVFP4 and all other architectures keep their pre-BASALT refusals byte-for-byte.
+Additionally (Phase 3): the D-B2 sidecar refusal and the T5 NaN-sentinel refusal are
+enforced in BOTH lanes — runnable admission/decode (Phase 2) and the gemma4 wire lane
+(`nvfp4_sidecar_check` at load + `WireQuant::new` sentinel scan) — because the wire lane
+never runs the runnable decoder and would otherwise silently bypass both signed postures.
+Closure accepted against Amendment 3 §1 bar on signature (2026-07-16): the synthetic
+sidecar-tripping wire-lane fixture per §1.2 is committed (`tests/fixtures/gguf/`,
+`tests/nvfp4_wire_lane_refusals.rs`), and the four sanctioned rows re-hashed
+byte-unchanged per §1.3 (`qa/evidence-bundles/basalt/phase3/row_rehash_post_closure.txt`).
+
+**D17 addendum 3 (2026-07-16, SHA_E3):** latent pre-BASALT K-quant projection routing gap
+fixed under the Amendment 3 §3 freeze-move mechanism (crash-fix, no design change),
+discovered by the S3 legs on the Q4K-mm row: the per-layer/batched projection call sites
+bypassed the top-level matvec's Q4_K/Q6_K → Q8_K-activation routing and panicked
+`unreachable!` at forward time; projections now dispatch per activation family
+(byte-identical for NVFP4/Q8_0/Q4_0/Q4_1), Q5_K matvec roles refuse typed at load, and the
+L2 I-unknown-type cell note is corrected (`qa/invariant_lanes.json`).
+
+**D17 addendum 4 — Gate G3 outcome: NO-GO (2026-07-17, final freeze SHA `8038abba`).** The
+pre-registered §5.2 rule (GO iff `agreement(NVFP4-mm)` ≥ `agreement(Q4K-mm)` − 2.0 pp) was
+applied verbatim to the eval legs: `agreement(NVFP4-mm)` = 88.5, `agreement(Q4K-mm)` = 92.6,
+threshold 90.6 → **NO-GO** (gap 4.1 pp, > 2× tolerance; sanity guard held at 92.6 ≥ 80.0).
+NVFP4-mm is the worst of the four produced rows on both top-1 agreement and mean KL vs the
+Q8_0 parent (all figures **vs Q8_0 parent, matched 4.5 bpw**, Amendment 3 §4). The
+format-isolated comparison isolates this to the weight format alone (proven identical
+elsewhere at G2). Cross-engine token parity passed independently (Leg B 8/9, one attributed
+0.084-logit near-tie). **Conclusion recorded as measured; no threshold adjusted.** The
+decode-bandwidth motivation (Phase 4) is a separate axis untouched by this quality verdict.
+Scope decision — postmortem-and-stop (A) vs continue-to-Phase-4-on-bandwidth-grounds (B) —
+is Tim's; recommendation (A) as the honest default, in the G3 PR. Receipts:
+`qa/evidence-bundles/basalt/phase3/BASALT_G3_SUMMARY.md` + `legs/`.
+
+**RESOLVED — Tim chose Option B (2026-07-17):** continue to Phase 4 on decode-bandwidth
+grounds, treating NVFP4 as a space/speed format, NOT a quality-competitive one. Binding
+consequence (claim-lint, enforced at Phase 6): every user-visible NVFP4 surface — README,
+capability/support matrices, CAIRN ledger rows, Evidence Chip copy — carries the G3 quality
+delta ("behind Q4_K at matched 4.5 bpw on the pilot: 88.5 % vs 92.6 % top-1 agreement,
+0.111 vs 0.065 mean-KL nats, vs the Q8_0 parent"); no NVFP4 surface may imply
+quality-competitiveness. The G3 NO-GO stands as a recorded, receipted result; Option B is a
+forward-scope choice on a different axis, not a reversal of it.
+
+**Micro-decisions (Amendment 3):**
+
+- **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
+  non-Windows targets via `cfg!(target_os = "windows")` INSIDE ordinary code, in both
+  lanes (`runnable::admit` after the D-B3/D-B2 checks; the gemma4 wire-lane load via
+  `nvfp4_windows_only_check`, after the sidecar check), with the named TK2 error
+  "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX". Rationale: the crate
+  compiles identically on every target (no cfg-walled decode code rotting unseen on
+  platforms that never build it), the refusal is a typed, testable error rather than a
+  missing symbol, and cfg-gated twin tests pin BOTH sides on the CI legs that actually
+  run there (ubuntu/macos assert the refusal; Windows asserts admission).
+- **§2.4 — invariant-matrix enforcement mechanism (S2):** `include_str!` file
+  binding + test-fn name assertion + fixture-tripping references, all in
+  `tests/invariant_matrix_binding.rs` against `qa/invariant_lanes.json`
+  (schema `qa/invariant_lanes.schema.json`, `camelid.invariant-lanes/v1`).
+  Every file an enforced cell names is `include_str!`-bound (a rename/move
+  breaks the BUILD); the meta-test validates the matrix against the schema
+  (hand validator, serde_json, no new deps), asserts full population (no empty
+  cells), asserts every enforced cell's test-fn NAME appears in its bound
+  file's text, and trips the committed `tests/fixtures/gguf/` fixtures (or
+  references the S1 per-lane test that already trips them — no duplicate
+  execution). HONESTLY NOTED: this is file-level compile-time + name-level
+  test-time — a fn RENAME fails the meta-test, not the build. **Disclosed
+  deviation, not a self-granted §2.4 pass** (SHA_E review correction): §2.4
+  permits substitutions only if strictly STRONGER than the prescribed
+  compile-time fn reference, and on the fn-rename axis test-time detection is
+  weaker. The prescribed mechanism is infeasible for private `#[cfg(test)]`
+  unit-test fns and cfg-twinned tests without restructuring every suite; the
+  practical gap is one CI stage (the meta-test runs in the same `ci-gate`
+  suite as the build — either way the PR goes red before merge). This
+  deviation is flagged for Tim's explicit nod at the G3 gate PR. Open-cell teeth: the
+  meta-test fails if the Phase-4 CUDA refusal text (or the P2b test-anchoring
+  marker) vanishes while a cell still cites that phase as open — ratchet
+  R3/R4 are enforced, not aspirational.

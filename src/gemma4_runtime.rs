@@ -13,9 +13,9 @@
 use crate::gguf::{read_metadata, GgufTensorType};
 use crate::inference::gemma4::{gelu_tanh, soft_cap_in_place};
 use crate::inference::{
-    q4_0_wire_block_dequant, q4_0_wire_row_dot, q4_1_wire_row_dot, q4_k_wire_row_dot,
-    q6_k_wire_block_dequant, q6_k_wire_row_dot, q8_0_wire_row_dot, quantize_q8_0_blocks,
-    quantize_q8_k_blocks,
+    nvfp4_wire_block_dequant, nvfp4_wire_row_dot, q4_0_wire_block_dequant, q4_0_wire_row_dot,
+    q4_1_wire_row_dot, q4_k_wire_row_dot, q6_k_wire_block_dequant, q6_k_wire_row_dot,
+    q8_0_wire_row_dot, quantize_q8_0_blocks, quantize_q8_k_blocks,
 };
 use crate::model::{Gemma4Binding, Gemma4Metadata, LlamaModelConfig};
 use crate::tensor::{f16_bits_to_f32, Q8_0Block, TensorStore};
@@ -34,6 +34,9 @@ const Q8_WIRE_BYTES_PER_BLOCK: usize = 34;
 /// The wire quant formats the gemma4 CPU runtime reads in place. Q8_0 is the
 /// proven baseline lane; Q4_0 and Q6_K are the QAT-row formats (all the QAT
 /// linear weights are Q4_0; the tied token/per-layer embeddings are Q6_K).
+/// NVFP4 is the BASALT pilot matmul-weight format (D17/D-B1: pin `block_nvfp4`
+/// byte-for-byte, 64-element/36-byte superblocks; the pilot's embeddings/norms
+/// stay in the Q8_0 baseline formats per `basalt_eval_protocol.md` §1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WireFormat {
     Q8_0,
@@ -42,6 +45,7 @@ enum WireFormat {
     Q4K,
     Q5K,
     Q6K,
+    Nvfp4,
 }
 
 impl WireFormat {
@@ -50,6 +54,7 @@ impl WireFormat {
         match self {
             WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => 32,
             WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => 256,
+            WireFormat::Nvfp4 => crate::tensor::NVFP4_VALUES_PER_BLOCK, // 64
         }
     }
 
@@ -63,7 +68,22 @@ impl WireFormat {
             WireFormat::Q4K => 144,
             WireFormat::Q5K => 176,
             WireFormat::Q6K => crate::inference::Q6_K_WIRE_BYTES_PER_BLOCK,
+            WireFormat::Nvfp4 => crate::tensor::NVFP4_WIRE_BYTES_PER_BLOCK, // 36
         }
+    }
+
+    /// Wire bytes of one weight row spanning `q8_blocks` Q8_0 activation blocks
+    /// (32 values each) — for the Q8_0-activation matvec family only. For the
+    /// 32-value formats this is `q8_blocks * bytes_per_block`; one 64-value
+    /// NVFP4 superblock spans TWO activation blocks, so its row is
+    /// `q8_blocks / 2` superblocks wide.
+    #[inline]
+    fn row_bytes_for_q8_blocks(self, q8_blocks: usize) -> usize {
+        debug_assert!(
+            (q8_blocks * Q8_VALUES_PER_BLOCK).is_multiple_of(self.values_per_block()),
+            "row of {q8_blocks} Q8_0 blocks is not whole {self:?} blocks"
+        );
+        q8_blocks * Q8_VALUES_PER_BLOCK / self.values_per_block() * self.bytes_per_block()
     }
 }
 
@@ -91,9 +111,10 @@ impl WireQuant {
             GgufTensorType::Q4K => WireFormat::Q4K,
             GgufTensorType::Q5K => WireFormat::Q5K,
             GgufTensorType::Q6K => WireFormat::Q6K,
+            GgufTensorType::NVFP4 => WireFormat::Nvfp4,
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} is {other:?}; gemma4 wire load supports Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, and Q6_K"
+                    "tensor {name} is {other:?}; gemma4 wire load supports Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and NVFP4"
                 )))
             }
         };
@@ -113,12 +134,45 @@ impl WireQuant {
         // Validate the whole tensor range lies inside the mapping once, so the
         // hot-path `bytes()` can index without re-checking.
         mmap.bytes(desc.absolute_offset, byte_len)?;
+        // BASALT D17/T5 fail-closed: NVFP4 files carrying NaN-sentinel UE4M3
+        // scale bytes (0x7F/0xFF) are refused at load — the pin's own CPU and
+        // CUDA backends disagree on 0xFF, so such a file has no well-defined
+        // cross-backend oracle. The runnable lane refuses inside
+        // `decode_nvfp4_tensor`; this wire lane never runs that decoder (the
+        // matvec reads wire bytes in place), so the scan lives here. One
+        // sequential pass over the tensor's mapped bytes (which the first
+        // generation would fault in anyway); zero scales admit.
+        if format == WireFormat::Nvfp4 {
+            let wire = mmap.bytes(desc.absolute_offset, byte_len)?;
+            if let Some(block_idx) = crate::tensor::nvfp4_find_nan_scale(wire) {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "tensor {name}: NVFP4 block {block_idx} carries a NaN-sentinel UE4M3 \
+                     scale byte (0x7F/0xFF) — refusing per D17/T5 (fail closed at load)"
+                )));
+            }
+        }
         Ok(Self {
             mmap: mmap.clone(),
             offset: desc.absolute_offset,
             element_count,
             format,
         })
+    }
+
+    /// Typed load-time guard for weights bound to a matvec/matmul role
+    /// (projection, expert band, or tied head). Q5_K is GATHER-ONLY in this
+    /// lane (`per_layer_token_embd`; no Q5_K row-dot kernel is wired here), so
+    /// admitting it into a matvec role would surface as a forward-time panic —
+    /// refuse it at load instead (invariant I-unknown-type: typed refusal,
+    /// never a reachable panic). Every other [`WireFormat`] has a matvec route.
+    fn require_matvec_capable(self, name: &str) -> Result<Self> {
+        if self.format == WireFormat::Q5K {
+            return Err(BackendError::UnsupportedTensorType(format!(
+                "tensor {name} is Q5_K; the gemma4 wire lane serves Q5_K gather-only \
+                 (per_layer_token_embd) — it cannot be a projection/head weight"
+            )));
+        }
+        Ok(self)
     }
 
     /// The tensor's full wire-byte slice. Bounds were validated in `new`.
@@ -152,14 +206,75 @@ impl WireQuant {
             "matvec assumes block-aligned rows"
         );
         match self.format {
-            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => {
+            // NVFP4 rides the Q8_0-activation family: the pin's
+            // `ggml_vec_dot_nvfp4_q8_0_generic` dots NVFP4 superblocks against
+            // Q8_0 activation blocks, exactly like Q8_0/Q4_0/Q4_1.
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
                 self.matvec_q(out_dim, &quantize_q8_0_blocks(x))
             }
             // K-quant rows dot against Q8_K activations (the reference's K-quant
             // activation format) — Q6_K/Q4_K used by the QAT tied embedding head.
             WireFormat::Q4K | WireFormat::Q6K => self.matvec_q8k(out_dim, &quantize_q8_k_blocks(x)),
-            // Q5_K is gather-only here (per_layer_token_embd); never a matvec weight.
+            // Q5_K is gather-only here (per_layer_token_embd); never a matvec
+            // weight — `require_matvec_capable` refuses it typed at load.
             WireFormat::Q5K => unreachable!("Q5_K is gather-only (per_layer_token_embd)"),
+        }
+    }
+
+    /// One projection off a [`SharedActivation`], routed by the SAME family
+    /// split as the top-level [`Self::matvec`]: K-quant weights (Q4_K/Q6_K)
+    /// dot Q8_K activations via [`Self::matvec_q8k`], everything else keeps
+    /// the Q8_0-activation fast path via [`Self::matvec_q`] byte-for-byte.
+    ///
+    /// This is the SHA_E3 crash fix: the per-layer projection call sites used
+    /// to pre-quantize the shared activation to Q8_0 once and call `matvec_q`
+    /// directly, which has no K-quant arms — a latent pre-BASALT gap (no
+    /// gemma4 K-quant matmul row existed) that panicked `unreachable!` at
+    /// forward time on the campaign's Q4K-mm/Q4_K_M rows. The shared
+    /// activation is still quantized at most once PER FAMILY per call site
+    /// (lazily), so single-family files pay exactly the old quantize count.
+    fn matvec_proj(&self, out_dim: usize, x: &SharedActivation) -> Vec<f32> {
+        match self.format {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
+                self.matvec_q(out_dim, x.q8_0())
+            }
+            WireFormat::Q4K | WireFormat::Q6K => self.matvec_q8k(out_dim, x.q8_k()),
+            // Structurally unreachable: `require_matvec_capable` refuses Q5_K
+            // in every matvec-role binding at load (typed, I-unknown-type).
+            WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
+        }
+    }
+
+    /// Batched sibling of [`Self::matvec_proj`] for the spec-verify chunk
+    /// path: routes to [`Self::matmul_q`] / [`Self::matmul_q8k`] by the same
+    /// family split, off a [`SharedActivationBatch`].
+    fn matmul_proj(&self, out_dim: usize, xs: &SharedActivationBatch) -> Vec<Vec<f32>> {
+        match self.format {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
+                self.matmul_q(out_dim, xs.q8_0())
+            }
+            WireFormat::Q4K | WireFormat::Q6K => self.matmul_q8k(out_dim, xs.q8_k()),
+            WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
+        }
+    }
+
+    /// Row-band sibling of [`Self::matvec_proj`] for the MoE expert matrices:
+    /// routes to [`Self::matvec_q_rows`] / [`Self::matvec_q8k_rows`] by the
+    /// same family split.
+    fn matvec_rows_proj(
+        &self,
+        row_start: usize,
+        out_count: usize,
+        x: &SharedActivation,
+    ) -> Vec<f32> {
+        match self.format {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
+                self.matvec_q_rows(row_start, out_count, x.q8_0())
+            }
+            WireFormat::Q4K | WireFormat::Q6K => {
+                self.matvec_q8k_rows(row_start, out_count, x.q8_k())
+            }
+            WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
         }
     }
 
@@ -175,12 +290,13 @@ impl WireQuant {
     /// the result is bit-identical to the per-row version (greedy parity safe).
     fn matvec_q(&self, out_dim: usize, xq: &[Q8_0Block]) -> Vec<f32> {
         const ROW_CHUNK: usize = 64;
-        let row_bytes = xq.len() * self.format.bytes_per_block();
+        let row_bytes = self.format.row_bytes_for_q8_blocks(xq.len());
         let bytes = self.bytes();
         let row_dot: fn(&[u8], &[Q8_0Block]) -> f32 = match self.format {
             WireFormat::Q8_0 => q8_0_wire_row_dot,
             WireFormat::Q4_0 => q4_0_wire_row_dot,
             WireFormat::Q4_1 => q4_1_wire_row_dot,
+            WireFormat::Nvfp4 => nvfp4_wire_row_dot,
             WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
                 unreachable!("K-quant matvec routes through matvec_q8k")
             }
@@ -205,12 +321,13 @@ impl WireQuant {
     /// `xq.len() * values_per_block`; each row is `xq.len()` blocks wide.
     fn matvec_q_rows(&self, row_start: usize, out_count: usize, xq: &[Q8_0Block]) -> Vec<f32> {
         const ROW_CHUNK: usize = 64;
-        let row_bytes = xq.len() * self.format.bytes_per_block();
+        let row_bytes = self.format.row_bytes_for_q8_blocks(xq.len());
         let bytes = self.bytes();
         let row_dot: fn(&[u8], &[Q8_0Block]) -> f32 = match self.format {
             WireFormat::Q8_0 => q8_0_wire_row_dot,
             WireFormat::Q4_0 => q4_0_wire_row_dot,
             WireFormat::Q4_1 => q4_1_wire_row_dot,
+            WireFormat::Nvfp4 => nvfp4_wire_row_dot,
             WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
                 unreachable!("K-quant rows route through matvec_q8k")
             }
@@ -261,12 +378,16 @@ impl WireQuant {
         if k == 0 {
             return Vec::new();
         }
-        let row_bytes = xqs[0].len() * self.format.bytes_per_block();
+        let row_bytes = self.format.row_bytes_for_q8_blocks(xqs[0].len());
         let bytes = self.bytes();
+        // The batched NVFP4 variant is the same shared-read pattern as its
+        // siblings: one weight-row read, `row_dot` looped over the K
+        // activations below (correctness-first; no perf claim).
         let row_dot: fn(&[u8], &[Q8_0Block]) -> f32 = match self.format {
             WireFormat::Q8_0 => q8_0_wire_row_dot,
             WireFormat::Q4_0 => q4_0_wire_row_dot,
             WireFormat::Q4_1 => q4_1_wire_row_dot,
+            WireFormat::Nvfp4 => nvfp4_wire_row_dot,
             WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
                 unreachable!("K-quant matmul routes through matmul_q8k")
             }
@@ -314,6 +435,39 @@ impl WireQuant {
             .enumerate()
             .for_each(|(chunk_idx, dst)| {
                 let base = chunk_idx * ROW_CHUNK;
+                for (i, d) in dst.iter_mut().enumerate() {
+                    let o = base + i;
+                    *d = row_dot(&bytes[o * row_bytes..(o + 1) * row_bytes], xq);
+                }
+            });
+        out
+    }
+
+    /// [`Self::matvec_q_rows`] for K-quant (Q4_K/Q6_K) weights against a Q8_K
+    /// activation: dot a contiguous band of `out_count` output rows starting at
+    /// `row_start` — the MoE expert-band path when the expert matrices are
+    /// K-quants. Same fixed row chunking as [`Self::matvec_q8k`], and rows land
+    /// at fixed indices, so `out[i]` is bit-identical to row `row_start + i` of
+    /// the full [`Self::matvec_q8k`] (greedy parity safe).
+    fn matvec_q8k_rows(
+        &self,
+        row_start: usize,
+        out_count: usize,
+        xq: &[crate::inference::Q8KBlock],
+    ) -> Vec<f32> {
+        const ROW_CHUNK: usize = 64;
+        let row_bytes = xq.len() * self.format.bytes_per_block();
+        let bytes = self.bytes();
+        let row_dot: fn(&[u8], &[crate::inference::Q8KBlock]) -> f32 = match self.format {
+            WireFormat::Q6K => q6_k_wire_row_dot,
+            WireFormat::Q4K => q4_k_wire_row_dot,
+            _ => unreachable!("matvec_q8k_rows is only for Q6_K/Q4_K weights"),
+        };
+        let mut out = vec![0f32; out_count];
+        out.par_chunks_mut(ROW_CHUNK)
+            .enumerate()
+            .for_each(|(chunk_idx, dst)| {
+                let base = row_start + chunk_idx * ROW_CHUNK;
                 for (i, d) in dst.iter_mut().enumerate() {
                     let o = base + i;
                     *d = row_dot(&bytes[o * row_bytes..(o + 1) * row_bytes], xq);
@@ -434,12 +588,100 @@ impl WireQuant {
                     out.push(decoded[e % BV]);
                 }
             }
-            // Q4_1 is a matvec-only weight here (ffn_down); never gathered.
+            // Q4_1 is a matvec-only weight here (ffn_down); no gather decoder is
+            // wired. A Q4_1 embedding table would land here, so refuse typed
+            // (I-unknown-type: never a reachable panic) — this arm was an
+            // `unreachable!` until the SHA_E3 K-quant routing fix swept the
+            // lane's reachable-panic arms.
             WireFormat::Q4_1 => {
-                unreachable!("Q4_1 is matvec-only (ffn_down); never gathered")
+                return Err(BackendError::UnsupportedTensorType(
+                    "gemma4 wire lane cannot gather Q4_1 elements (Q4_1 is a \
+                     matvec-only weight format here)"
+                        .into(),
+                ))
+            }
+            // NVFP4 gather: decode one 64-value superblock at a time via the
+            // pin-bitwise hot-path twin (same pattern as the Q4_0 arm). The
+            // BASALT pilot rows keep embeddings Q8_0 (matmul weights only are
+            // NVFP4), so this arm only runs on non-pilot shapes; sentinel scale
+            // bytes were already refused at load (D17/T5).
+            WireFormat::Nvfp4 => {
+                const BV: usize = crate::tensor::NVFP4_VALUES_PER_BLOCK;
+                const BB: usize = crate::tensor::NVFP4_WIRE_BYTES_PER_BLOCK;
+                let mut block = usize::MAX;
+                let mut decoded = [0f32; BV];
+                for e in start..end {
+                    if e / BV != block {
+                        block = e / BV;
+                        decoded = nvfp4_wire_block_dequant(&bytes[block * BB..(block + 1) * BB]);
+                    }
+                    out.push(decoded[e % BV]);
+                }
             }
         }
         Ok(out)
+    }
+}
+
+/// A shared per-layer activation with each matvec activation family quantized
+/// LAZILY, at most once, however many projections consume it (q/k/v share the
+/// pre-attention norm; gate/up share the pre-FFN norm). The Q8_0-family
+/// projections (Q8_0/Q4_0/Q4_1/NVFP4) dot Q8_0 blocks; K-quant projections
+/// (Q4_K/Q6_K) dot Q8_K blocks — a mixed-format layer quantizes once per
+/// family, a single-family layer pays exactly the old single quantize.
+/// Single-threaded by construction (a per-step local; rayon parallelism lives
+/// INSIDE the matvecs, over output rows), hence the plain `OnceCell`.
+struct SharedActivation<'a> {
+    x: &'a [f32],
+    q8_0: std::cell::OnceCell<Vec<Q8_0Block>>,
+    q8_k: std::cell::OnceCell<Vec<crate::inference::Q8KBlock>>,
+}
+
+impl<'a> SharedActivation<'a> {
+    fn new(x: &'a [f32]) -> Self {
+        Self {
+            x,
+            q8_0: std::cell::OnceCell::new(),
+            q8_k: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn q8_0(&self) -> &[Q8_0Block] {
+        self.q8_0.get_or_init(|| quantize_q8_0_blocks(self.x))
+    }
+
+    fn q8_k(&self) -> &[crate::inference::Q8KBlock] {
+        self.q8_k.get_or_init(|| quantize_q8_k_blocks(self.x))
+    }
+}
+
+/// The batched (spec-verify [`Gemma4Runtime::step_chunk`]) sibling of
+/// [`SharedActivation`]: K activation rows, each quantized family computed
+/// lazily once for the whole chunk. Quantization is a pure per-row function,
+/// so laziness cannot change any value.
+struct SharedActivationBatch<'a> {
+    xs: &'a [Vec<f32>],
+    q8_0: std::cell::OnceCell<Vec<Vec<Q8_0Block>>>,
+    q8_k: std::cell::OnceCell<Vec<Vec<crate::inference::Q8KBlock>>>,
+}
+
+impl<'a> SharedActivationBatch<'a> {
+    fn new(xs: &'a [Vec<f32>]) -> Self {
+        Self {
+            xs,
+            q8_0: std::cell::OnceCell::new(),
+            q8_k: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn q8_0(&self) -> &[Vec<Q8_0Block>] {
+        self.q8_0
+            .get_or_init(|| self.xs.iter().map(|x| quantize_q8_0_blocks(x)).collect())
+    }
+
+    fn q8_k(&self) -> &[Vec<crate::inference::Q8KBlock>] {
+        self.q8_k
+            .get_or_init(|| self.xs.iter().map(|x| quantize_q8_k_blocks(x)).collect())
     }
 }
 
@@ -781,13 +1023,160 @@ impl Gemma4Runtime {
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_layer_range(path, None)
     }
+}
 
+/// BASALT D-B2 fail-closed (DECISIONS.md D17): a ModelOpt-converted NVFP4 GGUF
+/// carries per-tensor sidecar scales as separate `.scale` / `.input_scale`
+/// tensors that MUST be multiplied post-matmul. The gemma4 wire lane does not
+/// implement that multiply, and silently ignoring the sidecars would compute
+/// wrong logits — so an NVFP4 file that carries any refuses at load, mirroring
+/// the runnable-lane admission check. Pin-quantized rows (the BASALT pilot
+/// artifacts, receipted at G2) carry none; the pilot's real
+/// `blk.N.layer_output_scale.weight` tensors do NOT match these suffixes.
+pub(crate) fn nvfp4_sidecar_check(tensors: &[crate::gguf::GgufTensorDescriptor]) -> Result<()> {
+    if tensors
+        .iter()
+        .any(|t| t.tensor_type == GgufTensorType::NVFP4)
+    {
+        if let Some(sidecar) = tensors
+            .iter()
+            .find(|t| t.name.ends_with(".scale") || t.name.ends_with(".input_scale"))
+        {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "NVFP4 GGUF carries per-tensor sidecar scale tensor {}; the gemma4 \
+                 wire lane does not apply sidecar scales and refuses rather than \
+                 compute wrong logits (BASALT D-B2)",
+                sidecar.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// BASALT Amendment 3 §9 platform gate (DECISIONS.md D17 micro-decisions): NVFP4
+/// is Windows-only in this release. This is a RUNTIME check (`cfg!` inside
+/// ordinary code), deliberately NOT a `#[cfg]` wall: the decode code compiles on
+/// every target, and non-Windows callers get this named refusal instead of a
+/// missing symbol. Enforced in BOTH lanes — runnable admission
+/// (`runnable::admit`) and this gemma4 wire-lane load path — because either lane
+/// alone could otherwise reach NVFP4 weights on an unvalidated platform. Fires
+/// AFTER [`nvfp4_sidecar_check`] so the D-B2 posture stays platform-independent.
+pub(crate) fn nvfp4_windows_only_check(
+    tensors: &[crate::gguf::GgufTensorDescriptor],
+) -> Result<()> {
+    if !cfg!(target_os = "windows")
+        && tensors
+            .iter()
+            .any(|t| t.tensor_type == GgufTensorType::NVFP4)
+    {
+        return Err(BackendError::UnsupportedGguf(
+            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// BASALT Amendment 3 review fix (Metal lane guard): the macOS GPU lane
+/// ([`Gemma4GpuRuntime::load`]) format-gates only layer-0 `attn_q` and never runs
+/// the NVFP4 wire decoder, so an NVFP4 file must refuse up front with a typed
+/// error rather than mis-bind. cfg-independent so it unit-tests on every host;
+/// the `cfg(target_os = "macos")` load site wires it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn nvfp4_metal_lane_check(tensors: &[crate::gguf::GgufTensorDescriptor]) -> Result<()> {
+    if let Some(t) = tensors
+        .iter()
+        .find(|t| t.tensor_type == GgufTensorType::NVFP4)
+    {
+        return Err(BackendError::UnsupportedGguf(format!(
+            "NVFP4 is not wired to the Metal lane (BASALT L4: na); tensor {} is NVFP4",
+            t.name
+        )));
+    }
+    Ok(())
+}
+
+/// BASALT Amendment 3 review fix (CUDA lane typed refusal), extended at SHA_E
+/// review: the CUDA-resident gemma4 lane repacks layer projections via
+/// `GemmaLayerQuant::from_wire`, whose catch-all PANICS on any format outside
+/// its covered set (Q8_0/Q4_0/Q4_1). Every lane-uncovered format — NVFP4 (Phase
+/// 4's work) AND the K-quants the CPU wire lane happily serves (the campaign's
+/// own Q4K-mm / Q4_K_M rows) — must refuse with a typed, named error before
+/// that panic seam is reachable (invariant I-unknown-type, L3 cell).
+/// cfg-independent over [`WireFormat`]s so it unit-tests without CUDA hardware;
+/// the `cfg(feature = "cuda")` load site ([`Gemma4CudaResident::load`]) wires it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn nvfp4_cuda_lane_check<I: IntoIterator<Item = WireFormat>>(formats: I) -> Result<()> {
+    for f in formats {
+        match f {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => {}
+            WireFormat::Nvfp4 => {
+                return Err(BackendError::UnsupportedGguf(
+                    "NVFP4 CUDA-resident lane is Phase 4 (BASALT); the CPU lane serves \
+                     NVFP4 in this release"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(BackendError::UnsupportedGguf(format!(
+                    "gemma4 CUDA-resident lane covers Q8_0/Q4_0/Q4_1 layer projections; \
+                     {other:?} is not wired (the CPU lane serves it) — refusing instead \
+                     of reaching the repack panic (BASALT I-unknown-type, L3)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// BASALT Amendment 3 review fix (step-boundary proof): the forced-decode loop's
+/// boundary bookkeeping, extracted so a unit test can prove the off-by-one
+/// contract with a scripted step closure and no model. Drives `step` (feed one
+/// token, return the next prediction state) over the forced list starting from
+/// the prompt-end prediction, guaranteeing:
+///
+/// 1. `observe(i, state)` sees the prediction computed BEFORE `forced[i]` is fed
+///    as the next input (the teacher-forcing boundary);
+/// 2. exactly `forced.len()` observations fire;
+/// 3. the FINAL forced token is never fed (its prediction is already observed;
+///    feeding it would only compute an unrecorded extra step).
+///
+/// [`Gemma4Runtime::forced_decode`] rewires through this; the real forward step
+/// is untouched.
+pub(crate) fn drive_forced_steps<P, E>(
+    forced: &[u32],
+    prompt_end_prediction: P,
+    mut step: impl FnMut(u32) -> std::result::Result<P, E>,
+    mut observe: impl FnMut(usize, &P),
+) -> std::result::Result<(), E> {
+    let mut prediction = prompt_end_prediction;
+    for (i, &tok) in forced.iter().enumerate() {
+        observe(i, &prediction);
+        if i + 1 < forced.len() {
+            prediction = step(tok)?;
+        }
+    }
+    Ok(())
+}
+
+impl Gemma4Runtime {
     /// Load only the given contiguous global layer range (None = all layers).
     /// Fails closed if the range would separate a KV-sharing layer from the
     /// cache it reads (the split must keep every shared layer on the same shard
     /// as its source layer).
     pub fn load_layer_range(path: &Path, range: Option<std::ops::Range<usize>>) -> Result<Self> {
         let gguf = read_metadata(path)?;
+        // BASALT D-B2 fail-closed (DECISIONS.md D17): a ModelOpt-converted NVFP4
+        // GGUF carries per-tensor sidecar scales as separate `.scale` /
+        // `.input_scale` tensors that MUST be multiplied post-matmul. This wire
+        // lane does not implement that multiply, and silently ignoring the
+        // sidecars would compute wrong logits — so an NVFP4 file that carries
+        // any refuses here, mirroring the runnable-lane admission check.
+        // Pin-quantized rows (the BASALT pilot artifacts) carry none.
+        nvfp4_sidecar_check(&gguf.tensors)?;
+        // BASALT Amendment 3 §9: NVFP4 is Windows-only in this release — a
+        // runtime platform gate (after the sidecar check so D-B2 stays
+        // platform-independent), mirrored in runnable admission.
+        nvfp4_windows_only_check(&gguf.tensors)?;
         let config = LlamaModelConfig::from_gguf(&gguf)?;
         let g = config.gemma4.clone().ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
@@ -831,23 +1220,27 @@ impl Gemma4Runtime {
             std::thread::spawn(move || mmap.advise_willneed());
         }
         let q8 = |name: &str| WireQuant::new(&store, &mmap, name);
+        // Matvec-role loads (projections, expert bands, the tied head) refuse
+        // Q5_K typed at load — it is gather-only in this lane and would
+        // otherwise panic at forward time (I-unknown-type, SHA_E3).
+        let q8m = |name: &str| -> Result<WireQuant> { q8(name)?.require_matvec_capable(name) };
         let f32t = |name: &str| -> Result<Vec<f32>> { Ok(store.load_cpu_f32(name)?.data) };
 
         let mut layers = Vec::with_capacity(range.len());
         for l in &binding.layers[range.clone()] {
             layers.push(LayerWeights {
                 attn_norm: f32t(&l.attn_norm.name)?,
-                attn_q: q8(&l.attn_q.name)?,
-                attn_k: l.attn_k.as_ref().map(|d| q8(&d.name)).transpose()?,
-                attn_v: l.attn_v.as_ref().map(|d| q8(&d.name)).transpose()?,
-                attn_output: q8(&l.attn_output.name)?,
+                attn_q: q8m(&l.attn_q.name)?,
+                attn_k: l.attn_k.as_ref().map(|d| q8m(&d.name)).transpose()?,
+                attn_v: l.attn_v.as_ref().map(|d| q8m(&d.name)).transpose()?,
+                attn_output: q8m(&l.attn_output.name)?,
                 q_norm: f32t(&l.attn_q_norm.name)?,
                 k_norm: l.attn_k_norm.as_ref().map(|d| f32t(&d.name)).transpose()?,
                 post_attn_norm: f32t(&l.post_attention_norm.name)?,
                 ffn_norm: f32t(&l.ffn_norm.name)?,
-                ffn_gate: q8(&l.ffn_gate.name)?,
-                ffn_up: q8(&l.ffn_up.name)?,
-                ffn_down: q8(&l.ffn_down.name)?,
+                ffn_gate: q8m(&l.ffn_gate.name)?,
+                ffn_up: q8m(&l.ffn_up.name)?,
+                ffn_down: q8m(&l.ffn_down.name)?,
                 post_ffw_norm: f32t(&l.post_ffw_norm.name)?,
                 post_norm: l.post_norm.as_ref().map(|d| f32t(&d.name)).transpose()?,
                 ple_inp_gate: l.ple_inp_gate.as_ref().map(|d| f32t(&d.name)).transpose()?,
@@ -870,8 +1263,8 @@ impl Gemma4Runtime {
                         })?;
                         let n_expert = moe_meta.expert_count as usize;
                         // 2*n_ff_exp = gate_up rows / n_expert; n_ff_exp halves it.
-                        let gate_up = q8(&m.gate_up_exps.name)?;
-                        let down = q8(&m.down_exps.name)?;
+                        let gate_up = q8m(&m.gate_up_exps.name)?;
+                        let down = q8m(&m.down_exps.name)?;
                         let two_nff =
                             gate_up.element_count / (n_expert * config.embedding_length as usize);
                         // Enable the AVX2 pre-pack expert path only when BOTH expert
@@ -908,7 +1301,10 @@ impl Gemma4Runtime {
         Ok(Self {
             tokenizer,
             first_layer: range.start,
-            token_embd: q8(&binding.token_embedding.name)?,
+            // The tied head matvecs token_embd on the tail shard, so it takes
+            // the matvec-role guard; per_layer_token_embd stays gather-only
+            // (plain q8) — Q5_K is legitimate there.
+            token_embd: q8m(&binding.token_embedding.name)?,
             per_layer_token_embd: binding
                 .per_layer_token_embd
                 .as_ref()
@@ -960,6 +1356,13 @@ impl Gemma4Runtime {
 
     pub fn hidden_size(&self) -> usize {
         self.config.embedding_length as usize
+    }
+
+    /// Logit-vector length of this model's tied head (`token_embd` rows) — the
+    /// exact length `step` returns, and therefore the bound the BASALT harness
+    /// uses to validate teacher-forced token ids before decoding.
+    pub fn vocab_size(&self) -> usize {
+        self.token_embd.element_count / self.hidden_size()
     }
 
     /// Greedy stop set for this model (metadata EOS/EOT/EOM + literal
@@ -1092,11 +1495,12 @@ impl Gemma4Runtime {
             };
 
             // --- attention projections, batched (one weight pass each) ---
-            let xnq: Vec<Vec<Q8_0Block>> = hs
+            let xn_rows: Vec<Vec<f32>> = hs
                 .iter()
-                .map(|h| quantize_q8_0_blocks(&rms_norm(h, Some(&lw.attn_norm), eps)))
+                .map(|h| rms_norm(h, Some(&lw.attn_norm), eps))
                 .collect();
-            let mut q_rows = lw.attn_q.matmul_q(q_dim, &xnq);
+            let xnq = SharedActivationBatch::new(&xn_rows);
+            let mut q_rows = lw.attn_q.matmul_proj(q_dim, &xnq);
             for q in q_rows.iter_mut() {
                 for hh in 0..heads {
                     let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
@@ -1112,9 +1516,9 @@ impl Gemma4Runtime {
                     .attn_k
                     .as_ref()
                     .expect("validate() guarantees owning layers bind attn_k")
-                    .matmul_q(kv_dim, &xnq);
+                    .matmul_proj(kv_dim, &xnq);
                 let mut v_rows = match lw.attn_v.as_ref() {
-                    Some(wv) => wv.matmul_q(kv_dim, &xnq),
+                    Some(wv) => wv.matmul_proj(kv_dim, &xnq),
                     None => k_rows.clone(),
                 };
                 for i in 0..kk {
@@ -1160,7 +1564,7 @@ impl Gemma4Runtime {
             let group = heads / self.g.kv_heads_at(src_global) as usize;
 
             // --- per-position attention (cheap; no big weight read) ---
-            let mut attn_q_rows: Vec<Vec<Q8_0Block>> = Vec::with_capacity(kk);
+            let mut attn_rows: Vec<Vec<f32>> = Vec::with_capacity(kk);
             for i in 0..kk {
                 let pos = start_pos + i;
                 let lo = if sliding {
@@ -1194,10 +1598,11 @@ impl Gemma4Runtime {
                         }
                     }
                 }
-                attn_q_rows.push(quantize_q8_0_blocks(&attn));
+                attn_rows.push(attn);
             }
             // o-projection batched, then residual + post-attn norm per token.
-            let o_rows = lw.attn_output.matmul_q(hidden, &attn_q_rows);
+            let attn_b = SharedActivationBatch::new(&attn_rows);
+            let o_rows = lw.attn_output.matmul_proj(hidden, &attn_b);
             for i in 0..kk {
                 let on = rms_norm(&o_rows[i], Some(&lw.post_attn_norm), eps);
                 for (a, b) in hs[i].iter_mut().zip(&on) {
@@ -1206,23 +1611,24 @@ impl Gemma4Runtime {
             }
 
             // --- FFN (dense), batched ---
-            let ffnq: Vec<Vec<Q8_0Block>> = hs
+            let ffn_rows: Vec<Vec<f32>> = hs
                 .iter()
-                .map(|h| quantize_q8_0_blocks(&rms_norm(h, Some(&lw.ffn_norm), eps)))
+                .map(|h| rms_norm(h, Some(&lw.ffn_norm), eps))
                 .collect();
-            let gate_rows = lw.ffn_gate.matmul_q(ffn_dim, &ffnq);
-            let up_rows = lw.ffn_up.matmul_q(ffn_dim, &ffnq);
-            let actq: Vec<Vec<Q8_0Block>> = (0..kk)
+            let ffnq = SharedActivationBatch::new(&ffn_rows);
+            let gate_rows = lw.ffn_gate.matmul_proj(ffn_dim, &ffnq);
+            let up_rows = lw.ffn_up.matmul_proj(ffn_dim, &ffnq);
+            let act_rows: Vec<Vec<f32>> = (0..kk)
                 .map(|i| {
-                    let act: Vec<f32> = gate_rows[i]
+                    gate_rows[i]
                         .iter()
                         .zip(&up_rows[i])
                         .map(|(g, u)| gelu_tanh(*g) * u)
-                        .collect();
-                    quantize_q8_0_blocks(&act)
+                        .collect()
                 })
                 .collect();
-            let mlp_rows = lw.ffn_down.matmul_q(hidden, &actq);
+            let actq = SharedActivationBatch::new(&act_rows);
+            let mlp_rows = lw.ffn_down.matmul_proj(hidden, &actq);
             for i in 0..kk {
                 let ffn_out = rms_norm(&mlp_rows[i], Some(&lw.post_ffw_norm), eps);
                 for (a, b) in hs[i].iter_mut().zip(&ffn_out) {
@@ -1258,18 +1664,11 @@ impl Gemma4Runtime {
             .iter()
             .map(|h| rms_norm(h, Some(&self.output_norm), eps))
             .collect();
-        let mut logits_rows: Vec<Vec<f32>> = match self.token_embd.format {
-            WireFormat::Q6K => {
-                let xqs: Vec<Vec<crate::inference::Q8KBlock>> =
-                    lastq.iter().map(|l| quantize_q8_k_blocks(l)).collect();
-                self.token_embd.matmul_q8k(vocab, &xqs)
-            }
-            _ => {
-                let xqs: Vec<Vec<Q8_0Block>> =
-                    lastq.iter().map(|l| quantize_q8_0_blocks(l)).collect();
-                self.token_embd.matmul_q(vocab, &xqs)
-            }
-        };
+        // Family-routed like every projection (SHA_E3): the old open-coded
+        // match sent only Q6_K through the Q8_K family, so a Q4_K tied head
+        // hit `matmul_q`'s K-quant unreachable! on this batched path.
+        let lastb = SharedActivationBatch::new(&lastq);
+        let mut logits_rows: Vec<Vec<f32>> = self.token_embd.matmul_proj(vocab, &lastb);
         if let Some(cap) = self.g.final_logit_softcapping {
             for logits in logits_rows.iter_mut() {
                 soft_cap_in_place(logits, cap);
@@ -1302,9 +1701,9 @@ impl Gemma4Runtime {
 
         // Dense "shared expert" MLP branch: ffn_norm -> parallel GeGLU -> down.
         let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
-        let xnq = quantize_q8_0_blocks(&xn);
-        let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
-        let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
+        let xnq = SharedActivation::new(&xn);
+        let gate = lw.ffn_gate.matvec_proj(ffn_dim, &xnq);
+        let up = lw.ffn_up.matvec_proj(ffn_dim, &xnq);
         let act: Vec<f32> = gate
             .iter()
             .zip(&up)
@@ -1340,31 +1739,34 @@ impl Gemma4Runtime {
         wsum = wsum.max(6.103_515e-5);
 
         let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
-        let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
+        let cur_moe_q = SharedActivation::new(&cur_moe);
         let two_nff = 2 * moe.n_ff_exp;
         let mut moe_acc = vec![0f32; hidden];
         // Pre-packed (interleaved 8-row) expert matrices for the AVX2 GEMV, packed
         // once per expert per session and cached; `None` disables the fast path.
+        // (The packed path exists only for Q4_0 experts — `pack_cache` is `None`
+        // otherwise — so its activations are always the Q8_0 family.)
         for &e in &idx {
             let w = probs[e] / wsum;
             let packed = moe.packed_expert(e, hidden, two_nff);
             // fused gate‖up for expert e: rows e*2nff .. +2nff, in_dim=n_embd.
             // Interleaved 8-row AVX2 GEMV (bit-exact vs the scalar row path) when
-            // the expert is pre-packed, else the scalar wire dot.
+            // the expert is pre-packed, else the scalar wire dot (routed by the
+            // expert matrices' activation family).
             let gate_up = match &packed {
-                Some(p) => packed_band_matvec(&p.gate_up, &cur_moe_q),
+                Some(p) => packed_band_matvec(&p.gate_up, cur_moe_q.q8_0()),
                 None => moe
                     .gate_up_exps
-                    .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q),
+                    .matvec_rows_proj(e * two_nff, two_nff, &cur_moe_q),
             };
             let hexp: Vec<f32> = (0..moe.n_ff_exp)
                 .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + moe.n_ff_exp])
                 .collect();
-            let hexp_q = quantize_q8_0_blocks(&hexp);
+            let hexp_q = SharedActivation::new(&hexp);
             // down for expert e: rows e*n_embd .. +n_embd, in_dim=n_ff_exp.
             let y = match &packed {
-                Some(p) => packed_band_matvec(&p.down, &hexp_q),
-                None => moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q),
+                Some(p) => packed_band_matvec(&p.down, hexp_q.q8_0()),
+                None => moe.down_exps.matvec_rows_proj(e * hidden, hidden, &hexp_q),
             };
             let scale = moe.down_exps_scale[e] * w;
             for (a, yv) in moe_acc.iter_mut().zip(&y) {
@@ -1502,9 +1904,10 @@ impl Gemma4Runtime {
             };
 
             let xn = rms_norm(&h, Some(&lw.attn_norm), eps);
-            // q/k/v all project the same normed input — quantize it once.
-            let xnq = quantize_q8_0_blocks(&xn);
-            let mut q = lw.attn_q.matvec_q(q_dim, &xnq);
+            // q/k/v all project the same normed input — quantize it once per
+            // activation family (lazily; K-quant projections dot Q8_K).
+            let xnq = SharedActivation::new(&xn);
+            let mut q = lw.attn_q.matvec_proj(q_dim, &xnq);
             for hh in 0..heads {
                 let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
                 s.copy_from_slice(&rms_norm(s, Some(&lw.q_norm), eps));
@@ -1524,12 +1927,12 @@ impl Gemma4Runtime {
                     .attn_k
                     .as_ref()
                     .expect("validate() guarantees owning layers bind attn_k")
-                    .matvec_q(kv_dim, &xnq);
+                    .matvec_proj(kv_dim, &xnq);
                 // V-less layers (12B full attention) reuse the raw K projection
                 // as V — reference: `if v_proj is not present, use Kcur as Vcur`.
                 // V then takes the usual weightless norm and never RoPE.
                 let mut v = match lw.attn_v.as_ref() {
-                    Some(wv) => wv.matvec_q(kv_dim, &xnq),
+                    Some(wv) => wv.matvec_proj(kv_dim, &xnq),
                     None => k.clone(),
                 };
                 for hh in 0..kv_heads {
@@ -1608,9 +2011,9 @@ impl Gemma4Runtime {
                 self.moe_layer_ffn(li, &h)
             } else {
                 let xn = rms_norm(&h, Some(&lw.ffn_norm), eps);
-                let xnq = quantize_q8_0_blocks(&xn);
-                let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
-                let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
+                let xnq = SharedActivation::new(&xn);
+                let gate = lw.ffn_gate.matvec_proj(ffn_dim, &xnq);
+                let up = lw.ffn_up.matvec_proj(ffn_dim, &xnq);
                 let act: Vec<f32> = gate
                     .iter()
                     .zip(&up)
@@ -1739,6 +2142,95 @@ impl Gemma4Runtime {
         }
         if cpu_timing_enabled() {
             report_cpu_timing();
+        }
+        let text = self.tokenizer.decode(&generated, true)?;
+        Ok((text, generated))
+    }
+
+    /// BASALT Phase 3 forced-decode harness surface (`basalt_eval_protocol.md`
+    /// §5.1): teacher-force `forced` through the model. Prefills `prompt` exactly
+    /// like [`Self::generate_greedy`], then at each continuation step `i` observes
+    /// the FULL next-token logit vector (the distribution predicting continuation
+    /// position `i`) via `on_step(i, &logits)` BEFORE feeding `forced[i]` as the
+    /// next input — regardless of the model's argmax, ignoring stop tokens (the
+    /// forced list defines the step count) and never taking the speculative path.
+    /// NO engine math changes: the forward pass is the same [`Self::step`] loop
+    /// the greedy decoder drives; only the next-token choice differs. The final
+    /// forced token is not fed (its prediction is already observed; feeding it
+    /// would only compute an unrecorded extra step). Returns the prompt token ids.
+    pub fn forced_decode<F: FnMut(usize, &[f32])>(
+        &self,
+        prompt: &str,
+        forced: &[u32],
+        mut on_step: F,
+    ) -> Result<Vec<u32>> {
+        let n_layers = self.layers.len();
+        let mut kc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let mut vc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.step(tok, pos, &mut kc, &mut vc)?;
+        }
+        // Boundary bookkeeping lives in `drive_forced_steps` (unit-tested with a
+        // scripted step fn): observe step i's logits BEFORE feeding forced[i];
+        // exactly forced.len() observations; the final forced token never fed.
+        let mut pos = prompt_tokens.len();
+        drive_forced_steps(
+            forced,
+            logits,
+            |tok| -> Result<Vec<f32>> {
+                let next = self.step(tok, pos, &mut kc, &mut vc)?;
+                pos += 1;
+                Ok(next)
+            },
+            |i, logits: &Vec<f32>| on_step(i, logits),
+        )?;
+        Ok(prompt_tokens)
+    }
+
+    /// [`Self::generate_greedy`] with a per-step FULL-logit observer, for the
+    /// BASALT Phase 3 harness (`--dump-step-logits` without `--force-tokens`):
+    /// `on_step(i, &logits)` fires for every continuation logit vector BEFORE its
+    /// argmax is taken — including the final vector whose argmax is a stop token
+    /// (that step is observed, then the loop breaks without emitting the token).
+    /// Always drives the plain one-token [`Self::step`] loop (the speculative
+    /// path does not surface per-step logits); the token-choice math is identical
+    /// to [`Self::generate_greedy`], so the emitted ids match the unobserved
+    /// greedy decode of the same prompt.
+    pub fn generate_greedy_observed<F: FnMut(usize, &[f32])>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        mut on_step: F,
+    ) -> Result<(String, Vec<u32>)> {
+        let n_layers = self.layers.len();
+        let mut kc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let mut vc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
+        let eot = gemma4_stop_token_ids(&self.tokenizer);
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.step(tok, pos, &mut kc, &mut vc)?;
+        }
+        let mut generated = Vec::new();
+        for i in 0..max_new {
+            on_step(i, &logits);
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if eot.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            // `next` is generated token #(generated.len()-1), sitting at absolute
+            // position prompt_len + that index — identical to generate_greedy's
+            // running `pos` counter.
+            let pos = prompt_tokens.len() + generated.len() - 1;
+            logits = self.step(next, pos, &mut kc, &mut vc)?;
         }
         let text = self.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
@@ -1966,6 +2458,13 @@ impl Gemma4GpuRuntime {
     /// is the KV-cache capacity (must cover prompt + generated tokens).
     pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
         let gguf = read_metadata(path)?;
+        // BASALT Amendment 3 review fix (Metal lane guard): this lane never ran
+        // the D-B2 sidecar check and format-gated only layer-0 attn_q, so a
+        // sidecar-bearing or NVFP4 file could slip past the signed refusals.
+        // Both typed refusals fire here, before any binding; the shared helpers
+        // are cfg-independent and unit-tested on every host.
+        nvfp4_sidecar_check(&gguf.tensors)?;
+        nvfp4_metal_lane_check(&gguf.tensors)?;
         let config = LlamaModelConfig::from_gguf(&gguf)?;
         let g = config.gemma4.clone().ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
@@ -2725,6 +3224,25 @@ impl Gemma4CudaResident {
     /// bounds the resident KV cache.
     pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
         let cpu = Gemma4Runtime::load(path)?;
+        // BASALT Amendment 3 review fix: refuse NVFP4 layer projections with a
+        // typed error BEFORE the `GemmaLayerQuant::from_wire` catch-all (`upw`
+        // below) can panic. The CPU wire lane serves NVFP4 in this release;
+        // CUDA-resident NVFP4 is Phase 4 (BASALT).
+        nvfp4_cuda_lane_check(cpu.layers.iter().flat_map(|lw| {
+            [
+                Some(lw.attn_q.format),
+                lw.attn_k.as_ref().map(|w| w.format),
+                lw.attn_v.as_ref().map(|w| w.format),
+                Some(lw.attn_output.format),
+                Some(lw.ffn_gate.format),
+                Some(lw.ffn_up.format),
+                Some(lw.ffn_down.format),
+                lw.moe.as_ref().map(|m| m.gate_up_exps.format),
+                lw.moe.as_ref().map(|m| m.down_exps.format),
+            ]
+            .into_iter()
+            .flatten()
+        }))?;
         let kernels = crate::cuda_resident::CudaResidentKernels::new()
             .map_err(BackendError::InvalidModelMetadata)?;
         // Disable cudarc's automatic cross-stream event tracking. Allocating a second
@@ -4544,5 +5062,749 @@ mod q4_0_cpu_tests {
         eprintln!("Q4_0 CPU ids:  {ids:?}");
         eprintln!("Q4_0 CPU text: {text:?}");
         assert!(!ids.is_empty(), "generated no tokens");
+    }
+}
+
+/// BASALT Phase 3: the gemma4 wire lane's NVFP4 seam — WireFormat constants,
+/// WireQuant admission (incl. the D17/T5 sentinel refusal), and matvec/matmul
+/// consistency with `nvfp4_wire_row_dot`. Fixture-anchored + deterministic; no
+/// model loads (a bare temp file of wire bytes plus a hand-built descriptor is
+/// all `WireQuant::new` consumes).
+#[cfg(test)]
+mod nvfp4_wire_tests {
+    use super::*;
+    use crate::gguf::{GgufFile, GgufTensorDescriptor};
+
+    /// Deterministic non-sentinel NVFP4 wire blocks: UE4M3 scale bytes drawn
+    /// from a fixed safe set (0x00 zero through 0x7E max-normal; never
+    /// 0x7F/0xFF), qs bytes from a small LCG-ish pattern.
+    pub(super) fn synth_wire(superblocks: usize) -> Vec<u8> {
+        const SAFE_SCALES: [u8; 8] = [0x00, 0x10, 0x2C, 0x38, 0x40, 0x51, 0x66, 0x7E];
+        let mut wire = Vec::with_capacity(superblocks * 36);
+        for b in 0..superblocks {
+            for s in 0..4 {
+                wire.push(SAFE_SCALES[(b + s) % SAFE_SCALES.len()]);
+            }
+            for j in 0..32 {
+                wire.push(((b * 37 + j * 11 + 5) % 256) as u8);
+            }
+        }
+        wire
+    }
+
+    pub(super) fn desc(
+        name: &str,
+        tensor_type: GgufTensorType,
+        dims: &[u64],
+        n_bytes: u64,
+    ) -> GgufTensorDescriptor {
+        GgufTensorDescriptor {
+            name: name.into(),
+            dimensions: dims.to_vec(),
+            tensor_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes,
+        }
+    }
+
+    #[test]
+    fn sidecar_check_refuses_nvfp4_with_scale_tensors() {
+        // ModelOpt-converted shape: NVFP4 weight + its sidecar `.scale` /
+        // `.input_scale` F32 tensors — the wire lane must refuse (D-B2).
+        for sidecar_name in ["blk.0.attn_q.scale", "blk.0.attn_q.input_scale"] {
+            let tensors = vec![
+                desc("blk.0.attn_q.weight", GgufTensorType::NVFP4, &[64, 4], 144),
+                desc(sidecar_name, GgufTensorType::F32, &[1], 4),
+            ];
+            let err = nvfp4_sidecar_check(&tensors).expect_err("sidecar must refuse");
+            let msg = err.to_string();
+            assert!(msg.contains(sidecar_name), "{msg}");
+            assert!(msg.contains("D-B2"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn sidecar_check_admits_pilot_shapes() {
+        // The pilot's real `layer_output_scale.weight` name must NOT false-positive,
+        // and sidecar-suffixed names without any NVFP4 tensor are out of scope.
+        let pilot = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::NVFP4, &[64, 4], 144),
+            desc(
+                "blk.0.layer_output_scale.weight",
+                GgufTensorType::F32,
+                &[1, 4],
+                16,
+            ),
+        ];
+        nvfp4_sidecar_check(&pilot).expect("pilot shape admits");
+
+        let no_nvfp4 = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0, &[64, 4], 136),
+            desc("blk.0.attn_q.scale", GgufTensorType::F32, &[1], 4),
+        ];
+        nvfp4_sidecar_check(&no_nvfp4).expect("no NVFP4 -> check is out of scope");
+    }
+
+    /// Write `wire` to a temp file and wrap it in the two inputs WireQuant::new
+    /// takes. The returned NamedTempFile keeps the mapping's backing file alive.
+    pub(super) fn fixture(
+        wire: &[u8],
+        descs: Vec<GgufTensorDescriptor>,
+    ) -> (tempfile::NamedTempFile, TensorStore, Arc<GgufWireMmap>) {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("temp wire file");
+        f.write_all(wire).expect("write wire bytes");
+        f.flush().expect("flush wire bytes");
+        let gguf = GgufFile {
+            path: f.path().to_path_buf(),
+            version: 3,
+            tensor_count: descs.len() as i64,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: std::collections::BTreeMap::new(),
+            tensors: descs,
+        };
+        let store = TensorStore::open(f.path(), &gguf);
+        let mmap = GgufWireMmap::map(f.path()).expect("map wire file");
+        (f, store, mmap)
+    }
+
+    #[test]
+    fn wire_format_nvfp4_constants() {
+        assert_eq!(WireFormat::Nvfp4.values_per_block(), 64);
+        assert_eq!(WireFormat::Nvfp4.bytes_per_block(), 36);
+        // 4 Q8_0 activation blocks = 128 values = 2 NVFP4 superblocks = 72 B...
+        assert_eq!(WireFormat::Nvfp4.row_bytes_for_q8_blocks(4), 72);
+        // ...while the 32-value formats keep their 1:1 block mapping.
+        assert_eq!(WireFormat::Q8_0.row_bytes_for_q8_blocks(4), 4 * 34);
+        assert_eq!(WireFormat::Q4_0.row_bytes_for_q8_blocks(4), 4 * 18);
+    }
+
+    #[test]
+    fn wire_quant_new_admits_nvfp4_and_still_refuses_uncovered() {
+        // 2 superblocks = 128 elements = 72 wire bytes, dims [64, 2].
+        let wire = synth_wire(2);
+        let (_f, store, mmap) = fixture(
+            &wire,
+            vec![
+                desc("blk.0.attn_q.weight", GgufTensorType::NVFP4, &[64, 2], 72),
+                desc("blk.0.attn_k.weight", GgufTensorType::BF16, &[64, 2], 256),
+            ],
+        );
+
+        let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight").expect("NVFP4 admits");
+        assert_eq!(wq.format, WireFormat::Nvfp4);
+        assert_eq!(wq.element_count, 128);
+        assert_eq!(wq.bytes(), &wire[..]);
+
+        // An uncovered type keeps the fail-closed refusal, now naming NVFP4 as covered.
+        // (WireQuant holds an Arc<GgufWireMmap> and derives no Debug, so match
+        // instead of expect_err.)
+        match WireQuant::new(&store, &mmap, "blk.0.attn_k.weight") {
+            Err(BackendError::UnsupportedTensorType(msg)) => {
+                assert!(msg.contains("gemma4 wire load supports"), "msg: {msg}");
+                assert!(msg.contains("NVFP4"), "covered list names NVFP4: {msg}");
+            }
+            Err(other) => panic!("expected UnsupportedTensorType, got {other:?}"),
+            Ok(_) => panic!("BF16 must stay refused"),
+        }
+    }
+
+    #[test]
+    fn wire_quant_new_refuses_nan_sentinel_scale_bytes() {
+        for sentinel in [0x7Fu8, 0xFFu8] {
+            let mut wire = synth_wire(2);
+            wire[36 + 2] = sentinel; // block 1, d[2]
+            let (_f, store, mmap) = fixture(
+                &wire,
+                vec![desc(
+                    "blk.0.ffn_up.weight",
+                    GgufTensorType::NVFP4,
+                    &[64, 2],
+                    72,
+                )],
+            );
+            match WireQuant::new(&store, &mmap, "blk.0.ffn_up.weight") {
+                Err(BackendError::InvalidTensorData(msg)) => {
+                    assert!(msg.contains("NaN-sentinel"), "msg: {msg}");
+                    assert!(msg.contains("block 1"), "first offending block: {msg}");
+                }
+                Err(other) => panic!("expected InvalidTensorData, got {other:?}"),
+                Ok(_) => panic!("sentinel scale byte must refuse at load (D17/T5)"),
+            }
+        }
+        // Zero scales admit (D17/T5: only the sentinel bytes refuse).
+        let mut wire = synth_wire(2);
+        for b in 0..2 {
+            for s in 0..4 {
+                wire[b * 36 + s] = 0x00;
+            }
+        }
+        let (_f, store, mmap) = fixture(
+            &wire,
+            vec![desc(
+                "blk.0.ffn_up.weight",
+                GgufTensorType::NVFP4,
+                &[64, 2],
+                72,
+            )],
+        );
+        WireQuant::new(&store, &mmap, "blk.0.ffn_up.weight").expect("zero scales admit");
+    }
+
+    #[test]
+    fn nvfp4_matvec_and_matmul_match_row_dot() {
+        // 4 output rows x 128 inputs = 8 superblocks of wire.
+        let (in_dim, out_dim) = (128usize, 4usize);
+        let wire = synth_wire(8);
+        let (_f, store, mmap) = fixture(
+            &wire,
+            vec![desc(
+                "blk.0.attn_q.weight",
+                GgufTensorType::NVFP4,
+                &[in_dim as u64, out_dim as u64],
+                wire.len() as u64,
+            )],
+        );
+        let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight").expect("load");
+
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+            .collect();
+        let xq = quantize_q8_0_blocks(&x);
+        let row_bytes = WireFormat::Nvfp4.row_bytes_for_q8_blocks(xq.len());
+        assert_eq!(row_bytes, 2 * 36, "two superblocks per 128-value row");
+
+        // matvec (public dispatch) must equal the row dot on each wire row, bitwise.
+        let out = wq.matvec(in_dim, out_dim, &x);
+        for o in 0..out_dim {
+            let want = nvfp4_wire_row_dot(&wire[o * row_bytes..(o + 1) * row_bytes], &xq);
+            assert_eq!(
+                out[o].to_bits(),
+                want.to_bits(),
+                "matvec row {o}: got {} want {want}",
+                out[o]
+            );
+        }
+
+        // matvec_q_rows: a row band must land on the same dots.
+        let rows = wq.matvec_q_rows(1, 2, &xq);
+        for (i, o) in (1..3).enumerate() {
+            assert_eq!(rows[i].to_bits(), out[o].to_bits(), "row band offset {o}");
+        }
+
+        // Batched matmul_q over K activations == matvec_q per activation, bitwise
+        // (the spec-verify shared-weight-read contract).
+        let xs: Vec<Vec<f32>> = (0..3)
+            .map(|k| {
+                (0..in_dim)
+                    .map(|i| ((i as f32) * 0.11 + k as f32 * 0.7).cos() * 2.0)
+                    .collect()
+            })
+            .collect();
+        let xqs: Vec<Vec<Q8_0Block>> = xs.iter().map(|x| quantize_q8_0_blocks(x)).collect();
+        let batched = wq.matmul_q(out_dim, &xqs);
+        for (k, xq) in xqs.iter().enumerate() {
+            let single = wq.matvec_q(out_dim, xq);
+            for o in 0..out_dim {
+                assert_eq!(
+                    batched[k][o].to_bits(),
+                    single[o].to_bits(),
+                    "matmul_q[{k}][{o}] != matvec_q"
+                );
+            }
+        }
+    }
+}
+
+/// BASALT Phase 3 SHA_E3 (§3 freeze-move crash fix) — K-quant LAYER-PROJECTION
+/// routing. The per-layer projection call sites used to pre-quantize the shared
+/// activation to Q8_0 and call `matvec_q` directly, which has no K-quant arms:
+/// any gemma4 file with Q4_K/Q5_K/Q6_K projection matmuls panicked
+/// `unreachable!` at forward time (latent pre-BASALT; probe-proven on the
+/// campaign's Q4K-mm row). These tests pin the fixed dispatch three ways:
+/// (1) K-quant projections route through the Q8_K family and land bit-equal to
+/// the top-level [`WireQuant::matvec`] — the pre-existing, correct route — and
+/// to the raw wire row dots; (2) the Q8_0-family dispatch stays byte-identical
+/// to the direct Q8_0-activation path it replaced (NVFP4 non-disturbance at the
+/// unit seam); (3) Q5_K matvec roles and Q4_1 gathers refuse TYPED, never panic
+/// (invariant I-unknown-type, L2).
+#[cfg(test)]
+mod kquant_projection_tests {
+    use super::nvfp4_wire_tests::{desc, fixture, synth_wire};
+    use super::*;
+    use crate::inference::{
+        Q4_K_WIRE_BYTES_PER_BLOCK, Q5_K_WIRE_BYTES_PER_BLOCK, Q6_K_WIRE_BYTES_PER_BLOCK,
+    };
+
+    /// Deterministic K-quant wire: LCG byte fill, then tame f16 scale fields
+    /// (per-block byte offsets in `f16_offs`) so no block scale is inf/NaN —
+    /// the same recipe as the inference-layer K-quant dot tests.
+    fn synth_kquant_wire(blocks: usize, bytes_per_block: usize, f16_offs: &[usize]) -> Vec<u8> {
+        let mut wire = vec![0u8; blocks * bytes_per_block];
+        for (i, b) in wire.iter_mut().enumerate() {
+            *b = ((i * 131 + 17) % 256) as u8;
+        }
+        for blk in wire.chunks_exact_mut(bytes_per_block) {
+            for (j, &off) in f16_offs.iter().enumerate() {
+                let v = if j == 0 { 0.0173f32 } else { 0.0049 };
+                blk[off..off + 2].copy_from_slice(&crate::tensor::f32_to_f16_bits(v).to_le_bytes());
+            }
+        }
+        wire
+    }
+
+    fn activation(in_dim: usize, seed: f32) -> Vec<f32> {
+        (0..in_dim)
+            .map(|i| ((i as f32) * 0.37 + seed).sin() * 3.0)
+            .collect()
+    }
+
+    #[test]
+    fn kquant_projection_dispatch_matches_top_level_matvec_bitwise() {
+        // 5 output rows x 512 inputs = 2 superblocks per row. Oracle #1 is the
+        // top-level `matvec` (the route that was always correct for K-quants);
+        // oracle #2 is the raw wire row dot on the same bytes.
+        let (in_dim, out_dim) = (512usize, 5usize);
+        let blocks_per_row = in_dim / 256;
+        for (tt, bb, f16_offs) in [
+            (
+                GgufTensorType::Q4K,
+                Q4_K_WIRE_BYTES_PER_BLOCK,
+                vec![0usize, 2],
+            ),
+            (GgufTensorType::Q6K, Q6_K_WIRE_BYTES_PER_BLOCK, vec![208]),
+        ] {
+            let wire = synth_kquant_wire(blocks_per_row * out_dim, bb, &f16_offs);
+            let (_f, store, mmap) = fixture(
+                &wire,
+                vec![desc(
+                    "blk.0.attn_q.weight",
+                    tt,
+                    &[in_dim as u64, out_dim as u64],
+                    wire.len() as u64,
+                )],
+            );
+            let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight").expect("K-quant admits");
+
+            let x = activation(in_dim, 0.0);
+            let oracle = wq.matvec(in_dim, out_dim, &x);
+            let sa = SharedActivation::new(&x);
+            let got = wq.matvec_proj(out_dim, &sa);
+
+            let xq = quantize_q8_k_blocks(&x);
+            let row_bytes = blocks_per_row * bb;
+            for o in 0..out_dim {
+                assert_eq!(
+                    got[o].to_bits(),
+                    oracle[o].to_bits(),
+                    "{tt:?} matvec_proj row {o} != top-level matvec"
+                );
+                let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+                let dot = match tt {
+                    GgufTensorType::Q4K => q4_k_wire_row_dot(w_row, &xq),
+                    _ => q6_k_wire_row_dot(w_row, &xq),
+                };
+                assert_eq!(
+                    got[o].to_bits(),
+                    dot.to_bits(),
+                    "{tt:?} matvec_proj row {o} != wire row dot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kquant_batched_and_row_band_projections_match_single_dispatch() {
+        // matmul_proj (the spec-verify chunk path) must equal matvec_proj per
+        // activation, and matvec_rows_proj (the MoE expert-band path) must
+        // land on the corresponding rows of the full matvec — all bitwise.
+        let (in_dim, out_dim) = (256usize, 6usize);
+        for (tt, bb, f16_offs) in [
+            (
+                GgufTensorType::Q4K,
+                Q4_K_WIRE_BYTES_PER_BLOCK,
+                vec![0usize, 2],
+            ),
+            (GgufTensorType::Q6K, Q6_K_WIRE_BYTES_PER_BLOCK, vec![208]),
+        ] {
+            let wire = synth_kquant_wire(out_dim, bb, &f16_offs);
+            let (_f, store, mmap) = fixture(
+                &wire,
+                vec![desc(
+                    "blk.0.ffn_up.weight",
+                    tt,
+                    &[in_dim as u64, out_dim as u64],
+                    wire.len() as u64,
+                )],
+            );
+            let wq = WireQuant::new(&store, &mmap, "blk.0.ffn_up.weight").expect("K-quant admits");
+
+            let xs: Vec<Vec<f32>> = (0..3).map(|k| activation(in_dim, k as f32 * 0.7)).collect();
+            let xb = SharedActivationBatch::new(&xs);
+            let batched = wq.matmul_proj(out_dim, &xb);
+            for (k, x) in xs.iter().enumerate() {
+                let sa = SharedActivation::new(x);
+                let single = wq.matvec_proj(out_dim, &sa);
+                for o in 0..out_dim {
+                    assert_eq!(
+                        batched[k][o].to_bits(),
+                        single[o].to_bits(),
+                        "{tt:?} matmul_proj[{k}][{o}] != matvec_proj"
+                    );
+                }
+            }
+
+            let sa = SharedActivation::new(&xs[0]);
+            let full = wq.matvec_proj(out_dim, &sa);
+            let band = wq.matvec_rows_proj(2, 3, &sa);
+            for (i, o) in (2..5).enumerate() {
+                assert_eq!(
+                    band[i].to_bits(),
+                    full[o].to_bits(),
+                    "{tt:?} matvec_rows_proj row band offset {o}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_family_dispatch_is_byte_identical_to_the_direct_q8_0_path() {
+        // NO behavior change for the matvec_q family (NVFP4/Q8_0 shown here;
+        // they share the dispatch arm with Q4_0/Q4_1): the routed calls must
+        // equal the pre-fix direct calls on the eagerly-quantized activation.
+        // Q8_0: 2 blocks/row of 34 bytes (f16 scale at +0), 4 rows x 64 inputs.
+        let (in_dim, out_dim) = (64usize, 4usize);
+        let q8_wire =
+            synth_kquant_wire((in_dim / 32) * out_dim, Q8_WIRE_BYTES_PER_BLOCK, &[0usize]);
+        // NVFP4: the pilot format — 128 inputs = 2 superblocks/row, 4 rows.
+        let nv_wire = synth_wire(8);
+        let cases: [(GgufTensorType, usize, &[u8]); 2] = [
+            (GgufTensorType::Q8_0, in_dim, &q8_wire),
+            (GgufTensorType::NVFP4, 128, &nv_wire),
+        ];
+        for (tt, in_dim, wire) in cases {
+            let (_f, store, mmap) = fixture(
+                wire,
+                vec![desc(
+                    "blk.0.attn_q.weight",
+                    tt,
+                    &[in_dim as u64, out_dim as u64],
+                    wire.len() as u64,
+                )],
+            );
+            let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight").expect("admits");
+
+            let xs: Vec<Vec<f32>> = (0..3).map(|k| activation(in_dim, k as f32 * 0.7)).collect();
+            let xqs: Vec<Vec<Q8_0Block>> = xs.iter().map(|x| quantize_q8_0_blocks(x)).collect();
+
+            let sa = SharedActivation::new(&xs[0]);
+            let via_dispatch = wq.matvec_proj(out_dim, &sa);
+            let direct = wq.matvec_q(out_dim, &xqs[0]);
+            for o in 0..out_dim {
+                assert_eq!(
+                    via_dispatch[o].to_bits(),
+                    direct[o].to_bits(),
+                    "{tt:?} matvec_proj row {o} != direct matvec_q"
+                );
+            }
+            let band_dispatch = wq.matvec_rows_proj(1, 2, &sa);
+            let band_direct = wq.matvec_q_rows(1, 2, &xqs[0]);
+            for i in 0..2 {
+                assert_eq!(
+                    band_dispatch[i].to_bits(),
+                    band_direct[i].to_bits(),
+                    "{tt:?} matvec_rows_proj row {i} != direct matvec_q_rows"
+                );
+            }
+            let xb = SharedActivationBatch::new(&xs);
+            let batch_dispatch = wq.matmul_proj(out_dim, &xb);
+            let batch_direct = wq.matmul_q(out_dim, &xqs);
+            for k in 0..xs.len() {
+                for o in 0..out_dim {
+                    assert_eq!(
+                        batch_dispatch[k][o].to_bits(),
+                        batch_direct[k][o].to_bits(),
+                        "{tt:?} matmul_proj[{k}][{o}] != direct matmul_q"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q5k_matvec_roles_refuse_typed_at_load() {
+        // Q5_K stays admitted for gather (per_layer_token_embd) but must
+        // refuse TYPED in any matvec role — pre-fix it loaded fine and
+        // panicked `unreachable!` in the forward pass.
+        let wire = synth_kquant_wire(2, Q5_K_WIRE_BYTES_PER_BLOCK, &[0, 2]);
+        let (_f, store, mmap) = fixture(
+            &wire,
+            vec![desc(
+                "blk.0.attn_q.weight",
+                GgufTensorType::Q5K,
+                &[256, 2],
+                wire.len() as u64,
+            )],
+        );
+        let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight")
+            .expect("Q5_K admits for gather roles");
+        assert_eq!(wq.format, WireFormat::Q5K);
+        wq.dequantize_elements(0, 4)
+            .expect("Q5_K gather stays served");
+        match wq.require_matvec_capable("blk.0.attn_q.weight") {
+            Err(BackendError::UnsupportedTensorType(msg)) => {
+                assert!(msg.contains("Q5_K"), "{msg}");
+                assert!(msg.contains("gather-only"), "{msg}");
+            }
+            Err(other) => panic!("expected UnsupportedTensorType, got {other:?}"),
+            Ok(_) => panic!("Q5_K must refuse matvec roles at load"),
+        }
+    }
+
+    #[test]
+    fn q4_1_gather_refuses_typed_instead_of_panicking() {
+        // The sibling reachable-panic arm swept with the SHA_E3 fix: a Q4_1
+        // embedding gather is not wired, so it must be a typed refusal.
+        let wire = synth_kquant_wire(2, 20, &[0, 2]);
+        let (_f, store, mmap) = fixture(
+            &wire,
+            vec![desc(
+                "blk.0.ffn_down.weight",
+                GgufTensorType::Q4_1,
+                &[32, 2],
+                wire.len() as u64,
+            )],
+        );
+        let wq = WireQuant::new(&store, &mmap, "blk.0.ffn_down.weight").expect("Q4_1 admits");
+        match wq.dequantize_elements(0, 4) {
+            Err(BackendError::UnsupportedTensorType(msg)) => {
+                assert!(msg.contains("Q4_1"), "{msg}");
+            }
+            Err(other) => panic!("expected UnsupportedTensorType, got {other:?}"),
+            Ok(_) => panic!("Q4_1 gather must be a typed refusal"),
+        }
+    }
+}
+
+/// BASALT Amendment 3: the GPU-lane typed refusals and the §9 platform gate.
+/// All helpers are cfg-independent, so these run on every host — no CUDA/Metal
+/// hardware and no model loads (descriptor lists and raw [`WireFormat`]s only).
+#[cfg(test)]
+mod gpu_lane_refusal_tests {
+    use super::*;
+    use crate::gguf::GgufTensorDescriptor;
+
+    fn desc(name: &str, tensor_type: GgufTensorType) -> GgufTensorDescriptor {
+        GgufTensorDescriptor {
+            name: name.into(),
+            dimensions: vec![64, 1],
+            tensor_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 36,
+        }
+    }
+
+    #[test]
+    fn cuda_lane_check_refuses_nvfp4_before_the_from_wire_panic() {
+        // Review fix #1: the exact formats GemmaLayerQuant::from_wire would
+        // panic on must instead surface as a typed BackendError.
+        let formats = vec![WireFormat::Q8_0, WireFormat::Nvfp4, WireFormat::Q4_0];
+        match nvfp4_cuda_lane_check(formats) {
+            Err(BackendError::UnsupportedGguf(msg)) => {
+                assert!(
+                    msg.contains("NVFP4 CUDA-resident lane is Phase 4 (BASALT)"),
+                    "msg: {msg}"
+                );
+                assert!(
+                    msg.contains("the CPU lane serves NVFP4 in this release"),
+                    "msg: {msg}"
+                );
+            }
+            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+            Ok(()) => panic!("NVFP4 projection must refuse in the CUDA lane"),
+        }
+    }
+
+    #[test]
+    fn cuda_lane_check_admits_the_supported_projection_formats() {
+        // Every format from_wire actually supports must keep loading.
+        nvfp4_cuda_lane_check([WireFormat::Q8_0, WireFormat::Q4_0, WireFormat::Q4_1])
+            .expect("Q8_0/Q4_0/Q4_1 projections stay admitted");
+        nvfp4_cuda_lane_check(std::iter::empty()).expect("no projections is vacuously fine");
+    }
+
+    #[test]
+    fn cuda_lane_check_refuses_every_lane_uncovered_format_typed() {
+        // SHA_E review finding #1: the campaign's own K-quant rows (Q4K-mm,
+        // Q4_K_M-df/-im) load clean on the CPU wire lane but would hit the
+        // from_wire repack panic on the CUDA lane. Every format outside the
+        // lane's covered set must refuse TYPED and NAMED — never a panic
+        // (invariant I-unknown-type, L3 cell).
+        for uncovered in [WireFormat::Q4K, WireFormat::Q5K, WireFormat::Q6K] {
+            match nvfp4_cuda_lane_check([WireFormat::Q8_0, uncovered]) {
+                Err(BackendError::UnsupportedGguf(msg)) => {
+                    assert!(
+                        msg.contains(&format!("{uncovered:?}")),
+                        "refusal must name the format: {msg}"
+                    );
+                    assert!(
+                        msg.contains("covers Q8_0/Q4_0/Q4_1"),
+                        "refusal must name the covered set: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+                Ok(()) => panic!("{uncovered:?} projection must refuse in the CUDA lane"),
+            }
+        }
+    }
+
+    #[test]
+    fn metal_lane_check_refuses_any_nvfp4_tensor() {
+        // Review fix #2: ANY NVFP4 tensor refuses (the lane format-gates only
+        // layer-0 attn_q, so a deeper NVFP4 tensor would otherwise mis-bind).
+        let tensors = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0),
+            desc("blk.7.ffn_down.weight", GgufTensorType::NVFP4),
+        ];
+        match nvfp4_metal_lane_check(&tensors) {
+            Err(BackendError::UnsupportedGguf(msg)) => {
+                assert!(
+                    msg.contains("NVFP4 is not wired to the Metal lane (BASALT L4: na)"),
+                    "msg: {msg}"
+                );
+                assert!(msg.contains("blk.7.ffn_down.weight"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+            Ok(()) => panic!("NVFP4 tensor must refuse in the Metal lane"),
+        }
+    }
+
+    #[test]
+    fn metal_lane_check_admits_files_without_nvfp4() {
+        let tensors = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0),
+            desc("token_embd.weight", GgufTensorType::Q6K),
+        ];
+        nvfp4_metal_lane_check(&tensors).expect("non-NVFP4 files keep loading");
+    }
+
+    #[test]
+    fn windows_only_check_ignores_files_without_nvfp4() {
+        // Platform-independent: the §9 gate only ever looks at NVFP4-bearing
+        // files, so every other row is untouched on every OS.
+        let tensors = vec![desc("blk.0.attn_q.weight", GgufTensorType::Q8_0)];
+        nvfp4_windows_only_check(&tensors).expect("non-NVFP4 files admit everywhere");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_only_check_admits_nvfp4_on_windows() {
+        // §9 twin (runs on the Windows leg): admission still works where the
+        // release actually supports NVFP4.
+        let tensors = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
+        nvfp4_windows_only_check(&tensors).expect("NVFP4 admits on Windows");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn windows_only_check_refuses_nvfp4_off_windows() {
+        // §9 twin (runs on the ubuntu/macos legs): the named TK2 refusal.
+        let tensors = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
+        match nvfp4_windows_only_check(&tensors) {
+            Err(BackendError::UnsupportedGguf(msg)) => {
+                assert_eq!(
+                    msg,
+                    "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
+                );
+            }
+            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+            Ok(()) => panic!("NVFP4 must refuse off Windows (Amendment 3 §9)"),
+        }
+    }
+}
+
+/// BASALT Amendment 3 review fix #4: the forced-decode step-boundary proof.
+/// A scripted fake step fn stands in for the model: `predicted = 1000 + fed`,
+/// prompt-end prediction 999 — so every observation uniquely identifies WHICH
+/// token had been fed before it, and any off-by-one is unmissable.
+#[cfg(test)]
+mod forced_step_boundary_tests {
+    use super::drive_forced_steps;
+
+    #[test]
+    fn observes_before_feeding_and_never_feeds_the_final_token() {
+        let forced = [10u32, 20, 30];
+        // One interleaved event log proves strict ordering, not just counts.
+        // (RefCell: both closures append to the same log.)
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+        let mut fed: Vec<u32> = Vec::new();
+        drive_forced_steps::<u32, std::convert::Infallible>(
+            &forced,
+            999,
+            |tok| {
+                fed.push(tok);
+                events.borrow_mut().push(format!("fed={tok}"));
+                Ok(1000 + tok)
+            },
+            |i, &pred| events.borrow_mut().push(format!("obs{i}={pred}")),
+        )
+        .unwrap();
+        let events = events.into_inner();
+
+        // Step i's recorded prediction is the state from BEFORE forced[i] was
+        // fed: obs0 sees the prompt-end prediction (999), obs1 sees 1000+forced[0],
+        // obs2 sees 1000+forced[1]. If the loop fed first and observed second,
+        // obs_i would read 1000+forced[i] instead.
+        assert_eq!(
+            events,
+            vec!["obs0=999", "fed=10", "obs1=1010", "fed=20", "obs2=1020"]
+        );
+        // count == forced.len(): exactly 3 observations fired (asserted above by
+        // the full event log), and the FINAL forced token (30) was never fed.
+        assert_eq!(fed, vec![10, 20]);
+    }
+
+    #[test]
+    fn single_forced_token_observes_once_and_feeds_nothing() {
+        let mut observed = Vec::new();
+        drive_forced_steps::<u32, std::convert::Infallible>(
+            &[42],
+            7,
+            |_| panic!("a single forced token must never be fed"),
+            |i, &pred| observed.push((i, pred)),
+        )
+        .unwrap();
+        assert_eq!(observed, vec![(0, 7)]);
+    }
+
+    #[test]
+    fn empty_forced_list_neither_observes_nor_feeds() {
+        // The CLI refuses empty lists upstream; the construct itself is total.
+        drive_forced_steps::<u32, std::convert::Infallible>(
+            &[],
+            0,
+            |_| panic!("nothing to feed"),
+            |_, _| panic!("nothing to observe"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn step_errors_propagate_after_the_boundary_observation() {
+        let mut observed = 0usize;
+        let err = drive_forced_steps::<u32, &'static str>(
+            &[1, 2],
+            0,
+            |_| Err("step failed"),
+            |_, _| observed += 1,
+        )
+        .unwrap_err();
+        assert_eq!(err, "step failed");
+        // The step-0 observation (pre-feed) had already fired.
+        assert_eq!(observed, 1);
     }
 }

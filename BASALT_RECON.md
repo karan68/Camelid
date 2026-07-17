@@ -383,3 +383,125 @@ in the scout lane transcript, distilled here:
 
 Gate G0 checklist (conductor §5): all five Phase 0 artifacts exist ✔; D-B1–D-B5 drafted with
 recommendations ✔ (§9); pin verified NVFP4-capable ✔ (§1, §5). **STOP — human review.**
+
+## 13. Invariant-lane matrix (Amendment 3 §2)
+
+Added at stage S2 (the SHA_E engine-freeze commit). **Canonical form:**
+`qa/invariant_lanes.json`, schema `qa/invariant_lanes.schema.json`
+(`camelid.invariant-lanes/v1`, ledger-convention versioned tag + provenance
+block). This section is the human-readable twin — if the two ever disagree, the
+JSON wins and the disagreement is a bug. Enforcement (§2.4 mechanism, recorded
+in DECISIONS.md D17 micro-decisions): `tests/invariant_matrix_binding.rs`
+`include_str!`-binds every file an enforced cell names (rename/move breaks the
+build), asserts every named test fn appears in its bound file's text (a fn
+rename fails the meta-test, not the build — the §2.4-permitted substitution),
+validates the JSON against the schema with a hand validator (serde_json, no new
+deps), and trips the committed fixtures.
+
+Cell legend: **E** = enforced (test fn named in the JSON cell), **na** =
+structural reason (file-anchored, meta-test-guarded), **open:P4** = nothing
+lands until Phase 4 (CUDA-resident NVFP4).
+
+| lane \ invariant | I-unknown-type | I-nan-scale | I-sidecar | I-scale-once | I-k-div | I-carveout | I-cache-quant | I-plat |
+|---|---|---|---|---|---|---|---|---|
+| **L1 runnable** (admit/dequant/smoke) | E `rejects_unknown_quant_naming_tensor` + parse-trip fixture | E `nvfp4_nan_sentinel_refused_at_decode` (+ S1 fixture via scan-seam trip) | E `rejects_nvfp4_sidecar_scale_tensor` + NEW end-to-end admission fixture | E via sidecar refusal (v1 posture, see below) | E `decode_nvfp4_tensor_refuses_non_multiple_of_64_elements` + NEW parse-trip fixture | E `rejects_nvfp4_outside_pilot_arch` (+2 boundary companions + smoke gate) | na (no warm state on this lane — below) | E §9 cfg twins + NEW pilot-admit fixture twin |
+| **L2 gemma4 wire** (the NVFP4-executing lane) | E `wire_quant_new_admits_nvfp4_and_still_refuses_uncovered` | E `wire_quant_new_refuses_nan_sentinel_scale_bytes` (fixture seam-tripped, S1 precedent) | E `sidecar_fixture_trips_d_b2_end_to_end` (END-TO-END on committed fixture) | E via sidecar refusal + bitwise matvec/decode anchors | E parse-boundary trip (in-lane re-check is defense-in-depth, see below) | na (no architecture axis to carve — below) | na (structurally cannot survive a swap — below) | E `windows_only_check_refuses_nvfp4_off_windows` (+ NaN-fixture load leg off-Windows) |
+| **L3 CUDA resident** (NVFP4 residency = P4) | E `cuda_lane_check_refuses_nvfp4_before_the_from_wire_panic` (typed, pre-panic) | open:P4 | open:P4 | open:P4 (kernel-epilogue vs host row scale is the P4 D-B2 seam) | open:P4 | E `cuda_lane_check_admits_the_supported_projection_formats` | open:P4 | open:P4 |
+| **L4 Metal** (§9.3 na, upgraded where S1 shipped refusals) | E `metal_lane_check_refuses_any_nvfp4_tensor` (UPGRADE over prescribed na) | na (NVFP4 never binds; refused at load) | E `sidecar_check_refuses_nvfp4_with_scale_tensors` (UPGRADE — D-B2 now runs in the Metal load path) | na | na | E `metal_lane_check_admits_files_without_nvfp4` | na | E (the lane refusal IS the platform posture; shared with I-unknown-type deliberately) |
+| **L5 native quantizer** | na | na | na | na | na | na | na | na — all eight: Phase 2b never scheduled; D-B5 pin-tool-only |
+
+**Counts: 19 enforced / 15 na / 6 open (all open:P4). 40/40 cells filled — no
+empty cells, meta-test-asserted.**
+
+### 13.1 Fixtures (§2.6)
+
+S1 pair unchanged (byte-identical through the generator refactor; shas
+re-verified): `nvfp4_sidecar_trip.gguf`, `nvfp4_nan_sentinel_trip.gguf`. S2
+quartet added by `scripts/basalt-nvfp4-golden/gen_sidecar_fixture.mjs`
+(deterministic, <4 KB, shas pinned in `tests/invariant_matrix_binding.rs` and
+`tests/fixtures/gguf/SHA256SUMS`):
+
+- `nvfp4_unknown_type_trip.gguf` — GGML type id 41 → parse refusal ("unknown or
+  removed GGML type"), the file boundary shared by every lane.
+- `nvfp4_k_div_trip.gguf` — NVFP4 first dim 48 → parse refusal ("not divisible
+  by block size 64"), never a silent pad.
+- `nvfp4_sidecar_admit_trip.gguf` — sidecar trio + `tokenizer.ggml.model`, so
+  runnable admission reaches the quant axis: D-B2 trips end-to-end from file
+  bytes on every platform (sidecar check precedes the §9 gate).
+- `nvfp4_pilot_admit.gguf` — BF16-free pilot shape: ADMITS on Windows (first
+  file-boundary positive control for the D-B3 carve-out) and trips the §9 TK2
+  refusal on the ubuntu/macos CI legs.
+
+Cells whose full-file trip is unreachable carry `fixture:"seam:<reason>"` (the
+S1 NaN precedent): L2 I-nan-scale (config parsing precedes the WireQuant scan —
+asserted, not assumed), L3/L4 refusal helpers (real-model + hardware/cfg-bound
+load paths; helpers are cfg-independent and unit-driven on every host), and the
+two I-scale-once cells (v1 posture: no out-of-block scale exists on the wire to
+apply twice — the sidecar refusal is the enforcement; in-block sub-scale
+single-application is bitwise-pinned by the golden decode/matvec suites).
+
+### 13.2 I-cache-quant verdict (investigated honestly, PR #419 lesson)
+
+**na everywhere NVFP4 can execute — structurally, with meta-test-guarded
+anchors; no cell was faked and no P3-FINDING was needed.** Facts (file-anchored
+in the JSON): the only cross-request decode cache in the serve stack is the
+Llama-path single-slot prompt-prefix cache (`src/api/mod.rs
+lookup/store/clear_prompt_prefix_cache`). NVFP4 cannot reach it: NVFP4 files
+are gemma4-only (D-B3), gemma4 chat resolves to a per-model-id
+`Gemma4ServeRuntime` (replaced wholesale on reload, cleared on unload) or fails
+typed (`model_not_ready`) — never a silent Llama-path fallback — and the cache
+payload is a `LlamaInferenceSession` with zero call sites in
+`gemma4_runtime.rs` (asserted literally by the meta-test). The cache key
+additionally carries `model_id` AND `model_path` (distinct quant rows are
+distinct files, G2 §1), and the slot is cleared on every active-model switch;
+key-miss on model change is pinned by
+`prompt_prefix_cache_reuses_exact_prompt_and_invalidates_key_changes`. The
+runnable lane serves only qwen35/gemma3 (`is_runnable_serve_arch`) with a
+`&self`-immutable runtime — no warm state exists. L3's cell stays open:P4: the
+future NVFP4-resident path must prove its own keying/reset story rather than
+inherit this note.
+
+Out-of-matrix observation (Llama lane, not an NVFP4 surface, reported for
+completeness): `AppState::cached_weights` is keyed by model id alone (path not
+in the key, `src/api/mod.rs load_weights_lru`); entries are removed on unload,
+so staleness would require re-registering the same id against different bytes
+without an unload. Flagged to Tim as an observation, not a matrix cell.
+
+### 13.3 Source reconciliations (extracted, not invented)
+
+- **Zero scales:** conductor §3.2/§8 say "NaN **or zero** scale byte → load
+  error"; the signed T5 posture (D17) is narrower — sentinel bytes 0x7F/0xFF
+  refuse, **zero scales admit** (and the G1 addendum strengthened the sentinel
+  story: the pin's own backends disagree on 0xFF). The matrix records the
+  signed T5/D17 semantics; the conductor text predates the sign-off and was
+  deliberately left unedited (campaign docs are append-only history).
+- **K%16 vs K%64:** conductor §8 states K%16 (the sub-block) as quantizer
+  keep-list guidance; the consume-side wire unit is the 64-element superblock,
+  and every consume-side check enforces %64 (parse `tensor_nbytes`, decoder,
+  WireQuant). The column is defined at %64 per the amendment; noted here so
+  nobody reads §8 as a consume-side 16.
+- **Defense-in-depth honesty (I-k-div L2):** `WireQuant::new`'s block-alignment
+  and byte-size re-checks are unreachable for NVFP4 through GGUF parse (parse
+  guarantees first-dim divisibility) — the cell therefore cites the parse-trip
+  as its enforcement and names the in-lane re-check as backstop, instead of
+  pretending a lane-native trip exists.
+- **L4 upgrades:** §9.3 prescribed na for Metal; S1 shipped typed refusals
+  (`nvfp4_metal_lane_check`, plus routing `nvfp4_sidecar_check` through the
+  Metal load path, which previously never ran it). Stronger-than-prescribed is
+  recorded as **enforced with the upgrade noted** — honest in both directions.
+- **Shared test across two cells (L4):** `metal_lane_check_refuses_any_nvfp4_tensor`
+  backs both I-unknown-type and I-plat on L4 — the single refusal genuinely
+  enforces both postures there; recorded in both cells deliberately rather than
+  manufacturing a second test.
+
+### 13.4 Ratchet (§2.5 — rules live as data in the JSON `ratchet` block)
+
+- **R1** — lane-adding PRs add a ROW and fill all 8 cells in the same PR (the
+  meta-test's full-population assertion makes a missing cell a failure).
+- **R2** — invariant-signing PRs (new D17 addendum / new refusal-bearing sharp
+  edge) add a COLUMN with its source cited, filled for all lanes.
+- **R3** — Gate G4 closes every open:P4 cell (enforced with lane-native tests,
+  or na with structural reasons). Teeth: the meta-test fails the moment the
+  Phase-4 CUDA-lane refusal text disappears while any open:P4 cell remains.
+- **R4** — scheduling Phase 2b re-opens the L5 row, same mechanics (proxy: the
+  encoder's TEST-ANCHORING-ONLY marker).
