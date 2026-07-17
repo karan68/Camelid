@@ -839,6 +839,27 @@ implementation + the unit bit-parity gate ONLY — the end-to-end CPU-vs-CUDA se
 and the Gate-G4 perf table (medians, achieved GB/s) are a separate later step (no model loaded,
 no benchmark here).
 
+**D17 addendum 6 (2026-07-17, Phase 4 — Gate G4 CERT + perf table, measured this box:
+RTX 3060 Laptop sm_86, driver 576.83, CUDA 12.9).** End-to-end self-parity CERT (NVFP4-mm
+greedy, Camelid CPU wire lane vs CUDA-resident lane, gemma4 lane-native 9-prompt pack) =
+**6/9 token-identical**; the 3 divergences are all near-tie argmax flips in which the CUDA
+token is exactly the CPU's #2 candidate at a 0.047–0.111 raw-logit gap — attributed to the
+accepted CUDA-f16-KV vs CPU-f32-KV difference (the same greedy-token contract the Q8_0 row
+ships under), NOT a wiring/kernel bug. **CERT PASS.** G4 perf (median of 5 warm runs, 128
+greedy tokens, decode tok/s): Q8_0 CUDA **25.80 tok/s** (39.8% of the 336 GB/s DRAM roofline,
+peak 5559 MiB), NVFP4-mm CUDA **14.64 tok/s** (13.3% of roofline, peak 3479 MiB), NVFP4-mm
+CPU 1.57 tok/s. Per-token weight read shrinks a **measured 1.70×** (matmul-only exactly
+1.889×; format-isolated 1.647×, matching the recon's pre-registered ~1.6×). **Surprise/headline:
+the byte reduction did NOT translate to speed — NVFP4-mm CUDA decodes at 0.57× the Q8_0 lane
+because the v1 scalar-LUT dequant kernel is COMPUTE-bound (13.3% vs 39.8% of roofline), leaving
+its bandwidth advantage on the table.** This is exactly the receipt recon §5 Q1 pre-registered:
+the parity-neutral `__byte_perm`+`__dp4a` inner-loop upgrade (and the gpu_head lever, §5 Q4) are
+now WARRANTED as the Phase-4-follow-up perf bite. NVFP4's realized win on this box today is VRAM
+headroom (2.08 GB more free), not decode speed. Pin-GPU cross-engine row skipped (memory-safety:
+a 6.06 GB model full-offload on a 6144 MiB card is not comfortable headroom). Receipts:
+`qa/evidence-bundles/basalt/phase4/cert/` (parity_cert.json, perf_table.json, byte_accounting.json,
+G4_PERF.md, sanitized command/resource logs).
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
