@@ -10,7 +10,7 @@ Branch: `basalt/phase2-load-interop` (off main 939710de = post-G1). Bundle:
 |---|---|---|---|---|---|
 | NVFP4-mm | gemma-4-E4B-it-NVFP4-mm.gguf | `eb293344972e2b292a043b8e7649b9788dca915b034e5c2721cfc531cf9863d9` | 6,058,607,776 | YES (sha-identical ×2) | 294 overrides ✔, embd q8_0 mmap-copy ✔ |
 | Q4K-mm | gemma-4-E4B-it-Q4K-mm.gguf | `d306fa7753ec80eda4ab389f1b3a06273cc2291ebe977993a767587c055b2031` | 6,058,607,776 | YES | 294 q4_K, byte-count identical to NVFP4-mm (both 4.5 bpw) |
-| Q4_K_M-df | gemma-4-E4B-it-Q4_K_M-df.gguf | `4f7f288ad56b9c64ddab0bdb25af1b14757f9470181252885f496ebbf18b25b5` | 6,180,443,296 | YES | mixture: 336 q4_K / 42 q6_K (ffn_down) / 2 q8_0 embd (pinned) |
+| Q4_K_M-df | gemma-4-E4B-it-Q4_K_M-df.gguf | `4f7f288ad56b9c64ddab0bdb25af1b14757f9470181252885f496ebbf18b25b5` | 6,180,443,296 | YES | mixture: 336 q4_K / 42 q6_K (21 attn_v + 21 ffn_down, the alternating promotion) / 2 q8_0 embd (pinned) |
 | Q4_K_M-im | gemma-4-E4B-it-Q4_K_M-im.gguf | `3f5a71ecf3bbd5ca7c7d6ee318208fe0ffd743935a2e3ad71b933afe809fde53` | 6,180,443,296 | YES | same types as -df, values differ (imatrix, 342 entries loaded clean) |
 | NVFP4-all | — | — | — | **BLOCKED-HOST** (Amendment 2; ~22.5 GB staging receipt) | — |
 
@@ -47,8 +47,13 @@ byte-range hashes IDENTICAL between baseline and NVFP4-mm; 3 sampled norms ident
 Pin side: 5,120 blocks from 10 tensors (all 7 matmul families, depths blk.0–blk.41),
 dequanted via the pin DLL (route linked-libs, same MSVC provenance as the Phase 1
 fixtures), run twice byte-identical, and every block reconstructs bit-exactly from the
-committed decode-table fixture. Fixture: `e4b_spotcheck_blocks.json`
-(nvfp4_real_blocks.json schema). Camelid side: DONE — tests/nvfp4_e4b_spotcheck.rs consumes the same fixture: all 5,120 blocks bit-exact through BOTH paths (nvfp4_wire_block_dequant per block; decode_nvfp4_tensor over concatenated groups), family-coverage asserted, fixture pinned to the receipted pilot sha. Full suite 1205/0.
+committed decode-table fixture. Fixture (committed as
+`tests/fixtures/dequant/nvfp4_e4b_spotcheck.json`, `nvfp4_real_blocks.json` schema).
+Camelid side: DONE — `tests/nvfp4_e4b_spotcheck.rs` consumes that fixture: all 5,120
+blocks bit-exact through BOTH paths (nvfp4_wire_block_dequant per block;
+decode_nvfp4_tensor over concatenated groups), family-coverage asserted, fixture pinned
+to the receipted pilot sha. Full suite 1205/0 at assembly (+2 tests in the review-fix
+commit: the real-pilot BF16 admission shape and the always-on reader id/layout pin).
 
 ## 6. Engine wiring (refusal-point move + admission scoping) — commit 63eeba5f
 
@@ -111,3 +116,12 @@ recorded verbatim, unknown provenance, no support claims either way.
   imatrix use from those keys; the authoritative statement is the command lines in the
   quantize logs (this bundle).
 - NVFP4-mm and Q4K-mm are byte-count identical — never distinguish rows by size.
+- Review-fix disclosures (post-assembly adversarial review, 8 confirmed findings applied):
+  the engine commit had appended an NVFP4 parenthetical to the GENERIC uncovered-quant
+  refusal message for all architectures — reverted, the generic message is again
+  byte-identical to pre-BASALT main (the D-B3 scope text lives only in the
+  NVFP4-specific rejection); the real-pilot admission shape (NVFP4 + BF16 → refuses on
+  BF16) is now pinned by an in-tree unit test, matching the receipts here; the
+  `log_sha256` block inside `quantize-quantize_legs_summary.json` hashes the
+  pre-sanitization scratchpad originals — the authoritative hashes for the committed
+  (renamed, path-sanitized) logs are this bundle's `SHA256SUMS`.

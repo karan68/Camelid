@@ -28,7 +28,11 @@
 //! `COVERED_ARCHITECTURES`, the architecture axis carries the mirror-image
 //! carve-out: a gemma4 GGUF passes that axis iff it carries NVFP4 tensors (the
 //! pilot shape); gemma4 files without NVFP4 keep today's architecture refusal.
-//! Admitting the pilot here is a metadata-level classification for the BASALT
+//! NOTE: the REAL produced pilot row additionally carries one BF16 tensor
+//! (`per_layer_model_proj.weight`), which the quant axis still refuses — so the
+//! real artifact passes the architecture carve-out but rejects on BF16 (receipted
+//! at G2). Full-file admission of an NVFP4 gemma4 GGUF requires a BF16-free file.
+//! Admitting that shape here is a metadata-level classification for the BASALT
 //! interop legs (inspect / dequant spot-checks); it is NOT a claim the generic
 //! runnable runtime executes the gemma4 graph — smoke stays refused via the
 //! oracle-qualification guardrail (`smoke::is_oracle_qualified`, anchored at G3),
@@ -252,8 +256,7 @@ fn check_quants(
                 tensor: Some(tensor.name.clone()),
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
-                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS \
-                     (NVFP4: gemma4 pilot only until Gate G3)",
+                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS",
                     tensor.tensor_type, tensor.name
                 ),
             });
@@ -412,8 +415,10 @@ mod tests {
 
     // --- BASALT D-B3 pilot scoping + D-B2 sidecar fail-closed ---
 
-    /// The pilot shape: a gemma4 GGUF whose matmuls are NVFP4 (embeddings kept Q8_0,
-    /// norms F32, exactly like the produced `gemma-4-E4B-it-NVFP4-mm` row).
+    /// A BF16-free pilot-like shape: gemma4 with NVFP4 matmuls (embeddings Q8_0,
+    /// norms F32). NOTE: the real produced `gemma-4-E4B-it-NVFP4-mm` row ALSO
+    /// carries one BF16 tensor and therefore refuses on the quant axis — that real
+    /// shape is pinned by `gemma4_nvfp4_with_bf16_refuses_on_bf16` below.
     fn gemma4_nvfp4_fixture() -> GgufFile {
         let mut file = base_fixture();
         set_meta(&mut file, "general.architecture", "gemma4");
@@ -429,6 +434,31 @@ mod tests {
         assert_eq!(ok.architecture, "gemma4");
         assert_eq!(ok.tokenizer, TokenizerFamily::Spm);
         assert!(ok.quants.contains(&GgufTensorType::NVFP4));
+    }
+
+    #[test]
+    fn gemma4_nvfp4_with_bf16_refuses_on_bf16() {
+        // The REAL produced pilot row's shape (G2 receipt): NVFP4 matmuls PLUS one
+        // BF16 tensor (per_layer_model_proj.weight). The architecture carve-out
+        // passes, but the quant axis still refuses on BF16 — pinned here in-tree
+        // so the receipted behavior can't drift silently.
+        let mut file = gemma4_nvfp4_fixture();
+        file.tensors
+            .push(tensor("per_layer_model_proj.weight", GgufTensorType::BF16));
+        let reject = admit(&file).expect_err("real pilot shape must refuse on BF16");
+        assert_eq!(reject.axis, AdmissionAxis::Quant);
+        assert_eq!(reject.offending_value, "BF16");
+        assert_eq!(
+            reject.tensor.as_deref(),
+            Some("per_layer_model_proj.weight")
+        );
+        // The generic covered-set message must be byte-identical to pre-BASALT
+        // main (no NVFP4 parenthetical leaking into non-NVFP4 refusals).
+        assert!(
+            reject.message.ends_with("IQ4_XS"),
+            "generic refusal message must be unchanged: {}",
+            reject.message
+        );
     }
 
     #[test]

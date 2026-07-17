@@ -670,3 +670,22 @@ impl Cursor {
             .map_err(|_| BackendError::InvalidGguf("invalid UTF-8 string".to_string()))
     }
 }
+
+#[cfg(test)]
+mod nvfp4_wire_facts {
+    use super::GgufTensorType;
+
+    /// Always-on pin of the BASALT engine facts: NVFP4 is ggml type id 40 with a
+    /// 64-element / 36-byte superblock. Every other NVFP4 parse-layer test in the
+    /// suite either skips when model artifacts are absent or bypasses `from_id`/
+    /// `layout` entirely — this one cannot skip, so an id or layout regression
+    /// fails on any box (fixture arbiter: tests/fixtures/dequant/nvfp4_*.json).
+    #[test]
+    fn nvfp4_id_and_layout_are_pinned() {
+        assert_eq!(GgufTensorType::from_id(40), GgufTensorType::NVFP4);
+        assert_eq!(GgufTensorType::NVFP4.layout(), Some((64, 36)));
+        assert_eq!(format!("{:?}", GgufTensorType::NVFP4), "NVFP4");
+        // Unknown ids still fall through to the fail-closed catch-all.
+        assert_eq!(GgufTensorType::from_id(41), GgufTensorType::Unknown(41));
+    }
+}
