@@ -819,6 +819,70 @@ delta ("behind Q4_K at matched 4.5 bpw on the pilot: 88.5 % vs 92.6 % top-1 agre
 quality-competitiveness. The G3 NO-GO stands as a recorded, receipted result; Option B is a
 forward-scope choice on a different axis, not a reversal of it.
 
+**D17 addendum 5 (2026-07-17, Phase 4 — NVFP4 CUDA decode kernel landed).** The NVFP4
+dequant-in-kernel CUDA-resident decode GEMV (`nvfp4_gemv`, `src/cuda_resident.rs`) shipped
+behind a unit-level bit-parity gate: warp-per-row, raw 36-byte wire, exact in-kernel UE4M3
+sub-scale decode (bit-for-bit `tensor::ue4m3_to_f32_const` — flush raw 0x00/0x7F, 0xFF->240.0
+pin-CPU-bitwise), scalar E2M1 LUT integer dot, and the ordered lane-0 sum reproducing
+`nvfp4_wire_row_dot`'s superblock-major/sub-block-minor order — so the kernel is 100%
+BIT-identical to the CPU oracle on the same bytes (`nvfp4_gemv_matches_oracle`, the same
+ordered-sum family as q8/q4_0/q4_1; the 1e-4 close() is a compiler backstop only). The
+gemma4 CUDA lane now covers Q8_0/Q4_0/Q4_1/NVFP4 (`nvfp4_cuda_lane_check` admit arm;
+`GemmaLayerQuant::Nvfp4` raw-wire passthrough); the K-quants stay CPU-only (still typed-refused
+on the CUDA lane). The scalar-LUT kernel is v1 per the orchestrator §5 Q1 decision; the pin's
+`__byte_perm`+`__dp4a` inner loop is recorded in a kernel comment as a measured
+PARITY-NEUTRAL follow-up (identical i32 sumi). The six L3 `open:P4` invariant cells closed in
+this commit (I-nan-scale/I-sidecar/I-scale-once/I-k-div/I-plat -> enforced with lane-native
+tests; I-cache-quant -> na structural per §5 Q3), satisfying ratchet R3; the pre-Phase-4
+CUDA-lane refusal text is gone and its pinning test inverted. Scope of THIS commit is
+implementation + the unit bit-parity gate ONLY — the end-to-end CPU-vs-CUDA self-parity CERT
+and the Gate-G4 perf table (medians, achieved GB/s) are a separate later step (no model loaded,
+no benchmark here).
+
+**D17 addendum 6 (2026-07-17, Phase 4 — Gate G4 CERT + perf table, measured this box:
+RTX 3060 Laptop sm_86, driver 576.83, CUDA 12.9).** End-to-end self-parity CERT (NVFP4-mm
+greedy, Camelid CPU wire lane vs CUDA-resident lane, gemma4 lane-native 9-prompt pack) =
+**6/9 token-identical**; the 3 divergences are all near-tie argmax flips in which the CUDA
+token is exactly the CPU's #2 candidate at a 0.047–0.111 raw-logit gap — attributed to the
+accepted CUDA-f16-KV vs CPU-f32-KV difference (the same greedy-token contract the Q8_0 row
+ships under), NOT a wiring/kernel bug. **CERT PASS.** G4 perf (median of 5 warm runs, 128
+greedy tokens, decode tok/s): Q8_0 CUDA **25.80 tok/s** (39.8% of the 336 GB/s DRAM roofline,
+peak 5559 MiB), NVFP4-mm CUDA **14.64 tok/s** (13.3% of roofline, peak 3479 MiB), NVFP4-mm
+CPU 1.57 tok/s. Per-token weight read shrinks a **measured 1.70×** (matmul-only exactly
+1.889×; format-isolated 1.647×, matching the recon's pre-registered ~1.6×). **Surprise/headline:
+the byte reduction did NOT translate to speed — NVFP4-mm CUDA decodes at 0.57× the Q8_0 lane
+because the v1 scalar-LUT dequant kernel is COMPUTE-bound (13.3% vs 39.8% of roofline), leaving
+its bandwidth advantage on the table.** This is exactly the receipt recon §5 Q1 pre-registered:
+the parity-neutral `__byte_perm`+`__dp4a` inner-loop upgrade (and the gpu_head lever, §5 Q4) are
+now WARRANTED as the Phase-4-follow-up perf bite. NVFP4's realized win on this box today is VRAM
+headroom (2.08 GB more free), not decode speed. Pin-GPU cross-engine row skipped (memory-safety:
+a 6.06 GB model full-offload on a 6144 MiB card is not comfortable headroom). Receipts:
+`qa/evidence-bundles/basalt/phase4/cert/` (parity_cert.json, perf_table.json, byte_accounting.json,
+G4_PERF.md, sanitized command/resource logs).
+
+**D17 addendum 7 (2026-07-17, Phase 4b — dp4a kernel upgrade landed, Option B executed).** Tim
+chose **Option B** at G4. The pre-registered parity-neutral upgrade is done: `nvfp4_gemv`'s
+per-sub-block integer dot (`src/cuda_resident.rs`) was rewritten from the scalar nibble-unpack +
+E2M1 KV-LUT × q8 multiply to the pin's `get_int_from_table_16` `__byte_perm` codebook expansion
+(nibble → signed int8) + `__dp4a` 4-way int8 dot — ported exactly from ggml-cuda/vecdotq.cuh
+(`sm_86` already has `__dp4a`; no arch change; the v1 scalar loop is kept as a code comment for
+the before/after receipt). Because the accumulated i32 `sumi` is identical by construction, it
+cannot move parity, and the gate confirms it: **`nvfp4_gemv_matches_oracle` stays 46/46
+bit-identical, worst rel diff 0.000e0**, with the sentinel-decode, residual-fusion, and
+even-bpr guards all green (plus fmt/clippy-all-features-deny/plain-test clean). **Perf (median
+of 5 warm runs, 128 greedy tokens, this box): NVFP4-mm CUDA decode 14.64 → 26.51 tok/s
+(+81.1 %, 1.81×)**, moving from 13.3 % to **24.0 %** of the 336 GB/s DRAM roofline (peak VRAM
+unchanged at 3479 MiB; byte read set unchanged at 3.048 GB/token). It **did NOT reach the
+roofline** (Q8_0 still sits higher at 39.8 %, so the kernel is not yet fully memory-bound), but
+the ~1.8× lift is enough to **overtake Q8_0: 26.51 vs 25.80 tok/s (1.03×)** — a narrow but
+measured decode-speed win, because NVFP4 reads 1.70× fewer bytes/token. **Option-B outcome:
+NVFP4-mm on this box is now BOTH faster than Q8_0 (1.03×) AND 2.08 GB lighter in VRAM.** The
+Phase-6 claim-lint statement updates accordingly (faster + lighter on this card, decode-only,
+narrow; the G3 quality delta still travels unchanged). The gpu_head lever (§5 Q4) and closing
+the remaining roofline gap remain open follow-ons, not scheduled. Receipts:
+`qa/evidence-bundles/basalt/phase4/cert/` (perf_table.json `NVFP4mm_cuda_dp4a` row kept beside
+the v1 row; BASALT_G4_SUMMARY.md §2/§3/§4; p4b_dp4a_perf_log.md).
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on

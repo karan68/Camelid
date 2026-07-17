@@ -1096,29 +1096,23 @@ fn nvfp4_metal_lane_check(tensors: &[crate::gguf::GgufTensorDescriptor]) -> Resu
 }
 
 /// BASALT Amendment 3 review fix (CUDA lane typed refusal), extended at SHA_E
-/// review: the CUDA-resident gemma4 lane repacks layer projections via
-/// `GemmaLayerQuant::from_wire`, whose catch-all PANICS on any format outside
-/// its covered set (Q8_0/Q4_0/Q4_1). Every lane-uncovered format — NVFP4 (Phase
-/// 4's work) AND the K-quants the CPU wire lane happily serves (the campaign's
-/// own Q4K-mm / Q4_K_M rows) — must refuse with a typed, named error before
-/// that panic seam is reachable (invariant I-unknown-type, L3 cell).
+/// review and lifted at Phase 4: the CUDA-resident gemma4 lane repacks layer
+/// projections via `GemmaLayerQuant::from_wire`, whose catch-all PANICS on any
+/// format outside its covered set. Phase 4 (BASALT G4) added the NVFP4 raw-wire
+/// GEMV (`nvfp4_gemv`), so the covered set is now Q8_0/Q4_0/Q4_1/NVFP4. Every
+/// remaining lane-uncovered format — the K-quants the CPU wire lane serves (the
+/// campaign's own Q4K-mm / Q4_K_M rows) — must still refuse with a typed, named
+/// error before that panic seam is reachable (invariant I-unknown-type, L3 cell).
 /// cfg-independent over [`WireFormat`]s so it unit-tests without CUDA hardware;
 /// the `cfg(feature = "cuda")` load site ([`Gemma4CudaResident::load`]) wires it.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn nvfp4_cuda_lane_check<I: IntoIterator<Item = WireFormat>>(formats: I) -> Result<()> {
     for f in formats {
         match f {
-            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => {}
-            WireFormat::Nvfp4 => {
-                return Err(BackendError::UnsupportedGguf(
-                    "NVFP4 CUDA-resident lane is Phase 4 (BASALT); the CPU lane serves \
-                     NVFP4 in this release"
-                        .into(),
-                ));
-            }
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {}
             other => {
                 return Err(BackendError::UnsupportedGguf(format!(
-                    "gemma4 CUDA-resident lane covers Q8_0/Q4_0/Q4_1 layer projections; \
+                    "gemma4 CUDA-resident lane covers Q8_0/Q4_0/Q4_1/NVFP4 layer projections; \
                      {other:?} is not wired (the CPU lane serves it) — refusing instead \
                      of reaching the repack panic (BASALT I-unknown-type, L3)"
                 )));
@@ -2889,14 +2883,15 @@ struct Gemma4LayerWeightsDev {
     down_q: GemmaLayerQuant,
 }
 
-/// Quant lane of a resident gemma4 layer projection. All three consume Q8_0
-/// activations; Q8_0 weights are SoA-repacked, Q4_0/Q4_1 are raw wire.
+/// Quant lane of a resident gemma4 layer projection. All consume Q8_0
+/// activations; Q8_0 weights are SoA-repacked, Q4_0/Q4_1/NVFP4 are raw wire.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GemmaLayerQuant {
     Q8_0,
     Q4_0,
     Q4_1,
+    Nvfp4,
 }
 
 #[cfg(feature = "cuda")]
@@ -2906,7 +2901,13 @@ impl GemmaLayerQuant {
             WireFormat::Q8_0 => Self::Q8_0,
             WireFormat::Q4_0 => Self::Q4_0,
             WireFormat::Q4_1 => Self::Q4_1,
-            other => panic!("gemma4 layer projection quant {other:?} unsupported (Q8_0/Q4_0/Q4_1)"),
+            // BASALT Phase 4: NVFP4 layer projections now reside on the CUDA lane
+            // (nvfp4_gemv, raw 36-byte wire). `nvfp4_cuda_lane_check` still refuses
+            // every other uncovered format before this catch-all can panic.
+            WireFormat::Nvfp4 => Self::Nvfp4,
+            other => {
+                panic!("gemma4 layer projection quant {other:?} unsupported (Q8_0/Q4_0/Q4_1/NVFP4)")
+            }
         }
     }
 }
@@ -2961,6 +2962,31 @@ fn gemma_proj_gemv(
             out,
             0,
         ),
+        // BASALT Phase 4: NVFP4 raw-wire GEMV. `launch_nvfp4_gemv` returns a typed
+        // Nvfp4LaunchError; the odd-block variant is the I-k-div lane guard and is
+        // structurally unreachable here (the parse boundary refuses non-%64 NVFP4
+        // first-dims at load — k_div_fixture_trips_parse_refusal — so every gemma4
+        // projection reaching the CUDA GEMV has an even Q8_0-block count), matching
+        // the codebase's guard-then-unreachable idiom (matvec's Q5_K arm).
+        GemmaLayerQuant::Nvfp4 => match crate::cuda_resident::launch_nvfp4_gemv(
+            s,
+            &kernels.nvfp4_gemv,
+            in_scales,
+            in_quants,
+            weight,
+            rows,
+            blocks_per_row,
+            out,
+            0,
+        ) {
+            Ok(()) => Ok(()),
+            Err(crate::cuda_resident::Nvfp4LaunchError::Driver(e)) => Err(e),
+            Err(crate::cuda_resident::Nvfp4LaunchError::OddBlocksPerRow(bpr)) => unreachable!(
+                "gemma4 NVFP4 projection reached the CUDA GEMV with an odd Q8_0-block count \
+                 {bpr} (in_dim % 64 != 0); the parse boundary refuses non-%64 NVFP4 tensors \
+                 before load"
+            ),
+        },
     }
 }
 
@@ -3382,7 +3408,12 @@ impl Gemma4CudaResident {
             let quant = GemmaLayerQuant::from_wire(wq.format);
             let bytes = match quant {
                 GemmaLayerQuant::Q8_0 => q8_wire_to_soa(wq.bytes()),
-                GemmaLayerQuant::Q4_0 | GemmaLayerQuant::Q4_1 => wq.bytes().to_vec(),
+                // Q4_0/Q4_1/NVFP4 residency is raw wire passthrough: the GEMV reads
+                // the packed nibbles + in-block scales directly, so the 4.x-bpw
+                // footprint is preserved in VRAM (no host-side dequant/expansion).
+                GemmaLayerQuant::Q4_0 | GemmaLayerQuant::Q4_1 | GemmaLayerQuant::Nvfp4 => {
+                    wq.bytes().to_vec()
+                }
             };
             Ok((s.clone_htod(&bytes).map_err(cu)?, quant))
         };
@@ -5609,31 +5640,29 @@ mod gpu_lane_refusal_tests {
     }
 
     #[test]
-    fn cuda_lane_check_refuses_nvfp4_before_the_from_wire_panic() {
-        // Review fix #1: the exact formats GemmaLayerQuant::from_wire would
-        // panic on must instead surface as a typed BackendError.
-        let formats = vec![WireFormat::Q8_0, WireFormat::Nvfp4, WireFormat::Q4_0];
-        match nvfp4_cuda_lane_check(formats) {
-            Err(BackendError::UnsupportedGguf(msg)) => {
-                assert!(
-                    msg.contains("NVFP4 CUDA-resident lane is Phase 4 (BASALT)"),
-                    "msg: {msg}"
-                );
-                assert!(
-                    msg.contains("the CPU lane serves NVFP4 in this release"),
-                    "msg: {msg}"
-                );
-            }
-            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
-            Ok(()) => panic!("NVFP4 projection must refuse in the CUDA lane"),
-        }
+    fn cuda_lane_check_admits_nvfp4_after_the_phase4_lift() {
+        // BASALT Phase 4 (G4) inverted the pre-Phase-4 refusal: NVFP4 layer
+        // projections now RESIDE on the CUDA lane (nvfp4_gemv), so an NVFP4
+        // format in the projection set must ADMIT — a positive control that the
+        // Phase-4 lift landed and the old "NVFP4 is Phase 4" refusal is gone.
+        // (Regression guard: ratchet R3 requires this flip in the same PR that
+        // closes the six L3 open:P4 cells.)
+        nvfp4_cuda_lane_check([WireFormat::Q8_0, WireFormat::Nvfp4, WireFormat::Q4_0])
+            .expect("NVFP4 projections now admit on the CUDA lane (Phase 4)");
     }
 
     #[test]
     fn cuda_lane_check_admits_the_supported_projection_formats() {
-        // Every format from_wire actually supports must keep loading.
-        nvfp4_cuda_lane_check([WireFormat::Q8_0, WireFormat::Q4_0, WireFormat::Q4_1])
-            .expect("Q8_0/Q4_0/Q4_1 projections stay admitted");
+        // Every format from_wire actually supports must keep loading — Q8_0/Q4_0/
+        // Q4_1 (pre-BASALT) plus NVFP4 (Phase 4). I-carveout boundary-preservation:
+        // the K-quant refusal must not bleed onto the formats this lane serves.
+        nvfp4_cuda_lane_check([
+            WireFormat::Q8_0,
+            WireFormat::Q4_0,
+            WireFormat::Q4_1,
+            WireFormat::Nvfp4,
+        ])
+        .expect("Q8_0/Q4_0/Q4_1/NVFP4 projections stay admitted");
         nvfp4_cuda_lane_check(std::iter::empty()).expect("no projections is vacuously fine");
     }
 
@@ -5652,7 +5681,7 @@ mod gpu_lane_refusal_tests {
                         "refusal must name the format: {msg}"
                     );
                     assert!(
-                        msg.contains("covers Q8_0/Q4_0/Q4_1"),
+                        msg.contains("covers Q8_0/Q4_0/Q4_1/NVFP4"),
                         "refusal must name the covered set: {msg}"
                     );
                 }
@@ -5724,6 +5753,65 @@ mod gpu_lane_refusal_tests {
             Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
             Ok(()) => panic!("NVFP4 must refuse off Windows (Amendment 3 §9)"),
         }
+    }
+
+    /// BASALT Phase 4 — L3 I-plat (cfg-twinned per §9.1): the shared §9 platform
+    /// gate `nvfp4_windows_only_check` fires inside `Gemma4Runtime::load` (via
+    /// `load_layer_range`), which is the FIRST act of `Gemma4CudaResident::load`,
+    /// so it fronts the CUDA lane's entry before any CUDA initialization. This is
+    /// the L3-native twin: the off-Windows legs assert the CUDA lane's shared
+    /// entry gate yields the named TK2 refusal (no GPU needed to observe it —
+    /// the gate is upstream of every CUDA call); the Windows leg asserts the pilot
+    /// shape admits through the gate so the CUDA lane can bind (D-B3 carve-out).
+    #[test]
+    fn cuda_resident_platform_gate_fronts_the_cuda_lane_entry() {
+        let pilot = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
+        #[cfg(target_os = "windows")]
+        {
+            nvfp4_windows_only_check(&pilot)
+                .expect("NVFP4 admits through the §9 gate on Windows so the CUDA lane binds");
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            match nvfp4_windows_only_check(&pilot) {
+                Err(BackendError::UnsupportedGguf(msg)) => assert_eq!(
+                    msg, "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX",
+                    "the CUDA lane's shared entry gate must yield the named TK2 refusal"
+                ),
+                Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+                Ok(()) => panic!(
+                    "the §9 gate fronting Gemma4CudaResident::load must refuse NVFP4 off Windows"
+                ),
+            }
+        }
+    }
+
+    /// BASALT Phase 4 — L3 I-sidecar: `Gemma4CudaResident::load`'s first act is
+    /// `Gemma4Runtime::load`, whose `nvfp4_sidecar_check` (D-B2) fires before any
+    /// CUDA work, so the CUDA lane cannot bind a sidecar-bearing NVFP4 file — it
+    /// inherits the shared refusal. Driven here on the shared helper (cfg-
+    /// independent, no GPU/model); the end-to-end file trip on the same seam is
+    /// `sidecar_fixture_trips_d_b2_end_to_end`. Also asserts the pilot shape (no
+    /// sidecar) admits, so the guard the CUDA lane relies on is exact, not blanket.
+    #[test]
+    fn cuda_resident_load_inherits_shared_sidecar_refusal() {
+        let sidecar = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::NVFP4),
+            desc("blk.0.attn_q.scale", GgufTensorType::F32),
+        ];
+        match nvfp4_sidecar_check(&sidecar) {
+            Err(BackendError::UnsupportedGguf(msg)) => {
+                assert!(
+                    msg.contains("blk.0.attn_q.scale"),
+                    "names the sidecar: {msg}"
+                );
+                assert!(msg.contains("D-B2"), "cites D-B2: {msg}");
+            }
+            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+            Ok(()) => panic!("sidecar-bearing NVFP4 must refuse before the CUDA lane binds (D-B2)"),
+        }
+        let pilot = vec![desc("blk.0.attn_q.weight", GgufTensorType::NVFP4)];
+        nvfp4_sidecar_check(&pilot).expect("pilot NVFP4 has no sidecar; the CUDA lane may bind");
     }
 }
 
