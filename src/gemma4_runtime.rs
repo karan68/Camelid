@@ -856,9 +856,7 @@ impl Gemma4Runtime {
 /// the runnable-lane admission check. Pin-quantized rows (the BASALT pilot
 /// artifacts, receipted at G2) carry none; the pilot's real
 /// `blk.N.layer_output_scale.weight` tensors do NOT match these suffixes.
-pub(crate) fn nvfp4_sidecar_check(
-    tensors: &[crate::gguf::GgufTensorDescriptor],
-) -> Result<()> {
+pub(crate) fn nvfp4_sidecar_check(tensors: &[crate::gguf::GgufTensorDescriptor]) -> Result<()> {
     if tensors
         .iter()
         .any(|t| t.tensor_type == GgufTensorType::NVFP4)
@@ -878,8 +876,97 @@ pub(crate) fn nvfp4_sidecar_check(
     Ok(())
 }
 
-impl Gemma4Runtime {
+/// BASALT Amendment 3 §9 platform gate (DECISIONS.md D17 micro-decisions): NVFP4
+/// is Windows-only in this release. This is a RUNTIME check (`cfg!` inside
+/// ordinary code), deliberately NOT a `#[cfg]` wall: the decode code compiles on
+/// every target, and non-Windows callers get this named refusal instead of a
+/// missing symbol. Enforced in BOTH lanes — runnable admission
+/// (`runnable::admit`) and this gemma4 wire-lane load path — because either lane
+/// alone could otherwise reach NVFP4 weights on an unvalidated platform. Fires
+/// AFTER [`nvfp4_sidecar_check`] so the D-B2 posture stays platform-independent.
+pub(crate) fn nvfp4_windows_only_check(
+    tensors: &[crate::gguf::GgufTensorDescriptor],
+) -> Result<()> {
+    if !cfg!(target_os = "windows")
+        && tensors
+            .iter()
+            .any(|t| t.tensor_type == GgufTensorType::NVFP4)
+    {
+        return Err(BackendError::UnsupportedGguf(
+            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX".into(),
+        ));
+    }
+    Ok(())
+}
 
+/// BASALT Amendment 3 review fix (Metal lane guard): the macOS GPU lane
+/// ([`Gemma4GpuRuntime::load`]) format-gates only layer-0 `attn_q` and never runs
+/// the NVFP4 wire decoder, so an NVFP4 file must refuse up front with a typed
+/// error rather than mis-bind. cfg-independent so it unit-tests on every host;
+/// the `cfg(target_os = "macos")` load site wires it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn nvfp4_metal_lane_check(tensors: &[crate::gguf::GgufTensorDescriptor]) -> Result<()> {
+    if let Some(t) = tensors
+        .iter()
+        .find(|t| t.tensor_type == GgufTensorType::NVFP4)
+    {
+        return Err(BackendError::UnsupportedGguf(format!(
+            "NVFP4 is not wired to the Metal lane (BASALT L4: na); tensor {} is NVFP4",
+            t.name
+        )));
+    }
+    Ok(())
+}
+
+/// BASALT Amendment 3 review fix (CUDA lane typed refusal): the CUDA-resident
+/// gemma4 lane repacks layer projections via `GemmaLayerQuant::from_wire`, whose
+/// catch-all PANICS on any format outside Q8_0/Q4_0/Q4_1. NVFP4 must instead
+/// refuse with a typed error before that seam is reachable. cfg-independent over
+/// [`WireFormat`]s so it unit-tests without CUDA hardware; the
+/// `cfg(feature = "cuda")` load site ([`Gemma4CudaResident::load`]) wires it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn nvfp4_cuda_lane_check<I: IntoIterator<Item = WireFormat>>(formats: I) -> Result<()> {
+    if formats.into_iter().any(|f| f == WireFormat::Nvfp4) {
+        return Err(BackendError::UnsupportedGguf(
+            "NVFP4 CUDA-resident lane is Phase 4 (BASALT); the CPU lane serves NVFP4 \
+             in this release"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// BASALT Amendment 3 review fix (step-boundary proof): the forced-decode loop's
+/// boundary bookkeeping, extracted so a unit test can prove the off-by-one
+/// contract with a scripted step closure and no model. Drives `step` (feed one
+/// token, return the next prediction state) over the forced list starting from
+/// the prompt-end prediction, guaranteeing:
+///
+/// 1. `observe(i, state)` sees the prediction computed BEFORE `forced[i]` is fed
+///    as the next input (the teacher-forcing boundary);
+/// 2. exactly `forced.len()` observations fire;
+/// 3. the FINAL forced token is never fed (its prediction is already observed;
+///    feeding it would only compute an unrecorded extra step).
+///
+/// [`Gemma4Runtime::forced_decode`] rewires through this; the real forward step
+/// is untouched.
+pub(crate) fn drive_forced_steps<P, E>(
+    forced: &[u32],
+    prompt_end_prediction: P,
+    mut step: impl FnMut(u32) -> std::result::Result<P, E>,
+    mut observe: impl FnMut(usize, &P),
+) -> std::result::Result<(), E> {
+    let mut prediction = prompt_end_prediction;
+    for (i, &tok) in forced.iter().enumerate() {
+        observe(i, &prediction);
+        if i + 1 < forced.len() {
+            prediction = step(tok)?;
+        }
+    }
+    Ok(())
+}
+
+impl Gemma4Runtime {
     /// Load only the given contiguous global layer range (None = all layers).
     /// Fails closed if the range would separate a KV-sharing layer from the
     /// cache it reads (the split must keep every shared layer on the same shard
@@ -894,6 +981,10 @@ impl Gemma4Runtime {
         // any refuses here, mirroring the runnable-lane admission check.
         // Pin-quantized rows (the BASALT pilot artifacts) carry none.
         nvfp4_sidecar_check(&gguf.tensors)?;
+        // BASALT Amendment 3 §9: NVFP4 is Windows-only in this release — a
+        // runtime platform gate (after the sidecar check so D-B2 stays
+        // platform-independent), mirrored in runnable admission.
+        nvfp4_windows_only_check(&gguf.tensors)?;
         let config = LlamaModelConfig::from_gguf(&gguf)?;
         let g = config.gemma4.clone().ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
@@ -1066,6 +1157,13 @@ impl Gemma4Runtime {
 
     pub fn hidden_size(&self) -> usize {
         self.config.embedding_length as usize
+    }
+
+    /// Logit-vector length of this model's tied head (`token_embd` rows) — the
+    /// exact length `step` returns, and therefore the bound the BASALT harness
+    /// uses to validate teacher-forced token ids before decoding.
+    pub fn vocab_size(&self) -> usize {
+        self.token_embd.element_count / self.hidden_size()
     }
 
     /// Greedy stop set for this model (metadata EOS/EOT/EOM + literal
@@ -1875,14 +1973,20 @@ impl Gemma4Runtime {
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             logits = self.step(tok, pos, &mut kc, &mut vc)?;
         }
+        // Boundary bookkeeping lives in `drive_forced_steps` (unit-tested with a
+        // scripted step fn): observe step i's logits BEFORE feeding forced[i];
+        // exactly forced.len() observations; the final forced token never fed.
         let mut pos = prompt_tokens.len();
-        for (i, &tok) in forced.iter().enumerate() {
-            on_step(i, &logits);
-            if i + 1 < forced.len() {
-                logits = self.step(tok, pos, &mut kc, &mut vc)?;
+        drive_forced_steps(
+            forced,
+            logits,
+            |tok| -> Result<Vec<f32>> {
+                let next = self.step(tok, pos, &mut kc, &mut vc)?;
                 pos += 1;
-            }
-        }
+                Ok(next)
+            },
+            |i, logits: &Vec<f32>| on_step(i, logits),
+        )?;
         Ok(prompt_tokens)
     }
 
@@ -2155,6 +2259,13 @@ impl Gemma4GpuRuntime {
     /// is the KV-cache capacity (must cover prompt + generated tokens).
     pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
         let gguf = read_metadata(path)?;
+        // BASALT Amendment 3 review fix (Metal lane guard): this lane never ran
+        // the D-B2 sidecar check and format-gated only layer-0 attn_q, so a
+        // sidecar-bearing or NVFP4 file could slip past the signed refusals.
+        // Both typed refusals fire here, before any binding; the shared helpers
+        // are cfg-independent and unit-tested on every host.
+        nvfp4_sidecar_check(&gguf.tensors)?;
+        nvfp4_metal_lane_check(&gguf.tensors)?;
         let config = LlamaModelConfig::from_gguf(&gguf)?;
         let g = config.gemma4.clone().ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
@@ -2914,6 +3025,25 @@ impl Gemma4CudaResident {
     /// bounds the resident KV cache.
     pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
         let cpu = Gemma4Runtime::load(path)?;
+        // BASALT Amendment 3 review fix: refuse NVFP4 layer projections with a
+        // typed error BEFORE the `GemmaLayerQuant::from_wire` catch-all (`upw`
+        // below) can panic. The CPU wire lane serves NVFP4 in this release;
+        // CUDA-resident NVFP4 is Phase 4 (BASALT).
+        nvfp4_cuda_lane_check(cpu.layers.iter().flat_map(|lw| {
+            [
+                Some(lw.attn_q.format),
+                lw.attn_k.as_ref().map(|w| w.format),
+                lw.attn_v.as_ref().map(|w| w.format),
+                Some(lw.attn_output.format),
+                Some(lw.ffn_gate.format),
+                Some(lw.ffn_up.format),
+                Some(lw.ffn_down.format),
+                lw.moe.as_ref().map(|m| m.gate_up_exps.format),
+                lw.moe.as_ref().map(|m| m.down_exps.format),
+            ]
+            .into_iter()
+            .flatten()
+        }))?;
         let kernels = crate::cuda_resident::CudaResidentKernels::new()
             .map_err(BackendError::InvalidModelMetadata)?;
         // Disable cudarc's automatic cross-stream event tracking. Allocating a second
@@ -4987,5 +5117,200 @@ mod nvfp4_wire_tests {
                 );
             }
         }
+    }
+}
+
+/// BASALT Amendment 3: the GPU-lane typed refusals and the §9 platform gate.
+/// All helpers are cfg-independent, so these run on every host — no CUDA/Metal
+/// hardware and no model loads (descriptor lists and raw [`WireFormat`]s only).
+#[cfg(test)]
+mod gpu_lane_refusal_tests {
+    use super::*;
+    use crate::gguf::GgufTensorDescriptor;
+
+    fn desc(name: &str, tensor_type: GgufTensorType) -> GgufTensorDescriptor {
+        GgufTensorDescriptor {
+            name: name.into(),
+            dimensions: vec![64, 1],
+            tensor_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 36,
+        }
+    }
+
+    #[test]
+    fn cuda_lane_check_refuses_nvfp4_before_the_from_wire_panic() {
+        // Review fix #1: the exact formats GemmaLayerQuant::from_wire would
+        // panic on must instead surface as a typed BackendError.
+        let formats = vec![WireFormat::Q8_0, WireFormat::Nvfp4, WireFormat::Q4_0];
+        match nvfp4_cuda_lane_check(formats) {
+            Err(BackendError::UnsupportedGguf(msg)) => {
+                assert!(
+                    msg.contains("NVFP4 CUDA-resident lane is Phase 4 (BASALT)"),
+                    "msg: {msg}"
+                );
+                assert!(
+                    msg.contains("the CPU lane serves NVFP4 in this release"),
+                    "msg: {msg}"
+                );
+            }
+            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+            Ok(()) => panic!("NVFP4 projection must refuse in the CUDA lane"),
+        }
+    }
+
+    #[test]
+    fn cuda_lane_check_admits_the_supported_projection_formats() {
+        // Every format from_wire actually supports must keep loading.
+        nvfp4_cuda_lane_check([WireFormat::Q8_0, WireFormat::Q4_0, WireFormat::Q4_1])
+            .expect("Q8_0/Q4_0/Q4_1 projections stay admitted");
+        nvfp4_cuda_lane_check(std::iter::empty()).expect("no projections is vacuously fine");
+    }
+
+    #[test]
+    fn metal_lane_check_refuses_any_nvfp4_tensor() {
+        // Review fix #2: ANY NVFP4 tensor refuses (the lane format-gates only
+        // layer-0 attn_q, so a deeper NVFP4 tensor would otherwise mis-bind).
+        let tensors = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0),
+            desc("blk.7.ffn_down.weight", GgufTensorType::NVFP4),
+        ];
+        match nvfp4_metal_lane_check(&tensors) {
+            Err(BackendError::UnsupportedGguf(msg)) => {
+                assert!(
+                    msg.contains("NVFP4 is not wired to the Metal lane (BASALT L4: na)"),
+                    "msg: {msg}"
+                );
+                assert!(msg.contains("blk.7.ffn_down.weight"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+            Ok(()) => panic!("NVFP4 tensor must refuse in the Metal lane"),
+        }
+    }
+
+    #[test]
+    fn metal_lane_check_admits_files_without_nvfp4() {
+        let tensors = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0),
+            desc("token_embd.weight", GgufTensorType::Q6K),
+        ];
+        nvfp4_metal_lane_check(&tensors).expect("non-NVFP4 files keep loading");
+    }
+
+    #[test]
+    fn windows_only_check_ignores_files_without_nvfp4() {
+        // Platform-independent: the §9 gate only ever looks at NVFP4-bearing
+        // files, so every other row is untouched on every OS.
+        let tensors = vec![desc("blk.0.attn_q.weight", GgufTensorType::Q8_0)];
+        nvfp4_windows_only_check(&tensors).expect("non-NVFP4 files admit everywhere");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_only_check_admits_nvfp4_on_windows() {
+        // §9 twin (runs on the Windows leg): admission still works where the
+        // release actually supports NVFP4.
+        let tensors = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
+        nvfp4_windows_only_check(&tensors).expect("NVFP4 admits on Windows");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn windows_only_check_refuses_nvfp4_off_windows() {
+        // §9 twin (runs on the ubuntu/macos legs): the named TK2 refusal.
+        let tensors = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
+        match nvfp4_windows_only_check(&tensors) {
+            Err(BackendError::UnsupportedGguf(msg)) => {
+                assert_eq!(
+                    msg,
+                    "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
+                );
+            }
+            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+            Ok(()) => panic!("NVFP4 must refuse off Windows (Amendment 3 §9)"),
+        }
+    }
+}
+
+/// BASALT Amendment 3 review fix #4: the forced-decode step-boundary proof.
+/// A scripted fake step fn stands in for the model: `predicted = 1000 + fed`,
+/// prompt-end prediction 999 — so every observation uniquely identifies WHICH
+/// token had been fed before it, and any off-by-one is unmissable.
+#[cfg(test)]
+mod forced_step_boundary_tests {
+    use super::drive_forced_steps;
+
+    #[test]
+    fn observes_before_feeding_and_never_feeds_the_final_token() {
+        let forced = [10u32, 20, 30];
+        // One interleaved event log proves strict ordering, not just counts.
+        // (RefCell: both closures append to the same log.)
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+        let mut fed: Vec<u32> = Vec::new();
+        drive_forced_steps::<u32, std::convert::Infallible>(
+            &forced,
+            999,
+            |tok| {
+                fed.push(tok);
+                events.borrow_mut().push(format!("fed={tok}"));
+                Ok(1000 + tok)
+            },
+            |i, &pred| events.borrow_mut().push(format!("obs{i}={pred}")),
+        )
+        .unwrap();
+        let events = events.into_inner();
+
+        // Step i's recorded prediction is the state from BEFORE forced[i] was
+        // fed: obs0 sees the prompt-end prediction (999), obs1 sees 1000+forced[0],
+        // obs2 sees 1000+forced[1]. If the loop fed first and observed second,
+        // obs_i would read 1000+forced[i] instead.
+        assert_eq!(
+            events,
+            vec!["obs0=999", "fed=10", "obs1=1010", "fed=20", "obs2=1020"]
+        );
+        // count == forced.len(): exactly 3 observations fired (asserted above by
+        // the full event log), and the FINAL forced token (30) was never fed.
+        assert_eq!(fed, vec![10, 20]);
+    }
+
+    #[test]
+    fn single_forced_token_observes_once_and_feeds_nothing() {
+        let mut observed = Vec::new();
+        drive_forced_steps::<u32, std::convert::Infallible>(
+            &[42],
+            7,
+            |_| panic!("a single forced token must never be fed"),
+            |i, &pred| observed.push((i, pred)),
+        )
+        .unwrap();
+        assert_eq!(observed, vec![(0, 7)]);
+    }
+
+    #[test]
+    fn empty_forced_list_neither_observes_nor_feeds() {
+        // The CLI refuses empty lists upstream; the construct itself is total.
+        drive_forced_steps::<u32, std::convert::Infallible>(
+            &[],
+            0,
+            |_| panic!("nothing to feed"),
+            |_, _| panic!("nothing to observe"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn step_errors_propagate_after_the_boundary_observation() {
+        let mut observed = 0usize;
+        let err = drive_forced_steps::<u32, &'static str>(
+            &[1, 2],
+            0,
+            |_| Err("step failed"),
+            |_, _| observed += 1,
+        )
+        .unwrap_err();
+        assert_eq!(err, "step failed");
+        // The step-0 observation (pre-feed) had already fired.
+        assert_eq!(observed, 1);
     }
 }

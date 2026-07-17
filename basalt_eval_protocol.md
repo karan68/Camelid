@@ -32,6 +32,13 @@ defaults are marked **[AMENDS §6]** with rationale and require Tim's sign-off a
 > known, disclosed side effect from either source: `blk.*.inp_gate/proj` (84 F32 tensors)
 > quantize to Q8_0 in every produced row — identical across the `-mm` pair, so the gated
 > isolation holds.
+>
+> **Amendment 3 addendum (signed 2026-07-16)** — the §4 phrasing-lock paragraph, verbatim:
+> All quality figures in the G3 table are measured against the Q8_0 parent at matched
+> 4.5 bpw. Any surfaced claim derived from this table carries the qualifier 'vs Q8_0
+> parent, matched 4.5 bpw' and may not be compressed to an unqualified 'NVFP4 ≈ Q4_K_M'
+> or any absolute-quality statement. Absolute-vs-BF16 characterization requires a
+> separately pre-registered eval.
 
 ## 1. Pilot and rows
 

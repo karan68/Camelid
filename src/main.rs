@@ -1583,6 +1583,10 @@ async fn main() -> anyhow::Result<()> {
                         let text = std::fs::read_to_string(p)?;
                         let ids = parse_forced_tokens(&text)
                             .map_err(|e| anyhow::anyhow!("--force-tokens {}: {e}", p.display()))?;
+                        // Vocab bound known here (post-load): refuse out-of-range
+                        // ids before any decode step runs.
+                        validate_forced_token_vocab(&ids, runtime.vocab_size())
+                            .map_err(|e| anyhow::anyhow!("--force-tokens {}: {e}", p.display()))?;
                         eprintln!(
                             "[gemma4] teacher-forcing {} tokens from {}",
                             ids.len(),
@@ -1594,6 +1598,9 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let dump_dir = dump_step_logits.clone();
                 if let Some(dir) = &dump_dir {
+                    // Refuse mixing this run's step_<i>.bin dumps into a
+                    // directory that already has contents.
+                    ensure_dump_dir_empty(dir).map_err(|e| anyhow::anyhow!(e))?;
                     std::fs::create_dir_all(dir)?;
                 }
 
@@ -6890,8 +6897,14 @@ fn parse_forced_tokens(text: &str) -> Result<Vec<u32>, String> {
         return Err("forced-token file is empty".into());
     }
     if trimmed.starts_with('[') {
-        return serde_json::from_str::<Vec<u32>>(trimmed)
-            .map_err(|e| format!("forced-token JSON parse failed: {e}"));
+        let ids = serde_json::from_str::<Vec<u32>>(trimmed)
+            .map_err(|e| format!("forced-token JSON parse failed: {e}"))?;
+        // The JSON branch must not bypass the emptiness guard above: `[]`
+        // parses fine but a zero-step forced decode is always a harness mistake.
+        if ids.is_empty() {
+            return Err("forced-token list is empty".into());
+        }
+        return Ok(ids);
     }
     trimmed
         .lines()
@@ -6902,6 +6915,48 @@ fn parse_forced_tokens(text: &str) -> Result<Vec<u32>, String> {
                 .map_err(|e| format!("bad forced token id {l:?}: {e}"))
         })
         .collect()
+}
+
+/// Refuse forced token ids outside the model's vocab (BASALT Amendment 3 review
+/// fix): an out-of-range id would panic (or silently mis-embed) deep inside the
+/// forward step, so it is validated at the CLI call site — the first point where
+/// the vocab size is known post-load. Names the offending id and step.
+fn validate_forced_token_vocab(ids: &[u32], vocab: usize) -> Result<(), String> {
+    match ids.iter().enumerate().find(|(_, &id)| id as usize >= vocab) {
+        Some((step, &id)) => Err(format!(
+            "forced token id {id} at step {step} is out of range for this model's \
+             vocab size {vocab}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a non-empty existing `--dump-step-logits` directory (BASALT
+/// Amendment 3 review fix): `step_<i>.bin` files from a previous run would
+/// silently mix with this run's dumps and corrupt the §5.3 exact-KL input.
+/// A missing directory is fine (created after this check); an existing empty
+/// directory is fine; anything else is a named error listing the offending dir.
+fn ensure_dump_dir_empty(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                Err(format!(
+                    "--dump-step-logits directory {} already exists and is not empty; \
+                     refusing to mix step dumps with pre-existing files (pass a fresh \
+                     or empty directory)",
+                    dir.display()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Exists but is not a listable directory (e.g. a plain file).
+        Err(e) => Err(format!(
+            "--dump-step-logits {} is not usable as a dump directory: {e}",
+            dir.display()
+        )),
+    }
 }
 
 /// Per-step argmax (id, logit) with `Gemma4Runtime::generate_greedy`'s EXACT
@@ -7019,6 +7074,55 @@ mod basalt_forced_decode_tests {
         assert!(parse_forced_tokens("   \n  ").is_err());
         assert!(parse_forced_tokens("notanid").is_err());
         assert!(parse_forced_tokens("[1, -2]").is_err());
+        // Review fix: the JSON branch must not bypass the emptiness guard.
+        for empty_json in ["[]", "[ ]"] {
+            match parse_forced_tokens(empty_json) {
+                Err(e) => assert_eq!(e, "forced-token list is empty", "input {empty_json:?}"),
+                Ok(ids) => panic!("empty JSON list {empty_json:?} must error, got {ids:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn forced_token_vocab_validation_names_the_offending_id() {
+        // In-range ids (including vocab-1) pass.
+        validate_forced_token_vocab(&[0, 5, 261_143], 261_144).expect("in-range ids admit");
+        validate_forced_token_vocab(&[], 16).expect("empty list is vacuously in range");
+        // First offending id + its step are named.
+        let err = validate_forced_token_vocab(&[3, 16, 2], 16).expect_err("16 >= vocab 16");
+        assert!(err.contains("forced token id 16"), "{err}");
+        assert!(err.contains("at step 1"), "{err}");
+        assert!(err.contains("vocab size 16"), "{err}");
+        // Boundary: id == vocab is out of range (ids are 0-based).
+        assert!(validate_forced_token_vocab(&[8], 8).is_err());
+    }
+
+    #[test]
+    fn dump_dir_check_refuses_non_empty_existing_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        // Nonexistent path: fine (created later by create_dir_all).
+        let fresh = root.path().join("fresh-dumps");
+        ensure_dump_dir_empty(&fresh).expect("missing dir is usable");
+
+        // Existing but empty: fine.
+        let empty = root.path().join("empty-dumps");
+        std::fs::create_dir(&empty).expect("mkdir");
+        ensure_dump_dir_empty(&empty).expect("empty dir is usable");
+
+        // Existing with contents: named refusal listing the offending dir.
+        let dirty = root.path().join("dirty-dumps");
+        std::fs::create_dir(&dirty).expect("mkdir");
+        std::fs::write(dirty.join("step_0.bin"), b"stale").expect("write");
+        let err = ensure_dump_dir_empty(&dirty).expect_err("non-empty dir must refuse");
+        assert!(err.contains("already exists and is not empty"), "{err}");
+        assert!(err.contains(&dirty.display().to_string()), "{err}");
+
+        // A plain file at the path is also a named error, not a panic.
+        let file_path = root.path().join("not-a-dir");
+        std::fs::write(&file_path, b"x").expect("write");
+        let err = ensure_dump_dir_empty(&file_path).expect_err("file path must refuse");
+        assert!(err.contains("not usable as a dump directory"), "{err}");
     }
 
     #[test]

@@ -783,3 +783,20 @@ Additionally (Phase 3): the D-B2 sidecar refusal and the T5 NaN-sentinel refusal
 enforced in BOTH lanes — runnable admission/decode (Phase 2) and the gemma4 wire lane
 (`nvfp4_sidecar_check` at load + `WireQuant::new` sentinel scan) — because the wire lane
 never runs the runnable decoder and would otherwise silently bypass both signed postures.
+Closure accepted against Amendment 3 §1 bar on signature (2026-07-16): the synthetic
+sidecar-tripping wire-lane fixture per §1.2 is committed (`tests/fixtures/gguf/`,
+`tests/nvfp4_wire_lane_refusals.rs`), and the four sanctioned rows re-hashed
+byte-unchanged per §1.3 (`qa/evidence-bundles/basalt/phase3/row_rehash_post_closure.txt`).
+
+**Micro-decisions (Amendment 3):**
+
+- **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
+  non-Windows targets via `cfg!(target_os = "windows")` INSIDE ordinary code, in both
+  lanes (`runnable::admit` after the D-B3/D-B2 checks; the gemma4 wire-lane load via
+  `nvfp4_windows_only_check`, after the sidecar check), with the named TK2 error
+  "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX". Rationale: the crate
+  compiles identically on every target (no cfg-walled decode code rotting unseen on
+  platforms that never build it), the refusal is a typed, testable error rather than a
+  missing symbol, and cfg-gated twin tests pin BOTH sides on the CI legs that actually
+  run there (ubuntu/macos assert the refusal; Windows asserts admission).
+- **§2.4 — support-matrix mechanism:** reserved; decided in the next commit.
