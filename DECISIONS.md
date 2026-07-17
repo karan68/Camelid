@@ -819,6 +819,26 @@ delta ("behind Q4_K at matched 4.5 bpw on the pilot: 88.5 % vs 92.6 % top-1 agre
 quality-competitiveness. The G3 NO-GO stands as a recorded, receipted result; Option B is a
 forward-scope choice on a different axis, not a reversal of it.
 
+**D17 addendum 5 (2026-07-17, Phase 4 — NVFP4 CUDA decode kernel landed).** The NVFP4
+dequant-in-kernel CUDA-resident decode GEMV (`nvfp4_gemv`, `src/cuda_resident.rs`) shipped
+behind a unit-level bit-parity gate: warp-per-row, raw 36-byte wire, exact in-kernel UE4M3
+sub-scale decode (bit-for-bit `tensor::ue4m3_to_f32_const` — flush raw 0x00/0x7F, 0xFF->240.0
+pin-CPU-bitwise), scalar E2M1 LUT integer dot, and the ordered lane-0 sum reproducing
+`nvfp4_wire_row_dot`'s superblock-major/sub-block-minor order — so the kernel is 100%
+BIT-identical to the CPU oracle on the same bytes (`nvfp4_gemv_matches_oracle`, the same
+ordered-sum family as q8/q4_0/q4_1; the 1e-4 close() is a compiler backstop only). The
+gemma4 CUDA lane now covers Q8_0/Q4_0/Q4_1/NVFP4 (`nvfp4_cuda_lane_check` admit arm;
+`GemmaLayerQuant::Nvfp4` raw-wire passthrough); the K-quants stay CPU-only (still typed-refused
+on the CUDA lane). The scalar-LUT kernel is v1 per the orchestrator §5 Q1 decision; the pin's
+`__byte_perm`+`__dp4a` inner loop is recorded in a kernel comment as a measured
+PARITY-NEUTRAL follow-up (identical i32 sumi). The six L3 `open:P4` invariant cells closed in
+this commit (I-nan-scale/I-sidecar/I-scale-once/I-k-div/I-plat -> enforced with lane-native
+tests; I-cache-quant -> na structural per §5 Q3), satisfying ratchet R3; the pre-Phase-4
+CUDA-lane refusal text is gone and its pinning test inverted. Scope of THIS commit is
+implementation + the unit bit-parity gate ONLY — the end-to-end CPU-vs-CUDA self-parity CERT
+and the Gate-G4 perf table (medians, achieved GB/s) are a separate later step (no model loaded,
+no benchmark here).
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on

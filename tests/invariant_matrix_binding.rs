@@ -43,6 +43,10 @@ const BOUND: &[(&str, &str)] = &[
         include_str!("../src/cuda_resident.rs"),
     ),
     (
+        "src/cuda_resident/tests.rs",
+        include_str!("../src/cuda_resident/tests.rs"),
+    ),
+    (
         "src/gemma4_runtime.rs",
         include_str!("../src/gemma4_runtime.rs"),
     ),

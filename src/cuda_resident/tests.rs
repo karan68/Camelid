@@ -2737,6 +2737,272 @@ fn q4_1_gemv_matches_oracle() {
     );
 }
 
+// Synthetic NVFP4 weight wire: rows*n_sb superblocks of 36 bytes (d[4] UE4M3 scales
+// then qs[32] packed E2M1 nibbles). Scale bytes cycle a deliberately adversarial set
+// — 0x00 zero, 0x01 subnormal, 0x08 min-normal, interior values, 0x7E max-normal
+// (224), 0x7F flush->0.0, and 0xFF ->240.0. The two sentinels (0x7F/0xFF) appear ONLY
+// here, below the load-time refusal seam: admitted files never carry them, but the
+// kernel must still decode them PIN-CPU-BITWISE (0x7F->0, 0xFF->240 — NOT the pin's
+// CUDA-intrinsic double-flush), and since kernel and oracle read the SAME bytes this
+// wire exercises exactly that. qs bytes are random, so the full codebook (codes +-12)
+// appears across blocks.
+fn synth_nvfp4_wire(rows: usize, n_sb: usize, rng: &mut Lcg) -> Vec<u8> {
+    const WIRE: usize = 36;
+    const SCALES: [u8; 10] = [0x00, 0x01, 0x08, 0x2C, 0x40, 0x51, 0x66, 0x7E, 0x7F, 0xFF];
+    let mut wire = vec![0u8; rows * n_sb * WIRE];
+    for sb in 0..rows * n_sb {
+        let blk = &mut wire[sb * WIRE..(sb + 1) * WIRE];
+        for (s, b) in blk.iter_mut().take(4).enumerate() {
+            *b = SCALES[(sb + s) % SCALES.len()];
+        }
+        for b in blk.iter_mut().skip(4) {
+            *b = rng.next_u8();
+        }
+    }
+    wire
+}
+
+// Split a Q8_0 activation into the (scales, concatenated i8 quants) buffers the GPU
+// GEMV reads — the oracle format, quantized by the CPU `quantize_q8_0_blocks` which is
+// bit-paired with the device `quantize_q8_0`, so kernel and oracle see identical
+// integers/scales and the GEMV kernel alone is under test.
+fn q8_activation_buffers(act: &[f32]) -> (Vec<crate::tensor::Q8_0Block>, Vec<f32>, Vec<i8>) {
+    let q8 = crate::inference::quantize_q8_0_blocks(act);
+    let scales: Vec<f32> = q8.iter().map(|b| b.scale).collect();
+    let mut quants = vec![0i8; act.len()];
+    for (b, blk) in q8.iter().enumerate() {
+        quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+    }
+    (q8, scales, quants)
+}
+
+// BASALT Phase 4 bit-parity GATE for the NVFP4 resident GEMV. Generates synthetic
+// NVFP4 wire (incl. crafted sentinel/subnormal/max scales) + a Q8_0 activation, runs
+// `nvfp4_gemv` on the GPU across several shapes (in_dim 64/128/2560/10240 — the last
+// is the ffn_down worst case at bpr=320 — with odd row counts), and asserts each
+// output row reproduces the validated CPU oracle `nvfp4_wire_row_dot` on the SAME
+// bytes. The kernel mirrors the oracle's exact per-sub-block integer dot + ordered f32
+// accumulation (superblock-major / sub-block-minor, the same ordered-sum contract as
+// q8/q4_0/q4_1), so the result is EXPECTED 100% bit-identical; the 1e-4 close() is a
+// compiler-robustness backstop only (no looser than Q4_K per conductor §6).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn nvfp4_gemv_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    // (rows, n_sb): 1/2/40/160 NVFP4 superblocks per row == in_dim 64/128/2560/10240.
+    let cases: [(usize, usize); 4] = [(1, 1), (3, 2), (37, 40), (5, 160)];
+    let mut total_rows = 0usize;
+    let mut total_exact = 0usize;
+    let mut worst = 0f32;
+    for (ci, &(rows, n_sb)) in cases.iter().enumerate() {
+        let bpr = n_sb * 2; // Q8_0 activation blocks per row (in_dim/32)
+        let kdim = bpr * 32; // in_dim
+        let mut rng = Lcg(0x4E_F4_00 + ci as u64);
+        let wire = synth_nvfp4_wire(rows, n_sb, &mut rng);
+
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let (q8, in_scales, in_quants) = q8_activation_buffers(&act);
+        assert_eq!(q8.len(), bpr);
+
+        let row_bytes = n_sb * 36;
+        let mut expected = vec![0f32; rows];
+        for (r, slot) in expected.iter_mut().enumerate() {
+            let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+            *slot = crate::inference::nvfp4_wire_row_dot(row_wire, &q8);
+        }
+
+        let d_is = k.stream.clone_htod(&in_scales).unwrap();
+        let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+        let d_w = k.stream.clone_htod(&wire).unwrap();
+        let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_nvfp4_gemv(
+            &k.stream,
+            &k.nvfp4_gemv,
+            &d_is,
+            &d_iq,
+            &d_w.slice(0..wire.len()),
+            rows,
+            bpr,
+            &mut d_out,
+            0,
+        )
+        .unwrap();
+        let mut got = vec![0f32; rows];
+        k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        for (g, e) in got.iter().zip(&expected) {
+            if g.to_bits() == e.to_bits() {
+                total_exact += 1;
+            }
+            let d = (g - e).abs() / e.abs().max(1.0);
+            if d > worst {
+                worst = d;
+            }
+        }
+        total_rows += rows;
+        assert!(
+            close(&got, &expected, 1e-4),
+            "nvfp4_gemv shape (rows={rows}, n_sb={n_sb}) diverged from oracle (worst rel {worst:.3e})"
+        );
+    }
+    eprintln!(
+        "nvfp4_gemv_matches_oracle: {}/{} rows bit-identical, worst rel diff {:.3e}",
+        total_exact, total_rows, worst
+    );
+    assert_eq!(
+        total_exact, total_rows,
+        "NVFP4 GEMV is an ordered-sum lane: every row must be BIT-identical to nvfp4_wire_row_dot"
+    );
+}
+
+// BASALT Phase 4 — L3 I-nan-scale (below-the-refusal-seam decode semantics on the
+// KERNEL): a crafted one-row wire whose sub-block 0 scales are exactly [0x7F, 0xFF,
+// 0x00, 0x7E] with nonzero qs. The kernel must decode them pin-CPU-bitwise — raw 0x7F
+// and 0x00 flush to 0.0 (their terms vanish), raw 0xFF decodes to 240.0 (D17/T5, NOT
+// the pin CUDA-intrinsic 0xFF->0 double-flush) — which is proven by bit-matching the
+// oracle on the same bytes: had the kernel copied the double-flush, the 240-scaled
+// sub-block-1 term would vanish on the GPU and diverge from the oracle here.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn nvfp4_gemv_decodes_ue4m3_sentinels_pin_cpu_bitwise() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, n_sb) = (1usize, 2usize);
+    let bpr = n_sb * 2;
+    let kdim = bpr * 32;
+    let mut rng = Lcg(0x5E_71_7E);
+    let mut wire = synth_nvfp4_wire(rows, n_sb, &mut rng);
+    // Superblock 0 sub-block scales, and nonzero codes so the 0xFF term is real.
+    wire[0] = 0x7F;
+    wire[1] = 0xFF;
+    wire[2] = 0x00;
+    wire[3] = 0x7E;
+    for b in wire.iter_mut().take(36).skip(4) {
+        *b = 0x77; // both nibbles = 7 => code +12
+    }
+
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let (q8, in_scales, in_quants) = q8_activation_buffers(&act);
+    let want = crate::inference::nvfp4_wire_row_dot(&wire, &q8);
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_nvfp4_gemv(
+        &k.stream,
+        &k.nvfp4_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wire.len()),
+        rows,
+        bpr,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert_eq!(
+        got[0].to_bits(),
+        want.to_bits(),
+        "kernel UE4M3 sentinel decode must be pin-CPU-bitwise (0x7F->0.0, 0xFF->240.0): \
+         got {} want {want}",
+        got[0]
+    );
+}
+
+// BASALT Phase 4 — residual-fusion twin (F2 contract): `residual=1` must equal
+// gemv-then-add. Seeds `output` with a base vector, runs the fused launch, and asserts
+// each row bit-equals base + nvfp4_wire_row_dot.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn nvfp4_gemv_fuses_residual_add() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, n_sb) = (7usize, 3usize);
+    let bpr = n_sb * 2;
+    let kdim = bpr * 32;
+    let mut rng = Lcg(0x4E_F4_AD);
+    let wire = synth_nvfp4_wire(rows, n_sb, &mut rng);
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let (q8, in_scales, in_quants) = q8_activation_buffers(&act);
+
+    let base: Vec<f32> = (0..rows).map(|_| rng.next_f32() * 5.0).collect();
+    let row_bytes = n_sb * 36;
+    let mut expected = vec![0f32; rows];
+    for (r, slot) in expected.iter_mut().enumerate() {
+        let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+        *slot = base[r] + crate::inference::nvfp4_wire_row_dot(row_wire, &q8);
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.clone_htod(&base).unwrap(); // residual=1 adds onto this
+    super::launch_nvfp4_gemv(
+        &k.stream,
+        &k.nvfp4_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wire.len()),
+        rows,
+        bpr,
+        &mut d_out,
+        1,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    for (r, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            e.to_bits(),
+            "nvfp4_gemv residual fusion row {r}: got {g} want {e}"
+        );
+    }
+}
+
+// BASALT Phase 4 — L3 I-k-div lane-native guard: the launcher refuses an odd Q8_0-block
+// count (in_dim % 64 != 0) with a typed `Nvfp4LaunchError::OddBlocksPerRow` BEFORE
+// touching the GPU, because one 64-value NVFP4 superblock needs a whole pair of
+// 32-value activation blocks. Fail-closed in every build profile (not a debug panic).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn nvfp4_gemv_requires_even_q8_blocks() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 4usize;
+    let odd_bpr = 3usize; // 3 Q8_0 blocks = 96 values; not a whole 64-superblock
+    let d_is = k.stream.clone_htod(&vec![0f32; odd_bpr]).unwrap();
+    let d_iq = k.stream.clone_htod(&vec![0i8; odd_bpr * 32]).unwrap();
+    let d_w = k.stream.clone_htod(&vec![0u8; rows * 2 * 36]).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    match super::launch_nvfp4_gemv(
+        &k.stream,
+        &k.nvfp4_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..d_w.len()),
+        rows,
+        odd_bpr,
+        &mut d_out,
+        0,
+    ) {
+        Err(super::Nvfp4LaunchError::OddBlocksPerRow(bpr)) => assert_eq!(bpr, odd_bpr),
+        Err(super::Nvfp4LaunchError::Driver(e)) => panic!("expected OddBlocksPerRow, got {e}"),
+        Ok(()) => panic!("odd blocks_per_row must refuse typed (I-k-div)"),
+    }
+}
+
 // Synthetic Q6_K weight wire bytes: rows*n_sb super-blocks of 210 bytes each
 // (ql[128] + qh[64] + scales(i8)[16] + d(f16)). Random payload with a small
 // positive f16 super-scale so the products stay in a sane f32 range.

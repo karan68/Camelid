@@ -424,6 +424,106 @@ extern "C" __global__ void q4_1_gemv(
     }
 }
 
+// ---- UE4M3 sub-block scale decode (header-free, exact) ---------------------
+// Bit-for-bit port of tensor::ue4m3_to_f32_const (which is itself pin-CPU-bitwise
+// vs ggml_ue4m3_to_fp32, ggml-impl.h): raw bytes 0x00 and 0x7F flush to 0.0 (the
+// NaN sentinel is checked on the RAW byte, so 0xFF is NOT flushed and decodes to
+// 240.0 — pin-CPU semantics; sentinel-bearing files are refused whole at load in
+// both lanes, so 0xFF only ever appears in crafted below-the-refusal-seam tests).
+// exp = bits 6..3 (bias 7), man = bits 2..0; exp==0 is subnormal man*2^-9, else
+// (1 + man/8) * 2^(exp-7); the extra 0.5 is the doubled-LUT pair-rule factor.
+// Every step scales an exact value by a power of two built directly from its
+// biased exponent via __uint_as_float, so with --fmad=false the result is
+// bit-equal to the Rust const table by construction (no libm, no rounding slack).
+__device__ __forceinline__ float ue4m3_to_f32(unsigned char byte) {
+    if (byte == 0x00 || byte == 0x7F) return 0.0f;
+    int e = (byte >> 3) & 0xF;
+    float man = (float)(byte & 0x7);
+    float raw;
+    if (e == 0) {
+        raw = man * __uint_as_float((unsigned int)(127 - 9) << 23); // man * 2^-9
+    } else {
+        raw = (1.0f + man / 8.0f) * __uint_as_float((unsigned int)(e - 7 + 127) << 23);
+    }
+    return raw * 0.5f;
+}
+
+// ---- NVFP4 GEMV: one warp per output row, raw 36-byte wire, Q8_0 activation ----
+// Bit-identical reproduction of the validated CPU oracle `nvfp4_wire_row_dot`
+// (inference.rs), i.e. the pin's `ggml_vec_dot_nvfp4_q8_0_generic` numeric shape.
+// Each 64-value NVFP4 superblock is 36 wire bytes: d[4] UE4M3 sub-block scales
+// then qs[32] packed E2M1 nibbles. One superblock spans TWO 32-value Q8_0
+// activation blocks: sub-blocks s=0,1 dot input[2*ib], s=2,3 dot input[2*ib+1],
+// at offset (s%2)*16 within that block; the low nibble of qs[s*8+j] is element
+// (s*16+j), the high nibble is element (s*16+8+j). Per sub-block the integer
+// accumulation is an EXACT i32 scalar-LUT nibble unpack (the q4_0_gemv precedent —
+// KV[] is tensor::KVALUES_MXFP4_I8), then the term is (x_scale * ue4m3(d[s])) *
+// (float)(sumi_lo + sumi_hi) with the SAME left-to-right association as the Rust,
+// and lane 0 sums the per-sub-block terms IN superblock-major / sub-block-minor
+// order == the CPU loop order, so the reduction stays token-identical. Weights are
+// read RAW (4.5 bpw preserved, no host expansion); the activation is the shared
+// Q8_0 buffer staged once like q8_gemv. `blocks_per_row` is the Q8_0 block count
+// (in_dim/32); one superblock spans two, so n_sb = blocks_per_row/2 (the launcher
+// refuses an odd count). MEASURED PARITY-NEUTRAL FOLLOW-UP (not done here per the
+// P4 scalar-first decision): the pin's get_int_from_table_16 __byte_perm expansion
+// + __dp4a inner loop yields the identical i32 sumi, so it cannot move parity —
+// adopt only if a perf receipt shows the kernel below the memory roofline.
+extern "C" __global__ void nvfp4_gemv(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smemN4[];
+    signed char* s_iq = (signed char*)smemN4;                        // blocks_per_row*32 i8
+    float* s_is = (float*)(smemN4 + (long)blocks_per_row * 32);       // blocks_per_row f32
+    float* terms = (float*)(smemN4 + (long)blocks_per_row * 36);      // warps*2*blocks_per_row f32
+    int tid = threadIdx.x;
+    // Stage the shared Q8_0 input vector cooperatively (coalesced), once per block.
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];             // blocks_per_row*32 bytes as ints
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int n_sb = blocks_per_row >> 1;                                  // NVFP4 superblocks per row (bpr even)
+    float* myterms = terms + (long)warp * 2 * blocks_per_row;        // 2*bpr sub-block terms per warp
+    const int WIRE = 36;
+    // Signed E2M1 codebook (== tensor::KVALUES_MXFP4_I8); scalar LUT, no dp4a bias hack.
+    const int KV[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    if (row < rows) {
+        long row_sb0 = (long)row * n_sb;
+        for (int b = lane; b < n_sb; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                float d = ue4m3_to_f32(blk[s]);
+                int act_blk = 2 * b + (s >> 1);         // input[2*ib + s/2]
+                int off = (s & 1) * 16;                 // (s%2)*16 within the activation block
+                const signed char* y = s_iq + (long)act_blk * 32;
+                const unsigned char* qs = blk + 4 + s * 8;
+                int sumi_lo = 0;
+                int sumi_hi = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    unsigned char byte = qs[j];
+                    sumi_lo += KV[byte & 0xF] * (int)y[off + j];
+                    sumi_hi += KV[byte >> 4] * (int)y[off + 8 + j];
+                }
+                myterms[4 * b + s] = (s_is[act_blk] * d) * (float)(sumi_lo + sumi_hi);
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int t = 0; t < 4 * n_sb; t++) acc += myterms[t];  // superblock-major, sub-block-minor
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
 // ---- Q4_K_M GEMV: one warp per output row, fused dequant + integer dot -------
 // Bit-identical reproduction of the validated CPU oracle `q4_k_wire_row_dot`
 // (ggml_vec_dot_q4_K_q8_K_generic shape). The activation is Q8_K (256-wide blocks
@@ -2922,6 +3022,7 @@ pub struct CudaResidentKernels {
     pub(crate) gemv: CudaFunction,
     pub(crate) q4_0_gemv: CudaFunction,
     pub(crate) q4_1_gemv: CudaFunction,
+    pub(crate) nvfp4_gemv: CudaFunction,
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q5k_gemv: CudaFunction,
     pub(crate) q6k_gemv: CudaFunction,
@@ -3015,6 +3116,7 @@ impl CudaResidentKernels {
             gemv: f("q8_gemv")?,
             q4_0_gemv: f("q4_0_gemv")?,
             q4_1_gemv: f("q4_1_gemv")?,
+            nvfp4_gemv: f("nvfp4_gemv")?,
             q4k_gemv: f("q4k_gemv")?,
             q5k_gemv: f("q5k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
@@ -3621,6 +3723,88 @@ pub(crate) fn launch_q4_1_gemv(
         .arg(out)
         .arg(&residual);
     unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Typed failure for [`launch_nvfp4_gemv`]. `OddBlocksPerRow` is the lane-native
+/// I-k-div guard — an odd Q8_0-block count (`in_dim % 64 != 0`) cannot form whole
+/// 64-value NVFP4 superblocks, so the launcher refuses it rather than mis-index;
+/// `Driver` wraps an ordinary CUDA launch error. Kept distinct from the bare
+/// `DriverError` the sibling launchers return so the divisibility refusal is a
+/// distinguishable, directly-testable variant (`nvfp4_gemv_requires_even_q8_blocks`).
+#[derive(Debug)]
+pub(crate) enum Nvfp4LaunchError {
+    OddBlocksPerRow(usize),
+    Driver(cudarc::driver::DriverError),
+}
+
+impl std::fmt::Display for Nvfp4LaunchError {
+    fn fmt(&self, fmtr: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Nvfp4LaunchError::OddBlocksPerRow(bpr) => write!(
+                fmtr,
+                "NVFP4 GEMV blocks_per_row {bpr} is odd (in_dim % 64 != 0); one 64-value \
+                 superblock spans two 32-value Q8_0 activation blocks"
+            ),
+            Nvfp4LaunchError::Driver(e) => write!(fmtr, "NVFP4 GEMV launch: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Nvfp4LaunchError {}
+
+/// NVFP4 GEMV launch: warp-per-row geometry like `launch_q4_0_gemv` (Q8_0
+/// activation), but the weight is RAW 36-byte NVFP4 superblock wire and one
+/// superblock spans TWO Q8_0 activation blocks, so the per-warp ordered-sum scratch
+/// holds `2*blocks_per_row` f32 sub-block terms (4 per superblock) instead of
+/// `blocks_per_row`. `blocks_per_row` is the Q8_0 activation block count
+/// (`in_dim/32`) and MUST be even (`in_dim % 64 == 0`): a lone 32-value activation
+/// block cannot pair into a 64-value superblock, so an odd count refuses TYPED
+/// (I-k-div lane-native guard; the file-parse boundary already refuses non-%64
+/// NVFP4 tensors, so this cannot fire in production — it exists for defense in depth
+/// and the direct refusal test). `residual != 0` fuses the post-projection add.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_nvfp4_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), Nvfp4LaunchError> {
+    // Fail-closed in EVERY build profile (not a debug_assert, which would panic
+    // before this typed refusal could be observed): an odd Q8_0-block count cannot
+    // form whole 64-value superblocks. This is the directly-tested I-k-div guard
+    // (nvfp4_gemv_requires_even_q8_blocks); in production gemma_proj_gemv proves the
+    // odd case impossible (parse refuses non-%64 NVFP4 first-dims) and maps it to
+    // unreachable!, which is the loud developer-facing failure for that path.
+    if !blocks_per_row.is_multiple_of(2) {
+        return Err(Nvfp4LaunchError::OddBlocksPerRow(blocks_per_row));
+    }
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let bpr = blocks_per_row as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged Q8_0 input: bpr*32 i8 + bpr*4 f32; per-warp scratch: 2*bpr f32
+        // sub-block terms (4 per NVFP4 superblock == 2 per activation block).
+        shared_mem_bytes: bpr * 32 + bpr * 4 + warps_per_block * 2 * bpr * 4,
+    };
+    let (r, nb) = (rows as i32, blocks_per_row as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }
+        .map(|_| ())
+        .map_err(Nvfp4LaunchError::Driver)
 }
 
 /// Per-projection GEMV dispatch: picks the kernel + activation buffers + contraction

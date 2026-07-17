@@ -282,49 +282,82 @@
         "test_file": "src/gemma4_runtime.rs",
         "test_fn": "cuda_lane_check_refuses_every_lane_uncovered_format_typed",
         "companion_tests": [
-          { "file": "src/gemma4_runtime.rs", "fn": "cuda_lane_check_refuses_nvfp4_before_the_from_wire_panic" },
+          { "file": "src/gemma4_runtime.rs", "fn": "cuda_lane_check_admits_nvfp4_after_the_phase4_lift" },
           { "file": "src/gemma4_runtime.rs", "fn": "cuda_lane_check_admits_the_supported_projection_formats" }
         ],
         "source": "src/gemma4_runtime.rs",
         "fixture": "seam:Gemma4CudaResident::load requires a bindable real gemma4 model plus a CUDA device — not constructible under the <4KB synthetic-fixture rule; nvfp4_cuda_lane_check is cfg-independent and driven directly on every WireFormat outside the lane's covered set",
-        "note": "SHA_E review extension: the check refuses EVERY format outside the lane's covered set (Q8_0/Q4_0/Q4_1) typed and named — NVFP4 (Phase 4 boundary message) AND the K-quants the CPU wire lane serves (Q4K/Q5K/Q6K, incl. the campaign's own Q4K-mm and Q4_K_M rows, which previously reached the from_wire repack panic under CAMELID_GEMMA4_CUDA=1). The earlier cell wording ('NVFP4 is this lane's uncovered format') was an overclaim caught by the pre-G3 adversarial review."
+        "note": "Phase 4 (G4) lift: the lane's covered set is now Q8_0/Q4_0/Q4_1/NVFP4 (nvfp4_gemv shipped), so the check ADMITS NVFP4 (positive control cuda_lane_check_admits_nvfp4_after_the_phase4_lift, inverting the pre-Phase-4 refusal — ratchet R3) and still refuses EVERY remaining uncovered format typed and named — the K-quants the CPU wire lane serves (Q4K/Q5K/Q6K, incl. the campaign's own Q4K-mm and Q4_K_M rows, which would otherwise reach the from_wire repack panic under CAMELID_GEMMA4_CUDA=1)."
       },
       "I-nan-scale": {
-        "status": "open",
-        "phase": "P4",
-        "note": "Inherited today: Gemma4CudaResident::load's first act is Gemma4Runtime::load, which runs the WireQuant sentinel scan — but NVFP4 never reaches residency in this release (nvfp4_cuda_lane_check refuses first), so the lane-native cell is P4's to earn with its own test."
+        "status": "enforced",
+        "test_file": "src/cuda_resident/tests.rs",
+        "test_fn": "nvfp4_gemv_decodes_ue4m3_sentinels_pin_cpu_bitwise",
+        "source": "src/cuda_resident.rs",
+        "companion_tests": [
+          { "file": "src/gemma4_runtime.rs", "fn": "wire_quant_new_refuses_nan_sentinel_scale_bytes" },
+          { "file": "tests/nvfp4_wire_lane_refusals.rs", "fn": "nan_sentinel_fixture_trips_the_scan_seam" }
+        ],
+        "fixture": "seam:the load-time sentinel REFUSAL is inherited — Gemma4CudaResident::load's first act is Gemma4Runtime::load, whose WireQuant::new nvfp4_find_nan_scale runs before any CUDA work; a CUDA-bound full-file trip needs a real gemma4 model + a CUDA device (not constructible under the <4KB fixture rule), so the S1 fixture trips the shared scan seam and the lane-native test proves the below-the-seam DECODE semantics on the kernel itself",
+        "note": "P4 earns this lane-natively two ways: (1) the inherited load-time refusal (companion wire_quant_new_refuses_nan_sentinel_scale_bytes drives the same WireQuant seam the CUDA entry shares; the S1 fixture trip is the on-disk leg); (2) the NEW kernel test feeds crafted 0x7F/0xFF scale blocks through nvfp4_gemv BELOW the refusal seam and bit-matches nvfp4_wire_row_dot, proving pin-CPU-bitwise decode (0x7F->0.0, 0xFF->240.0 — deliberately NOT the pin CUDA-intrinsic double-flush; D17 addendum/T5)."
       },
       "I-sidecar": {
-        "status": "open",
-        "phase": "P4",
-        "note": "Inherited today via Gemma4Runtime::load (nvfp4_sidecar_check fires before any CUDA work); P4 must pin it lane-natively when NVFP4 residency lands."
+        "status": "enforced",
+        "test_file": "src/gemma4_runtime.rs",
+        "test_fn": "cuda_resident_load_inherits_shared_sidecar_refusal",
+        "source": "src/gemma4_runtime.rs",
+        "companion_tests": [
+          { "file": "tests/nvfp4_wire_lane_refusals.rs", "fn": "sidecar_fixture_trips_d_b2_end_to_end" },
+          { "file": "src/gemma4_runtime.rs", "fn": "sidecar_check_admits_pilot_shapes" }
+        ],
+        "fixture": "seam:Gemma4CudaResident::load's first act is Gemma4Runtime::load, whose nvfp4_sidecar_check (D-B2) fires before any CUDA work — so the CUDA lane cannot bind a sidecar-bearing NVFP4 file; a CUDA-bound full-file trip is not constructible under the <4KB fixture rule, so the shared helper is unit-driven here and the end-to-end file trip on the same seam is the L2 cell's nvfp4_sidecar_trip.gguf",
+        "note": "The lane-native test drives the exact shared guard the CUDA entry inherits (sidecar refuses D-B2, pilot admits), and the end-to-end companion trips Gemma4Runtime::load — the CUDA lane's first act — on the on-disk sidecar fixture. No sidecar application exists on the v1 wire (I-scale-once), so this refusal IS the enforcement."
       },
       "I-scale-once": {
-        "status": "open",
-        "phase": "P4",
-        "note": "Kernel-epilogue vs host-side row scale is the P4 D-B2 seam decision (BASALT_CONDUCTOR.md §5 Phase 4); no NVFP4 kernel exists to test."
+        "status": "enforced",
+        "test_file": "src/cuda_resident/tests.rs",
+        "test_fn": "nvfp4_gemv_matches_oracle",
+        "source": "src/cuda_resident.rs",
+        "companion_tests": [
+          { "file": "src/gemma4_runtime.rs", "fn": "cuda_resident_load_inherits_shared_sidecar_refusal" }
+        ],
+        "fixture": "seam:v1 posture (D-B2, pin truth) — the P4 D-B2 seam (BASALT_CONDUCTOR.md §5 Phase 4: kernel epilogue vs host-side row scale) resolves as NEITHER EXISTS: there is no out-of-block per-tensor scale on the wire, and the four in-block UE4M3 sub-scales are applied exactly once inside the per-sub-block term (nvfp4_gemv), the same place the CPU oracle applies them",
+        "note": "Bit-parity on random + crafted blocks (nvfp4_gemv_matches_oracle, 100% bit-identical vs nvfp4_wire_row_dot) is the dropped/doubled-sub-scale killer — a scale applied zero or twice cannot survive same-bytes bit-comparison across the shapes; the sidecar-refusal companion enforces the whole-file half. If a future phase lands sidecar application, re-sign per BASALT_CONDUCTOR.md §3.3."
       },
       "I-k-div": {
-        "status": "open",
-        "phase": "P4",
-        "note": "Parse boundary (I-k-div L2 note) already guards file loads; the P4 kernel's block indexing needs its own divisibility proof."
+        "status": "enforced",
+        "test_file": "src/cuda_resident/tests.rs",
+        "test_fn": "nvfp4_gemv_requires_even_q8_blocks",
+        "source": "src/cuda_resident.rs",
+        "companion_tests": [
+          { "file": "src/cuda_resident/tests.rs", "fn": "nvfp4_gemv_matches_oracle" }
+        ],
+        "fixture": "nvfp4_k_div_trip.gguf",
+        "fixture_trip": "tests/invariant_matrix_binding.rs::k_div_fixture_trips_parse_refusal",
+        "note": "The file-parse boundary (tensor_nbytes, first dim % 64) still refuses non-%64 NVFP4 tensors before load (fixture trip). The P4 kernel earns its OWN divisibility proof lane-natively: launch_nvfp4_gemv refuses an odd Q8_0-block count typed (Nvfp4LaunchError::OddBlocksPerRow — one 64-value superblock spans two 32-value activation blocks), and nvfp4_gemv_matches_oracle exercises the 64-element indexing at 1 and many superblocks (n_sb 1/2/40/160)."
       },
       "I-carveout": {
         "status": "enforced",
         "test_file": "src/gemma4_runtime.rs",
         "test_fn": "cuda_lane_check_admits_the_supported_projection_formats",
         "source": "src/gemma4_runtime.rs",
-        "note": "Boundary-preservation direction: the new NVFP4 refusal must not bleed onto the formats this lane already served — Q8_0/Q4_0/Q4_1 projections (and the no-projection case) keep loading exactly as pre-BASALT."
+        "note": "Boundary-preservation direction: the K-quant refusal must not bleed onto the formats this lane serves — Q8_0/Q4_0/Q4_1 (pre-BASALT) AND NVFP4 (Phase 4) projections, plus the no-projection case, keep loading. Post-Phase-4 the covered set grew by NVFP4 only; every K-quant stays typed-refused (I-unknown-type)."
       },
       "I-cache-quant": {
-        "status": "open",
-        "phase": "P4",
-        "note": "Resident warm state (KV caches, CUDA graphs, scratch) is per-Gemma4CudaResident-instance today, keyed by model id in AppState::gemma4_runtimes and replaced on reload; the P4 NVFP4-resident path must prove its own keying/reset story (PR #419 lesson) rather than inherit this note."
+        "status": "na",
+        "reason": "Structural — NVFP4 residency adds NO new cross-instance warm state: the resident KV caches, the captured decode CUDA graph (SendGraph), the cached_tokens prefix, and the gpu_head buffers are all per-Gemma4CudaResident fields; instances are keyed by model id in AppState::gemma4_runtimes (src/api/mod.rs fn resolve_gemma4_runtime_for_model), replaced wholesale on reload and cleared on unload, and distinct quant rows are distinct files (G2 §1). The P4 NVFP4 upload path is upw raw-wire passthrough into fresh per-instance CudaSlices — it introduces no new cache to key. The Llama prompt-prefix cache (LlamaInferenceSession payload) has zero call sites in gemma4_runtime.rs, asserted by the meta-test's na-anchor check. Per orchestrator decision (recon §5 Q3) this closes na-with-structural-reasons; no behavioral reload test is pre-committed."
       },
       "I-plat": {
-        "status": "open",
-        "phase": "P4",
-        "note": "Per the amendment: L3 platform posture lands with the P4 lane itself. (The §9 gate inside Gemma4Runtime::load already fires on the shared load path, but the lane-native cell stays open until P4 owns it.)"
+        "status": "enforced",
+        "test_file": "src/gemma4_runtime.rs",
+        "test_fn": "cuda_resident_platform_gate_fronts_the_cuda_lane_entry",
+        "source": "src/gemma4_runtime.rs",
+        "companion_tests": [
+          { "file": "src/gemma4_runtime.rs", "fn": "windows_only_check_refuses_nvfp4_off_windows" },
+          { "file": "tests/nvfp4_wire_lane_refusals.rs", "fn": "nan_sentinel_fixture_trips_the_scan_seam" }
+        ],
+        "fixture": "seam:Gemma4CudaResident::load requires a real gemma4 model + a CUDA device — not constructible under the <4KB fixture rule; the §9 gate (nvfp4_windows_only_check) fires inside Gemma4Runtime::load, the CUDA lane's FIRST act, BEFORE any CUDA initialization, so the cfg-twin observes the refusal with no GPU, and the shared load-leg file trip is the L2 cell's nvfp4_nan_sentinel_trip.gguf",
+        "note": "cfg-twinned per §9.1 (its own named L3 test, not an inheritance note): off-Windows legs assert the CUDA lane's shared entry gate yields the named TK2 refusal before any CUDA init; the Windows leg asserts the pilot shape admits so the CUDA lane can bind (D-B3). The companion off-Windows refusal + the S1 fixture's load leg (Gemma4Runtime::load, the CUDA entry's first act) are the file-boundary coverage."
       }
     },
     "L4-metal": {
