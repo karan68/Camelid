@@ -111,6 +111,57 @@ fn diffusiongemma_real_file_is_refused() {
     assert_eq!(reject.offending_value, arch.unwrap());
 }
 
+/// BASALT Phase 2 (D-B3): a real pin-produced NVFP4 GGUF on a NON-pilot architecture
+/// (qwen3) must now PARSE (the enum variant moved the refusal off the parser) and then
+/// refuse at ADMISSION with the machine-readable pilot-scope reject. This is the
+/// refusal-point move the Phase 0 baseline receipt was captured to witness.
+/// Skipped when the artifact is absent (it lives in the models dir, not in git);
+/// honors `CAMELID_MODELS_DIR` like the serving stack does.
+#[test]
+fn qwen3_nvfp4_parses_then_pilot_scope_refuses() {
+    use camelid::runnable::AdmissionAxis;
+
+    let filename = "qwen3-0.6b-NVFP4-basalt-refusal.gguf";
+    let mut path = models_dir().join(filename);
+    if !path.exists() {
+        if let Ok(dir) = std::env::var("CAMELID_MODELS_DIR") {
+            path = PathBuf::from(dir).join(filename);
+        }
+    }
+    if !path.exists() {
+        eprintln!("SKIP {filename}: not present");
+        return;
+    }
+
+    // Parse now succeeds — before Phase 2 this failed at tensor_nbytes with
+    // `unknown or removed GGML type Unknown(40)`.
+    let file = read_metadata(&path).expect("NVFP4 GGUF must parse post-Phase-2");
+    let nvfp4_count = file
+        .tensors
+        .iter()
+        .filter(|t| t.tensor_type == GgufTensorType::NVFP4)
+        .count();
+    eprintln!(
+        "{filename}: {nvfp4_count} NVFP4 tensors of {}",
+        file.tensor_count
+    );
+    assert!(
+        nvfp4_count > 0,
+        "artifact must actually carry NVFP4 tensors"
+    );
+
+    let reject = admit(&file).expect_err("non-pilot arch with NVFP4 must refuse (D-B3)");
+    eprintln!(
+        "REFUSED: axis={:?} value={} tensor={:?} :: {reject}",
+        reject.axis, reject.offending_value, reject.tensor
+    );
+    assert_eq!(reject.axis, AdmissionAxis::Quant);
+    assert_eq!(reject.offending_value, "NVFP4");
+    assert!(reject
+        .message
+        .contains("pilot-scoped to gemma4 until Gate G3"));
+}
+
 /// Mirror of the gate's covered-quant predicate, for the sanity check above.
 fn is_covered_quant(tt: GgufTensorType) -> bool {
     matches!(
