@@ -796,6 +796,20 @@ bypassed the top-level matvec's Q4_K/Q6_K → Q8_K-activation routing and panick
 (byte-identical for NVFP4/Q8_0/Q4_0/Q4_1), Q5_K matvec roles refuse typed at load, and the
 L2 I-unknown-type cell note is corrected (`qa/invariant_lanes.json`).
 
+**D17 addendum 4 — Gate G3 outcome: NO-GO (2026-07-17, final freeze SHA `8038abba`).** The
+pre-registered §5.2 rule (GO iff `agreement(NVFP4-mm)` ≥ `agreement(Q4K-mm)` − 2.0 pp) was
+applied verbatim to the eval legs: `agreement(NVFP4-mm)` = 88.5, `agreement(Q4K-mm)` = 92.6,
+threshold 90.6 → **NO-GO** (gap 4.1 pp, > 2× tolerance; sanity guard held at 92.6 ≥ 80.0).
+NVFP4-mm is the worst of the four produced rows on both top-1 agreement and mean KL vs the
+Q8_0 parent (all figures **vs Q8_0 parent, matched 4.5 bpw**, Amendment 3 §4). The
+format-isolated comparison isolates this to the weight format alone (proven identical
+elsewhere at G2). Cross-engine token parity passed independently (Leg B 8/9, one attributed
+0.084-logit near-tie). **Conclusion recorded as measured; no threshold adjusted.** The
+decode-bandwidth motivation (Phase 4) is a separate axis untouched by this quality verdict.
+Scope decision — postmortem-and-stop (A) vs continue-to-Phase-4-on-bandwidth-grounds (B) —
+is Tim's; recommendation (A) as the honest default, in the G3 PR. Receipts:
+`qa/evidence-bundles/basalt/phase3/BASALT_G3_SUMMARY.md` + `legs/`.
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
