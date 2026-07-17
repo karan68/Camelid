@@ -860,6 +860,29 @@ a 6.06 GB model full-offload on a 6144 MiB card is not comfortable headroom). Re
 `qa/evidence-bundles/basalt/phase4/cert/` (parity_cert.json, perf_table.json, byte_accounting.json,
 G4_PERF.md, sanitized command/resource logs).
 
+**D17 addendum 7 (2026-07-17, Phase 4b — dp4a kernel upgrade landed, Option B executed).** Tim
+chose **Option B** at G4. The pre-registered parity-neutral upgrade is done: `nvfp4_gemv`'s
+per-sub-block integer dot (`src/cuda_resident.rs`) was rewritten from the scalar nibble-unpack +
+E2M1 KV-LUT × q8 multiply to the pin's `get_int_from_table_16` `__byte_perm` codebook expansion
+(nibble → signed int8) + `__dp4a` 4-way int8 dot — ported exactly from ggml-cuda/vecdotq.cuh
+(`sm_86` already has `__dp4a`; no arch change; the v1 scalar loop is kept as a code comment for
+the before/after receipt). Because the accumulated i32 `sumi` is identical by construction, it
+cannot move parity, and the gate confirms it: **`nvfp4_gemv_matches_oracle` stays 46/46
+bit-identical, worst rel diff 0.000e0**, with the sentinel-decode, residual-fusion, and
+even-bpr guards all green (plus fmt/clippy-all-features-deny/plain-test clean). **Perf (median
+of 5 warm runs, 128 greedy tokens, this box): NVFP4-mm CUDA decode 14.64 → 26.51 tok/s
+(+81.1 %, 1.81×)**, moving from 13.3 % to **24.0 %** of the 336 GB/s DRAM roofline (peak VRAM
+unchanged at 3479 MiB; byte read set unchanged at 3.048 GB/token). It **did NOT reach the
+roofline** (Q8_0 still sits higher at 39.8 %, so the kernel is not yet fully memory-bound), but
+the ~1.8× lift is enough to **overtake Q8_0: 26.51 vs 25.80 tok/s (1.03×)** — a narrow but
+measured decode-speed win, because NVFP4 reads 1.70× fewer bytes/token. **Option-B outcome:
+NVFP4-mm on this box is now BOTH faster than Q8_0 (1.03×) AND 2.08 GB lighter in VRAM.** The
+Phase-6 claim-lint statement updates accordingly (faster + lighter on this card, decode-only,
+narrow; the G3 quality delta still travels unchanged). The gpu_head lever (§5 Q4) and closing
+the remaining roofline gap remain open follow-ons, not scheduled. Receipts:
+`qa/evidence-bundles/basalt/phase4/cert/` (perf_table.json `NVFP4mm_cuda_dp4a` row kept beside
+the v1 row; BASALT_G4_SUMMARY.md §2/§3/§4; p4b_dp4a_perf_log.md).
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on

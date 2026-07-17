@@ -448,6 +448,33 @@ __device__ __forceinline__ float ue4m3_to_f32(unsigned char byte) {
     return raw * 0.5f;
 }
 
+// ---- NVFP4 nibble -> signed-int8 codebook expansion via __byte_perm ----------
+// Ported EXACTLY from the pin's get_int_from_table_16 (ggml-cuda/vecdotq.cuh:34-80,
+// CUDA branch). `q4` packs 8 nibbles across 4 little-endian bytes; the returned
+// pair holds the codebook value at each nibble index as four packed int8s ready
+// for __dp4a: `.x` = the four EVEN indices (the low nibble of each byte), `.y` =
+// the four ODD indices (the high nibble of each byte). CUDA has no 4-bit-index
+// byte select, so __byte_perm (3-bit index) is used twice per half with a
+// fourth-bit low/high merge. Crucially it selects whole BYTES from `table`, so a
+// signed codebook entry (e.g. -12 stored as 0xF4) survives intact and __dp4a
+// reads it back as a signed int8. `table` is the 16-entry signed E2M1 codebook.
+__device__ __forceinline__ int2 nvfp4_table_lookup_16(int q4, const signed char* table) {
+    const unsigned int* table32 = (const unsigned int*) table;
+    // __byte_perm selects bytes from the low 3 bits of each index nibble; the 4th
+    // (sign/high-half) bit picks between the low and high 8 table entries.
+    const unsigned int low_high_selection_indices = (0x32103210u | ((q4 & 0x88888888) >> 1));
+    unsigned int tmp[2];
+    #pragma unroll
+    for (unsigned int i = 0; i < 2; ++i) {
+        const unsigned int shift = 16 * i;
+        const unsigned int low  = __byte_perm(table32[0], table32[1], q4 >> shift);
+        const unsigned int high = __byte_perm(table32[2], table32[3], q4 >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+    // tmp holds the bytes in nibble order; regroup into all-even / all-odd ints.
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
 // ---- NVFP4 GEMV: one warp per output row, raw 36-byte wire, Q8_0 activation ----
 // Bit-identical reproduction of the validated CPU oracle `nvfp4_wire_row_dot`
 // (inference.rs), i.e. the pin's `ggml_vec_dot_nvfp4_q8_0_generic` numeric shape.
@@ -464,10 +491,12 @@ __device__ __forceinline__ float ue4m3_to_f32(unsigned char byte) {
 // read RAW (4.5 bpw preserved, no host expansion); the activation is the shared
 // Q8_0 buffer staged once like q8_gemv. `blocks_per_row` is the Q8_0 block count
 // (in_dim/32); one superblock spans two, so n_sb = blocks_per_row/2 (the launcher
-// refuses an odd count). MEASURED PARITY-NEUTRAL FOLLOW-UP (not done here per the
-// P4 scalar-first decision): the pin's get_int_from_table_16 __byte_perm expansion
-// + __dp4a inner loop yields the identical i32 sumi, so it cannot move parity —
-// adopt only if a perf receipt shows the kernel below the memory roofline.
+// refuses an odd count). PHASE 4b (Option B): the per-sub-block integer dot is now
+// the pin's get_int_from_table_16 __byte_perm expansion + __dp4a inner loop (see
+// the loop body). The v1 scalar KV-LUT nibble unpack was correct (46/46 bit-
+// identical) but COMPUTE-BOUND on this box (13.3% of the 336 GB/s DRAM roofline vs
+// Q8_0's 39.8%), so its 1.70x byte reduction did not become speed; dp4a yields the
+// IDENTICAL i32 sumi (recon §3.2), so it cannot move parity, only the instructions.
 extern "C" __global__ void nvfp4_gemv(
     const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
@@ -491,8 +520,10 @@ extern "C" __global__ void nvfp4_gemv(
     int n_sb = blocks_per_row >> 1;                                  // NVFP4 superblocks per row (bpr even)
     float* myterms = terms + (long)warp * 2 * blocks_per_row;        // 2*bpr sub-block terms per warp
     const int WIRE = 36;
-    // Signed E2M1 codebook (== tensor::KVALUES_MXFP4_I8); scalar LUT, no dp4a bias hack.
-    const int KV[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    // Signed E2M1 codebook (== tensor::KVALUES_MXFP4_I8), stored as int8 bytes so
+    // the __byte_perm table lookup (nvfp4_table_lookup_16) selects the correct
+    // signed value for __dp4a (e.g. -12 == 0xF4 survives as a signed int8).
+    const signed char KV[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
     if (row < rows) {
         long row_sb0 = (long)row * n_sb;
         for (int b = lane; b < n_sb; b += 32) {
@@ -504,15 +535,30 @@ extern "C" __global__ void nvfp4_gemv(
                 int off = (s & 1) * 16;                 // (s%2)*16 within the activation block
                 const signed char* y = s_iq + (long)act_blk * 32;
                 const unsigned char* qs = blk + 4 + s * 8;
-                int sumi_lo = 0;
-                int sumi_hi = 0;
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    unsigned char byte = qs[j];
-                    sumi_lo += KV[byte & 0xF] * (int)y[off + j];
-                    sumi_hi += KV[byte >> 4] * (int)y[off + 8 + j];
-                }
-                myterms[4 * b + s] = (s_is[act_blk] * d) * (float)(sumi_lo + sumi_hi);
+                // v1 (scalar, kept for the receipt) accumulated, over j=0..8:
+                //   sumi_lo += KV[qs[j] & 0xF] * y[off + j];
+                //   sumi_hi += KV[qs[j] >> 4] * y[off + 8 + j];
+                // then used (float)(sumi_lo + sumi_hi). That was compute-bound
+                // (13.3% of roofline on this box), so the nibble unpack + KV
+                // multiply is replaced by nvfp4_table_lookup_16 (__byte_perm) +
+                // __dp4a: t0/t1 expand the 8 low + 8 high nibbles to signed int8
+                // codebook values (.x = low nibbles, .y = high nibbles), and four
+                // __dp4a calls form the SAME 16 low + 16 high signed-int8 products.
+                // Integer add is exact and order-free, so the accumulated i32
+                // equals sumi_lo + sumi_hi exactly — parity is untouched (§3.2);
+                // the sub-block UE4M3 scale is still applied ONCE here, and the
+                // lane-0 ordered f32 sum below is UNCHANGED.
+                int q0 = *reinterpret_cast<const int*>(qs);       // qs[0..4]
+                int q1 = *reinterpret_cast<const int*>(qs + 4);   // qs[4..8]
+                int2 t0 = nvfp4_table_lookup_16(q0, KV);          // .x low, .y high nibbles
+                int2 t1 = nvfp4_table_lookup_16(q1, KV);
+                const int* ylo = reinterpret_cast<const int*>(y + off);      // y[off+0..8]
+                const int* yhi = reinterpret_cast<const int*>(y + off + 8);  // y[off+8..16]
+                int sumi = __dp4a(t0.x, ylo[0], 0);   // KV[qs0..3 & F] . y[off+0..4]
+                sumi = __dp4a(t1.x, ylo[1], sumi);    // KV[qs4..7 & F] . y[off+4..8]
+                sumi = __dp4a(t0.y, yhi[0], sumi);    // KV[qs0..3 >> 4] . y[off+8..12]
+                sumi = __dp4a(t1.y, yhi[1], sumi);    // KV[qs4..7 >> 4] . y[off+12..16]
+                myterms[4 * b + s] = (s_is[act_blk] * d) * (float)sumi;
             }
         }
     }
