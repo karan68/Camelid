@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "f74b61ba",
+    "source_head": "e3f81552",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -71,6 +71,11 @@
         "id": "Q4_K_M/Q5_K_M",
         "status": "planned_beyond_named_certified_rows",
         "notes": "additional K-quant rows beyond the named certified exact rows (see supported_quantization and the K-quant model_compatibility rows) remain planned; support never spreads to neighboring files"
+      },
+      {
+        "id": "NVFP4",
+        "status": "planned_beyond_named_certified_rows",
+        "notes": "Engine facts shipped for the gemma-4-E4B-it pilot only, Windows-only (NVFP4 = E2M1 4-bit weights with UE4M3 sub-block scales, type id 40, 64-element/36-byte superblock). Loads and decodes bit-exact on the CPU wire lane and the CUDA-resident nvfp4_gemv dp4a kernel (46/46 bit-identical to the CPU oracle); sidecar-bearing and NaN-sentinel files fail closed. Measured vs the Q8_0 parent at matched 4.5 bpw: NOT quality-competitive with Q4_K (Gate G3 NO-GO, 88.5% vs 92.6% top-1 agreement, 0.111 vs 0.065 mean-KL nats). On an RTX 3060 Laptop the CUDA decode is 1.03x faster than Q8_0 (26.51 vs 25.80 tok/s) and 2.08 GB lighter in VRAM -- decode-only, measured on this box, not a general claim. Runnable-lane admission covers the format with no parity claim; no certified support row -- Supported promotion is a separate later decision. Phase 5 Blackwell tensor-core path is BLOCKED-HW (no sm_120 silicon)."
       }
     ],
     "supported_model_families": [
