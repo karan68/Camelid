@@ -8,6 +8,8 @@ frontend/dist/
 
 # Internal/local harness command scratchpads
 *-harness-commands.md
+# Local agent scratch dir — measurement logs etc. carry host paths; never commit.
+/scratchpad/
 
 # Raw evidence bundle staging copies may contain private host/path details; publish only the sanitized *-public-* variants.
 qa/evidence-bundles/four-row-20260503T024119Z/

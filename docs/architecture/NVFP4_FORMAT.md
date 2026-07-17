@@ -14,7 +14,11 @@ NVFP4 is llama.cpp's E2M1 4-bit weight format with per-16-element UE4M3 sub-bloc
 targeted **decode bandwidth** on a 6 GB card: the pilot's 294 matmul weights shrink 1.889×
 vs Q8_0, moving fewer bytes per token. The vehicle is `gemma-4-E4B-it` and nothing else —
 the runnable-lane admission is a pilot-model-only carve-out (D-B3), and the format is
-Windows-only in this release. The 6 GB *full-residency* motivation was refuted at recon (the
+Windows-only in this release. Runnable-lane admission covers the NVFP4 format, but its only
+produced file (gemma4-E4B) executes via `gemma4_runtime` — the CPU wire + CUDA-resident lanes,
+not the generic runnable serve bridge — and itself refuses generic runnable admission on its
+BF16 tensor (`per_layer_model_proj`, G2 §6b). "Runnable" here is format admission, not a
+runnable serve path. The 6 GB *full-residency* motivation was refuted at recon (the
 Q8_0 embeddings are never repacked, ~3.7 GB of them), so the campaign proceeds on
 decode-bandwidth + partial-residency grounds, not a fully-resident promise.
 
