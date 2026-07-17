@@ -53,7 +53,7 @@
       "invariant": "D-B3 boundary: everything OUTSIDE the gemma4+NVFP4 pilot carve-out keeps its pre-BASALT behavior — gemma4 files without NVFP4 and all other architectures keep their refusals byte-for-byte; formats a lane already served keep loading.",
       "sources": [
         "DECISIONS.md D17 addendum 2 (architecture-axis carve-out, signed at G2)",
-        "BASALT_G2_SUMMARY.md §6/§9 (refusal-move receipts; review fix: generic refusal message byte-identical to pre-BASALT main)"
+        "BASALT_G2_SUMMARY.md §6/§9 (refusal-move receipts; the S1 review fix's byte-identical-message pin is superseded by DECISIONS.md D-B6, which lists BF16 in the covered set — a sanctioned covered-set widening, IQ4_XS precedent)"
       ]
     },
     {
@@ -171,10 +171,10 @@
         "source": "src/runnable/admit.rs",
         "companion_tests": [
           { "file": "src/runnable/admit.rs", "fn": "rejects_gemma4_without_nvfp4" },
-          { "file": "src/runnable/admit.rs", "fn": "gemma4_nvfp4_with_bf16_refuses_on_bf16" },
+          { "file": "src/runnable/admit.rs", "fn": "gemma4_nvfp4_with_bf16_admits_fully_after_d_b6" },
           { "file": "src/runnable/smoke.rs", "fn": "gemma4_nvfp4_smoke_refusal_is_not_yet_anchored" }
         ],
-        "note": "The three admit tests pin the boundary in all directions (non-gemma4+NVFP4 refuses with the D-B3 scope message; gemma4-without-NVFP4 keeps the architecture refusal; the generic uncovered-quant message is byte-identical to pre-BASALT main per the S1 review fix). The smoke test pins admit-then-fail exclusion: the pilot stays oracle-refused until G3."
+        "note": "The three admit tests pin the boundary in all directions (non-gemma4+NVFP4 refuses with the D-B3 scope message; gemma4-without-NVFP4 keeps the architecture refusal; the real pilot shape now ADMITS FULLY after BASALT D-B6 added BF16 to the covered set — the off-Windows twin gemma4_nvfp4_with_bf16_refuses_off_windows_platform_gate keeps the §9 gate, and the SHA_E byte-identical-message pin is retired since the covered set now lists BF16, a sanctioned widening per the IQ4_XS precedent). The smoke test pins admit-then-fail exclusion: the pilot stays oracle-refused until G3."
       },
       "I-cache-quant": {
         "status": "na",

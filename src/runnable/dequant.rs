@@ -7,10 +7,13 @@
 //! anchored externally against ggml reference fixtures (Gate 2), not trusted from the
 //! internal paths it reuses.
 //!
-//! Covered v1 set: `F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS`, plus `NVFP4`
-//! (admission-scoped to the gemma4 pilot until Gate G3 — BASALT D-B3). Anything else
-//! is refused — admission (`super::admit`) should already have rejected it, but
-//! dequant fails closed regardless.
+//! Covered v1 set: `F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16`, plus
+//! `NVFP4` (admission-scoped to the gemma4 pilot until Gate G3 — BASALT D-B3).
+//! BF16 joined the covered set at BASALT D-B6 (2026-07-17) as an exact-decode type:
+//! bf16 is the high 16 bits of f32, so decode is the lossless bit-widening
+//! [`crate::tensor::decode_bf16_tensor`] (no new numeric code). Anything else is
+//! refused — admission (`super::admit`) should already have rejected it, but dequant
+//! fails closed regardless.
 //!
 //! NVFP4 seam note: admission is metadata-only, so the D17/T5 NaN-sentinel refusal
 //! (UE4M3 scale bytes `0x7F`/`0xFF`) cannot happen there — it fires HERE, inside
@@ -19,9 +22,9 @@
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
 use crate::tensor::{
-    decode_iq4_xs_tensor, decode_nvfp4_tensor, decode_q3_k_tensor, decode_q4_0_tensor,
-    decode_q4_k_tensor, decode_q5_k_tensor, decode_q6_k_tensor, decode_q8_0_tensor,
-    f16_bits_to_f32,
+    decode_bf16_tensor, decode_iq4_xs_tensor, decode_nvfp4_tensor, decode_q3_k_tensor,
+    decode_q4_0_tensor, decode_q4_k_tensor, decode_q5_k_tensor, decode_q6_k_tensor,
+    decode_q8_0_tensor, f16_bits_to_f32,
 };
 
 /// Dequantize one tensor's wire bytes to a flat row-major `Vec<f32>` of
@@ -42,13 +45,18 @@ pub fn dequantize(
         GgufTensorType::Q5K => decode_q5_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q6K => decode_q6_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::IQ4XS => decode_iq4_xs_tensor(tensor_name, bytes, n_elements),
+        // BASALT D-B6: BF16 is a covered exact-decode quant. bf16 stores the top 16
+        // bits of the f32 encoding, so widening (u32::from(u16) << 16) is lossless
+        // and bit-deterministic — definitionally identical to the pin's
+        // ggml_bf16_to_fp32. Reuses the crate's existing decoder; no new numeric code.
+        GgufTensorType::BF16 => decode_bf16_tensor(tensor_name, bytes, n_elements),
         // Pin-bitwise NVFP4 decode; refuses NaN-sentinel UE4M3 scale bytes
         // (0x7F/0xFF) per DECISIONS.md D17/T5 — the byte-level half of the
         // admission seam split documented in `super::admit::check_quants`.
         GgufTensorType::NVFP4 => decode_nvfp4_tensor(tensor_name, bytes, n_elements),
         other => Err(BackendError::UnsupportedTensorType(format!(
             "tensor {tensor_name} is {other:?}; runnable dequant covers \
-             F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, NVFP4"
+             F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16, NVFP4"
         ))),
     }
 }
@@ -110,6 +118,20 @@ mod tests {
     fn uncovered_quant_refused() {
         let err = dequantize(GgufTensorType::Q2K, &[0u8; 84], 256, "blk.0").unwrap_err();
         assert!(matches!(err, BackendError::UnsupportedTensorType(_)));
+    }
+
+    #[test]
+    fn bf16_dispatches_to_decoder() {
+        // BASALT D-B6: the runnable dispatch routes BF16 to the lossless exact-
+        // widening decoder. Wire bytes are LE u16: 0x3F80 -> 1.0, 0xC000 -> -2.0,
+        // 0x0000 -> +0.0, 0x8000 -> -0.0. Compared on to_bits so -0.0 is distinct.
+        let bytes = [0x80, 0x3F, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x80];
+        let out = dequantize(GgufTensorType::BF16, &bytes, 4, "blk.0").unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].to_bits(), 1.0f32.to_bits());
+        assert_eq!(out[1].to_bits(), (-2.0f32).to_bits());
+        assert_eq!(out[2].to_bits(), 0.0f32.to_bits());
+        assert_eq!(out[3].to_bits(), (-0.0f32).to_bits());
     }
 
     #[test]
