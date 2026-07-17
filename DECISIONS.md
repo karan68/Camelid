@@ -773,3 +773,13 @@ strengthened: Camelid decode is pin-CPU-bitwise (`0xFF` → 240.0), and admissio
 files containing either sentinel byte — such files cannot even produce a well-defined
 cross-backend oracle. Also fixture-corrected: `decode(0x7E)` = 224.0 (a Phase 0 aside said
 112.0). See BASALT_RECON.md §1 [G1 errata] and the Phase 1 evidence bundle.
+
+**D17 addendum 2 (2026-07-16, G2 signed):** Tim signed Gate G2 (PR #470 merged), which
+included the flagged D-B3 implementation shape: since gemma4 is deliberately outside the
+runnable lane's covered architectures, the pilot scoping is an architecture-axis
+carve-out — a gemma4 GGUF passes that axis iff it carries ≥1 NVFP4 tensor; gemma4 files
+without NVFP4 and all other architectures keep their pre-BASALT refusals byte-for-byte.
+Additionally (Phase 3): the D-B2 sidecar refusal and the T5 NaN-sentinel refusal are
+enforced in BOTH lanes — runnable admission/decode (Phase 2) and the gemma4 wire lane
+(`nvfp4_sidecar_check` at load + `WireQuant::new` sentinel scan) — because the wire lane
+never runs the runnable decoder and would otherwise silently bypass both signed postures.

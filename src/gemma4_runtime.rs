@@ -846,6 +846,39 @@ impl Gemma4Runtime {
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_layer_range(path, None)
     }
+}
+
+/// BASALT D-B2 fail-closed (DECISIONS.md D17): a ModelOpt-converted NVFP4 GGUF
+/// carries per-tensor sidecar scales as separate `.scale` / `.input_scale`
+/// tensors that MUST be multiplied post-matmul. The gemma4 wire lane does not
+/// implement that multiply, and silently ignoring the sidecars would compute
+/// wrong logits — so an NVFP4 file that carries any refuses at load, mirroring
+/// the runnable-lane admission check. Pin-quantized rows (the BASALT pilot
+/// artifacts, receipted at G2) carry none; the pilot's real
+/// `blk.N.layer_output_scale.weight` tensors do NOT match these suffixes.
+pub(crate) fn nvfp4_sidecar_check(
+    tensors: &[crate::gguf::GgufTensorDescriptor],
+) -> Result<()> {
+    if tensors
+        .iter()
+        .any(|t| t.tensor_type == GgufTensorType::NVFP4)
+    {
+        if let Some(sidecar) = tensors
+            .iter()
+            .find(|t| t.name.ends_with(".scale") || t.name.ends_with(".input_scale"))
+        {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "NVFP4 GGUF carries per-tensor sidecar scale tensor {}; the gemma4 \
+                 wire lane does not apply sidecar scales and refuses rather than \
+                 compute wrong logits (BASALT D-B2)",
+                sidecar.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl Gemma4Runtime {
 
     /// Load only the given contiguous global layer range (None = all layers).
     /// Fails closed if the range would separate a KV-sharing layer from the
@@ -853,6 +886,14 @@ impl Gemma4Runtime {
     /// as its source layer).
     pub fn load_layer_range(path: &Path, range: Option<std::ops::Range<usize>>) -> Result<Self> {
         let gguf = read_metadata(path)?;
+        // BASALT D-B2 fail-closed (DECISIONS.md D17): a ModelOpt-converted NVFP4
+        // GGUF carries per-tensor sidecar scales as separate `.scale` /
+        // `.input_scale` tensors that MUST be multiplied post-matmul. This wire
+        // lane does not implement that multiply, and silently ignoring the
+        // sidecars would compute wrong logits — so an NVFP4 file that carries
+        // any refuses here, mirroring the runnable-lane admission check.
+        // Pin-quantized rows (the BASALT pilot artifacts) carry none.
+        nvfp4_sidecar_check(&gguf.tensors)?;
         let config = LlamaModelConfig::from_gguf(&gguf)?;
         let g = config.gemma4.clone().ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
@@ -4736,6 +4777,44 @@ mod nvfp4_wire_tests {
             absolute_offset: 0,
             n_bytes,
         }
+    }
+
+    #[test]
+    fn sidecar_check_refuses_nvfp4_with_scale_tensors() {
+        // ModelOpt-converted shape: NVFP4 weight + its sidecar `.scale` /
+        // `.input_scale` F32 tensors — the wire lane must refuse (D-B2).
+        for sidecar_name in ["blk.0.attn_q.scale", "blk.0.attn_q.input_scale"] {
+            let tensors = vec![
+                desc("blk.0.attn_q.weight", GgufTensorType::NVFP4, &[64, 4], 144),
+                desc(sidecar_name, GgufTensorType::F32, &[1], 4),
+            ];
+            let err = nvfp4_sidecar_check(&tensors).expect_err("sidecar must refuse");
+            let msg = err.to_string();
+            assert!(msg.contains(sidecar_name), "{msg}");
+            assert!(msg.contains("D-B2"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn sidecar_check_admits_pilot_shapes() {
+        // The pilot's real `layer_output_scale.weight` name must NOT false-positive,
+        // and sidecar-suffixed names without any NVFP4 tensor are out of scope.
+        let pilot = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::NVFP4, &[64, 4], 144),
+            desc(
+                "blk.0.layer_output_scale.weight",
+                GgufTensorType::F32,
+                &[1, 4],
+                16,
+            ),
+        ];
+        nvfp4_sidecar_check(&pilot).expect("pilot shape admits");
+
+        let no_nvfp4 = vec![
+            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0, &[64, 4], 136),
+            desc("blk.0.attn_q.scale", GgufTensorType::F32, &[1], 4),
+        ];
+        nvfp4_sidecar_check(&no_nvfp4).expect("no NVFP4 -> check is out of scope");
     }
 
     /// Write `wire` to a temp file and wrap it in the two inputs WireQuant::new
