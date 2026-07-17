@@ -918,20 +918,35 @@ fn nvfp4_metal_lane_check(tensors: &[crate::gguf::GgufTensorDescriptor]) -> Resu
     Ok(())
 }
 
-/// BASALT Amendment 3 review fix (CUDA lane typed refusal): the CUDA-resident
-/// gemma4 lane repacks layer projections via `GemmaLayerQuant::from_wire`, whose
-/// catch-all PANICS on any format outside Q8_0/Q4_0/Q4_1. NVFP4 must instead
-/// refuse with a typed error before that seam is reachable. cfg-independent over
-/// [`WireFormat`]s so it unit-tests without CUDA hardware; the
-/// `cfg(feature = "cuda")` load site ([`Gemma4CudaResident::load`]) wires it.
+/// BASALT Amendment 3 review fix (CUDA lane typed refusal), extended at SHA_E
+/// review: the CUDA-resident gemma4 lane repacks layer projections via
+/// `GemmaLayerQuant::from_wire`, whose catch-all PANICS on any format outside
+/// its covered set (Q8_0/Q4_0/Q4_1). Every lane-uncovered format — NVFP4 (Phase
+/// 4's work) AND the K-quants the CPU wire lane happily serves (the campaign's
+/// own Q4K-mm / Q4_K_M rows) — must refuse with a typed, named error before
+/// that panic seam is reachable (invariant I-unknown-type, L3 cell).
+/// cfg-independent over [`WireFormat`]s so it unit-tests without CUDA hardware;
+/// the `cfg(feature = "cuda")` load site ([`Gemma4CudaResident::load`]) wires it.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn nvfp4_cuda_lane_check<I: IntoIterator<Item = WireFormat>>(formats: I) -> Result<()> {
-    if formats.into_iter().any(|f| f == WireFormat::Nvfp4) {
-        return Err(BackendError::UnsupportedGguf(
-            "NVFP4 CUDA-resident lane is Phase 4 (BASALT); the CPU lane serves NVFP4 \
-             in this release"
-                .into(),
-        ));
+    for f in formats {
+        match f {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => {}
+            WireFormat::Nvfp4 => {
+                return Err(BackendError::UnsupportedGguf(
+                    "NVFP4 CUDA-resident lane is Phase 4 (BASALT); the CPU lane serves \
+                     NVFP4 in this release"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(BackendError::UnsupportedGguf(format!(
+                    "gemma4 CUDA-resident lane covers Q8_0/Q4_0/Q4_1 layer projections; \
+                     {other:?} is not wired (the CPU lane serves it) — refusing instead \
+                     of reaching the repack panic (BASALT I-unknown-type, L3)"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -5166,6 +5181,31 @@ mod gpu_lane_refusal_tests {
         nvfp4_cuda_lane_check([WireFormat::Q8_0, WireFormat::Q4_0, WireFormat::Q4_1])
             .expect("Q8_0/Q4_0/Q4_1 projections stay admitted");
         nvfp4_cuda_lane_check(std::iter::empty()).expect("no projections is vacuously fine");
+    }
+
+    #[test]
+    fn cuda_lane_check_refuses_every_lane_uncovered_format_typed() {
+        // SHA_E review finding #1: the campaign's own K-quant rows (Q4K-mm,
+        // Q4_K_M-df/-im) load clean on the CPU wire lane but would hit the
+        // from_wire repack panic on the CUDA lane. Every format outside the
+        // lane's covered set must refuse TYPED and NAMED — never a panic
+        // (invariant I-unknown-type, L3 cell).
+        for uncovered in [WireFormat::Q4K, WireFormat::Q5K, WireFormat::Q6K] {
+            match nvfp4_cuda_lane_check([WireFormat::Q8_0, uncovered]) {
+                Err(BackendError::UnsupportedGguf(msg)) => {
+                    assert!(
+                        msg.contains(&format!("{uncovered:?}")),
+                        "refusal must name the format: {msg}"
+                    );
+                    assert!(
+                        msg.contains("covers Q8_0/Q4_0/Q4_1"),
+                        "refusal must name the covered set: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
+                Ok(()) => panic!("{uncovered:?} projection must refuse in the CUDA lane"),
+            }
+        }
     }
 
     #[test]

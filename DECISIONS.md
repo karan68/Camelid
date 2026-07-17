@@ -810,11 +810,15 @@ byte-unchanged per §1.3 (`qa/evidence-bundles/basalt/phase3/row_rehash_post_clo
   file's text, and trips the committed `tests/fixtures/gguf/` fixtures (or
   references the S1 per-lane test that already trips them — no duplicate
   execution). HONESTLY NOTED: this is file-level compile-time + name-level
-  test-time — a fn RENAME fails the meta-test, not the build. That is the
-  §2.4-permitted substitution; acceptable because the meta-test runs in the
-  same `ci-gate` suite as the build (either way the PR goes red before merge),
-  and it is strictly stronger than nothing on both axes: moved/renamed files
-  cannot compile, renamed/deleted test fns cannot pass. Open-cell teeth: the
+  test-time — a fn RENAME fails the meta-test, not the build. **Disclosed
+  deviation, not a self-granted §2.4 pass** (SHA_E review correction): §2.4
+  permits substitutions only if strictly STRONGER than the prescribed
+  compile-time fn reference, and on the fn-rename axis test-time detection is
+  weaker. The prescribed mechanism is infeasible for private `#[cfg(test)]`
+  unit-test fns and cfg-twinned tests without restructuring every suite; the
+  practical gap is one CI stage (the meta-test runs in the same `ci-gate`
+  suite as the build — either way the PR goes red before merge). This
+  deviation is flagged for Tim's explicit nod at the G3 gate PR. Open-cell teeth: the
   meta-test fails if the Phase-4 CUDA refusal text (or the P2b test-anchoring
   marker) vanishes while a cell still cites that phase as open — ratchet
   R3/R4 are enforced, not aspirational.

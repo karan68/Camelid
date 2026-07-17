@@ -80,7 +80,7 @@
     {
       "id": "L2-gemma4-wire",
       "name": "Gemma4 wire lane (CPU; the NVFP4-executing lane in this release)",
-      "sources": ["src/gemma4_runtime.rs", "src/inference (nvfp4_wire_row_dot family)", "src/tensor/mod.rs (decode_nvfp4_tensor, nvfp4_find_nan_scale)"]
+      "sources": ["src/gemma4_runtime.rs", "src/inference.rs", "src/tensor/mod.rs (decode_nvfp4_tensor, nvfp4_find_nan_scale)"]
     },
     {
       "id": "L3-cuda-resident",
@@ -275,10 +275,14 @@
       "I-unknown-type": {
         "status": "enforced",
         "test_file": "src/gemma4_runtime.rs",
-        "test_fn": "cuda_lane_check_refuses_nvfp4_before_the_from_wire_panic",
+        "test_fn": "cuda_lane_check_refuses_every_lane_uncovered_format_typed",
+        "companion_tests": [
+          { "file": "src/gemma4_runtime.rs", "fn": "cuda_lane_check_refuses_nvfp4_before_the_from_wire_panic" },
+          { "file": "src/gemma4_runtime.rs", "fn": "cuda_lane_check_admits_the_supported_projection_formats" }
+        ],
         "source": "src/gemma4_runtime.rs",
-        "fixture": "seam:Gemma4CudaResident::load requires a bindable real gemma4 model plus a CUDA device — not constructible under the <4KB synthetic-fixture rule; nvfp4_cuda_lane_check is cfg-independent and driven directly on the exact WireFormat set from_wire would panic on",
-        "note": "NVFP4 is this lane's uncovered format until P4: the S1 review fix surfaces it as a typed UnsupportedGguf naming the Phase 4 boundary instead of the GemmaLayerQuant::from_wire panic."
+        "fixture": "seam:Gemma4CudaResident::load requires a bindable real gemma4 model plus a CUDA device — not constructible under the <4KB synthetic-fixture rule; nvfp4_cuda_lane_check is cfg-independent and driven directly on every WireFormat outside the lane's covered set",
+        "note": "SHA_E review extension: the check refuses EVERY format outside the lane's covered set (Q8_0/Q4_0/Q4_1) typed and named — NVFP4 (Phase 4 boundary message) AND the K-quants the CPU wire lane serves (Q4K/Q5K/Q6K, incl. the campaign's own Q4K-mm and Q4_K_M rows, which previously reached the from_wire repack panic under CAMELID_GEMMA4_CUDA=1). The earlier cell wording ('NVFP4 is this lane's uncovered format') was an overclaim caught by the pre-G3 adversarial review."
       },
       "I-nan-scale": {
         "status": "open",

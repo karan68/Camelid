@@ -47,6 +47,7 @@ const BOUND: &[(&str, &str)] = &[
         include_str!("../src/gemma4_runtime.rs"),
     ),
     ("src/gguf/reader.rs", include_str!("../src/gguf/reader.rs")),
+    ("src/inference.rs", include_str!("../src/inference.rs")),
     (
         "src/runnable/admit.rs",
         include_str!("../src/runnable/admit.rs"),
