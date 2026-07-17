@@ -788,6 +788,14 @@ sidecar-tripping wire-lane fixture per §1.2 is committed (`tests/fixtures/gguf/
 `tests/nvfp4_wire_lane_refusals.rs`), and the four sanctioned rows re-hashed
 byte-unchanged per §1.3 (`qa/evidence-bundles/basalt/phase3/row_rehash_post_closure.txt`).
 
+**D17 addendum 3 (2026-07-16, SHA_E3):** latent pre-BASALT K-quant projection routing gap
+fixed under the Amendment 3 §3 freeze-move mechanism (crash-fix, no design change),
+discovered by the S3 legs on the Q4K-mm row: the per-layer/batched projection call sites
+bypassed the top-level matvec's Q4_K/Q6_K → Q8_K-activation routing and panicked
+`unreachable!` at forward time; projections now dispatch per activation family
+(byte-identical for NVFP4/Q8_0/Q4_0/Q4_1), Q5_K matvec roles refuse typed at load, and the
+L2 I-unknown-type cell note is corrected (`qa/invariant_lanes.json`).
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on

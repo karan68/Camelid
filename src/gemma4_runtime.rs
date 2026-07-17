@@ -159,6 +159,22 @@ impl WireQuant {
         })
     }
 
+    /// Typed load-time guard for weights bound to a matvec/matmul role
+    /// (projection, expert band, or tied head). Q5_K is GATHER-ONLY in this
+    /// lane (`per_layer_token_embd`; no Q5_K row-dot kernel is wired here), so
+    /// admitting it into a matvec role would surface as a forward-time panic —
+    /// refuse it at load instead (invariant I-unknown-type: typed refusal,
+    /// never a reachable panic). Every other [`WireFormat`] has a matvec route.
+    fn require_matvec_capable(self, name: &str) -> Result<Self> {
+        if self.format == WireFormat::Q5K {
+            return Err(BackendError::UnsupportedTensorType(format!(
+                "tensor {name} is Q5_K; the gemma4 wire lane serves Q5_K gather-only \
+                 (per_layer_token_embd) — it cannot be a projection/head weight"
+            )));
+        }
+        Ok(self)
+    }
+
     /// The tensor's full wire-byte slice. Bounds were validated in `new`.
     #[inline]
     fn bytes(&self) -> &[u8] {
@@ -199,8 +215,66 @@ impl WireQuant {
             // K-quant rows dot against Q8_K activations (the reference's K-quant
             // activation format) — Q6_K/Q4_K used by the QAT tied embedding head.
             WireFormat::Q4K | WireFormat::Q6K => self.matvec_q8k(out_dim, &quantize_q8_k_blocks(x)),
-            // Q5_K is gather-only here (per_layer_token_embd); never a matvec weight.
+            // Q5_K is gather-only here (per_layer_token_embd); never a matvec
+            // weight — `require_matvec_capable` refuses it typed at load.
             WireFormat::Q5K => unreachable!("Q5_K is gather-only (per_layer_token_embd)"),
+        }
+    }
+
+    /// One projection off a [`SharedActivation`], routed by the SAME family
+    /// split as the top-level [`Self::matvec`]: K-quant weights (Q4_K/Q6_K)
+    /// dot Q8_K activations via [`Self::matvec_q8k`], everything else keeps
+    /// the Q8_0-activation fast path via [`Self::matvec_q`] byte-for-byte.
+    ///
+    /// This is the SHA_E3 crash fix: the per-layer projection call sites used
+    /// to pre-quantize the shared activation to Q8_0 once and call `matvec_q`
+    /// directly, which has no K-quant arms — a latent pre-BASALT gap (no
+    /// gemma4 K-quant matmul row existed) that panicked `unreachable!` at
+    /// forward time on the campaign's Q4K-mm/Q4_K_M rows. The shared
+    /// activation is still quantized at most once PER FAMILY per call site
+    /// (lazily), so single-family files pay exactly the old quantize count.
+    fn matvec_proj(&self, out_dim: usize, x: &SharedActivation) -> Vec<f32> {
+        match self.format {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
+                self.matvec_q(out_dim, x.q8_0())
+            }
+            WireFormat::Q4K | WireFormat::Q6K => self.matvec_q8k(out_dim, x.q8_k()),
+            // Structurally unreachable: `require_matvec_capable` refuses Q5_K
+            // in every matvec-role binding at load (typed, I-unknown-type).
+            WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
+        }
+    }
+
+    /// Batched sibling of [`Self::matvec_proj`] for the spec-verify chunk
+    /// path: routes to [`Self::matmul_q`] / [`Self::matmul_q8k`] by the same
+    /// family split, off a [`SharedActivationBatch`].
+    fn matmul_proj(&self, out_dim: usize, xs: &SharedActivationBatch) -> Vec<Vec<f32>> {
+        match self.format {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
+                self.matmul_q(out_dim, xs.q8_0())
+            }
+            WireFormat::Q4K | WireFormat::Q6K => self.matmul_q8k(out_dim, xs.q8_k()),
+            WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
+        }
+    }
+
+    /// Row-band sibling of [`Self::matvec_proj`] for the MoE expert matrices:
+    /// routes to [`Self::matvec_q_rows`] / [`Self::matvec_q8k_rows`] by the
+    /// same family split.
+    fn matvec_rows_proj(
+        &self,
+        row_start: usize,
+        out_count: usize,
+        x: &SharedActivation,
+    ) -> Vec<f32> {
+        match self.format {
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
+                self.matvec_q_rows(row_start, out_count, x.q8_0())
+            }
+            WireFormat::Q4K | WireFormat::Q6K => {
+                self.matvec_q8k_rows(row_start, out_count, x.q8_k())
+            }
+            WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
         }
     }
 
@@ -369,6 +443,39 @@ impl WireQuant {
         out
     }
 
+    /// [`Self::matvec_q_rows`] for K-quant (Q4_K/Q6_K) weights against a Q8_K
+    /// activation: dot a contiguous band of `out_count` output rows starting at
+    /// `row_start` — the MoE expert-band path when the expert matrices are
+    /// K-quants. Same fixed row chunking as [`Self::matvec_q8k`], and rows land
+    /// at fixed indices, so `out[i]` is bit-identical to row `row_start + i` of
+    /// the full [`Self::matvec_q8k`] (greedy parity safe).
+    fn matvec_q8k_rows(
+        &self,
+        row_start: usize,
+        out_count: usize,
+        xq: &[crate::inference::Q8KBlock],
+    ) -> Vec<f32> {
+        const ROW_CHUNK: usize = 64;
+        let row_bytes = xq.len() * self.format.bytes_per_block();
+        let bytes = self.bytes();
+        let row_dot: fn(&[u8], &[crate::inference::Q8KBlock]) -> f32 = match self.format {
+            WireFormat::Q6K => q6_k_wire_row_dot,
+            WireFormat::Q4K => q4_k_wire_row_dot,
+            _ => unreachable!("matvec_q8k_rows is only for Q6_K/Q4_K weights"),
+        };
+        let mut out = vec![0f32; out_count];
+        out.par_chunks_mut(ROW_CHUNK)
+            .enumerate()
+            .for_each(|(chunk_idx, dst)| {
+                let base = row_start + chunk_idx * ROW_CHUNK;
+                for (i, d) in dst.iter_mut().enumerate() {
+                    let o = base + i;
+                    *d = row_dot(&bytes[o * row_bytes..(o + 1) * row_bytes], xq);
+                }
+            });
+        out
+    }
+
     /// Batched [`matvec_q8k`]: each Q6_K output row is read once and dotted against
     /// every Q8_K activation in `xqs`. The QAT tied head over K verify positions in a
     /// single weight pass; `out[k]` is bit-identical to `matvec_q8k(out_dim, xqs[k])`.
@@ -481,9 +588,17 @@ impl WireQuant {
                     out.push(decoded[e % BV]);
                 }
             }
-            // Q4_1 is a matvec-only weight here (ffn_down); never gathered.
+            // Q4_1 is a matvec-only weight here (ffn_down); no gather decoder is
+            // wired. A Q4_1 embedding table would land here, so refuse typed
+            // (I-unknown-type: never a reachable panic) — this arm was an
+            // `unreachable!` until the SHA_E3 K-quant routing fix swept the
+            // lane's reachable-panic arms.
             WireFormat::Q4_1 => {
-                unreachable!("Q4_1 is matvec-only (ffn_down); never gathered")
+                return Err(BackendError::UnsupportedTensorType(
+                    "gemma4 wire lane cannot gather Q4_1 elements (Q4_1 is a \
+                     matvec-only weight format here)"
+                        .into(),
+                ))
             }
             // NVFP4 gather: decode one 64-value superblock at a time via the
             // pin-bitwise hot-path twin (same pattern as the Q4_0 arm). The
@@ -505,6 +620,68 @@ impl WireQuant {
             }
         }
         Ok(out)
+    }
+}
+
+/// A shared per-layer activation with each matvec activation family quantized
+/// LAZILY, at most once, however many projections consume it (q/k/v share the
+/// pre-attention norm; gate/up share the pre-FFN norm). The Q8_0-family
+/// projections (Q8_0/Q4_0/Q4_1/NVFP4) dot Q8_0 blocks; K-quant projections
+/// (Q4_K/Q6_K) dot Q8_K blocks — a mixed-format layer quantizes once per
+/// family, a single-family layer pays exactly the old single quantize.
+/// Single-threaded by construction (a per-step local; rayon parallelism lives
+/// INSIDE the matvecs, over output rows), hence the plain `OnceCell`.
+struct SharedActivation<'a> {
+    x: &'a [f32],
+    q8_0: std::cell::OnceCell<Vec<Q8_0Block>>,
+    q8_k: std::cell::OnceCell<Vec<crate::inference::Q8KBlock>>,
+}
+
+impl<'a> SharedActivation<'a> {
+    fn new(x: &'a [f32]) -> Self {
+        Self {
+            x,
+            q8_0: std::cell::OnceCell::new(),
+            q8_k: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn q8_0(&self) -> &[Q8_0Block] {
+        self.q8_0.get_or_init(|| quantize_q8_0_blocks(self.x))
+    }
+
+    fn q8_k(&self) -> &[crate::inference::Q8KBlock] {
+        self.q8_k.get_or_init(|| quantize_q8_k_blocks(self.x))
+    }
+}
+
+/// The batched (spec-verify [`Gemma4Runtime::step_chunk`]) sibling of
+/// [`SharedActivation`]: K activation rows, each quantized family computed
+/// lazily once for the whole chunk. Quantization is a pure per-row function,
+/// so laziness cannot change any value.
+struct SharedActivationBatch<'a> {
+    xs: &'a [Vec<f32>],
+    q8_0: std::cell::OnceCell<Vec<Vec<Q8_0Block>>>,
+    q8_k: std::cell::OnceCell<Vec<Vec<crate::inference::Q8KBlock>>>,
+}
+
+impl<'a> SharedActivationBatch<'a> {
+    fn new(xs: &'a [Vec<f32>]) -> Self {
+        Self {
+            xs,
+            q8_0: std::cell::OnceCell::new(),
+            q8_k: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn q8_0(&self) -> &[Vec<Q8_0Block>] {
+        self.q8_0
+            .get_or_init(|| self.xs.iter().map(|x| quantize_q8_0_blocks(x)).collect())
+    }
+
+    fn q8_k(&self) -> &[Vec<crate::inference::Q8KBlock>] {
+        self.q8_k
+            .get_or_init(|| self.xs.iter().map(|x| quantize_q8_k_blocks(x)).collect())
     }
 }
 
@@ -1043,23 +1220,27 @@ impl Gemma4Runtime {
             std::thread::spawn(move || mmap.advise_willneed());
         }
         let q8 = |name: &str| WireQuant::new(&store, &mmap, name);
+        // Matvec-role loads (projections, expert bands, the tied head) refuse
+        // Q5_K typed at load — it is gather-only in this lane and would
+        // otherwise panic at forward time (I-unknown-type, SHA_E3).
+        let q8m = |name: &str| -> Result<WireQuant> { q8(name)?.require_matvec_capable(name) };
         let f32t = |name: &str| -> Result<Vec<f32>> { Ok(store.load_cpu_f32(name)?.data) };
 
         let mut layers = Vec::with_capacity(range.len());
         for l in &binding.layers[range.clone()] {
             layers.push(LayerWeights {
                 attn_norm: f32t(&l.attn_norm.name)?,
-                attn_q: q8(&l.attn_q.name)?,
-                attn_k: l.attn_k.as_ref().map(|d| q8(&d.name)).transpose()?,
-                attn_v: l.attn_v.as_ref().map(|d| q8(&d.name)).transpose()?,
-                attn_output: q8(&l.attn_output.name)?,
+                attn_q: q8m(&l.attn_q.name)?,
+                attn_k: l.attn_k.as_ref().map(|d| q8m(&d.name)).transpose()?,
+                attn_v: l.attn_v.as_ref().map(|d| q8m(&d.name)).transpose()?,
+                attn_output: q8m(&l.attn_output.name)?,
                 q_norm: f32t(&l.attn_q_norm.name)?,
                 k_norm: l.attn_k_norm.as_ref().map(|d| f32t(&d.name)).transpose()?,
                 post_attn_norm: f32t(&l.post_attention_norm.name)?,
                 ffn_norm: f32t(&l.ffn_norm.name)?,
-                ffn_gate: q8(&l.ffn_gate.name)?,
-                ffn_up: q8(&l.ffn_up.name)?,
-                ffn_down: q8(&l.ffn_down.name)?,
+                ffn_gate: q8m(&l.ffn_gate.name)?,
+                ffn_up: q8m(&l.ffn_up.name)?,
+                ffn_down: q8m(&l.ffn_down.name)?,
                 post_ffw_norm: f32t(&l.post_ffw_norm.name)?,
                 post_norm: l.post_norm.as_ref().map(|d| f32t(&d.name)).transpose()?,
                 ple_inp_gate: l.ple_inp_gate.as_ref().map(|d| f32t(&d.name)).transpose()?,
@@ -1082,8 +1263,8 @@ impl Gemma4Runtime {
                         })?;
                         let n_expert = moe_meta.expert_count as usize;
                         // 2*n_ff_exp = gate_up rows / n_expert; n_ff_exp halves it.
-                        let gate_up = q8(&m.gate_up_exps.name)?;
-                        let down = q8(&m.down_exps.name)?;
+                        let gate_up = q8m(&m.gate_up_exps.name)?;
+                        let down = q8m(&m.down_exps.name)?;
                         let two_nff =
                             gate_up.element_count / (n_expert * config.embedding_length as usize);
                         // Enable the AVX2 pre-pack expert path only when BOTH expert
@@ -1120,7 +1301,10 @@ impl Gemma4Runtime {
         Ok(Self {
             tokenizer,
             first_layer: range.start,
-            token_embd: q8(&binding.token_embedding.name)?,
+            // The tied head matvecs token_embd on the tail shard, so it takes
+            // the matvec-role guard; per_layer_token_embd stays gather-only
+            // (plain q8) — Q5_K is legitimate there.
+            token_embd: q8m(&binding.token_embedding.name)?,
             per_layer_token_embd: binding
                 .per_layer_token_embd
                 .as_ref()
@@ -1311,11 +1495,12 @@ impl Gemma4Runtime {
             };
 
             // --- attention projections, batched (one weight pass each) ---
-            let xnq: Vec<Vec<Q8_0Block>> = hs
+            let xn_rows: Vec<Vec<f32>> = hs
                 .iter()
-                .map(|h| quantize_q8_0_blocks(&rms_norm(h, Some(&lw.attn_norm), eps)))
+                .map(|h| rms_norm(h, Some(&lw.attn_norm), eps))
                 .collect();
-            let mut q_rows = lw.attn_q.matmul_q(q_dim, &xnq);
+            let xnq = SharedActivationBatch::new(&xn_rows);
+            let mut q_rows = lw.attn_q.matmul_proj(q_dim, &xnq);
             for q in q_rows.iter_mut() {
                 for hh in 0..heads {
                     let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
@@ -1331,9 +1516,9 @@ impl Gemma4Runtime {
                     .attn_k
                     .as_ref()
                     .expect("validate() guarantees owning layers bind attn_k")
-                    .matmul_q(kv_dim, &xnq);
+                    .matmul_proj(kv_dim, &xnq);
                 let mut v_rows = match lw.attn_v.as_ref() {
-                    Some(wv) => wv.matmul_q(kv_dim, &xnq),
+                    Some(wv) => wv.matmul_proj(kv_dim, &xnq),
                     None => k_rows.clone(),
                 };
                 for i in 0..kk {
@@ -1379,7 +1564,7 @@ impl Gemma4Runtime {
             let group = heads / self.g.kv_heads_at(src_global) as usize;
 
             // --- per-position attention (cheap; no big weight read) ---
-            let mut attn_q_rows: Vec<Vec<Q8_0Block>> = Vec::with_capacity(kk);
+            let mut attn_rows: Vec<Vec<f32>> = Vec::with_capacity(kk);
             for i in 0..kk {
                 let pos = start_pos + i;
                 let lo = if sliding {
@@ -1413,10 +1598,11 @@ impl Gemma4Runtime {
                         }
                     }
                 }
-                attn_q_rows.push(quantize_q8_0_blocks(&attn));
+                attn_rows.push(attn);
             }
             // o-projection batched, then residual + post-attn norm per token.
-            let o_rows = lw.attn_output.matmul_q(hidden, &attn_q_rows);
+            let attn_b = SharedActivationBatch::new(&attn_rows);
+            let o_rows = lw.attn_output.matmul_proj(hidden, &attn_b);
             for i in 0..kk {
                 let on = rms_norm(&o_rows[i], Some(&lw.post_attn_norm), eps);
                 for (a, b) in hs[i].iter_mut().zip(&on) {
@@ -1425,23 +1611,24 @@ impl Gemma4Runtime {
             }
 
             // --- FFN (dense), batched ---
-            let ffnq: Vec<Vec<Q8_0Block>> = hs
+            let ffn_rows: Vec<Vec<f32>> = hs
                 .iter()
-                .map(|h| quantize_q8_0_blocks(&rms_norm(h, Some(&lw.ffn_norm), eps)))
+                .map(|h| rms_norm(h, Some(&lw.ffn_norm), eps))
                 .collect();
-            let gate_rows = lw.ffn_gate.matmul_q(ffn_dim, &ffnq);
-            let up_rows = lw.ffn_up.matmul_q(ffn_dim, &ffnq);
-            let actq: Vec<Vec<Q8_0Block>> = (0..kk)
+            let ffnq = SharedActivationBatch::new(&ffn_rows);
+            let gate_rows = lw.ffn_gate.matmul_proj(ffn_dim, &ffnq);
+            let up_rows = lw.ffn_up.matmul_proj(ffn_dim, &ffnq);
+            let act_rows: Vec<Vec<f32>> = (0..kk)
                 .map(|i| {
-                    let act: Vec<f32> = gate_rows[i]
+                    gate_rows[i]
                         .iter()
                         .zip(&up_rows[i])
                         .map(|(g, u)| gelu_tanh(*g) * u)
-                        .collect();
-                    quantize_q8_0_blocks(&act)
+                        .collect()
                 })
                 .collect();
-            let mlp_rows = lw.ffn_down.matmul_q(hidden, &actq);
+            let actq = SharedActivationBatch::new(&act_rows);
+            let mlp_rows = lw.ffn_down.matmul_proj(hidden, &actq);
             for i in 0..kk {
                 let ffn_out = rms_norm(&mlp_rows[i], Some(&lw.post_ffw_norm), eps);
                 for (a, b) in hs[i].iter_mut().zip(&ffn_out) {
@@ -1477,18 +1664,11 @@ impl Gemma4Runtime {
             .iter()
             .map(|h| rms_norm(h, Some(&self.output_norm), eps))
             .collect();
-        let mut logits_rows: Vec<Vec<f32>> = match self.token_embd.format {
-            WireFormat::Q6K => {
-                let xqs: Vec<Vec<crate::inference::Q8KBlock>> =
-                    lastq.iter().map(|l| quantize_q8_k_blocks(l)).collect();
-                self.token_embd.matmul_q8k(vocab, &xqs)
-            }
-            _ => {
-                let xqs: Vec<Vec<Q8_0Block>> =
-                    lastq.iter().map(|l| quantize_q8_0_blocks(l)).collect();
-                self.token_embd.matmul_q(vocab, &xqs)
-            }
-        };
+        // Family-routed like every projection (SHA_E3): the old open-coded
+        // match sent only Q6_K through the Q8_K family, so a Q4_K tied head
+        // hit `matmul_q`'s K-quant unreachable! on this batched path.
+        let lastb = SharedActivationBatch::new(&lastq);
+        let mut logits_rows: Vec<Vec<f32>> = self.token_embd.matmul_proj(vocab, &lastb);
         if let Some(cap) = self.g.final_logit_softcapping {
             for logits in logits_rows.iter_mut() {
                 soft_cap_in_place(logits, cap);
@@ -1521,9 +1701,9 @@ impl Gemma4Runtime {
 
         // Dense "shared expert" MLP branch: ffn_norm -> parallel GeGLU -> down.
         let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
-        let xnq = quantize_q8_0_blocks(&xn);
-        let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
-        let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
+        let xnq = SharedActivation::new(&xn);
+        let gate = lw.ffn_gate.matvec_proj(ffn_dim, &xnq);
+        let up = lw.ffn_up.matvec_proj(ffn_dim, &xnq);
         let act: Vec<f32> = gate
             .iter()
             .zip(&up)
@@ -1559,31 +1739,34 @@ impl Gemma4Runtime {
         wsum = wsum.max(6.103_515e-5);
 
         let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
-        let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
+        let cur_moe_q = SharedActivation::new(&cur_moe);
         let two_nff = 2 * moe.n_ff_exp;
         let mut moe_acc = vec![0f32; hidden];
         // Pre-packed (interleaved 8-row) expert matrices for the AVX2 GEMV, packed
         // once per expert per session and cached; `None` disables the fast path.
+        // (The packed path exists only for Q4_0 experts — `pack_cache` is `None`
+        // otherwise — so its activations are always the Q8_0 family.)
         for &e in &idx {
             let w = probs[e] / wsum;
             let packed = moe.packed_expert(e, hidden, two_nff);
             // fused gate‖up for expert e: rows e*2nff .. +2nff, in_dim=n_embd.
             // Interleaved 8-row AVX2 GEMV (bit-exact vs the scalar row path) when
-            // the expert is pre-packed, else the scalar wire dot.
+            // the expert is pre-packed, else the scalar wire dot (routed by the
+            // expert matrices' activation family).
             let gate_up = match &packed {
-                Some(p) => packed_band_matvec(&p.gate_up, &cur_moe_q),
+                Some(p) => packed_band_matvec(&p.gate_up, cur_moe_q.q8_0()),
                 None => moe
                     .gate_up_exps
-                    .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q),
+                    .matvec_rows_proj(e * two_nff, two_nff, &cur_moe_q),
             };
             let hexp: Vec<f32> = (0..moe.n_ff_exp)
                 .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + moe.n_ff_exp])
                 .collect();
-            let hexp_q = quantize_q8_0_blocks(&hexp);
+            let hexp_q = SharedActivation::new(&hexp);
             // down for expert e: rows e*n_embd .. +n_embd, in_dim=n_ff_exp.
             let y = match &packed {
-                Some(p) => packed_band_matvec(&p.down, &hexp_q),
-                None => moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q),
+                Some(p) => packed_band_matvec(&p.down, hexp_q.q8_0()),
+                None => moe.down_exps.matvec_rows_proj(e * hidden, hidden, &hexp_q),
             };
             let scale = moe.down_exps_scale[e] * w;
             for (a, yv) in moe_acc.iter_mut().zip(&y) {
@@ -1721,9 +1904,10 @@ impl Gemma4Runtime {
             };
 
             let xn = rms_norm(&h, Some(&lw.attn_norm), eps);
-            // q/k/v all project the same normed input — quantize it once.
-            let xnq = quantize_q8_0_blocks(&xn);
-            let mut q = lw.attn_q.matvec_q(q_dim, &xnq);
+            // q/k/v all project the same normed input — quantize it once per
+            // activation family (lazily; K-quant projections dot Q8_K).
+            let xnq = SharedActivation::new(&xn);
+            let mut q = lw.attn_q.matvec_proj(q_dim, &xnq);
             for hh in 0..heads {
                 let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
                 s.copy_from_slice(&rms_norm(s, Some(&lw.q_norm), eps));
@@ -1743,12 +1927,12 @@ impl Gemma4Runtime {
                     .attn_k
                     .as_ref()
                     .expect("validate() guarantees owning layers bind attn_k")
-                    .matvec_q(kv_dim, &xnq);
+                    .matvec_proj(kv_dim, &xnq);
                 // V-less layers (12B full attention) reuse the raw K projection
                 // as V — reference: `if v_proj is not present, use Kcur as Vcur`.
                 // V then takes the usual weightless norm and never RoPE.
                 let mut v = match lw.attn_v.as_ref() {
-                    Some(wv) => wv.matvec_q(kv_dim, &xnq),
+                    Some(wv) => wv.matvec_proj(kv_dim, &xnq),
                     None => k.clone(),
                 };
                 for hh in 0..kv_heads {
@@ -1827,9 +2011,9 @@ impl Gemma4Runtime {
                 self.moe_layer_ffn(li, &h)
             } else {
                 let xn = rms_norm(&h, Some(&lw.ffn_norm), eps);
-                let xnq = quantize_q8_0_blocks(&xn);
-                let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
-                let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
+                let xnq = SharedActivation::new(&xn);
+                let gate = lw.ffn_gate.matvec_proj(ffn_dim, &xnq);
+                let up = lw.ffn_up.matvec_proj(ffn_dim, &xnq);
                 let act: Vec<f32> = gate
                     .iter()
                     .zip(&up)
@@ -4894,7 +5078,7 @@ mod nvfp4_wire_tests {
     /// Deterministic non-sentinel NVFP4 wire blocks: UE4M3 scale bytes drawn
     /// from a fixed safe set (0x00 zero through 0x7E max-normal; never
     /// 0x7F/0xFF), qs bytes from a small LCG-ish pattern.
-    fn synth_wire(superblocks: usize) -> Vec<u8> {
+    pub(super) fn synth_wire(superblocks: usize) -> Vec<u8> {
         const SAFE_SCALES: [u8; 8] = [0x00, 0x10, 0x2C, 0x38, 0x40, 0x51, 0x66, 0x7E];
         let mut wire = Vec::with_capacity(superblocks * 36);
         for b in 0..superblocks {
@@ -4908,7 +5092,7 @@ mod nvfp4_wire_tests {
         wire
     }
 
-    fn desc(
+    pub(super) fn desc(
         name: &str,
         tensor_type: GgufTensorType,
         dims: &[u64],
@@ -4964,7 +5148,7 @@ mod nvfp4_wire_tests {
 
     /// Write `wire` to a temp file and wrap it in the two inputs WireQuant::new
     /// takes. The returned NamedTempFile keeps the mapping's backing file alive.
-    fn fixture(
+    pub(super) fn fixture(
         wire: &[u8],
         descs: Vec<GgufTensorDescriptor>,
     ) -> (tempfile::NamedTempFile, TensorStore, Arc<GgufWireMmap>) {
@@ -5131,6 +5315,276 @@ mod nvfp4_wire_tests {
                     "matmul_q[{k}][{o}] != matvec_q"
                 );
             }
+        }
+    }
+}
+
+/// BASALT Phase 3 SHA_E3 (§3 freeze-move crash fix) — K-quant LAYER-PROJECTION
+/// routing. The per-layer projection call sites used to pre-quantize the shared
+/// activation to Q8_0 and call `matvec_q` directly, which has no K-quant arms:
+/// any gemma4 file with Q4_K/Q5_K/Q6_K projection matmuls panicked
+/// `unreachable!` at forward time (latent pre-BASALT; probe-proven on the
+/// campaign's Q4K-mm row). These tests pin the fixed dispatch three ways:
+/// (1) K-quant projections route through the Q8_K family and land bit-equal to
+/// the top-level [`WireQuant::matvec`] — the pre-existing, correct route — and
+/// to the raw wire row dots; (2) the Q8_0-family dispatch stays byte-identical
+/// to the direct Q8_0-activation path it replaced (NVFP4 non-disturbance at the
+/// unit seam); (3) Q5_K matvec roles and Q4_1 gathers refuse TYPED, never panic
+/// (invariant I-unknown-type, L2).
+#[cfg(test)]
+mod kquant_projection_tests {
+    use super::nvfp4_wire_tests::{desc, fixture, synth_wire};
+    use super::*;
+    use crate::inference::{
+        Q4_K_WIRE_BYTES_PER_BLOCK, Q5_K_WIRE_BYTES_PER_BLOCK, Q6_K_WIRE_BYTES_PER_BLOCK,
+    };
+
+    /// Deterministic K-quant wire: LCG byte fill, then tame f16 scale fields
+    /// (per-block byte offsets in `f16_offs`) so no block scale is inf/NaN —
+    /// the same recipe as the inference-layer K-quant dot tests.
+    fn synth_kquant_wire(blocks: usize, bytes_per_block: usize, f16_offs: &[usize]) -> Vec<u8> {
+        let mut wire = vec![0u8; blocks * bytes_per_block];
+        for (i, b) in wire.iter_mut().enumerate() {
+            *b = ((i * 131 + 17) % 256) as u8;
+        }
+        for blk in wire.chunks_exact_mut(bytes_per_block) {
+            for (j, &off) in f16_offs.iter().enumerate() {
+                let v = if j == 0 { 0.0173f32 } else { 0.0049 };
+                blk[off..off + 2].copy_from_slice(&crate::tensor::f32_to_f16_bits(v).to_le_bytes());
+            }
+        }
+        wire
+    }
+
+    fn activation(in_dim: usize, seed: f32) -> Vec<f32> {
+        (0..in_dim)
+            .map(|i| ((i as f32) * 0.37 + seed).sin() * 3.0)
+            .collect()
+    }
+
+    #[test]
+    fn kquant_projection_dispatch_matches_top_level_matvec_bitwise() {
+        // 5 output rows x 512 inputs = 2 superblocks per row. Oracle #1 is the
+        // top-level `matvec` (the route that was always correct for K-quants);
+        // oracle #2 is the raw wire row dot on the same bytes.
+        let (in_dim, out_dim) = (512usize, 5usize);
+        let blocks_per_row = in_dim / 256;
+        for (tt, bb, f16_offs) in [
+            (
+                GgufTensorType::Q4K,
+                Q4_K_WIRE_BYTES_PER_BLOCK,
+                vec![0usize, 2],
+            ),
+            (GgufTensorType::Q6K, Q6_K_WIRE_BYTES_PER_BLOCK, vec![208]),
+        ] {
+            let wire = synth_kquant_wire(blocks_per_row * out_dim, bb, &f16_offs);
+            let (_f, store, mmap) = fixture(
+                &wire,
+                vec![desc(
+                    "blk.0.attn_q.weight",
+                    tt,
+                    &[in_dim as u64, out_dim as u64],
+                    wire.len() as u64,
+                )],
+            );
+            let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight").expect("K-quant admits");
+
+            let x = activation(in_dim, 0.0);
+            let oracle = wq.matvec(in_dim, out_dim, &x);
+            let sa = SharedActivation::new(&x);
+            let got = wq.matvec_proj(out_dim, &sa);
+
+            let xq = quantize_q8_k_blocks(&x);
+            let row_bytes = blocks_per_row * bb;
+            for o in 0..out_dim {
+                assert_eq!(
+                    got[o].to_bits(),
+                    oracle[o].to_bits(),
+                    "{tt:?} matvec_proj row {o} != top-level matvec"
+                );
+                let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+                let dot = match tt {
+                    GgufTensorType::Q4K => q4_k_wire_row_dot(w_row, &xq),
+                    _ => q6_k_wire_row_dot(w_row, &xq),
+                };
+                assert_eq!(
+                    got[o].to_bits(),
+                    dot.to_bits(),
+                    "{tt:?} matvec_proj row {o} != wire row dot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kquant_batched_and_row_band_projections_match_single_dispatch() {
+        // matmul_proj (the spec-verify chunk path) must equal matvec_proj per
+        // activation, and matvec_rows_proj (the MoE expert-band path) must
+        // land on the corresponding rows of the full matvec — all bitwise.
+        let (in_dim, out_dim) = (256usize, 6usize);
+        for (tt, bb, f16_offs) in [
+            (
+                GgufTensorType::Q4K,
+                Q4_K_WIRE_BYTES_PER_BLOCK,
+                vec![0usize, 2],
+            ),
+            (GgufTensorType::Q6K, Q6_K_WIRE_BYTES_PER_BLOCK, vec![208]),
+        ] {
+            let wire = synth_kquant_wire(out_dim, bb, &f16_offs);
+            let (_f, store, mmap) = fixture(
+                &wire,
+                vec![desc(
+                    "blk.0.ffn_up.weight",
+                    tt,
+                    &[in_dim as u64, out_dim as u64],
+                    wire.len() as u64,
+                )],
+            );
+            let wq = WireQuant::new(&store, &mmap, "blk.0.ffn_up.weight").expect("K-quant admits");
+
+            let xs: Vec<Vec<f32>> = (0..3).map(|k| activation(in_dim, k as f32 * 0.7)).collect();
+            let xb = SharedActivationBatch::new(&xs);
+            let batched = wq.matmul_proj(out_dim, &xb);
+            for (k, x) in xs.iter().enumerate() {
+                let sa = SharedActivation::new(x);
+                let single = wq.matvec_proj(out_dim, &sa);
+                for o in 0..out_dim {
+                    assert_eq!(
+                        batched[k][o].to_bits(),
+                        single[o].to_bits(),
+                        "{tt:?} matmul_proj[{k}][{o}] != matvec_proj"
+                    );
+                }
+            }
+
+            let sa = SharedActivation::new(&xs[0]);
+            let full = wq.matvec_proj(out_dim, &sa);
+            let band = wq.matvec_rows_proj(2, 3, &sa);
+            for (i, o) in (2..5).enumerate() {
+                assert_eq!(
+                    band[i].to_bits(),
+                    full[o].to_bits(),
+                    "{tt:?} matvec_rows_proj row band offset {o}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_family_dispatch_is_byte_identical_to_the_direct_q8_0_path() {
+        // NO behavior change for the matvec_q family (NVFP4/Q8_0 shown here;
+        // they share the dispatch arm with Q4_0/Q4_1): the routed calls must
+        // equal the pre-fix direct calls on the eagerly-quantized activation.
+        // Q8_0: 2 blocks/row of 34 bytes (f16 scale at +0), 4 rows x 64 inputs.
+        let (in_dim, out_dim) = (64usize, 4usize);
+        let q8_wire =
+            synth_kquant_wire((in_dim / 32) * out_dim, Q8_WIRE_BYTES_PER_BLOCK, &[0usize]);
+        // NVFP4: the pilot format — 128 inputs = 2 superblocks/row, 4 rows.
+        let nv_wire = synth_wire(8);
+        let cases: [(GgufTensorType, usize, &[u8]); 2] = [
+            (GgufTensorType::Q8_0, in_dim, &q8_wire),
+            (GgufTensorType::NVFP4, 128, &nv_wire),
+        ];
+        for (tt, in_dim, wire) in cases {
+            let (_f, store, mmap) = fixture(
+                wire,
+                vec![desc(
+                    "blk.0.attn_q.weight",
+                    tt,
+                    &[in_dim as u64, out_dim as u64],
+                    wire.len() as u64,
+                )],
+            );
+            let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight").expect("admits");
+
+            let xs: Vec<Vec<f32>> = (0..3).map(|k| activation(in_dim, k as f32 * 0.7)).collect();
+            let xqs: Vec<Vec<Q8_0Block>> = xs.iter().map(|x| quantize_q8_0_blocks(x)).collect();
+
+            let sa = SharedActivation::new(&xs[0]);
+            let via_dispatch = wq.matvec_proj(out_dim, &sa);
+            let direct = wq.matvec_q(out_dim, &xqs[0]);
+            for o in 0..out_dim {
+                assert_eq!(
+                    via_dispatch[o].to_bits(),
+                    direct[o].to_bits(),
+                    "{tt:?} matvec_proj row {o} != direct matvec_q"
+                );
+            }
+            let band_dispatch = wq.matvec_rows_proj(1, 2, &sa);
+            let band_direct = wq.matvec_q_rows(1, 2, &xqs[0]);
+            for i in 0..2 {
+                assert_eq!(
+                    band_dispatch[i].to_bits(),
+                    band_direct[i].to_bits(),
+                    "{tt:?} matvec_rows_proj row {i} != direct matvec_q_rows"
+                );
+            }
+            let xb = SharedActivationBatch::new(&xs);
+            let batch_dispatch = wq.matmul_proj(out_dim, &xb);
+            let batch_direct = wq.matmul_q(out_dim, &xqs);
+            for k in 0..xs.len() {
+                for o in 0..out_dim {
+                    assert_eq!(
+                        batch_dispatch[k][o].to_bits(),
+                        batch_direct[k][o].to_bits(),
+                        "{tt:?} matmul_proj[{k}][{o}] != direct matmul_q"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q5k_matvec_roles_refuse_typed_at_load() {
+        // Q5_K stays admitted for gather (per_layer_token_embd) but must
+        // refuse TYPED in any matvec role — pre-fix it loaded fine and
+        // panicked `unreachable!` in the forward pass.
+        let wire = synth_kquant_wire(2, Q5_K_WIRE_BYTES_PER_BLOCK, &[0, 2]);
+        let (_f, store, mmap) = fixture(
+            &wire,
+            vec![desc(
+                "blk.0.attn_q.weight",
+                GgufTensorType::Q5K,
+                &[256, 2],
+                wire.len() as u64,
+            )],
+        );
+        let wq = WireQuant::new(&store, &mmap, "blk.0.attn_q.weight")
+            .expect("Q5_K admits for gather roles");
+        assert_eq!(wq.format, WireFormat::Q5K);
+        wq.dequantize_elements(0, 4)
+            .expect("Q5_K gather stays served");
+        match wq.require_matvec_capable("blk.0.attn_q.weight") {
+            Err(BackendError::UnsupportedTensorType(msg)) => {
+                assert!(msg.contains("Q5_K"), "{msg}");
+                assert!(msg.contains("gather-only"), "{msg}");
+            }
+            Err(other) => panic!("expected UnsupportedTensorType, got {other:?}"),
+            Ok(_) => panic!("Q5_K must refuse matvec roles at load"),
+        }
+    }
+
+    #[test]
+    fn q4_1_gather_refuses_typed_instead_of_panicking() {
+        // The sibling reachable-panic arm swept with the SHA_E3 fix: a Q4_1
+        // embedding gather is not wired, so it must be a typed refusal.
+        let wire = synth_kquant_wire(2, 20, &[0, 2]);
+        let (_f, store, mmap) = fixture(
+            &wire,
+            vec![desc(
+                "blk.0.ffn_down.weight",
+                GgufTensorType::Q4_1,
+                &[32, 2],
+                wire.len() as u64,
+            )],
+        );
+        let wq = WireQuant::new(&store, &mmap, "blk.0.ffn_down.weight").expect("Q4_1 admits");
+        match wq.dequantize_elements(0, 4) {
+            Err(BackendError::UnsupportedTensorType(msg)) => {
+                assert!(msg.contains("Q4_1"), "{msg}");
+            }
+            Err(other) => panic!("expected UnsupportedTensorType, got {other:?}"),
+            Ok(_) => panic!("Q4_1 gather must be a typed refusal"),
         }
     }
 }
