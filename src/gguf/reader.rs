@@ -58,6 +58,11 @@ pub enum GgufTensorType {
     I64,
     F64,
     BF16,
+    /// NVFP4 (BASALT D-B1): pin `GGML_TYPE_NVFP4` = 40, 64-element/36-byte superblock
+    /// `{ d[4] UE4M3 sub-scales, qs[32] packed E2M1 nibbles }`. The Debug name "NVFP4"
+    /// is the receipt-visible quantization label (receipt `lane.quantization`,
+    /// smoke `headline_quant`) — never rename it.
+    NVFP4,
     Unknown(i32),
 }
 
@@ -88,6 +93,7 @@ impl GgufTensorType {
             27 => Self::I64,
             28 => Self::F64,
             30 => Self::BF16,
+            40 => Self::NVFP4,
             other => Self::Unknown(other),
         }
     }
@@ -116,6 +122,9 @@ impl GgufTensorType {
             Self::Tq1_0 => Some((256, 54)),
             // block_tq2_0 = qs[QK_K/4]=64 + f16 d(2) = 66 (2.06 bpw)
             Self::Tq2_0 => Some((256, 66)),
+            // block_nvfp4 = d[4] UE4M3 sub-block scales + qs[32] packed E2M1 nibbles = 36
+            // bytes per QK_NVFP4=64 elements (4.5 bpw; pin ggml-common.h:211-217).
+            Self::NVFP4 => Some((64, 36)),
             Self::I8 => Some((1, 1)),
             Self::I16 | Self::BF16 => Some((1, 2)),
             Self::I32 => Some((1, 4)),

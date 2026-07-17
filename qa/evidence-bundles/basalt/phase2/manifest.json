@@ -1,0 +1,26 @@
+{
+  "schema": "camelid.basalt_phase2_evidence.v1",
+  "generated_utc": "2026-07-17T01:10:47.442Z",
+  "git_head": "939710de (branch basalt/phase2-load-interop, parent of the Phase 2 commit)",
+  "campaign": "BASALT",
+  "phase": 2,
+  "gate": "G2",
+  "note": "Phase 2 load-interop evidence (engine side): refusal-point-move receipts on the Phase 0 qwen3-0.6b NVFP4 refusal artifact (BEFORE = parse-time refusal cited from the phase0 bundle; AFTER = this branch's release build parses the file and refuses at ADMISSION with the D-B3 pilot-scope reject), the metadata-only inspect receipt for the produced gemma-4-E4B-it-NVFP4-mm pilot row, and the full cargo test log (fmt --check + clippy --all-targets --all-features -D warnings + complete suite green, appended at the log tail). Code surfaces wired this phase: GgufTensorType::NVFP4 (id 40, layout 64/36), receipt ftype 39 => NVFP4 (LLAMA_FTYPE_MOSTLY_NVFP4), runnable admission D-B3 gemma4 pilot scoping + D-B2 sidecar fail-closed, runnable dequant NVFP4 dispatch to the Phase 1 fail-closed decoder; smoke stays refused (combo not yet anchored) until Gate G3. Host paths sanitized to placeholders: <cam-basalt>=this worktree, <camelid>=the Camelid checkout, <home>=user home, <scratchpad>=session temp dir.",
+  "files": [
+    {
+      "file": "basalt_phase2_cargo_test.txt",
+      "sha256": "89e65edb330bf5729a8762244261d3e5f1f463e262e33d8d1595085afbdf87ca",
+      "size_bytes": 110466
+    },
+    {
+      "file": "pilot_inspect_receipt.md",
+      "sha256": "47d4c962146b96c638a9589db4b605bf771a8f2c321b6ae6d22fbaf9c480622a",
+      "size_bytes": 5900
+    },
+    {
+      "file": "refusal_move_receipt.md",
+      "sha256": "09727b40c75d77cdfad95f92aeefa707111422aefcae292cb06610c1d1a8c8b0",
+      "size_bytes": 5110
+    }
+  ]
+}

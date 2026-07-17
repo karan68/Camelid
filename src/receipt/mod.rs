@@ -252,6 +252,10 @@ fn file_type_label(value: &GgufMetadataValue) -> Option<&'static str> {
         32 => "BF16",
         36 => "TQ1_0",
         37 => "TQ2_0",
+        // 39 = LLAMA_FTYPE_MOSTLY_NVFP4 (llama.h) — what `general.file_type` carries in
+        // a GGUF. NOT 26: that is GGML_FTYPE_MOSTLY_NVFP4, a different (ggml) enum that
+        // never lands in GGUF metadata (BASALT_RECON.md §5).
+        39 => "NVFP4",
         _ => return None,
     })
 }

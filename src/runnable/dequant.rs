@@ -7,15 +7,21 @@
 //! anchored externally against ggml reference fixtures (Gate 2), not trusted from the
 //! internal paths it reuses.
 //!
-//! Covered v1 set: `F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS`. Anything else is
-//! refused — admission (`super::admit`) should already have rejected it, but dequant
-//! fails closed regardless.
+//! Covered v1 set: `F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, IQ4_XS`, plus `NVFP4`
+//! (admission-scoped to the gemma4 pilot until Gate G3 — BASALT D-B3). Anything else
+//! is refused — admission (`super::admit`) should already have rejected it, but
+//! dequant fails closed regardless.
+//!
+//! NVFP4 seam note: admission is metadata-only, so the D17/T5 NaN-sentinel refusal
+//! (UE4M3 scale bytes `0x7F`/`0xFF`) cannot happen there — it fires HERE, inside
+//! [`decode_nvfp4_tensor`], the fail-closed Phase 1 load path.
 
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
 use crate::tensor::{
-    decode_iq4_xs_tensor, decode_q3_k_tensor, decode_q4_0_tensor, decode_q4_k_tensor,
-    decode_q5_k_tensor, decode_q6_k_tensor, decode_q8_0_tensor, f16_bits_to_f32,
+    decode_iq4_xs_tensor, decode_nvfp4_tensor, decode_q3_k_tensor, decode_q4_0_tensor,
+    decode_q4_k_tensor, decode_q5_k_tensor, decode_q6_k_tensor, decode_q8_0_tensor,
+    f16_bits_to_f32,
 };
 
 /// Dequantize one tensor's wire bytes to a flat row-major `Vec<f32>` of
@@ -36,9 +42,13 @@ pub fn dequantize(
         GgufTensorType::Q5K => decode_q5_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q6K => decode_q6_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::IQ4XS => decode_iq4_xs_tensor(tensor_name, bytes, n_elements),
+        // Pin-bitwise NVFP4 decode; refuses NaN-sentinel UE4M3 scale bytes
+        // (0x7F/0xFF) per DECISIONS.md D17/T5 — the byte-level half of the
+        // admission seam split documented in `super::admit::check_quants`.
+        GgufTensorType::NVFP4 => decode_nvfp4_tensor(tensor_name, bytes, n_elements),
         other => Err(BackendError::UnsupportedTensorType(format!(
             "tensor {tensor_name} is {other:?}; runnable dequant covers \
-             F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS"
+             F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, NVFP4"
         ))),
     }
 }
@@ -100,5 +110,32 @@ mod tests {
     fn uncovered_quant_refused() {
         let err = dequantize(GgufTensorType::Q2K, &[0u8; 84], 256, "blk.0").unwrap_err();
         assert!(matches!(err, BackendError::UnsupportedTensorType(_)));
+    }
+
+    #[test]
+    fn nvfp4_dispatches_to_decoder() {
+        // One all-zero 36-byte block: d[0..4] = 0x00 (a legitimate all-zero scale,
+        // NOT a sentinel) → 64 exact zeros. Bit-level parity vs the pin lives in the
+        // Phase 1 golden-vector suites; this asserts the dispatch arm routes.
+        let out = dequantize(GgufTensorType::NVFP4, &[0u8; 36], 64, "blk.0").unwrap();
+        assert_eq!(out.len(), 64);
+        assert!(out.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn nvfp4_nan_sentinel_refused_at_decode() {
+        // D17/T5: the NaN-sentinel refusal is a DECODE-time check (admission is
+        // metadata-only and never sees wire bytes). 0x7F is the pin CPU's sentinel;
+        // 0xFF is the byte the pin's own backends disagree on — both refuse.
+        for sentinel in [0x7Fu8, 0xFF] {
+            let mut block = [0u8; 36];
+            block[0] = sentinel;
+            let err = dequantize(GgufTensorType::NVFP4, &block, 64, "blk.0").unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("NaN-sentinel"),
+                "sentinel {sentinel:#04x} must refuse with the NaN-sentinel message, got: {msg}"
+            );
+        }
     }
 }

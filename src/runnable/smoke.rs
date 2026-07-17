@@ -49,6 +49,21 @@ fn is_oracle_qualified(arch: &str, tok: TokenizerFamily, quant: &str) -> bool {
     )
 }
 
+/// The guardrail refusal, split out so the refusal class is unit-testable: an
+/// ADMITTED but non-anchored combo (e.g. the BASALT gemma4+NVFP4 pilot before
+/// Gate G3) refuses with "combo not yet anchored", NOT with a quant-not-covered
+/// admission reject — that distinction is load-bearing for the refusal receipts.
+fn oracle_qualification_gate(arch: &str, tok: TokenizerFamily, quant: &str) -> Result<()> {
+    if is_oracle_qualified(arch, tok, quant) {
+        return Ok(());
+    }
+    Err(BackendError::UnsupportedGguf(format!(
+        "combo not yet anchored: {arch}/{quant}/{tok:?}; smoke-admission runs only on \
+         oracle-qualified combos (llama/Q8_0/SPM, qwen3/Q8_0/BPE, gemma3/Q8_0/SPM, \
+         phi3/Q8_0/SPM)"
+    )))
+}
+
 /// Public (architecture, quant) view of the oracle-qualified set — the tokenizer
 /// family is implied by the architecture for every anchored combo. Used by the API
 /// to classify local models and catalog entries without running a model.
@@ -90,14 +105,7 @@ pub fn smoke_admit(path: &str) -> Result<SmokeReport> {
     let quant = headline_quant(&gguf);
 
     // Oracle-qualified guardrail.
-    if !is_oracle_qualified(&admitted.architecture, admitted.tokenizer, &quant) {
-        return Err(BackendError::UnsupportedGguf(format!(
-            "combo not yet anchored: {}/{}/{:?}; smoke-admission runs only on \
-             oracle-qualified combos (llama/Q8_0/SPM, qwen3/Q8_0/BPE, gemma3/Q8_0/SPM, \
-             phi3/Q8_0/SPM)",
-            admitted.architecture, quant, admitted.tokenizer
-        )));
-    }
+    oracle_qualification_gate(&admitted.architecture, admitted.tokenizer, &quant)?;
 
     // (2) load: all tensors present, shapes consistent, dequant succeeds on every
     // weight (RunnableModel::load fails closed otherwise).
@@ -341,6 +349,31 @@ mod tests {
         assert!(!is_oracle_qualified("llama", TokenizerFamily::Spm, "Q4K"));
         // Not anchored: anchored arch but unexpected tokenizer family.
         assert!(!is_oracle_qualified("llama", TokenizerFamily::Bpe, "Q8_0"));
+        // Not anchored: the BASALT gemma4+NVFP4 pilot — admission passes (D-B3)
+        // but smoke stays refused until Gate G3 anchors the combo.
+        assert!(!is_oracle_qualified(
+            "gemma4",
+            TokenizerFamily::Spm,
+            "NVFP4"
+        ));
+    }
+
+    /// BASALT Phase 2: the gemma4+NVFP4 pilot's smoke refusal must be the
+    /// not-yet-anchored class (an admitted combo awaiting its G3 oracle), NOT a
+    /// quant-not-covered admission reject.
+    #[test]
+    fn gemma4_nvfp4_smoke_refusal_is_not_yet_anchored() {
+        let err = oracle_qualification_gate("gemma4", TokenizerFamily::Spm, "NVFP4")
+            .expect_err("gemma4+NVFP4 must stay smoke-refused until G3");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("combo not yet anchored: gemma4/NVFP4/Spm"),
+            "refusal must be the anchored-gate class: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported quant"),
+            "refusal must not read as a quant-coverage reject: {msg}"
+        );
     }
 
     #[test]

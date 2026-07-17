@@ -20,6 +20,19 @@
 //! admitted files bind through the runnable lane's own generic runtime
 //! (`runnable::model`, which implements the gemma2 attention/final logit
 //! soft-caps), never through `model.rs`'s `LlamaModelConfig`.
+//!
+//! **BASALT D-B3 pilot carve-out (until Gate G3):** NVFP4 is a covered quant for
+//! the `gemma4` pilot ONLY — `(arch == "gemma4", quant == NVFP4)` admits, any other
+//! architecture carrying NVFP4 tensors is refused with a machine-readable reject
+//! naming the D-B3 scope. Because `gemma4` is otherwise outside
+//! `COVERED_ARCHITECTURES`, the architecture axis carries the mirror-image
+//! carve-out: a gemma4 GGUF passes that axis iff it carries NVFP4 tensors (the
+//! pilot shape); gemma4 files without NVFP4 keep today's architecture refusal.
+//! Admitting the pilot here is a metadata-level classification for the BASALT
+//! interop legs (inspect / dequant spot-checks); it is NOT a claim the generic
+//! runnable runtime executes the gemma4 graph — smoke stays refused via the
+//! oracle-qualification guardrail (`smoke::is_oracle_qualified`, anchored at G3),
+//! and the serve bridge does not route gemma4.
 
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -119,7 +132,7 @@ pub struct AdmissionOk {
 pub fn admit(file: &GgufFile) -> Result<AdmissionOk, AdmissionReject> {
     let architecture = check_architecture(file)?;
     let tokenizer = check_tokenizer(file)?;
-    let quants = check_quants(file)?;
+    let quants = check_quants(file, &architecture)?;
     Ok(AdmissionOk {
         architecture,
         tokenizer,
@@ -127,9 +140,22 @@ pub fn admit(file: &GgufFile) -> Result<AdmissionOk, AdmissionReject> {
     })
 }
 
+/// True iff the file carries at least one NVFP4 tensor (the BASALT pilot shape).
+fn has_nvfp4_tensors(file: &GgufFile) -> bool {
+    file.tensors
+        .iter()
+        .any(|t| t.tensor_type == GgufTensorType::NVFP4)
+}
+
 fn check_architecture(file: &GgufFile) -> Result<String, AdmissionReject> {
     match file.architecture() {
         Some(arch) if COVERED_ARCHITECTURES.contains(&arch) => Ok(arch.to_string()),
+        // BASALT D-B3 pilot carve-out: gemma4 is otherwise outside the runnable
+        // covered set (its production forward lives in `gemma4_runtime`), but the
+        // NVFP4 pilot rows are gemma4 files, so a gemma4 GGUF that carries NVFP4
+        // tensors passes this axis. gemma4 files WITHOUT NVFP4 keep the refusal
+        // below unchanged. Lane-wide NVFP4 admission is gated on G3.
+        Some(arch @ "gemma4") if has_nvfp4_tensors(file) => Ok(arch.to_string()),
         Some(arch) => Err(AdmissionReject {
             axis: AdmissionAxis::Architecture,
             offending_value: arch.to_string(),
@@ -174,6 +200,10 @@ fn check_tokenizer(file: &GgufFile) -> Result<TokenizerFamily, AdmissionReject> 
 /// A GGUF tensor quant type is covered iff the runnable lane has a dequant-to-f32
 /// routine for it. K-quant *mix* recipes (Q4_K_M, Q5_K_M) are not distinct ggml
 /// types — they appear on the wire as Q4K/Q5K/Q6K/Q8_0 tensors, all covered below.
+///
+/// NVFP4 is deliberately NOT in this blanket set: a dequant routine exists
+/// (`crate::tensor::decode_nvfp4_tensor`), but admission is pilot-scoped to the
+/// gemma4 architecture until Gate G3 (BASALT D-B3) — see `check_quants`.
 fn is_covered_quant(tt: GgufTensorType) -> bool {
     matches!(
         tt,
@@ -189,23 +219,82 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
     )
 }
 
-fn check_quants(file: &GgufFile) -> Result<BTreeSet<GgufTensorType>, AdmissionReject> {
+/// The BASALT pilot architecture: the only arch for which NVFP4 tensors admit
+/// until Gate G3 anchors the lane-wide decision (DECISIONS.md D17 / D-B3).
+const NVFP4_PILOT_ARCH: &str = "gemma4";
+
+fn check_quants(
+    file: &GgufFile,
+    architecture: &str,
+) -> Result<BTreeSet<GgufTensorType>, AdmissionReject> {
     let mut seen = BTreeSet::new();
     for tensor in &file.tensors {
-        if !is_covered_quant(tensor.tensor_type) {
+        // BASALT D-B3: NVFP4 is arch-conditional, not a blanket covered quant.
+        let nvfp4_pilot =
+            tensor.tensor_type == GgufTensorType::NVFP4 && architecture == NVFP4_PILOT_ARCH;
+        if !is_covered_quant(tensor.tensor_type) && !nvfp4_pilot {
+            if tensor.tensor_type == GgufTensorType::NVFP4 {
+                return Err(AdmissionReject {
+                    axis: AdmissionAxis::Quant,
+                    offending_value: format!("{:?}", tensor.tensor_type),
+                    tensor: Some(tensor.name.clone()),
+                    message: format!(
+                        "unsupported quant NVFP4 in tensor {} for architecture \
+                         {architecture:?}: NVFP4 is pilot-scoped to gemma4 until Gate G3 \
+                         (BASALT D-B3)",
+                        tensor.name
+                    ),
+                });
+            }
             return Err(AdmissionReject {
                 axis: AdmissionAxis::Quant,
                 offending_value: format!("{:?}", tensor.tensor_type),
                 tensor: Some(tensor.name.clone()),
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
-                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS",
+                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS \
+                     (NVFP4: gemma4 pilot only until Gate G3)",
                     tensor.tensor_type, tensor.name
                 ),
             });
         }
         seen.insert(tensor.tensor_type);
     }
+
+    // BASALT D-B2: sidecar per-tensor scales fail closed at admission.
+    //
+    // ModelOpt-converted NVFP4 GGUFs carry optional F32 sidecar tensors
+    // (`<name>.scale` = weight_scale_2, `<name>.input_scale`) that the reference
+    // implementation applies POST-matmul via a ggml_mul node. Camelid v1 implements
+    // only the in-block UE4M3 sub-scales; silently ignoring sidecar scales would
+    // compute wrong logits — quiet corruption, so we refuse the whole file.
+    //
+    // Seam split (deliberate): admission is METADATA-only — it sees tensor names,
+    // types, and shapes, never wire bytes, so the sidecar check (name-visible)
+    // lives here, while the D17/T5 NaN-sentinel refusal (0x7F/0xFF UE4M3 scale
+    // bytes, byte-visible only) fires at decode time in
+    // `crate::tensor::decode_nvfp4_tensor` via `runnable::dequant`.
+    if seen.contains(&GgufTensorType::NVFP4) {
+        if let Some(sidecar) = file
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with(".scale") || t.name.ends_with(".input_scale"))
+        {
+            return Err(AdmissionReject {
+                axis: AdmissionAxis::Quant,
+                offending_value: "NVFP4".to_string(),
+                tensor: Some(sidecar.name.clone()),
+                message: format!(
+                    "NVFP4 GGUF carries per-tensor scale sidecar tensor {}; \
+                     sidecar-bearing (ModelOpt-converted) NVFP4 files are not yet \
+                     supported — ignoring their scales would silently corrupt logits, \
+                     so admission fails closed (BASALT D-B2)",
+                    sidecar.name
+                ),
+            });
+        }
+    }
+
     Ok(seen)
 }
 
@@ -319,6 +408,129 @@ mod tests {
             .push(tensor("blk.0.ffn_down.weight", GgufTensorType::IQ4XS));
         let ok = admit(&file).expect("IQ4_XS must admit");
         assert!(ok.quants.contains(&GgufTensorType::IQ4XS));
+    }
+
+    // --- BASALT D-B3 pilot scoping + D-B2 sidecar fail-closed ---
+
+    /// The pilot shape: a gemma4 GGUF whose matmuls are NVFP4 (embeddings kept Q8_0,
+    /// norms F32, exactly like the produced `gemma-4-E4B-it-NVFP4-mm` row).
+    fn gemma4_nvfp4_fixture() -> GgufFile {
+        let mut file = base_fixture();
+        set_meta(&mut file, "general.architecture", "gemma4");
+        set_meta(&mut file, "tokenizer.ggml.model", "gemma4");
+        file.tensors
+            .push(tensor("blk.0.ffn_down.weight", GgufTensorType::NVFP4));
+        file
+    }
+
+    #[test]
+    fn admits_gemma4_nvfp4_pilot() {
+        let ok = admit(&gemma4_nvfp4_fixture()).expect("gemma4+NVFP4 pilot must admit (D-B3)");
+        assert_eq!(ok.architecture, "gemma4");
+        assert_eq!(ok.tokenizer, TokenizerFamily::Spm);
+        assert!(ok.quants.contains(&GgufTensorType::NVFP4));
+    }
+
+    #[test]
+    fn rejects_nvfp4_outside_pilot_arch() {
+        // qwen3 + NVFP4 (the Phase 0/2 refusal artifact's exact shape) must refuse
+        // with the D-B3 scope message on the quant axis — not a generic
+        // quant-not-covered message and not a parse failure.
+        let mut file = base_fixture();
+        set_meta(&mut file, "general.architecture", "qwen3");
+        set_meta(&mut file, "tokenizer.ggml.model", "gpt2");
+        file.tensors
+            .push(tensor("blk.0.ffn_down.weight", GgufTensorType::NVFP4));
+        let reject = admit(&file).expect_err("qwen3+NVFP4 must reject until G3");
+        assert_eq!(reject.axis, AdmissionAxis::Quant);
+        assert_eq!(reject.offending_value, "NVFP4");
+        assert_eq!(reject.tensor.as_deref(), Some("blk.0.ffn_down.weight"));
+        assert!(
+            reject
+                .message
+                .contains("pilot-scoped to gemma4 until Gate G3"),
+            "message must name the D-B3 scope: {}",
+            reject.message
+        );
+        // Machine-readable, like every other reject.
+        let json = serde_json::to_value(&reject).expect("reject serializes");
+        assert_eq!(json["axis"], "quant");
+        assert_eq!(json["offending_value"], "NVFP4");
+    }
+
+    #[test]
+    fn rejects_gemma4_without_nvfp4() {
+        // The carve-out is pilot-shaped, not a blanket gemma4 admission: a gemma4
+        // file with no NVFP4 tensors (e.g. the E4B Q8_0 row) keeps today's
+        // architecture-axis refusal.
+        let mut file = base_fixture();
+        set_meta(&mut file, "general.architecture", "gemma4");
+        let reject = admit(&file).expect_err("gemma4 without NVFP4 must still reject");
+        assert_eq!(reject.axis, AdmissionAxis::Architecture);
+        assert_eq!(reject.offending_value, "gemma4");
+    }
+
+    #[test]
+    fn rejects_nvfp4_sidecar_scale_tensor() {
+        // D-B2: a ModelOpt-style `<name>.scale` sidecar in an NVFP4 file fails
+        // closed at admission (ignoring it would silently corrupt logits).
+        let mut file = gemma4_nvfp4_fixture();
+        file.tensors
+            .push(tensor("blk.0.ffn_down.weight.scale", GgufTensorType::F32));
+        let reject = admit(&file).expect_err("sidecar-bearing NVFP4 must reject");
+        assert_eq!(reject.axis, AdmissionAxis::Quant);
+        assert_eq!(reject.offending_value, "NVFP4");
+        assert_eq!(
+            reject.tensor.as_deref(),
+            Some("blk.0.ffn_down.weight.scale")
+        );
+        assert!(
+            reject.message.contains("sidecar") && reject.message.contains("D-B2"),
+            "message must name the sidecar refusal: {}",
+            reject.message
+        );
+    }
+
+    #[test]
+    fn rejects_nvfp4_sidecar_input_scale_tensor() {
+        let mut file = gemma4_nvfp4_fixture();
+        file.tensors.push(tensor(
+            "blk.0.ffn_down.weight.input_scale",
+            GgufTensorType::F32,
+        ));
+        let reject = admit(&file).expect_err("input_scale sidecar must reject");
+        assert_eq!(reject.axis, AdmissionAxis::Quant);
+        assert_eq!(
+            reject.tensor.as_deref(),
+            Some("blk.0.ffn_down.weight.input_scale")
+        );
+    }
+
+    #[test]
+    fn sidecar_names_without_nvfp4_admit() {
+        // The D-B2 refusal is scoped to NVFP4-bearing files: a covered-quant model
+        // that happens to carry a `.scale`-suffixed tensor name is untouched.
+        let mut file = base_fixture();
+        file.tensors
+            .push(tensor("blk.0.some.scale", GgufTensorType::F32));
+        assert!(
+            admit(&file).is_ok(),
+            ".scale names without NVFP4 must keep admitting"
+        );
+    }
+
+    #[test]
+    fn pilot_layer_output_scale_weight_is_not_a_sidecar() {
+        // The real gemma4 pilot carries 42 F32 `blk.N.layer_output_scale.weight`
+        // tensors. They end in `.weight`, not `.scale` — the sidecar check must not
+        // false-positive on them or the pilot row itself would be refused.
+        let mut file = gemma4_nvfp4_fixture();
+        file.tensors.push(tensor(
+            "blk.0.layer_output_scale.weight",
+            GgufTensorType::F32,
+        ));
+        let ok = admit(&file).expect("pilot layer_output_scale.weight must admit");
+        assert!(ok.quants.contains(&GgufTensorType::NVFP4));
     }
 
     #[test]
