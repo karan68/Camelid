@@ -799,4 +799,22 @@ byte-unchanged per §1.3 (`qa/evidence-bundles/basalt/phase3/row_rehash_post_clo
   platforms that never build it), the refusal is a typed, testable error rather than a
   missing symbol, and cfg-gated twin tests pin BOTH sides on the CI legs that actually
   run there (ubuntu/macos assert the refusal; Windows asserts admission).
-- **§2.4 — support-matrix mechanism:** reserved; decided in the next commit.
+- **§2.4 — invariant-matrix enforcement mechanism (S2):** `include_str!` file
+  binding + test-fn name assertion + fixture-tripping references, all in
+  `tests/invariant_matrix_binding.rs` against `qa/invariant_lanes.json`
+  (schema `qa/invariant_lanes.schema.json`, `camelid.invariant-lanes/v1`).
+  Every file an enforced cell names is `include_str!`-bound (a rename/move
+  breaks the BUILD); the meta-test validates the matrix against the schema
+  (hand validator, serde_json, no new deps), asserts full population (no empty
+  cells), asserts every enforced cell's test-fn NAME appears in its bound
+  file's text, and trips the committed `tests/fixtures/gguf/` fixtures (or
+  references the S1 per-lane test that already trips them — no duplicate
+  execution). HONESTLY NOTED: this is file-level compile-time + name-level
+  test-time — a fn RENAME fails the meta-test, not the build. That is the
+  §2.4-permitted substitution; acceptable because the meta-test runs in the
+  same `ci-gate` suite as the build (either way the PR goes red before merge),
+  and it is strictly stronger than nothing on both axes: moved/renamed files
+  cannot compile, renamed/deleted test fns cannot pass. Open-cell teeth: the
+  meta-test fails if the Phase-4 CUDA refusal text (or the P2b test-anchoring
+  marker) vanishes while a cell still cites that phase as open — ratchet
+  R3/R4 are enforced, not aspirational.
