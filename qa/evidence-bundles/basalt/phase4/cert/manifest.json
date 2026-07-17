@@ -6,9 +6,19 @@
   "phase": 4,
   "gate": "G4",
   "outcome": "CERT PASS; perf measured",
-  "note": "Phase 4 CERT (NVFP4-mm CPU wire lane vs CUDA-resident lane, greedy self-parity, gemma4 lane-native 9-prompt pack) = 6/9 token-identical + 3 attributed near-tie argmax flips (CUDA f16 KV vs CPU f32 KV; CUDA token = CPU #2 at 0.047-0.111 raw-logit gap); no wiring/kernel bug. G4 perf (median 5 warm runs, 128 greedy tokens, RTX 3060 Laptop sm_86 driver 576.83 CUDA 12.9): Q8_0 CUDA 25.80 tok/s (39.8% of 336 GB/s roofline, 5559 MiB), NVFP4-mm CUDA 14.64 tok/s (13.3% roofline, 3479 MiB), NVFP4-mm CPU 1.57 tok/s. Per-token weight read shrinks 1.70x (matmul-only 1.889x) but NVFP4 v1 scalar-LUT kernel is COMPUTE-bound (13.3% vs 39.8% roofline) so the byte reduction is unrealized => dp4a/byte-perm follow-up warranted (recon §5 Q1). Pin GPU row skipped (memory-safety: 6.06 GB model full-offload on 6144 MiB card). Placeholders: <cam-basalt>/<camelid>/<pin-tools>/<scratch>/<home>.",
+  "note": "Phase 4 CERT (self-parity 6/9, all near-tie attributed) + G4 perf table (measured this box). CERT PASS; NVFP4 CUDA correct + VRAM-saving (2.08GB) but compute-bound at v1 (0.57x Q8_0 speed) — dp4a upgrade pre-registered/warranted. Gate summary + decision in BASALT_G4_SUMMARY.md. Placeholders <cam-basalt>/<camelid>/<pin-tools>/<home>.",
   "hardware": "RTX 3060 Laptop GPU, sm_86, driver 576.83, CUDA 12.9, Windows 11",
   "files": [
+    {
+      "file": "BASALT_G4_SUMMARY.md",
+      "sha256": "bef1d311e9180898e40ef2e51a4d126c8baf875f40d7afbdf5f986c0002ded31",
+      "size_bytes": 5656
+    },
+    {
+      "file": "G4_PERF.md",
+      "sha256": "64a3f66f2c1aa2a7e18d951c8273731bfee10a49b8c5f54fd88eaeb249093027",
+      "size_bytes": 6984
+    },
     {
       "file": "byte_accounting.json",
       "sha256": "67c732aa2e5f22f3b3eb2e2b4057e93107f19246e2ecf7958c3c1f0c4381f28e",
@@ -18,11 +28,6 @@
       "file": "commands_log.txt",
       "sha256": "e340f3f9b19093ca028644a2307099f8df0acb7b74230b7ee9eb3cc0569fdfe3",
       "size_bytes": 9044
-    },
-    {
-      "file": "G4_PERF.md",
-      "sha256": "64a3f66f2c1aa2a7e18d951c8273731bfee10a49b8c5f54fd88eaeb249093027",
-      "size_bytes": 6984
     },
     {
       "file": "parity_cert.json",
