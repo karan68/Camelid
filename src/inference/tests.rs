@@ -13347,3 +13347,194 @@ fn decode_linear_binder_matches_cascade_on_real_3b_weights() {
     }
     eprintln!("binder equivalence: {checked} (weight x plan) combinations checked, 0 mismatches");
 }
+
+// ---------------------------------------------------------------------------
+// BASALT Phase 3: nvfp4_wire_row_dot vs an in-test straightforward reference
+// over the Phase 2 produced-pilot-row fixture.
+// ---------------------------------------------------------------------------
+
+/// Minimal RFC 4648 base64 decoder (mirrors tests/nvfp4_e4b_spotcheck.rs; the
+/// fixture stores wire bytes base64-encoded and this module takes no new deps).
+#[cfg(test)]
+fn nvfp4_b64_decode(s: &str) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let rev = {
+        let mut r = [255u8; 256];
+        for (i, &c) in TABLE.iter().enumerate() {
+            r[c as usize] = i as u8;
+        }
+        r
+    };
+    let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut acc = 0u32;
+        for &c in chunk {
+            let v = rev[c as usize];
+            assert_ne!(v, 255, "invalid base64 byte {c}");
+            acc = (acc << 6) | u32::from(v);
+        }
+        let bits = chunk.len() * 6;
+        acc <<= 24 - bits.min(24);
+        let full = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+        out.extend_from_slice(&full[..(bits / 8).min(3)]);
+    }
+    out
+}
+
+/// In-test straightforward reference for `nvfp4_wire_row_dot`, written against
+/// the pin contract directly (`ggml_vec_dot_nvfp4_q8_0_generic`, llama.cpp
+/// acd79d603 ggml-cpu/quants.c): first decode each superblock's 64 E2M1 codes
+/// to their integer kvalues, then per sub-block take the exact i32 dot against
+/// the owning Q8_0 activation block and accumulate
+/// `x_scale * UE4M3_TO_F32[d[s]] * sumi` in f32, sub-block-major. Integer adds
+/// are order-free; the f32 accumulation order is the load-bearing part and
+/// matches the pin (and the production kernel) exactly.
+#[cfg(test)]
+fn nvfp4_reference_row_dot(wire: &[u8], input: &[Q8_0Block]) -> f32 {
+    use crate::tensor::{KVALUES_MXFP4_I8, UE4M3_TO_F32};
+    assert_eq!(wire.len() % 36, 0);
+    assert_eq!(input.len(), wire.len() / 36 * 2);
+    let mut sumf = 0.0_f32;
+    for (ib, blk) in wire.chunks_exact(36).enumerate() {
+        // Decode the 64 integer code values (pre-scale): sub-block s owns qs
+        // bytes s*8..s*8+8; low nibble of byte j -> element s*16+j, high
+        // nibble -> element s*16+8+j.
+        let mut codes = [0i32; 64];
+        for s in 0..4 {
+            for j in 0..8 {
+                let byte = blk[4 + s * 8 + j];
+                codes[s * 16 + j] = i32::from(KVALUES_MXFP4_I8[(byte & 0x0F) as usize]);
+                codes[s * 16 + 8 + j] = i32::from(KVALUES_MXFP4_I8[(byte >> 4) as usize]);
+            }
+        }
+        for s in 0..4 {
+            let y = &input[2 * ib + s / 2];
+            let off = (s % 2) * 16;
+            let mut sumi = 0i32;
+            for j in 0..16 {
+                sumi += codes[s * 16 + j] * i32::from(y.quants[off + j]);
+            }
+            sumf += y.scale * UE4M3_TO_F32[blk[s] as usize] * sumi as f32;
+        }
+    }
+    sumf
+}
+
+/// The three §-pre-registered deterministic activation patterns for the row-dot
+/// test: constant, alternating-sign, and seeded pseudo-random i8 quants.
+#[cfg(test)]
+fn nvfp4_test_activation(pattern: usize, blocks: usize) -> Vec<Q8_0Block> {
+    match pattern {
+        0 => (0..blocks)
+            .map(|_| Q8_0Block {
+                scale: 0.0625,
+                quants: [3i8; 32],
+            })
+            .collect(),
+        1 => (0..blocks)
+            .map(|b| {
+                let mut quants = [0i8; 32];
+                for (j, q) in quants.iter_mut().enumerate() {
+                    *q = if j % 2 == 0 { 5 } else { -7 };
+                }
+                Q8_0Block {
+                    scale: if b % 2 == 0 { 1.5 } else { 0.75 },
+                    quants,
+                }
+            })
+            .collect(),
+        _ => {
+            // xorshift64: deterministic pseudo-random i8 quants + positive scales.
+            let mut state = 0x243F_6A88_85A3_08D3_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            (0..blocks)
+                .map(|_| {
+                    let mut quants = [0i8; 32];
+                    for q in quants.iter_mut() {
+                        *q = (next() & 0xFF) as u8 as i8;
+                    }
+                    Q8_0Block {
+                        scale: (next() % 1000) as f32 / 333.0 + 0.001,
+                        quants,
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// BASALT Phase 3 (test a): `nvfp4_wire_row_dot` must match the in-test pin-order
+/// reference BITWISE over ALL 5,120 blocks of the produced-pilot-row fixture
+/// (`tests/fixtures/dequant/nvfp4_e4b_spotcheck.json`, real wire bytes from
+/// gemma-4-E4B-it-NVFP4-mm.gguf) x 3 deterministic activation patterns — both as
+/// 5,120 x 3 single-superblock rows and as 64-superblock rows (8 per tensor) that
+/// exercise the cross-superblock f32 accumulation order.
+#[test]
+fn nvfp4_wire_row_dot_matches_pin_order_reference_on_pilot_fixture() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("dequant")
+        .join("nvfp4_e4b_spotcheck.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
+    let fx: serde_json::Value = serde_json::from_str(&raw).expect("spotcheck fixture parses");
+    assert_eq!(
+        fx["provenance"]["pin_sha"].as_str(),
+        Some("acd79d603"),
+        "fixture provenance pin mismatch"
+    );
+    let blocks = fx["blocks"].as_array().expect("blocks");
+    assert_eq!(blocks.len(), 5120, "5120 sampled blocks (512 x 10 tensors)");
+
+    let wires: Vec<Vec<u8>> = blocks
+        .iter()
+        .map(|b| {
+            let wire = nvfp4_b64_decode(b["w"].as_str().expect("wire b64"));
+            assert_eq!(wire.len(), 36);
+            wire
+        })
+        .collect();
+
+    let mut single_rows_checked = 0usize;
+    let mut multi_rows_checked = 0usize;
+    for pattern in 0..3 {
+        // Every fixture block as its own single-superblock row.
+        let xq2 = nvfp4_test_activation(pattern, 2);
+        for (bi, wire) in wires.iter().enumerate() {
+            let got = super::nvfp4_wire_row_dot(wire, &xq2);
+            let want = nvfp4_reference_row_dot(wire, &xq2);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "pattern {pattern} fixture block {bi}: got {got} want {want}"
+            );
+            single_rows_checked += 1;
+        }
+        // 64-superblock rows (80 per pattern): cross-superblock accumulation order.
+        let xq128 = nvfp4_test_activation(pattern, 128);
+        for (ri, row_blocks) in wires.chunks_exact(64).enumerate() {
+            let row: Vec<u8> = row_blocks.iter().flatten().copied().collect();
+            let got = super::nvfp4_wire_row_dot(&row, &xq128);
+            let want = nvfp4_reference_row_dot(&row, &xq128);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "pattern {pattern} 64-superblock row {ri}: got {got} want {want}"
+            );
+            multi_rows_checked += 1;
+        }
+    }
+    assert_eq!(single_rows_checked, 5120 * 3);
+    assert_eq!(multi_rows_checked, 80 * 3);
+    eprintln!(
+        "nvfp4 row dot: {single_rows_checked} single-superblock + {multi_rows_checked} \
+         64-superblock rows bitwise-identical to the pin-order reference"
+    );
+}

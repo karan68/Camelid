@@ -19245,6 +19245,56 @@ pub fn nvfp4_wire_block_dequant(
     out
 }
 
+/// NVFP4 x Q8_0 dot of one weight row read straight from the GGUF wire bytes
+/// (36-byte superblocks: `d[4]` UE4M3 sub-block scales then `qs[32]` packed E2M1
+/// nibbles) against a pre-quantized Q8_0 activation row, mirroring the pin's
+/// `ggml_vec_dot_nvfp4_q8_0_generic` (llama.cpp acd79d603, ggml-cpu/quants.c)
+/// numeric shape EXACTLY: each 64-value superblock `ib` dots against TWO 32-value
+/// Q8_0 activation blocks — sub-blocks s=0,1 against `input[2*ib]`, s=2,3 against
+/// `input[2*ib+1]`, at offset `(s%2)*16` within that block. Per sub-block the
+/// integer accumulation is exact i32
+/// (`sumi_lo = sum_j kvalues[lo_nibble(qs[s*8+j])] * q8[off+j]`, j=0..8; high
+/// nibbles pair with `q8[off+8+j]`), then
+/// `sumf += x_scale * UE4M3_TO_F32[d[s]] * (sumi_lo + sumi_hi)` accumulates in f32,
+/// sub-block-major — the load-bearing float order. Scale byte 0x7F flushes to 0.0
+/// through the UE4M3 table (pin-CPU-bitwise; sentinel REFUSAL is the load path's
+/// job — `crate::tensor::decode_nvfp4_tensor` / the gemma4 wire load, per
+/// DECISIONS.md D17/T5). BASALT Phase 3: correctness-first scalar, no SIMD.
+pub(crate) fn nvfp4_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
+    use crate::tensor::{KVALUES_MXFP4_I8, NVFP4_WIRE_BYTES_PER_BLOCK, UE4M3_TO_F32};
+    debug_assert!(
+        weight_wire.len().is_multiple_of(NVFP4_WIRE_BYTES_PER_BLOCK),
+        "NVFP4 wire row must be whole 36-byte superblocks"
+    );
+    let superblocks = weight_wire.len() / NVFP4_WIRE_BYTES_PER_BLOCK;
+    debug_assert_eq!(
+        input.len(),
+        2 * superblocks,
+        "one 64-value NVFP4 superblock spans two 32-value Q8_0 activation blocks"
+    );
+    let mut sumf = 0.0_f32;
+    for ib in 0..superblocks {
+        let block =
+            &weight_wire[ib * NVFP4_WIRE_BYTES_PER_BLOCK..(ib + 1) * NVFP4_WIRE_BYTES_PER_BLOCK];
+        for s in 0..4 {
+            let d = UE4M3_TO_F32[block[s] as usize];
+            let y = &input[2 * ib + s / 2];
+            let off = (s % 2) * 16;
+            let mut sumi_lo = 0_i32;
+            let mut sumi_hi = 0_i32;
+            for j in 0..8 {
+                let qv = block[4 + s * 8 + j];
+                sumi_lo += i32::from(KVALUES_MXFP4_I8[(qv & 0x0F) as usize])
+                    * i32::from(y.quants[off + j]);
+                sumi_hi += i32::from(KVALUES_MXFP4_I8[(qv >> 4) as usize])
+                    * i32::from(y.quants[off + 8 + j]);
+            }
+            sumf += y.scale * d * (sumi_lo + sumi_hi) as f32;
+        }
+    }
+    sumf
+}
+
 pub(crate) const Q4_K_WIRE_BYTES_PER_BLOCK: usize = 144;
 pub(crate) const Q5_K_WIRE_BYTES_PER_BLOCK: usize = 176;
 pub(crate) const Q5_0_WIRE_BYTES_PER_BLOCK: usize = 22;

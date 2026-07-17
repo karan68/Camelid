@@ -602,6 +602,20 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
+        /// BASALT forced-decode harness (basalt_eval_protocol.md §5.1):
+        /// teacher-force the token ids in this file (newline-separated decimal
+        /// ids, or one JSON array). Each step feeds the forced token as the
+        /// next input REGARDLESS of the model's argmax, while the per-step
+        /// argmax id + logit are still recorded (stdout JSON). Ignores
+        /// --max-tokens and stop tokens: the list length defines the step count.
+        #[arg(long)]
+        force_tokens: Option<PathBuf>,
+        /// Write each step's FULL logit vector into this directory as raw
+        /// little-endian f32 `step_<i>.bin` files, plus a `meta.json` (vocab
+        /// size, step count, prompt info, per-step top-32 (id, logit)). Works
+        /// with or without --force-tokens.
+        #[arg(long)]
+        dump_step_logits: Option<PathBuf>,
     },
     /// Generate with the CUDA-resident Gemma 4 lane (dev harness for the SSER build).
     #[cfg(feature = "cuda")]
@@ -1537,23 +1551,156 @@ async fn main() -> anyhow::Result<()> {
             path,
             prompt,
             max_tokens,
+            force_tokens,
+            dump_step_logits,
         } => {
             eprintln!("[gemma4] loading {}...", path.display());
             let t0 = std::time::Instant::now();
             let runtime = camelid::gemma4_runtime::Gemma4Runtime::load(&path)?;
-            eprintln!(
-                "[gemma4] loaded in {:.1}s; generating {max_tokens} tokens...",
-                t0.elapsed().as_secs_f32()
-            );
-            let t1 = std::time::Instant::now();
-            let (out, ids) = runtime.generate_greedy(&prompt, max_tokens)?;
-            let gen = t1.elapsed().as_secs_f32();
-            eprintln!(
-                "[gemma4] generated in {gen:.1}s ({:.2} tok/s)",
-                ids.len() as f32 / gen
-            );
-            eprintln!("[gemma4] token_ids: {ids:?}");
-            println!("{prompt}{out}");
+            if force_tokens.is_none() && dump_step_logits.is_none() {
+                // Default arm — byte-identical behavior to before the BASALT
+                // harness flags existed.
+                eprintln!(
+                    "[gemma4] loaded in {:.1}s; generating {max_tokens} tokens...",
+                    t0.elapsed().as_secs_f32()
+                );
+                let t1 = std::time::Instant::now();
+                let (out, ids) = runtime.generate_greedy(&prompt, max_tokens)?;
+                let gen = t1.elapsed().as_secs_f32();
+                eprintln!(
+                    "[gemma4] generated in {gen:.1}s ({:.2} tok/s)",
+                    ids.len() as f32 / gen
+                );
+                eprintln!("[gemma4] token_ids: {ids:?}");
+                println!("{prompt}{out}");
+            } else {
+                // BASALT Phase 3 harness surface (basalt_eval_protocol.md §5.1):
+                // forced decode and/or per-step full-logit dumps. NO engine math
+                // changes — both modes drive the same step loop as generate_greedy.
+                eprintln!("[gemma4] loaded in {:.1}s", t0.elapsed().as_secs_f32());
+                let forced: Option<Vec<u32>> = match &force_tokens {
+                    Some(p) => {
+                        let text = std::fs::read_to_string(p)?;
+                        let ids = parse_forced_tokens(&text)
+                            .map_err(|e| anyhow::anyhow!("--force-tokens {}: {e}", p.display()))?;
+                        eprintln!(
+                            "[gemma4] teacher-forcing {} tokens from {}",
+                            ids.len(),
+                            p.display()
+                        );
+                        Some(ids)
+                    }
+                    None => None,
+                };
+                let dump_dir = dump_step_logits.clone();
+                if let Some(dir) = &dump_dir {
+                    std::fs::create_dir_all(dir)?;
+                }
+
+                let mut records: Vec<Gemma4StepRecord> = Vec::new();
+                let mut vocab_size = 0usize;
+                let mut dump_err: Option<std::io::Error> = None;
+                let t1 = std::time::Instant::now();
+
+                let (mode, prompt_token_ids, greedy_out) = match &forced {
+                    Some(ids) => {
+                        let ptoks = runtime.forced_decode(&prompt, ids, |i, logits| {
+                            vocab_size = logits.len();
+                            let (argmax_id, argmax_logit) = greedy_argmax(logits);
+                            records.push(Gemma4StepRecord {
+                                step: i,
+                                forced_id: Some(ids[i]),
+                                argmax_id,
+                                argmax_logit,
+                                top32: top_n_logits(logits, 32),
+                            });
+                            if let Some(dir) = &dump_dir {
+                                if dump_err.is_none() {
+                                    if let Err(e) = write_step_logits(dir, i, logits) {
+                                        dump_err = Some(e);
+                                    }
+                                }
+                            }
+                        })?;
+                        ("forced", ptoks, None)
+                    }
+                    None => {
+                        // --dump-step-logits alone: observed greedy decode
+                        // (token-identical to generate_greedy on the plain loop).
+                        let ptoks = runtime.tokenizer().encode(&prompt, true, true)?;
+                        let (out, ids) = runtime.generate_greedy_observed(
+                            &prompt,
+                            max_tokens,
+                            |i, logits| {
+                                vocab_size = logits.len();
+                                let (argmax_id, argmax_logit) = greedy_argmax(logits);
+                                records.push(Gemma4StepRecord {
+                                    step: i,
+                                    forced_id: None,
+                                    argmax_id,
+                                    argmax_logit,
+                                    top32: top_n_logits(logits, 32),
+                                });
+                                if let Some(dir) = &dump_dir {
+                                    if dump_err.is_none() {
+                                        if let Err(e) = write_step_logits(dir, i, logits) {
+                                            dump_err = Some(e);
+                                        }
+                                    }
+                                }
+                            },
+                        )?;
+                        ("greedy", ptoks, Some((out, ids)))
+                    }
+                };
+                if let Some(e) = dump_err {
+                    return Err(anyhow::anyhow!(
+                        "--dump-step-logits write failed in {}: {e}",
+                        dump_dir
+                            .as_ref()
+                            .expect("dump dir set when dump_err set")
+                            .display()
+                    ));
+                }
+                let gen = t1.elapsed().as_secs_f32();
+                eprintln!(
+                    "[gemma4] {} steps in {gen:.1}s ({:.2} steps/s)",
+                    records.len(),
+                    records.len() as f32 / gen.max(1e-9)
+                );
+
+                let meta = Gemma4StepMeta {
+                    protocol: "basalt_eval_protocol.md §5.1/§5.3",
+                    mode,
+                    model: path.display().to_string(),
+                    prompt: prompt.clone(),
+                    prompt_token_ids,
+                    vocab_size,
+                    step_count: records.len(),
+                    logits_dtype: "f32_le",
+                    logits_file_pattern: "step_<i>.bin",
+                    steps: records,
+                };
+                if let Some(dir) = &dump_dir {
+                    let meta_path = dir.join("meta.json");
+                    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+                    eprintln!(
+                        "[gemma4] wrote {} step_<i>.bin dumps + meta.json to {}",
+                        meta.step_count,
+                        dir.display()
+                    );
+                }
+                match (mode, &greedy_out) {
+                    // Forced mode: stdout is the machine-readable step record.
+                    ("forced", _) => println!("{}", serde_json::to_string_pretty(&meta)?),
+                    // Greedy+dump mode: stdout keeps the default arm's shape.
+                    (_, Some((out, ids))) => {
+                        eprintln!("[gemma4] token_ids: {ids:?}");
+                        println!("{prompt}{out}");
+                    }
+                    _ => unreachable!("greedy mode always carries generate output"),
+                }
+            }
         }
         #[cfg(feature = "cuda")]
         Command::Gemma4CudaGenerate {
@@ -6695,6 +6842,196 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
         }
     };
     f32::from_bits(out)
+}
+
+// ---------------------------------------------------------------------------
+// BASALT Phase 3 forced-decode harness helpers (basalt_eval_protocol.md §5.1) —
+// `camelid gemma4-generate --force-tokens/--dump-step-logits` records. Pure
+// CLI-side plumbing: no engine math lives here.
+// ---------------------------------------------------------------------------
+
+/// One recorded step of the §5.1 harness: the argmax (id, logit) of the step's
+/// full logit vector plus its top-32 excerpt (§5.3 bundle convention), and the
+/// teacher-forced token when in forced mode.
+#[derive(Debug, Serialize)]
+struct Gemma4StepRecord {
+    step: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forced_id: Option<u32>,
+    argmax_id: u32,
+    argmax_logit: f32,
+    /// Top-32 (token id, logit) pairs, logit-descending (ties: lower id first).
+    top32: Vec<(u32, f32)>,
+}
+
+/// The harness `meta.json` (and forced-mode stdout) document.
+#[derive(Debug, Serialize)]
+struct Gemma4StepMeta {
+    protocol: &'static str,
+    /// "forced" (--force-tokens) or "greedy" (--dump-step-logits alone).
+    mode: &'static str,
+    model: String,
+    prompt: String,
+    prompt_token_ids: Vec<u32>,
+    vocab_size: usize,
+    step_count: usize,
+    logits_dtype: &'static str,
+    logits_file_pattern: &'static str,
+    steps: Vec<Gemma4StepRecord>,
+}
+
+/// Parse a `--force-tokens` file: either one JSON array of token ids
+/// (`[5, 6, 7]`) or newline-separated decimal ids (blank lines, CR, and a BOM
+/// tolerated). Empty files are an error — a forced decode with zero steps is
+/// always a harness mistake.
+fn parse_forced_tokens(text: &str) -> Result<Vec<u32>, String> {
+    let trimmed = text.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return Err("forced-token file is empty".into());
+    }
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<u32>>(trimmed)
+            .map_err(|e| format!("forced-token JSON parse failed: {e}"));
+    }
+    trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            l.parse::<u32>()
+                .map_err(|e| format!("bad forced token id {l:?}: {e}"))
+        })
+        .collect()
+}
+
+/// Per-step argmax (id, logit) with `Gemma4Runtime::generate_greedy`'s EXACT
+/// tie convention (`max_by` + `partial_cmp`: the last of equal maxima wins), so
+/// the recorded argmax is the token the greedy decoder would emit at this step.
+fn greedy_argmax(logits: &[f32]) -> (u32, f32) {
+    let (i, v) = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .expect("non-empty logits");
+    (i as u32, *v)
+}
+
+/// Top-`n` (id, logit) pairs by logit descending, ties broken by lower id —
+/// deterministic (`total_cmp`) and independent of the argmax tie convention
+/// above (the two can differ on an exact tie; the argmax field is authoritative
+/// for greedy-parity questions).
+fn top_n_logits(logits: &[f32], n: usize) -> Vec<(u32, f32)> {
+    let take = n.min(logits.len());
+    if take == 0 {
+        return Vec::new();
+    }
+    let mut ids: Vec<u32> = (0..logits.len() as u32).collect();
+    let cmp = |a: &u32, b: &u32| {
+        logits[*b as usize]
+            .total_cmp(&logits[*a as usize])
+            .then(a.cmp(b))
+    };
+    if take < ids.len() {
+        ids.select_nth_unstable_by(take - 1, cmp);
+        ids.truncate(take);
+    }
+    ids.sort_unstable_by(cmp);
+    ids.into_iter().map(|i| (i, logits[i as usize])).collect()
+}
+
+/// Write one step's FULL logit vector as raw little-endian f32 bytes
+/// (`step_<i>.bin` — the §5.3 exact-KL input; dumps are temporary, the bundle
+/// keeps the meta.json top-32 excerpts).
+fn write_step_logits(dir: &std::path::Path, step: usize, logits: &[f32]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(logits.len() * 4);
+    for v in logits {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(dir.join(format!("step_{step}.bin")), buf)
+}
+
+#[cfg(test)]
+mod basalt_forced_decode_tests {
+    use super::*;
+
+    #[test]
+    fn gemma4_generate_parses_forced_decode_flags() {
+        let cli = Cli::try_parse_from([
+            "camelid",
+            "gemma4-generate",
+            "model.gguf",
+            "--force-tokens",
+            "toks.txt",
+            "--dump-step-logits",
+            "dumps",
+            "--max-tokens",
+            "8",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Gemma4Generate {
+                path,
+                max_tokens,
+                force_tokens,
+                dump_step_logits,
+                ..
+            }) => {
+                assert_eq!(path, PathBuf::from("model.gguf"));
+                assert_eq!(max_tokens, 8);
+                assert_eq!(force_tokens, Some(PathBuf::from("toks.txt")));
+                assert_eq!(dump_step_logits, Some(PathBuf::from("dumps")));
+            }
+            other => panic!("expected Gemma4Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemma4_generate_harness_flags_default_off() {
+        let cli = Cli::try_parse_from(["camelid", "gemma4-generate", "model.gguf"]).expect("parse");
+        match cli.command {
+            Some(Command::Gemma4Generate {
+                prompt,
+                max_tokens,
+                force_tokens,
+                dump_step_logits,
+                ..
+            }) => {
+                // Default behavior unchanged: no harness flags, prior defaults intact.
+                assert_eq!(force_tokens, None);
+                assert_eq!(dump_step_logits, None);
+                assert_eq!(prompt, "The capital of France is");
+                assert_eq!(max_tokens, 24);
+            }
+            other => panic!("expected Gemma4Generate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forced_token_file_parses_newline_and_json_forms() {
+        assert_eq!(parse_forced_tokens("5\n6\n7\n").unwrap(), vec![5, 6, 7]);
+        assert_eq!(parse_forced_tokens("[5, 6, 7]").unwrap(), vec![5, 6, 7]);
+        // CRLF + blank lines + BOM tolerated (Windows-authored token files).
+        assert_eq!(
+            parse_forced_tokens("\u{feff}5\r\n\r\n6\r\n").unwrap(),
+            vec![5, 6]
+        );
+        assert!(parse_forced_tokens("").is_err());
+        assert!(parse_forced_tokens("   \n  ").is_err());
+        assert!(parse_forced_tokens("notanid").is_err());
+        assert!(parse_forced_tokens("[1, -2]").is_err());
+    }
+
+    #[test]
+    fn step_record_helpers_are_deterministic() {
+        let logits = [0.5f32, 2.5, -1.0, 2.5, 0.0];
+        // generate_greedy's max_by(partial_cmp) keeps the LAST of equal maxima.
+        assert_eq!(greedy_argmax(&logits), (3, 2.5));
+        // top-n orders logit-descending with lower-id-first ties.
+        assert_eq!(top_n_logits(&logits, 3), vec![(1, 2.5), (3, 2.5), (0, 0.5)]);
+        // n larger than vocab clamps.
+        assert_eq!(top_n_logits(&logits, 64).len(), 5);
+        assert_eq!(top_n_logits(&[], 32), Vec::new());
+    }
 }
 
 #[cfg(test)]
