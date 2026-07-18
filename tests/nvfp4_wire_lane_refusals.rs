@@ -127,9 +127,10 @@ fn nan_sentinel_fixture_trips_the_scan_seam() {
     assert!(msg.contains("D17/T5"), "{msg}");
 
     // Documented non-reachability: full-file load DOES error, but never with
-    // the sentinel message — on Windows it dies in gemma4 config parsing
-    // (which precedes WireQuant construction); on non-Windows the Amendment 3
-    // §9 platform gate fires even earlier. Either way the file boundary cannot
+    // the sentinel message — on Windows and macOS (both admit NVFP4 since GABBRO
+    // M2) it dies in gemma4 config parsing, which precedes WireQuant
+    // construction; on the remaining (unvalidated) platforms the Amendment 3 §9
+    // platform gate fires even earlier. Either way the file boundary cannot
     // exercise the sentinel scan, which is why this cell is seam-only.
     let msg = match Gemma4Runtime::load(&path) {
         Err(e) => e.to_string(),
@@ -139,9 +140,9 @@ fn nan_sentinel_fixture_trips_the_scan_seam() {
         !msg.contains("NaN-sentinel"),
         "if load ever reaches the sentinel scan, promote this cell to end-to-end: {msg}"
     );
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     assert!(
-        msg.contains("NVFP4 is Windows-only in this release"),
-        "off Windows the §9 platform gate fires first: {msg}"
+        msg.contains("NVFP4 is Windows/macOS-only in this release"),
+        "on unvalidated platforms the §9 platform gate fires first: {msg}"
     );
 }

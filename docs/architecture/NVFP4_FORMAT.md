@@ -13,8 +13,9 @@ NVFP4 is llama.cpp's E2M1 4-bit weight format with per-16-element UE4M3 sub-bloc
 (`GGML_TYPE_NVFP4` = 40, added upstream 2026-03). BASALT (the campaign that landed this)
 targeted **decode bandwidth** on a 6 GB card: the pilot's 294 matmul weights shrink 1.889×
 vs Q8_0, moving fewer bytes per token. The vehicle is `gemma-4-E4B-it` and nothing else —
-the runnable-lane admission is a pilot-model-only carve-out (D-B3), and the format is
-Windows-only in this release. Runnable-lane admission covers the NVFP4 format and — as of
+the runnable-lane admission is a pilot-model-only carve-out (D-B3), and the format admits on
+Windows and macOS in this release (GABBRO M2; on macOS the CPU wire lane only — the Metal GPU
+kernel is GABBRO Phase M3, not yet wired). Runnable-lane admission covers the NVFP4 format and — as of
 D-B6 (2026-07-17) — BF16 as a covered exact-decode type, so its only produced file (gemma4-E4B)
 admits fully; its one BF16 tensor (`per_layer_model_proj`) was the prior admission blocker
 (G2 §6b). It executes via `gemma4_runtime` — the CPU wire + CUDA-resident lanes, not the generic
@@ -102,11 +103,12 @@ Phase 0 prose claims were found wrong — cite `BASALT_RECON.md` §1 [G1 errata]
   to 0.0), **and** Camelid admission scans NVFP4 tensors and refuses files containing `0x7F` or
   `0xFF` scale sentinel bytes (such files cannot even produce a well-defined cross-backend
   oracle). Zero scale bytes admit (they are legitimate all-zero blocks).
-- **§9 — Windows-only.** NVFP4 admission refuses on non-Windows targets via a runtime
-  platform gate (`cfg!(target_os = "windows")` inside ordinary code, both lanes) with the
-  typed error "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX". cfg-twinned tests
-  pin both sides on the CI legs that run there (ubuntu/macos assert refusal; Windows asserts
-  admission).
+- **§9 — Windows/macOS-only (GABBRO M2).** NVFP4 admission is allowed on Windows and macOS and
+  refuses on every other target via a runtime platform gate (`!cfg!(windows) && !cfg!(macos)`
+  inside ordinary code, both lanes) with the typed error "NVFP4 is Windows/macOS-only in this
+  release; see SUPPORT_MATRIX". cfg-twinned tests pin every side on the CI legs that run there
+  (Windows and macOS assert admission; other targets assert the refusal). macOS runs the CPU
+  wire lane only (bit-exact, Gate G-M1); its Metal GPU kernel is Phase M3, not yet wired.
 
 ## Quality / performance receipts
 
@@ -117,8 +119,10 @@ Quality (Gate G3) and CUDA decode perf (Gate G4 + Phase 4b dp4a) are receipted i
 
 ## Support status
 
-NVFP4 4-bit weights, gemma-4-E4B pilot, Windows-only. Engine facts: bit-exact CPU decode +
-CUDA dp4a GEMV kernel (46/46 bit-identical). Measured vs the Q8_0 parent at matched 4.5 bpw:
+NVFP4 4-bit weights, gemma-4-E4B pilot, Windows + macOS (CPU wire lane; the macOS Metal GPU
+kernel is GABBRO Phase M3, not yet wired). Engine facts: bit-exact CPU decode, validated on
+x86 and on Apple Silicon/ARM (GABBRO Gate G-M1), + a Windows CUDA dp4a GEMV kernel (46/46
+bit-identical). Measured vs the Q8_0 parent at matched 4.5 bpw:
 behind Q4_K on quality (G3 NO-GO, 88.5% vs 92.6% top-1 agreement; 0.111 vs 0.065 mean-KL
 nats), but 1.03x faster than Q8_0 CUDA decode (26.51 vs 25.80 tok/s) and 2.08 GB lighter VRAM
 on an RTX 3060 Laptop (decode-only, this box). Not a supported row; not quality-competitive.

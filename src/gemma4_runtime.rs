@@ -1053,24 +1053,35 @@ pub(crate) fn nvfp4_sidecar_check(tensors: &[crate::gguf::GgufTensorDescriptor])
     Ok(())
 }
 
-/// BASALT Amendment 3 §9 platform gate (DECISIONS.md D17 micro-decisions): NVFP4
-/// is Windows-only in this release. This is a RUNTIME check (`cfg!` inside
-/// ordinary code), deliberately NOT a `#[cfg]` wall: the decode code compiles on
-/// every target, and non-Windows callers get this named refusal instead of a
-/// missing symbol. Enforced in BOTH lanes — runnable admission
+/// BASALT Amendment 3 §9 platform gate (DECISIONS.md D17 micro-decisions),
+/// GABBRO M2 narrowing: NVFP4 admits on Windows AND macOS in this release, and
+/// refuses on every other target (Linux et al.). macOS joined the admit set once
+/// its CPU wire-lane decode was proven bit-exact on Apple Silicon (GABBRO Gate
+/// G-M1, `qa/evidence-bundles/gabbro/phase1/`). This is a RUNTIME check (`cfg!`
+/// inside ordinary code), deliberately NOT a `#[cfg]` wall: the decode code
+/// compiles on every target, and refused callers get this named refusal instead
+/// of a missing symbol. Enforced in BOTH lanes — runnable admission
 /// (`runnable::admit`) and this gemma4 wire-lane load path — because either lane
 /// alone could otherwise reach NVFP4 weights on an unvalidated platform. Fires
 /// AFTER [`nvfp4_sidecar_check`] so the D-B2 posture stays platform-independent.
+///
+/// NOTE (GABBRO M2): the refusal message reads "Windows/macOS-only" and the
+/// support matrices are truthed-up to Windows+macOS in this same ratchet PR
+/// (Tim folded the surface truth-up into M2). macOS runs the CPU wire lane only;
+/// its Metal GPU kernel is Phase M3, still typed-refused by
+/// `nvfp4_metal_lane_check`. The fn name `nvfp4_windows_only_check` is retained
+/// as an optional internal rename follow-up (pub(crate); not a user surface).
 pub(crate) fn nvfp4_windows_only_check(
     tensors: &[crate::gguf::GgufTensorDescriptor],
 ) -> Result<()> {
     if !cfg!(target_os = "windows")
+        && !cfg!(target_os = "macos")
         && tensors
             .iter()
             .any(|t| t.tensor_type == GgufTensorType::NVFP4)
     {
         return Err(BackendError::UnsupportedGguf(
-            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX".into(),
+            "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX".into(),
         ));
     }
     Ok(())
@@ -1167,9 +1178,10 @@ impl Gemma4Runtime {
         // any refuses here, mirroring the runnable-lane admission check.
         // Pin-quantized rows (the BASALT pilot artifacts) carry none.
         nvfp4_sidecar_check(&gguf.tensors)?;
-        // BASALT Amendment 3 §9: NVFP4 is Windows-only in this release — a
-        // runtime platform gate (after the sidecar check so D-B2 stays
-        // platform-independent), mirrored in runnable admission.
+        // BASALT Amendment 3 §9 + GABBRO M2: NVFP4 admits on Windows and macOS
+        // in this release (other targets refuse) — a runtime platform gate
+        // (after the sidecar check so D-B2 stays platform-independent), mirrored
+        // in runnable admission.
         nvfp4_windows_only_check(&gguf.tensors)?;
         let config = LlamaModelConfig::from_gguf(&gguf)?;
         let g = config.gemma4.clone().ok_or_else(|| {
@@ -5739,19 +5751,29 @@ mod gpu_lane_refusal_tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    fn windows_only_check_admits_nvfp4_on_macos() {
+        // GABBRO M2 twin (runs on the macOS leg): NVFP4 now admits on macOS too,
+        // once the Apple-Silicon CPU decode was proven bit-exact (Gate G-M1).
+        let tensors = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
+        nvfp4_windows_only_check(&tensors).expect("NVFP4 admits on macOS (GABBRO M2)");
+    }
+
+    #[test]
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     fn windows_only_check_refuses_nvfp4_off_windows() {
-        // §9 twin (runs on the ubuntu/macos legs): the named TK2 refusal.
+        // §9 twin (runs on the linux leg — macOS now admits, GABBRO M2): the
+        // named TK2 refusal on the still-unvalidated platforms.
         let tensors = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
         match nvfp4_windows_only_check(&tensors) {
             Err(BackendError::UnsupportedGguf(msg)) => {
                 assert_eq!(
                     msg,
-                    "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
+                    "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX"
                 );
             }
             Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
-            Ok(()) => panic!("NVFP4 must refuse off Windows (Amendment 3 §9)"),
+            Ok(()) => panic!("NVFP4 must refuse on unvalidated platforms (Amendment 3 §9)"),
         }
     }
 
@@ -5766,21 +5788,22 @@ mod gpu_lane_refusal_tests {
     #[test]
     fn cuda_resident_platform_gate_fronts_the_cuda_lane_entry() {
         let pilot = vec![desc("blk.0.ffn_down.weight", GgufTensorType::NVFP4)];
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            nvfp4_windows_only_check(&pilot)
-                .expect("NVFP4 admits through the §9 gate on Windows so the CUDA lane binds");
+            nvfp4_windows_only_check(&pilot).expect(
+                "NVFP4 admits through the §9 gate on Windows/macOS so the resident lane binds",
+            );
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             match nvfp4_windows_only_check(&pilot) {
                 Err(BackendError::UnsupportedGguf(msg)) => assert_eq!(
-                    msg, "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX",
+                    msg, "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX",
                     "the CUDA lane's shared entry gate must yield the named TK2 refusal"
                 ),
                 Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
                 Ok(()) => panic!(
-                    "the §9 gate fronting Gemma4CudaResident::load must refuse NVFP4 off Windows"
+                    "the §9 gate fronting Gemma4CudaResident::load must refuse NVFP4 on unvalidated platforms"
                 ),
             }
         }
