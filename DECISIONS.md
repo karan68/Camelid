@@ -903,6 +903,25 @@ pending Tim's signature (carried, non-blocking): **D-B6/TK3** per-tensor sidecar
 (draft banked, Option A recommended) and the **§2.4** invariant-matrix-mechanism deviation
 (disclosed above). Surface-alignment only — no support claim moved.
 
+**D17 addendum 9 (2026-07-18, GABBRO M2 — macOS admit + §9 gate narrowed).** GABBRO Gate
+G-M1 proved the NVFP4 CPU wire-lane decode bit-exact on Apple Silicon/ARM (13/13 committed
+`nvfp4_*` tests on an Apple M4; receipt `qa/evidence-bundles/gabbro/phase1/`), so the
+Amendment 3 §9 platform gate is narrowed to admit NVFP4 on **Windows AND macOS**, refusing
+only on other targets. Both lanes (`nvfp4_windows_only_check` in the gemma4 wire path and the
+mirrored `runnable::admit` gate) now test `!windows && !macos`; the TK2 error text is
+truthed-up to **"NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX"** and every
+support surface (SUPPORT_MATRIX, CAPABILITY_MATRIX, STATUS, COMPATIBILITY, README,
+`docs/architecture/NVFP4_FORMAT.md`, `qa/invariant_lanes.json`) is updated in the same ratchet
+PR (Tim's ruling folded the surface truth-up into M2). Scope on macOS is the **CPU wire lane
+only** — the Metal GPU kernel is GABBRO Phase M3 and is not yet wired (`Gemma4GpuRuntime`
+still typed-refuses NVFP4 via `nvfp4_metal_lane_check`), so no macOS GPU/perf claim is made;
+the CUDA dp4a kernel and its RTX-3060 numbers stay Windows-only. Still NOT a supported/certified
+row and NOT quality-competitive (G3 NO-GO stands). The L4-metal invariant cells were already
+`enforced` by BASALT (S1 upgrade over the prescribed na), so GABBRO's "flip L4 na→enforced"
+step is a no-op — the pin was ahead of the GABBRO conductor. The internal fn name
+`nvfp4_windows_only_check` is retained (optional rename follow-up; pub(crate), not a user
+surface).
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
@@ -913,7 +932,10 @@ pending Tim's signature (carried, non-blocking): **D-B6/TK3** per-tensor sidecar
   compiles identically on every target (no cfg-walled decode code rotting unseen on
   platforms that never build it), the refusal is a typed, testable error rather than a
   missing symbol, and cfg-gated twin tests pin BOTH sides on the CI legs that actually
-  run there (ubuntu/macos assert the refusal; Windows asserts admission).
+  run there (ubuntu/macos assert the refusal; Windows asserts admission). **[NARROWED by
+  addendum 9 (GABBRO M2, 2026-07-18): the gate now admits on `windows` OR `macos`; only
+  non-(Windows/macOS) legs assert the refusal, and the TK2 text is now "NVFP4 is
+  Windows/macOS-only in this release; see SUPPORT_MATRIX".]**
 - **§2.4 — invariant-matrix enforcement mechanism (S2):** `include_str!` file
   binding + test-fn name assertion + fixture-tripping references, all in
   `tests/invariant_matrix_binding.rs` against `qa/invariant_lanes.json`

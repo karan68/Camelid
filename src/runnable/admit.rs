@@ -309,15 +309,23 @@ fn check_quants(
         }
     }
 
-    // BASALT Amendment 3 §9 platform gate: NVFP4 admission is Windows-only in
-    // this release. A RUNTIME check (`cfg!` inside ordinary code), deliberately
-    // not a `#[cfg]` wall — the crate compiles identically on every target and
-    // non-Windows hosts get this named refusal (DECISIONS.md D17
+    // BASALT Amendment 3 §9 platform gate + GABBRO M2 narrowing: NVFP4 admission
+    // is allowed on Windows AND macOS in this release, and refused on every other
+    // target (macOS joined once its Apple-Silicon CPU decode was proven bit-exact,
+    // GABBRO Gate G-M1). A RUNTIME check (`cfg!` inside ordinary code),
+    // deliberately not a `#[cfg]` wall — the crate compiles identically on every
+    // target and refused hosts get this named refusal (DECISIONS.md D17
     // micro-decisions, §9.1). It fires AFTER the D-B3 scope and D-B2 sidecar
     // checks so those signed postures stay platform-independent: only a file
     // that would otherwise fully admit reaches this refusal. Mirrored in the
     // gemma4 wire-lane load path (`gemma4_runtime::nvfp4_windows_only_check`).
-    if !cfg!(target_os = "windows") && seen.contains(&GgufTensorType::NVFP4) {
+    // NOTE (GABBRO M2): the refusal message reads "Windows/macOS-only" and the
+    // support matrices are truthed-up in this same ratchet PR (Tim's ruling).
+    // macOS runs the CPU wire lane only; its Metal GPU kernel is Phase M3.
+    if !cfg!(target_os = "windows")
+        && !cfg!(target_os = "macos")
+        && seen.contains(&GgufTensorType::NVFP4)
+    {
         let tensor = file
             .tensors
             .iter()
@@ -327,7 +335,7 @@ fn check_quants(
             axis: AdmissionAxis::Quant,
             offending_value: "NVFP4".to_string(),
             tensor,
-            message: "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX".to_string(),
+            message: "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX".to_string(),
         });
     }
 
@@ -463,9 +471,10 @@ mod tests {
         file
     }
 
-    // Amendment 3 §9: full NVFP4 admission is Windows-only, so the two tests
-    // that expect an ADMIT run on the Windows leg, and their off-Windows twins
-    // (below) pin the named platform refusal on the ubuntu/macos CI legs.
+    // Amendment 3 §9 + GABBRO M2: NVFP4 admission is allowed on Windows and
+    // macOS, so the tests that expect an ADMIT run on those legs, and the
+    // remaining-platform twin (below) pins the named platform refusal on the
+    // ubuntu/linux CI leg.
     #[test]
     #[cfg(target_os = "windows")]
     fn admits_gemma4_nvfp4_pilot() {
@@ -476,18 +485,31 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    fn admits_gemma4_nvfp4_pilot_on_macos() {
+        // GABBRO M2 twin: the pilot shape now admits on macOS too (bit-exact
+        // Apple-Silicon CPU decode, Gate G-M1), mirroring the Windows admit.
+        let ok =
+            admit(&gemma4_nvfp4_fixture()).expect("gemma4+NVFP4 pilot must admit on macOS (M2)");
+        assert_eq!(ok.architecture, "gemma4");
+        assert_eq!(ok.tokenizer, TokenizerFamily::Spm);
+        assert!(ok.quants.contains(&GgufTensorType::NVFP4));
+    }
+
+    #[test]
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     fn gemma4_nvfp4_pilot_refuses_off_windows_with_platform_gate() {
         // Amendment 3 §9 twin: the otherwise-admitting pilot shape gets the
-        // named TK2 refusal on non-Windows targets — a runtime gate, not a
-        // compile wall, so this exact path runs on the ubuntu/macos CI legs.
-        let reject = admit(&gemma4_nvfp4_fixture()).expect_err("NVFP4 must refuse off Windows");
+        // named TK2 refusal on unvalidated targets — a runtime gate, not a
+        // compile wall, so this exact path runs on the ubuntu/linux CI leg.
+        let reject =
+            admit(&gemma4_nvfp4_fixture()).expect_err("NVFP4 must refuse on unvalidated platforms");
         assert_eq!(reject.axis, AdmissionAxis::Quant);
         assert_eq!(reject.offending_value, "NVFP4");
         assert_eq!(reject.tensor.as_deref(), Some("blk.0.ffn_down.weight"));
         assert_eq!(
             reject.message,
-            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
+            "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX"
         );
     }
 
@@ -626,11 +648,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn pilot_layer_output_scale_weight_is_not_a_sidecar() {
         // The real gemma4 pilot carries 42 F32 `blk.N.layer_output_scale.weight`
         // tensors. They end in `.weight`, not `.scale` — the sidecar check must not
-        // false-positive on them or the pilot row itself would be refused.
+        // false-positive on them or the pilot row itself would be refused. Runs on
+        // the admit legs (Windows + macOS since GABBRO M2).
         let mut file = gemma4_nvfp4_fixture();
         file.tensors.push(tensor(
             "blk.0.layer_output_scale.weight",
@@ -641,11 +664,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     fn pilot_layer_output_scale_weight_is_not_a_sidecar_off_windows() {
-        // Off-Windows twin of the false-positive pin: the refusal must be the
-        // §9 PLATFORM gate (which fires after the sidecar check), never a
-        // sidecar misclassification of `layer_output_scale.weight`.
+        // Unvalidated-platform twin of the false-positive pin (Linux leg — macOS
+        // now admits, GABBRO M2): the refusal must be the §9 PLATFORM gate (which
+        // fires after the sidecar check), never a sidecar misclassification of
+        // `layer_output_scale.weight`.
         let mut file = gemma4_nvfp4_fixture();
         file.tensors.push(tensor(
             "blk.0.layer_output_scale.weight",
@@ -654,7 +678,7 @@ mod tests {
         let reject = admit(&file).expect_err("NVFP4 refuses off Windows");
         assert_eq!(
             reject.message,
-            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
+            "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX"
         );
         assert!(
             !reject.message.contains("sidecar"),

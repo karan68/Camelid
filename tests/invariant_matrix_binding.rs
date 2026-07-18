@@ -627,10 +627,11 @@ fn sidecar_admit_fixture_trips_d_b2_at_admission() {
 }
 
 /// I-plat, L1 file boundary — the §9 cfg twin on one fixture: the BF16-free
-/// pilot shape ADMITS on the Windows leg (positive control: the platform gate
-/// does not misfire where NVFP4 is supported, and the D-B3 carve-out admits at
-/// the file boundary), and refuses with the named TK2 message on the
-/// ubuntu/macos legs.
+/// pilot shape ADMITS on the Windows and macOS legs (positive control: the
+/// platform gate does not misfire where NVFP4 is supported, and the D-B3
+/// carve-out admits at the file boundary), and refuses with the named TK2
+/// message on the remaining (ubuntu/linux) legs. macOS joined the admit set at
+/// GABBRO M2 once its CPU decode was proven bit-exact (Gate G-M1).
 #[test]
 fn pilot_admit_fixture_is_the_platform_gate_twin() {
     assert_fixture_pinned(PILOT_ADMIT_FIXTURE, PILOT_ADMIT_SHA256);
@@ -638,26 +639,27 @@ fn pilot_admit_fixture_is_the_platform_gate_twin() {
         .expect("fixture must parse on every platform");
     assert_eq!(gguf.architecture(), Some("gemma4"));
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         use camelid::gguf::GgufTensorType;
         use camelid::runnable::{admit, TokenizerFamily};
-        let ok = admit(&gguf).expect("gemma4+NVFP4 pilot must admit on Windows (D-B3)");
+        let ok = admit(&gguf).expect("gemma4+NVFP4 pilot must admit on Windows/macOS (D-B3)");
         assert_eq!(ok.architecture, "gemma4");
         assert_eq!(ok.tokenizer, TokenizerFamily::Spm);
         assert!(ok.quants.contains(&GgufTensorType::NVFP4));
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         use camelid::runnable::{admit, AdmissionAxis};
-        let reject = admit(&gguf).expect_err("NVFP4 must refuse off Windows (Amendment 3 §9)");
+        let reject =
+            admit(&gguf).expect_err("NVFP4 must refuse on unvalidated platforms (Amendment 3 §9)");
         assert_eq!(reject.axis, AdmissionAxis::Quant);
         assert_eq!(reject.offending_value, "NVFP4");
         assert_eq!(reject.tensor.as_deref(), Some("blk.0.ffn_down.weight"));
         assert_eq!(
             reject.message,
-            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
+            "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX"
         );
     }
 }

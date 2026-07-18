@@ -65,7 +65,7 @@
     },
     {
       "id": "I-plat",
-      "invariant": "Amendment 3 §9: NVFP4 admission refuses off-Windows with the named TK2 error ('NVFP4 is Windows-only in this release; see SUPPORT_MATRIX') — a runtime gate inside ordinary code, not a #[cfg] wall; fires AFTER the D-B3/D-B2 checks so signed postures stay platform-independent.",
+      "invariant": "Amendment 3 §9 (GABBRO M2 narrowing): NVFP4 admission is allowed on Windows and macOS and refuses on every other platform with the named TK2 error ('NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX') — a runtime gate inside ordinary code, not a #[cfg] wall; fires AFTER the D-B3/D-B2 checks so signed postures stay platform-independent. macOS joined the admit set once its CPU wire-lane decode was proven bit-exact (Gate G-M1, qa/evidence-bundles/gabbro/phase1/).",
       "sources": [
         "DECISIONS.md D17 micro-decisions §9.1"
       ]
@@ -273,7 +273,7 @@
         ],
         "fixture": "nvfp4_nan_sentinel_trip.gguf",
         "fixture_trip": "tests/nvfp4_wire_lane_refusals.rs::nan_sentinel_fixture_trips_the_scan_seam",
-        "note": "cfg-twinned per §9.1. File-boundary coverage rides the S1 NaN fixture's load leg: on non-Windows, Gemma4Runtime::load on that fixture is asserted to fail with the named TK2 message (the §9 gate fires before config parsing there), executed on the ubuntu/macos CI legs."
+        "note": "cfg-twinned per §9.1. File-boundary coverage rides the S1 NaN fixture's load leg: on unvalidated platforms (non-Windows, non-macOS), Gemma4Runtime::load on that fixture is asserted to fail with the named TK2 message (the §9 gate fires before config parsing there), executed on the ubuntu/linux CI leg. On the Windows and macOS admit legs (GABBRO M2) the load instead dies in gemma4 config parsing, before the sentinel scan."
       }
     },
     "L3-cuda-resident": {
@@ -408,7 +408,7 @@
         "companion_tests": [
           { "file": "src/gemma4_runtime.rs", "fn": "windows_only_check_refuses_nvfp4_off_windows" }
         ],
-        "note": "The lane-local refusal IS the platform posture here (Metal = macOS, NVFP4 is Windows-only): the same typed refusal enforces both this cell and I-unknown-type — recorded in both deliberately. The macOS CPU wire path additionally gets the §9 TK2 refusal (companion test runs on the macos CI leg)."
+        "note": "The lane-local refusal IS the platform posture here (Metal = macOS): the Metal GPU lane still refuses ANY NVFP4 tensor via nvfp4_metal_lane_check (its decode kernel is GABBRO Phase M3, not yet wired), and the same typed refusal enforces both this cell and I-unknown-type — recorded in both deliberately. NOTE (GABBRO M2): the macOS CPU wire path now ADMITS NVFP4 (bit-exact decode, Gate G-M1); it is only the Metal GPU lane that refuses here, so this cell tracks the GPU-lane posture, not a macOS-wide refusal."
       }
     },
     "L5-native-quantizer": {
