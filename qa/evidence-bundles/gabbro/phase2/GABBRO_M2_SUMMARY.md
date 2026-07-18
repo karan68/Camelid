@@ -4,7 +4,7 @@
 
 ## Provenance
 - Campaign: GABBRO, Gate **G-M2** (STOP for review — **not merged**)
-- Host: Apple M4, 16 GiB, macOS 26.5, Darwin arm64; worktree `/Volumes/Untitled/Camelid-gabbro` @ `510fa51` (origin/main) + M2, branch `gabbro/m1-arm-decode`
+- Host: Apple M4, 16 GiB, macOS 26.5, Darwin arm64; worktree `<worktree>` @ `510fa51` (origin/main) + M2, branch `gabbro/m1-arm-decode`
 - Depends on: G-M1 (`qa/evidence-bundles/gabbro/phase1/`); Tim's ruling folding the surface truth-up into M2
 - UTC: 2026-07-18
 

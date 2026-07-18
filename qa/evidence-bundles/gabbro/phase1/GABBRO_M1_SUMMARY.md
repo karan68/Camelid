@@ -6,8 +6,8 @@
 - Campaign: GABBRO (macOS/Metal expansion of BASALT), Gate **G-M1**
 - Host: `Apple M4`, 10-core (4P+6E), 16 GiB unified, macOS 26.5 (25F5058e), Darwin arm64
 - Toolchain: AppleClang 17.0.0, Command Line Tools SDK (no Xcode.app)
-- Worktree: `/Volumes/Untitled/Camelid-gabbro` @ `510fa51` (origin/main), branch `gabbro/m1-arm-decode`
-- Target dir: `/Volumes/Untitled/camelid-target` (documented T7 build target)
+- Worktree: `<worktree>` @ `510fa51` (origin/main), branch `gabbro/m1-arm-decode`
+- Target dir: `<target-dir>` (documented T7 build target)
 - UTC: 2026-07-18T18:36Z
 
 ## What ran and the result
