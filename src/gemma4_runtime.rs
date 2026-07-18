@@ -1122,7 +1122,11 @@ fn nvfp4_metal_sentinel_check(
 /// and NAMED (invariant I-unknown-type, L4 cell) rather than mis-binding. Extracted so
 /// it unit-tests without a real model; the load site probes layer-0 `attn_q` (the
 /// export quantizes every layer's projections alike).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn gemma4_metal_layer_fmt(tensor_type: GgufTensorType) -> Result<crate::metal::GemmaWireFmt> {
+    // The only non-test caller is `Gemma4GpuRuntime::load`, which is `cfg(macos)`-gated, so
+    // the non-macOS lib build sees this as dead; allow it there (the `#[cfg(test)]` covered-set
+    // test still exercises it on every platform). Mirrors `nvfp4_metal_sentinel_check`.
     match tensor_type {
         GgufTensorType::Q8_0 => Ok(crate::metal::GemmaWireFmt::Q8_0),
         GgufTensorType::Q4_0 => Ok(crate::metal::GemmaWireFmt::Q4_0),
