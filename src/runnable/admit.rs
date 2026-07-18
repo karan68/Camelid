@@ -321,7 +321,10 @@ fn check_quants(
     // gemma4 wire-lane load path (`gemma4_runtime::nvfp4_windows_only_check`).
     // NOTE (GABBRO M2): the refusal message reads "Windows/macOS-only" and the
     // support matrices are truthed-up in this same ratchet PR (Tim's ruling).
-    // macOS runs the CPU wire lane only; its Metal GPU kernel is Phase M3.
+    // macOS runs NVFP4 on the CPU wire lane (used by `serve`) and, opt-in via the
+    // gemma4-generate-gpu subcommand, on the Metal GPU resident lane (kernel
+    // nvfp4_block_linear_row_ksplit_f32y_wire; GABBRO M3 + M3-followup, self-parity-
+    // proven vs the CPU oracle, T5 sentinel guard).
     if !cfg!(target_os = "windows")
         && !cfg!(target_os = "macos")
         && seen.contains(&GgufTensorType::NVFP4)
@@ -522,9 +525,9 @@ mod tests {
         // the architecture carve-out passes AND the quant axis passes (the BF16
         // tensor decodes losslessly via crate::tensor::decode_bf16_tensor). This
         // inverts the pre-D-B6 refusal pin so the admission flip can't drift
-        // silently. (Amendment 3 §9: full NVFP4 admission is Windows-only, so the
-        // ADMIT expectation runs on the Windows leg; the off-Windows twin below
-        // pins the platform gate.)
+        // silently. (Amendment 3 §9 + GABBRO M2: full NVFP4 admission is Windows AND
+        // macOS, so the ADMIT expectation runs on the Windows and macOS legs; the
+        // off-Windows/macOS twin below pins the platform gate.)
         let mut file = gemma4_nvfp4_fixture();
         file.tensors
             .push(tensor("per_layer_model_proj.weight", GgufTensorType::BF16));

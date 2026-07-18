@@ -55,7 +55,7 @@ These documents are working notes, not support ledgers. When a note and a public
 - [`TOKENIZER_RECON.md`](docs/recon/TOKENIZER_RECON.md)
 - [`SAMPLING_API_RECON.md`](docs/recon/SAMPLING_API_RECON.md)
 - [`SAFETENSORS_PLAN.md`](docs/architecture/SAFETENSORS_PLAN.md)
-- [`NVFP4_FORMAT.md`](docs/architecture/NVFP4_FORMAT.md) — NVFP4 weight-format spec + BASALT pilot findings (format spec, not a support claim; gemma-4-E4B pilot only, Windows + macOS — macOS CPU wire lane only, Metal GPU is GABBRO Phase M3)
+- [`NVFP4_FORMAT.md`](docs/architecture/NVFP4_FORMAT.md) — NVFP4 weight-format spec + BASALT pilot findings (format spec, not a support claim; gemma-4-E4B pilot only, Windows + macOS — macOS runs the CPU wire lane (`serve`) plus an opt-in Metal GPU resident lane via `gemma4-generate-gpu` as of GABBRO M3-followup, self-parity-proven, no macOS perf/real-artifact claim)
 - [`ATTENTION_CHECKPOINTS.md`](docs/recon/ATTENTION_CHECKPOINTS.md)
 - [`REPO_READINESS_PLAN.md`](docs/architecture/REPO_READINESS_PLAN.md) — draft repo-readiness improvement plan for contributor setup, configuration, and validation ergonomics
 

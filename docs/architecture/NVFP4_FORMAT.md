@@ -14,11 +14,15 @@ NVFP4 is llama.cpp's E2M1 4-bit weight format with per-16-element UE4M3 sub-bloc
 targeted **decode bandwidth** on a 6 GB card: the pilot's 294 matmul weights shrink 1.889×
 vs Q8_0, moving fewer bytes per token. The vehicle is `gemma-4-E4B-it` and nothing else —
 the runnable-lane admission is a pilot-model-only carve-out (D-B3), and the format admits on
-Windows and macOS in this release (GABBRO M2; on macOS the CPU wire lane only — the Metal GPU
-kernel is GABBRO Phase M3, not yet wired). Runnable-lane admission covers the NVFP4 format and — as of
+Windows and macOS in this release (GABBRO M2). On macOS both a CPU wire lane and, as of GABBRO
+M3 + M3-followup, a Metal GPU resident lane run NVFP4; the Metal lane is opt-in via the
+macOS-only `gemma4-generate-gpu` subcommand (kernel `nvfp4_block_linear_row_ksplit_f32y_wire`),
+self-parity-proven vs the CPU oracle — not yet exercised end-to-end on a real NVFP4 artifact,
+and with no macOS GPU perf number. Runnable-lane admission covers the NVFP4 format and — as of
 D-B6 (2026-07-17) — BF16 as a covered exact-decode type, so its only produced file (gemma4-E4B)
 admits fully; its one BF16 tensor (`per_layer_model_proj`) was the prior admission blocker
-(G2 §6b). It executes via `gemma4_runtime` — the CPU wire + CUDA-resident lanes, not the generic
+(G2 §6b). It executes via `gemma4_runtime` — the CPU wire + CUDA-resident lanes plus an opt-in macOS
+Metal resident lane (via `gemma4-generate-gpu`), not the generic
 runnable serve bridge. "Runnable" here is format admission, not a runnable serve path. The 6 GB *full-residency* motivation was refuted at recon (the
 Q8_0 embeddings are never repacked, ~3.7 GB of them), so the campaign proceeds on
 decode-bandwidth + partial-residency grounds, not a fully-resident promise.
@@ -108,7 +112,10 @@ Phase 0 prose claims were found wrong — cite `BASALT_RECON.md` §1 [G1 errata]
   inside ordinary code, both lanes) with the typed error "NVFP4 is Windows/macOS-only in this
   release; see SUPPORT_MATRIX". cfg-twinned tests pin every side on the CI legs that run there
   (Windows and macOS assert admission; other targets assert the refusal). macOS runs the CPU
-  wire lane only (bit-exact, Gate G-M1); its Metal GPU kernel is Phase M3, not yet wired.
+  wire lane (bit-exact, Gate G-M1; used by `serve`); its Metal GPU resident kernel
+  (`nvfp4_block_linear_row_ksplit_f32y_wire`) is now wired via GABBRO M3 + M3-followup and
+  reachable opt-in through the macOS-only `gemma4-generate-gpu` subcommand, self-parity-proven
+  vs the CPU oracle (not yet run end-to-end on a real NVFP4 artifact; no macOS GPU perf number).
 
 ## Quality / performance receipts
 
@@ -119,8 +126,10 @@ Quality (Gate G3) and CUDA decode perf (Gate G4 + Phase 4b dp4a) are receipted i
 
 ## Support status
 
-NVFP4 4-bit weights, gemma-4-E4B pilot, Windows + macOS (CPU wire lane; the macOS Metal GPU
-kernel is GABBRO Phase M3, not yet wired). Engine facts: bit-exact CPU decode, validated on
+NVFP4 4-bit weights, gemma-4-E4B pilot, Windows + macOS. On macOS: a CPU wire lane (bit-exact,
+used by `serve`) and an opt-in Metal GPU resident lane via the macOS-only `gemma4-generate-gpu`
+subcommand (wired via GABBRO M3 + M3-followup, self-parity-proven vs the CPU oracle; not yet
+exercised end-to-end on a real NVFP4 artifact, and no macOS GPU perf number yet). Engine facts: bit-exact CPU decode, validated on
 x86 and on Apple Silicon/ARM (GABBRO Gate G-M1), + a Windows CUDA dp4a GEMV kernel (46/46
 bit-identical). Measured vs the Q8_0 parent at matched 4.5 bpw:
 behind Q4_K on quality (G3 NO-GO, 88.5% vs 92.6% top-1 agreement; 0.111 vs 0.065 mean-KL
