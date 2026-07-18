@@ -29,9 +29,12 @@
 //! carve-out: a gemma4 GGUF passes that axis iff it carries NVFP4 tensors (the
 //! pilot shape); gemma4 files without NVFP4 keep today's architecture refusal.
 //! NOTE: the REAL produced pilot row additionally carries one BF16 tensor
-//! (`per_layer_model_proj.weight`), which the quant axis still refuses — so the
-//! real artifact passes the architecture carve-out but rejects on BF16 (receipted
-//! at G2). Full-file admission of an NVFP4 gemma4 GGUF requires a BF16-free file.
+//! (`per_layer_model_proj.weight`). As of BASALT D-B6 (2026-07-17) BF16 is a
+//! covered exact-decode quant (see `is_covered_quant`), so the real artifact now
+//! admits fully: it passes the architecture carve-out AND the quant axis — the
+//! single BF16 tensor decodes losslessly via `crate::tensor::decode_bf16_tensor`
+//! (bf16 = the high 16 bits of f32; widening is exact). Full-file admission of an
+//! NVFP4 gemma4 GGUF no longer requires a BF16-free file (the prior blocker is gone).
 //! Admitting that shape here is a metadata-level classification for the BASALT
 //! interop legs (inspect / dequant spot-checks); it is NOT a claim the generic
 //! runnable runtime executes the gemma4 graph — smoke stays refused via the
@@ -208,6 +211,13 @@ fn check_tokenizer(file: &GgufFile) -> Result<TokenizerFamily, AdmissionReject> 
 /// NVFP4 is deliberately NOT in this blanket set: a dequant routine exists
 /// (`crate::tensor::decode_nvfp4_tensor`), but admission is pilot-scoped to the
 /// gemma4 architecture until Gate G3 (BASALT D-B3) — see `check_quants`.
+///
+/// BASALT D-B6 (2026-07-17): BF16 joined the covered set as an exact-decode type.
+/// bf16 stores the high 16 bits of the f32 encoding, so decode is the lossless,
+/// bit-deterministic widening `crate::tensor::decode_bf16_tensor` — no new numeric
+/// code, and definitionally identical to the pin's `ggml_bf16_to_fp32`. This admits
+/// legitimate mixed-type files (the gemma4-E4B pilot's single `per_layer_model_proj`
+/// BF16 tensor) under the existing whole-file coverage model.
 fn is_covered_quant(tt: GgufTensorType) -> bool {
     matches!(
         tt,
@@ -220,6 +230,7 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::Q3K
             | GgufTensorType::Q4_0
             | GgufTensorType::IQ4XS
+            | GgufTensorType::BF16
     )
 }
 
@@ -256,7 +267,7 @@ fn check_quants(
                 tensor: Some(tensor.name.clone()),
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
-                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS",
+                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16",
                     tensor.tensor_type, tensor.name
                 ),
             });
@@ -437,10 +448,12 @@ mod tests {
 
     // --- BASALT D-B3 pilot scoping + D-B2 sidecar fail-closed ---
 
-    /// A BF16-free pilot-like shape: gemma4 with NVFP4 matmuls (embeddings Q8_0,
-    /// norms F32). NOTE: the real produced `gemma-4-E4B-it-NVFP4-mm` row ALSO
-    /// carries one BF16 tensor and therefore refuses on the quant axis — that real
-    /// shape is pinned by `gemma4_nvfp4_with_bf16_refuses_on_bf16` below.
+    /// A BF16-free pilot-like base shape: gemma4 with NVFP4 matmuls (embeddings
+    /// Q8_0, norms F32). NOTE: the real produced `gemma-4-E4B-it-NVFP4-mm` row ALSO
+    /// carries one BF16 tensor (`per_layer_model_proj.weight`); as of BASALT D-B6
+    /// that tensor is a covered exact-decode quant, so the real shape now ADMITS
+    /// FULLY — pinned by `gemma4_nvfp4_with_bf16_admits_fully_after_d_b6` below (the
+    /// off-Windows twin keeps the §9 platform gate).
     fn gemma4_nvfp4_fixture() -> GgufFile {
         let mut file = base_fixture();
         set_meta(&mut file, "general.architecture", "gemma4");
@@ -479,27 +492,48 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_nvfp4_with_bf16_refuses_on_bf16() {
+    #[cfg(target_os = "windows")]
+    fn gemma4_nvfp4_with_bf16_admits_fully_after_d_b6() {
         // The REAL produced pilot row's shape (G2 receipt): NVFP4 matmuls PLUS one
-        // BF16 tensor (per_layer_model_proj.weight). The architecture carve-out
-        // passes, but the quant axis still refuses on BF16 — pinned here in-tree
-        // so the receipted behavior can't drift silently.
+        // BF16 tensor (per_layer_model_proj.weight). As of BASALT D-B6 (2026-07-17)
+        // BF16 is a covered exact-decode quant, so the whole file now ADMITS FULLY:
+        // the architecture carve-out passes AND the quant axis passes (the BF16
+        // tensor decodes losslessly via crate::tensor::decode_bf16_tensor). This
+        // inverts the pre-D-B6 refusal pin so the admission flip can't drift
+        // silently. (Amendment 3 §9: full NVFP4 admission is Windows-only, so the
+        // ADMIT expectation runs on the Windows leg; the off-Windows twin below
+        // pins the platform gate.)
         let mut file = gemma4_nvfp4_fixture();
         file.tensors
             .push(tensor("per_layer_model_proj.weight", GgufTensorType::BF16));
-        let reject = admit(&file).expect_err("real pilot shape must refuse on BF16");
-        assert_eq!(reject.axis, AdmissionAxis::Quant);
-        assert_eq!(reject.offending_value, "BF16");
-        assert_eq!(
-            reject.tensor.as_deref(),
-            Some("per_layer_model_proj.weight")
-        );
-        // The generic covered-set message must be byte-identical to pre-BASALT
-        // main (no NVFP4 parenthetical leaking into non-NVFP4 refusals).
+        let ok = admit(&file).expect("real pilot shape must admit fully after D-B6");
+        assert_eq!(ok.architecture, "gemma4");
+        assert_eq!(ok.tokenizer, TokenizerFamily::Spm);
+        assert!(ok.quants.contains(&GgufTensorType::NVFP4));
         assert!(
-            reject.message.ends_with("IQ4_XS"),
-            "generic refusal message must be unchanged: {}",
-            reject.message
+            ok.quants.contains(&GgufTensorType::BF16),
+            "the pilot's BF16 tensor is now a covered quant (D-B6)"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn gemma4_nvfp4_with_bf16_refuses_off_windows_platform_gate() {
+        // Off-Windows twin of the D-B6 admission pin: with BF16 covered, the real
+        // pilot shape (NVFP4 + BF16) no longer refuses on the BF16 quant axis, so it
+        // reaches the Amendment 3 §9 platform gate — which refuses NVFP4 off Windows
+        // with the named TK2 message. The refusal is the PLATFORM gate, never a BF16
+        // quant refusal (that would mean the covered-set widening regressed).
+        let mut file = gemma4_nvfp4_fixture();
+        file.tensors
+            .push(tensor("per_layer_model_proj.weight", GgufTensorType::BF16));
+        let reject = admit(&file).expect_err("NVFP4 must refuse off Windows");
+        assert_eq!(reject.axis, AdmissionAxis::Quant);
+        assert_eq!(reject.offending_value, "NVFP4");
+        assert_eq!(reject.tensor.as_deref(), Some("blk.0.ffn_down.weight"));
+        assert_eq!(
+            reject.message,
+            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
         );
     }
 
@@ -662,6 +696,15 @@ mod tests {
         assert_eq!(reject.offending_value, "Q2K");
         assert_eq!(reject.tensor.as_deref(), Some("blk.12.ffn_down.weight"));
         assert!(reject.message.contains("blk.12.ffn_down.weight"));
+        // BASALT D-B6: the SHA_E `ends_with("IQ4_XS")` pin (generic covered-set
+        // message byte-identical to pre-BASALT main) is deliberately retired — the
+        // covered set now lists BF16, a sanctioned covered-set widening (IQ4_XS
+        // precedent). The generic message must now name BF16 as the covered-set tail.
+        assert!(
+            reject.message.ends_with("IQ4_XS, BF16"),
+            "generic covered-set message must now list BF16 (D-B6): {}",
+            reject.message
+        );
     }
 
     #[test]

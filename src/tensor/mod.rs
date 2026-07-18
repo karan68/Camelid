@@ -6096,6 +6096,117 @@ mod nvfp4_tests {
     }
 }
 
+/// BASALT D-B6 (2026-07-17) — BF16 runnable-lane dequant-parity gate (M-B5 exit
+/// condition (a)). bf16 -> f32 is the exact bit-widening `f32::from_bits(u32::from(u16)
+/// << 16)`: bf16 stores the high 16 bits of the IEEE-754 f32 encoding, so widening
+/// appends 16 zero low bits — lossless, no rounding, bit-deterministic, and
+/// definitionally identical to the pin's (`llama.cpp acd79d603`) `ggml_bf16_to_fp32`.
+/// The committed fixture `tests/fixtures/dequant/bf16_exact.json` carries the LE wire
+/// bytes plus the reference f32 outputs as u32 bit patterns; every comparison here is
+/// on `f32::to_bits()` (so +0.0/-0.0 and NaN payloads are distinguished exactly).
+#[cfg(test)]
+mod bf16_dequant_parity_tests {
+    use super::decode_bf16_tensor;
+
+    fn fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("dequant")
+            .join("bf16_exact.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("bf16_exact.json parses: {e}"))
+    }
+
+    fn hex_u32(s: &str) -> u32 {
+        u32::from_str_radix(s.trim_start_matches("0x"), 16)
+            .unwrap_or_else(|e| panic!("hex {s:?}: {e}"))
+    }
+
+    fn hex_bytes(h: &str) -> Vec<u8> {
+        assert!(h.len().is_multiple_of(2), "odd hex length {}", h.len());
+        (0..h.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&h[i..i + 2], 16).expect("hex byte"))
+            .collect()
+    }
+
+    /// The fixture's provenance must state the definitional lossless-widening
+    /// grounds (not a claim it was captured from a binary run), and the reference
+    /// bits must BE the exact widening `bf16_u16 << 16` — a self-check so the golden
+    /// can never silently encode a wrong value.
+    #[test]
+    fn bf16_fixture_reference_is_the_exact_widening() {
+        let fx = fixture();
+        assert_eq!(fx["qtype"].as_str(), Some("BF16"));
+        let method = fx["provenance"]["method"]
+            .as_str()
+            .expect("provenance.method");
+        assert!(
+            method.contains("Lossless") || method.contains("lossless"),
+            "provenance must state bf16->f32 is lossless: {method}"
+        );
+        assert!(
+            fx["provenance"]["pin_equivalence"]
+                .as_str()
+                .expect("provenance.pin_equivalence")
+                .contains("ggml_bf16_to_fp32"),
+            "provenance must name the pin's bf16->f32 equivalence"
+        );
+        let u16s = fx["bf16_u16_hex"].as_array().expect("bf16_u16_hex");
+        let refs = fx["ref_f32_bits"].as_array().expect("ref_f32_bits");
+        assert_eq!(u16s.len(), refs.len(), "u16 vs ref length");
+        for (u, r) in u16s.iter().zip(refs.iter()) {
+            let bf16 = hex_u32(u.as_str().expect("u16 hex"));
+            let want = hex_u32(r.as_str().expect("ref hex"));
+            assert_eq!(
+                bf16 << 16,
+                want,
+                "reference bits must be the exact widening (bf16 {bf16:#06x} << 16)"
+            );
+        }
+    }
+
+    /// `decode_bf16_tensor` reproduces the golden reference bit-for-bit.
+    #[test]
+    fn decode_bf16_tensor_matches_golden_bit_exact() {
+        let fx = fixture();
+        let n = fx["n_elements"].as_u64().expect("n_elements") as usize;
+        let bytes = hex_bytes(fx["quant_hex"].as_str().expect("quant_hex"));
+        assert_eq!(bytes.len(), n * 2, "wire byte length");
+        let refs: Vec<u32> = fx["ref_f32_bits"]
+            .as_array()
+            .expect("ref_f32_bits")
+            .iter()
+            .map(|r| hex_u32(r.as_str().expect("ref hex")))
+            .collect();
+        assert_eq!(refs.len(), n, "ref count");
+
+        let out =
+            decode_bf16_tensor("fixture:bf16_exact", &bytes, n).expect("bf16 decode must succeed");
+        assert_eq!(out.len(), n, "decoded length");
+        for (i, (got, want)) in out.iter().zip(refs.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                *want,
+                "element {i}: got {:#010x} want {want:#010x}",
+                got.to_bits()
+            );
+        }
+    }
+
+    /// Wrong wire length fails closed (the lane never pads or truncates silently).
+    #[test]
+    fn decode_bf16_tensor_wrong_length_fails_closed() {
+        let err = decode_bf16_tensor("t", &[0u8; 6], 2).expect_err("length mismatch must refuse");
+        assert!(matches!(
+            err,
+            crate::error::BackendError::InvalidTensorData(_)
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

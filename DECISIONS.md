@@ -937,3 +937,30 @@ pending Tim's signature (carried, non-blocking): **D-B6/TK3** per-tensor sidecar
   meta-test fails if the Phase-4 CUDA refusal text (or the P2b test-anchoring
   marker) vanishes while a cell still cites that phase as open — ratchet
   R3/R4 are enforced, not aspirational.
+
+  **SIGNED — Tim, 2026-07-17.** The disclosed test-time-mechanism deviation
+  (fn-rename caught by the meta-test, not the build) is accepted as-is; no
+  restructuring required. The invariant-matrix enforcement stands as shipped.
+
+## D-B6 — Admission of the pilot's BF16 tensor: Option A (2026-07-17, SIGNED)
+
+**SIGNED by Tim, 2026-07-17: Option A** (draft `scratchpad/basalt-db6/D-B6_DRAFT.md`).
+Add BF16 to the runnable lane's covered quant set as an exact-decode type (the dispatch arm
+reuses the existing lossless `crate::tensor::decode_bf16_tensor` — no new numeric code), so
+legitimate mixed-type NVFP4 files (the gemma-4-E4B pilot's single `per_layer_model_proj`
+BF16 tensor) admit under the existing **whole-file** coverage model rather than requiring a
+per-tensor admission predicate (B/C, rejected — they mirror load-path code, the CAIRN
+anti-pattern, and carry the admit-then-fail hazard D-B3 excluded). TK3's conditional ("IF
+mixed-type files REQUIRE per-tensor coverage") is not met; the pilot's mixed type is
+coverable losslessly at ~5 lines. Signed riders (all land in the implementation PR):
+(1) BF16 dequant-parity fixture vs the pin (M-B5 exit condition (a)); (2) L1 `I-carveout`
+matrix re-sign — the `gemma4_nvfp4_with_bf16_refuses_on_bf16` refusal-pin test inverts to an
+admission-pin test, off-Windows §9 twin retained; (3) surface rows (README/COMPAT/
+SUPPORT_MATRIX/ledger) updated in the same PR — **this REVERSES the #475 execution-truth
+clause** ("refuses generic runnable admission on its BF16 tensor") to full admission;
+(4) disclosures: the SHA_E `ends_with("IQ4_XS")` generic-message pin retires (sanctioned
+covered-set change, IQ4_XS precedent); BF16 runnable loads f32-materialize (memory doubling
+— ornith-9B BF16 ~17.9→~35 GB, guarded by the fit advisor as a host limit per the
+runnable-lane memory policy, not an engine refusal; M-B5 HOLD stands on host grounds);
+(5) NO support-status / smoke / `oracle_qualified` / eligibility change — the pilot's bucket
+stays `not_anchored`. Implementation is a bounded pass; scheduled separately.
