@@ -24,7 +24,7 @@
 ## Verify (this box) — all green
 - `cargo fmt --all --check`: PASS (exit 0)
 - `cargo clippy -p camelid --lib --tests`: clean, no warnings
-- Tests: **975 passed / 0 failed / 19 ignored** — lib 861, gemma4_capabilities 88, api_vertical_slice 4, invariant_matrix_binding 9 (the §2.4 meta-test), nvfp4_format 9, nvfp4_e4b_spotcheck 1, nvfp4_wire_lane_refusals 3. Full log: `m2-verify.log`.
+- Tests: **975 passed / 0 failed / 19 ignored** — lib 861, gemma4_capabilities 88, api_vertical_slice 4, invariant_matrix_binding 9 (the §2.4 meta-test), nvfp4_format 9, nvfp4_e4b_spotcheck 1, nvfp4_wire_lane_refusals 3. Full log: `m2-verify.txt`.
 
 ## Not done here (by design)
 - Full `--all-targets` suite on ARM (scoped run only).

@@ -28,7 +28,7 @@ Hygiene on the unmodified `origin/main` worktree: `cargo fmt --all --check` PASS
 - **Not proven here:** a full end-to-end pilot token run (needs the 6 GB `gemma-4-E4B-it-NVFP4-mm.gguf`, sha256 `eb293344…9863d9`, which is not committed); `cargo-test-all` on ARM (this run was scoped to the decode/format/refusal binaries).
 
 ## Artifacts
-- `nvfp4-arm-decode-test.log` — full test output
-- `cargo-clippy.log`, `cargo-clippy.status`, `cargo-fmt.status`, `cargo-test-nvfp4.status`
+- `nvfp4-arm-decode-test.txt` — full test output
+- `cargo-clippy.txt`, `cargo-clippy.status`, `cargo-fmt.status`, `cargo-test-nvfp4.status`
 - `hw_probe_mac.json`
 - `SHA256SUMS`
