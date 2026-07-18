@@ -89,8 +89,8 @@
     },
     {
       "id": "L4-metal",
-      "name": "Metal lane (Gemma4GpuRuntime, macOS; NVFP4 never wired per §9.3)",
-      "sources": ["src/gemma4_runtime.rs (Gemma4GpuRuntime::load, nvfp4_metal_lane_check)"]
+      "name": "Metal lane (Gemma4GpuRuntime, macOS; NVFP4 layer projections wired per GABBRO M3)",
+      "sources": ["src/gemma4_runtime.rs (Gemma4GpuRuntime::load, gemma4_metal_layer_fmt, nvfp4_metal_sentinel_check)"]
     },
     {
       "id": "L5-native-quantizer",
@@ -364,51 +364,53 @@
       "I-unknown-type": {
         "status": "enforced",
         "test_file": "src/gemma4_runtime.rs",
-        "test_fn": "metal_lane_check_refuses_any_nvfp4_tensor",
+        "test_fn": "metal_layer_fmt_covers_q8_q4_nvfp4_refuses_others",
         "source": "src/gemma4_runtime.rs",
-        "fixture": "seam:Gemma4GpuRuntime::load is cfg(target_os = \"macos\") and requires a real model; nvfp4_metal_lane_check is cfg-independent and unit-driven on every host, including a deep (non-layer-0) NVFP4 tensor that the lane's layer-0-only format gate would otherwise mis-bind",
-        "note": "UPGRADE over the prescribed na (§9.3): S1 wired a typed refusal naming 'BASALT L4: na' into the Metal load path — stronger than prescribed, recorded honestly as enforced."
+        "note": "GABBRO M3-followup: the Metal resident lane now COVERS Q8_0/Q4_0/NVFP4 layer projections (gemma4_metal_layer_fmt); every other format refuses TYPED and NAMED at load rather than mis-binding. The prior blanket 'NVFP4 is not wired to the Metal lane' refusal was replaced by this covered-set gate once the NVFP4 GEMV kernel (GABBRO M3) landed."
       },
       "I-nan-scale": {
-        "status": "na",
-        "reason": "NVFP4 never binds on the Metal lane: nvfp4_metal_lane_check refuses ANY NVFP4 tensor at Gemma4GpuRuntime::load (src/gemma4_runtime.rs), before any wire-byte scan territory — there is no NVFP4 decode on this lane to guard (§9.3 posture; the refusal itself is this lane's I-unknown-type/I-plat cells)."
+        "status": "enforced",
+        "test_file": "src/gemma4_runtime.rs",
+        "test_fn": "metal_sentinel_check_refuses_nan_sentinel_nvfp4",
+        "source": "src/gemma4_runtime.rs",
+        "note": "GABBRO M3-followup FLIP (was na): NVFP4 now RUNS on this lane, which reads its wire RAW via WirePages — bypassing WireQuant::new's scan — so nvfp4_metal_sentinel_check scans every NVFP4 tensor's UE4M3 scale bytes at load and refuses 0x7F/0xFF (D17/T5), matching the CPU wire lane. Zero scales admit."
       },
       "I-sidecar": {
         "status": "enforced",
         "test_file": "src/gemma4_runtime.rs",
         "test_fn": "sidecar_check_refuses_nvfp4_with_scale_tensors",
         "source": "src/gemma4_runtime.rs",
-        "fixture": "seam:the Metal load path is cfg(target_os = \"macos\") + real-model-bound; the shared nvfp4_sidecar_check helper (called at Gemma4GpuRuntime::load before nvfp4_metal_lane_check) is unit-driven on every host, and its end-to-end file trip is the L2 cell's nvfp4_sidecar_trip.gguf",
-        "note": "UPGRADE over the prescribed na: S1's review fix routed the D-B2 sidecar check through the Metal load path too (it previously never ran there), so a sidecar-bearing file cannot slip past the signed posture via macOS."
+        "fixture": "seam:the Metal load path is cfg(target_os = \"macos\") + real-model-bound; the shared nvfp4_sidecar_check helper (called at Gemma4GpuRuntime::load, up top before binding) is unit-driven on every host, and its end-to-end file trip is the L2 cell's nvfp4_sidecar_trip.gguf",
+        "note": "D-B2 sidecar refusal runs in the Metal load path (nvfp4_sidecar_check), so a sidecar-bearing file cannot slip past the signed posture via macOS — unchanged by the M3-followup lift, which only lifted the blanket NVFP4 refusal."
       },
       "I-scale-once": {
         "status": "na",
-        "reason": "No NVFP4 execution exists on this lane to apply a scale once or twice — nvfp4_metal_lane_check refuses at load (src/gemma4_runtime.rs, Gemma4GpuRuntime::load); the sidecar half of the v1 posture is this lane's I-sidecar cell (enforced upgrade)."
+        "reason": "GABBRO M3-followup: NVFP4 now executes on this lane, but v1 NVFP4 carries NO per-tensor scale to apply once or twice — the only in-block factors are the four UE4M3 sub-scales (applied once in the kernel), and any per-tensor sidecar scale is refused at load (I-sidecar, D-B2). There is no scale-once/twice ambiguity to guard."
       },
       "I-k-div": {
         "status": "na",
-        "reason": "No NVFP4 wire is ever consumed on this lane (refused at load by nvfp4_metal_lane_check, src/gemma4_runtime.rs); file-boundary divisibility is guarded lane-independently at parse (src/gguf/reader.rs tensor_nbytes, tripped by nvfp4_k_div_trip.gguf)."
+        "reason": "GABBRO M3-followup: NVFP4 wire is now consumed on this lane, but K%64 divisibility is guarded lane-independently at parse (src/gguf/reader.rs tensor_nbytes, tripped by nvfp4_k_div_trip.gguf) — a non-multiple-of-64 first dim never reaches the resident load."
       },
       "I-carveout": {
         "status": "enforced",
         "test_file": "src/gemma4_runtime.rs",
-        "test_fn": "metal_lane_check_admits_files_without_nvfp4",
+        "test_fn": "metal_sentinel_check_admits_clean_nvfp4_and_non_nvfp4",
         "source": "src/gemma4_runtime.rs",
-        "note": "Boundary-preservation direction: files without NVFP4 keep loading on the Metal lane exactly as pre-BASALT — the new refusal touches only NVFP4-bearing files."
+        "note": "Boundary-preservation: files without NVFP4 keep loading on the Metal lane exactly as pre-BASALT (the sentinel scan is a no-op for them), and clean NVFP4 now admits (GABBRO M3-followup)."
       },
       "I-cache-quant": {
         "status": "na",
-        "reason": "No NVFP4 warm state can exist on this lane: the load-time refusal (nvfp4_metal_lane_check, src/gemma4_runtime.rs) precedes any session/KV construction, so no cached state with NVFP4 provenance is ever created to be mis-reused."
+        "reason": "GABBRO M3-followup: NVFP4 now runs on this lane, but it adds no cross-instance warm state — the resident model is per-Gemma4GpuRuntime, keyed by model id and replaced wholesale on reload, and distinct quant rows are distinct files, so no cached state with NVFP4 provenance is ever mis-reused (same structural na as the other resident lanes)."
       },
       "I-plat": {
         "status": "enforced",
         "test_file": "src/gemma4_runtime.rs",
-        "test_fn": "metal_lane_check_refuses_any_nvfp4_tensor",
+        "test_fn": "metal_layer_fmt_covers_q8_q4_nvfp4_refuses_others",
         "source": "src/gemma4_runtime.rs",
         "companion_tests": [
-          { "file": "src/gemma4_runtime.rs", "fn": "windows_only_check_refuses_nvfp4_off_windows" }
+          { "file": "src/gemma4_runtime.rs", "fn": "windows_only_check_admits_nvfp4_on_macos" }
         ],
-        "note": "The lane-local refusal IS the platform posture here (Metal = macOS): the Metal GPU lane still refuses ANY NVFP4 tensor via nvfp4_metal_lane_check (its decode kernel is GABBRO Phase M3, not yet wired), and the same typed refusal enforces both this cell and I-unknown-type — recorded in both deliberately. NOTE (GABBRO M2): the macOS CPU wire path now ADMITS NVFP4 (bit-exact decode, Gate G-M1); it is only the Metal GPU lane that refuses here, so this cell tracks the GPU-lane posture, not a macOS-wide refusal."
+        "note": "GABBRO M3-followup: the Metal (macOS) lane now ADMITS and RUNS NVFP4 layer projections (gemma4_metal_layer_fmt covers NVFP4), consistent with the §9 platform gate admitting NVFP4 on macOS (windows_only_check_admits_nvfp4_on_macos). The prior 'Metal GPU refuses NVFP4' posture is lifted; the T5 sentinel guard (I-nan-scale) is the remaining fail-closed on this lane."
       }
     },
     "L5-native-quantizer": {
