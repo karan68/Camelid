@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn gemma4_nvfp4_with_bf16_admits_fully_after_d_b6() {
         // The REAL produced pilot row's shape (G2 receipt): NVFP4 matmuls PLUS one
         // BF16 tensor (per_layer_model_proj.weight). As of BASALT D-B6 (2026-07-17)
@@ -539,23 +539,24 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     fn gemma4_nvfp4_with_bf16_refuses_off_windows_platform_gate() {
-        // Off-Windows twin of the D-B6 admission pin: with BF16 covered, the real
-        // pilot shape (NVFP4 + BF16) no longer refuses on the BF16 quant axis, so it
-        // reaches the Amendment 3 §9 platform gate — which refuses NVFP4 off Windows
-        // with the named TK2 message. The refusal is the PLATFORM gate, never a BF16
-        // quant refusal (that would mean the covered-set widening regressed).
+        // Unvalidated-platform twin of the D-B6 admission pin (Linux leg — macOS now
+        // admits, GABBRO M2): with BF16 covered, the real pilot shape (NVFP4 + BF16)
+        // no longer refuses on the BF16 quant axis, so it reaches the Amendment 3 §9
+        // platform gate — which refuses NVFP4 on targets other than Windows/macOS with
+        // the named TK2 message. The refusal is the PLATFORM gate, never a BF16 quant
+        // refusal (that would mean the covered-set widening regressed).
         let mut file = gemma4_nvfp4_fixture();
         file.tensors
             .push(tensor("per_layer_model_proj.weight", GgufTensorType::BF16));
-        let reject = admit(&file).expect_err("NVFP4 must refuse off Windows");
+        let reject = admit(&file).expect_err("NVFP4 must refuse on unvalidated platforms");
         assert_eq!(reject.axis, AdmissionAxis::Quant);
         assert_eq!(reject.offending_value, "NVFP4");
         assert_eq!(reject.tensor.as_deref(), Some("blk.0.ffn_down.weight"));
         assert_eq!(
             reject.message,
-            "NVFP4 is Windows-only in this release; see SUPPORT_MATRIX"
+            "NVFP4 is Windows/macOS-only in this release; see SUPPORT_MATRIX"
         );
     }
 
