@@ -38,6 +38,7 @@ struct MetalLinearKernel {
     q8_0_block_ksplit_f32y_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q4_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
+    nvfp4_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
     #[allow(dead_code)] // batched-column verify GEMV; exercised by the C0 unit test,
     // consumed by the speculative-verify lane in a later checkpoint
@@ -414,6 +415,26 @@ static METAL_LINEAR_CACHE: OnceLock<Mutex<MetalLinearCache>> = OnceLock::new();
 const LINEAR_ROW_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+// ---- NVFP4 decode primitives (GABBRO M3) --------------------------------------
+// Bit-for-bit twins of the CPU oracle in src/tensor/mod.rs: KVALUES_MXFP4 (the
+// E2M1 codebook, magnitudes doubled with the sign in nibble bit 3) and
+// ue4m3_to_f32_const (the UE4M3 sub-block-scale decode, carrying the 0.5 pair-rule
+// factor). Every op is an exact power-of-two scale of an exactly-representable
+// mantissa, so ldexp cannot round differently from the Rust const path.
+constant float NVFP4_KVALUES[16] = {
+    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+    0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0
+};
+inline float nvfp4_ue4m3_to_f32(uchar b) {
+    if (b == 0x00 || b == 0x7F) {
+        return 0.0f; // 0x7F is the NaN sentinel, FLUSHED (raw-byte check; 0xFF is not)
+    }
+    int e = (int(b) >> 3) & 0xF;
+    float man = float(b & 0x7);
+    float raw = (e == 0) ? ldexp(man, -9) : ldexp(1.0f + man * 0.125f, e - 7);
+    return raw * 0.5f;
+}
 
 kernel void linear_row_f32(
     device const float* input [[buffer(0)]],
@@ -972,6 +993,80 @@ kernel void q4_0_block_linear_row_ksplit_f32y_wire(
                 sumq += lo * ylo[i] + hi * yhi[i];
             }
             sumf[row] += sumq * w_scale;
+        }
+    }
+    for (uint row = 0; row < NR0; ++row) {
+        if (sg == 0) {
+            shmem[row * 32 + lane] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (lane == 0) {
+            shmem[row * 32 + sg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+        const float tot = simd_sum(shmem[row * 32 + lane]);
+        if (lane == 0 && sg == 0) {
+            output[r0 + row] = tot;
+        }
+    }
+}
+// NVFP4 f32-activation GEMV (GABBRO M3). 64-value superblocks (36 bytes: d[4] UE4M3
+// scales + qs[32] nibbles). Lane split: s = lane%4 owns one 16-value sub-block AND
+// its matching UE4M3 scale d[s]; ix = lane/4 selects the superblock slot in flight.
+// The 4 lanes sharing an ix cover a superblock's 4 sub-blocks, so simd_sum over the
+// 32 lanes yields the full per-row dot — same reduction skeleton as the q4_0 kernel.
+kernel void nvfp4_block_linear_row_ksplit_f32y_wire(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],   // 64-value NVFP4 superblocks per row
+    constant uint& rows [[buffer(5)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;                 // superblock slots in flight per simdgroup
+    constexpr uint nvfp4_block_bytes = 36;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * nvfp4_block_bytes;
+
+    const uint s = lane % 4;               // sub-block index == UE4M3 scale index (0..3)
+    const uint ix = lane / 4;              // which superblock slot in flight (0..7)
+
+    float sumf[NR0] = {0.0f, 0.0f};
+    for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+        // this lane's 16 activations = sub-block s of superblock ib
+        float ylo[8], yhi[8];
+        device const float* yb = y + ib * 64 + s * 16;
+        for (uint j = 0; j < 8; ++j) {
+            ylo[j] = yb[j];       // element s*16 + j     (low nibble)
+            yhi[j] = yb[8 + j];   // element s*16 + 8 + j (high nibble)
+        }
+        for (uint row = 0; row < NR0; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= rows) {
+                break;
+            }
+            device const uchar* wb = reinterpret_cast<device const uchar*>(
+                weight_blocks + rr * row_stride + ib * nvfp4_block_bytes);
+            const float scale = nvfp4_ue4m3_to_f32(wb[s]);   // d[s]
+            device const uchar* wq = wb + 4 + s * 8;         // qs bytes for sub-block s
+            float sumq = 0.0f;
+            for (uint j = 0; j < 8; ++j) {
+                const uint b = uint(wq[j]);
+                const float lo = NVFP4_KVALUES[b & 0x0F];
+                const float hi = NVFP4_KVALUES[b >> 4];
+                sumq += lo * ylo[j] + hi * yhi[j];
+            }
+            sumf[row] += sumq * scale;
         }
     }
     for (uint row = 0; row < NR0; ++row) {
@@ -4600,6 +4695,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q4_0_block_ksplit_f32y_wire_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4_0_block_ksplit_f32y_wire_function)
                 .ok()?;
+            let nvfp4_block_ksplit_f32y_wire_function = library
+                .get_function("nvfp4_block_linear_row_ksplit_f32y_wire", None)
+                .ok()?;
+            let nvfp4_block_ksplit_f32y_wire_pipeline = device
+                .new_compute_pipeline_state_with_function(&nvfp4_block_ksplit_f32y_wire_function)
+                .ok()?;
             let q8_0_block_ksplit_f32y_wire_nsg8_function = library
                 .get_function("q8_0_block_linear_row_ksplit_f32y_wire_nsg8", None)
                 .ok()?;
@@ -4650,6 +4751,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_ksplit_f32y_pipeline,
                 q8_0_block_ksplit_f32y_wire_pipeline,
                 q4_0_block_ksplit_f32y_wire_pipeline,
+                nvfp4_block_ksplit_f32y_wire_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline,
                 q8_0_block_ksplit_f32y_wire_gemm_pipeline,
@@ -5829,6 +5931,62 @@ pub fn try_gemma4_q4_0_matmul_f32y(
     let cb = k.queue.new_command_buffer();
     let e = cb.new_compute_command_encoder();
     encode_gemma4_q4_0_matmul(e, k, &y_buf, &w_buf, &out_buf, &scalar_buf, rows);
+    e.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    let mut out = vec![0.0f32; rows];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
+/// NVFP4 wire GEMV on the GPU (GABBRO M3) — the NVFP4 counterpart of
+/// [`try_gemma4_q4_0_matmul_f32y`]. `weight_wire` is `rows * blocks_per_row`
+/// 36-byte NVFP4 superblocks; `y` is `blocks_per_row * 64` f32 activations (the
+/// superblock is 64 values, unlike the 32-value Q8_0/Q4_0 blocks). Returns `rows`
+/// f32 outputs (f32 activation × inline-decoded NVFP4 weight). For validating the
+/// NVFP4 GPU kernel against the CPU `nvfp4_wire_block_dequant` reference.
+#[cfg(target_os = "macos")]
+pub fn try_gemma4_nvfp4_matmul_f32y(
+    y: &[f32],
+    weight_wire: &[u8],
+    rows: usize,
+    blocks_per_row: usize,
+) -> Option<Vec<f32>> {
+    const WIRE: usize = 36;
+    // The NVFP4 superblock is 64 values (block_elements), not 32 — the single
+    // point where an NVFP4 row's activation stride differs from Q8_0/Q4_0.
+    if rows == 0
+        || blocks_per_row == 0
+        || y.len() != blocks_per_row * GemmaWireFmt::Nvfp4.block_elements()
+        || weight_wire.len() != rows * blocks_per_row * WIRE
+    {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let y_buf = k.device.new_buffer(
+        std::mem::size_of_val(y) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let w_buf = k.device.new_buffer(
+        weight_wire.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let out_buf = k
+        .device
+        .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let scalar_buf = k
+        .device
+        .new_buffer(8, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&y_buf, y);
+    write_buffer_u8(&w_buf, weight_wire);
+    unsafe {
+        let p = scalar_buf.contents() as *mut u32;
+        *p = blocks_per_row as u32;
+        *p.add(1) = rows as u32;
+    }
+    let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
+    encode_gemma4_nvfp4_matmul(e, k, &y_buf, &w_buf, &out_buf, &scalar_buf, rows);
     e.end_encoding();
     cb.commit();
     cb.wait_until_completed();
@@ -7805,14 +7963,32 @@ fn encode_q8_matmul_f32y_batched(
 pub enum GemmaWireFmt {
     Q8_0,
     Q4_0,
+    /// NVFP4 (GABBRO M3): 64-element superblocks, 36 wire bytes (`d[4]` UE4M3
+    /// sub-block scales + `qs[32]` packed E2M1 nibbles). Unlike Q8_0/Q4_0
+    /// (32-value blocks) this is a 64-value block, so callers must size
+    /// `blocks_per_row` by [`GemmaWireFmt::block_elements`], never a hardcoded 32.
+    Nvfp4,
 }
 
 impl GemmaWireFmt {
-    /// Bytes per 32-weight wire block.
+    /// Bytes per wire block: 34/18 over 32 values (Q8_0/Q4_0), 36 over 64 values
+    /// (NVFP4 superblock).
     pub fn wire_bytes(self) -> usize {
         match self {
             GemmaWireFmt::Q8_0 => 34,
             GemmaWireFmt::Q4_0 => 18,
+            GemmaWireFmt::Nvfp4 => 36,
+        }
+    }
+
+    /// Weight values per wire block: 32 for Q8_0/Q4_0, 64 for the NVFP4
+    /// superblock. Row block count is `in_dim / block_elements()`, so this is the
+    /// single source of truth that keeps `blocks_per_row`, `row_stride`, and the
+    /// kernel's activation stride consistent across formats.
+    pub fn block_elements(self) -> usize {
+        match self {
+            GemmaWireFmt::Q8_0 | GemmaWireFmt::Q4_0 => 32,
+            GemmaWireFmt::Nvfp4 => 64,
         }
     }
 }
@@ -7836,6 +8012,7 @@ fn encode_gemma4_matmul(
     match fmt {
         GemmaWireFmt::Q8_0 => encode_gemma4_q8_matmul(e, k, y, weight, out, scalar, rows),
         GemmaWireFmt::Q4_0 => encode_gemma4_q4_0_matmul(e, k, y, weight, out, scalar, rows),
+        GemmaWireFmt::Nvfp4 => encode_gemma4_nvfp4_matmul(e, k, y, weight, out, scalar, rows),
     }
 }
 
@@ -7892,6 +8069,44 @@ fn encode_gemma4_q4_0_matmul(
     rows: usize,
 ) {
     e.set_compute_pipeline_state(&k.q4_0_block_ksplit_f32y_wire_pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(2, Some(weight), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (rows as u64).div_ceil(2),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Encode one f32-activation × wire-NVFP4 GEMV (GABBRO M3). Same dispatch shape as
+/// the Q8/Q4_0 paths (128 threads/TG, NR0=2 rows/TG, 2*32*4 threadgroup mem); only
+/// the bound pipeline differs — it reads 36-byte NVFP4 superblocks (64 values:
+/// `d[4]` UE4M3 sub-block scales + `qs[32]` E2M1 nibbles) and reproduces the CPU
+/// oracle `nvfp4_wire_block_dequant` bit-for-bit. `scalar` holds
+/// [blocks_per_row: u32 @0, rows: u32 @4] where blocks_per_row counts 64-value
+/// superblocks (in_dim / 64), so `row_stride = blocks_per_row * 36` is exact.
+#[cfg(target_os = "macos")]
+fn encode_gemma4_nvfp4_matmul(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    e.set_compute_pipeline_state(&k.nvfp4_block_ksplit_f32y_wire_pipeline);
     e.set_buffer(0, Some(y), 0);
     e.set_buffer(2, Some(weight), 0);
     e.set_buffer(3, Some(out), 0);
@@ -15194,6 +15409,68 @@ mod tests {
         assert!(try_gemma4_q4_0_matmul_f32y(&y, &wire, 0, blocks_per_row).is_none());
         assert!(
             try_gemma4_q4_0_matmul_f32y(&y, &wire[..wire.len() - 1], rows, blocks_per_row)
+                .is_none()
+        );
+    }
+
+    // GABBRO M3 parity gate: the Metal NVFP4 GEMV must match the CPU oracle
+    // `nvfp4_wire_block_dequant` × f32 activation (self-parity, §3 leg 3). Reduction
+    // order differs from the CPU dot, so the bar is a tolerance (like the q4_0 gate),
+    // not bit-exact; decode bit-exactness itself is proven by the M1 golden vectors.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_nvfp4_matmul_f32y_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::nvfp4_wire_block_dequant;
+        for blocks_per_row in [3usize, 40, 160] {
+            // blocks_per_row counts 64-value NVFP4 superblocks.
+            let in_dim = blocks_per_row * 64;
+            let rows = 7usize;
+            let y: Vec<f32> = (0..in_dim)
+                .map(|i| ((i as f32 % 11.0) - 5.0) * 0.1)
+                .collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 36);
+            let mut want = vec![0.0f32; rows];
+            for (r, w) in want.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for b in 0..blocks_per_row {
+                    let mut blk = [0u8; 36];
+                    // 4 UE4M3 sub-block scales in [8, 72) — non-zero, and never the
+                    // 0x7F/0xFF NaN sentinels.
+                    for (s, slot) in blk[0..4].iter_mut().enumerate() {
+                        *slot = (((r * 5 + b * 3 + s) % 64) + 8) as u8;
+                    }
+                    // 32 packed E2M1 nibble bytes.
+                    for (j, slot) in blk[4..].iter_mut().enumerate() {
+                        *slot = ((r * 31 + b * 17 + j * 3) % 256) as u8;
+                    }
+                    let deq = nvfp4_wire_block_dequant(&blk);
+                    for (i, &d) in deq.iter().enumerate() {
+                        acc += d * y[b * 64 + i];
+                    }
+                    wire.extend_from_slice(&blk);
+                }
+                *w = acc;
+            }
+            let got = try_gemma4_nvfp4_matmul_f32y(&y, &wire, rows, blocks_per_row)
+                .expect("gemma4 nvfp4 matmul");
+            for (a, b) in got.iter().zip(&want) {
+                assert!((a - b).abs() < 2.0e-2, "bpr={blocks_per_row} {a} != {b}");
+            }
+        }
+        // Shape guards.
+        let blocks_per_row = 3usize;
+        let in_dim = blocks_per_row * 64;
+        let y: Vec<f32> = (0..in_dim)
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.1)
+            .collect();
+        let wire = vec![0u8; 7 * blocks_per_row * 36];
+        let rows = 7usize;
+        assert!(try_gemma4_nvfp4_matmul_f32y(&y, &wire, 0, blocks_per_row).is_none());
+        assert!(
+            try_gemma4_nvfp4_matmul_f32y(&y, &wire[..wire.len() - 1], rows, blocks_per_row)
                 .is_none()
         );
     }
