@@ -1067,10 +1067,11 @@ pub(crate) fn nvfp4_sidecar_check(tensors: &[crate::gguf::GgufTensorDescriptor])
 ///
 /// NOTE (GABBRO M2): the refusal message reads "Windows/macOS-only" and the
 /// support matrices are truthed-up to Windows+macOS in this same ratchet PR
-/// (Tim folded the surface truth-up into M2). macOS runs the CPU wire lane only;
-/// its Metal GPU kernel is Phase M3, still typed-refused by
-/// `nvfp4_metal_lane_check`. The fn name `nvfp4_windows_only_check` is retained
-/// as an optional internal rename follow-up (pub(crate); not a user surface).
+/// (Tim folded the surface truth-up into M2). macOS runs NVFP4 on both the CPU wire
+/// lane and the Metal resident GPU lane (GABBRO M3 + followup), the Metal lane
+/// guarded by `gemma4_metal_layer_fmt` (covered set) + `nvfp4_metal_sentinel_check`
+/// (D17/T5). The fn name `nvfp4_windows_only_check` is retained as an optional
+/// internal rename follow-up (pub(crate); not a user surface).
 pub(crate) fn nvfp4_windows_only_check(
     tensors: &[crate::gguf::GgufTensorDescriptor],
 ) -> Result<()> {
@@ -1087,23 +1088,54 @@ pub(crate) fn nvfp4_windows_only_check(
     Ok(())
 }
 
-/// BASALT Amendment 3 review fix (Metal lane guard): the macOS GPU lane
-/// ([`Gemma4GpuRuntime::load`]) format-gates only layer-0 `attn_q` and never runs
-/// the NVFP4 wire decoder, so an NVFP4 file must refuse up front with a typed
-/// error rather than mis-bind. cfg-independent so it unit-tests on every host;
-/// the `cfg(target_os = "macos")` load site wires it.
+/// GABBRO M3-followup (D17/T5 fail-closed): the macOS GPU lane
+/// ([`Gemma4GpuRuntime::load`]) now RUNS NVFP4 layer projections (kernel
+/// `nvfp4_block_linear_row_ksplit_f32y_wire`), reading their wire bytes RAW via
+/// WirePages — which bypasses `WireQuant::new`'s NaN-sentinel scan. So the T5 guard
+/// lives here: scan every NVFP4 tensor's UE4M3 scale bytes and refuse `0x7F`/`0xFF`
+/// (the pin's CPU and CUDA backends disagree on `0xFF`, so such a file has no
+/// well-defined cross-backend oracle), matching the CPU wire lane. Clean NVFP4 — and
+/// files without NVFP4 — admit. The shared [`crate::tensor::nvfp4_find_nan_scale`]
+/// does the byte scan; called once the mmap is available.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn nvfp4_metal_lane_check(tensors: &[crate::gguf::GgufTensorDescriptor]) -> Result<()> {
-    if let Some(t) = tensors
-        .iter()
-        .find(|t| t.tensor_type == GgufTensorType::NVFP4)
-    {
-        return Err(BackendError::UnsupportedGguf(format!(
-            "NVFP4 is not wired to the Metal lane (BASALT L4: na); tensor {} is NVFP4",
-            t.name
-        )));
+fn nvfp4_metal_sentinel_check(
+    tensors: &[crate::gguf::GgufTensorDescriptor],
+    mmap: &GgufWireMmap,
+) -> Result<()> {
+    for t in tensors {
+        if t.tensor_type == GgufTensorType::NVFP4 {
+            let wire = mmap.bytes(t.absolute_offset, t.n_bytes as usize)?;
+            if let Some(block_idx) = crate::tensor::nvfp4_find_nan_scale(wire) {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "tensor {}: NVFP4 block {block_idx} carries a NaN-sentinel UE4M3 \
+                     scale byte (0x7F/0xFF) — refusing on the Metal resident lane per D17/T5",
+                    t.name
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+/// GABBRO M3-followup: the Metal resident lane's covered layer-projection formats —
+/// Q8_0 / Q4_0 / NVFP4, each a parity-gated GPU GEMV. Any other format refuses TYPED
+/// and NAMED (invariant I-unknown-type, L4 cell) rather than mis-binding. Extracted so
+/// it unit-tests without a real model; the load site probes layer-0 `attn_q` (the
+/// export quantizes every layer's projections alike).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gemma4_metal_layer_fmt(tensor_type: GgufTensorType) -> Result<crate::metal::GemmaWireFmt> {
+    // The only non-test caller is `Gemma4GpuRuntime::load`, which is `cfg(macos)`-gated, so
+    // the non-macOS lib build sees this as dead; allow it there (the `#[cfg(test)]` covered-set
+    // test still exercises it on every platform). Mirrors `nvfp4_metal_sentinel_check`.
+    match tensor_type {
+        GgufTensorType::Q8_0 => Ok(crate::metal::GemmaWireFmt::Q8_0),
+        GgufTensorType::Q4_0 => Ok(crate::metal::GemmaWireFmt::Q4_0),
+        GgufTensorType::NVFP4 => Ok(crate::metal::GemmaWireFmt::Nvfp4),
+        other => Err(BackendError::UnsupportedTensorType(format!(
+            "gemma4 GPU runtime supports Q8_0/Q4_0/NVFP4 layer projections; \
+             layer 0 attn_q is {other:?}"
+        ))),
+    }
 }
 
 /// BASALT Amendment 3 review fix (CUDA lane typed refusal), extended at SHA_E
@@ -2464,38 +2496,32 @@ impl Gemma4GpuRuntime {
     /// is the KV-cache capacity (must cover prompt + generated tokens).
     pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
         let gguf = read_metadata(path)?;
-        // BASALT Amendment 3 review fix (Metal lane guard): this lane never ran
-        // the D-B2 sidecar check and format-gated only layer-0 attn_q, so a
-        // sidecar-bearing or NVFP4 file could slip past the signed refusals.
-        // Both typed refusals fire here, before any binding; the shared helpers
-        // are cfg-independent and unit-tested on every host.
+        // BASALT Amendment 3 (D-B2 sidecar guard): this lane never ran the sidecar
+        // check, so a sidecar-bearing NVFP4 file could compute wrong logits — refuse
+        // it here, before any binding (cfg-independent, unit-tested on every host).
+        // GABBRO M3-followup lifted the blanket NVFP4 refusal (the Metal resident lane
+        // now runs NVFP4 layer projections via nvfp4_block_linear_row_ksplit_f32y_wire);
+        // the D17/T5 NaN-sentinel guard moved to nvfp4_metal_sentinel_check below,
+        // where the mmap is available to scan the wire bytes the raw upload reads.
         nvfp4_sidecar_check(&gguf.tensors)?;
-        nvfp4_metal_lane_check(&gguf.tensors)?;
         let config = LlamaModelConfig::from_gguf(&gguf)?;
         let g = config.gemma4.clone().ok_or_else(|| {
             BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
         })?;
         let binding = Gemma4Binding::bind(&gguf, &config)?;
         let store = TensorStore::open(path, &gguf);
-        // The GPU-resident decode kernels run the layer projections as either Q8_0
-        // (34-byte wire blocks) or Q4_0 (18-byte QAT wire blocks) — both are
-        // parity-gated GPU GEMVs. The tied head is read separately: Q8_0 runs on the
-        // GPU (inside forward_token); Q6_K (the QAT tied head, no GPU kernel) runs on
-        // the CPU via the held WireQuant. Layer 0's attn_q is representative of the
-        // projection format (the export quantizes every layer's projections alike).
-        let layer_fmt = match store
-            .descriptor(&binding.layers[0].attn_q.name)?
-            .tensor_type
-        {
-            GgufTensorType::Q8_0 => crate::metal::GemmaWireFmt::Q8_0,
-            GgufTensorType::Q4_0 => crate::metal::GemmaWireFmt::Q4_0,
-            other => {
-                return Err(BackendError::UnsupportedTensorType(format!(
-                    "gemma4 GPU runtime supports Q8_0 or Q4_0 layer projections; \
-                     layer 0 attn_q is {other:?}"
-                )));
-            }
-        };
+        // The GPU-resident decode kernels run the layer projections as Q8_0 (34-byte
+        // wire blocks), Q4_0 (18-byte QAT wire blocks), or NVFP4 (36-byte 64-value
+        // superblocks; GABBRO M3) — all parity-gated GPU GEMVs. The tied head is read
+        // separately: Q8_0 runs on the GPU (inside forward_token); Q6_K (the QAT tied
+        // head, no GPU kernel) runs on the CPU via the held WireQuant. Layer 0's attn_q
+        // is representative of the projection format (the export quantizes every
+        // layer's projections alike).
+        let layer_fmt = gemma4_metal_layer_fmt(
+            store
+                .descriptor(&binding.layers[0].attn_q.name)?
+                .tensor_type,
+        )?;
         let head_on_cpu = match store.descriptor(&binding.token_embedding.name)?.tensor_type {
             GgufTensorType::Q8_0 => false, // GPU Q8 head
             GgufTensorType::Q6K => true,   // CPU Q6_K head (QAT tied head)
@@ -2511,6 +2537,12 @@ impl Gemma4GpuRuntime {
         // it never forces the anonymous GPU WirePages to swap). GPU layer weights load
         // separately as page-aligned WirePages.
         let mmap = GgufWireMmap::map(path)?;
+        // GABBRO M3-followup (D17/T5 fail-closed): the resident lane reads NVFP4 layer
+        // wire RAW via WirePages (bypassing WireQuant::new's sentinel scan), so the
+        // NaN-sentinel guard fires here — one pass over each NVFP4 tensor's UE4M3 scale
+        // bytes before any GPU upload; 0x7F/0xFF refuses fail-closed, matching the CPU
+        // wire lane. (nvfp4_sidecar_check for D-B2 already ran up top.)
+        nvfp4_metal_sentinel_check(&gguf.tensors, &mmap)?;
         // Warm the embedding mmap off the loading thread (matching the CPU lane): the
         // QAT hybrid head reads the whole Q6_K tied table every token on the CPU, and
         // every row gather hits this mapping, so the first token would otherwise pay the
@@ -5298,6 +5330,58 @@ mod nvfp4_wire_tests {
     }
 
     #[test]
+    fn metal_sentinel_check_refuses_nan_sentinel_nvfp4() {
+        // GABBRO M3-followup: the Metal resident lane now RUNS NVFP4, reading wire raw
+        // (bypassing WireQuant's scan), so nvfp4_metal_sentinel_check is the T5 guard —
+        // a NaN-sentinel UE4M3 scale byte refuses at load, naming the tensor.
+        for sentinel in [0x7Fu8, 0xFFu8] {
+            let mut wire = synth_wire(2);
+            wire[36 + 2] = sentinel; // block 1, d[2]
+            let descs = vec![desc(
+                "blk.7.ffn_down.weight",
+                GgufTensorType::NVFP4,
+                &[64, 2],
+                72,
+            )];
+            let (_f, _store, mmap) = fixture(&wire, descs.clone());
+            match nvfp4_metal_sentinel_check(&descs, &mmap) {
+                Err(BackendError::InvalidTensorData(msg)) => {
+                    assert!(msg.contains("NaN-sentinel"), "msg: {msg}");
+                    assert!(
+                        msg.contains("blk.7.ffn_down.weight"),
+                        "names the tensor: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected InvalidTensorData, got {other:?}"),
+                Ok(()) => panic!("sentinel-bearing NVFP4 must refuse on the Metal lane (D17/T5)"),
+            }
+        }
+    }
+
+    #[test]
+    fn metal_sentinel_check_admits_clean_nvfp4_and_non_nvfp4() {
+        // Clean NVFP4 admits (the lane runs it now); files without NVFP4 are out of scope.
+        let wire = synth_wire(2);
+        let descs = vec![desc(
+            "blk.0.attn_q.weight",
+            GgufTensorType::NVFP4,
+            &[64, 2],
+            72,
+        )];
+        let (_f, _store, mmap) = fixture(&wire, descs.clone());
+        nvfp4_metal_sentinel_check(&descs, &mmap).expect("clean NVFP4 admits on the Metal lane");
+
+        let descs2 = vec![desc(
+            "blk.0.attn_q.weight",
+            GgufTensorType::Q8_0,
+            &[64, 2],
+            136,
+        )];
+        let (_f2, _store2, mmap2) = fixture(&synth_wire(2), descs2.clone());
+        nvfp4_metal_sentinel_check(&descs2, &mmap2).expect("non-NVFP4 files keep loading");
+    }
+
+    #[test]
     fn nvfp4_matvec_and_matmul_match_row_dot() {
         // 4 output rows x 128 inputs = 8 superblocks of wire.
         let (in_dim, out_dim) = (128usize, 4usize);
@@ -5703,34 +5787,48 @@ mod gpu_lane_refusal_tests {
         }
     }
 
-    #[test]
-    fn metal_lane_check_refuses_any_nvfp4_tensor() {
-        // Review fix #2: ANY NVFP4 tensor refuses (the lane format-gates only
-        // layer-0 attn_q, so a deeper NVFP4 tensor would otherwise mis-bind).
-        let tensors = vec![
-            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0),
-            desc("blk.7.ffn_down.weight", GgufTensorType::NVFP4),
-        ];
-        match nvfp4_metal_lane_check(&tensors) {
-            Err(BackendError::UnsupportedGguf(msg)) => {
-                assert!(
-                    msg.contains("NVFP4 is not wired to the Metal lane (BASALT L4: na)"),
-                    "msg: {msg}"
-                );
-                assert!(msg.contains("blk.7.ffn_down.weight"), "msg: {msg}");
-            }
-            Err(other) => panic!("expected UnsupportedGguf, got {other:?}"),
-            Ok(()) => panic!("NVFP4 tensor must refuse in the Metal lane"),
-        }
-    }
+    // GABBRO M3-followup: the blanket `nvfp4_metal_lane_check` refusal was lifted (the
+    // Metal resident lane now RUNS NVFP4), replaced by `nvfp4_metal_sentinel_check` (the
+    // T5 guard). Its tests need real wire bytes, so they live in the fixture-bearing mod:
+    // `metal_sentinel_check_refuses_nan_sentinel_nvfp4` and
+    // `metal_sentinel_check_admits_clean_nvfp4_and_non_nvfp4`.
 
     #[test]
-    fn metal_lane_check_admits_files_without_nvfp4() {
-        let tensors = vec![
-            desc("blk.0.attn_q.weight", GgufTensorType::Q8_0),
-            desc("token_embd.weight", GgufTensorType::Q6K),
-        ];
-        nvfp4_metal_lane_check(&tensors).expect("non-NVFP4 files keep loading");
+    fn metal_layer_fmt_covers_q8_q4_nvfp4_refuses_others() {
+        // I-unknown-type (L4): the Metal resident lane covers Q8_0/Q4_0/NVFP4 layer
+        // projections; every other format refuses TYPED and NAMED, never a mis-bind.
+        use crate::metal::GemmaWireFmt;
+        assert_eq!(
+            gemma4_metal_layer_fmt(GgufTensorType::Q8_0).unwrap(),
+            GemmaWireFmt::Q8_0
+        );
+        assert_eq!(
+            gemma4_metal_layer_fmt(GgufTensorType::Q4_0).unwrap(),
+            GemmaWireFmt::Q4_0
+        );
+        assert_eq!(
+            gemma4_metal_layer_fmt(GgufTensorType::NVFP4).unwrap(),
+            GemmaWireFmt::Nvfp4
+        );
+        for uncovered in [
+            GgufTensorType::Q6K,
+            GgufTensorType::BF16,
+            GgufTensorType::Q4K,
+        ] {
+            match gemma4_metal_layer_fmt(uncovered) {
+                Err(BackendError::UnsupportedTensorType(msg)) => {
+                    assert!(
+                        msg.contains(&format!("{uncovered:?}")),
+                        "names the format: {msg}"
+                    );
+                    assert!(
+                        msg.contains("Q8_0/Q4_0/NVFP4"),
+                        "names the covered set: {msg}"
+                    );
+                }
+                other => panic!("uncovered format must refuse typed: {other:?}"),
+            }
+        }
     }
 
     #[test]

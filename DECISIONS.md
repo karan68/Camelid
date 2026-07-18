@@ -922,6 +922,32 @@ step is a no-op — the pin was ahead of the GABBRO conductor. The internal fn n
 `nvfp4_windows_only_check` is retained (optional rename follow-up; pub(crate), not a user
 surface).
 
+**D17 addendum 10 (2026-07-18, GABBRO M3-followup — NVFP4 wired through the Metal resident
+lane).** M3 landed the `nvfp4_block_linear_row_ksplit_f32y_wire` Metal kernel and its
+CPU-parity gate (PR #478); this follow-up wires it into the runtime so `Gemma4GpuRuntime`
+actually runs NVFP4 layer projections on the GPU. **L1 (forward):** the resident forward's
+`blocks_per_row` is made format-aware (`fmt.block_elements()`, 64 for NVFP4 vs 32 for
+Q8_0/Q4_0) in `encode_gemma4_ffn`/`encode_gemma4_attention` — the old hardcoded `dim/32`
+would have mis-strided NVFP4 rows; proven by `metal_gemma4_resident_nvfp4_forward_matches_cpu`.
+**L2 (load admission):** the blanket `nvfp4_metal_lane_check` typed-refusal is lifted and
+`Gemma4GpuRuntime::load` gains an `NVFP4` layer-fmt arm via the testable covered-set helper
+`gemma4_metal_layer_fmt` (Q8_0/Q4_0/NVFP4; others refuse typed). **Safety (D17/T5 carried
+into the GPU lane):** the resident lane reads NVFP4 wire bytes RAW via `WirePages`, bypassing
+`WireQuant::new`'s NaN-sentinel scan — so the fail-closed guard is re-established as
+`nvfp4_metal_sentinel_check`, run once the mmap is available: it scans every NVFP4 tensor's
+UE4M3 scale bytes and refuses the `0x7F`/`0xFF` sentinels, matching the CPU wire lane; the
+D-B2 sidecar check already runs up top. **Invariant matrix (L4-metal):** `I-nan-scale` flips
+`na → enforced` (the new sentinel scan is the enforcing test), and `I-unknown-type`/`I-plat`/
+`I-carveout` rebind to the new helper tests. **Scope unchanged:** the Metal GPU lane is
+reached only via the macOS-only `gemma4-generate-gpu` subcommand (opt-in; `serve` still uses
+the CPU wire lane), it is self-parity-proven against the CPU oracle but **not yet exercised
+end-to-end with a real NVFP4 artifact and carries no perf claim**, and it remains NOT a
+supported/certified row and NOT quality-competitive (G3 NO-GO stands). The live
+`/api/capabilities` note + its ledger mirror are truthed-up here; the human support matrices
+(SUPPORT_MATRIX/CAPABILITY/STATUS/COMPATIBILITY/README/`NVFP4_FORMAT`/DOCS) currently
+**understate** the lane ("Metal GPU not yet wired") and are corrected in the M4 surface-
+alignment pass — a conservative staleness, not an overclaim.
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
