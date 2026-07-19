@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "ca9a6e27",
+    "source_head": "1182947",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -811,7 +811,9 @@
       "identity": {
         "id": "gemma4_e4b_it_nvfp4",
         "family": "gemma4_ple_matformer_decoder",
-        "quantization": "NVFP4"
+        "quantization": "NVFP4",
+        "gguf_filename": "gemma-4-E4B-it-NVFP4-mm.gguf",
+        "sha256": "eb293344972e2b292a043b8e7649b9788dca915b034e5c2721cfc531cf9863d9"
       },
       "contract": {
         "id": "gemma4_e4b_it_nvfp4",
