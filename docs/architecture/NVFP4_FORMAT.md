@@ -17,8 +17,8 @@ the runnable-lane admission is a pilot-model-only carve-out (D-B3), and the form
 Windows and macOS in this release (GABBRO M2). On macOS both a CPU wire lane and, as of GABBRO
 M3 + M3-followup, a Metal GPU resident lane run NVFP4; the Metal lane is opt-in via the
 macOS-only `gemma4-generate-gpu` subcommand (kernel `nvfp4_block_linear_row_ksplit_f32y_wire`),
-self-parity-proven vs the CPU oracle — not yet exercised end-to-end on a real NVFP4 artifact,
-and with no macOS GPU perf number. Runnable-lane admission covers the NVFP4 format and — as of
+self-parity-proven vs the CPU oracle — run end-to-end on the byte-exact artifact,
+isolated 128-tok decode 12.12 tok/s. Runnable-lane admission covers the NVFP4 format and — as of
 D-B6 (2026-07-17) — BF16 as a covered exact-decode type, so its only produced file (gemma4-E4B)
 admits fully; its one BF16 tensor (`per_layer_model_proj`) was the prior admission blocker
 (G2 §6b). It executes via `gemma4_runtime` — the CPU wire + CUDA-resident lanes plus an opt-in macOS
@@ -115,7 +115,7 @@ Phase 0 prose claims were found wrong — cite `BASALT_RECON.md` §1 [G1 errata]
   wire lane (bit-exact, Gate G-M1; used by `serve`); its Metal GPU resident kernel
   (`nvfp4_block_linear_row_ksplit_f32y_wire`) is now wired via GABBRO M3 + M3-followup and
   reachable opt-in through the macOS-only `gemma4-generate-gpu` subcommand, self-parity-proven
-  vs the CPU oracle (not yet run end-to-end on a real NVFP4 artifact; no macOS GPU perf number).
+  vs the CPU oracle (run end-to-end on the byte-exact artifact; isolated 128-tok decode 12.12 tok/s).
 
 ## Quality / performance receipts
 
@@ -129,9 +129,9 @@ Quality (Gate G3) and CUDA decode perf (Gate G4 + Phase 4b dp4a) are receipted i
 NVFP4 4-bit weights, gemma-4-E4B pilot, Windows + macOS. On macOS: a CPU wire lane (bit-exact,
 used by `serve`) and an opt-in Metal GPU resident lane via the macOS-only `gemma4-generate-gpu`
 subcommand (wired via GABBRO M3 + M3-followup, self-parity-proven vs the CPU oracle; not yet
-exercised end-to-end on a real NVFP4 artifact, and no macOS GPU perf number yet). Engine facts: bit-exact CPU decode, validated on
+exercised end-to-end on the byte-exact artifact; isolated 128-tok decode 12.12 tok/s). Engine facts: bit-exact CPU decode, validated on
 x86 and on Apple Silicon/ARM (GABBRO Gate G-M1), + a Windows CUDA dp4a GEMV kernel (46/46
 bit-identical). Measured vs the Q8_0 parent at matched 4.5 bpw:
 behind Q4_K on quality (G3 NO-GO, 88.5% vs 92.6% top-1 agreement; 0.111 vs 0.065 mean-KL
 nats), but 1.03x faster than Q8_0 CUDA decode (26.51 vs 25.80 tok/s) and 2.08 GB lighter VRAM
-on an RTX 3060 Laptop (decode-only, this box). Not a supported row; not quality-competitive.
+on an RTX 3060 Laptop (decode-only, this box). The macOS row is now a supported_exact_row_smoke row (a current-engine near-tie vs Q4_K; the frozen G3 NO-GO stands as history); NOT quality-competitive beyond the 2pp GO tolerance — a space/speed quant.
