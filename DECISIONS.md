@@ -948,6 +948,34 @@ supported/certified row and NOT quality-competitive (G3 NO-GO stands). The live
 **understate** the lane ("Metal GPU not yet wired") and are corrected in the M4 surface-
 alignment pass — a conservative staleness, not an overclaim.
 
+**D17 addendum 11 (2026-07-18, GABBRO — NVFP4 gemma4-E4B PROMOTED to a supported row; G3
+gate REVISITED, not reversed).** Tim directed "make these supported models on the mac, do
+whatever it takes"; then, shown that pure-NVFP4 quality is a knife-edge, "grind it" and chose
+**pure NVFP4-mm**. Promotion basis (evidence bundle `qa/evidence-bundles/gabbro/support/`):
+**(1) Decode-parity anchor** — NVFP4 CPU decode bit-exact on ARM (G-M1), Metal resident forward
+== CPU oracle (`metal_gemma4_resident_nvfp4_forward_matches_cpu`), BASALT Leg B cross-engine
+8/9+near-tie, and a fresh macOS llama.cpp `acd79d603` spot-check (both → "Paris"). **(2) End-to-end**
+— first real-artifact run on the Metal resident lane produces coherent output; isolated 128-tok
+decode **12.12 tok/s** (fastest of NVFP4/Q8_0/Q4_0, 1.45× the Q8_0 parent, 26% smaller).
+**(3) Quality** — a NEW, disclosed current-engine teacher-forced re-eval (harness
+`camelid gemma4-eval-pack`, validated: Q8_0 self-agreement 296/296, baseline token-identical to
+BASALT's committed baseline for 8/9 prompts): NVFP4-mm **90.5%** (268/296) vs format-isolated
+Q4K-mm **91.9%** (272/296) → gap **1.4pp ≤ the pre-registered 2.0pp GO tolerance = GO**, vs the
+frozen G3's 4.1pp NO-GO. **The frozen Gate G3 NO-GO (88.5% vs 92.6%, engine `8038abba`) STANDS
+as a recorded historical result — this is not a reversal but a disclosed re-measurement on the
+current engine.** HONESTY (binding, Option-B claim-lint preserved): the pure-NVFP4 pass is a
+**comparator-sensitive NEAR-TIE** (against a 92.6%-level Q4_K comparator the gap is 2.1pp,
+marginal NO-GO); the +6-match NVFP4 gain (88.5→90.5) is a real current-engine decode-fidelity
+improvement (byte-identical file, near-identical baseline), the −2 on Q4K reflects an ARM-quantized
+comparator (Q4_K's float-search quantizer is ISA-sensitive; NVFP4 RTN is not). imatrix is proven
+dead for NVFP4 (`ggml-quants.c GGML_UNUSED(quant_weights)`). No surface may claim NVFP4 is
+quality-competitive-beyond-tolerance or better than Q4_K; it stays a **space/speed** quant. New
+row `gemma4_e4b_it_nvfp4`: `supported_exact_row_smoke`, scope
+`exact_row_gpu_resident_raw_decode_parity_smoke_only`, `full_support_status` blocked (no bounded
+packs, perf/RSS, portability, arbitrary templates). Ledger + capabilities builder + the committed-set
+/ scope guard tests in `tests/gemma4_capabilities.rs` updated in sync; a robust alternative
+(ffn_down→Q8_0 hybrid, 91.9% = Q4_K) is recorded but NOT shipped (needs Metal per-tensor-fmt).
+
 **Micro-decisions (Amendment 3):**
 
 - **§9.1 — runtime platform gate over a `#[cfg]` wall:** NVFP4 admission refuses on
