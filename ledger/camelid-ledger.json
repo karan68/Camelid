@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "ca9a6e27",
+    "source_head": "1182947",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -75,7 +75,7 @@
       {
         "id": "NVFP4",
         "status": "planned_beyond_named_certified_rows",
-        "notes": "Engine facts shipped for the gemma-4-E4B-it pilot only, on Windows and macOS (NVFP4 = E2M1 4-bit weights with UE4M3 sub-block scales, type id 40, 64-element/36-byte superblock). Loads and decodes bit-exact on the CPU wire lane, validated on x86 and on Apple Silicon/ARM (GABBRO Gate G-M1), plus a Windows CUDA-resident nvfp4_gemv dp4a kernel (46/46 bit-identical to the CPU oracle); on macOS the Metal GPU resident lane also runs NVFP4 as of GABBRO M3-followup (opt-in via gemma4-generate-gpu; self-parity-proven forward + T5 sentinel guard; end-to-end run and perf pending a real artifact), alongside the bit-exact CPU wire lane; sidecar-bearing and NaN-sentinel files fail closed. Measured vs the Q8_0 parent at matched 4.5 bpw: NOT quality-competitive with Q4_K (Gate G3 NO-GO, 88.5% vs 92.6% top-1 agreement, 0.111 vs 0.065 mean-KL nats). On an RTX 3060 Laptop the CUDA decode is 1.03x faster than Q8_0 (26.51 vs 25.80 tok/s) and 2.08 GB lighter in VRAM -- decode-only, measured on this box, not a general claim. Runnable-lane admission covers the format with no parity claim; as of D-B6 (2026-07-17) BF16 is a covered exact-decode type, so the produced gemma4-E4B pilot file admits fully (its one BF16 tensor per_layer_model_proj was the prior blocker); it executes via gemma4_runtime (CPU wire + CUDA-resident lanes), not the generic runnable serve bridge; no certified support row -- Supported promotion is a separate later decision. Phase 5 Blackwell tensor-core path is BLOCKED-HW (no sm_120 silicon)."
+        "notes": "Engine facts shipped for the gemma-4-E4B-it pilot only, on Windows and macOS (NVFP4 = E2M1 4-bit weights with UE4M3 sub-block scales, type id 40, 64-element/36-byte superblock). Loads and decodes bit-exact on the CPU wire lane, validated on x86 and on Apple Silicon/ARM (GABBRO Gate G-M1), plus a Windows CUDA-resident nvfp4_gemv dp4a kernel (46/46 bit-identical to the CPU oracle); on macOS the Metal GPU resident lane also runs NVFP4 as of GABBRO M3-followup (opt-in via gemma4-generate-gpu; self-parity-proven forward + T5 sentinel guard; end-to-end run PROVEN on the byte-exact real artifact, isolated decode 12.12 tok/s (1.45x the Q8_0 parent, fastest of NVFP4/Q8_0/Q4_0)), alongside the bit-exact CPU wire lane; sidecar-bearing and NaN-sentinel files fail closed. Quality vs the Q8_0 parent at matched 4.5 bpw: the frozen Gate G3 recorded NO-GO (NVFP4-mm 88.5% vs Q4K-mm 92.6% top-1) and STANDS as history; a disclosed current-engine teacher-forced re-eval is a comparator-sensitive NEAR-TIE (90.5% vs 91.9%, gap 1.4pp within the pre-registered 2.0pp GO tolerance) -- still a space/speed quant, NOT a quality win beyond that tolerance. On an RTX 3060 Laptop the CUDA decode is 1.03x faster than Q8_0 (26.51 vs 25.80 tok/s) and 2.08 GB lighter in VRAM -- decode-only, measured on this box, not a general claim. Runnable-lane admission covers the format with no parity claim; as of D-B6 (2026-07-17) BF16 is a covered exact-decode type, so the produced gemma4-E4B pilot file admits fully (its one BF16 tensor per_layer_model_proj was the prior blocker); it executes via gemma4_runtime (CPU wire + CUDA-resident lanes), not the generic runnable serve bridge; the gemma4-E4B NVFP4 pilot is now a supported_exact_row_smoke row (gemma4_e4b_it_nvfp4, scope exact_row_gpu_resident_raw_decode_parity_smoke_only), oracle-parity-anchored (G-M1 bit-exact CPU + Metal self-parity + BASALT Leg B + fresh macOS spot-check); see qa/evidence-bundles/gabbro/support/. Phase 5 Blackwell tensor-core path is BLOCKED-HW (no sm_120 silicon)."
       }
     ],
     "supported_model_families": [
@@ -805,6 +805,57 @@
         "latest_checked_output": "8192",
         "evidence": "the exact tracked gemma-4-E4B-it-Q8_0 GGUF (8,192,951,456 bytes, general.architecture=gemma4, gemma4 SPM tokenizer) loads through the mmap wire-backed Q8 lane (no eager decode; ~instant load) and generates greedily with token IDs identical to the reference llama.cpp b9430 greedy decode ([9079, 236761, 108, 1018, 14977, 53121, 2900, 563, 506, 5279, 529, 7001] for 'The capital of France is'). Served live through /v1/chat/completions both non-streaming and streaming (OpenAI chat.completion.chunk shape) behind CAMELID_GEMMA4_SERVE; non-streaming returns 'Paris' with finish_reason stop and no prompt echo, streaming yields incremental token deltas then [DONE], /v1/health reports backend=gemma4-runtime/model_family=gemma4/gemma4_available=true, and the CLI greedy output matches the API for the same templated prompt. Committed basic_v1 pack parity vs the pinned plain-f32 GEMV comparator (llama.cpp 5d56eff, --no-repack -fa off -ctk f32 -ctv f32 -ub 1): CPU and GPU both match all five prompts full-budget with no frontier annotations (the previously recorded knife-edge was the missing rope_freqs proportional-rope semantics, since implemented from the reference graph). Distributed layer-sharding greedy output is token-identical to the oracle with fail-closed handshake/checksum/shared-KV guards. Raw logs: qa/evidence-bundles/gemma4-e4b-it-q8-0-20260610T103400Z-head-96a75007b156. See docs/gemma4-engine-status.md. Bounded-context ladder: committed packs + pinned-comparator oracles at qa/gemma4/prompt_packs/context_{512,1024,2048,4096,8192}_v1.json with recall asserted at capture; CPU and GPU parity cells pass full-budget at every bucket with no recorded frontiers (10/10 cells this row). The reference-exact chat template (both thinking modes) is locked byte-for-byte and token-for-token by qa/gemma4/template_shapes_v1.json. Distributed layer-sharding SERVE lane (CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT) reuses wire protocol v1 with per-request worker sessions. Camelid supports exact-row text-token generation + serve smoke with checked bounded 512-8192 context packs for this row only; no model-native/larger context, performance, portability, multimodal, or full support is implied",
         "next_step": "add performance/RSS gates and durable current-head QA bundles, and broaden template coverage before any wider gemma4 claim; bounded 512-8192 context packs are checked"
+      }
+    },
+    {
+      "identity": {
+        "id": "gemma4_e4b_it_nvfp4",
+        "family": "gemma4_ple_matformer_decoder",
+        "quantization": "NVFP4",
+        "gguf_filename": "gemma-4-E4B-it-NVFP4-mm.gguf",
+        "sha256": "eb293344972e2b292a043b8e7649b9788dca915b034e5c2721cfc531cf9863d9"
+      },
+      "contract": {
+        "id": "gemma4_e4b_it_nvfp4",
+        "tool_capable": false,
+        "family": "gemma4_ple_matformer_decoder",
+        "quantization": "NVFP4",
+        "status": "supported_exact_row_smoke",
+        "support_scope": "exact_row_gpu_resident_raw_decode_parity_smoke_only",
+        "full_support_status": "blocked_pending_normalized_full_support",
+        "full_support_blockers": "NVFP4 is a space/speed quant, NOT quality-competitive-beyond-tolerance with Q4_K: a current-engine teacher-forced re-eval is a comparator-sensitive NEAR-TIE (90.5% vs Q4K 91.9%, gap 1.4pp within the pre-registered 2.0pp GO tolerance; the frozen Gate G3 NO-GO at 88.5% vs 92.6% stands as history). performance/RSS gates, bounded context packs (not run for NVFP4), portability, and arbitrary/Jinja template coverage beyond the gemma4 marker template remain missing",
+        "metadata_parses": "validated",
+        "tokenizer_works": "validated_for_gemma4_spm",
+        "tensors_load": "validated_metal_resident_wire_nvfp4_plus_q8_embeddings",
+        "generation_runs": "metal_gpu_resident_greedy_e2e_real_artifact_plus_cpu_forced_decode_eval",
+        "parity_audited": "nvfp4_cpu_decode_bit_exact_arm_gate_g_m1_13of13_plus_metal_self_parity_metal_gemma4_resident_nvfp4_forward_matches_cpu_plus_basalt_leg_b_cross_engine_8of9_plus_fresh_macos_llama_cpp_acd79d603_spotcheck",
+        "performance_measured": "isolated_128tok_greedy_decode_12_12_tok_s_metal_resident_1_45x_q8_0_parent_not_perf_validated",
+        "frontend_load_path_verified": "served_via_gemma4_runtime_metal_resident_lane",
+        "frontend_readiness_gate": "green only when this exact gemma4 NVFP4 GGUF row plus NVFP4 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (Metal resident lane opt-in via the macOS-only gemma4-generate-gpu subcommand)",
+        "tested_context": "gpu_resident_raw_decode_parity_smoke_plus_teacher_forced_top1_quality_eval",
+        "chat_template_renderer": "gemma4_marker",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "gpu_resident_raw_decode_parity_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "Paris",
+        "evidence": "the exact tracked gemma-4-E4B-it-NVFP4-mm.gguf (6,058,607,776 bytes, sha256 eb293344972e2b292a043b8e7649b9788dca915b034e5c2721cfc531cf9863d9, general.architecture=gemma4, gemma4 SPM tokenizer; 294 attn/ffn matmul tensors NVFP4 4.5bpw, embeddings Q8_0) loads on the macOS Metal GPU-resident lane and generates greedily end-to-end (first real-artifact run: 'The capital of France is' -> 'Paris.'). DECODE PARITY (the support anchor): NVFP4 CPU wire-lane decode is bit-exact on Apple Silicon/ARM (GABBRO Gate G-M1, 13/13 nvfp4_* tests); the Metal resident forward matches the CPU oracle (metal_gemma4_resident_nvfp4_forward_matches_cpu); BASALT Leg B cross-engine token parity vs pinned llama.cpp on the byte-identical file is 8/9 exact + 1 attributed 0.084-logit near-tie; and a fresh macOS spot-check has llama.cpp acd79d603 and Camelid both decoding 'The capital of France is' -> 'Paris'. QUALITY (honest, current engine): teacher-forced top-1 agreement vs the Q8_0 parent over the committed basic_v1+deep_v1 packs (296 positions, harness validated at Q8_0 self-agreement 296/296 and baseline token-identical to BASALT's committed baseline for 8/9 prompts) is 90.5% (268/296) vs the format-isolated Q4K-mm comparator 91.9% (272/296) -> gap 1.4pp within the pre-registered 2.0pp GO tolerance. This is a comparator-sensitive NEAR-TIE and NOT a claim of quality-competitiveness beyond that tolerance; the frozen Gate G3 NO-GO (88.5% vs 92.6%) stands as a recorded historical result and this is a disclosed current-engine re-eval. PERF: isolated 128-token greedy decode 12.12 tok/s on the Metal resident lane (fastest of NVFP4/Q8_0/Q4_0; 1.45x the Q8_0 parent at 26% smaller). imatrix is not a lever for NVFP4 (ggml-quants.c GGML_UNUSED(quant_weights); pure RTN). Receipts: qa/evidence-bundles/gabbro/support/ (GABBRO_SUPPORT_SUMMARY.md + eval_scores.json), qa/evidence-bundles/gabbro/phase1/ (G-M1). Camelid supports exact-row NVFP4 GPU-resident raw-decode parity smoke for this row only (the gemma4-E4B NVFP4 pilot); no bounded-context packs, quality-competitiveness beyond tolerance, other architectures/quants, performance, portability, multimodal, or full support is implied",
+        "next_step": "add bounded-context packs, performance/RSS gates, and durable current-head QA bundles for the NVFP4 row before any wider claim; the quality standing is a disclosed current-engine near-tie, not a G3 reversal"
       }
     },
     {

@@ -59,6 +59,12 @@ async fn gemma4_supported_rows_are_exactly_the_committed_set() {
             "gemma4_12b_it_q8_0",
             "gemma4_26b_a4b_it_q4_0",
             "gemma4_e2b_it_q8_0",
+            // GABBRO support promotion: the NVFP4 pilot row is oracle-parity-anchored
+            // (G-M1 bit-exact CPU + Metal self-parity + BASALT Leg B cross-engine +
+            // fresh macOS spot-check) and clears the pre-registered G3 GO rule in the
+            // current engine as a disclosed near-tie; evidence bundle at
+            // qa/evidence-bundles/gabbro/support/.
+            "gemma4_e4b_it_nvfp4",
             "gemma4_e4b_it_q8_0"
         ],
         "exact-row support must not grow without committed evidence"
@@ -74,6 +80,7 @@ async fn gemma4_rows_scope_stays_exact_row_and_text_only() {
         assert!(
             scope == "exact_row_smoke_only"
                 || scope == "exact_row_distributed_serve_smoke_only"
+                || scope == "exact_row_gpu_resident_raw_decode_parity_smoke_only"
                 || scope == "active_validation_only"
                 || scope.starts_with("blocked"),
             "{id}: scope must stay exact-row bounded, got {scope}"

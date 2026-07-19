@@ -617,6 +617,30 @@ enum Command {
         #[arg(long)]
         dump_step_logits: Option<PathBuf>,
     },
+    /// Load-amortized BASALT eval-pack runner (`basalt_eval_protocol.md` §5.1):
+    /// load a gemma4 model ONCE and run every prompt in the given packs. This is
+    /// the load-once form of the per-prompt `Gemma4Generate` harness, for the G3(b)
+    /// teacher-forced top-1 agreement metric when iterating over many quant rows.
+    ///
+    /// Without `--score`: greedy-generate each prompt and write
+    /// `<baseline_dir>/<prompt_id>.txt` (newline token ids) — the Q8_0 reference.
+    /// With `--score`: teacher-force each prompt's reference ids from
+    /// `<baseline_dir>` through THIS model and report teacher-forced top-1
+    /// agreement (overall + per prompt). CPU path; no engine math change.
+    Gemma4EvalPack {
+        path: PathBuf,
+        /// Pack JSON file(s), e.g. qa/gemma4/prompt_packs/basic_v1.json.
+        #[arg(long = "pack", required = true, num_args = 1..)]
+        packs: Vec<PathBuf>,
+        /// Directory holding (score mode) or receiving (baseline mode) the
+        /// per-prompt reference token-id files `<prompt_id>.txt`.
+        #[arg(long)]
+        baseline_dir: PathBuf,
+        /// Score this model's teacher-forced agreement against the reference ids
+        /// in `--baseline-dir` instead of generating them.
+        #[arg(long)]
+        score: bool,
+    },
     /// Generate with the CUDA-resident Gemma 4 lane (dev harness for the SSER build).
     #[cfg(feature = "cuda")]
     Gemma4CudaGenerate {
@@ -1707,6 +1731,113 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ => unreachable!("greedy mode always carries generate output"),
                 }
+            }
+        }
+        Command::Gemma4EvalPack {
+            path,
+            packs,
+            baseline_dir,
+            score,
+        } => {
+            #[derive(serde::Deserialize)]
+            struct PackPrompt {
+                id: String,
+                text: String,
+                #[serde(default)]
+                max_new_tokens: usize,
+            }
+            #[derive(serde::Deserialize)]
+            struct Pack {
+                prompts: Vec<PackPrompt>,
+            }
+            let mut prompts: Vec<PackPrompt> = Vec::new();
+            for p in &packs {
+                let txt = std::fs::read_to_string(p)
+                    .map_err(|e| anyhow::anyhow!("--pack {}: {e}", p.display()))?;
+                let parsed: Pack = serde_json::from_str(&txt)
+                    .map_err(|e| anyhow::anyhow!("--pack {}: {e}", p.display()))?;
+                prompts.extend(parsed.prompts);
+            }
+            eprintln!(
+                "[gemma4-eval] loading {} ({} prompts, mode={})...",
+                path.display(),
+                prompts.len(),
+                if score { "score" } else { "baseline" }
+            );
+            let t0 = std::time::Instant::now();
+            let runtime = camelid::gemma4_runtime::Gemma4Runtime::load(&path)?;
+            eprintln!("[gemma4-eval] loaded in {:.1}s", t0.elapsed().as_secs_f32());
+            if !score {
+                std::fs::create_dir_all(&baseline_dir)?;
+            }
+            let mut total = 0usize;
+            let mut agree = 0usize;
+            let t1 = std::time::Instant::now();
+            for pr in &prompts {
+                let f = baseline_dir.join(format!("{}.txt", pr.id));
+                if score {
+                    let text = std::fs::read_to_string(&f)
+                        .map_err(|e| anyhow::anyhow!("baseline {}: {e}", f.display()))?;
+                    let ids = parse_forced_tokens(&text)
+                        .map_err(|e| anyhow::anyhow!("baseline {}: {e}", f.display()))?;
+                    validate_forced_token_vocab(&ids, runtime.vocab_size())
+                        .map_err(|e| anyhow::anyhow!("baseline {}: {e}", f.display()))?;
+                    let mut m = 0usize;
+                    runtime.forced_decode(&pr.text, &ids, |i, logits| {
+                        let (argmax_id, _) = greedy_argmax(logits);
+                        if argmax_id == ids[i] {
+                            m += 1;
+                        }
+                    })?;
+                    total += ids.len();
+                    agree += m;
+                    eprintln!(
+                        "[gemma4-eval]   {:<16} {:>3}/{:<3} = {:.1}%",
+                        pr.id,
+                        m,
+                        ids.len(),
+                        100.0 * m as f64 / ids.len().max(1) as f64
+                    );
+                } else {
+                    let (_out, ids) = runtime.generate_greedy(&pr.text, pr.max_new_tokens)?;
+                    let body = ids
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    std::fs::write(&f, body)?;
+                    total += ids.len();
+                    eprintln!(
+                        "[gemma4-eval]   {:<16} {} tokens -> {}",
+                        pr.id,
+                        ids.len(),
+                        f.display()
+                    );
+                }
+            }
+            let secs = t1.elapsed().as_secs_f32();
+            if score {
+                let pct = 100.0 * agree as f64 / total.max(1) as f64;
+                eprintln!(
+                    "[gemma4-eval] TEACHER-FORCED TOP-1 AGREEMENT: {agree}/{total} = {pct:.1}% ({secs:.1}s)"
+                );
+                println!(
+                    "{{\"model\":{:?},\"agreement_pct\":{:.1},\"agree\":{},\"total\":{}}}",
+                    path.display(),
+                    pct,
+                    agree,
+                    total
+                );
+            } else {
+                eprintln!(
+                    "[gemma4-eval] baseline: {total} tokens across {} prompts ({secs:.1}s)",
+                    prompts.len()
+                );
+                println!(
+                    "{{\"model\":{:?},\"baseline_total\":{}}}",
+                    path.display(),
+                    total
+                );
             }
         }
         #[cfg(feature = "cuda")]
