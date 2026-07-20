@@ -2076,11 +2076,11 @@ impl LlamaInferenceSession {
 
     /// Roll back a GPU-resident drafter session to `position`. Unlike
     /// [`rollback_to_position`], this does NOT require CPU-authoritative KV: it
-    /// resets the resident CUDA engine's `filled` to `position` so the next decode
-    /// trusts the (still-valid) GPU KV up to `position` instead of reseeding from the
-    /// CPU history. The GPU KV is position-major, so entries past `position` are
-    /// overwritten on the next append. For a CPU drafter (no resident engine in the
-    /// cache) this is just the plain kv_cache rollback.
+    /// resets the resident engine's `filled` to `position` (CUDA and Metal alike) so the
+    /// next decode trusts the (still-valid) GPU KV up to `position` instead of reseeding
+    /// from the CPU history. The GPU KV is position-indexed, so entries past `position`
+    /// are overwritten on the next append. For a CPU drafter (no resident engine) this is
+    /// just the plain kv_cache rollback.
     pub fn rollback_resident_to_position(&mut self, position: usize) -> Result<()> {
         self.kv_cache.rollback_to_position(position)?;
         #[cfg(feature = "cuda")]
@@ -2091,6 +2091,18 @@ impl LlamaInferenceSession {
                         slot.engine.set_filled(position);
                     }
                 }
+            }
+        }
+        // Metal analog of the CUDA branch. The Metal resident engine hangs off the session
+        // itself rather than a process-global cache, but the state it carries is the same:
+        // lowering only `kv_cache.position` leaves `filled()` stale, the next resident decode
+        // reads that as a new sequence (`filled() != position`) and tries to reseed the GPU
+        // cache from a CPU KV history a GPU-resident drafter never wrote — `keys` is empty
+        // until `ensure_position_capacity` grows it, so the seeding copy indexes out of range.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(session) = self.resident_decode.as_mut() {
+                session.rollback_to_position(position);
             }
         }
         Ok(())

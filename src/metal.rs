@@ -11046,6 +11046,26 @@ impl ResidentDecodeState {
         self.filled = n;
     }
 
+    /// Discard the KV positions at and after `position` (speculative rollback of rejected
+    /// draft tokens). The cache is position-indexed and the next append overwrites the
+    /// dropped slots, so nothing but the materialized count moves — no buffer work, and the
+    /// still-valid history `[0, position)` stays on the GPU instead of being reseeded from
+    /// the CPU. A no-op when the cache holds no more than `position` positions. The
+    /// encode-ahead graph was built for the abandoned position, so it is released here
+    /// rather than left for `forward_token` to discover (releasing is mandatory: it sits
+    /// committed and gated on the serial queue).
+    pub fn rollback_to_position(&mut self, position: usize) {
+        if position >= self.filled {
+            return;
+        }
+        if let Some(stale) = self.pending.take() {
+            self.release_stale(stale);
+        }
+        self.pending_signaled = false;
+        self.last_sampled = None;
+        self.filled = position;
+    }
+
     /// Decode one token at sequence position `position` (0-based): append this token's K/V to
     /// the persistent GPU cache and attend over positions `0..=position`, all layers in one
     /// command buffer. `cos_t`/`sin_t` are the RoPE tables for `position`; `scale` is the
@@ -13859,6 +13879,8 @@ impl ResidentDecodeState {
     }
 
     pub fn set_filled(&mut self, _n: usize) {}
+
+    pub fn rollback_to_position(&mut self, _position: usize) {}
 }
 
 #[cfg(not(target_os = "macos"))]

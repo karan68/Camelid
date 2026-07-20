@@ -209,6 +209,28 @@ impl super::LlamaInferenceSession {
                 None => return Ok(None),
             };
             if position > 0 {
+                // Seeding reads the CPU KV history [0, position) out of `kv_cache.keys` /
+                // `.values`. Those buffers are grown only by `ensure_position_capacity`, so a
+                // session whose positions were all produced by this resident engine carries a
+                // non-zero `position` over empty buffers (and an F16 cache keeps its entries
+                // elsewhere entirely). Decline instead of indexing out of range. With the
+                // rollback state reset in `rollback_resident_to_position` this is unreachable
+                // on the drafter path, and it must stay that way — a CPU fallback per draft
+                // token would cost far more than it saves.
+                //
+                // LIMIT OF THIS GUARD: it is a bounds probe (see `f32_history_addressable`),
+                // so it only catches the case where the buffers were NEVER grown. Once any
+                // CPU fallback has grown them, this passes even though positions the GPU
+                // produced are still zero-filled, and the seed below copies those zeros —
+                // silently wrong output rather than a panic. That path predates this guard
+                // and is not fixed by it; closing it needs a materialized-through watermark
+                // on the cache.
+                if !self
+                    .kv_cache
+                    .f32_history_addressable(range.end.saturating_sub(1), position)
+                {
+                    return Ok(None);
+                }
                 let kv_dim = n_kv * head_dim;
                 for layer in 0..n_layers {
                     let mut ck = vec![0.0f32; kv_dim * position];
