@@ -13538,3 +13538,77 @@ fn nvfp4_wire_row_dot_matches_pin_order_reference_on_pilot_fixture() {
          64-superblock rows bitwise-identical to the pin-order reference"
     );
 }
+
+/// A session whose positions were all produced by a GPU-resident engine carries a
+/// non-zero `kv_cache.position` over CPU K/V buffers that were never grown — the
+/// state the resident reseed path used to index blindly.
+#[test]
+fn f32_history_addressable_declines_kv_buffers_a_resident_session_never_grew() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(64);
+
+    // Position 0 needs no history, so seeding from it is always safe.
+    assert!(session.kv_cache.f32_history_addressable(0, 0));
+
+    // The resident lane advances `position` without touching the CPU buffers.
+    session.kv_cache.position = 5;
+    assert!(session.kv_cache.keys.is_empty());
+    assert!(
+        !session.kv_cache.f32_history_addressable(0, 5),
+        "an unallocated CPU KV history must never be reported as readable"
+    );
+
+    // Once the CPU path has grown the buffers the same range is readable...
+    session.kv_cache.ensure_position_capacity(5).unwrap();
+    assert!(session.kv_cache.f32_history_addressable(0, 5));
+    // ...but only up to what was actually allocated.
+    let past_end = session.kv_cache.allocated_sequence_length + 1;
+    assert!(!session.kv_cache.f32_history_addressable(0, past_end));
+    // A layer index past the plan is out of range for the offset math.
+    assert!(!session
+        .kv_cache
+        .f32_history_addressable(session.kv_cache.plan.layer_count, 5));
+}
+
+/// Rejected-draft rollback must move the Metal resident engine's `filled` with the KV
+/// position. Leaving it stale is what made the next resident decode treat the session as
+/// a new sequence and reseed from a CPU KV history the GPU-resident drafter never wrote
+/// (`range end index <head_dim> out of range for slice of length 0`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn metal_resident_rollback_moves_filled_with_the_kv_position() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(64);
+    // tiny_kv_budget_session: 1 layer, 1 head, 1 kv head, head_dim 32, hidden 32, ffn 32.
+    let Some(mut state) =
+        crate::metal::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false)
+    else {
+        return; // no Metal device on this host — nothing to exercise
+    };
+
+    // Six positions decoded on the GPU: `filled` and `position` advance together, and the
+    // CPU K/V buffers stay empty (only `ensure_position_capacity` grows them).
+    state.set_filled(6);
+    session.resident_decode = Some(state);
+    session.kv_cache.position = 6;
+    assert!(session.kv_cache.keys.is_empty());
+
+    // The target accepted four of those positions and rejected the tail.
+    session.rollback_resident_to_position(4).unwrap();
+
+    let filled = session
+        .resident_decode
+        .as_ref()
+        .expect("rollback must not drop the resident session")
+        .filled();
+    assert_eq!(session.kv_cache.position, 4);
+    assert_eq!(
+        filled, session.kv_cache.position,
+        "a stale `filled` sends the next decode into the reseed path"
+    );
+
+    // Rolling back to the current position is a no-op, and rolling forward is not a
+    // rollback: neither may raise `filled` past what the GPU cache holds.
+    session.rollback_resident_to_position(4).unwrap();
+    assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 4);
+    session.rollback_resident_to_position(0).unwrap();
+    assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 0);
+}

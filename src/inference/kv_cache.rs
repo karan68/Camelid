@@ -374,6 +374,40 @@ impl LlamaKvCache {
         }
     }
 
+    /// Whether the f32 `keys`/`values` buffers are ADDRESSABLE over `[0, position)` for every
+    /// layer through `last_layer` — i.e. whether a reader may index them with
+    /// [`offset`](Self::offset) over that range without going out of bounds.
+    ///
+    /// `position` alone does NOT imply the buffers exist: only `ensure_position_capacity`
+    /// grows them, so a session whose positions were all produced by a GPU-resident engine
+    /// carries a high `position` over empty buffers, and in `F16` dtype the entries live in
+    /// `keys_f16`/`values_f16` instead. Both layouts put the maximum offset at the last
+    /// layer's last kv head at `position - 1`, so one probe bounds the whole range.
+    ///
+    /// SCOPE — read this before relying on it. This is a BOUNDS check, not a validity check.
+    /// It says the bytes are safe to index; it does NOT say they hold the sequence's real
+    /// K/V. Once `ensure_position_capacity` has grown the buffers for ANY position, this
+    /// returns true for every position `<= allocated_sequence_length` regardless of what was
+    /// actually written — so a range this accepts may still be zero-filled for positions the
+    /// GPU produced and the CPU never wrote. Seeding from such a range is silently wrong, not
+    /// unsafe. Distinguishing that needs a materialized-through watermark, which the cache
+    /// does not currently carry. Same weakness as the pre-existing `cpu_kv_authoritative`.
+    pub(super) fn f32_history_addressable(&self, last_layer: usize, position: usize) -> bool {
+        if position == 0 {
+            return true;
+        }
+        if self.dtype != KvDtype::F32
+            || position > self.allocated_sequence_length
+            || last_layer >= self.plan.layer_count
+            || self.plan.kv_head_count == 0
+        {
+            return false;
+        }
+        let end =
+            self.offset(last_layer, position - 1, self.plan.kv_head_count - 1) + self.plan.head_dim;
+        self.keys.len() >= end && self.values.len() >= end
+    }
+
     pub(super) fn offset(&self, layer_idx: usize, position: usize, kv_head: usize) -> usize {
         match self.layout {
             KvLayout::PositionMajor => {
