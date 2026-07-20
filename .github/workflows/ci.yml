@@ -290,6 +290,12 @@ jobs:
       - name: Frontend model-lanes smoke
         run: npm run smoke:model-lanes
 
+      - name: Frontend catalog activation smoke
+        run: npm run smoke:catalog-activation
+
+      - name: Frontend model deletion smoke
+        run: npm run smoke:model-deletion
+
       - name: Frontend 3B exact-row closure smoke
         run: npm run smoke:3b-closure
 

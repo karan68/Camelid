@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     extract::{rejection::JsonRejection, Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
@@ -20,6 +20,8 @@ use minijinja::{
     UndefinedBehavior,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
@@ -103,6 +105,19 @@ pub struct AppState {
     active_model_id: Arc<RwLock<Option<String>>>,
     model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
+    /// Shared leases cover every local GGUF reader and download transition;
+    /// deletion takes the exclusive lease before re-validating file identity.
+    model_file_lifecycle: Arc<RwLock<()>>,
+    /// Serializes load publication and unload teardown. File readers use the
+    /// lifecycle lock separately so generation can continue concurrently.
+    model_transition: Arc<tokio::sync::Mutex<()>>,
+    /// Per-process nonce makes scan-issued deletion tokens opaque and prevents
+    /// clients from constructing authorization from visible file metadata.
+    #[cfg(windows)]
+    model_delete_nonce: Arc<str>,
+    /// Destructive local-file management is available only when the listener
+    /// itself is bound to loopback.
+    allow_local_model_delete: bool,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     /// The engine worker: the single thread where decode compute and
     /// resident-GPU-state mutations execute (see api/engine.rs). This
@@ -139,6 +154,11 @@ impl Default for AppState {
             active_model_id: Arc::new(RwLock::new(None)),
             model_last_used: Arc::new(RwLock::new(HashMap::new())),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
+            model_file_lifecycle: Arc::new(RwLock::new(())),
+            model_transition: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(windows)]
+            model_delete_nonce: Arc::from(uuid::Uuid::new_v4().to_string()),
+            allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             engine: engine::EngineHandle::spawn(),
             planner_env: PlannerEnv::capture(),
@@ -163,6 +183,11 @@ impl AppState {
     /// is silent.
     pub fn with_default_enable_thinking(mut self, default_enable_thinking: bool) -> Self {
         self.default_enable_thinking = default_enable_thinking;
+        self
+    }
+
+    fn with_local_model_delete(mut self, allow: bool) -> Self {
+        self.allow_local_model_delete = allow;
         self
     }
 
@@ -1410,6 +1435,9 @@ fn generation_cancelled_response(generated_tokens: usize) -> Box<Response> {
 }
 
 struct PreparedGeneration {
+    /// Prevent unload or deletion while preparation/decode owns file-backed
+    /// model state. Test-only synthetic generations do not need a lease.
+    _model_file_lease: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     model_id: String,
     model_path: PathBuf,
     token_ids: Vec<u32>,
@@ -1812,12 +1840,17 @@ pub fn router_with_state(state: AppState) -> Router {
             get(generation_sessions).post(create_generation_session),
         )
         .route("/api/models/local", get(local_models))
+        .route("/api/models/local/delete", post(delete_local_model))
         .route("/api/models/runnable-receipt", get(runnable_receipt))
         .route("/api/models/runnable-smoke", post(run_runnable_smoke))
         .route("/api/models/catalog", get(get_catalog))
         .route("/api/models/catalog/install", post(install_catalog_model))
         .route("/api/models/catalog/downloads", get(get_catalog_downloads))
         .route("/api/models/catalog/cancel", post(cancel_catalog_download))
+        .route(
+            "/api/models/catalog/ack",
+            post(acknowledge_catalog_download),
+        )
         .route("/v1/models", get(v1_models))
         .route("/v1/models/:model", get(v1_model))
         .route("/v1/completions", post(completions))
@@ -1846,6 +1879,7 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let state = AppState::with_configured_threads(configured_threads)
         .with_default_enable_thinking(default_enable_thinking)
+        .with_local_model_delete(addr.ip().is_loopback())
         .with_models_dir(models_dir);
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
@@ -4325,10 +4359,13 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
     // fall through to the load, where VramShortfall/KvCache remain the hard net.
     let guard_path = path.clone();
-    if let Ok(Some(resp)) =
-        tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path)).await
     {
-        return resp;
+        let _reader = state.model_file_lifecycle.read().await;
+        if let Ok(Some(resp)) =
+            tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path)).await
+        {
+            return resp;
+        }
     }
     match load_model_from_path(&state, path, req.id).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
@@ -4388,6 +4425,7 @@ async fn inspect_model(
     State(state): State<AppState>,
     Json(req): Json<InspectModelRequest>,
 ) -> Response {
+    let _reader = state.model_file_lifecycle.read().await;
     // Same request-path resolution as the load endpoints, so inspect and load
     // agree about which file a relative path names.
     let req = match resolve_request_model_path(&state.models_dir, req.path) {
@@ -6685,6 +6723,8 @@ async fn load_model_from_path_with_activation(
     id: Option<String>,
     set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
+    let _transition = state.model_transition.lock().await;
+    let _reader = state.model_file_lifecycle.read().await;
     // Every load funnels through here, so resolve relative paths against the
     // configured models dir at this one chokepoint (absolute paths and
     // CWD-relative hits pass through untouched — see resolve_request_model_path).
@@ -6912,6 +6952,8 @@ async fn unload_model(
     State(state): State<AppState>,
     payload: Option<Json<UnloadModelRequest>>,
 ) -> Response {
+    let _transition = state.model_transition.lock().await;
+    let _exclusive = state.model_file_lifecycle.write().await;
     let model_id = if let Some(Json(req)) = payload {
         req.id
     } else {
@@ -9176,6 +9218,9 @@ async fn prepare_generation(
     let logit_diagnostic_token_ids =
         diagnostic_logit_token_ids(req.camelid_logit_token_ids.as_deref())
             .map_err(|response| *response)?;
+    let collect_dense_diagnostics = req.camelid_dense_diagnostics.unwrap_or(false)
+        || req.camelid_dense_diagnostic_generated_index.is_some();
+    let speculative_mode = spec_decode_mode_from_env();
     if requested_max_tokens == Some(0) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -9214,6 +9259,30 @@ async fn prepare_generation(
         Ok(m) => m,
         Err(res) => return Err(res),
     };
+    let draft_may_be_used = speculative_mode == Some(SpecDecodeMode::DraftModel)
+        && sampling == SamplingConfig::default()
+        && !collect_dense_diagnostics
+        && logit_diagnostic_token_ids.is_empty();
+    if draft_may_be_used {
+        ensure_spec_draft_model_loaded(state).await?;
+    }
+
+    let model_file_lease = state.model_file_lifecycle.clone().read_owned().await;
+    let model = {
+        let loaded = state.loaded_models.read().await;
+        loaded
+            .get(&model.id)
+            .filter(|current| current.path == model.path)
+            .cloned()
+    }
+    .ok_or_else(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "model_transitioned",
+            "the model was unloaded while generation was preparing; retry the request".to_string(),
+            Some("model"),
+        )
+    })?;
 
     let mut timings = GenerationTimings::default();
     let tokenization_started = Instant::now();
@@ -9463,12 +9532,10 @@ async fn prepare_generation(
         }
     }
 
-    let collect_dense_diagnostics = req.camelid_dense_diagnostics.unwrap_or(false)
-        || req.camelid_dense_diagnostic_generated_index.is_some();
     // Lossless greedy speculation is a server-level opt-in and only engages
     // for plain greedy requests with no per-step logit consumers; anything
     // else keeps the unchanged vanilla decode loop.
-    let speculative = match spec_decode_mode_from_env() {
+    let speculative = match speculative_mode {
         None => None,
         Some(_)
             if sampling != SamplingConfig::default()
@@ -9526,6 +9593,7 @@ async fn prepare_generation(
         req.completion_logprobs.map(|n| n as usize)
     };
     Ok(PreparedGeneration {
+        _model_file_lease: Some(model_file_lease),
         model_id: model.id,
         model_path: model.path,
         token_ids,
@@ -9555,6 +9623,39 @@ async fn prepare_generation(
 /// it the active model) and fail closed unless its token mapping is
 /// identical to the target's â€” drafted token ids must mean the same text in
 /// the target vocabulary.
+async fn ensure_spec_draft_model_loaded(state: &AppState) -> std::result::Result<(), Response> {
+    let Some(path) = env::var_os(SPEC_DRAFT_MODEL_ENV).map(PathBuf::from) else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "spec_draft_model_missing",
+            format!(
+                "{SPEC_DECODE_ENV}=draft requires {SPEC_DRAFT_MODEL_ENV} to point at a draft model GGUF"
+            ),
+            None,
+        ));
+    };
+    let already_loaded = state
+        .loaded_models
+        .read()
+        .await
+        .get(SPEC_DRAFT_MODEL_ID)
+        .is_some_and(|model| model.path == path);
+    if already_loaded {
+        return Ok(());
+    }
+    load_model_from_path_with_activation(state, path, Some(SPEC_DRAFT_MODEL_ID.to_string()), false)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "spec_draft_model_load_failed",
+                err.to_string(),
+                None,
+            )
+        })
+}
+
 async fn build_model_drafter(
     state: &AppState,
     target: &LoadedModel,
@@ -9578,24 +9679,15 @@ async fn build_model_drafter(
             .filter(|model| model.path == path)
             .cloned()
     };
-    let draft_model = match existing {
-        Some(model) => model,
-        None => load_model_from_path_with_activation(
-            state,
-            path,
-            Some(SPEC_DRAFT_MODEL_ID.to_string()),
-            false,
+    let draft_model = existing.ok_or_else(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "spec_draft_model_transitioned",
+            "the speculative draft model was unloaded while generation was preparing; retry the request"
+                .to_string(),
+            None,
         )
-        .await
-        .map_err(|err| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "spec_draft_model_load_failed",
-                err.to_string(),
-                None,
-            )
-        })?,
-    };
+    })?;
     let Some(draft_tokenizer) = draft_model.tokenizer_runtime.as_deref() else {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -13362,7 +13454,7 @@ mod tests {
         request_b_error: Option<String>,
     }
 
-    fn orphan_test_prepared(model: &str) -> PreparedGeneration {
+    pub(super) fn orphan_test_prepared(model: &str) -> PreparedGeneration {
         let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
         let mut prepared = prepared_for_cache("tiny", model, vec![1, 2], session);
         // The shared test tokenizer has an empty vocab, which fails the decode-
@@ -17003,6 +17095,7 @@ mod tests {
         session: LlamaInferenceSession,
     ) -> PreparedGeneration {
         PreparedGeneration {
+            _model_file_lease: None,
             model_id: model_id.to_string(),
             model_path: PathBuf::from(model_path),
             token_ids,
@@ -17724,6 +17817,11 @@ pub struct CatalogQuery {
 pub struct LocalModelEntry {
     pub filename: String,
     pub size_bytes: u64,
+    /// Opaque, process-bound authorization for deleting this exact unchanged
+    /// directory entry. Clients must return it verbatim; metadata alone is not
+    /// sufficient to authorize a destructive operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_token: Option<String>,
     pub architecture: Option<String>,
     /// Headline (dominant non-F32) quant, e.g. `Q8_0`.
     pub quantization: Option<String>,
@@ -17764,6 +17862,448 @@ pub struct LocalModelsResponse {
     pub models: Vec<LocalModelEntry>,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalModelFileIdentity {
+    size_bytes: u64,
+    modified_nanos: u128,
+    delete_token: Option<String>,
+}
+
+fn validate_local_model_filename(filename: &str) -> bool {
+    let path = std::path::Path::new(filename);
+    filename == filename.trim()
+        && !filename.is_empty()
+        && !filename.contains(['/', '\\', ':'])
+        && matches!(
+            (path.components().next(), path.components().nth(1)),
+            (Some(std::path::Component::Normal(_)), None)
+        )
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+#[cfg(windows)]
+fn local_model_delete_token(
+    nonce: &str,
+    filename: &str,
+    size_bytes: u64,
+    modified_nanos: u128,
+    platform_id: &str,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"camelid.local-model-delete/v1\0");
+    hash.update(nonce.as_bytes());
+    hash.update(b"\0");
+    hash.update(filename.as_bytes());
+    hash.update(b"\0");
+    hash.update(size_bytes.to_le_bytes());
+    hash.update(modified_nanos.to_le_bytes());
+    hash.update(platform_id.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+#[cfg(windows)]
+struct LocalModelWindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for LocalModelWindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_local_model_windows(
+    path: &std::path::Path,
+    exclusive_delete: bool,
+) -> std::io::Result<LocalModelWindowsHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        },
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let share_mode = if exclusive_delete {
+        FILE_SHARE_READ
+    } else {
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    };
+    let desired_access = if exclusive_delete {
+        DELETE | FILE_READ_ATTRIBUTES
+    } else {
+        FILE_READ_ATTRIBUTES
+    };
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            desired_access,
+            share_mode,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(LocalModelWindowsHandle(handle))
+    }
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    filename: &str,
+    nonce: &str,
+) -> std::io::Result<Option<LocalModelFileIdentity>> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    if unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Ok(None);
+    }
+    let size_bytes = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
+    let modified_nanos = (((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | info.ftLastWriteTime.dwLowDateTime as u64) as u128
+        * 100;
+    let platform_id = format!(
+        "windows:{}:{}:{}:{}",
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow, info.nNumberOfLinks
+    );
+    let delete_token = (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && info.nNumberOfLinks == 1)
+        .then(|| {
+            local_model_delete_token(nonce, filename, size_bytes, modified_nanos, &platform_id)
+        });
+    Ok(Some(LocalModelFileIdentity {
+        size_bytes,
+        modified_nanos,
+        delete_token,
+    }))
+}
+
+#[cfg(windows)]
+fn local_model_file_identity(
+    models_dir: &std::path::Path,
+    filename: &str,
+    nonce: &str,
+) -> std::io::Result<Option<LocalModelFileIdentity>> {
+    if !validate_local_model_filename(filename) {
+        return Ok(None);
+    }
+    let handle = open_local_model_windows(&models_dir.join(filename), false)?;
+    windows_handle_identity(handle.0, filename, nonce)
+}
+
+#[cfg(windows)]
+#[derive(Debug, serde::Deserialize)]
+struct DeleteLocalModelRequest {
+    filename: String,
+    delete_token: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, serde::Serialize)]
+struct DeleteLocalModelResponse {
+    deleted: bool,
+    filename: String,
+    bytes_freed: u64,
+}
+
+#[cfg(windows)]
+fn local_management_request_allowed(headers: &HeaderMap) -> bool {
+    let authority = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<axum::http::uri::Authority>().ok());
+    let Some(authority) = authority else {
+        return false;
+    };
+    let host = authority.host().trim_matches(['[', ']']);
+    let host_is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !host_is_loopback {
+        return false;
+    }
+
+    let origin = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<axum::http::Uri>().ok());
+    if let Some(ref origin) = origin {
+        if !matches!(origin.scheme_str(), Some("http") | Some("https")) {
+            return false;
+        }
+        if origin.authority() != Some(&authority) {
+            return false;
+        }
+    }
+    origin.is_some()
+        || headers
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            == Some("same-origin")
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum DeleteLocalModelError {
+    Io(std::io::Error),
+    Busy(std::io::Error),
+    Changed,
+    Unsafe,
+}
+
+#[cfg(windows)]
+fn classify_delete_io(err: std::io::Error) -> DeleteLocalModelError {
+    match err.raw_os_error() {
+        Some(32 | 33) => DeleteLocalModelError::Busy(err),
+        _ => DeleteLocalModelError::Io(err),
+    }
+}
+
+#[cfg(windows)]
+fn delete_identity_bound_local_model(
+    path: &std::path::Path,
+    filename: &str,
+    nonce: &str,
+    expected_token: &str,
+) -> Result<u64, DeleteLocalModelError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    let handle = open_local_model_windows(path, true).map_err(classify_delete_io)?;
+    let identity = windows_handle_identity(handle.0, filename, nonce)
+        .map_err(DeleteLocalModelError::Io)?
+        .ok_or(DeleteLocalModelError::Unsafe)?;
+    if identity.delete_token.as_deref() != Some(expected_token) {
+        return Err(DeleteLocalModelError::Changed);
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    if unsafe {
+        SetFileInformationByHandle(
+            handle.0,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(classify_delete_io(std::io::Error::last_os_error()));
+    }
+    Ok(identity.size_bytes)
+}
+
+#[cfg(not(windows))]
+async fn delete_local_model(
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
+    Json(_req): Json<serde_json::Value>,
+) -> Response {
+    api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "model_delete_unsupported",
+        "identity-bound model deletion is not available on this platform".to_string(),
+        None,
+    )
+}
+
+#[cfg(windows)]
+async fn delete_local_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteLocalModelRequest>,
+) -> Response {
+    if !state.allow_local_model_delete || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "model deletion is available only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    if !validate_local_model_filename(&req.filename) || req.delete_token.len() != 64 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_model_identity",
+            "delete requires one scanned local GGUF filename and its opaque identity token"
+                .to_string(),
+            Some("filename"),
+        );
+    }
+
+    let _transition = state.model_transition.lock().await;
+    let _exclusive = match state.model_file_lifecycle.try_write() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                "Wait for the current model operation to finish before deleting files.".to_string(),
+                Some("filename"),
+            )
+        }
+    };
+    if !state.loaded_models.read().await.is_empty() || state.active_model_id.read().await.is_some()
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_in_use",
+            "Unload the current model before deleting any model from disk.".to_string(),
+            Some("filename"),
+        );
+    }
+    if active_downloads_map()
+        .lock()
+        .unwrap()
+        .values()
+        .any(|download| download.status == "downloading")
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_download_in_progress",
+            "Cancel or finish active model downloads before deleting files.".to_string(),
+            Some("filename"),
+        );
+    }
+
+    let identity = match local_model_file_identity(
+        &state.models_dir,
+        &req.filename,
+        &state.model_delete_nonce,
+    ) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "unsafe_model_file",
+                "the target is not the regular local GGUF returned by the latest scan".to_string(),
+                Some("filename"),
+            )
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("{} is no longer present", req.filename),
+                Some("filename"),
+            )
+        }
+        Err(err) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model_identity_failed",
+                format!("could not verify {}: {err}", req.filename),
+                Some("filename"),
+            )
+        }
+    };
+    if identity.delete_token.as_deref() != Some(req.delete_token.as_str()) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_changed",
+            "the model changed after confirmation; refresh Models and try again".to_string(),
+            Some("delete_token"),
+        );
+    }
+
+    let path = state.models_dir.join(&req.filename);
+    let filename = req.filename.clone();
+    let filename_for_delete = filename.clone();
+    let nonce = state.model_delete_nonce.clone();
+    let expected_token = req.delete_token.clone();
+    let deletion = tokio::task::spawn_blocking(move || {
+        delete_identity_bound_local_model(&path, &filename_for_delete, &nonce, &expected_token)
+            .map(|bytes| (filename_for_delete, bytes))
+    })
+    .await;
+    let (filename, bytes_freed) = match deletion {
+        Ok(Ok(result)) => result,
+        Ok(Err(DeleteLocalModelError::Changed)) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "model_changed",
+                "the model changed before deletion; refresh Models and try again".to_string(),
+                Some("delete_token"),
+            )
+        }
+        Ok(Err(DeleteLocalModelError::Unsafe)) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "unsafe_model_file",
+                "the target is a link, reparse point, directory, or hard-linked file".to_string(),
+                Some("filename"),
+            )
+        }
+        Ok(Err(DeleteLocalModelError::Busy(err))) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "model_in_use",
+                format!("could not delete {filename} because the file is in use: {err}"),
+                Some("filename"),
+            )
+        }
+        Ok(Err(DeleteLocalModelError::Io(err))) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model_delete_failed",
+                format!("could not delete {filename}: {err}"),
+                Some("filename"),
+            )
+        }
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model_delete_failed",
+                format!("model deletion task failed for {filename}"),
+                Some("filename"),
+            )
+        }
+    };
+
+    local_meta_cache().lock().unwrap().remove(&filename);
+    let _ = std::fs::remove_file(runnable_smoke_receipt_path(&filename));
+    eprintln!(
+        "[models] deleted local GGUF {:?} ({} bytes, identity {}…)",
+        filename,
+        bytes_freed,
+        &req.delete_token[..12]
+    );
+    (
+        StatusCode::OK,
+        Json(DeleteLocalModelResponse {
+            deleted: true,
+            filename,
+            bytes_freed,
+        }),
+    )
+        .into_response()
+}
+
 /// Cached metadata-derived facts for one local model, keyed by (mtime, size) so a
 /// re-download invalidates it. Parsing a GGUF's tensor index is slow for big models
 /// (the 16 GB MoE alone is seconds), and this endpoint is polled â€” so we re-parse
@@ -17802,14 +18342,24 @@ fn runnable_smoke_receipt_path(filename: &str) -> PathBuf {
 /// `GET /api/models/local` â€” enumerate `<models_dir>/*.gguf` with per-model lane
 /// facts. Membership is derived downstream from these facts; nothing here is
 /// hand-authored.
-async fn local_models(State(state): State<AppState>) -> Json<LocalModelsResponse> {
+async fn local_models(
+    State(state): State<AppState>,
+    _headers: HeaderMap,
+) -> Json<LocalModelsResponse> {
+    let _reader = state.model_file_lifecycle.read().await;
+    #[cfg(windows)]
+    let expose_delete_tokens =
+        state.allow_local_model_delete && local_management_request_allowed(&_headers);
     let dir = state.models_dir.clone();
     let mut models = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let mut paths: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == "gguf").unwrap_or(false))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            })
             .collect();
         paths.sort();
         for path in paths {
@@ -17817,14 +18367,57 @@ async fn local_models(State(state): State<AppState>) -> Json<LocalModelsResponse
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let fs_meta = std::fs::metadata(&path).ok();
-            let size_bytes = fs_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime_secs = fs_meta
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => {
+                    tracing::warn!(%filename, "skipping non-file local GGUF entry");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(%filename, error = %err, "could not inspect local GGUF metadata");
+                    continue;
+                }
+            };
+            #[cfg(windows)]
+            let identity = match local_model_file_identity(
+                &dir,
+                &filename,
+                &state.model_delete_nonce,
+            ) {
+                Ok(identity) => identity,
+                Err(err) => {
+                    tracing::warn!(%filename, error = %err, "could not inspect local GGUF identity");
+                    None
+                }
+            };
+            #[cfg(windows)]
+            let delete_token = identity
                 .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .and_then(|identity| expose_delete_tokens.then(|| identity.delete_token.clone()))
+                .flatten();
+            #[cfg(not(windows))]
+            let delete_token = None;
+            #[cfg(windows)]
+            let deletable_identity = identity
+                .as_ref()
+                .filter(|identity| identity.delete_token.is_some());
+            #[cfg(windows)]
+            let size_bytes =
+                deletable_identity.map_or_else(|| metadata.len(), |identity| identity.size_bytes);
+            #[cfg(not(windows))]
+            let size_bytes = metadata.len();
+            let metadata_mtime_secs = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            #[cfg(windows)]
+            let mtime_secs = deletable_identity.map_or(metadata_mtime_secs, |identity| {
+                (identity.modified_nanos / 1_000_000_000) as u64
+            });
+            #[cfg(not(windows))]
+            let mtime_secs = metadata_mtime_secs;
 
             // Reuse cached metadata facts when the file is unchanged; only the cheap
             // receipt-present check (which a smoke run can flip) is always live.
@@ -17894,6 +18487,7 @@ async fn local_models(State(state): State<AppState>) -> Json<LocalModelsResponse
                 runnable_receipt_present: runnable_smoke_receipt_path(&filename).exists(),
                 filename,
                 size_bytes,
+                delete_token,
                 architecture: meta.architecture,
                 quantization: meta.quantization,
                 tokenizer_kind: meta.tokenizer_kind,
@@ -17990,30 +18584,35 @@ async fn run_runnable_smoke(
         );
     }
     let path_str = path.to_string_lossy().to_string();
-    let result = tokio::task::spawn_blocking(move || crate::runnable::smoke_admit(&path_str)).await;
-    match result {
-        Ok(Ok(report)) => {
-            let out = runnable_smoke_receipt_path(&filename);
-            if let Some(parent) = out.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(json) = serde_json::to_string_pretty(&report.receipt) {
-                let _ = std::fs::write(&out, json);
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "passed": true,
-                    "architecture": report.architecture,
-                    "quant": report.quant,
-                    "logit_min": report.logit_min,
-                    "logit_max": report.logit_max,
-                    "generated_text": report.generated_text,
-                    "receipt": report.receipt,
-                })),
-            )
-                .into_response()
+    let smoke_filename = filename.clone();
+    let reader = state.model_file_lifecycle.clone().read_owned().await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _reader = reader;
+        let report = crate::runnable::smoke_admit(&path_str)?;
+        let out = runnable_smoke_receipt_path(&smoke_filename);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        if let Ok(json) = serde_json::to_string_pretty(&report.receipt) {
+            let _ = std::fs::write(&out, json);
+        }
+        Ok::<_, BackendError>(report)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "passed": true,
+                "architecture": report.architecture,
+                "quant": report.quant,
+                "logit_min": report.logit_min,
+                "logit_max": report.logit_max,
+                "generated_text": report.generated_text,
+                "receipt": report.receipt,
+            })),
+        )
+            .into_response(),
         Ok(Err(err)) => api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "smoke_admission_failed",
@@ -18230,11 +18829,14 @@ pub struct ActiveDownload {
     pub id: String,
     pub repo_id: String,
     pub filename: String,
+    pub continuation_mode: String,
     pub total_bytes: u64,
     pub bytes_downloaded: u64,
     pub status: &'static str,
     #[serde(skip)]
     pub child_pid: Option<u32>,
+    #[serde(skip)]
+    pub finished_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -18243,21 +18845,95 @@ pub struct InstallCatalogRequest {
     pub repo_id: String,
     pub filename: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub continuation_mode: Option<String>,
 }
 
 static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashMap<String, ActiveDownload>>> = OnceLock::new();
+const TERMINAL_DOWNLOAD_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 fn active_downloads_map() -> &'static Mutex<HashMap<String, ActiveDownload>> {
     ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn download_destination_key(filename: &str) -> String {
+    #[cfg(windows)]
+    {
+        filename.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        filename.to_string()
+    }
 }
 
 async fn install_catalog_model(
     State(state): State<AppState>,
     Json(req): Json<InstallCatalogRequest>,
 ) -> Response {
+    let _reader = state.model_file_lifecycle.read().await;
+    if !validate_local_model_filename(&req.filename) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_filename",
+            "catalog filename must be one bare .gguf name".to_string(),
+            Some("filename"),
+        );
+    }
+    let continuation_mode = match req.continuation_mode.as_deref().unwrap_or("download") {
+        mode @ ("download" | "smoke" | "start") => mode.to_string(),
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_continuation_mode",
+                "continuation_mode must be download, smoke, or start".to_string(),
+                Some("continuation_mode"),
+            )
+        }
+    };
     let mut map = active_downloads_map().lock().unwrap();
-    if map.contains_key(&req.catalog_id) {
-        return (StatusCode::BAD_REQUEST, "Download already running").into_response();
+    if map
+        .get(&req.catalog_id)
+        .is_some_and(|existing| existing.status != "downloading")
+    {
+        map.remove(&req.catalog_id);
+    }
+    if let Some(existing) = map.get(&req.catalog_id) {
+        if existing.repo_id != req.repo_id || existing.filename != req.filename {
+            return api_error(
+                StatusCode::CONFLICT,
+                "download_identity_conflict",
+                "this catalog id is already downloading a different artifact".to_string(),
+                Some("catalog_id"),
+            );
+        }
+        if existing.continuation_mode != continuation_mode {
+            return api_error(
+                StatusCode::CONFLICT,
+                "download_continuation_conflict",
+                "this catalog download is already running with a different continuation"
+                    .to_string(),
+                Some("continuation_mode"),
+            );
+        }
+        return api_error(
+            StatusCode::CONFLICT,
+            "download_already_running",
+            "this catalog download is already running".to_string(),
+            Some("catalog_id"),
+        );
+    }
+    let destination_key = download_destination_key(&req.filename);
+    if map.values().any(|download| {
+        download.status == "downloading"
+            && download_destination_key(&download.filename) == destination_key
+    }) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "download_destination_busy",
+            "another download is already writing this model filename".to_string(),
+            Some("filename"),
+        );
     }
 
     // Download into the configured models dir — the same directory the
@@ -18316,16 +18992,19 @@ async fn install_catalog_model(
                 id: req.catalog_id.clone(),
                 repo_id: req.repo_id.clone(),
                 filename: req.filename.clone(),
+                continuation_mode,
                 total_bytes: req.size_bytes,
                 bytes_downloaded: 0,
                 status: "downloading",
                 child_pid: Some(pid),
+                finished_at: None,
             };
             map.insert(req.catalog_id.clone(), download);
 
             let catalog_id_clone = req.catalog_id.clone();
             let part_path_clone = part_path.clone();
             let dest_path_clone = dest_path.clone();
+            let lifecycle = state.model_file_lifecycle.clone();
             tokio::spawn(async move {
                 let mut child = child;
                 let succeeded = matches!(child.wait(), Ok(status) if status.success());
@@ -18334,6 +19013,7 @@ async fn install_catalog_model(
                 // is held across the promote decision so a cancel cannot race the
                 // rename: cancel removes the entry, and an untracked (canceled)
                 // download must never promote, whatever curl's exit code says.
+                let _reader = lifecycle.read().await;
                 let mut map = active_downloads_map().lock().unwrap();
                 let still_tracked = map.contains_key(&catalog_id_clone);
                 let status = finalize_download_artifact(
@@ -18344,6 +19024,7 @@ async fn install_catalog_model(
                 );
                 if let Some(dl) = map.get_mut(&catalog_id_clone) {
                     dl.status = status;
+                    dl.finished_at = Some(std::time::Instant::now());
                 }
             });
 
@@ -18362,7 +19043,12 @@ async fn get_catalog_downloads(State(state): State<AppState>) -> Json<Vec<Active
     let mut to_remove = Vec::new();
     for (id, dl) in map.iter_mut() {
         if dl.status == "completed" || dl.status == "failed" {
-            to_remove.push(id.clone());
+            if dl
+                .finished_at
+                .is_some_and(|finished| finished.elapsed() >= TERMINAL_DOWNLOAD_RETENTION)
+            {
+                to_remove.push(id.clone());
+            }
             continue;
         }
 
@@ -18439,6 +19125,17 @@ pub struct CancelDownloadRequest {
 
 async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Response {
     let mut map = active_downloads_map().lock().unwrap();
+    if map
+        .get(&req.id)
+        .is_some_and(|download| download.status != "downloading")
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "download_already_completed",
+            "the download has already finished and cannot be canceled".to_string(),
+            Some("id"),
+        );
+    }
     if let Some(dl) = map.remove(&req.id) {
         if let Some(pid) = dl.child_pid {
             kill_download_process(pid);
@@ -18450,6 +19147,506 @@ async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Resp
         (StatusCode::OK, "Download canceled").into_response()
     } else {
         (StatusCode::NOT_FOUND, "Download not found").into_response()
+    }
+}
+
+async fn acknowledge_catalog_download(
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
+    Json(req): Json<CancelDownloadRequest>,
+) -> Response {
+    let mut map = active_downloads_map().lock().unwrap();
+    if map
+        .get(&req.id)
+        .is_some_and(|download| download.status == "downloading")
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "download_still_running",
+            "the download cannot be acknowledged before it finishes".to_string(),
+            Some("id"),
+        );
+    }
+    map.remove(&req.id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(all(test, windows))]
+mod local_model_delete_tests {
+    use super::{active_downloads_map, router_with_state, ActiveDownload, AppState};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        Router,
+    };
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    static DELETE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn management_authorization_requires_exact_loopback_origin() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", "127.0.0.1:8181".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(super::local_management_request_allowed(&headers));
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", "127.0.0.1:8181".parse().unwrap());
+        headers.insert("origin", "http://127.0.0.1:8181".parse().unwrap());
+        assert!(super::local_management_request_allowed(&headers));
+        headers.insert("origin", "http://127.0.0.1:4177".parse().unwrap());
+        assert!(!super::local_management_request_allowed(&headers));
+        headers.insert("origin", "http://[::1]:8181".parse().unwrap());
+        headers.insert("host", "[::1]:8181".parse().unwrap());
+        assert!(super::local_management_request_allowed(&headers));
+        headers.insert("host", "127.0.0.1:8181".parse().unwrap());
+        headers.insert("origin", "https://example.com".parse().unwrap());
+        assert!(!super::local_management_request_allowed(&headers));
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(!super::local_management_request_allowed(&headers));
+        headers.insert("origin", "http://127.0.0.1:4177".parse().unwrap());
+        headers.insert("host", "attacker.example:8181".parse().unwrap());
+        assert!(!super::local_management_request_allowed(&headers));
+        headers.clear();
+        assert!(!super::local_management_request_allowed(&headers));
+    }
+
+    async fn request(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1:8181")
+            .header("sec-fetch-site", "same-origin");
+        let request_body = match body {
+            Some(value) => {
+                builder = builder
+                    .header("content-type", "application/json")
+                    .header("sec-fetch-site", "same-origin");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = app
+            .oneshot(builder.body(request_body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    fn state_for(dir: &std::path::Path) -> AppState {
+        AppState {
+            models_dir: dir.to_path_buf(),
+            allow_local_model_delete: true,
+            ..AppState::default()
+        }
+    }
+
+    async fn scanned_token(app: Router, filename: &str) -> String {
+        let (status, listing) = request(app, "GET", "/api/models/local", None).await;
+        assert_eq!(status, StatusCode::OK);
+        listing["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["filename"] == filename)
+            .and_then(|entry| entry["delete_token"].as_str())
+            .expect("scan-issued delete token")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn endpoint_deletes_only_the_identity_bound_sibling() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.gguf");
+        let sibling = temp.path().join("sibling.gguf");
+        std::fs::write(&target, b"target bytes").unwrap();
+        std::fs::write(&sibling, b"sibling bytes").unwrap();
+        let app = router_with_state(state_for(temp.path()));
+        let token = scanned_token(app.clone(), "target.gguf").await;
+
+        let (status, body) = request(
+            app,
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "target.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["bytes_freed"], 12);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(sibling).unwrap(), b"sibling bytes");
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_a_stale_token_after_file_replacement() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("replace.gguf");
+        std::fs::write(&target, b"first identity").unwrap();
+        let app = router_with_state(state_for(temp.path()));
+        let token = scanned_token(app.clone(), "replace.gguf").await;
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, b"other identity").unwrap();
+
+        let (status, body) = request(
+            app,
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "replace.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "model_changed");
+        assert!(target.exists());
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_traversal_loaded_state_and_active_downloads() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("guarded.gguf");
+        std::fs::write(&target, b"guarded bytes").unwrap();
+        let state = state_for(temp.path());
+        let app = router_with_state(state.clone());
+        let token = scanned_token(app.clone(), "guarded.gguf").await;
+
+        let (status, _) = request(
+            app.clone(),
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "../guarded.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        *state.active_model_id.write().await = Some("active-model".to_string());
+        let token = scanned_token(app.clone(), "guarded.gguf").await;
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "guarded.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "model_in_use");
+        *state.active_model_id.write().await = None;
+
+        let download_id = format!("delete-test-{}", uuid::Uuid::new_v4());
+        active_downloads_map().lock().unwrap().insert(
+            download_id.clone(),
+            ActiveDownload {
+                id: download_id.clone(),
+                repo_id: "test/repo".to_string(),
+                filename: "other.gguf".to_string(),
+                continuation_mode: "download".to_string(),
+                total_bytes: 1,
+                bytes_downloaded: 0,
+                status: "downloading",
+                child_pid: None,
+                finished_at: None,
+            },
+        );
+        let token = scanned_token(app.clone(), "guarded.gguf").await;
+        let (status, body) = request(
+            app,
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "guarded.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        active_downloads_map().lock().unwrap().remove(&download_id);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "model_download_in_progress");
+        assert!(target.exists());
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_while_file_readers_are_active_then_allows_retry() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("leased.gguf");
+        std::fs::write(&target, b"leased bytes").unwrap();
+        let state = state_for(temp.path());
+        let app = router_with_state(state.clone());
+        let token = scanned_token(app.clone(), "leased.gguf").await;
+        let reader = state.model_file_lifecycle.read().await;
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "leased.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "model_operation_in_progress");
+        assert!(target.exists());
+        drop(reader);
+
+        let token = scanned_token(app.clone(), "leased.gguf").await;
+        let (status, _) = request(
+            app,
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "leased.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn prepared_generation_lease_blocks_deletion_until_dropped() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("generating.gguf");
+        std::fs::write(&target, b"generation bytes").unwrap();
+        let state = state_for(temp.path());
+        let app = router_with_state(state.clone());
+        let token = scanned_token(app.clone(), "generating.gguf").await;
+        let lease = state.model_file_lifecycle.clone().read_owned().await;
+        let mut prepared = super::tests::orphan_test_prepared("generating.gguf");
+        prepared._model_file_lease = Some(lease);
+
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "generating.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "model_operation_in_progress");
+        assert!(target.exists());
+
+        drop(prepared);
+        let token = scanned_token(app.clone(), "generating.gguf").await;
+        let (status, _) = request(
+            app,
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "generating.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_missing_same_origin_or_non_loopback_capability() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("auth.gguf");
+        std::fs::write(&target, b"auth bytes").unwrap();
+        let allowed_state = state_for(temp.path());
+        let app = router_with_state(allowed_state.clone());
+        let token = scanned_token(app.clone(), "auth.gguf").await;
+        let request_without_origin = Request::builder()
+            .method("POST")
+            .uri("/api/models/local/delete")
+            .header("host", "127.0.0.1:8181")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "filename": "auth.gguf",
+                    "delete_token": token,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request_without_origin).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(target.exists());
+
+        let mut disabled_state = allowed_state;
+        disabled_state.allow_local_model_delete = false;
+        let token = super::local_model_file_identity(
+            temp.path(),
+            "auth.gguf",
+            &disabled_state.model_delete_nonce,
+        )
+        .unwrap()
+        .unwrap()
+        .delete_token
+        .unwrap();
+        let (status, body) = request(
+            router_with_state(disabled_state),
+            "POST",
+            "/api/models/local/delete",
+            Some(serde_json::json!({
+                "filename": "auth.gguf",
+                "delete_token": token,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "local_management_forbidden");
+        assert!(target.exists());
+    }
+
+    #[tokio::test]
+    async fn scan_lists_hardlinked_models_without_deletion_tokens() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("hardlink.gguf");
+        let sibling = temp.path().join("alias.gguf");
+        std::fs::write(&target, b"shared bytes").unwrap();
+        std::fs::hard_link(&target, &sibling).unwrap();
+        let (status, listing) = request(
+            router_with_state(state_for(temp.path())),
+            "GET",
+            "/api/models/local",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let models = listing["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models
+            .iter()
+            .all(|entry| entry.get("delete_token").is_none()));
+        assert!(target.exists());
+        assert!(sibling.exists());
+    }
+
+    #[tokio::test]
+    async fn scan_includes_uppercase_gguf_extensions() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("UPPER.GGUF"), b"uppercase bytes").unwrap();
+        let token = scanned_token(router_with_state(state_for(temp.path())), "UPPER.GGUF").await;
+        assert_eq!(token.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn scan_withholds_delete_tokens_from_cross_origin_clients() {
+        let _test = DELETE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("private.gguf"), b"private bytes").unwrap();
+        let app = router_with_state(state_for(temp.path()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/models/local")
+                    .header("host", "127.0.0.1:8181")
+                    .header("origin", "http://127.0.0.1:4177")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listing: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(listing["models"][0].get("delete_token").is_none());
+        assert!(temp.path().join("private.gguf").exists());
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod non_windows_model_delete_tests {
+    use super::{router_with_state, AppState};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn scan_omits_tokens_and_delete_reports_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("model.gguf"), b"fixture").unwrap();
+        let state = AppState {
+            models_dir: temp.path().to_path_buf(),
+            allow_local_model_delete: true,
+            ..AppState::default()
+        };
+        let app = router_with_state(state);
+
+        let listing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/models/local")
+                    .header("host", "127.0.0.1:8181")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listing.status(), StatusCode::OK);
+        let listing: serde_json::Value =
+            serde_json::from_slice(&to_bytes(listing.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(listing["models"][0].get("delete_token").is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/models/local/delete")
+                    .header("host", "127.0.0.1:8181")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "filename": "model.gguf",
+                            "delete_token": "0".repeat(64),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "model_delete_unsupported");
+        assert!(temp.path().join("model.gguf").exists());
     }
 }
 
@@ -18680,7 +19877,38 @@ mod catalog_fit_tests {
 
 #[cfg(test)]
 mod download_cancel_tests {
-    use super::{finalize_download_artifact, kill_download_process};
+    use super::{
+        active_downloads_map, download_destination_key, finalize_download_artifact,
+        kill_download_process, router_with_state, ActiveDownload, AppState,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    static DOWNLOAD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn request(
+        app: axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(value) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = app.oneshot(builder.body(body).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
 
     fn temp_paths(tag: &str) -> (String, String) {
         let dir =
@@ -18732,6 +19960,109 @@ mod download_cancel_tests {
         assert_eq!(status, "failed");
         assert!(!std::path::Path::new(&part).exists());
         assert!(!std::path::Path::new(&dest).exists());
+    }
+
+    #[test]
+    fn destination_reservation_uses_platform_filename_semantics() {
+        #[cfg(windows)]
+        assert_eq!(
+            download_destination_key("Model.GGUF"),
+            download_destination_key("model.gguf")
+        );
+        #[cfg(not(windows))]
+        assert_ne!(
+            download_destination_key("Model.GGUF"),
+            download_destination_key("model.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_downloads_remain_visible_until_acknowledged() {
+        let _test = DOWNLOAD_TEST_LOCK.lock().await;
+        let id = format!("terminal-test-{}", uuid::Uuid::new_v4());
+        let mut terminal = ActiveDownload {
+            id: id.clone(),
+            repo_id: "test/repo".to_string(),
+            filename: "terminal.gguf".to_string(),
+            continuation_mode: "start".to_string(),
+            total_bytes: 10,
+            bytes_downloaded: 10,
+            status: "downloading",
+            child_pid: None,
+            finished_at: Some(std::time::Instant::now()),
+        };
+        terminal.status = "completed";
+        active_downloads_map()
+            .lock()
+            .unwrap()
+            .insert(id.clone(), terminal);
+        let app = router_with_state(AppState::default());
+
+        for _ in 0..2 {
+            let (status, body) =
+                request(app.clone(), "GET", "/api/models/catalog/downloads", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|download| download["id"] == id));
+        }
+
+        let (status, _) = request(
+            app.clone(),
+            "POST",
+            "/api/models/catalog/ack",
+            Some(serde_json::json!({ "id": id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = request(app, "GET", "/api/models/catalog/downloads", None).await;
+        assert!(!body
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|download| download["id"] == id));
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_rejects_active_downloads_and_is_idempotent_when_missing() {
+        let _test = DOWNLOAD_TEST_LOCK.lock().await;
+        let id = format!("active-test-{}", uuid::Uuid::new_v4());
+        active_downloads_map().lock().unwrap().insert(
+            id.clone(),
+            ActiveDownload {
+                id: id.clone(),
+                repo_id: "test/repo".to_string(),
+                filename: "active.gguf".to_string(),
+                continuation_mode: "download".to_string(),
+                total_bytes: 10,
+                bytes_downloaded: 1,
+                status: "downloading",
+                child_pid: None,
+                finished_at: None,
+            },
+        );
+        let app = router_with_state(AppState::default());
+        let (status, body) = request(
+            app.clone(),
+            "POST",
+            "/api/models/catalog/ack",
+            Some(serde_json::json!({ "id": id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "download_still_running");
+        active_downloads_map().lock().unwrap().remove(&id);
+
+        let (status, _) = request(
+            app,
+            "POST",
+            "/api/models/catalog/ack",
+            Some(serde_json::json!({ "id": id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[test]

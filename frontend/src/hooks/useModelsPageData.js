@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { localModelDeleteRequest } from '../lib/modelDeletion'
 
 /* Single data spine for the Models page. Owns fetch + refresh for the three
    backend truths the page renders from — /api/models/local (disk scan with lane
@@ -30,18 +31,49 @@ export function useModelsPageData({ apiBase = '' } = {}) {
 
   const idleTicksRef = useRef(0)
   const prevDownloadIdsRef = useRef(new Set())
+  const refreshLocalPromiseRef = useRef(null)
+  const localRequestSequenceRef = useRef(0)
+  const localAppliedSequenceRef = useRef(0)
+  const localRequestsPendingRef = useRef({ base, count: 0 })
+  const baseRef = useRef(base)
+  baseRef.current = base
 
-  const refreshLocal = useCallback(async () => {
-    setLocalLoading(true)
-    setLocalError('')
+  const refreshLocal = useCallback(async ({ force = false } = {}) => {
+    if (!force && refreshLocalPromiseRef.current?.base === base) return refreshLocalPromiseRef.current.promise
+    const sequence = ++localRequestSequenceRef.current
+    if (force) localAppliedSequenceRef.current = sequence
+    const request = (async () => {
+      if (localRequestsPendingRef.current.base !== base) {
+        localRequestsPendingRef.current = { base, count: 0 }
+      }
+      localRequestsPendingRef.current.count += 1
+      setLocalLoading(true)
+      setLocalError('')
+      try {
+        const res = await fetch(`${base}/api/models/local`)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const next = await res.json()
+        if (baseRef.current === base && sequence >= localAppliedSequenceRef.current) {
+          localAppliedSequenceRef.current = sequence
+          setLocal(next)
+        }
+        return next
+      } catch (err) {
+        if (baseRef.current === base) setLocalError(String(err?.message || err))
+        return null
+      } finally {
+        if (localRequestsPendingRef.current.base === base) {
+          localRequestsPendingRef.current.count -= 1
+          if (localRequestsPendingRef.current.count === 0) setLocalLoading(false)
+        }
+      }
+    })()
+    const trackedRequest = { base, promise: request }
+    refreshLocalPromiseRef.current = trackedRequest
     try {
-      const res = await fetch(`${base}/api/models/local`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setLocal(await res.json())
-    } catch (err) {
-      setLocalError(String(err?.message || err))
+      return await request
     } finally {
-      setLocalLoading(false)
+      if (refreshLocalPromiseRef.current === trackedRequest) refreshLocalPromiseRef.current = null
     }
   }, [base])
 
@@ -49,12 +81,16 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     try {
       const res = await fetch(`${base}/api/models/current`)
       if (!res.ok) {
-        setCurrent(null)
-        return
+        if (baseRef.current === base) setCurrent(null)
+        return null
       }
-      setCurrent(await res.json())
+      const next = await res.json()
+      if (baseRef.current !== base) return null
+      setCurrent(next)
+      return next
     } catch {
-      setCurrent(null)
+      if (baseRef.current === base) setCurrent(null)
+      return null
     }
   }, [base])
 
@@ -63,6 +99,7 @@ export function useModelsPageData({ apiBase = '' } = {}) {
       const res = await fetch(`${base}/api/models/catalog/downloads`)
       if (!res.ok) return null
       const list = await res.json()
+      if (baseRef.current !== base) return null
       setDownloads(Array.isArray(list) ? list : [])
       return Array.isArray(list) ? list : []
     } catch {
@@ -90,14 +127,55 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     [base, refreshDownloads, refreshLocal],
   )
 
+  const deleteLocalModel = useCallback(
+    async (entry) => {
+      const payload = localModelDeleteRequest(entry)
+      if (!payload) throw new Error('Refresh Models before deleting this file.')
+      const res = await fetch(`${base}/api/models/local/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        await Promise.all([
+          refreshLocal({ force: true }),
+          refreshCurrent(),
+          refreshDownloads(),
+        ])
+        const error = new Error(body?.error?.message || `delete failed (HTTP ${res.status})`)
+        error.code = body?.error?.code || 'model_delete_failed'
+        throw error
+      }
+      const verified = await refreshLocal({ force: true })
+      if (!verified) {
+        setLocal((current) => current
+          ? { ...current, models: current.models.filter((model) => model.filename !== entry.filename) }
+          : current)
+      }
+      return body
+    },
+    [base, refreshCurrent, refreshDownloads, refreshLocal],
+  )
+
   const refreshAll = useCallback(async () => {
     await Promise.all([refreshLocal(), refreshCurrent(), refreshDownloads()])
   }, [refreshLocal, refreshCurrent, refreshDownloads])
 
   useEffect(() => {
+    setLocal(null)
+    setCurrent(null)
+    setDownloads([])
+    setLocalLoading(false)
+    refreshLocalPromiseRef.current = null
+    localRequestsPendingRef.current = { base, count: 0 }
+    localRequestSequenceRef.current += 1
+    localAppliedSequenceRef.current = localRequestSequenceRef.current
+    idleTicksRef.current = 0
+    setPolling(true)
     refreshLocal()
     refreshCurrent()
-  }, [refreshLocal, refreshCurrent])
+  }, [base, refreshLocal, refreshCurrent])
 
   useEffect(() => {
     if (!polling) return undefined
@@ -146,5 +224,6 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     refreshAll,
     kickDownloadsPoll,
     cancelDownload,
+    deleteLocalModel,
   }
 }
