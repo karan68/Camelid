@@ -1118,6 +1118,19 @@ enum Command {
         #[arg(long, default_value_t = false)]
         evict_page_cache: bool,
     },
+    /// Verify one exact GGUF by replaying a built-in, reference-anchored,
+    /// deterministic request. Emits a digest-sealed report. A pass proves one
+    /// request for one exact file; it is not a broad support claim.
+    Verify {
+        /// GGUF model path. Verification abstains when no exact-hash profile exists.
+        model: PathBuf,
+        /// Report output path. Defaults to `<model-stem>.verify.json`.
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Override Rayon worker threads for the deterministic replay.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// Verify a parity receipt: self-digest, lane identity, an in-process
     /// Camelid re-run, and a llama.cpp reference re-run. A verified receipt
     /// proves one request matched the reference for one exact GGUF; it does
@@ -2346,6 +2359,31 @@ async fn main() -> anyhow::Result<()> {
                 draft_len,
                 evict_page_cache,
             )?;
+        }
+        Command::Verify {
+            model,
+            output,
+            threads,
+        } => {
+            configure_rayon_threads(threads)?;
+            let report = camelid::verify::run(&model, threads)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let output = output.unwrap_or_else(|| camelid::verify::default_report_path(&model));
+            camelid::verify::write_report(&output, &report).map_err(anyhow::Error::msg)?;
+            println!(
+                "{} model={} report_id={} output={}",
+                match report.outcome {
+                    camelid::verify::VerificationOutcome::Verified => "VERIFIED",
+                    camelid::verify::VerificationOutcome::NotVerified => "NOT VERIFIED",
+                    camelid::verify::VerificationOutcome::NoProfile => "NO PROFILE",
+                },
+                report.model.gguf_filename,
+                report.report_id,
+                output.display()
+            );
+            println!("{}", report.detail);
+            std::process::exit(report.outcome.exit_code());
         }
         Command::VerifyReceipt {
             receipt,

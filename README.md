@@ -369,6 +369,14 @@ camelid verify-receipt receipt.json --gguf path/to/exact-model.Q8_0.gguf
 
 The verifier recomputes the receipt's digest, confirms your GGUF is the named file, replays the request through Camelid, and re-runs it through llama.cpp — in two isolated passes so each model loads within one model's memory footprint, which lets a 7B receipt verify on a 16 GB Mac. Receipts exist only for deterministic (greedy) runs; sampled runs are stamped `reproducible: false`. **A receipt verifies a single request; it does not change the release ledger or promote any lane.** Details in [`RECEIPTS.md`](RECEIPTS.md).
 
+For an exact GGUF with a built-in reference-anchored profile, run the local known-answer check directly:
+
+```bash
+camelid verify path/to/exact-model.Q8_0.gguf
+```
+
+This emits a digest-sealed `camelid.verify-report/v1` file and exits nonzero on mismatch or when Camelid has no profile for those exact model bytes. While serving, `GET /api/models/verify` reports eligibility and the latest in-memory result for the active model; `POST /api/models/verify` runs the same pinned request through the already-loaded model. The Models screen exposes that action and result. **Verified means one pinned deterministic request matched for one exact GGUF. It is not a digital signature, broad model certification, support promotion, or performance claim.**
+
 To measure *any* local runtime — not only Camelid — by determinism, cross-runtime agreement, tokenizer parity, and provability on the same model bytes, see the [conformance suite](docs/CONFORMANCE.md).
 
 ---

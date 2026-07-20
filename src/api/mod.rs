@@ -119,6 +119,7 @@ pub struct AppState {
     /// itself is bound to loopback.
     allow_local_model_delete: bool,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
+    verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
     /// The engine worker: the single thread where decode compute and
     /// resident-GPU-state mutations execute (see api/engine.rs). This
     /// replaces the old `generation_lock` — serialization is by construction
@@ -160,6 +161,7 @@ impl Default for AppState {
             model_delete_nonce: Arc::from(uuid::Uuid::new_v4().to_string()),
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
+            verification_reports: Arc::new(RwLock::new(HashMap::new())),
             engine: engine::EngineHandle::spawn(),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
@@ -1807,6 +1809,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/models/inspect", post(inspect_model))
         .route("/api/models/unload", post(unload_model))
         .route("/api/models/current", get(current_model))
+        .route(
+            "/api/models/verify",
+            get(model_verification_status).post(verify_current_model),
+        )
         .route("/api/models/metadata", get(model_metadata))
         .route("/api/models/tokenizer", get(model_tokenizer))
         .route("/api/models/tokenizer/encode", post(tokenizer_encode))
@@ -4178,6 +4184,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
         ],
         api_features: vec![
+            SupportItem {
+                id: "camelid_verify",
+                status: "partial",
+                notes: "CLI `camelid verify <gguf>` plus GET/POST /api/models/verify replay one pinned deterministic request for a built-in exact-GGUF-hash profile and emit a digest-sealed report. The initial profile covers only the tracked Llama 3.2 1B Instruct Q8_0 Windows artifact. A pass proves that one request on those exact bytes; it is not a digital signature, broad certification, support promotion, or performance claim.",
+            },
             SupportItem {
                 id: "openai_chat_completions",
                 status: "supported_current_gate",
@@ -7026,6 +7037,152 @@ async fn current_model(State(state): State<AppState>) -> Response {
     )
 }
 
+#[derive(Debug, Serialize)]
+struct ModelVerificationStatus {
+    model_id: String,
+    gguf_sha256: String,
+    eligible: bool,
+    profile_id: Option<String>,
+    report: Option<crate::verify::VerificationReport>,
+}
+
+async fn active_model_for_verification(state: &AppState) -> Result<LoadedModel, Response> {
+    let Some(active_id) = state.active_model_id.read().await.clone() else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "model_not_loaded",
+            BackendError::ModelNotLoaded.to_string(),
+            None,
+        ));
+    };
+    state
+        .loaded_models
+        .read()
+        .await
+        .get(&active_id)
+        .cloned()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "model_not_loaded",
+                BackendError::ModelNotLoaded.to_string(),
+                None,
+            )
+        })
+}
+
+async fn verification_status_for_model(
+    state: &AppState,
+    model: &LoadedModel,
+) -> Result<ModelVerificationStatus, String> {
+    let profile = crate::verify::profile_for_sha256(&model.lane.gguf_sha256)?;
+    let report = state
+        .verification_reports
+        .read()
+        .await
+        .get(&model.lane.gguf_sha256)
+        .cloned();
+    Ok(ModelVerificationStatus {
+        model_id: model.id.clone(),
+        gguf_sha256: model.lane.gguf_sha256.clone(),
+        eligible: profile.is_some(),
+        profile_id: profile.map(|profile| profile.profile_id),
+        report,
+    })
+}
+
+async fn model_verification_status(State(state): State<AppState>) -> Response {
+    let model = match active_model_for_verification(&state).await {
+        Ok(model) => model,
+        Err(response) => return response,
+    };
+    match verification_status_for_model(&state, &model).await {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(err) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "verification_profile_invalid",
+            err,
+            None,
+        ),
+    }
+}
+
+async fn verify_current_model(State(state): State<AppState>) -> Response {
+    let model = match active_model_for_verification(&state).await {
+        Ok(model) => model,
+        Err(response) => return response,
+    };
+    let profile = match crate::verify::profile_for_sha256(&model.lane.gguf_sha256) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "verification_profile_unavailable",
+                "no built-in verification profile matches the active model's exact GGUF hash"
+                    .to_string(),
+                Some("model"),
+            )
+        }
+        Err(err) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verification_profile_invalid",
+                err,
+                None,
+            )
+        }
+    };
+    let replay = match replay_loaded_receipt_request(&state, &model.id, &profile.request).await {
+        Ok(replay) => replay,
+        Err(err) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verification_replay_failed",
+                err,
+                None,
+            )
+        }
+    };
+    let active_id = state.active_model_id.read().await.clone();
+    let active_hash = match active_id.as_deref() {
+        Some(id) if id == model.id => state
+            .loaded_models
+            .read()
+            .await
+            .get(id)
+            .map(|loaded| loaded.lane.gguf_sha256.clone()),
+        _ => None,
+    };
+    if replay.lane.gguf_sha256 != profile.model.gguf_sha256
+        || active_hash.as_deref() != Some(profile.model.gguf_sha256.as_str())
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_changed_during_verification",
+            "the active model changed while verification was running; no result was stored"
+                .to_string(),
+            Some("model"),
+        );
+    }
+    let report = match crate::verify::evaluate(&profile, &replay.result) {
+        Ok(report) => report,
+        Err(err) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verification_report_failed",
+                err.to_string(),
+                None,
+            )
+        }
+    };
+    state
+        .verification_reports
+        .write()
+        .await
+        .insert(model.lane.gguf_sha256.clone(), report.clone());
+    (StatusCode::OK, Json(report)).into_response()
+}
+
 async fn model_metadata(State(state): State<AppState>) -> Response {
     let active_id = state.active_model_id.read().await;
     if let Some(id) = active_id.as_ref() {
@@ -8755,6 +8912,21 @@ pub async fn replay_receipt_request(
     let loaded = load_model_from_path(&state, gguf_path.to_path_buf(), None)
         .await
         .map_err(|err| format!("model load failed: {err}"))?;
+    replay_loaded_receipt_request(&state, &loaded.id, request).await
+}
+
+async fn replay_loaded_receipt_request(
+    state: &AppState,
+    model_id: &str,
+    request: &receipt::ReceiptRequest,
+) -> std::result::Result<ReceiptReplay, String> {
+    let loaded = state
+        .loaded_models
+        .read()
+        .await
+        .get(model_id)
+        .cloned()
+        .ok_or_else(|| BackendError::ModelNotLoaded.to_string())?;
     let is_chat = request.endpoint.contains("chat");
     let (prompt, messages) = if is_chat {
         let messages: Vec<ChatMessage> = serde_json::from_value(request.messages_or_prompt.clone())
@@ -8816,11 +8988,11 @@ pub async fn replay_receipt_request(
     // prepare_generation serializes via its own engine job. The replay decode
     // itself now runs as an engine job too — closing the pre-inversion hole
     // where a receipt replay decoded UNLOCKED next to a live request.
-    let prepared = match prepare_generation(&state, session_request).await {
+    let prepared = match prepare_generation(state, session_request).await {
         Ok(prepared) => prepared,
         Err(response) => return Err(response_error_text(response).await),
     };
-    let generated = match generate_decoded_tokens_blocking(&state, prepared).await {
+    let generated = match generate_decoded_tokens_blocking(state, prepared).await {
         Ok(generated) => generated,
         Err(response) => return Err(response_error_text(*response).await),
     };

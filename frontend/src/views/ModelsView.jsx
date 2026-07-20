@@ -47,6 +47,9 @@ export default function ModelsView({
   const [smokeBusy, setSmokeBusy] = useState({})
   const [usingFilename, setUsingFilename] = useState('')
   const [unloading, setUnloading] = useState(false)
+  const [verification, setVerification] = useState(null)
+  const [verificationBusy, setVerificationBusy] = useState(false)
+  const verificationRequestRef = useRef(0)
   // Typed fail-closed blocker from a pre-load inspect ({ code, message }), shown
   // verbatim instead of attempting a multi-GB load that cannot run.
   const [blocker, setBlocker] = useState(null)
@@ -175,6 +178,40 @@ export default function ModelsView({
       await spine.refreshCurrent()
     } finally {
       setUnloading(false)
+    }
+  }
+
+  const refreshVerification = async () => {
+    const requestId = ++verificationRequestRef.current
+    if (!spine.activeFilename) {
+      setVerification(null)
+      return
+    }
+    try {
+      const res = await fetch(`${spine.base}/api/models/verify`)
+      const next = res.ok ? await res.json() : null
+      if (requestId === verificationRequestRef.current) setVerification(next)
+    } catch {
+      if (requestId === verificationRequestRef.current) setVerification(null)
+    }
+  }
+
+  useEffect(() => {
+    refreshVerification()
+  }, [spine.activeFilename, spine.base])
+
+  const runVerification = async () => {
+    setVerificationBusy(true)
+    setLaneError('')
+    try {
+      const res = await fetch(`${spine.base}/api/models/verify`, { method: 'POST' })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(body?.error?.message || `verification failed (HTTP ${res.status})`)
+      await refreshVerification()
+    } catch (err) {
+      setLaneError(String(err?.message || err))
+    } finally {
+      setVerificationBusy(false)
     }
   }
 
@@ -329,7 +366,11 @@ export default function ModelsView({
         activeFilename={spine.activeFilename}
         activeEntry={activeEntry}
         capabilities={capabilities}
-        busy={unloading || Boolean(loadingModelId)}
+        busy={unloading || verificationBusy || Boolean(loadingModelId)}
+        unloading={unloading}
+        verification={verification}
+        verificationBusy={verificationBusy}
+        onVerify={runVerification}
         onUnload={handleUnload}
       />
       {laneError ? <p className="lane-error">{laneError}</p> : null}

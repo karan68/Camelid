@@ -33,6 +33,7 @@ pub mod runnable;
 pub mod telemetry;
 pub mod tensor;
 pub mod tokenizer;
+pub mod verify;
 pub mod web_ui;
 pub mod wire_mmap;
 

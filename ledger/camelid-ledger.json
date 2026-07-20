@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "1182947",
+    "source_head": "8f02e5e",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -128,6 +128,11 @@
       }
     ],
     "api_features": [
+      {
+        "id": "camelid_verify",
+        "status": "partial",
+        "notes": "CLI `camelid verify <gguf>` plus GET/POST /api/models/verify replay one pinned deterministic request for a built-in exact-GGUF-hash profile and emit a digest-sealed report. The initial profile covers only the tracked Llama 3.2 1B Instruct Q8_0 Windows artifact. A pass proves that one request on those exact bytes; it is not a digital signature, broad certification, support promotion, or performance claim."
+      },
       {
         "id": "openai_chat_completions",
         "status": "supported_current_gate",
