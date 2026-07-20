@@ -93,10 +93,26 @@ thread 'main' panicked at src/inference/metal_resident.rs:213:69:
 range end index 128 out of range for slice of length 0
 ```
 
-That is the KV-seeding loop (now `metal_resident.rs:212-228`), reached with an empty CPU KV cache.
-**Not reproduced**: all three 3B columns ran to completion past that point on this build. Cause
-remains unidentified, so this is recorded as *not observed*, not *fixed*. If it reappears in a
-later phase, this is the signature to match.
+**Not reproduced** — all three 3B columns ran past that point. The mechanism has since been
+identified, and the bug is **real and still present on main**; Phase 0 simply cannot reach it.
+
+`rollback_resident_to_position` (`src/inference.rs:2084-2096`) resets the resident engine's
+`filled` under `#[cfg(feature = "cuda")]` **only** — there is no Metal branch. On macOS it lowers
+`kv_cache.position` while leaving `resident_decode.filled()` stale, which trips
+`rebuild = s.filled() != position` (`metal_resident.rs:191-193`), enters the seeding loop at `:211`
+(`if position > 0`), and indexes `self.kv_cache.keys[src..src + head_dim]` at `:221` while `keys`
+is still zero-length (`KvCache::keys` starts `Vec::new()`, grown only by
+`ensure_position_capacity`). The `128` in the message is `head_dim` — it identifies the model
+(3B and Qwen3 = 128, 1B = 64), **not** the mechanism.
+
+Reachability: the sole caller is `ModelDrafter::draft` (`src/inference/speculative.rs:199`),
+constructed only for `--drafter draft` **without** `--cpu-draft`. The `--drafter ngram` path cannot
+reach it — its CPU fallback runs `forward_greedy_verify_chunk` → `ensure_position_capacity`, which
+allocates `keys`. **The defect is config-dependent, not model-size-dependent**, and the 1B-vs-3B
+framing of the original report was a red herring.
+
+It sits in the `--drafter draft` lane, which conductor §1 puts out of scope, so it is **not fixed
+here** (§10.6 — do not move the denominator mid-campaign). Tracked separately.
 
 ---
 
@@ -159,6 +175,22 @@ tree lane through `bench-speculative` with the conductor's env block. Phase 0 st
 `MODEL=` override of it; the conductor treats it as 1B-only.
 
 **A9 — T4 resolved by retirement.** See §5.
+
+**A10 — `--model` does not exist on `bench-speculative`.** The GGUF is a bare **positional**
+(`src/main.rs`, `Command::BenchSpeculative { model: PathBuf, .. }`). The conductor's §2.1 command
+block is correct on this point; noted because sibling harnesses in the repo use `--model` for
+`serve` and the two are easy to conflate.
+
+**A11 — set `CAMELID_COMMIT`.** The record's `commit` field is
+`std::env::var("CAMELID_COMMIT").unwrap_or("unknown")`. Phase 0's records all read `"unknown"`.
+Every measured run from Phase 1 on exports `CAMELID_COMMIT=$(git rev-parse --short HEAD)` so the
+record is self-identifying independent of the receipt wrapper.
+
+**A12 — the failed-verify-attempt charge is intentional.** With `CAMELID_SPEC_CPU_VERIFY=0`, a
+round whose tree verify declines charges `verify_us` at the fall-through site for the wasted
+verify attempt, then charges `normal_step_us` for the plain step that replaces it. That is correct
+accounting — the wasted attempt *is* speculation overhead — but it means `verify_ms` on a
+high-miss run is not purely successful-verify time. Read it alongside `rounds` and `normal_steps`.
 
 ---
 
