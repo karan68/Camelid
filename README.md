@@ -118,6 +118,12 @@ network stays off unless you pass `--allow-net`. Tool results are treated as unt
 only models the compatibility ledger marks `tool_capable` are eligible (promoted only after a
 `camelid agent-eval` PASS). Treat it as a preview and review every requested action.
 
+**Workspace (preview).** Choose one local directory and ask follow-up questions across a durable
+conversation. Workspace can only list, read, and search within that canonical root; writes, shell,
+network, GUI control, and subagents are unavailable. File inventories are grounded in observed
+directory entries, and reversible compaction keeps long threads within an exact context budget.
+Workspace requires a loaded exact model row that has earned `tool_capable: true`.
+
 ## Call the API
 
 The served model id comes from the GGUF's `general.name`. Run `GET /v1/models` to read the exact
