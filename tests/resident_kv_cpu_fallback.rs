@@ -213,3 +213,98 @@ fn cpu_fallback_mid_sequence_preserves_the_resident_kv_history() {
         );
     }
 }
+
+/// Greedy generation on the GPU-resident lane, but at `FALLBACK_AT` the next token is produced by
+/// the SPECULATIVE CPU verify path (`forward_greedy_verify_chunk`, a one-token batch) instead of a
+/// resident decode step. Returns `None` if the resident lane was never actually taken.
+///
+/// That path is the THIRD CPU KV-history reader (alongside `forward_layer_range_from_hidden` and
+/// `forward_single_token_timed_internal`). Before its guard it attended over `[0, position)`
+/// without mirroring the resident KV back, so on a hollow CPU cache it read a zero-filled prefix —
+/// and its batch write then advanced the materialized-through watermark ACROSS the unwritten gap,
+/// so the NEXT resident step's reseed (which trusts the watermark) copied those zeros onto the GPU
+/// and made the corruption permanent. In production this path is reached under `CAMELID_SPEC_GPU=1`
+/// when `verify_drafts_gpu` declines (an offloaded engine, or a multi-session same-model collision);
+/// the test drives it directly, which covers the recovery the same way regardless of how it is
+/// reached.
+fn resident_run_verify_chunk(model: &Model, force_verify_chunk: bool) -> Option<Vec<u32>> {
+    let mut s = session(model);
+
+    // Produce the whole history on the resident lane so the CPU KV buffers stay empty — the state
+    // the bug needs.
+    let (&first, rest) = model.prompt.split_first().expect("non-empty prompt");
+    let mut next = s.generate_next_token_greedy_resident(first).ok()??.0;
+    for &tok in rest {
+        next = s.generate_next_token_greedy_resident(tok).ok()??.0;
+    }
+
+    // Same load-bearing precondition as the single-token regression: a hollow CPU history is what
+    // makes the verify chunk's read observable. If the prompt materialized the CPU buffers this
+    // run would pass even with the guard reverted.
+    assert!(
+        !s.cpu_kv_authoritative(),
+        "the resident prompt left the CPU KV cache authoritative, so this run cannot prove \
+         anything about a hollow GPU-only history"
+    );
+
+    let mut out = Vec::with_capacity(GENERATE);
+    for i in 0..GENERATE {
+        out.push(next);
+        let fed = next;
+        next = if force_verify_chunk && i == FALLBACK_AT {
+            // One token off the resident lane, through the speculative CPU verify chunk. A batch of
+            // exactly the fed token appends one position and predicts the token after it — the same
+            // net effect as a decode step, but computed on the CPU path that reads `[0, position)`.
+            let (predictions, _timings) = s
+                .forward_greedy_verify_chunk(&[fed])
+                .expect("verify chunk forward");
+            assert_eq!(
+                predictions.len(),
+                1,
+                "a one-token chunk yields one prediction"
+            );
+            predictions[0]
+        } else {
+            match s.generate_next_token_greedy_resident(fed) {
+                Ok(Some((id, _))) => id,
+                Ok(None) => panic!("resident lane declined unexpectedly at generated token {i}"),
+                Err(e) => panic!("resident generation step {i} failed: {e}"),
+            }
+        };
+    }
+    Some(out)
+}
+
+#[test]
+fn speculative_verify_chunk_preserves_the_resident_kv_history() {
+    let Some(model) = load() else {
+        eprintln!(
+            "SKIP verify-chunk resident KV regression: set CAMELID_RESIDENT_KV_FALLBACK_GGUF"
+        );
+        return;
+    };
+    // Same lane opt-in as the sibling test: inert on a CUDA host (default-on), required on Metal.
+    std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+
+    let Some(clean) = resident_run_verify_chunk(&model, false) else {
+        eprintln!(
+            "SKIP verify-chunk resident KV regression: resident lane unavailable on this host"
+        );
+        return;
+    };
+    eprintln!("resident, no verify-chunk : {clean:?}");
+
+    let with_chunk = resident_run_verify_chunk(&model, true)
+        .expect("the resident lane was available for the control run, so it must be here too");
+    eprintln!("resident, one verify-chunk: {with_chunk:?}");
+
+    // THE assertion. One speculative CPU verify chunk in the middle of a resident sequence must be
+    // transparent. Pre-guard this fails hard: the chunk attends over a zeroed prefix, then the next
+    // resident reseed copies those zeros onto the GPU, so the tail is unrelated text.
+    assert_eq!(
+        with_chunk, clean,
+        "one speculative CPU verify chunk changed the output — forward_greedy_verify_chunk read a \
+         hollow GPU-only KV history (the CPU cache holds no history for GPU-produced positions), so \
+         it attended over a zeroed prefix and the next resident reseed made it stick"
+    );
+}

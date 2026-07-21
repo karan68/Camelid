@@ -3780,6 +3780,16 @@ impl LlamaInferenceSession {
             )));
         }
 
+        // Guard the third CPU KV-history reader, exactly as the other two CPU forward paths do
+        // (`forward_layer_range_from_hidden`, `forward_single_token_timed_internal`). The layer
+        // loop below attends over `[0, chunk_base_position)`; on a sequence that has been running
+        // on a GPU-resident lane, those rows live only on the device and the CPU buffers are
+        // hollow, so reading them zero-filled corrupts the greedy argmax that decides accepted
+        // drafts — and the batch write then advances the materialized-through watermark ACROSS the
+        // unwritten gap, so a later resident reseed launders the zeros onto the GPU permanently.
+        // Mirror the resident KV back first; a no-op once the cache is already materialized.
+        self.ensure_cpu_kv_materialized()?;
+
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let chunk_base_position = self.kv_cache.position;
         let total_started = Instant::now();
