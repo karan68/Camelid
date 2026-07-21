@@ -13581,6 +13581,16 @@ fn metal_resident_rollback_moves_filled_with_the_kv_position() {
     let Some(mut state) =
         crate::metal::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false)
     else {
+        // No usable Metal lane. This is the ONLY guard for the draft-rollback regression that
+        // needs no model file, so a silent skip here means the regression is unguarded — and
+        // indistinguishable from a pass. Under CAMELID_REQUIRE_METAL_TESTS=1 (set by CI on the
+        // macOS leg once the runner is known to be capable) that is a failure, not a skip.
+        // `metal_lane_capability_probe` in src/metal.rs reports which capability is missing.
+        assert!(
+            std::env::var("CAMELID_REQUIRE_METAL_TESTS").as_deref() != Ok("1"),
+            "CAMELID_REQUIRE_METAL_TESTS=1 but ResidentDecodeState::new returned None — the \
+             draft-rollback regression is UNGUARDED on this runner"
+        );
         return; // no Metal device on this host — nothing to exercise
     };
 

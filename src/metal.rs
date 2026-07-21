@@ -14294,6 +14294,63 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 #[cfg(test)]
 mod tests {
 
+    /// Capability gate for the whole macOS Metal test lane.
+    ///
+    /// 56 device-gated tests in this file open with `if !detect_metal_device().available {
+    /// return; }`, and `metal_resident_rollback_moves_filled_with_the_kv_position`
+    /// (`src/inference/tests.rs`) — the only guard for the draft-rollback regression that needs
+    /// no model file — skips the same way on `ResidentDecodeState::new(..) -> None`. If the host
+    /// reports no device, or reports one whose driver cannot build the resident pipelines, every
+    /// one of them prints `ok` while proving nothing. CI has never measured which case it is on
+    /// `macos-latest`; the workflow comment merely *asserts* the tests self-skip.
+    ///
+    /// This test always PRINTS what the host can do (visible with `--nocapture`; CI runs it as a
+    /// dedicated step) and, under `CAMELID_REQUIRE_METAL_TESTS=1`, turns "no lane" into a hard
+    /// failure. Contributors never set that variable, so a Mac without a usable GPU session — or
+    /// a non-macOS host, where this test does not exist — still passes locally.
+    ///
+    /// Two distinct capabilities are reported, because they fail independently:
+    ///   `available`         — a Metal device exists.
+    ///   `resident_kernels`  — `ResidentDecodeState::new` built its shaders and pipelines, i.e.
+    ///                         the GPU-resident decode lane can actually run here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_lane_capability_probe() {
+        let info = super::detect_metal_device();
+        // Same shape as `tiny_kv_budget_session` (1 layer / 1 head / 1 kv head, dims 32,
+        // kv budget 64), so this reaches the kernel build with every dimension guard
+        // satisfied: `Some(..)` proves device + shader libraries + compute pipelines.
+        let resident = super::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false);
+        let resident_kernels = resident.is_some();
+        eprintln!(
+            "CAMELID_METAL_CAPABILITY available={} resident_kernels={} device={:?} \
+             headless={:?} unified={:?} low_power={:?} note={:?}",
+            info.available,
+            resident_kernels,
+            info.device_name,
+            info.headless,
+            info.has_unified_memory,
+            info.low_power,
+            info.note
+        );
+
+        if std::env::var("CAMELID_REQUIRE_METAL_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(
+            info.available,
+            "CAMELID_REQUIRE_METAL_TESTS=1 but no Metal device is reported — every \
+             device-gated Metal test on this host is a silent no-op"
+        );
+        assert!(
+            resident_kernels,
+            "CAMELID_REQUIRE_METAL_TESTS=1 and a Metal device is present ({:?}), but \
+             ResidentDecodeState::new returned None — the shaders/pipelines could not be \
+             built here, so the GPU-resident lane and its regression tests cannot run",
+            info.device_name
+        );
+    }
+
     /// End-to-end proof for the instant-start lane: Metal can wrap a page-aligned
     /// window of an mmap'd GGUF with newBufferWithBytesNoCopy and the GPU reads the
     /// file's own bytes at per-tensor offsets — no read loop, no conversion, no
