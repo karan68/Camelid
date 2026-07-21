@@ -31,6 +31,15 @@ use std::sync::Arc;
 #[test]
 fn draft_model_rollback_after_rejection_keeps_the_resident_engine_in_sync() {
     let Some(model) = std::env::var_os("CAMELID_DRAFT_ROLLBACK_GGUF").map(PathBuf::from) else {
+        // Skipping is correct for contributors and for CI legs that carry no model files, but a
+        // skip that reports "ok" is indistinguishable from coverage. A job that is CONFIGURED to
+        // prove this fix opts in with CAMELID_REQUIRE_MODEL_TESTS=1 and then cannot silently
+        // degrade to a no-op.
+        assert!(
+            std::env::var("CAMELID_REQUIRE_MODEL_TESTS").as_deref() != Ok("1"),
+            "CAMELID_REQUIRE_MODEL_TESTS=1 but CAMELID_DRAFT_ROLLBACK_GGUF is unset — this job \
+             is configured to prove the draft-rollback fix and cannot"
+        );
         eprintln!("SKIP draft rollback regression: set CAMELID_DRAFT_ROLLBACK_GGUF");
         return;
     };
@@ -65,6 +74,17 @@ fn draft_model_rollback_after_rejection_keeps_the_resident_engine_in_sync() {
     let (_, resident_steps, cpu_steps) = drafter.take_forward_stats();
     let resident_lane = resident_steps > 0;
     eprintln!("round 1: drafts={first:?} resident_steps={resident_steps} cpu_steps={cpu_steps}");
+    // A model WAS supplied, so the caller asked for the resident lane. Falling back to CPU is
+    // not a softer pass — the panic this file guards lives in the resident reseed, so a CPU-only
+    // run proves nothing and every assertion below also holds with the fix reverted. Opt out
+    // explicitly (CAMELID_ALLOW_CPU_LANE=1) if you are deliberately smoke-testing the CPU path.
+    if !resident_lane && std::env::var("CAMELID_ALLOW_CPU_LANE").as_deref() != Ok("1") {
+        panic!(
+            "a model was supplied but the resident lane never engaged (resident_steps=0, \
+             cpu_steps={cpu_steps}) — this run cannot reproduce the pre-fix panic, which lives \
+             in the resident reseed. Set CAMELID_ALLOW_CPU_LANE=1 to accept a CPU-only run."
+        );
+    }
     // LOAD-BEARING PRECONDITION, not a nicety. The pre-fix failure mode is the panic in the
     // round-2 reseed, and that panic needs `kv_cache.keys` to still be EMPTY — i.e. round 1
     // must have stayed entirely on the resident lane. A single CPU-fallback step here calls

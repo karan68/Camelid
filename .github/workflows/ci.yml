@@ -170,7 +170,11 @@ jobs:
       #
       # macos-latest is Apple Silicon, so it compiles and lints the
       # cfg(target_os = "macos") Metal path that ubuntu never sees. The Metal
-      # tests self-skip when no GPU device is reported by the runner.
+      # tests self-skip when no GPU device is reported by the runner — which
+      # means a green macOS leg proves the Metal path COMPILES, not that any of
+      # it RAN. The "Metal lane capability probe" step below prints whether this
+      # runner has a usable device and can build the resident pipelines, so that
+      # is measured rather than assumed.
       # windows-latest (MSVC) is a first-class CPU target: it builds the
       # Windows file-I/O / mmap path (src/platform_fs.rs, the memmap2 wire
       # mapping) and runs the same exact-row gates as the other hosts.
@@ -204,6 +208,17 @@ jobs:
 
       - name: Tests
         run: cargo test --all-targets ${{ matrix.features }}
+
+      # Report, in the log, whether this runner can actually execute the macOS Metal test
+      # lane. 56 device-gated tests in src/metal.rs and the draft-rollback regression guard
+      # in src/inference/tests.rs all self-skip on a host with no usable GPU session, and a
+      # skip is indistinguishable from a pass in the summary above. This step prints the two
+      # capabilities that decide it (`available`, `resident_kernels`) so the assumption is
+      # measured rather than asserted. It does NOT gate the build: once a runner is known to
+      # be capable, set CAMELID_REQUIRE_METAL_TESTS=1 here to make those skips fail-closed.
+      - name: Metal lane capability probe (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --all-targets ${{ matrix.features }} metal_lane_capability_probe -- --nocapture
 
       - name: Docs
         run: cargo doc --no-deps ${{ matrix.features }}
