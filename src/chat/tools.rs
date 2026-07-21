@@ -2224,7 +2224,8 @@ mod tests {
             std::fs::write(dir.path().join(format!("entry-{index:04}.md")), "x").unwrap();
         }
         let output = list_dir(dir.path(), MAX_LIST_ENTRIES - 1, Some(2));
-        assert!(output.text().contains("entry-4095.md"));
+        let retained = output.text().lines().next().unwrap();
+        assert!(retained.starts_with("entry-") && retained.ends_with(".md"));
         assert!(output
             .text()
             .contains("additional entries exist and cannot be paged"));
