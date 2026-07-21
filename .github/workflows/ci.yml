@@ -206,7 +206,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
+      # CAMELID_REQUIRE_METAL_TESTS=1 makes the macOS Metal lane fail-closed: the
+      # device-gated skips (56 in src/metal.rs, plus the draft-rollback regression guard
+      # in src/inference/tests.rs) become hard failures instead of silent passes. Enabled
+      # because the capability probe below MEASURED this runner as capable:
+      #   available=true resident_kernels=true device="Apple Paravirtual device"
+      # If GitHub ever withdraws the paravirtual Metal device, this leg goes red with an
+      # explicit message rather than quietly reverting to proving nothing — which is the
+      # entire point.
       - name: Tests
+        env:
+          CAMELID_REQUIRE_METAL_TESTS: ${{ runner.os == 'macOS' && '1' || '' }}
         run: cargo test --all-targets ${{ matrix.features }}
 
       # Report, in the log, whether this runner can actually execute the macOS Metal test
@@ -214,10 +224,12 @@ jobs:
       # in src/inference/tests.rs all self-skip on a host with no usable GPU session, and a
       # skip is indistinguishable from a pass in the summary above. This step prints the two
       # capabilities that decide it (`available`, `resident_kernels`) so the assumption is
-      # measured rather than asserted. It does NOT gate the build: once a runner is known to
-      # be capable, set CAMELID_REQUIRE_METAL_TESTS=1 here to make those skips fail-closed.
+      # measured rather than asserted, and keeps reporting them on every run so a change in
+      # the runner image is visible in the log rather than inferred from a red build.
       - name: Metal lane capability probe (macOS)
         if: runner.os == 'macOS'
+        env:
+          CAMELID_REQUIRE_METAL_TESTS: '1'
         run: cargo test --all-targets ${{ matrix.features }} metal_lane_capability_probe -- --nocapture
 
       - name: Docs
