@@ -60,5 +60,12 @@ cargo build --release --features cuda --bin camelid
 cargo test --release --features cuda --lib -- --include-ignored q4k q6k tree_verify   # parity gates
 bash qa/speed/residency_check.sh                                                       # 8B-on-6GB residency
 ```
-Harnesses: `qa/speed/{residency_check,spike_speed_ab,tree_verify_check}.sh`,
+Harnesses: `qa/speed/{residency_check,spike_speed_ab}.sh`,
 `{parity_check,ab_summary}.mjs`.
+
+`tree_verify_check.sh` was retired (BARCHAN Phase 0). It drove `bench-generate`, which
+never reads `CAMELID_SPEC_TREE` — the only read site is `generate_run_speculative`
+(`src/main.rs`, reached from `bench-speculative`) — so it silently compared plain decode
+against plain decode and could never have exercised the tree verify. Its intended job is
+done correctly by the tree lane in `qa/speed/spec-verify-parity.sh`, which drives
+`bench-speculative` and gates on `lossless && gpu_verify_rounds > 0`.

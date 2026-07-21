@@ -24,6 +24,15 @@ dead end. **Prefill is compute-bound** → that is the one place a tiled GEMM ca
 
 ## Already-settled negatives (do not re-run)
 
+- **Tree-speculation WIDTH on Apple Silicon (BARCHAN Gate 1, 2026-07-20, M4 / 3B Q8_0):** per-round
+  verify cost is **linear in tree width** (R² = 0.997, N=5) at **38.24 ms per node** against a
+  **35.72 ms** plain decode step — i.e. each verified row costs a full independent decode, and the batched verify amortizes the
+  weight read **not at all**. k=15 vs k=1 = **9.25×** (KILL threshold 3×). Fixed per-round cost
+  (intercept) ≈ 0, so this is NOT KV compaction / rollback / dispatch overhead — the PIVOT
+  hypothesis is refuted too. Widening can never pay; the optimum is the *minimum* width (2 nodes,
+  s_sync ≈ 1.03). Phases 3–4 dropped. Full curve: `BARCHAN_PHASE1_COST_CURVE.md`.
+  Reopening requires first answering "why does one verified row cost a full decode?", which is a
+  Q8 Metal *kernel* question — a lane `METAL_PARITY_RESULT.md` §4 already closed.
 - Gated x86 packed-rows4/GEMM4 SIMD A/B (`CAMELID_X86_Q8_*`): −8…−11%, byte-identical → default-off.
 - VNNI/AVX2/scalar packed-dot matrix: identical-throughput + byte-identical → decode is DRAM-bound.
 - Prefill routing (layer-major, chunk 64/all/lm): <3% noise, parity-identical.

@@ -4131,7 +4131,15 @@ struct SpeculativeRun {
     drafted: u64,
     accepted_drafts: u64,
     draft_us: u128,
+    /// SPECULATIVE VERIFY time only: the batched verify calls (GPU tree, GPU linear, CPU
+    /// chunk) plus failed verify attempts. It must NOT accumulate plain single-token step
+    /// time — those go to `normal_step_us`. Conflating the two made `verify_ms` read as
+    /// ~100% of `spec_decode_ms` and silently charged plain decode to verify overhead
+    /// (BARCHAN Phase 0, amendment A4).
     verify_us: u128,
+    /// Plain single-token step time, for the `normal_steps` below. Kept separate from
+    /// `verify_us` so the per-round verify cost curve is attributable.
+    normal_step_us: u128,
     /// Single-token plain steps taken when the drafter proposed nothing (no n-gram match).
     normal_steps: u64,
     gpu_verify_rounds: u64,
@@ -4210,6 +4218,7 @@ fn generate_run_speculative(
         accepted_drafts: 0,
         draft_us: 0,
         verify_us: 0,
+        normal_step_us: 0,
         normal_steps: 0,
         gpu_verify_rounds: 0,
         cpu_verify_rounds: 0,
@@ -4347,7 +4356,7 @@ fn generate_run_speculative(
                             .next_token_id
                     }
                 };
-                run.verify_us += step_started.elapsed().as_micros();
+                run.normal_step_us += step_started.elapsed().as_micros();
                 run.normal_steps += 1;
                 generated.push(next);
                 history.push(next);
@@ -4506,7 +4515,7 @@ fn generate_run_speculative(
                         .next_token_id
                 }
             };
-            run.verify_us += step_started.elapsed().as_micros();
+            run.normal_step_us += step_started.elapsed().as_micros();
             run.normal_steps += 1;
             generated.push(next);
             history.push(next);
@@ -4544,7 +4553,7 @@ fn generate_run_speculative(
                         .next_token_id
                 }
             };
-            run.verify_us += step_started.elapsed().as_micros();
+            run.normal_step_us += step_started.elapsed().as_micros();
             run.normal_steps += 1;
             generated.push(next);
             history.push(next);
@@ -4641,7 +4650,14 @@ struct BenchSpeculativeRecord {
     accept_rate: f64,
     mean_accepted_tokens_per_round: f64,
     draft_ms: f64,
+    /// SPECULATIVE VERIFY time only — batched verify calls plus failed verify attempts.
+    /// Plain single-token step time is reported separately in `normal_step_ms`; before
+    /// BARCHAN Phase 0 the two were summed here, which made this field read as ~100% of
+    /// `spec_decode_ms` and made any per-round verify cost derived from it wrong.
     verify_ms: f64,
+    /// Plain single-token step time for the `normal_steps` rounds (drafter proposed
+    /// nothing, latch skipped, or the engine was not ready). Not speculation overhead.
+    normal_step_ms: f64,
     /// draft / (draft + verify): the fraction of round time spent drafting. The Phase-4
     /// decision gate turns on this — ~0 for n-gram (nothing to hide with concurrency).
     f_draft: f64,
@@ -4899,6 +4915,7 @@ fn run_bench_speculative(
     };
     let draft_ms = spec.draft_us as f64 / 1000.0;
     let verify_ms = spec.verify_us as f64 / 1000.0;
+    let normal_step_ms = spec.normal_step_us as f64 / 1000.0;
     let f_draft = if draft_ms + verify_ms > 0.0 {
         draft_ms / (draft_ms + verify_ms)
     } else {
@@ -4938,6 +4955,7 @@ fn run_bench_speculative(
         mean_accepted_tokens_per_round,
         draft_ms,
         verify_ms,
+        normal_step_ms,
         f_draft,
         s_sync,
         normal_steps: spec.normal_steps,
