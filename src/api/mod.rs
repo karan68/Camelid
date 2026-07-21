@@ -503,6 +503,9 @@ pub struct ChatCompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Optional hard ceiling for the exact rendered prompt plus generation.
+    /// Workspace sets this private extension; ordinary OpenAI callers omit it.
+    pub camelid_context_budget_tokens: Option<u32>,
     /// Opt-in: attach a parity receipt to the (non-streaming) response. The
     /// receipt is a claim of output for the verifier to check â€” no reference
     /// runs here, so its parity block is emitted as not-compared.
@@ -1009,6 +1012,7 @@ pub struct GenerationSessionRequest {
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    pub camelid_context_budget_tokens: Option<u32>,
     /// Opt-in Qwen3/gemma4 thinking mode: when true the chat renderer emits the
     /// template's thinking generation prompt (the model produces its own
     /// `<think>â€¦</think>` block) instead of the deterministic thinking-disabled
@@ -1857,6 +1861,21 @@ pub fn router_with_state(state: AppState) -> Router {
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
         )
+        .route("/api/generation/preflight", post(preflight_generation))
+        .route(
+            "/api/agent/workspace/models",
+            get(workspace::compatible_models),
+        )
+        .route("/api/agent/workspace/threads", get(workspace::list_threads))
+        .route(
+            "/api/agent/workspace/threads/:id",
+            get(workspace::get_thread).delete(workspace::delete_thread),
+        )
+        .route(
+            "/api/agent/workspace/threads/:id/compact",
+            post(workspace::compact_thread).delete(workspace::undo_thread_compaction),
+        )
+        .route("/api/agent/workspace/browse", get(workspace::browse))
         .route(
             "/api/agent/workspace/sessions",
             post(workspace::create_session),
@@ -1868,6 +1887,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route(
             "/api/agent/workspace/sessions/:id/events",
             get(workspace::session_events),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/messages",
+            post(workspace::send_message),
         )
         .route(
             "/api/agent/workspace/sessions/:id/decisions",
@@ -2598,6 +2621,7 @@ async fn llama_server_completion(
         camelid_prompt_token_ids,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: req.unsupported_fields,
@@ -4226,7 +4250,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "web_workspace",
                 status: "supported_current_gate",
-                notes: "loopback WebUI only: one bounded plan-act-observe session over exactly read_file/list_dir/search/write_file/edit_file inside one canonical workspace root; read-only tools run automatically, every write is approval-gated with the exact target and complete proposed content, SSE disconnect/cancel fails closed, and model load/unload is excluded while active. Available only to supported exact rows with tool_capable=true. Real-model closure: exact Qwen3-4B-Q4_K_M (sha256 7485fe6f...) read/list/search + denied-write + approved-write scenarios and real approval/terminal UI, qa/evidence-bundles/workspace-qwen3-4b-q4km-20260717T165404Z-head-8c2a2b74/. No shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim.",
+                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Available only to supported exact rows with tool_capable=true. The historical Qwen3-4B-Q4_K_M bundle validates the underlying tool-call and sandbox path, but its write scenarios no longer describe the current read-only surface. No write, shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim.",
             },
             SupportItem {
                 id: "stream_options.include_usage",
@@ -7969,6 +7993,20 @@ async fn create_generation_session(
     }
 }
 
+async fn preflight_generation(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<GenerationSessionRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(err) => return malformed_json_error(err),
+    };
+    match validate_generation_request(&state, req).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(response) => response,
+    }
+}
+
 /// Every choice of an n>1 request, prepared upfront (KV caches allocate
 /// lazily, so n prepared sessions cost weights-Arc clones, not n KV buffers),
 /// sharing ONE cancel signal so a dropped handler stops whichever choice is
@@ -8235,6 +8273,7 @@ async fn completions(
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: req.unsupported_fields,
@@ -8628,6 +8667,7 @@ async fn chat_completions(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_context_budget_tokens: req.camelid_context_budget_tokens,
         // An explicit request value always wins; the server-wide default
         // (`serve --enable-thinking`) only fills in when the request is silent.
         camelid_enable_thinking: req
@@ -9030,6 +9070,7 @@ async fn replay_loaded_receipt_request(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: HashMap::new(),
@@ -9404,6 +9445,28 @@ fn binding_runs_on_cpu_wire_only(binding: &LlamaTensorBinding) -> bool {
     crate::inference::q4_k_cpu_block_dot_enabled() && binding_all_resident_quant_linears(binding)
 }
 
+fn enforce_context_budget(
+    prompt_tokens: usize,
+    max_tokens: u32,
+    budget_tokens: u32,
+) -> Result<(), String> {
+    let total = (prompt_tokens as u64).saturating_add(u64::from(max_tokens));
+    if total > u64::from(budget_tokens) {
+        return Err(format!(
+            "exact rendered prompt ({prompt_tokens} tokens) plus generation allowance \
+             ({max_tokens} tokens) exceeds the Workspace context budget ({budget_tokens} tokens)"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    model_id.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crate::Result<u64> {
     // Resident-GPU models load wire-only (packed Q8_0/Q4_K/Q6_K bytes the CUDA engine
     // reads in place) and never materialize the f32 weights this guard sizes. Bypass the
@@ -9433,6 +9496,7 @@ async fn prepare_generation(
     req: GenerationSessionRequest,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
+    let context_budget_tokens = req.camelid_context_budget_tokens;
     let request_tools = req.tools.clone();
     validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
@@ -9674,6 +9738,24 @@ async fn prepare_generation(
             ));
         }
     }
+    if let Some(budget_tokens) = context_budget_tokens {
+        if budget_tokens == 0 {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_context_budget",
+                "camelid_context_budget_tokens must be greater than zero".to_string(),
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+        if let Err(message) = enforce_context_budget(token_ids.len(), max_tokens, budget_tokens) {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "context_budget_exceeded",
+                message,
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+    }
 
     let weight_load_started = Instant::now();
     let cache_hit = state.cached_weights.read().await.contains_key(&model.id);
@@ -9696,14 +9778,8 @@ async fn prepare_generation(
     // Pin the GPU resident-decode engine cache to the model identity (not the
     // per-load weights Arc pointer), so every request for this model reuses the
     // uploaded weights instead of rebuilding the engine each time.
-    let resident_cache_key = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        model.id.hash(&mut hasher);
-        let key = hasher.finish();
-        session.set_resident_cache_key(key);
-        key
-    };
+    let resident_cache_key = model_resident_cache_key(&model.id);
+    session.set_resident_cache_key(resident_cache_key);
     timings.session_create = session_create_started.elapsed().as_millis();
 
     // GPU-runnable tier: an uncurated model whose plan routed it onto the resident path
@@ -15647,6 +15723,14 @@ mod tests {
             estimated
         );
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn context_budget_counts_exact_prompt_and_generation_allowance() {
+        assert!(enforce_context_budget(1_536, 512, 2_048).is_ok());
+        let error = enforce_context_budget(1_537, 512, 2_048).unwrap_err();
+        assert!(error.contains("exact rendered prompt (1537 tokens)"));
+        assert!(error.contains("generation allowance (512 tokens)"));
     }
 
     #[test]

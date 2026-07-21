@@ -48,19 +48,76 @@ pub fn parse(text: &str, family: &str) -> Vec<ToolCall> {
     parse_hermes(text)
 }
 
+/// Parse JSON leniently for model-emitted tool calls. On Windows, models often
+/// place paths like `C:\workspace\docs` or `\\?\C:\x` inside JSON string values without
+/// escaping the backslashes — invalid JSON. When a strict parse fails, repair any
+/// backslash that does not begin a valid JSON escape by doubling it, then retry
+/// once. Returns `None` if it still will not parse.
+fn json_from_str_lenient(s: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(s) {
+        return Some(value);
+    }
+    serde_json::from_str::<Value>(&escape_lone_backslashes(s)).ok()
+}
+
+/// Public wrapper for the structured-`tool_calls` path: parse an arguments string
+/// leniently, defaulting to an empty object.
+pub(crate) fn json_args_lenient(s: &str) -> Value {
+    json_from_str_lenient(s).unwrap_or_else(|| Value::Object(Default::default()))
+}
+
+/// Repair backslashes inside JSON string literals for model tool calls that
+/// failed a strict parse. Because strict parsing already handles fully-valid
+/// escapes, reaching here means the JSON is invalid — overwhelmingly from a
+/// Windows path whose separators were not escaped (`C:\workspace\new` → the `\w`,
+/// `\n` are literal, not escapes). So every backslash is treated as a literal
+/// separator and doubled, EXCEPT an already-escaped quote (`\"`) or an
+/// already-doubled backslash (`\\`), which are kept intact so string boundaries
+/// and valid pairs survive. Turns `"C:\workspace\new"` into the valid
+/// `"C:\\workspace\\new"`; text outside string literals is untouched.
+fn escape_lone_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut in_string = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_string = !in_string;
+                out.push('"');
+            }
+            '\\' if in_string => match chars.peek() {
+                // Escaped quote or already-escaped backslash: keep the pair intact
+                // (consume both) so the string boundary and valid `\\` are preserved.
+                Some('"' | '\\') => {
+                    out.push('\\');
+                    out.push(chars.next().unwrap());
+                }
+                // Any other backslash is a literal Windows separator the model
+                // failed to escape (`\C`, `\a`, `\n`, `\t`, ...): double it.
+                _ => {
+                    out.push('\\');
+                    out.push('\\');
+                }
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// `[TOOL_CALLS] [{"name": …, "arguments": {…}}, …]` (Mistral Instruct v0.3+).
 fn parse_mistral(text: &str) -> Vec<ToolCall> {
     let marker = "[TOOL_CALLS]";
     if let Some(idx) = text.find(marker) {
         let rest = text[idx + marker.len()..].trim();
-        if let Ok(value) = serde_json::from_str::<Value>(rest) {
+        if let Some(value) = json_from_str_lenient(rest) {
             return calls_from_value(&value);
         }
         // The model sometimes appends an EOS token or trailing text after the array;
         // try to extract the first balanced [...] substring.
         if let Some(start) = rest.find('[') {
             let slice = &rest[start..];
-            if let Ok(value) = serde_json::from_str::<Value>(slice) {
+            if let Some(value) = json_from_str_lenient(slice) {
                 return calls_from_value(&value);
             }
         }
@@ -68,7 +125,7 @@ fn parse_mistral(text: &str) -> Vec<ToolCall> {
     // Mistral v0.3 GGUF emits bare JSON arrays without [TOOL_CALLS] marker.
     // Extract the first balanced [...] block, ignoring trailing prose.
     if let Some(arr_slice) = first_json_array(text.trim()) {
-        if let Ok(value) = serde_json::from_str::<Value>(arr_slice) {
+        if let Some(value) = json_from_str_lenient(arr_slice) {
             let calls = calls_from_value(&value);
             if !calls.is_empty() {
                 return calls;
@@ -92,7 +149,7 @@ fn parse_hermes(text: &str) -> Vec<ToolCall> {
             }
             None => rest,
         };
-        if let Ok(value) = serde_json::from_str::<Value>(inner.trim()) {
+        if let Some(value) = json_from_str_lenient(inner.trim()) {
             if let Some(call) = call_from_obj(&value) {
                 calls.push(call);
             }
@@ -165,12 +222,12 @@ fn parse_ornith(text: &str) -> Vec<ToolCall> {
 fn parse_json(text: &str) -> Vec<ToolCall> {
     let cleaned = strip_markers(text);
     let trimmed = cleaned.trim();
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+    if let Some(value) = json_from_str_lenient(trimmed) {
         return calls_from_value(&value);
     }
     // Otherwise try to extract the first balanced {…} object.
     if let Some(slice) = first_json_object(trimmed) {
-        if let Ok(value) = serde_json::from_str::<Value>(slice) {
+        if let Some(value) = json_from_str_lenient(slice) {
             return calls_from_value(&value);
         }
     }
@@ -331,6 +388,38 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "list_dir");
         assert_eq!(out[0].args["path"], ".");
+    }
+
+    #[test]
+    fn parses_windows_path_with_unescaped_backslashes() {
+        // Qwen echoes a Windows workspace path with single (JSON-invalid) backslashes.
+        let out = parse(
+            r#"<tool_call>{"name": "list_dir", "arguments": {"path": "C:\workspace\docs"}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "list_dir");
+        assert_eq!(out[0].args["path"], r"C:\workspace\docs");
+    }
+
+    #[test]
+    fn lenient_parse_preserves_valid_escapes() {
+        // Valid JSON (with legitimate \n and \") must parse strictly and be untouched.
+        let out = parse(
+            r#"<tool_call>{"name":"write_file","arguments":{"path":"a.txt","content":"line1\nline2 \"q\""}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].args["content"], "line1\nline2 \"q\"");
+    }
+
+    #[test]
+    fn json_args_lenient_repairs_or_defaults() {
+        assert_eq!(json_args_lenient(r#"{"path":"C:\a\b"}"#)["path"], r"C:\a\b");
+        assert_eq!(
+            json_args_lenient("not json"),
+            Value::Object(Default::default())
+        );
     }
 
     #[test]

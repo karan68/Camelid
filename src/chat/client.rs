@@ -120,6 +120,14 @@ pub enum StreamEnd {
     Cancelled,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct StreamStats {
+    pub end: StreamEnd,
+    pub deltas: u32,
+    pub total_ms: u64,
+    pub ttft_ms: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct Client {
     addr: SocketAddr,
@@ -252,8 +260,30 @@ impl Client {
         &self,
         request: &Value,
         cancel: &AtomicBool,
-        mut on_delta: impl FnMut(&str),
+        on_delta: impl FnMut(&str),
     ) -> anyhow::Result<(StreamEnd, u32)> {
+        let stats = self.chat_stream_timed(request, cancel, on_delta)?;
+        Ok((stats.end, stats.deltas))
+    }
+
+    pub fn chat_stream_timed(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+        on_delta: impl FnMut(&str),
+    ) -> anyhow::Result<StreamStats> {
+        self.chat_stream_timed_with_timeout(request, cancel, None, on_delta)
+    }
+
+    pub fn chat_stream_timed_with_timeout(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+        timeout: Option<Duration>,
+        mut on_delta: impl FnMut(&str),
+    ) -> anyhow::Result<StreamStats> {
+        let started = std::time::Instant::now();
+        let deadline = timeout.map(|timeout| started + timeout);
         // A short read timeout lets the loop wake to check `cancel` even while
         // the server is mid-generation and no bytes are arriving.
         let mut stream = self.connect(Duration::from_millis(250))?;
@@ -268,8 +298,13 @@ impl Client {
         stream.write_all(&body)?;
 
         let mut reader = SseReader::new(stream);
-        if reader.read_headers(cancel)? {
-            return Ok((StreamEnd::Cancelled, 0));
+        if reader.read_headers(cancel, deadline)? {
+            return Ok(StreamStats {
+                end: StreamEnd::Cancelled,
+                deltas: 0,
+                total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                ttft_ms: None,
+            });
         }
         if reader.status != 200 {
             let message = reader.drain_error_body();
@@ -277,7 +312,8 @@ impl Client {
         }
 
         let mut deltas: u32 = 0;
-        let end = reader.stream(cancel, |line| {
+        let mut ttft_ms = None;
+        let end = reader.stream(cancel, deadline, |line| {
             if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
                 if payload == "[DONE]" {
@@ -289,6 +325,9 @@ impl Client {
                         .and_then(Value::as_str)
                     {
                         if !content.is_empty() {
+                            ttft_ms.get_or_insert_with(|| {
+                                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                            });
                             deltas += 1;
                             on_delta(content);
                         }
@@ -297,7 +336,12 @@ impl Client {
             }
             SseControl::Continue
         })?;
-        Ok((end, deltas))
+        Ok(StreamStats {
+            end,
+            deltas,
+            total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            ttft_ms,
+        })
     }
 
     /// POST a chat request and return the full assistant turn: text content PLUS
@@ -318,6 +362,23 @@ impl Client {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
         }
         Ok(parse_chat_turn(&body))
+    }
+
+    pub fn generation_preflight(&self, request: &Value) -> anyhow::Result<u32> {
+        let (status, body) = self.request(
+            "POST",
+            "/api/generation/preflight",
+            Some(request),
+            Duration::from_secs(30),
+        )?;
+        if status != 200 {
+            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        let count = body
+            .get("prompt_token_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
+        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
     }
 
     /// Text-only convenience over [`chat_turn`] for the plain chat UI (which never
@@ -449,7 +510,11 @@ impl SseReader {
     /// leaving any post-header body bytes in `pending`. Returns `true` if Ctrl-C
     /// cancelled while waiting (the server may prefill for many seconds before the
     /// first byte, so a read timeout here is normal and is retried, not an error).
-    fn read_headers(&mut self, cancel: &AtomicBool) -> anyhow::Result<bool> {
+    fn read_headers(
+        &mut self,
+        cancel: &AtomicBool,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<bool> {
         let mut scratch = [0u8; 4096];
         loop {
             if let Some(end) = find(&self.pending, b"\r\n\r\n") {
@@ -477,6 +542,9 @@ impl SseReader {
             }
             if cancel.load(Ordering::Relaxed) {
                 return Ok(true);
+            }
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                anyhow::bail!("chat stream exceeded its model-step deadline");
             }
             match self.stream.read(&mut scratch) {
                 Ok(0) => anyhow::bail!("connection closed before HTTP headers completed"),
@@ -531,6 +599,7 @@ impl SseReader {
     fn stream(
         &mut self,
         cancel: &AtomicBool,
+        deadline: Option<std::time::Instant>,
         mut on_line: impl FnMut(&str) -> SseControl,
     ) -> anyhow::Result<StreamEnd> {
         let mut decoder = ChunkDecoder::new(self.chunked);
@@ -544,6 +613,9 @@ impl SseReader {
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(StreamEnd::Cancelled);
+            }
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                anyhow::bail!("chat stream exceeded its model-step deadline");
             }
             match self.stream.read(&mut scratch) {
                 Ok(0) => return Ok(StreamEnd::Done),
@@ -734,6 +806,8 @@ fn decode_chunked(mut raw: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
 
     #[test]
     fn parse_chat_turn_reads_structured_tool_calls() {
@@ -813,6 +887,33 @@ mod tests {
         }
         assert!(done_seen, "stream must terminate on [DONE]");
         assert_eq!(collected, "Certainly");
+    }
+
+    #[test]
+    fn sse_header_read_honors_model_step_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut reader = SseReader::new(stream);
+        let error = reader
+            .read_headers(
+                &AtomicBool::new(false),
+                Some(std::time::Instant::now() + Duration::from_millis(30)),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("chat stream exceeded its model-step deadline"));
+        let _ = release_tx.send(());
+        server.join().unwrap();
     }
 
     #[test]

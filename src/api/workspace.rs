@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
@@ -11,22 +11,40 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::{
-    api_error, capabilities_response_with_plan, curated_catalog, AppState, LoadedModel,
-    NON_CATALOG_SUPPORTED_ARTIFACTS,
+    api_error, capabilities_response_with_plan, curated_catalog, AppState, CatalogItemView,
+    LoadedModel, NON_CATALOG_SUPPORTED_ARTIFACTS,
 };
 use crate::chat::agent::LoopEnd;
 use crate::chat::workspace_bridge::{
     bridge, run_live, WorkspaceBridgeControl, WorkspaceBridgeWorker, WorkspaceDecisionKind,
     WorkspaceEvent, WorkspaceRunConfig,
 };
+use crate::chat::workspace_memory::{
+    default_store_path, CompactionResult, EvidenceInput, StoredThread, WorkspaceMemoryStore,
+};
 
 const EVENT_BACKLOG: usize = 128;
 const EVENT_STREAM_BUFFER: usize = 128;
 const DEFAULT_MAX_STEPS: usize = 12;
 const MAX_STEPS: usize = 32;
-const DEFAULT_MAX_TOKENS: u32 = 800;
-const MAX_TOKENS: u32 = 4096;
-const MAX_GOAL_BYTES: usize = 16 * 1024;
+const DEFAULT_MAX_TOKENS: u32 = 512;
+const MAX_TOKENS: u32 = 1024;
+const MAX_GOAL_BYTES: usize = 4 * 1024;
+const AUTO_COMPACT_TRIGGER_PERCENT: u32 = 75;
+const AUTO_COMPACT_MIN_TURNS: u32 = 4;
+
+fn should_auto_compact(
+    turn_count: u32,
+    prompt_tokens: u32,
+    generation_tokens: u32,
+    budget_total: u32,
+) -> bool {
+    if turn_count < AUTO_COMPACT_MIN_TURNS || budget_total == 0 {
+        return false;
+    }
+    u64::from(prompt_tokens.saturating_add(generation_tokens)) * 100
+        >= u64::from(budget_total) * u64::from(AUTO_COMPACT_TRIGGER_PERCENT)
+}
 
 #[derive(Clone, Default)]
 pub(super) struct WorkspaceSessionManager {
@@ -37,19 +55,36 @@ struct ActiveWorkspaceSession {
     id: String,
     workspace: PathBuf,
     model_id: String,
+    max_steps: usize,
+    max_tokens: u32,
+    temperature: f32,
+    allow_writes: bool,
+    memory: WorkspaceMemoryStore,
     state: StdMutex<WorkspaceSessionState>,
     events: StdMutex<Option<std::sync::mpsc::Receiver<WorkspaceEvent>>>,
     worker: StdMutex<Option<WorkspaceBridgeWorker>>,
     run_config: StdMutex<Option<WorkspaceRunConfig>>,
-    control: WorkspaceBridgeControl,
+    control: StdMutex<Option<WorkspaceBridgeControl>>,
+    current_turn: StdMutex<Option<(String, u32)>>,
+}
+
+enum InstallTurn {
+    Installed,
+    Duplicate(u32),
+}
+
+#[derive(Clone, Copy)]
+enum TurnCompletion {
+    Idle,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceSessionState {
     WaitingForEvents,
     Running,
+    Idle,
     Cancelling,
-    Finished,
     Cancelled,
     Failed,
 }
@@ -59,8 +94,8 @@ impl WorkspaceSessionState {
         match self {
             Self::WaitingForEvents => "waiting_for_events",
             Self::Running => "running",
+            Self::Idle => "idle",
             Self::Cancelling => "cancelling",
-            Self::Finished => "finished",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }
@@ -77,18 +112,15 @@ impl WorkspaceSessionState {
         match self {
             Self::WaitingForEvents => Self::Cancelled,
             Self::Running => Self::Cancelling,
+            Self::Idle => Self::Cancelled,
             other => other,
         }
     }
 
-    fn after_worker_exit(self, result: &Result<LoopEnd, String>) -> Self {
-        if self == Self::Cancelling {
-            return Self::Cancelled;
-        }
-        match result {
-            Ok(LoopEnd::Aborted) => Self::Cancelled,
-            Ok(LoopEnd::DriverError) | Err(_) => Self::Failed,
-            Ok(LoopEnd::Answered | LoopEnd::StepCapped | LoopEnd::Repeated) => Self::Finished,
+    fn after_events_claimed(self) -> Self {
+        match self {
+            Self::WaitingForEvents => Self::Running,
+            other => other,
         }
     }
 }
@@ -116,16 +148,111 @@ impl WorkspaceSessionManager {
     }
 }
 
+impl ActiveWorkspaceSession {
+    fn pending_message(&self, client_message_id: &str) -> Option<u32> {
+        self.current_turn
+            .lock()
+            .ok()
+            .and_then(|turn| turn.as_ref().cloned())
+            .filter(|(message_id, _)| message_id == client_message_id)
+            .map(|(_, turn_index)| turn_index)
+    }
+
+    fn install_turn(
+        &self,
+        events: std::sync::mpsc::Receiver<WorkspaceEvent>,
+        worker: WorkspaceBridgeWorker,
+        run_config: WorkspaceRunConfig,
+        control: WorkspaceBridgeControl,
+    ) -> Result<InstallTurn, &'static str> {
+        let mut status = self
+            .state
+            .lock()
+            .map_err(|_| "thread state is unavailable")?;
+        let mut current_turn = self
+            .current_turn
+            .lock()
+            .map_err(|_| "turn identity is unavailable")?;
+        if *status != WorkspaceSessionState::Idle {
+            if let Some((message_id, turn_index)) = current_turn.as_ref() {
+                if message_id == &run_config.client_message_id {
+                    return Ok(InstallTurn::Duplicate(*turn_index));
+                }
+            }
+            return Err("a turn is already active");
+        }
+        let mut event_slot = self
+            .events
+            .lock()
+            .map_err(|_| "event slot is unavailable")?;
+        let mut worker_slot = self
+            .worker
+            .lock()
+            .map_err(|_| "worker slot is unavailable")?;
+        let mut config_slot = self
+            .run_config
+            .lock()
+            .map_err(|_| "turn configuration is unavailable")?;
+        let mut control_slot = self
+            .control
+            .lock()
+            .map_err(|_| "turn control is unavailable")?;
+        *current_turn = Some((run_config.client_message_id.clone(), run_config.turn_index));
+        *event_slot = Some(events);
+        *worker_slot = Some(worker);
+        *config_slot = Some(run_config);
+        *control_slot = Some(control);
+        *status = WorkspaceSessionState::WaitingForEvents;
+        Ok(InstallTurn::Installed)
+    }
+
+    fn finish_turn_if_current(&self, message_id: &str, completion: TurnCompletion) -> bool {
+        let (Ok(mut status), Ok(mut current_turn)) = (self.state.lock(), self.current_turn.lock())
+        else {
+            return false;
+        };
+        let owns_turn = current_turn
+            .as_ref()
+            .is_some_and(|(current_id, _)| current_id == message_id);
+        if !owns_turn {
+            return false;
+        }
+        *status = if matches!(
+            *status,
+            WorkspaceSessionState::Cancelling | WorkspaceSessionState::Cancelled
+        ) {
+            WorkspaceSessionState::Cancelled
+        } else {
+            match completion {
+                TurnCompletion::Idle => WorkspaceSessionState::Idle,
+                TurnCompletion::Failed => WorkspaceSessionState::Failed,
+            }
+        };
+        *current_turn = None;
+        true
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateWorkspaceSessionRequest {
     workspace: PathBuf,
     goal: String,
+    #[serde(default)]
+    thread_id: Option<String>,
     #[serde(default)]
     max_steps: Option<usize>,
     #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f32>,
+    #[serde(default)]
+    allow_writes: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceMessageRequest {
+    text: String,
+    client_message_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +263,7 @@ struct WorkspaceSessionResponse {
     state: &'static str,
     max_steps: usize,
     max_tokens: u32,
+    allow_writes: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +272,50 @@ struct WorkspaceSessionStatusResponse {
     workspace: String,
     model_id: String,
     state: &'static str,
+    context_budget_tokens: u32,
+    resident_cuda: Option<crate::inference::ResidentCudaStatus>,
+    allow_writes: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceMessageResponse {
+    session_id: String,
+    turn_index: u32,
+    state: &'static str,
+    duplicate: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct WorkspaceModelOption {
+    row_id: &'static str,
+    name: String,
+    filename: &'static str,
+    quantization: &'static str,
+    installed: bool,
+    catalog_id: Option<&'static str>,
+    fit: crate::fit::FitVerdict,
+    fit_confidence: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceModelsResponse {
+    models: Vec<WorkspaceModelOption>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceThreadsQuery {
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceThreadsResponse {
+    threads: Vec<StoredThread>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceThreadResponse {
+    thread: StoredThread,
+    turns: Vec<crate::chat::workspace_memory::StoredTurn>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +338,533 @@ impl Drop for CancelStreamOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+pub(super) async fn compatible_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+
+    Json(WorkspaceModelsResponse {
+        models: workspace_model_options(&state.models_dir),
+    })
+    .into_response()
+}
+
+pub(super) async fn list_threads(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceThreadsQuery>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let workspace = match std::fs::canonicalize(&query.workspace) {
+        Ok(path) if path.is_dir() => path,
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "workspace_root_not_accessible",
+                "workspace must name an accessible local directory".to_string(),
+                Some("workspace"),
+            )
+        }
+    };
+    let store = match WorkspaceMemoryStore::open(default_store_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not be opened: {error}"),
+                None,
+            )
+        }
+    };
+    let (model, _) = match active_tool_capable_model(&state).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match store.threads_for_root(&simplify_path(&workspace), 20) {
+        Ok(threads) => Json(WorkspaceThreadsResponse {
+            threads: threads
+                .into_iter()
+                .filter(|thread| {
+                    thread.model_id == model.id && thread.model_sha256 == model.lane.gguf_sha256
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_memory_unavailable",
+            format!("Workspace threads could not be listed: {error}"),
+            None,
+        ),
+    }
+}
+
+pub(super) async fn get_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<WorkspaceThreadsQuery>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let workspace = match std::fs::canonicalize(&query.workspace) {
+        Ok(path) if path.is_dir() => simplify_path(&path),
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "workspace_root_not_accessible",
+                "workspace must name an accessible local directory".to_string(),
+                Some("workspace"),
+            )
+        }
+    };
+    let store = match WorkspaceMemoryStore::open(default_store_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not be opened: {error}"),
+                None,
+            )
+        }
+    };
+    let thread = match store.thread(&id) {
+        Ok(Some(thread)) if thread.canonical_root == workspace => thread,
+        Ok(_) => return workspace_not_found(),
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not load this thread: {error}"),
+                None,
+            )
+        }
+    };
+    match store.recent_turns(&id, 200) {
+        Ok(turns) => Json(WorkspaceThreadResponse { thread, turns }).into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_memory_unavailable",
+            format!("Workspace transcript could not be loaded: {error}"),
+            None,
+        ),
+    }
+}
+
+pub(super) async fn delete_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<WorkspaceThreadsQuery>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let workspace = match std::fs::canonicalize(&query.workspace) {
+        Ok(path) if path.is_dir() => simplify_path(&path),
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "workspace_root_not_accessible",
+                "workspace must name an accessible local directory".to_string(),
+                Some("workspace"),
+            )
+        }
+    };
+    if let Some(session) = state.workspace_sessions.active.lock().await.as_ref() {
+        if session.id == id {
+            let terminal = session
+                .state
+                .lock()
+                .map(|state| {
+                    matches!(
+                        *state,
+                        WorkspaceSessionState::Cancelled | WorkspaceSessionState::Failed
+                    )
+                })
+                .unwrap_or(false);
+            if !terminal {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "workspace_thread_active",
+                    "clear the active Workspace thread before deleting its saved memory"
+                        .to_string(),
+                    None,
+                );
+            }
+        }
+    }
+    let store = match WorkspaceMemoryStore::open(default_store_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not be opened: {error}"),
+                None,
+            )
+        }
+    };
+    match store.thread(&id) {
+        Ok(Some(thread)) if thread.canonical_root == workspace => {}
+        Ok(_) => return workspace_not_found(),
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not load this thread: {error}"),
+                None,
+            )
+        }
+    }
+    match store.delete_thread(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => workspace_not_found(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_memory_unavailable",
+            format!("Workspace memory could not delete this thread: {error}"),
+            None,
+        ),
+    }
+}
+
+pub(super) async fn compact_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<WorkspaceThreadsQuery>,
+) -> Response {
+    compact_thread_operation(state, headers, id, query, false).await
+}
+
+pub(super) async fn undo_thread_compaction(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<WorkspaceThreadsQuery>,
+) -> Response {
+    compact_thread_operation(state, headers, id, query, true).await
+}
+
+async fn compact_thread_operation(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+    query: WorkspaceThreadsQuery,
+    undo: bool,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let workspace = match std::fs::canonicalize(&query.workspace) {
+        Ok(path) if path.is_dir() => simplify_path(&path),
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "workspace_root_not_accessible",
+                "workspace must name an accessible local directory".to_string(),
+                Some("workspace"),
+            )
+        }
+    };
+    if let Some(session) = state.workspace_sessions.active.lock().await.as_ref() {
+        if session.id == id {
+            let idle = session
+                .state
+                .lock()
+                .map(|state| *state == WorkspaceSessionState::Idle)
+                .unwrap_or(false);
+            if !idle {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "workspace_turn_active",
+                    "wait for the active turn to finish before compacting this conversation"
+                        .to_string(),
+                    None,
+                );
+            }
+        }
+    }
+    let store = match WorkspaceMemoryStore::open(default_store_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not be opened: {error}"),
+                None,
+            )
+        }
+    };
+    match store.thread(&id) {
+        Ok(Some(thread)) if thread.canonical_root == workspace => {}
+        Ok(_) => return workspace_not_found(),
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not load this thread: {error}"),
+                None,
+            )
+        }
+    }
+    let result: anyhow::Result<CompactionResult> = if undo {
+        store.undo_compaction(&id)
+    } else {
+        store.compact_thread(&id)
+    };
+    match result {
+        Ok(compaction) => Json(compaction).into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_memory_unavailable",
+            format!("Workspace memory compaction failed: {error}"),
+            None,
+        ),
+    }
+}
+
+fn workspace_model_options(models_dir: &std::path::Path) -> Vec<WorkspaceModelOption> {
+    let catalog = curated_catalog();
+    let rows = tool_capable_compatibility_rows();
+    let hardware = crate::capability::HardwareProfile::cached();
+    let mut models = Vec::new();
+
+    for item in &catalog {
+        if let Some(row) = rows.iter().find(|row| row.id == item.catalog_id) {
+            let view = CatalogItemView::from_curated(item, hardware);
+            models.push(WorkspaceModelOption {
+                row_id: row.id,
+                name: item.name.to_string(),
+                filename: item.filename,
+                quantization: row.quantization,
+                installed: models_dir.join(item.filename).is_file(),
+                catalog_id: Some(item.catalog_id),
+                fit: view.fit,
+                fit_confidence: view.fit_confidence,
+            });
+        }
+    }
+
+    for (filename, row_id) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+        let Some(row) = rows.iter().find(|row| row.id == *row_id) else {
+            continue;
+        };
+        if models.iter().any(|model| model.filename == *filename) {
+            continue;
+        }
+        models.push(WorkspaceModelOption {
+            row_id: row.id,
+            name: filename.trim_end_matches(".gguf").to_string(),
+            filename,
+            quantization: row.quantization,
+            installed: models_dir.join(filename).is_file(),
+            catalog_id: None,
+            fit: crate::fit::FitVerdict::Unknown,
+            fit_confidence: "unknown",
+        });
+    }
+
+    models.sort_by_key(|model| {
+        (
+            !model.installed,
+            workspace_fit_rank(model.fit),
+            model.catalog_id.is_none(),
+            model.name.clone(),
+        )
+    });
+    models
+}
+
+fn workspace_fit_rank(fit: crate::fit::FitVerdict) -> u8 {
+    match fit {
+        crate::fit::FitVerdict::FitsResident => 0,
+        crate::fit::FitVerdict::FitsWithOffload | crate::fit::FitVerdict::CpuOnlyOk => 1,
+        crate::fit::FitVerdict::Unknown => 2,
+        crate::fit::FitVerdict::WontFit => 3,
+    }
+}
+
+fn tool_capable_compatibility_rows() -> Vec<super::ModelCompatibilityTarget> {
+    capabilities_response_with_plan(None)
+        .model_compatibility
+        .into_iter()
+        .filter(|row| row.tool_capable && row.status.starts_with("supported"))
+        .collect()
+}
+
+/// Cap on directories returned per browse call so a folder with an enormous
+/// number of children cannot produce an unbounded response body.
+const MAX_BROWSE_ENTRIES: usize = 4096;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceBrowseQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceBrowseEntry {
+    name: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceBrowseResponse {
+    /// Canonical folder being listed, or `None` for the Windows drive-roots
+    /// view. The UI shows an "up" affordance only when this is `Some`.
+    path: Option<String>,
+    /// Parent folder within the filesystem, or `None` at a drive/root.
+    parent: Option<String>,
+    /// True on platforms that have a roots listing (Windows drives), so the UI
+    /// can offer "up to drives" when `parent` is `None`.
+    has_roots: bool,
+    /// Native path separator, so the UI can render paths without guessing.
+    separator: String,
+    /// Immediate child directories, name-sorted, directories only.
+    entries: Vec<WorkspaceBrowseEntry>,
+    /// True when `entries` was capped at `MAX_BROWSE_ENTRIES`.
+    truncated: bool,
+}
+
+/// Read-only directory browsing that backs the Workspace folder picker. This is
+/// a setup helper, not an agent tool: it never reads file contents, lists only
+/// directories, and does not widen the agent sandbox (the chosen root is still
+/// canonicalized and confined when a session starts).
+pub(super) async fn browse(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceBrowseQuery>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    match browse_directory(query.path.as_deref()) {
+        Ok(body) => Json(body).into_response(),
+        Err((code, id, message)) => api_error(code, id, message, Some("path")),
+    }
+}
+
+fn browse_directory(
+    requested: Option<&str>,
+) -> Result<WorkspaceBrowseResponse, (StatusCode, &'static str, String)> {
+    let has_roots = cfg!(windows);
+    let separator = std::path::MAIN_SEPARATOR.to_string();
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+
+    // Windows with no folder selected shows the available drive letters.
+    if requested.is_none() && has_roots {
+        return Ok(WorkspaceBrowseResponse {
+            path: None,
+            parent: None,
+            has_roots,
+            separator,
+            entries: windows_drive_roots(),
+            truncated: false,
+        });
+    }
+
+    let target = match requested {
+        Some(value) => PathBuf::from(value),
+        // Unix with no folder selected starts at the filesystem root.
+        None => PathBuf::from(std::path::MAIN_SEPARATOR.to_string()),
+    };
+
+    let canonical = std::fs::canonicalize(&target).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "workspace_browse_path_invalid",
+            "that folder is not accessible".to_string(),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "workspace_browse_path_invalid",
+            "that path is not a folder".to_string(),
+        ));
+    }
+
+    let (entries, truncated) = list_child_directories(&canonical);
+    Ok(WorkspaceBrowseResponse {
+        path: Some(simplify_path(&canonical)),
+        parent: canonical.parent().map(simplify_path),
+        has_roots,
+        separator,
+        entries,
+        truncated,
+    })
+}
+
+fn windows_drive_roots() -> Vec<WorkspaceBrowseEntry> {
+    let mut roots = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let root = format!("{}:\\", letter as char);
+        if std::path::Path::new(&root).is_dir() {
+            roots.push(WorkspaceBrowseEntry {
+                name: root.clone(),
+                path: root,
+            });
+        }
+    }
+    roots
+}
+
+fn list_child_directories(dir: &std::path::Path) -> (Vec<WorkspaceBrowseEntry>, bool) {
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            // Directories only, and don't follow symlinks (`file_type` reports
+            // the link itself). Unreadable entries are skipped, not fatal.
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Hide dot-directories to keep the picker readable.
+            if name.starts_with('.') {
+                continue;
+            }
+            if entries.len() >= MAX_BROWSE_ENTRIES {
+                truncated = true;
+                break;
+            }
+            entries.push(WorkspaceBrowseEntry {
+                path: simplify_path(&entry.path()),
+                name,
+            });
+        }
+    }
+    entries.sort_by_key(|entry| entry.name.to_lowercase());
+    (entries, truncated)
+}
+
+/// `std::fs::canonicalize` yields Windows extended-length (`\\?\C:\...`) paths.
+/// Strip that verbatim prefix so the picker shows and round-trips ordinary
+/// `C:\...` paths; selecting one canonicalizes again on the server anyway.
+fn simplify_path(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            if let Some(unc) = stripped.strip_prefix("UNC\\") {
+                return format!(r"\\{unc}");
+            }
+            return stripped.to_string();
+        }
+    }
+    text
 }
 
 pub(super) async fn create_session(
@@ -213,6 +912,15 @@ pub(super) async fn create_session(
             Some("temperature"),
         );
     }
+    if request.allow_writes.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "workspace_read_only",
+            "Workspace is read-only; write and edit tools are not available".to_string(),
+            Some("allow_writes"),
+        );
+    }
+    let allow_writes = false;
 
     let workspace = match std::fs::canonicalize(&request.workspace) {
         Ok(path) if path.is_dir() => path,
@@ -246,13 +954,84 @@ pub(super) async fn create_session(
         *active = None;
     }
 
-    let id = format!("workspace-{}", uuid::Uuid::new_v4());
+    let memory = match WorkspaceMemoryStore::open(default_store_path()) {
+        Ok(memory) => memory,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not be opened: {error}"),
+                None,
+            )
+        }
+    };
+    let canonical_root = simplify_path(&workspace);
+    let resume_id = request
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty());
+    let (id, context, turn_index) = if let Some(thread_id) = resume_id {
+        let stored = match memory.thread(thread_id) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return workspace_not_found(),
+            Err(error) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "workspace_memory_unavailable",
+                    format!("Workspace memory could not load this thread: {error}"),
+                    None,
+                )
+            }
+        };
+        if stored.canonical_root != canonical_root
+            || stored.model_id != model.id
+            || stored.model_sha256 != model.lane.gguf_sha256
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "workspace_thread_identity_mismatch",
+                "the saved thread does not belong to this canonical folder and active model"
+                    .to_string(),
+                None,
+            );
+        }
+        let context = match memory.context_for(thread_id, goal, 2 * 1024) {
+            Ok(context) => context,
+            Err(error) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "workspace_memory_unavailable",
+                    format!("Workspace memory could not retrieve prior turns: {error}"),
+                    None,
+                )
+            }
+        };
+        (thread_id.to_string(), context, stored.turn_count)
+    } else {
+        let id = format!("workspace-{}", uuid::Uuid::new_v4());
+        if let Err(error) =
+            memory.create_thread_for_model(&id, &canonical_root, &model.id, &model.lane.gguf_sha256)
+        {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not create this thread: {error}"),
+                None,
+            );
+        }
+        (id, Default::default(), 0)
+    };
     let (worker, client) = bridge(EVENT_BACKLOG);
     let (events, control) = client.into_parts();
+    let client_message_id = format!("initial-{}", uuid::Uuid::new_v4());
     let run_config = WorkspaceRunConfig {
         addr: state.serve_addr,
         workspace: workspace.clone(),
         goal: goal.to_string(),
+        client_message_id: client_message_id.clone(),
+        turn_index,
+        memory: context,
         model_id: model.id.clone(),
         family,
         max_steps,
@@ -263,11 +1042,17 @@ pub(super) async fn create_session(
         id: id.clone(),
         workspace: workspace.clone(),
         model_id: model.id.clone(),
+        max_steps,
+        max_tokens,
+        temperature,
+        allow_writes,
+        memory,
         state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
         events: StdMutex::new(Some(events)),
         worker: StdMutex::new(Some(worker)),
         run_config: StdMutex::new(Some(run_config)),
-        control,
+        control: StdMutex::new(Some(control)),
+        current_turn: StdMutex::new(Some((client_message_id, turn_index))),
     });
     *active = Some(session);
 
@@ -275,11 +1060,12 @@ pub(super) async fn create_session(
         StatusCode::CREATED,
         Json(WorkspaceSessionResponse {
             id,
-            workspace: workspace.display().to_string(),
+            workspace: simplify_path(&workspace),
             model_id: model.id,
             state: WorkspaceSessionState::WaitingForEvents.as_str(),
             max_steps,
             max_tokens,
+            allow_writes,
         }),
     )
         .into_response()
@@ -297,7 +1083,6 @@ pub(super) async fn session_events(
         Ok(session) => session,
         Err(response) => return response,
     };
-
     let events = match session.events.lock() {
         Ok(mut events) => events.take(),
         Err(_) => None,
@@ -310,7 +1095,14 @@ pub(super) async fn session_events(
         Ok(mut config) => config.take(),
         Err(_) => None,
     };
-    let (Some(events), Some(worker), Some(run_config)) = (events, worker, run_config) else {
+    let control = session
+        .control
+        .lock()
+        .ok()
+        .and_then(|control| control.clone());
+    let (Some(events), Some(worker), Some(run_config), Some(control)) =
+        (events, worker, run_config, control)
+    else {
         return api_error(
             StatusCode::CONFLICT,
             "workspace_event_stream_already_claimed",
@@ -318,28 +1110,131 @@ pub(super) async fn session_events(
             None,
         );
     };
+    let persisted_turn = run_config.clone();
     if let Ok(mut status) = session.state.lock() {
-        *status = WorkspaceSessionState::Running;
+        *status = status.after_events_claimed();
     }
 
     let worker_session = Arc::clone(&session);
+    let worker_turn_id = run_config.client_message_id.clone();
+    let delivery_failed = Arc::clone(&worker.delivery_failed);
     std::thread::Builder::new()
         .name("camelid-workspace-agent".to_string())
         .spawn(move || {
             let result = run_live(run_config, worker);
-            if let Ok(mut status) = worker_session.state.lock() {
-                *status = status.after_worker_exit(&result);
+            if result.is_err() || delivery_failed.load(std::sync::atomic::Ordering::Acquire) {
+                let completion = if matches!(result, Ok(LoopEnd::DriverError) | Err(_)) {
+                    TurnCompletion::Failed
+                } else {
+                    TurnCompletion::Idle
+                };
+                worker_session.finish_turn_if_current(&worker_turn_id, completion);
             }
         })
         .expect("spawn Workspace agent thread");
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(EVENT_STREAM_BUFFER);
-    let forward_control = session.control.clone();
+    let forward_control = control.clone();
+    let persist_session = Arc::clone(&session);
     std::thread::Builder::new()
         .name("camelid-workspace-events".to_string())
         .spawn(move || {
+            let mut pending_call = None;
+            let mut evidence = Vec::new();
+            let mut last_context_usage = None;
             while let Ok(event) = events.recv() {
+                if let WorkspaceEvent::MemoryUpdated {
+                    prompt_tokens,
+                    generation_tokens,
+                    budget_total,
+                    ..
+                } = &event
+                {
+                    last_context_usage =
+                        Some((*prompt_tokens, *generation_tokens, *budget_total));
+                }
+                if let WorkspaceEvent::ToolCall { detail } = &event {
+                    pending_call = Some(detail.clone());
+                }
+                if let WorkspaceEvent::ToolResult { tool, content, .. } = &event {
+                    evidence.push(EvidenceInput {
+                        tool: tool.clone(),
+                        detail: pending_call.take().unwrap_or_default(),
+                        observation: content.clone(),
+                    });
+                }
+                let mut automatic_compaction = None;
+                if let WorkspaceEvent::ModelAnswer { content } = &event {
+                    if let Err(error) = persist_session.memory.append_turn_with_evidence(
+                        &persist_session.id,
+                        &persisted_turn.client_message_id,
+                        &persisted_turn.goal,
+                        content,
+                        &evidence,
+                    ) {
+                        let _ = event_tx.try_send(WorkspaceEvent::Error {
+                            message: format!("Workspace memory could not save this turn: {error}"),
+                        });
+                        persist_session.finish_turn_if_current(
+                            &persisted_turn.client_message_id,
+                            TurnCompletion::Failed,
+                        );
+                        forward_control.cancel();
+                        break;
+                    }
+                    if let Some((prompt_tokens, generation_tokens, budget_total)) =
+                        last_context_usage
+                    {
+                        let thread = persist_session.memory.thread(&persist_session.id);
+                        if let Ok(Some(thread)) = thread {
+                            if should_auto_compact(
+                                thread.turn_count,
+                                prompt_tokens,
+                                generation_tokens,
+                                budget_total,
+                            ) {
+                                match persist_session.memory.compact_thread(&persist_session.id) {
+                                    Ok(result) if result.archived_turns > 0 => {
+                                        automatic_compaction =
+                                            Some(WorkspaceEvent::MemoryCompacted {
+                                                compacted_through_turn: result
+                                                    .compacted_through_turn,
+                                                archived_turns: result.archived_turns,
+                                                compaction_count: result.compaction_count,
+                                                trigger_tokens: prompt_tokens
+                                                    .saturating_add(generation_tokens),
+                                                budget_total,
+                                            });
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        automatic_compaction = Some(WorkspaceEvent::Notice {
+                                            content: format!(
+                                                "Automatic conversation compaction was skipped: {error}"
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let WorkspaceEvent::Finished { outcome } = &event {
+                    let completion = if *outcome == "driver_error" {
+                        TurnCompletion::Failed
+                    } else {
+                        TurnCompletion::Idle
+                    };
+                    persist_session
+                        .finish_turn_if_current(&persisted_turn.client_message_id, completion);
+                }
                 if event_tx.try_send(event).is_err() {
+                    forward_control.cancel();
+                    break;
+                }
+                if automatic_compaction
+                    .is_some_and(|event| event_tx.try_send(event).is_err())
+                {
                     forward_control.cancel();
                     break;
                 }
@@ -348,7 +1243,7 @@ pub(super) async fn session_events(
         .expect("spawn Workspace event forwarder");
 
     let session_id = session.id.clone();
-    let disconnect_guard = CancelStreamOnDrop(session.control.clone());
+    let disconnect_guard = CancelStreamOnDrop(control);
     let stream = async_stream::stream! {
         let _disconnect_guard = disconnect_guard;
         let mut sequence = 0_u64;
@@ -393,10 +1288,20 @@ pub(super) async fn decide(
         Ok(session) => session,
         Err(response) => return response,
     };
-    match session
+    let control = session
         .control
-        .try_decide(request.approval_id, request.decision)
-    {
+        .lock()
+        .ok()
+        .and_then(|control| control.clone());
+    let Some(control) = control else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_approval_not_pending",
+            "this Workspace thread has no active turn".to_string(),
+            Some("approval_id"),
+        );
+    };
+    match control.try_decide(request.approval_id, request.decision) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(message) => api_error(
             StatusCode::CONFLICT,
@@ -426,11 +1331,172 @@ pub(super) async fn session_status(
         .unwrap_or("error");
     Json(WorkspaceSessionStatusResponse {
         id: session.id.clone(),
-        workspace: session.workspace.display().to_string(),
+        workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
+        context_budget_tokens: crate::chat::workspace_bridge::WORKSPACE_CONTEXT_BUDGET_TOKENS,
+        resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
+            &session.model_id,
+        )),
+        allow_writes: session.allow_writes,
     })
     .into_response()
+}
+
+pub(super) async fn send_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<WorkspaceMessageRequest>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let text = request.text.trim();
+    let client_message_id = request.client_message_id.trim();
+    if text.is_empty() || text.len() > MAX_GOAL_BYTES {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_message",
+            format!("text must contain 1 to {MAX_GOAL_BYTES} UTF-8 bytes"),
+            Some("text"),
+        );
+    }
+    if client_message_id.is_empty() || client_message_id.len() > 128 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_workspace_message_id",
+            "client_message_id must contain 1 to 128 characters".to_string(),
+            Some("client_message_id"),
+        );
+    }
+    let session = match find_session(&state, &id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Some(turn_index) = session.pending_message(client_message_id) {
+        let state = session
+            .state
+            .lock()
+            .map(|state| state.as_str())
+            .unwrap_or("error");
+        return (
+            StatusCode::OK,
+            Json(WorkspaceMessageResponse {
+                session_id: session.id.clone(),
+                turn_index,
+                state,
+                duplicate: true,
+            }),
+        )
+            .into_response();
+    }
+    match session
+        .memory
+        .turn_by_client_message(&session.id, client_message_id)
+    {
+        Ok(Some(turn)) => {
+            return (
+                StatusCode::OK,
+                Json(WorkspaceMessageResponse {
+                    session_id: session.id.clone(),
+                    turn_index: turn.turn_index,
+                    state: WorkspaceSessionState::Idle.as_str(),
+                    duplicate: true,
+                }),
+            )
+                .into_response()
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not check this message: {error}"),
+                None,
+            )
+        }
+    }
+    let (model, family) = match active_tool_capable_model(&state).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if model.id != session.model_id {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_model_changed",
+            "resume this thread with the same model that created it".to_string(),
+            None,
+        );
+    }
+    let memory = match session.memory.context_for(&session.id, text, 2 * 1024) {
+        Ok(memory) => memory,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_memory_unavailable",
+                format!("Workspace memory could not retrieve prior turns: {error}"),
+                None,
+            )
+        }
+    };
+    let turn_index = memory
+        .recent
+        .last()
+        .map(|turn| turn.turn_index.saturating_add(1))
+        .unwrap_or(0);
+    let (worker, client) = bridge(EVENT_BACKLOG);
+    let (events, control) = client.into_parts();
+    let run_config = WorkspaceRunConfig {
+        addr: state.serve_addr,
+        workspace: session.workspace.clone(),
+        goal: text.to_string(),
+        client_message_id: client_message_id.to_string(),
+        turn_index,
+        memory,
+        model_id: session.model_id.clone(),
+        family,
+        max_steps: session.max_steps,
+        max_tokens: session.max_tokens,
+        temperature: session.temperature,
+    };
+    match session.install_turn(events, worker, run_config, control) {
+        Ok(InstallTurn::Installed) => {}
+        Ok(InstallTurn::Duplicate(existing_index)) => {
+            return (
+                StatusCode::OK,
+                Json(WorkspaceMessageResponse {
+                    session_id: session.id.clone(),
+                    turn_index: existing_index,
+                    state: session
+                        .state
+                        .lock()
+                        .map(|state| state.as_str())
+                        .unwrap_or("error"),
+                    duplicate: true,
+                }),
+            )
+                .into_response()
+        }
+        Err(message) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "workspace_turn_already_active",
+                message.to_string(),
+                None,
+            )
+        }
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(WorkspaceMessageResponse {
+            session_id: session.id.clone(),
+            turn_index,
+            state: WorkspaceSessionState::WaitingForEvents.as_str(),
+            duplicate: false,
+        }),
+    )
+        .into_response()
 }
 
 pub(super) async fn cancel_session(
@@ -448,7 +1514,14 @@ pub(super) async fn cancel_session(
     if session.id != id {
         return workspace_not_found();
     }
-    session.control.cancel();
+    if let Some(control) = session
+        .control
+        .lock()
+        .ok()
+        .and_then(|control| control.clone())
+    {
+        control.cancel();
+    }
     if let Ok(mut status) = session.state.lock() {
         *status = status.after_cancel_request();
     }
@@ -572,10 +1645,9 @@ fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'stat
                 .map(|(_, row_id)| *row_id)
         });
     row_id.and_then(|row_id| {
-        capabilities_response_with_plan(None)
-            .model_compatibility
+        tool_capable_compatibility_rows()
             .into_iter()
-            .find(|row| row.id == row_id && row.tool_capable && row.status.starts_with("supported"))
+            .find(|row| row.id == row_id)
             .map(|row| (row.id, row.family))
     })
 }
@@ -583,6 +1655,73 @@ fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browse_lists_only_child_directories_sorted_and_excludes_files() {
+        let root = tempfile::tempdir().expect("browse root");
+        std::fs::create_dir(root.path().join("zeta")).unwrap();
+        std::fs::create_dir(root.path().join("Alpha")).unwrap();
+        std::fs::write(root.path().join("note.txt"), b"x").unwrap();
+
+        let response = browse_directory(Some(root.path().to_str().unwrap())).expect("browse ok");
+        let names: Vec<_> = response
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Alpha", "zeta"]);
+        assert!(response.path.is_some());
+        assert!(!response.truncated);
+        for entry in &response.entries {
+            assert!(std::path::Path::new(&entry.path).is_dir());
+        }
+    }
+
+    #[test]
+    fn browse_reports_parent_of_a_subdirectory() {
+        let root = tempfile::tempdir().expect("browse root");
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+
+        let response = browse_directory(Some(child.to_str().unwrap())).expect("browse ok");
+        let parent = response.parent.expect("child has a parent");
+        assert_eq!(
+            std::fs::canonicalize(parent).unwrap(),
+            std::fs::canonicalize(root.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn browse_rejects_missing_and_non_directory_paths() {
+        let root = tempfile::tempdir().expect("browse root");
+        let missing = root.path().join("does-not-exist");
+        assert!(browse_directory(Some(missing.to_str().unwrap())).is_err());
+
+        let file = root.path().join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(browse_directory(Some(file.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn compatible_models_expose_only_exact_earned_artifacts_and_installed_state() {
+        let models_dir = tempfile::tempdir().expect("models dir");
+        std::fs::write(models_dir.path().join("Qwen3-4B-Q4_K_M.gguf"), b"stub")
+            .expect("write installed model");
+
+        let options = workspace_model_options(models_dir.path());
+        let installed = options
+            .iter()
+            .find(|model| model.filename == "Qwen3-4B-Q4_K_M.gguf")
+            .expect("earned Qwen row");
+        assert!(installed.installed);
+        assert_eq!(installed.row_id, "qwen3_4b_q4_k_m");
+        assert!(options
+            .iter()
+            .all(|model| tool_capable_row_for_filename(model.filename).is_some()));
+        assert!(!options
+            .iter()
+            .any(|model| model.filename == "ornith-1.0-9b-Q3_K_M.gguf"));
+    }
 
     #[test]
     fn management_authorization_is_loopback_and_browser_scoped() {
@@ -607,7 +1746,7 @@ mod tests {
         assert!(WorkspaceSessionState::WaitingForEvents.blocks_model_transition());
         assert!(WorkspaceSessionState::Running.blocks_model_transition());
         assert!(WorkspaceSessionState::Cancelling.blocks_model_transition());
-        assert!(!WorkspaceSessionState::Finished.blocks_model_transition());
+        assert!(!WorkspaceSessionState::Idle.blocks_model_transition());
         assert!(!WorkspaceSessionState::Cancelled.blocks_model_transition());
         assert!(!WorkspaceSessionState::Failed.blocks_model_transition());
     }
@@ -618,29 +1757,21 @@ mod tests {
         assert_eq!(requested, WorkspaceSessionState::Cancelling);
         assert!(requested.blocks_model_transition());
         assert_eq!(
-            requested.after_worker_exit(&Ok(LoopEnd::Aborted)),
+            WorkspaceSessionState::WaitingForEvents.after_cancel_request(),
             WorkspaceSessionState::Cancelled
         );
         assert_eq!(
-            WorkspaceSessionState::WaitingForEvents.after_cancel_request(),
+            WorkspaceSessionState::Cancelled.after_events_claimed(),
             WorkspaceSessionState::Cancelled
         );
     }
 
     #[test]
-    fn disconnect_abort_and_driver_failure_have_truthful_terminal_states() {
-        assert_eq!(
-            WorkspaceSessionState::Running.after_worker_exit(&Ok(LoopEnd::Aborted)),
-            WorkspaceSessionState::Cancelled
-        );
-        assert_eq!(
-            WorkspaceSessionState::Running.after_worker_exit(&Ok(LoopEnd::DriverError)),
-            WorkspaceSessionState::Failed
-        );
-        assert_eq!(
-            WorkspaceSessionState::Running.after_worker_exit(&Err("startup failed".to_string())),
-            WorkspaceSessionState::Failed
-        );
+    fn automatic_compaction_uses_exact_context_threshold_and_minimum_turns() {
+        assert!(!should_auto_compact(3, 2_800, 512, 4_096));
+        assert!(!should_auto_compact(4, 2_559, 512, 4_096));
+        assert!(should_auto_compact(4, 2_560, 512, 4_096));
+        assert!(!should_auto_compact(100, 4_096, 0, 0));
     }
 
     #[test]
@@ -652,11 +1783,21 @@ mod tests {
                 id: "session-test".to_string(),
                 workspace: PathBuf::from("."),
                 model_id: "model-test".to_string(),
+                max_steps: 1,
+                max_tokens: 1,
+                temperature: 0.0,
+                allow_writes: true,
+                memory: WorkspaceMemoryStore::open(std::env::temp_dir().join(format!(
+                    "camelid-workspace-state-test-{}.sqlite3",
+                    uuid::Uuid::new_v4()
+                )))
+                .unwrap(),
                 state: StdMutex::new(state),
                 events: StdMutex::new(Some(events)),
                 worker: StdMutex::new(Some(worker)),
                 run_config: StdMutex::new(None),
-                control,
+                control: StdMutex::new(Some(control)),
+                current_turn: StdMutex::new(None),
             })
         };
 
@@ -669,14 +1810,106 @@ mod tests {
             .unwrap()
             .blocks_model_transition());
 
-        let finished = Some(make_session(WorkspaceSessionState::Finished));
+        let finished = Some(make_session(WorkspaceSessionState::Idle));
         assert_eq!(
             WorkspaceSessionManager::active_state(&finished),
-            Some(WorkspaceSessionState::Finished)
+            Some(WorkspaceSessionState::Idle)
         );
         assert!(!WorkspaceSessionManager::active_state(&finished)
             .unwrap()
             .blocks_model_transition());
+    }
+
+    #[test]
+    fn duplicate_pending_message_resolves_to_the_installed_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = WorkspaceMemoryStore::open(dir.path().join("memory.sqlite3")).unwrap();
+        let (initial_worker, initial_client) = bridge(1);
+        let (_initial_events, initial_control) = initial_client.into_parts();
+        let session = ActiveWorkspaceSession {
+            id: "thread".into(),
+            workspace: dir.path().to_path_buf(),
+            model_id: "model".into(),
+            max_steps: 1,
+            max_tokens: 1,
+            temperature: 0.0,
+            allow_writes: true,
+            memory,
+            state: StdMutex::new(WorkspaceSessionState::Idle),
+            events: StdMutex::new(None),
+            worker: StdMutex::new(Some(initial_worker)),
+            run_config: StdMutex::new(None),
+            control: StdMutex::new(Some(initial_control)),
+            current_turn: StdMutex::new(None),
+        };
+        let config = WorkspaceRunConfig {
+            addr: "127.0.0.1:8181".parse().unwrap(),
+            workspace: dir.path().to_path_buf(),
+            goal: "question".into(),
+            client_message_id: "message-1".into(),
+            turn_index: 3,
+            memory: Default::default(),
+            model_id: "model".into(),
+            family: "qwen3".into(),
+            max_steps: 1,
+            max_tokens: 1,
+            temperature: 0.0,
+        };
+        let (worker, client) = bridge(1);
+        let (events, control) = client.into_parts();
+        assert!(matches!(
+            session.install_turn(events, worker, config.clone(), control),
+            Ok(InstallTurn::Installed)
+        ));
+        assert!(!session.finish_turn_if_current("stale-message", TurnCompletion::Idle));
+        assert_eq!(
+            session.state.lock().map(|state| *state).unwrap(),
+            WorkspaceSessionState::WaitingForEvents
+        );
+        assert_eq!(session.pending_message("message-1"), Some(3));
+        let (duplicate_worker, duplicate_client) = bridge(1);
+        let (duplicate_events, duplicate_control) = duplicate_client.into_parts();
+        assert!(matches!(
+            session.install_turn(
+                duplicate_events,
+                duplicate_worker,
+                config,
+                duplicate_control
+            ),
+            Ok(InstallTurn::Duplicate(3))
+        ));
+        assert!(session.finish_turn_if_current("message-1", TurnCompletion::Idle));
+        assert_eq!(
+            session.state.lock().map(|state| *state).unwrap(),
+            WorkspaceSessionState::Idle
+        );
+    }
+
+    #[test]
+    fn cancelled_turn_completion_remains_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = WorkspaceMemoryStore::open(dir.path().join("memory.sqlite3")).unwrap();
+        let session = ActiveWorkspaceSession {
+            id: "thread".into(),
+            workspace: dir.path().to_path_buf(),
+            model_id: "model".into(),
+            max_steps: 1,
+            max_tokens: 1,
+            temperature: 0.0,
+            allow_writes: false,
+            memory,
+            state: StdMutex::new(WorkspaceSessionState::Cancelled),
+            events: StdMutex::new(None),
+            worker: StdMutex::new(None),
+            run_config: StdMutex::new(None),
+            control: StdMutex::new(None),
+            current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+        };
+        assert!(session.finish_turn_if_current("message-1", TurnCompletion::Idle));
+        assert_eq!(
+            session.state.lock().map(|state| *state).unwrap(),
+            WorkspaceSessionState::Cancelled
+        );
     }
 
     #[test]

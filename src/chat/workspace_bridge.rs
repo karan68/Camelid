@@ -13,23 +13,56 @@ use std::{net::SocketAddr, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::agent::{
-    run_loop, AgentConfig, AgentMsg, Approver, Decision, LiveDriver, LoopEnd, Policy, Reporter,
+    run_loop, AgentConfig, AgentMsg, Approver, ContextBudgetUsage, Decision, LiveDriver, LoopEnd,
+    ModelStepMetrics, Policy, Reporter,
 };
 use super::audit::NoopSink;
 use super::client::Client;
 use super::shell_sandbox::ShellSandbox;
-use super::tools::{self, Action, Sandbox, ToolOutcome, ToolProfile};
+use super::tools::{Action, Sandbox, ToolOutcome, ToolProfile};
+use super::workspace_memory::MemoryContext;
 
 const APPROVAL_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
+const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum WorkspaceEvent {
     #[serde(rename = "session.started")]
     Started { workspace: String, model_id: String },
+    #[serde(rename = "turn.started")]
+    TurnStarted { turn_index: u32 },
+    #[serde(rename = "memory.updated")]
+    MemoryUpdated {
+        prompt_tokens: u32,
+        generation_tokens: u32,
+        budget_total: u32,
+        system_tokens_estimate: u32,
+        tool_definition_tokens_estimate: u32,
+        message_tokens_estimate: u32,
+        recent_memory_tokens_estimate: u32,
+        retrieved_memory_tokens_estimate: u32,
+        evidence_memory_tokens_estimate: u32,
+        tool_result_tokens_estimate: u32,
+    },
+    #[serde(rename = "memory.compacted")]
+    MemoryCompacted {
+        compacted_through_turn: Option<u32>,
+        archived_turns: u32,
+        compaction_count: u32,
+        trigger_tokens: u32,
+        budget_total: u32,
+    },
     #[serde(rename = "model.delta")]
     ModelDelta { content: String },
+    #[serde(rename = "model.timing")]
+    ModelTiming {
+        total_ms: u64,
+        ttft_ms: Option<u64>,
+        output_tokens: Option<u32>,
+    },
     #[serde(rename = "model.answer")]
     ModelAnswer { content: String },
     #[serde(rename = "tool.call")]
@@ -74,6 +107,7 @@ pub(crate) struct WorkspaceBridgeWorker {
     pub reporter: WorkspaceReporter,
     pub approver: WorkspaceApprover,
     pub cancel: Arc<AtomicBool>,
+    pub delivery_failed: Arc<AtomicBool>,
 }
 
 pub(crate) struct WorkspaceBridgeClient {
@@ -83,10 +117,14 @@ pub(crate) struct WorkspaceBridgeClient {
     pending_approval: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct WorkspaceRunConfig {
     pub addr: SocketAddr,
     pub workspace: PathBuf,
     pub goal: String,
+    pub client_message_id: String,
+    pub turn_index: u32,
+    pub memory: MemoryContext,
     pub model_id: String,
     pub family: String,
     pub max_steps: usize,
@@ -186,20 +224,24 @@ fn bridge_with_timeout(
     let (event_tx, event_rx) = sync_channel(capacity);
     let (decision_tx, decision_rx) = sync_channel(1);
     let cancel = Arc::new(AtomicBool::new(false));
+    let delivery_failed = Arc::new(AtomicBool::new(false));
     let pending_approval = Arc::new(Mutex::new(None));
     (
         WorkspaceBridgeWorker {
             reporter: WorkspaceReporter {
                 events: event_tx.clone(),
+                delivery_failed: Arc::clone(&delivery_failed),
             },
             approver: WorkspaceApprover {
                 events: event_tx,
                 decisions: decision_rx,
                 cancel: Arc::clone(&cancel),
+                delivery_failed: Arc::clone(&delivery_failed),
                 pending_approval: Arc::clone(&pending_approval),
                 approval_timeout,
             },
             cancel: Arc::clone(&cancel),
+            delivery_failed,
         },
         WorkspaceBridgeClient {
             events: event_rx,
@@ -213,13 +255,16 @@ fn bridge_with_timeout(
 #[derive(Clone)]
 pub(crate) struct WorkspaceReporter {
     events: SyncSender<WorkspaceEvent>,
+    delivery_failed: Arc<AtomicBool>,
 }
 
 impl WorkspaceReporter {
     fn send(&self, event: WorkspaceEvent) {
         // A bounded blocking send provides backpressure without unbounded memory.
         // A dropped receiver ends delivery; the agent loop remains cancellable.
-        let _ = self.events.send(event);
+        if self.events.send(event).is_err() {
+            self.delivery_failed.store(true, Ordering::Release);
+        }
     }
 
     fn model_delta(&self, content: &str) {
@@ -255,12 +300,36 @@ impl Reporter for WorkspaceReporter {
             content: text.to_string(),
         });
     }
+
+    fn context_budget(&mut self, usage: ContextBudgetUsage) {
+        self.send(WorkspaceEvent::MemoryUpdated {
+            prompt_tokens: usage.prompt_tokens,
+            generation_tokens: usage.generation_tokens,
+            budget_total: usage.budget_tokens,
+            system_tokens_estimate: usage.system_tokens_estimate,
+            tool_definition_tokens_estimate: usage.tool_definition_tokens_estimate,
+            message_tokens_estimate: usage.message_tokens_estimate,
+            recent_memory_tokens_estimate: usage.recent_memory_tokens_estimate,
+            retrieved_memory_tokens_estimate: usage.retrieved_memory_tokens_estimate,
+            evidence_memory_tokens_estimate: usage.evidence_memory_tokens_estimate,
+            tool_result_tokens_estimate: usage.tool_result_tokens_estimate,
+        });
+    }
+
+    fn model_timing(&mut self, metrics: ModelStepMetrics) {
+        self.send(WorkspaceEvent::ModelTiming {
+            total_ms: metrics.total_ms,
+            ttft_ms: metrics.ttft_ms,
+            output_tokens: metrics.output_tokens,
+        });
+    }
 }
 
 pub(crate) struct WorkspaceApprover {
     events: SyncSender<WorkspaceEvent>,
     decisions: Receiver<WorkspaceDecision>,
     cancel: Arc<AtomicBool>,
+    delivery_failed: Arc<AtomicBool>,
     pending_approval: Arc<Mutex<Option<String>>>,
     approval_timeout: Duration,
 }
@@ -288,6 +357,7 @@ impl Approver for WorkspaceApprover {
             detail: action.approval_detail(sandbox),
         };
         if self.events.send(event).is_err() {
+            self.delivery_failed.store(true, Ordering::Release);
             self.clear_pending();
             return Decision::Abort;
         }
@@ -344,15 +414,25 @@ pub(crate) fn run_live(
         }
     };
     worker.reporter.send(WorkspaceEvent::Started {
-        workspace: sandbox.root().display().to_string(),
+        workspace: sandbox.root_display(),
         model_id: config.model_id.clone(),
     });
+    worker.reporter.send(WorkspaceEvent::TurnStarted {
+        turn_index: config.turn_index,
+    });
 
-    let tools = tools::specs_for(ToolProfile::WorkspaceFiles, false, ShellSandbox::Disabled);
-    let mut history = vec![
-        AgentMsg::System(super::agent::system_prompt(&sandbox, &tools)),
-        AgentMsg::User(config.goal),
-    ];
+    let system = super::agent::workspace_system_prompt(&sandbox);
+    let mut history = vec![AgentMsg::System(system)];
+    if let Some(memory) = render_relevant_memory(&config.memory.relevant) {
+        history.push(AgentMsg::Memory(memory));
+    }
+    if let Some(memory) = render_evidence_memory(&config.memory.evidence) {
+        history.push(AgentMsg::Memory(memory));
+    }
+    if let Some(memory) = render_recent_memory(&config.memory.recent) {
+        history.push(AgentMsg::Memory(memory));
+    }
+    history.push(AgentMsg::User(config.goal));
     let mut driver = LiveDriver::with(
         Client::new(config.addr),
         config.model_id,
@@ -360,6 +440,8 @@ pub(crate) fn run_live(
         config.max_tokens,
         config.temperature,
     );
+    driver.set_context_budget(Some(WORKSPACE_CONTEXT_BUDGET_TOKENS));
+    driver.set_stream_control(Arc::clone(&worker.cancel), WORKSPACE_MODEL_STEP_TIMEOUT);
     let delta_reporter = worker.reporter.clone();
     driver.set_delta_sink(Some(Box::new(move |delta| {
         delta_reporter.model_delta(delta);
@@ -376,7 +458,7 @@ pub(crate) fn run_live(
         temperature: config.temperature,
         audit: Box::new(NoopSink),
         shell_sandbox: ShellSandbox::Disabled,
-        tool_profile: ToolProfile::WorkspaceFiles,
+        tool_profile: ToolProfile::WorkspaceReadOnly,
     };
     let end = run_loop(
         &mut driver,
@@ -397,6 +479,48 @@ pub(crate) fn run_live(
     };
     worker.reporter.send(WorkspaceEvent::Finished { outcome });
     Ok(end)
+}
+
+fn render_relevant_memory(relevant: &[super::workspace_memory::StoredTurn]) -> Option<String> {
+    if relevant.is_empty() {
+        return None;
+    }
+    let mut rendered = String::from("Relevant earlier conversation excerpts:\n");
+    for turn in relevant {
+        rendered.push_str(&format!(
+            "- Earlier user: {}\n  Earlier assistant: {}\n",
+            turn.user_text, turn.assistant_text
+        ));
+    }
+    Some(rendered)
+}
+
+fn render_recent_memory(recent: &[super::workspace_memory::StoredTurn]) -> Option<String> {
+    if recent.is_empty() {
+        return None;
+    }
+    let mut rendered = String::from("Recent conversation excerpts:\n");
+    for turn in recent {
+        rendered.push_str(&format!(
+            "- Earlier user: {}\n  Earlier assistant: {}\n",
+            turn.user_text, turn.assistant_text
+        ));
+    }
+    Some(rendered)
+}
+
+fn render_evidence_memory(evidence: &[super::workspace_memory::StoredEvidence]) -> Option<String> {
+    if evidence.is_empty() {
+        return None;
+    }
+    let mut rendered = String::from("Evidence recorded for selected earlier turns:\n");
+    for entry in evidence {
+        rendered.push_str(&format!(
+            "- Tool: {}\n  Call: {}\n  Observation: {}\n  SHA-256: {}\n",
+            entry.tool, entry.detail, entry.observation, entry.observation_sha256
+        ));
+    }
+    Some(rendered)
 }
 
 #[cfg(test)]

@@ -45,6 +45,7 @@ mod win_job;
 #[cfg(windows)]
 mod win_uia;
 pub(crate) mod workspace_bridge;
+pub(crate) mod workspace_memory;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
