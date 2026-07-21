@@ -1011,6 +1011,7 @@ struct ListDirArg {
 /// Validate a parsed tool call against the schema + sandbox. Returns a typed
 /// error string (→ tool-error result the model can recover from) rather than
 /// panicking, for unknown tools, bad args, or sandbox escapes.
+#[cfg(any(windows, test))]
 pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
     validate_for(ToolProfile::Full, call, sandbox)
 }
