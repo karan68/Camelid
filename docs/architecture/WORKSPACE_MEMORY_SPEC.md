@@ -80,7 +80,7 @@ The Web Agent Workspace is a **single‑shot, bounded agent task** over one loca
 
 - The user picks **one canonical directory** and **one goal**, then Starts.
 - A plan‑act‑observe agent loop runs with exactly five file tools (see §2.3), read‑only tools auto‑run, every write is approval‑gated.
-- When the loop ends, the session is over. There is **no follow‑up turn and no memory** — each Start is a fresh session. The design doc `docs/architecture/WEB_AGENT_WORKSPACE_PLAN.md` explicitly lists **"background persistence"** as *out of scope* for the first release, so the absence of memory is intentional for v1, not an accident.
+- When the loop ends, the session is over. There is **no follow‑up turn and no memory** — each Start is a fresh session. The original 2026‑07‑17 Workspace design treated **"background persistence"** as *out of scope* for the first release, so the absence of memory was intentional for v1, not an accident.
 
 ### 1.2 The product gap
 Users' natural mental model is **"chat with my folder"** — ask, get an answer, then follow up ("tell me more", "now look at the architecture folder"), with the assistant remembering the conversation. The current one‑shot model does not support this. The missing primitive is **conversational memory (continuity)**, both **within a session** (multi‑turn) and **across sessions** (resumable).

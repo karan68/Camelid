@@ -1,233 +1,215 @@
-# Web Agent Workspace Plan
+# Web Workspace Feature Plan
 
-Status: executable plan. Each stage must pass its gate before the next stage starts.
+**Status:** Implemented preview feature on `feat/web-agent-workspace`; not production-promoted.
+**Last verified:** 2026-07-22.
 
-Execution status (2026-07-17):
+## Purpose
 
-- Stage 0: complete — contract and adversarial architecture review.
-- Stage 1: complete — shared agent core, exact five-tool profile, bounded bridge,
-  approval identity/timeout/cancellation tests.
-- Stage 2: complete — loopback-authorized one-session API, exact earned-model
-  gate, SSE/decision/cancel routes, and model-transition exclusion.
-- Stage 3: complete — first-class operational Workspace view, exact eligibility,
-  responsive timeline, and production frontend build.
-- Stage 4: complete — live event reducer, approval modal, intentional-close
-  handling, desktop/mobile overflow and control-size gates.
-- Stage 5: complete — exact `Qwen3-4B-Q4_K_M.gguf` was acquired from the pinned
-  official revision and verified at 2,497,280,256 bytes / SHA-256
-  `7485fe6f…fdf5`. The fail-closed harness passed multi-step
-  list/read/search, denied-write no-mutation, approved exact-content write, an
-  unchanged outside-root canary, and real approval/terminal WebUI capture. The
-  bundle is `qa/evidence-bundles/workspace-qwen3-4b-q4km-20260717T165404Z-head-8c2a2b74/`.
+Web Workspace is an additive Camelid feature, not a product rebrand or a replacement for Chat, the CLI/TUI agent, model management, or the OpenAI-compatible API.
 
-## Product boundary
+It lets a user select one local directory and hold a resumable, multi-turn conversation about the files in that directory. The browser owns presentation only. The server owns authorization, canonical path confinement, model eligibility, tool selection, context budgeting, persistence, and cancellation.
 
-Camelid Workspace lets a user give a tool-capable local model one canonical
-directory and one goal. The model may inspect that directory, propose changes,
-and apply a write only after explicit user approval. The browser is a view and
-approval surface; all path validation and tool execution remain server-side.
+## Current Product Boundary
 
-The first release supports:
+Workspace provides:
 
-- one active workspace session per Camelid process;
-- exact model rows whose capability contract has `tool_capable: true`;
-- directory listing, bounded file reads, bounded search, and approval-gated
-  file writes inside one canonical workspace root;
-- a bounded plan-act-observe loop, live activity events, cancellation, and a
-  final answer;
-- `allow once`, `always allow this tool for this session`, `deny`, and `abort`
-  decisions at the existing approval-policy chokepoint.
+- one canonical local directory per conversation;
+- one active Workspace session per Camelid process;
+- follow-up messages after a completed turn;
+- explicit resume and deletion of saved conversations;
+- local SQLite/FTS5 episodic memory;
+- exact prompt budgeting and a context inspector;
+- automatic and manual reversible compaction;
+- deterministic, evidence-backed file inventories;
+- bounded SSE activity and turn-scoped cancellation;
+- exact-model eligibility through the existing `tool_capable` capability contract.
 
-The first release does not expose shell execution, unrestricted filesystem
-access, network access, GUI control, subagents, unattended approval, or
-background persistence. Those capabilities remain available only on their
-existing CLI/TUI surfaces and are not implied by Workspace.
+Workspace is strictly read-only. Its advertised tool profile contains exactly:
 
-## Invariants
+- `read_file`;
+- `list_dir`;
+- literal-content `search`.
 
-1. **Exact capability gate.** Starting a session requires the active loaded
-   model to match a supported compatibility row with `tool_capable: true`.
-2. **Loopback management boundary.** Workspace routes are unavailable when the
-  server is bound to a non-loopback address. Every route requires a loopback
-  `Host` plus either `Sec-Fetch-Site: same-origin` or an `Origin` whose host is
-  loopback. This mirrors the reviewed local-management predicate from PR #447,
-  including the separate loopback frontend/backend ports used in development.
-3. **Server-owned sandbox.** The server canonicalizes the workspace root once.
-   Clients never authorize paths or submit prevalidated actions.
-4. **One approval chokepoint.** `agent::run_loop` remains the only place that
-   decides whether an action executes. The HTTP bridge implements `Approver`;
-   it does not bypass `ApprovalPolicy` or call tools directly.
-5. **Fail closed on disconnect.** If the event consumer disappears while an
-   approval is pending, the action is denied and the session is aborted.
-6. **Bounded operation.** Session count, steps, event backlog, read/output
-  sizes, and model output remain bounded. At most one session record exists;
-  its terminal state remains inspectable until the next session replaces it.
-7. **Model lifecycle exclusion.** An active Workspace session prevents every
-  load or unload through the current main load/unload chokepoints. Stage 2 adds
-  this Workspace-owned gate directly; it does not depend on PR #447 merging.
-  If #447 lands first, the gate composes with its broader lifecycle lease
-  instead of creating a second model-lifecycle protocol.
-8. **No support widening.** Workspace availability is a product surface over
-   existing `tool_capable` evidence. It does not promote a model, quant,
-   platform, backend, or context window.
+Workspace does not expose writes, edits, shell commands, network access, GUI control, subagents, or unattended execution. A legacy request with `allow_writes: true` fails with typed `400 workspace_read_only` before path or model access.
 
-## HTTP contract
+The CLI/TUI agent remains a separate preview surface with its existing broader, approval-gated capabilities.
 
-All routes are under `/api/agent/workspace` and return Camelid's existing error
-envelope on failure.
+## Governing Invariants
 
-### Create
+1. **Additive surface.** Removing the Workspace routes, view, memory module, and capability entry restores the prior product without changing ordinary Chat or CLI/TUI agent behavior.
+2. **Exact model gate.** The loaded artifact must match an existing supported row with `tool_capable: true`. Saved threads also bind the model ID and exact GGUF SHA-256.
+3. **Loopback management boundary.** Workspace routes require a loopback-bound server, a loopback `Host`, and same-origin fetch metadata or an allowed loopback `Origin`.
+4. **Server-owned sandbox.** The server canonicalizes the selected root. Every tool path is resolved under that root and escapes fail closed.
+5. **Read-only enforcement at both layers.** The API rejects legacy write mode, and `ToolProfile::WorkspaceReadOnly` advertises and validates only the three read tools.
+6. **Untrusted observations.** Persisted conversation memory and tool evidence enter prompts as user-role, explicitly untrusted data, never as system policy.
+7. **Bounded execution.** Steps, generation, events, tool output, retained evidence, memory context, and total prompt-plus-generation tokens are capped.
+8. **No partial durable turn.** Cancellation or failure during a model step cannot persist a partial assistant answer.
+9. **No support widening.** Workspace availability does not promote a model, quantization, backend, platform, context window, or latency claim.
 
-`POST /api/agent/workspace/sessions`
+## HTTP Surface
 
-```json
-{
-  "workspace": "C:\\projects\\example",
-  "goal": "Find the failing test and make the smallest repair.",
-  "max_steps": 12,
-  "max_tokens": 800,
-  "temperature": 0.0
-}
-```
+All routes are under `/api/agent/workspace` and use Camelid's normal typed error envelope.
 
-The server returns `201` with the session id, canonical workspace display path,
-active model id, state, and limits. A second active session returns typed `409`.
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/models` | List exact eligible model artifacts and fit state |
+| `GET` | `/browse` | Browse local directories for the folder picker |
+| `GET` | `/threads?workspace=...` | List saved threads for the canonical root and active exact model |
+| `GET` | `/threads/:id?workspace=...` | Load a saved transcript and metadata |
+| `DELETE` | `/threads/:id?workspace=...` | Delete saved thread memory when it is not active |
+| `POST` | `/threads/:id/compact?workspace=...` | Compact completed turns |
+| `DELETE` | `/threads/:id/compact?workspace=...` | Undo the most recent compaction |
+| `POST` | `/sessions` | Start a new thread or explicitly resume one |
+| `GET` | `/sessions/:id` | Read non-sensitive session state and context capacity |
+| `GET` | `/sessions/:id/events` | Claim the bounded SSE stream for the pending turn |
+| `POST` | `/sessions/:id/messages` | Send an idempotent follow-up message |
+| `DELETE` | `/sessions/:id` | Request cooperative cancellation |
+| `POST` | `/sessions/:id/decisions` | Shared bridge compatibility route; current read-only tools do not request approval |
 
-### Events
+A create request includes the root, first goal, optional saved `thread_id`, and bounded step/generation settings. A follow-up includes both text and a caller-generated `client_message_id`; duplicate IDs return the existing turn rather than inserting it twice.
 
-`GET /api/agent/workspace/sessions/:id/events`
+## Turn Lifecycle
 
-SSE event types:
+The active session state is one of:
 
-- `session.started`
-- `model.delta`
-- `tool.call`
-- `approval.required`
-- `tool.result`
-- `model.answer`
-- `session.notice`
-- `session.finished`
-- `session.error`
+- `waiting_for_events`;
+- `running`;
+- `idle`;
+- `cancelling`;
+- `cancelled`;
+- `failed`.
 
-Every event has a monotonically increasing sequence number and session id.
-Approval events include an opaque approval id, risk, tool name, and validated
-human-readable detail. Raw tool arguments are never used as authorization.
+A new or follow-up turn is installed as `waiting_for_events`. Claiming its event stream moves it to `running`. A successful persisted answer returns the session to `idle`, where it no longer blocks model transitions and can accept another message. Cancellation preserves `cancelled` even when it races event-stream claim or worker completion. A failed turn becomes `failed`.
 
-### Decision
+Only `waiting_for_events`, `running`, and `cancelling` block model load or unload transitions.
 
-`POST /api/agent/workspace/sessions/:id/decisions`
+The SSE event vocabulary is:
 
-```json
-{ "approval_id": "...", "decision": "allow_once" }
-```
+- `session.started`;
+- `turn.started`;
+- `memory.updated`;
+- `memory.compacted`;
+- `model.delta`;
+- `model.timing`;
+- `model.answer`;
+- `tool.call`;
+- `approval.required` (shared bridge compatibility; not expected for the read-only profile);
+- `tool.result`;
+- `session.notice`;
+- `session.finished`;
+- `session.error`.
 
-Accepted decisions are `allow_once`, `always_tool`, `deny`, and `abort`. A
-stale, duplicate, or wrong-session approval id returns typed `409`.
+Every envelope carries a session ID and monotonically increasing sequence number.
 
-### Cancel and inspect
+## Local Conversation Memory
 
-- `DELETE /api/agent/workspace/sessions/:id` requests cooperative cancellation.
-- `GET /api/agent/workspace/sessions/:id` returns state and non-sensitive
-  counters, never tool output or raw arguments.
+`src/chat/workspace_memory.rs` owns an app-managed SQLite schema at:
 
-## Stages and gates
+- `%LOCALAPPDATA%\camelid\workspace-memory.sqlite3` on Windows;
+- `$XDG_DATA_HOME/camelid/workspace-memory.sqlite3` or the standard home fallback elsewhere;
+- `CAMELID_WORKSPACE_MEMORY_DB` when an isolated path is explicitly configured.
 
-### Stage 0 - Contract and architecture
+Schema v4 stores:
 
-- Freeze this plan and verify the current agent, API, lifecycle, and frontend
-  ownership boundaries.
-- Record conflicts with active upstream work before code starts.
+- threads keyed by ID, canonical root, model ID, and model SHA-256;
+- idempotent ordered turns keyed by `client_message_id`;
+- bounded tool evidence with SHA-256 observation integrity checks;
+- reversible compaction boundaries and history;
+- an FTS5 index over user and assistant turn text.
 
-Gate: plan review finds no route that executes a tool outside `run_loop`, no
-browser-owned path validation, and no capability claim beyond existing rows.
+Writes use immediate transactions. Unknown newer schema versions and malformed current schemas fail closed. Foreign keys use cascade deletion and connections enable WAL mode with a bounded busy timeout.
 
-### Stage 1 - Reusable bridge core
+For a turn, memory retrieval keeps up to three recent uncompacted turns, lexically retrieves up to six older relevant turns, then includes bounded evidence associated with selected turns. Raw unbounded tool output, hidden reasoning, and approval grants are not persisted.
 
-- Move or expose only the minimum agent-core types needed by both the CLI/TUI
-  and server without making UI code a library dependency.
-- Add an explicit tool profile to `run_loop`: the existing CLI/TUI profile is
-  unchanged, while `WorkspaceFiles` contains exactly `read_file`, `list_dir`,
-  `search`, `write_file`, and `edit_file`. The profile is the source of the
-  advertised schemas and validation allowlist; global subagent state and
-  platform system tools cannot widen it.
-- Add a bounded event reporter and channel-backed approver around `run_loop`.
-- Keep the bridge independent of Axum and test it with a mock model driver.
+Compaction changes which completed turns are always recent; it does not delete their transcript, FTS entry, or evidence. Undo restores the previous boundary. Automatic compaction runs only after a successful durable turn when there are at least four turns and exact prompt plus reserved generation reaches 75% of the Workspace envelope.
 
-Gate: focused tests prove that reads may auto-run, writes block, denial does not
-execute, explicit approval executes once, cancellation stops the loop, and the
-step cap is enforced.
+## Exact Context Budget
 
-### Stage 2 - Secured session API
+Workspace uses a static total envelope of 4,096 tokens:
 
-- Add the one-session manager to `AppState`.
-- Add create/events/decision/status/cancel routes.
-- Enforce loopback bind plus the reviewed local-management authorization
-  predicate (`Host` loopback and either same-origin fetch metadata or a
-  loopback `Origin`).
-- Gate the active model against the compatibility contract.
-- Add a Workspace operation lease and check it at
-  `load_model_from_path_with_activation` and `unload_model`, the current main
-  transition chokepoints, for the complete session.
+- default generation reserve: 512 tokens;
+- maximum generation reserve: 1,024 tokens;
+- default agent steps: 12;
+- maximum agent steps: 32;
+- maximum first goal: 4 KiB.
 
-Gate: focused router tests cover authorization, malformed requests, inaccessible
-roots, non-tool-capable models, active-session conflict, stale decisions,
-cancellation, event ordering, and disconnect during approval. Rust format,
-Clippy for touched targets, and focused library tests pass.
+Before every model step, Camelid renders the real chat template with the actual tool schemas and tokenizer. The required system policy, current user message, and latest native tool call/result pair stay intact. Earlier tool exchanges are reduced to bounded observations. If the request is too large, optional memory is removed first, followed by complete older user/assistant turn pairs. If required content still cannot fit, the turn fails instead of overflowing.
 
-### Stage 3 - Workspace UI shell
+The Workspace request carries the private `camelid_context_budget_tokens` field. The generation server independently verifies prompt tokens plus requested generation against that ceiling, so the UI/agent compiler is not the sole guard.
 
-- Add a first-class `Workspace` view beside Chat, not a marketing page.
-- Show the selected root, active exact model, capability state, goal composer,
-  limits, activity timeline, and a quiet empty state.
-- Match the existing typography, spacing, controls, evidence language, and
-  responsive shell. Do not add decorative cards, gradients, or explanatory
-  feature copy.
+`memory.updated` reports exact prompt tokens, generation reserve, and total budget. Its category split for system, tools, messages, recent memory, retrieved memory, evidence, and current tool results is an estimate that reconciles to the exact prompt total; it is not separate tokenizer accounting for each category.
 
-Gate: frontend state and rendering smokes cover eligible, ineligible, running,
-terminal, reconnect, and error states. Production build passes.
+## Grounded File Answers
 
-### Stage 4 - Approval and live execution UX
+File-inspection requests must obtain a successful observation before the final answer. The model cannot turn a positive observation into an unsupported absence claim.
 
-- Connect SSE events to the timeline.
-- Present approval as a focused modal with exact validated action detail.
-- Implement allow once, always for this tool, deny, abort, and stop.
-- Prevent duplicate decisions and make reconnect behavior explicit.
+For immediate non-recursive extension inventories, Camelid derives the answer from successful `list_dir` output:
 
-Gate: end-to-end browser tests prove no write before approval, denied writes do
-not occur, approved writes remain inside the root, stop prevents later tools,
-and ordinary Chat is unchanged. Desktop and 390x844 layouts have no overflow or
-overlap.
+- matching filenames are case-folded for deduplication;
+- results are lexically sorted;
+- directories and nonmatching entries are excluded;
+- the result is rendered as stable Markdown bullets;
+- nested-folder scope and truncation are disclosed;
+- empty results are grounded in the observation;
+- control characters, percent signs, and backticks are represented safely.
 
-### Stage 5 - Real-model closure and release truth
+Directory listing retains at most 4,096 observed entries and explicitly says when additional entries cannot be paged. Reads, searches, pages, hits, and observations are separately bounded; Workspace observations are clipped before history insertion.
 
-- Run a certified `tool_capable` exact row through read, search, denied-write,
-  and approved-write scenarios against a disposable workspace.
-- Capture a privacy-scrubbed evidence bundle with request/event summaries,
-  filesystem before/after hashes, model identity, and UI screenshots.
-- Add the bounded Workspace API feature to the capability contract and
-  regenerate the ledger only after the real-model gate passes.
-- Update README and compatibility wording with explicit non-claims.
+## Cancellation and Deadlines
 
-Gate: full Rust gates, ledger drift/schema checks, frontend build/smokes,
-privacy scrub, and the disposable real-model scenario all pass. No user files
-outside the disposable root are touched.
+Cancellation is turn-scoped rather than process-global. The model client uses an absolute 90-second deadline covering both HTTP header wait and SSE body streaming, with periodic wakeups to observe cancellation.
 
-## Design review checklist
+The agent checks cancellation before work and again after each model step. If cancellation arrives during streaming, partial text is discarded before reporting a final answer or committing a turn. The API also protects cancellation state from stale worker completion and event-claim races.
 
-- Workspace is an operational surface, not a landing page.
-- The activity timeline is dense and scannable; individual tool operations are
-  rows, not nested cards.
-- Risk is communicated by action-specific language and icons, not alarm colors
-  everywhere.
-- Approval controls have stable dimensions and remain reachable on mobile.
-- File paths wrap safely and never force horizontal page scrolling.
-- Empty, loading, reconnecting, denied, cancelled, capped, failed, and completed
-  states are all designed explicitly.
-- The UI never labels an unverified model as agent-capable and never hides why a
-  session cannot start.
+Dropping the event stream requests cancellation. A failed cancellation request is shown as an error in the UI and is never mislabeled as stopped.
 
-## Rollback
+## Frontend Behavior
 
-Workspace is additive. Removing its routes, manager field, view, and capability
-entry restores the previous product without changing chat generation, model
-loading, tool execution, or the CLI/TUI agent.
+Workspace is a normal operational view in the existing Web UI. It adds:
+
+- a canonical folder picker and exact-model eligibility state;
+- a transcript with user and assistant turns;
+- a follow-up composer while the thread is idle;
+- saved-thread resume and delete actions;
+- a collapsible activity history for tool/model events;
+- a context inspector with exact budget, estimated categories, model timing, resident CUDA status when available, and Compact/Undo controls;
+- responsive desktop and mobile layouts.
+
+The Web UI contains no write toggle or write-approval workflow. Clearing the active view does not silently delete saved memory; deletion is explicit.
+
+## Validation
+
+The branch is covered by:
+
+- focused agent, tool, memory, cancellation, budget, inventory, and rendering unit tests;
+- eight Workspace HTTP integration tests, including authorization, inaccessible roots, model gating, follow-up routing, and fail-closed legacy write mode;
+- frontend build, reducer, Markdown, integration, and deterministic browser UI smokes;
+- desktop and 390x844 mobile checks for overflow, overlap, list spacing, compaction, Undo, and cancellation failure display;
+- the full macOS, Ubuntu all-features, Windows, desktop, frontend, public-scrub, validation-script, and final CI gates.
+
+Exact-model receipts use the pinned 2,497,280,256-byte `Qwen3-4B-Q4_K_M.gguf` with SHA-256 `7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5` on an RTX 4060 Laptop GPU with all 36 layers resident. They cover multi-turn recall, idempotency, explicit resume, reversible compaction, FTS recall, sustained follow-ups, and cancellation races with no partial persisted turn.
+
+The historical bundle `qa/evidence-bundles/workspace-qwen3-4b-q4km-20260717T165404Z-head-8c2a2b74/` records the earlier write-capable prototype. It remains an auditable historical receipt but does not define the current read-only product boundary.
+
+## Known Limits and Non-Claims
+
+This preview does not claim:
+
+- production-ready interactive latency;
+- a population-level latency or retrieval-recall SLA;
+- per-request proof of resident GPU execution versus CPU fallback;
+- dynamic selection of the 4,096-token envelope from device capacity;
+- prefix reuse or appendable GPU KV sessions;
+- semantic or embedding-based retrieval;
+- recursive inventory without explicit bounded observation;
+- support for neighboring models, quantizations, or hardware paths.
+
+On the measured sustained exact-model run, follow-up elapsed p50 was 15.110 seconds and p95/max was 18.299 seconds; TTFT p95 was 17.593 seconds. Repeated prompt prefill remains the main limitation. These are single-host measurements, not a production SLA.
+
+The final exact-model rerun after narrowing hostile-filename display encoding was blocked locally by enterprise Code Integrity rejecting newly linked executable hashes. Compiler, renderer, and CI coverage pass, but that final model-backed rerun must not be claimed.
+
+## Release and Rollback
+
+Workspace remains labeled preview until its latency, retrieval, and execution-path evidence meet the project's promotion standard. Public claims must stay narrower than the receipts above.
+
+Rollback is additive: remove the Workspace routes and manager from `src/api`, the Workspace bridge/memory modules, the Web UI view and styles, and the `web_workspace` capability entry. Ordinary Chat, model loading, the OpenAI-compatible API, and CLI/TUI agent behavior remain unchanged.
