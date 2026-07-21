@@ -6286,6 +6286,13 @@ impl CudaResidentDecode {
         self.max_pos
     }
 
+    /// Layer count this engine was built for — the session's OWNED layer range, so a caller
+    /// mapping engine slots to absolute layer ids can confirm the shard shapes agree before
+    /// trusting the global engine's KV (see `recover_cpu_kv_from_cuda_resident`).
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
     /// Seed one layer's KV cache from CPU history. `ck`/`cv` hold positions
     /// `[0, position)` laid out `[kv_head][position'][head_dim]` (stride
     /// `position`); they are written into the existing GPU cache buffers (stride
@@ -6343,6 +6350,18 @@ impl CudaResidentDecode {
         layer: usize,
         n_positions: usize,
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        // Bounds first, as `seed_layer` does: the slices below would otherwise panic on an
+        // out-of-range layer or an over-long read. Callers are seams that already fall back on
+        // Err, so refusing is strictly better than aborting the process.
+        if layer >= self.n_layers {
+            return Err("read_kv_layer: layer out of range".into());
+        }
+        if n_positions > self.max_pos {
+            return Err(format!(
+                "read_kv_layer: {n_positions} positions exceeds resident capacity {}",
+                self.max_pos
+            ));
+        }
         let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
         let s = self.k.stream.clone();
         let span = n_positions * hd;
