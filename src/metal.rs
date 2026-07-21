@@ -332,6 +332,37 @@ fn command_buffer_gpu_times_us(cb: &metal::CommandBuffer) -> (u128, u128) {
     }
 }
 
+/// IEEE 754 binary16 bits -> f32. Exact in every case (f32 covers the whole f16 range,
+/// subnormals included), so it is the exact inverse of [`f32_to_f16_bits`] on any value that
+/// round-trips. Used by the KV readback when the resident cache is in half mode.
+#[cfg(target_os = "macos")]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits as u32) & 0x8000) << 16;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = ((bits & 0x03ff) as u32) << 13;
+    let rest = match exp {
+        // Inf/NaN: max f32 exponent, mantissa carried through (quiet bit preserved by the shift).
+        0x1f => 0x7f80_0000 | mant,
+        // Zero / subnormal: renormalize into f32, which has the range to hold it exactly.
+        0 => {
+            if mant == 0 {
+                0
+            } else {
+                let mut m = mant;
+                let mut e: u32 = 127 - 15 + 1;
+                while m & 0x0080_0000 == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                ((e) << 23) | (m & 0x007f_ffff)
+            }
+        }
+        // Normal: rebias the exponent (f16 bias 15 -> f32 bias 127).
+        _ => ((exp + 127 - 15) << 23) | mant,
+    };
+    f32::from_bits(sign | rest)
+}
+
 /// f32 -> IEEE 754 binary16 bits, round-to-nearest-even (exact for values that started as
 /// f16, which all GGUF Q8_0 scales did).
 #[cfg(target_os = "macos")]
@@ -13421,6 +13452,78 @@ impl ResidentDecodeState {
         true
     }
 
+    /// Read layer `layer`'s first `positions` cached K and V back out as contiguous
+    /// `[kv_head][positions][head_dim]` f32 — the exact inverse of [`seed_layer`](Self::seed_layer),
+    /// and the Metal twin of the CUDA engine's `read_kv_layer`.
+    ///
+    /// This exists so a CPU fallback mid-sequence can recover the history the resident engine
+    /// produced. Without it the CPU KV cache is simply empty for every GPU-produced position,
+    /// and both the fallback step and any later GPU reseed silently run over a zeroed prompt.
+    /// Metal buffers are shared storage, so this is a strided memcpy over unified memory — no
+    /// device transfer, and it touches no kernel.
+    ///
+    /// Returns `None` on a dimension mismatch. Caller must ensure prior GPU work has completed.
+    pub fn read_kv_layer(&self, layer: usize, positions: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        if layer >= self.n_layers || positions > self.max_positions {
+            return None;
+        }
+        Some((
+            Self::read_from(
+                &self.cache_k[layer],
+                self.n_kv_heads,
+                self.max_positions,
+                self.head_dim,
+                positions,
+                self.kv16,
+            ),
+            Self::read_from(
+                &self.cache_v[layer],
+                self.n_kv_heads,
+                self.max_positions,
+                self.head_dim,
+                positions,
+                self.kv16,
+            ),
+        ))
+    }
+
+    /// Gather a `[kv_head][max_positions][head_dim]` cache buffer's first `positions` slots
+    /// into contiguous `[kv_head][positions][head_dim]` f32. Inverse of [`Self::seed_into`].
+    fn read_from(
+        buf: &Buffer,
+        n_kv_heads: usize,
+        max_positions: usize,
+        head_dim: usize,
+        positions: usize,
+        kv16: bool,
+    ) -> Vec<f32> {
+        let run = positions * head_dim;
+        let mut out = vec![0.0f32; n_kv_heads * run];
+        // SAFETY: shared-storage buffer of n_kv_heads*max_positions*head_dim elements (f32 or
+        // f16); each head's `run` values are read from a disjoint slot well within that
+        // capacity (`positions <= max_positions` checked by the caller).
+        unsafe {
+            if kv16 {
+                let src = buf.contents() as *const u16;
+                for h in 0..n_kv_heads {
+                    let s = h * max_positions * head_dim;
+                    let d = h * run;
+                    for i in 0..run {
+                        out[d + i] = f16_bits_to_f32(*src.add(s + i));
+                    }
+                }
+            } else {
+                let src = buf.contents() as *const f32;
+                for h in 0..n_kv_heads {
+                    let s = h * max_positions * head_dim;
+                    let d = h * run;
+                    std::ptr::copy_nonoverlapping(src.add(s), out[d..d + run].as_mut_ptr(), run);
+                }
+            }
+        }
+        out
+    }
+
     /// Scatter contiguous `[kv_head][seed_positions][head_dim]` source data into a persistent
     /// `[kv_head][max_positions][head_dim]` cache buffer (the per-head position stride differs).
     fn seed_into(
@@ -13872,6 +13975,10 @@ impl ResidentDecodeState {
         _seed_positions: usize,
     ) -> bool {
         false
+    }
+
+    pub fn read_kv_layer(&self, _layer: usize, _positions: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
     }
 
     pub fn filled(&self) -> usize {

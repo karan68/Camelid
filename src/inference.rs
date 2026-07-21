@@ -1869,6 +1869,7 @@ impl LlamaInferenceSession {
                     values_f16: Vec::new(),
                     allocated_sequence_length: 0,
                     position: 0,
+                    materialized_through: 0,
                     kv_budget_bytes,
                 },
             ),
@@ -1885,9 +1886,13 @@ impl LlamaInferenceSession {
     /// history lives on the GPU), so a session in that state must not be cloned-and-resumed
     /// from CPU state (e.g. by the prompt-prefix cache): the clone drops the GPU cache and
     /// would reseed from zeros.
+    ///
+    /// Gated on the materialized-through watermark, NOT on `allocated_sequence_length`.
+    /// Allocation only proves the bytes exist: one CPU fallback mid-sequence grows the buffers
+    /// for its own position and leaves every earlier position zero-filled, at which point an
+    /// allocation-based check reports "authoritative" over a zeroed prompt.
     pub fn cpu_kv_authoritative(&self) -> bool {
-        self.kv_cache.position == 0
-            || self.kv_cache.allocated_sequence_length >= self.kv_cache.position
+        self.kv_cache.materialized_through >= self.kv_cache.position
     }
 
     /// Approximate resident-weight footprint of this session in bytes: the raw Q8_0 block
@@ -2431,7 +2436,15 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
             ) {
-                Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
+                Some(engine) => {
+                    // Prefill is whole-model only (`layer_range.is_some()` bails above), so
+                    // the built range is the full stack.
+                    *guard = Some(ResidentCudaSlot {
+                        key,
+                        engine,
+                        range: 0..n_layers,
+                    })
+                }
                 None => return Ok(false),
             }
         }
@@ -2534,6 +2547,99 @@ impl LlamaInferenceSession {
             }
         }
         Ok(())
+    }
+
+    /// Recover the CPU KV history for `[0, position)` from the process-global CUDA resident
+    /// engine — the CUDA half of [`ensure_cpu_kv_materialized`], and the piece the decode lane
+    /// needs because, unlike the prefill (which mirrors eagerly via
+    /// `copy_resident_cuda_kv_to_host`), `try_resident_decode_forward_cuda` only ever calls
+    /// `set_filled(position + 1)`: every resident-decoded token advances `kv_cache.position`
+    /// with nothing written into the CPU buffers. One CPU fallback later, the CPU layer loop
+    /// attends over a zero-filled prefix and the next reseed copies those zeros back onto the
+    /// GPU, making it permanent.
+    ///
+    /// IDENTITY IS THE HARD PART, and it is why this could not simply reuse the Metal recovery.
+    /// The Metal engine hangs off the session, so it necessarily holds this sequence. The CUDA
+    /// engine is a process-global keyed by model identity: any session running the same model
+    /// shares it. So before trusting a single byte, this requires
+    ///   - the cached slot's key to be OUR model key (the same key the decode lane builds and
+    ///     rebuilds the engine on), and its weights to still be uploaded;
+    ///   - the slot's recorded layer range to equal this session's owned range — not merely its
+    ///     length. Two pipeline shards of one model share a key and can share a length, and the
+    ///     mirror maps engine slots onto ABSOLUTE cache layer ids, so `0..16` vs `16..32` would
+    ///     write the wrong shard's K/V at this session's layer ids; and
+    ///   - `filled() == position` EXACTLY.
+    ///
+    /// That last one is deliberately stricter than the Metal side's `filled() >= position`, and
+    /// it is not a new rule: it is the same readiness triple `verify_drafts_gpu` already uses
+    /// before letting the global engine speak for this sequence. `filled == position` is the
+    /// steady-decode invariant the decode lane itself relies on (`need_seed = filled !=
+    /// position`), so this claims no more trust than the lane does — and it is exactly the state
+    /// the bug arises from: the last resident token left `filled == position`, then the step at
+    /// `position` declined. It also survives a speculative rollback, since
+    /// `rollback_resident_to_position` lowers `filled` in step. Anything else — another session
+    /// having reseeded the engine in between — is ambiguous, and mirroring an ambiguous history
+    /// would write wrong K/V into the CPU cache AND mark it materialized, which is worse than
+    /// the zeros. Declining leaves the caller to warn instead.
+    ///
+    /// The engine lock is held across the readback on purpose: it is what stops another session
+    /// from reseeding the engine between the identity check and the last layer's copy.
+    ///
+    /// Returns `Ok(true)` when the CPU history is materialized on return.
+    #[cfg(feature = "cuda")]
+    fn recover_cpu_kv_from_cuda_resident(&mut self, position: usize) -> Result<bool> {
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let range = self
+            .weights
+            .layer_range
+            .clone()
+            .unwrap_or(0..dims.block_count);
+        // Same key derivation as the decode/prefill lanes: the stable model identity when the
+        // API set one, else the weights Arc pointer.
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
+        // `resident_cache()` hands back a `'static` handle, so this guard borrows the global
+        // cache and NOT the session — the stores below can take `&mut self.kv_cache` under it.
+        let cache = self.resident_cache();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(slot) = guard.as_ref() else {
+            return Ok(false);
+        };
+        if slot.key != key
+            || slot.range != range
+            || !slot.engine.weights_ready()
+            || slot.engine.n_layers() != range.len()
+            || slot.engine.filled() != position
+        {
+            return Ok(false);
+        }
+        for (engine_layer, layer_idx) in range.clone().enumerate() {
+            let (keys, values) = slot
+                .engine
+                .read_kv_layer(engine_layer, position)
+                .map_err(BackendError::RuntimeShapeMismatch)?;
+            self.kv_cache
+                .store_mirrored_layer_kv(layer_idx, position, &keys, &values)?;
+        }
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-kv-mirror] recovered {position} positions x {} layers from the CUDA \
+                 resident cache into the CPU KV history",
+                range.len()
+            );
+        }
+        Ok(true)
+    }
+
+    /// Non-CUDA build: there is no CUDA engine to recover from, so the Metal recovery is the
+    /// only one and this always declines.
+    #[cfg(not(feature = "cuda"))]
+    fn recover_cpu_kv_from_cuda_resident(&mut self, _position: usize) -> Result<bool> {
+        Ok(false)
     }
 
     /// Run the whole token forward on the GPU resident-decode session. Returns Some(hidden) on
@@ -3092,7 +3198,13 @@ impl LlamaInferenceSession {
                 tables.split_half_pairing,
                 self.is_drafter,
             ) {
-                Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
+                Some(engine) => {
+                    *guard = Some(ResidentCudaSlot {
+                        key,
+                        engine,
+                        range: range.clone(),
+                    })
+                }
                 None => {
                     if trace {
                         eprintln!("[resident-cuda] engine build failed (unsupported weights?)");
@@ -3132,6 +3244,28 @@ impl LlamaInferenceSession {
         let seed_started = std::time::Instant::now();
         if need_seed {
             if position > 0 {
+                // The seed below COPIES the CPU history onto the GPU, so that history must
+                // actually have been written — not merely be indexable. Positions produced by
+                // a resident lane and never mirrored back read as zeros here, and seeding from
+                // them silently replaces the sequence's context with nothing for the rest of
+                // the generation. `ensure_cpu_kv_materialized` mirrors on every CPU fallback,
+                // so reaching this with a hollow history means the history is genuinely gone
+                // (engine evicted or rebuilt for another model); declining routes to the CPU
+                // path, which warns, instead of laundering zeros through the GPU cache.
+                //
+                // The watermark alone, not `f32_history_materialized`: the loop below reads via
+                // `copy_key_row_into`, which serves an F16 cache too, so pairing it with a probe
+                // over the (legitimately empty) f32 buffers would decline a readable history.
+                if !self.kv_cache.history_materialized(position) {
+                    if trace {
+                        eprintln!(
+                            "[resident-cuda] declining reseed at position {position}: CPU KV \
+                             history materialized only through {}",
+                            self.kv_cache.materialized_through
+                        );
+                    }
+                    return Ok(None);
+                }
                 let kv_dim = n_kv * head_dim;
                 for layer in 0..n_layers {
                     let mut ck = vec![0.0f32; kv_dim * position];
@@ -3415,6 +3549,10 @@ impl LlamaInferenceSession {
                 return Ok(out);
             }
         }
+
+        // As in the general forward: this CPU chunk path reads the KV history, so any
+        // positions a resident decode produced must be mirrored back first.
+        self.ensure_cpu_kv_materialized()?;
 
         let mut current_hidden = hidden.clone();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
@@ -4032,6 +4170,10 @@ impl LlamaInferenceSession {
                 }
             }
         } else {
+            // The CPU layer loop below attends over `kv_cache` positions [0, position]. If a
+            // GPU-resident lane produced any of those positions, the CPU buffers do not hold
+            // them — recover them from the resident engine before reading (no-op otherwise).
+            self.ensure_cpu_kv_materialized()?;
             for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
                 if let Some(range) = &self.weights.layer_range {
                     if !range.contains(&layer_idx) {
@@ -10762,6 +10904,15 @@ fn resident_decode_metal_enabled() -> bool {
 struct ResidentCudaSlot {
     key: usize,
     engine: crate::cuda_resident::CudaResidentDecode,
+    /// The ABSOLUTE layer range this engine was built over — `0..block_count` for a whole
+    /// model, a sub-range for a pipeline shard. Recorded because `key` alone does not
+    /// distinguish two shards of the SAME model co-hosted in one process: the API derives the
+    /// key from the model id, so `0..16` and `16..32` collide on it, and an engine's layer
+    /// slots are relative to its own range. Only `recover_cpu_kv_from_cuda_resident` reads
+    /// this — it maps engine slots onto absolute cache layer ids, so a range mismatch there
+    /// would write another shard's K/V at this session's layer ids and mark it materialized.
+    /// (The build/reseed decisions deliberately keep their existing key-only policy.)
+    range: std::ops::Range<usize>,
 }
 
 #[cfg(feature = "cuda")]

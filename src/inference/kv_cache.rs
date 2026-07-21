@@ -89,6 +89,24 @@ pub struct LlamaKvCache {
     pub values_f16: Vec<u16>,
     pub allocated_sequence_length: usize,
     pub position: usize,
+    /// Materialized-through watermark: positions `[0, materialized_through)` have had
+    /// their K/V actually WRITTEN by a CPU forward, a prefill, or a GPU→host mirror —
+    /// as opposed to merely being addressable. `allocated_sequence_length` answers "are
+    /// these bytes safe to index"; this answers "do these bytes hold this sequence's
+    /// history". They diverge exactly when a GPU-resident engine produced positions the
+    /// CPU never wrote: `ensure_position_capacity` then grows the buffers zero-filled and
+    /// every bounds probe starts passing over a history that is all zeros.
+    ///
+    /// Maintained by [`store_kv_head_row`](Self::store_kv_head_row) (the canonical store
+    /// every writer routes through) and clamped down by
+    /// [`rollback_to_position`](Self::rollback_to_position) — a rollback must not leave the
+    /// watermark vouching for rows a rejected speculative branch wrote, which are stale
+    /// rather than zero and therefore even harder to spot.
+    ///
+    /// GRANULARITY: bumped per written row, so DURING a layer loop it leads by the layers
+    /// of the current token not yet written. Every consumer reads it BETWEEN forward passes,
+    /// where it is exactly token-complete.
+    pub materialized_through: usize,
     /// Max f32 K+V bytes this session may materialize before the predict-and-abort
     /// guard in `ensure_position_capacity` refuses. Host-derived operational config
     /// (env / available RAM), NOT cache state — excluded from `PartialEq`. `pub(super)`
@@ -110,6 +128,7 @@ impl PartialEq for LlamaKvCache {
             && self.values_f16 == other.values_f16
             && self.allocated_sequence_length == other.allocated_sequence_length
             && self.position == other.position
+            && self.materialized_through == other.materialized_through
     }
 }
 
@@ -219,6 +238,7 @@ impl LlamaKvCache {
             values_f16: Vec::new(),
             allocated_sequence_length: 0,
             position: 0,
+            materialized_through: 0,
             kv_budget_bytes: resolve_kv_cache_budget_bytes(),
         })
     }
@@ -240,6 +260,11 @@ impl LlamaKvCache {
             )));
         }
         self.position = position;
+        // Clamp the watermark with the position. Rows past the rollback point were written
+        // by a branch that has been rejected: they are STALE, not zero, so leaving the
+        // watermark above `position` would let a later GPU reseed copy a dead speculative
+        // branch's K/V into the cache and call it history.
+        self.materialized_through = self.materialized_through.min(position);
         Ok(())
     }
 
@@ -389,9 +414,10 @@ impl LlamaKvCache {
     /// K/V. Once `ensure_position_capacity` has grown the buffers for ANY position, this
     /// returns true for every position `<= allocated_sequence_length` regardless of what was
     /// actually written — so a range this accepts may still be zero-filled for positions the
-    /// GPU produced and the CPU never wrote. Seeding from such a range is silently wrong, not
-    /// unsafe. Distinguishing that needs a materialized-through watermark, which the cache
-    /// does not currently carry. Same weakness as the pre-existing `cpu_kv_authoritative`.
+    /// GPU produced and the CPU never wrote.
+    ///
+    /// Anything that READS the history (rather than merely indexing it) must therefore use
+    /// [`f32_history_materialized`](Self::f32_history_materialized) instead.
     pub(super) fn f32_history_addressable(&self, last_layer: usize, position: usize) -> bool {
         if position == 0 {
             return true;
@@ -406,6 +432,91 @@ impl LlamaKvCache {
         let end =
             self.offset(last_layer, position - 1, self.plan.kv_head_count - 1) + self.plan.head_dim;
         self.keys.len() >= end && self.values.len() >= end
+    }
+
+    /// Whether `[0, position)` is both addressable AND actually written — the check any
+    /// consumer that READS the f32 history needs (GPU reseeding, resumption from CPU state).
+    ///
+    /// This is the strict form of [`f32_history_addressable`](Self::f32_history_addressable).
+    /// The bounds probe alone cannot tell "grown and written" from "grown and zero", and the
+    /// two become indistinguishable the moment a single CPU fallback fires mid-sequence on a
+    /// GPU-resident run: that one step grows the buffers for its own position and leaves every
+    /// earlier position zero-filled, after which the probe passes and a reseed copies a zeroed
+    /// prompt onto the GPU. The watermark is what separates them.
+    pub(super) fn f32_history_materialized(&self, last_layer: usize, position: usize) -> bool {
+        self.materialized_through >= position && self.f32_history_addressable(last_layer, position)
+    }
+
+    /// Dtype-neutral form of the same question: has `[0, position)` actually been written?
+    ///
+    /// [`f32_history_materialized`](Self::f32_history_materialized) pairs the watermark with a
+    /// bounds probe over the f32 buffers, which is right for a reader that indexes `keys` /
+    /// `values` directly (the Metal seed does) but wrong for one that goes through
+    /// [`copy_key_row_into`](Self::copy_key_row_into) / `copy_value_row_into` (the CUDA seed
+    /// does): those serve both dtypes, so on an F16 cache — where the f32 buffers are empty by
+    /// design — the probe would decline a history that is perfectly readable. The watermark
+    /// alone is the correct predicate there, and it is not weaker: it only ever advances from
+    /// `store_kv_head_row`, which cannot have written a position without capacity for it.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn history_materialized(&self, position: usize) -> bool {
+        self.materialized_through >= position
+    }
+
+    /// Mirror ONE layer's GPU-resident K/V for positions `[0, position_count)` back into this
+    /// cache. `keys`/`values` arrive in the resident engines' readback order —
+    /// `[kv_head][position][head_dim]`, position stride `position_count` — which is what both
+    /// `metal::ResidentDecodeState::read_kv_layer` and
+    /// `cuda_resident::CudaResidentDecode::read_kv_layer` return.
+    ///
+    /// `layer_idx` is the ABSOLUTE layer id in this cache. Resident engines index their own
+    /// slots relative to the session's owned layer range, so a sharded caller translates
+    /// before calling (as the CUDA seed path already does in the other direction).
+    ///
+    /// Rows go through [`store_kv_head_row`](Self::store_kv_head_row), so the f16 rounding and
+    /// the materialized-through watermark are handled exactly as for a CPU write — the GPU KV
+    /// is f16 already, so the re-rounding is idempotent.
+    ///
+    /// Shared by the Metal and CUDA recovery paths so the only backend-specific code left is
+    /// the device readback itself.
+    pub(super) fn store_mirrored_layer_kv(
+        &mut self,
+        layer_idx: usize,
+        position_count: usize,
+        keys: &[f32],
+        values: &[f32],
+    ) -> Result<()> {
+        let head_dim = self.plan.head_dim;
+        let n_kv = self.plan.kv_head_count;
+        let expected = n_kv
+            .checked_mul(position_count)
+            .and_then(|v| v.checked_mul(head_dim))
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "resident KV readback element count overflow".to_string(),
+                )
+            })?;
+        if keys.len() != expected || values.len() != expected {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "resident KV readback for layer {layer_idx} returned {} key / {} value elements, \
+                 expected {expected} ({n_kv} kv heads x {position_count} positions x {head_dim})",
+                keys.len(),
+                values.len()
+            )));
+        }
+        self.ensure_position_capacity(position_count)?;
+        for p in 0..position_count {
+            for h in 0..n_kv {
+                let src = (h * position_count + p) * head_dim;
+                self.store_kv_head_row(
+                    layer_idx,
+                    p,
+                    h,
+                    &keys[src..src + head_dim],
+                    &values[src..src + head_dim],
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn offset(&self, layer_idx: usize, position: usize, kv_head: usize) -> usize {
@@ -470,6 +581,10 @@ impl LlamaKvCache {
         let head_dim = self.plan.head_dim;
         debug_assert_eq!(key_row.len(), head_dim);
         debug_assert_eq!(value_row.len(), head_dim);
+        // Every writer routes through here, so this is THE place the materialized-through
+        // watermark advances — including the GPU→host mirror, which therefore needs no
+        // special-casing to be trusted afterwards.
+        self.materialized_through = self.materialized_through.max(position + 1);
         let dst = self.offset(layer_idx, position, kv_head);
         match self.dtype {
             KvDtype::F32 => {

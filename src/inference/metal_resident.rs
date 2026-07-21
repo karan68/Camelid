@@ -139,6 +139,133 @@ impl super::LlamaInferenceSession {
         Ok(true)
     }
 
+    /// Make the CPU KV cache hold this sequence's real history before a CPU forward reads it.
+    ///
+    /// The GPU-resident lanes advance `kv_cache.position` while writing K/V only into the GPU
+    /// cache (`try_metal_resident_prefill` sets `position = n` outright; each resident decode
+    /// step appends on the GPU). The CPU buffers stay empty. That is fine for as long as the
+    /// sequence stays resident — but a CPU forward reads `kv_cache.keys` over the whole
+    /// `[0, position]` range, so the first step that falls back attends over a zeroed prompt,
+    /// and its `ensure_position_capacity` call then makes the zeros look addressable to every
+    /// later reseed. Silently wrong output for the rest of the generation.
+    ///
+    /// So: mirror the resident engine's KV back into the CPU cache — lazily, on the fallback
+    /// that needs it, which is the same thing CUDA does eagerly after its prefill
+    /// (`copy_resident_cuda_kv_to_host`) but at a price the decode path can afford. Metal
+    /// buffers are shared storage, so recovery is a strided memcpy over unified memory; the
+    /// CUDA half pays a device→host copy, and both pay it at most once per fallback rather than
+    /// once per token. Writes go through `store_kv_head_row`, which rounds through f16 exactly
+    /// as every other CPU write does and advances the watermark.
+    ///
+    /// No-op when the CPU history is already materialized — the common case, covering every
+    /// pure-CPU run and the CUDA prefill (which mirrors eagerly).
+    ///
+    /// BACKENDS. Both GPU-resident lanes are asked, in the order they can be trusted. The Metal
+    /// engine hangs off the session, so it is unambiguously this sequence's. The CUDA engine
+    /// lives in a process-global cache, so its recovery has to establish identity first — see
+    /// `recover_cpu_kv_from_cuda_resident`. When neither can supply the gap the history is
+    /// genuinely lost (the engine was evicted or rebuilt for another model); that is not
+    /// recoverable here, so it warns rather than pretending, and the CPU forward proceeds over
+    /// whatever prefix it has.
+    ///
+    /// NEVER RETURNS Err FOR A FAILED RECOVERY, and never leaves the watermark vouching for a
+    /// half-done one — see the two comments inside. Both rules exist because this sits on the
+    /// ordinary CPU forward path, where the alternatives are worse than a warning.
+    pub(super) fn ensure_cpu_kv_materialized(&mut self) -> Result<()> {
+        let position = self.kv_cache.position;
+        if position == 0 || self.kv_cache.materialized_through >= position {
+            return Ok(());
+        }
+        // The watermark advances on the FIRST row a recovery writes, so a recovery that dies
+        // part way through (a device readback error on layer 12 of 16) would leave it claiming
+        // a history that is still zero for the layers never reached — every later
+        // `history_materialized` / `cpu_kv_authoritative` check would then pass over exactly
+        // the hollow prefix this function exists to prevent, and the next GPU reseed would
+        // launder it. Strictly worse than not trying. So on any failure the watermark goes
+        // back to where it was: the rows already written stay (they are real K/V, not damage),
+        // they simply stop being vouched for.
+        let restore = self.kv_cache.materialized_through;
+        let attempt = match self.recover_cpu_kv_from_metal_resident(position) {
+            Ok(true) => Ok(true),
+            Ok(false) => self.recover_cpu_kv_from_cuda_resident(position),
+            Err(e) => Err(e),
+        };
+        let recovered = match attempt {
+            Ok(recovered) => recovered,
+            // A readback failure must not abort the caller's forward. This is called from the
+            // ordinary CPU path, so propagating would turn a recoverable degradation into a
+            // failed request; the CUDA prefill lane already treats the identical
+            // `copy_resident_cuda_kv_to_host` failure as `Ok(false)` + a trace line. Report it
+            // and fall through to the warning, which says what the consequence actually is.
+            Err(e) => {
+                self.kv_cache.materialized_through = restore;
+                static READBACK_WARNED: std::sync::Once = std::sync::Once::new();
+                READBACK_WARNED.call_once(|| {
+                    eprintln!("[resident-kv] WARNING: GPU KV readback failed: {e}");
+                });
+                false
+            }
+        };
+        if recovered {
+            return Ok(());
+        }
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "[resident-kv] WARNING: the CPU KV history is materialized only through {} but \
+                 the sequence is at position {position}, and no GPU-resident engine holds the \
+                 gap — this CPU forward attends over a zero-filled prefix. (See \
+                 `ensure_cpu_kv_materialized`.)",
+                self.kv_cache.materialized_through
+            );
+        });
+        Ok(())
+    }
+
+    /// Recover `[0, position)` from the SESSION-resident Metal engine. `Ok(false)` when this
+    /// session has no Metal engine, or it does not hold the range (so the caller tries the next
+    /// backend); `Ok(true)` when the CPU history is materialized on return.
+    fn recover_cpu_kv_from_metal_resident(&mut self, position: usize) -> Result<bool> {
+        // The engine must still hold the history we are missing.
+        if self
+            .resident_decode
+            .as_ref()
+            .is_none_or(|s| s.filled() < position)
+        {
+            return Ok(false);
+        }
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let range = self
+            .weights
+            .layer_range
+            .clone()
+            .unwrap_or(0..dims.block_count);
+
+        // Read each owned layer out of the GPU cache and store it at its ABSOLUTE layer id
+        // (the resident session is built over the owned subrange, so its slots are relative).
+        for (slot, layer_idx) in range.clone().enumerate() {
+            let session = self
+                .resident_decode
+                .as_ref()
+                .expect("resident session present (checked above)");
+            let (keys, values) = session.read_kv_layer(slot, position).ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(format!(
+                    "resident KV readback failed for layer {layer_idx} at {position} positions"
+                ))
+            })?;
+            self.kv_cache
+                .store_mirrored_layer_kv(layer_idx, position, &keys, &values)?;
+        }
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-kv-mirror] recovered {position} positions x {} layers from the Metal \
+                 resident cache into the CPU KV history",
+                range.len()
+            );
+        }
+        Ok(true)
+    }
+
     pub(super) fn try_resident_decode_forward_metal(
         &mut self,
         embedding: &CpuTensor,
@@ -210,24 +337,26 @@ impl super::LlamaInferenceSession {
             };
             if position > 0 {
                 // Seeding reads the CPU KV history [0, position) out of `kv_cache.keys` /
-                // `.values`. Those buffers are grown only by `ensure_position_capacity`, so a
-                // session whose positions were all produced by this resident engine carries a
-                // non-zero `position` over empty buffers (and an F16 cache keeps its entries
-                // elsewhere entirely). Decline instead of indexing out of range. With the
-                // rollback state reset in `rollback_resident_to_position` this is unreachable
-                // on the drafter path, and it must stay that way — a CPU fallback per draft
-                // token would cost far more than it saves.
+                // `.values`, so that range must be both addressable AND actually written.
                 //
-                // LIMIT OF THIS GUARD: it is a bounds probe (see `f32_history_addressable`),
-                // so it only catches the case where the buffers were NEVER grown. Once any
-                // CPU fallback has grown them, this passes even though positions the GPU
-                // produced are still zero-filled, and the seed below copies those zeros —
-                // silently wrong output rather than a panic. That path predates this guard
-                // and is not fixed by it; closing it needs a materialized-through watermark
-                // on the cache.
+                // Addressability alone is not enough, and the difference is the whole bug this
+                // guard exists for. Those buffers are grown only by `ensure_position_capacity`,
+                // so a session whose positions were all produced by this resident engine
+                // carries a non-zero `position` over empty buffers (and an F16 cache keeps its
+                // entries elsewhere entirely) — a bounds probe catches that and declines. But
+                // ONE CPU fallback mid-sequence grows the buffers for its own position and
+                // leaves every earlier position zero-filled; from then on a bounds probe passes
+                // and this loop would copy a zeroed prompt onto the GPU, so the model attends
+                // over nothing for the rest of the generation. Wrong output, no error.
+                //
+                // `f32_history_materialized` adds the materialized-through watermark, which
+                // distinguishes the two. Reaching it with a hollow history should now be
+                // impossible — `ensure_cpu_kv_materialized` mirrors the GPU history back before
+                // any CPU fallback runs — so this is the backstop, not the fix; declining is
+                // lossless and the caller takes the CPU path.
                 if !self
                     .kv_cache
-                    .f32_history_addressable(range.end.saturating_sub(1), position)
+                    .f32_history_materialized(range.end.saturating_sub(1), position)
                 {
                     return Ok(None);
                 }
