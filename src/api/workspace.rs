@@ -666,12 +666,15 @@ async fn compact_thread_operation(
     }
     if let Some(session) = state.workspace_sessions.active.lock().await.as_ref() {
         if session.id == id {
-            let idle = session
+            // Stopped or failed sessions hold no in-flight turn; the same states
+            // that accept a follow-up turn must also allow manual compact/undo,
+            // or a stopped session's memory controls stay dead until Reset.
+            let available = session
                 .state
                 .lock()
-                .map(|state| *state == WorkspaceSessionState::Idle)
+                .map(|state| state.accepts_new_turn())
                 .unwrap_or(false);
-            if !idle {
+            if !available {
                 return api_error(
                     StatusCode::CONFLICT,
                     "workspace_turn_active",
