@@ -22,6 +22,7 @@ mod agent_syscap;
 mod agent_tui;
 mod audit;
 mod banner;
+mod checkpoint;
 mod client;
 mod clipboard;
 mod inline;

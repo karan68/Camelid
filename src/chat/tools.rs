@@ -886,8 +886,17 @@ impl Action {
             Action::ReadFile { path } => read_file(path),
             Action::ListDir { path } => list_dir(path),
             Action::Search { pattern, path } => search(pattern, path),
-            Action::WriteFile { path, content, .. } => write_file(path, content),
-            Action::EditFile { path, old, new } => edit_file(path, old, new),
+            // Snapshot before every mutation, at the execution site rather than
+            // on the model's say-so, so undo is available whether or not the
+            // model thought to ask for it.
+            Action::WriteFile { path, content, .. } => {
+                super::checkpoint::take(sandbox, path, "write_file");
+                write_file(path, content)
+            }
+            Action::EditFile { path, old, new } => {
+                super::checkpoint::take(sandbox, path, "edit_file");
+                edit_file(path, old, new)
+            }
             Action::RunShell { command } => run_shell(sandbox, command),
             Action::HttpFetch { method, url } => http_fetch(sandbox, method, url),
             Action::RunWindowsCommand {

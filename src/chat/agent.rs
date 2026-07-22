@@ -1073,6 +1073,24 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         tui_only: false,
     },
     SlashCommand {
+        name: "diff",
+        alias: None,
+        help: "show what the agent changed on disk",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "undo",
+        alias: None,
+        help: "revert the agent's last file change",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "checkpoints",
+        alias: None,
+        help: "list this session's file changes",
+        tui_only: false,
+    },
+    SlashCommand {
         name: "init",
         alias: None,
         help: "scaffold a CAMELID.md for this workspace",
@@ -1366,6 +1384,7 @@ pub fn run_exec(
     let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
     let project = load_project_context(&sandbox);
     plan_reset();
+    super::checkpoint::clear();
     let mut history = vec![
         AgentMsg::System(system_prompt_with_project(
             &sandbox,
@@ -1554,6 +1573,10 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
         cfg.shell_sandbox,
     ));
 
+    // Checkpoints span the session, not one goal, so /undo still works after a
+    // goal ends — but a fresh session starts with a clean history.
+    super::checkpoint::clear();
+
     let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
     let mut rl = rustyline::DefaultEditor::new()?;
     // The most recent final answer, for `/copy`.
@@ -1602,6 +1625,14 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             "{}",
                             banner::dim(&format!("step budget: {} per goal", cfg.max_steps))
                         ),
+                        "diff" => println!("{}", banner::dim(&super::checkpoint::diff(&sandbox))),
+                        "undo" => match super::checkpoint::undo(&sandbox) {
+                            Ok(m) => println!("{}", banner::dim(&m)),
+                            Err(e) => println!("{}", banner::dim(&e)),
+                        },
+                        "checkpoints" => {
+                            println!("{}", banner::dim(&super::checkpoint::summary()))
+                        }
                         "init" => match init_project_file(&sandbox) {
                             Ok(p) => println!(
                                 "{}",
@@ -2362,7 +2393,7 @@ mod tests {
         let tui_only: Vec<_> = tui.iter().filter(|n| !line.contains(n)).copied().collect();
         assert_eq!(tui_only, vec!["theme", "sidebar"]);
         // The G8 additions are available in both front ends.
-        for n in ["init", "copy", "plan"] {
+        for n in ["init", "copy", "plan", "diff", "undo", "checkpoints"] {
             assert!(line.contains(&n), "/{n} should be in the line renderer");
             assert!(tui.contains(&n), "/{n} should be in the TUI");
         }

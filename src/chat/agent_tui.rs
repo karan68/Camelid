@@ -183,6 +183,8 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         cfg.shell_sandbox,
     ));
 
+    super::checkpoint::clear();
+
     let driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     let engine = Box::new(Engine {
         driver,
@@ -487,6 +489,22 @@ impl<'a> App<'a> {
                 }
             }
             "steps" => self.status = format!("step budget: {} per goal", self.max_steps),
+            "diff" | "undo" | "checkpoints" => {
+                let text = match self.engine.as_ref() {
+                    Some(e) => match cmd.split_whitespace().next().unwrap_or("") {
+                        "diff" => super::checkpoint::diff(&e.sandbox),
+                        "undo" => match super::checkpoint::undo(&e.sandbox) {
+                            Ok(m) => m,
+                            Err(err) => err,
+                        },
+                        _ => super::checkpoint::summary(),
+                    },
+                    None => "busy — try again when idle".into(),
+                };
+                for line in text.lines() {
+                    self.push(Entry::Notice(line.to_string()));
+                }
+            }
             "init" => {
                 self.status = match self.engine.as_ref() {
                     Some(e) => match agent::init_project_file(&e.sandbox) {
