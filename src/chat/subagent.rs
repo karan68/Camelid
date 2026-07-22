@@ -657,10 +657,22 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         )
     };
 
+    // Exhaustive on purpose: this maps a loop outcome onto the subagent exit
+    // code (completed=0, inconclusive=3, everything else=1), so a new LoopEnd
+    // variant must be classified deliberately. Under the previous catch-all a
+    // new variant compiled silently and reported "failed" — a wrong answer for
+    // any outcome that is merely inconclusive.
+    //
+    // Classification below is unchanged from the catch-all it replaces.
+    // Whether StepCapped is really a *failure* rather than inconclusive is a
+    // live question, but it decides an exit code on a shipped gate lane, so it
+    // is left to the phase that defines the tri-state contract.
     let status = match end {
         agent::LoopEnd::Answered => "completed",
         agent::LoopEnd::Aborted => "inconclusive",
-        _ => "failed",
+        agent::LoopEnd::StepCapped | agent::LoopEnd::Repeated | agent::LoopEnd::DriverError => {
+            "failed"
+        }
     };
     SubagentResult {
         subtask_id: task.subtask_id.clone(),
