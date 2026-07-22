@@ -376,35 +376,45 @@ plain integer**. Recommendation: nest under `## D18 — DROVER`, matching the D1
 
 ---
 
-## 7. Gate G0 — open items for Tim
+## 7. Gate G0 — SIGNED (Tim, 2026-07-22)
 
-Answers below are recommendations with evidence; **the roster is not signed until Tim rules.**
+All eight items ruled. The four load-bearing ones were put to Tim directly; the remaining four had
+unambiguous evidence and were accepted as recommended.
 
-1. **Phase order.** Recommend **P0.5 → G1 → G2 → G7 → G3 → G8 → G4 → G5 → G6** (§5.3). Two changes
-   from the brief: a new pre-phase (P0.5) that adds the untrusted wrapper and the three missing test
-   pins, and **G7 promoted ahead of G3/G8** because `&'static str` in `ToolSpec` means the later
-   order forces a rewrite (§5.1). *Rule?*
-2. **Project file name.** `CAMELID.md` primary, `AGENTS.md` fallback — no collision, nothing in the
-   tree uses either name. Recommend as written. *Confirm?*
-3. **Headless verb.** `camelid agent exec "<goal>"` — fully free, and the `gait` nested-subcommand
-   shape already exists to copy. Recommend the verb over `-p` (cleaner for CI; `-p` is also
-   half-taken on `tokenize`). *Confirm?*
-4. **Checkpoint substrate.** Recommend **snapshot-only**, dropping the git-stash variant: the jail
-   check (§4.8 symlink escape) and determinism are both easier to prove, and a stash-based path
-   mutates user git state the sandbox does not own. *Rule?*
-5. **MCP config surface.** `camelid.mcp.json` at the sandbox root, stdio-only in v1 — recommend as
-   written, and recommend **against** reading an existing Claude/Codex MCP config in v1: that would
-   silently import third-party server declarations the user never placed in this workspace, which
-   cuts against the opt-in posture. *Rule?*
-6. **CERT model pin.** **`qwen3_4b_instruct_q8_0`** at `/Volumes/Untitled/models/Qwen3-4B-Q8_0.gguf`,
-   secondary `llama32_3b_instruct_q8_0` (§4.4). Note this is the **Mac mini M4**, not the RTX 3060 box
-   the brief names first. *Confirm?*
-7. **NEW — G1 vs. the promotion basis (§4.2).** Does `agent-eval` inject project instructions (making
-   all five existing receipts stale, 3 of which cannot be re-minted locally), or is the eval harness
-   explicitly excluded so it keeps attesting the baseline prompt? **Recommend excluded.** *Rule — this
-   one is load-bearing and has no safe default.*
-8. **NEW — G2's budget (§4.3).** Re-pin from "80% of training `ctx`" to **80% of the row's validated
-   envelope = 6554 tokens, target 4096** on the recommended row? *Rule?*
+1. **Phase order — RULED: `P0.5 → G1 → G2 → G7 → G3 → G8 → G4 → G5 → G6`.** A new pre-phase P0.5 is
+   authorized, and G7 is promoted ahead of G3/G8 per the `&'static str` constraint (§5.1).
+2. **Project file name — `CAMELID.md` primary, `AGENTS.md` fallback.** As written; no collision.
+3. **Headless verb — `camelid agent exec "<goal>"`.** As written; free, and the `gait` nested shape
+   exists to copy (§6).
+4. **Checkpoint substrate — RULED: snapshot-only.** Content snapshots always; the git-stash variant
+   is dropped. Rationale: one code path to prove against the jail check, and the agent never mutates
+   git state the sandbox does not own.
+5. **MCP config — RULED: `camelid.mcp.json` at the sandbox root, stdio-only, v1 reads nothing else.**
+   Importing a Claude/Codex config would pull in third-party server declarations the user never
+   placed in this workspace, against the opt-in posture.
+6. **CERT pin — `qwen3_4b_instruct_q8_0`** at `/Volumes/Untitled/models/Qwen3-4B-Q8_0.gguf`;
+   secondary `llama32_3b_instruct_q8_0` (§4.4). Host is the **Mac mini M4**, not the RTX 3060 box.
+7. **G1 vs. the promotion basis — RULED: `agent-eval` is EXCLUDED from project-instruction
+   injection.** `agent_eval.rs:290` keeps feeding the baseline prompt so the five existing receipts
+   remain valid attestations. Recorded as **D-DROVER-6** (§9.1).
+8. **G2's budget — re-pinned to 80% of the row's *validated envelope*:** 6554 tokens, compaction
+   target 4096, on the recommended row (§4.3). Not the model's `n_ctx`.
+
+### 7.1 P0.5 — authorized scope
+
+Four independent concerns, one commit each, all HARNESS-provable with no model:
+
+1. Frame tool results as untrusted data in the transcript (`agent.rs:630`) — §4.1.
+2. Add the three missing regression pins: system-prompt shape, advertised-tool-name set, and
+   slash-command parity across the two front ends — §4.7.
+3. Keep agent scratch state out of the workspace and out of its own search index: `.camelid/` into
+   `.gitignore` and into the `search` skip list (`tools.rs:1220`) — §4.8.
+4. Make a new `LoopEnd` variant a compile error in the subagent status map (`subagent.rs:663`) — §4.6.
+
+**Carry-over risk on P0.5(1):** the wrapper changes tool-result framing on *every* lane, including
+`agent-eval`. This is the same coupling as §4.2 but weaker — it changes the *observation* text, not
+the instruction that elicits tool use. Mitigation: after landing, re-run `agent-eval` on the primary
+CERT row and refresh that receipt, converting a staleness risk into current evidence.
 
 ---
 
@@ -432,7 +442,31 @@ same commit that acts on the finding.
 
 ---
 
-## 9. What is NOT true — myths this recon retires
+## 9. Decision records
+
+### 9.1 Draft entries for `DECISIONS.md`
+
+To be numbered into the live root `DECISIONS.md` on acceptance. Per §6.3 the namespaced form does
+not consume a plain integer, so these nest as bullets under a single `## D18 — DROVER` entry,
+matching the D17/D-B1..5 precedent.
+
+- **D-DROVER-1 — Compaction retains the safety spine.** The system prompt and the data-not-commands
+  rule are never compacted; summaries of untrusted output remain untrusted. The budget is 80% of the
+  row's *validated context envelope*, not the model's `n_ctx` (§4.3).
+- **D-DROVER-2 — `agent exec` is a subcommand, not a binary.** Tri-state exit 0/1/3; non-interactive
+  approver; `--yolo` refused under `CAMELID_PRODUCTION`.
+- **D-DROVER-3 — MCP is opt-in, Confirm-tier, production-off, namespaced, output-untrusted**, stdio
+  only, declared solely by a workspace-local `camelid.mcp.json`.
+- **D-DROVER-4 — Resume re-validates model identity** and never re-executes historical tool calls.
+- **D-DROVER-5 — Checkpoint and session stores live under the sandbox root**, pass the jail check,
+  and are content snapshots only — never a git mutation (G0 item 4).
+- **D-DROVER-6 — The promotion harness attests the baseline prompt.** `agent-eval` is excluded from
+  project-instruction injection so `tool_capable` receipts keep attesting a fixed, reproducible
+  prompt rather than whatever `CAMELID.md` a workspace happens to carry (G0 item 7, §4.2).
+
+---
+
+## 10. What is NOT true — myths this recon retires
 
 - *"The loop needs rebuilding."* It does not. `run_loop` is complete, cancellable, step-capped, and
   result-aware. Every phase wires into it.
