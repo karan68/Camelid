@@ -4,6 +4,7 @@ export const WORKSPACE_IDLE_STATE = Object.freeze({
   phase: 'idle',
   events: [],
   turns: [],
+  totalTurns: 0,
   error: '',
 })
 
@@ -17,14 +18,21 @@ function appendActivity(events, event) {
 export function reduceWorkspaceEvent(state, envelope) {
   const event = envelope?.event
   if (!event) return state
-  if (event === 'session.reset') return { ...WORKSPACE_IDLE_STATE, events: [], turns: [] }
+  if (event === 'session.reset') return { ...WORKSPACE_IDLE_STATE, events: [], turns: [], totalTurns: 0 }
   if (event === 'thread.restored') {
     const turns = (Array.isArray(envelope.turns) ? envelope.turns : []).map((turn) => ({
       user: String(turn.user_text || ''),
       assistant: String(turn.assistant_text || ''),
       outcome: String(turn.terminal_outcome || 'answered'),
     }))
-    return { ...state, phase: 'idle', events: [], turns, error: '' }
+    return {
+      ...state,
+      phase: 'idle',
+      events: [],
+      turns,
+      totalTurns: Math.max(turns.length, Number(envelope.turnCount || 0)),
+      error: '',
+    }
   }
   if (event === 'session.starting') return { ...state, phase: 'starting', error: '' }
   if (event === 'turn.starting') return { ...state, phase: 'starting', error: '' }
@@ -38,6 +46,7 @@ export function reduceWorkspaceEvent(state, envelope) {
       phase: 'running',
       events: appendActivity(state.events, envelope),
       turns: [...state.turns, { user: String(envelope.content || ''), assistant: '', outcome: '' }],
+      totalTurns: Math.max(state.totalTurns || 0, state.turns.length) + 1,
     }
   }
   const events = [...state.events]

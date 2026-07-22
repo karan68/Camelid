@@ -38,9 +38,11 @@ state = reduceWorkspaceEvent(state, { event: 'session.reset' })
 assert.deepEqual(state, { ...WORKSPACE_IDLE_STATE, events: [] })
 state = reduceWorkspaceEvent(state, {
   event: 'thread.restored',
+  turnCount: 7,
   turns: [{ user_text: 'Where is login?', assistant_text: 'In src/auth.rs.' }],
 })
 assert.deepEqual(state.turns, [{ user: 'Where is login?', assistant: 'In src/auth.rs.', outcome: 'answered' }])
+assert.equal(state.totalTurns, 7)
 assert.equal(state.events.length, 0)
 state = reduceWorkspaceEvent(state, { event: 'turn.starting' })
 assert.equal(state.phase, 'starting')

@@ -270,6 +270,9 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const [followUp, setFollowUp] = useState('')
   const [savedThreads, setSavedThreads] = useState([])
   const [selectedThreadId, setSelectedThreadId] = useState('')
+  const [previewedThreadId, setPreviewedThreadId] = useState('')
+  const [threadPreviewLoading, setThreadPreviewLoading] = useState(false)
+  const [threadPreviewError, setThreadPreviewError] = useState('')
   const [threadDeleteBusy, setThreadDeleteBusy] = useState(false)
   const [compactionBusy, setCompactionBusy] = useState(false)
   const [compaction, setCompaction] = useState(null)
@@ -303,10 +306,11 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const runtimeReady = runtime?.status === 'online' && runtime?.loaded_now && runtime?.generation_ready
   const running = stopPending || ['starting', 'running', 'cancelling', 'cancel_error'].includes(state.phase)
   const stopping = stopPending
-  const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
+  const selectedThreadReady = !selectedThreadId || previewedThreadId === selectedThreadId
+  const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session && selectedThreadReady && !threadPreviewLoading && !threadPreviewError)
   const conversation = state.turns
-  const hiddenTurnCount = Math.max(0, conversation.length - MAX_RENDERED_TURNS)
-  const visibleConversation = hiddenTurnCount ? conversation.slice(-MAX_RENDERED_TURNS) : conversation
+  const visibleConversation = conversation.length > MAX_RENDERED_TURNS ? conversation.slice(-MAX_RENDERED_TURNS) : conversation
+  const hiddenTurnCount = Math.max(0, Math.max(state.totalTurns || 0, conversation.length) - visibleConversation.length)
   const answers = conversation.map((turn) => turn.assistant).filter(Boolean)
   const finalAnswer = answers.at(-1) || ''
   const stepCount = useMemo(
@@ -344,6 +348,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   useEffect(() => {
     const path = workspacePath.trim()
     setSelectedThreadId('')
+    setPreviewedThreadId('')
+    setThreadPreviewError('')
     if (!path) { setSavedThreads([]); return undefined }
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
@@ -353,6 +359,41 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     }, 250)
     return () => { window.clearTimeout(timer); controller.abort() }
   }, [apiBase, workspacePath])
+
+  useEffect(() => {
+    if (session) return undefined
+    const path = workspacePath.trim()
+    if (!selectedThreadId || !path) {
+      setPreviewedThreadId('')
+      setThreadPreviewLoading(false)
+      setThreadPreviewError('')
+      dispatch({ event: 'session.reset' })
+      setCompaction(null)
+      return undefined
+    }
+    const controller = new AbortController()
+    setPreviewedThreadId('')
+    setThreadPreviewLoading(true)
+    setThreadPreviewError('')
+    getWorkspaceThread(apiBase, path, selectedThreadId, { signal: controller.signal })
+      .then((restored) => {
+        if (controller.signal.aborted) return
+        dispatch({ event: 'thread.restored', turns: restored.turns, turnCount: restored.thread.turn_count })
+        setCompaction({
+          compacted_through_turn: restored.thread.compacted_through_turn,
+          archived_turns: 0,
+          compaction_count: restored.thread.compaction_count || 0,
+        })
+        setPreviewedThreadId(selectedThreadId)
+      })
+      .catch((error) => {
+        if (error.name !== 'AbortError') setThreadPreviewError(error.message || 'Saved conversation could not be loaded.')
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setThreadPreviewLoading(false)
+      })
+    return () => controller.abort()
+  }, [apiBase, workspacePath, selectedThreadId, session])
 
   useEffect(() => {
     if (workspacePath) window.localStorage.setItem('camelid.workspacePath', workspacePath)
@@ -433,15 +474,6 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     if (!canStart) return
     dispatch({ event: 'session.starting' })
     try {
-      if (selectedThreadId) {
-        const restored = await getWorkspaceThread(apiBase, workspacePath.trim(), selectedThreadId)
-        dispatch({ event: 'thread.restored', turns: restored.turns })
-        setCompaction({
-          compacted_through_turn: restored.thread.compacted_through_turn,
-          archived_turns: 0,
-          compaction_count: restored.thread.compaction_count || 0,
-        })
-      }
       const created = await createWorkspaceSession(apiBase, {
         workspace: workspacePath.trim(),
         goal: goal.trim(),
@@ -505,6 +537,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     setSession(null)
     setSessionRuntime(null)
     setSelectedThreadId('')
+    setPreviewedThreadId('')
+    setThreadPreviewError('')
     setFollowUp('')
     setCompaction(null)
     dispatch({ event: 'session.reset' })
@@ -606,6 +640,23 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }
 
   const renderResult = () => {
+    if (threadPreviewLoading) {
+      return (
+        <div className="workspace-result__working" role="status">
+          <span className="workspace-result__spinner" aria-hidden="true" />
+          <strong>Loading saved conversation…</strong>
+        </div>
+      )
+    }
+    if (threadPreviewError) {
+      return (
+        <div className="workspace-result__status is-error" role="alert">
+          <IconError size={20} />
+          <strong>Conversation could not be loaded</strong>
+          <span>{threadPreviewError}</span>
+        </div>
+      )
+    }
     const terminalError = ['error', 'driver_error', 'cancel_error'].includes(state.phase)
     if (terminalError && conversation.length === 0) {
       const meta = TERMINAL_RESULT[state.phase]
@@ -637,7 +688,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               <span>{state.error || errorMeta.detail}</span>
             </div>
           ) : null}
-          {hiddenTurnCount ? <p className="workspace-conversation__truncated">{hiddenTurnCount} older turns remain saved in this conversation.</p> : null}
+          {hiddenTurnCount ? <p className="workspace-conversation__truncated">Showing the latest {visibleConversation.length} turns. {hiddenTurnCount} older turns remain saved in this conversation.</p> : null}
           {visibleConversation.map((turn, index) => (
             <article className="workspace-answer" key={`answer-${hiddenTurnCount + index}-${turn.assistant.length}`}>
               {turn.user ? <p className="workspace-answer__question">{turn.user}</p> : null}
@@ -658,7 +709,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               </div>
             </article>
           ))}
-          {!running ? <form className="workspace-follow-up" onSubmit={(event) => { event.preventDefault(); sendFollowUp() }}>
+          {!running && session ? <form className="workspace-follow-up" onSubmit={(event) => { event.preventDefault(); sendFollowUp() }}>
             <label htmlFor="workspace-follow-up">Follow up</label>
             <div className="workspace-follow-up__control">
               <textarea
@@ -798,7 +849,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
                 Delete
               </Button>
             </div>
-            <small>Saved conversations are local and resume only when you choose one.</small>
+            <small>Choose a saved conversation to preview it on the right, then enter the next goal and Resume &amp; send.</small>
           </label>
         ) : null}
         {browseOpen ? (
@@ -811,7 +862,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
         ) : null}
 
         <label className="workspace-field workspace-field--goal">
-          <span>Goal</span>
+          <span>{selectedThreadId ? 'Next goal' : 'Goal'}</span>
           <textarea
             value={goal}
             onChange={(event) => setGoal(event.target.value)}
@@ -825,7 +876,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
           {running ? (
             <Button variant="outline" onClick={stop} disabled={stopping} loading={stopping}><IconStop size={17} /> {stopping ? 'Stopping' : 'Stop'}</Button>
           ) : !session ? (
-            <Button variant="primary" onClick={start} disabled={!canStart}><IconPlay size={17} /> Start Workspace</Button>
+            <Button variant="primary" onClick={start} disabled={!canStart}><IconPlay size={17} /> {selectedThreadId ? 'Resume & send' : 'Start Workspace'}</Button>
           ) : null}
           {!running && state.events.length > 0 && <Button variant="ghost" onClick={reset}><IconClose size={17} /> Clear activity</Button>}
           <span>12 steps · read-only tools run automatically · files are never changed</span>

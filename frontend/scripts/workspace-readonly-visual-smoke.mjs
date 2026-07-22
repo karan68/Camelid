@@ -287,6 +287,70 @@ try {
     await page.close()
   }
 
+  const resumePage = await browser.newPage()
+  await resumePage.setViewport({ width: 1280, height: 800 })
+  await resumePage.evaluateOnNewDocument(() => {
+    localStorage.setItem('camelid-theme', 'dark')
+    localStorage.setItem('camelid.workspacePath', 'C:/workspace-preview')
+  })
+  await resumePage.setRequestInterception(true)
+  resumePage.on('request', async (request) => {
+    const url = request.url()
+    if (request.method() === 'OPTIONS') {
+      return request.respond({ status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }, body: '' })
+    }
+    if (url.endsWith('/v1/health')) return respondJson(request, health)
+    if (url.endsWith('/v1/models')) return respondJson(request, models)
+    if (url.endsWith('/api/capabilities')) return respondJson(request, capabilities)
+    if (url.endsWith('/api/models/catalog/downloads')) return respondJson(request, [])
+    if (url.endsWith('/api/models/current')) return respondJson(request, currentModel)
+    if (url.endsWith('/api/models/local')) return respondJson(request, localModels)
+    if (url.endsWith('/api/agent/workspace/models')) return respondJson(request, { models: [] })
+    if (url.includes('/api/agent/workspace/threads/workspace-preview?')) {
+      return respondJson(request, {
+        thread: {
+          id: 'workspace-preview', canonical_root: 'C:/workspace-preview', model_id: 'qwen3_4b_q4_k_m',
+          model_sha256: 'test-sha', compacted_through_turn: null, compaction_count: 0,
+          updated_at: 1_784_733_939, turn_count: 2,
+        },
+        turns: [
+          { user_text: 'Which file handles authentication?', assistant_text: 'Authentication is handled by auth.rs.', terminal_outcome: 'answered' },
+          { user_text: 'Read every file before I stopped you.', assistant_text: '', terminal_outcome: 'aborted' },
+        ],
+      })
+    }
+    if (url.includes('/api/agent/workspace/threads?')) {
+      return respondJson(request, { threads: [{
+        id: 'workspace-preview', canonical_root: 'C:/workspace-preview', model_id: 'qwen3_4b_q4_k_m',
+        model_sha256: 'test-sha', compacted_through_turn: null, compaction_count: 0,
+        updated_at: 1_784_733_939, turn_count: 2,
+      }] })
+    }
+    return request.continue()
+  })
+  await resumePage.goto(`${baseUrl}/#workspace`, { waitUntil: 'networkidle2', timeout: 30000 })
+  await resumePage.waitForSelector('.workspace-thread-picker option[value="workspace-preview"]')
+  await resumePage.select('.workspace-thread-picker select', 'workspace-preview')
+  await resumePage.waitForFunction(() => document.body.textContent.includes('Authentication is handled by auth.rs.'), { timeout: 5000 })
+  const resumeState = await resumePage.evaluate(() => ({
+    questions: [...document.querySelectorAll('.workspace-answer__question')].map((node) => node.textContent.trim()),
+    answerText: document.querySelector('.workspace-result')?.textContent,
+    followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
+    goalLabel: document.querySelector('.workspace-field--goal > span')?.textContent,
+    primaryText: document.querySelector('.workspace-setup__actions .cx-btn--primary')?.textContent.trim(),
+  }))
+  if (JSON.stringify(resumeState.questions) !== JSON.stringify(['Which file handles authentication?', 'Read every file before I stopped you.'])) {
+    throw new Error(`saved conversation questions did not hydrate on selection: ${JSON.stringify(resumeState)}`)
+  }
+  if (!resumeState.answerText.includes('Authentication is handled by auth.rs.') || !resumeState.answerText.includes('Stopped')) {
+    throw new Error(`saved conversation answers/outcomes did not hydrate on selection: ${JSON.stringify(resumeState)}`)
+  }
+  if (resumeState.followUpPresent || resumeState.goalLabel !== 'Next goal' || resumeState.primaryText !== 'Resume & send') {
+    throw new Error(`saved conversation preview exposed incorrect controls: ${JSON.stringify(resumeState)}`)
+  }
+  console.log(`resume-preview: PASS ${JSON.stringify(resumeState)}`)
+  await resumePage.close()
+
   const cancelPage = await browser.newPage()
   await cancelPage.setViewport({ width: 1280, height: 800 })
   await cancelPage.evaluateOnNewDocument(() => {
