@@ -8,9 +8,10 @@
 //! instructions (constraint 6). `run_shell` is cwd-pinned + approval-gated, not a
 //! filesystem jail (Decision C / DECISIONS D9).
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -200,6 +201,42 @@ impl ToolOutcome {
     pub fn is_err(&self) -> bool {
         matches!(self, ToolOutcome::Err(_))
     }
+
+    pub fn clipped(self, max_bytes: usize) -> Self {
+        let clip_text = |text: String| {
+            const MARKER: &str = "\n...[truncated for Workspace]";
+            if text.len() <= max_bytes {
+                return text;
+            }
+            let mut end = max_bytes.saturating_sub(MARKER.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}{MARKER}", &text[..end])
+        };
+        match self {
+            Self::Ok(text) => Self::Ok(clip_text(text)),
+            Self::Err(text) => Self::Err(clip_text(text)),
+        }
+    }
+}
+
+/// Strip the Windows extended-length `\\?\` (and `\\?\UNC\`) verbatim prefix that
+/// `std::fs::canonicalize` produces, so a canonical path reads as an ordinary
+/// `C:\...` / `\\server\share\...` for display and for the model. Non-Windows
+/// paths and paths without the prefix pass through unchanged.
+pub fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            if let Some(unc) = stripped.strip_prefix("UNC\\") {
+                return format!(r"\\{unc}");
+            }
+            return stripped.to_string();
+        }
+    }
+    text
 }
 
 /// The enforced sandbox: a canonical root + the network/shell policy.
@@ -219,14 +256,12 @@ pub struct Sandbox {
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
-const MAX_SEARCH_HITS: usize = 100;
-
-/// Directories `search` never descends into.
-///
-/// `.camelid` is the agent's own scratch dir (subagent task/result files today;
-/// checkpoints and saved sessions later). Indexing it would feed the agent's own
-/// prior output back to it as workspace content — laundering untrusted tool
-/// output into something that reads like a source file.
+const MAX_RANGED_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LIST_ENTRIES: usize = 4_096;
+const MAX_SEARCH_FILES: usize = 5_000;
+const MAX_SEARCH_DURATION: Duration = Duration::from_secs(2);
+const FULL_SEARCH_HITS: u64 = 100;
+const WORKSPACE_SEARCH_HITS: u64 = 20;
 const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
 
 impl Sandbox {
@@ -273,6 +308,19 @@ impl Sandbox {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn permits(&self, path: &Path) -> bool {
+        self.fs_unrestricted || path == self.root || path.starts_with(&self.root)
+    }
+
+    /// The workspace root as a clean display string with the Windows extended-length
+    /// `\\?\` verbatim prefix stripped, for the system prompt shown to the model and
+    /// for the UI. Confinement still uses the canonical `root`, so this never widens
+    /// the sandbox — it only stops the model from echoing a `\\?\C:\...` path (whose
+    /// backslashes break tool-call JSON) back into its tool calls.
+    pub fn root_display(&self) -> String {
+        display_path(&self.root)
     }
 
     /// Resolve a user/model-supplied path against the root and confirm it stays
@@ -330,28 +378,70 @@ impl Sandbox {
 
 // --- tool registry --------------------------------------------------------
 
+/// The tool surface advertised to and accepted from the model for one agent
+/// loop. The full CLI/TUI profile preserves the existing computer-control
+/// surface. Workspace is deliberately limited to scoped file operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProfile {
+    Full,
+    WorkspaceReadOnly,
+}
+
+impl ToolProfile {
+    pub fn allows(self, tool: &str) -> bool {
+        self == ToolProfile::Full
+            || (self == ToolProfile::WorkspaceReadOnly
+                && matches!(tool, "read_file" | "list_dir" | "search"))
+    }
+
+    pub fn is_workspace(self) -> bool {
+        self == Self::WorkspaceReadOnly
+    }
+
+    pub fn observation_limit(self) -> Option<usize> {
+        match self {
+            Self::Full => None,
+            Self::WorkspaceReadOnly => Some(2 * 1024),
+        }
+    }
+
+    fn search_hit_limit(self) -> u64 {
+        if self.is_workspace() {
+            WORKSPACE_SEARCH_HITS
+        } else {
+            FULL_SEARCH_HITS
+        }
+    }
+}
+
 /// The tools offered to the model. `http_fetch` is included only when network
 /// access is enabled (`--allow-net`); `run_shell` is omitted entirely when the
 /// shell sandbox is `disabled` (Task 1 — the tool is not registered at all).
 pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
+    specs_for(ToolProfile::Full, allow_net, shell_mode)
+}
+
+pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
     let mut tools = vec![
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file within the workspace.".into(),
+            description: "Read a UTF-8 text file within the workspace. Use start_line and \
+                          max_lines for bounded excerpts."
+                .into(),
             risk: Risk::Read,
-            params: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            params: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "list_dir".into(),
-            description: "List the entries of a directory within the workspace.".into(),
+            description: "List a page of directory entry names within the workspace. Use this to discover filenames and file extensions.".into(),
             risk: Risk::Read,
-            params: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            params: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search file contents for a substring within the workspace.".into(),
+            description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex or glob syntax.".into(),
             risk: Risk::Read,
-            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}),
+            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
         ToolSpec {
             name: "update_plan".into(),
@@ -381,6 +471,10 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
             params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
         },
     ];
+    if profile == ToolProfile::WorkspaceReadOnly {
+        tools.retain(|tool| profile.allows(&tool.name));
+        return tools;
+    }
     if shell_mode != ShellSandbox::Disabled {
         tools.push(ToolSpec {
             name: "run_shell".into(),
@@ -450,7 +544,8 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
             tools.push(ToolSpec {
                 name: "run_windows_command".into(),
                 description: "Windows only: run a PowerShell command in the workspace and capture \
-                              its output. Exec tier — always gated by the approval policy.".into(),
+                              its output. Exec tier — always gated by the approval policy."
+                    .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
                     "command":{"type":"string","description":"PowerShell command to run (passed verbatim via stdin)"},
@@ -497,7 +592,8 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
                 name: "mouse_click".into(),
                 description: "Windows only: click the mouse. Optionally move to (x,y) first; \
                               button is left|right|middle (default left); double=true double-clicks. \
-                              Exec tier — gated.".into(),
+                              Exec tier — gated."
+                    .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
                     "x":{"type":"integer","description":"Optional: move here before clicking"},
@@ -513,7 +609,8 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
                 description: "Windows only: click a UI control BY NAME using UI Automation \
                               (invokes it, or clicks its center). Pass `window` (a title \
                               substring) to target a specific app, else the foreground window. \
-                              Prefer this over raw mouse_click. Exec tier — gated.".into(),
+                              Prefer this over raw mouse_click. Exec tier — gated."
+                    .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
                     "name":{"type":"string","description":"The control's accessible name, e.g. \"Save\""},
@@ -524,7 +621,8 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
                 name: "screenshot".into(),
                 description: "Windows only: capture the primary screen to a PNG file (for the \
                               operator/logging — the model cannot read pixels). Optional `path`; \
-                              defaults to screenshot.png in the workspace. Exec tier — gated.".into(),
+                              defaults to screenshot.png in the workspace. Exec tier — gated."
+                    .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
                     "path":{"type":"string","description":"Optional PNG output path (default screenshot.png)"}
@@ -549,7 +647,8 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
             name: "inspect_system".into(),
             description: "Windows only: read host state (read-only). query_type is one of \
                           processes | environment | network_ports | registry_read. `filter` is a \
-                          case-insensitive line filter; for registry_read it is the key path to read.".into(),
+                          case-insensitive line filter; for registry_read it is the key path to read."
+                .into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{
                 "query_type":{"type":"string","enum":["processes","environment","network_ports","registry_read"]},
@@ -557,7 +656,9 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
             },"required":["query_type"]}),
         });
     }
-    tools.extend(super::mcp::specs());
+    if profile == ToolProfile::Full {
+        tools.extend(super::mcp::specs());
+    }
     tools
 }
 
@@ -607,13 +708,19 @@ impl SystemQuery {
 pub enum Action {
     ReadFile {
         path: PathBuf,
+        start_line: Option<usize>,
+        max_lines: Option<usize>,
     },
     ListDir {
         path: PathBuf,
+        offset: usize,
+        limit: Option<usize>,
     },
     Search {
         pattern: String,
         path: PathBuf,
+        limit: usize,
+        bounded: bool,
     },
     WriteFile {
         path: PathBuf,
@@ -704,9 +811,6 @@ pub enum Action {
     Screenshot {
         path: PathBuf,
     },
-    /// A tool provided by an MCP server (`mcp__<server>__<tool>`). The name is
-    /// runtime data, not a compile-time variant, because the tool set is
-    /// whatever the configured servers advertise.
     McpCall {
         name: String,
         args: Value,
@@ -736,8 +840,6 @@ impl Action {
             | Action::MouseClick { .. }
             | Action::UiClick { .. }
             | Action::Screenshot { .. }
-            // An MCP tool does whatever its third-party server does, so it is
-            // always gated and --auto-approve does not promote it.
             | Action::McpCall { .. } => Risk::Exec,
             Action::HttpFetch { .. } | Action::WebSearch { .. } => Risk::Network,
             Action::InspectSystem { .. }
@@ -776,10 +878,33 @@ impl Action {
     /// One-line summary of the *call* for the transcript (resolved, not prose).
     pub fn call_line(&self, sandbox: &Sandbox) -> String {
         match self {
-            Action::ReadFile { path } => format!("read_file({})", sandbox.rel(path)),
-            Action::ListDir { path } => format!("list_dir({})", sandbox.rel(path)),
-            Action::Search { pattern, path } => {
-                format!("search({pattern:?}, {})", sandbox.rel(path))
+            Action::ReadFile {
+                path,
+                start_line,
+                max_lines,
+            } => format!(
+                "read_file({}, start_line={}, max_lines={})",
+                sandbox.rel(path),
+                start_line.unwrap_or(1),
+                max_lines.map_or_else(|| "all".to_string(), |value| value.to_string())
+            ),
+            Action::ListDir {
+                path,
+                offset,
+                limit,
+            } => format!(
+                "list_dir({}, offset={}, limit={})",
+                sandbox.rel(path),
+                offset,
+                limit.map_or_else(|| "all".to_string(), |value| value.to_string())
+            ),
+            Action::Search {
+                pattern,
+                path,
+                limit,
+                ..
+            } => {
+                format!("search({pattern:?}, {}, limit={limit})", sandbox.rel(path))
             }
             Action::WriteFile { path, content, .. } => {
                 format!("write_file({}, {} bytes)", sandbox.rel(path), content.len())
@@ -884,9 +1009,22 @@ impl Action {
     /// Execute the (already approved) action.
     pub fn execute(&self, sandbox: &Sandbox) -> ToolOutcome {
         match self {
-            Action::ReadFile { path } => read_file(path),
-            Action::ListDir { path } => list_dir(path),
-            Action::Search { pattern, path } => search(pattern, path),
+            Action::ReadFile {
+                path,
+                start_line,
+                max_lines,
+            } => read_file(path, *start_line, *max_lines),
+            Action::ListDir {
+                path,
+                offset,
+                limit,
+            } => list_dir(path, *offset, *limit),
+            Action::Search {
+                pattern,
+                path,
+                limit,
+                bounded,
+            } => search(pattern, path, *limit, *bounded, sandbox),
             // Snapshot before every mutation, at the execution site rather than
             // on the model's say-so, so undo is available whether or not the
             // model thought to ask for it.
@@ -939,21 +1077,46 @@ impl Action {
             // the same fenced tool-result path as every native tool.
             Action::McpCall { name, args } => match super::mcp::call(name, args) {
                 Ok(text) => ToolOutcome::Ok(clip(&text)),
-                Err(e) => ToolOutcome::Err(e),
+                Err(error) => ToolOutcome::Err(error),
             },
         }
     }
 }
 
 #[derive(Deserialize)]
-struct PathArg {
+struct ReadFileArg {
     path: String,
+    start_line: Option<usize>,
+    max_lines: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ListDirArg {
+    path: String,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
 }
 
 /// Validate a parsed tool call against the schema + sandbox. Returns a typed
 /// error string (→ tool-error result the model can recover from) rather than
 /// panicking, for unknown tools, bad args, or sandbox escapes.
+#[cfg(any(windows, test))]
 pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
+    validate_for(ToolProfile::Full, call, sandbox)
+}
+
+pub fn validate_for(
+    profile: ToolProfile,
+    call: &ToolCall,
+    sandbox: &Sandbox,
+) -> Result<Action, String> {
+    if !profile.allows(&call.name) {
+        return Err(format!(
+            "tool `{}` is not available in this agent mode",
+            call.name
+        ));
+    }
     let args = &call.args;
     let str_arg = |key: &str| -> Result<String, String> {
         args.get(key)
@@ -963,23 +1126,49 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
     };
     match call.name.as_str() {
         "read_file" => {
-            let a: PathArg = parse_args(args, &call.name)?;
+            let a: ReadFileArg = parse_args(args, &call.name)?;
+            if a.start_line == Some(0)
+                || a.max_lines.is_some_and(|limit| !(1..=200).contains(&limit))
+            {
+                return Err(
+                    "read_file requires start_line >= 1 and max_lines between 1 and 200".into(),
+                );
+            }
             Ok(Action::ReadFile {
                 path: sandbox.resolve(&a.path, true)?,
+                start_line: a.start_line,
+                max_lines: a.max_lines,
             })
         }
         "list_dir" => {
-            let a: PathArg = parse_args(args, &call.name)?;
+            let a: ListDirArg = parse_args(args, &call.name)?;
+            if a.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
+                return Err("list_dir requires limit between 1 and 200".into());
+            }
             Ok(Action::ListDir {
                 path: sandbox.resolve(&a.path, true)?,
+                offset: a.offset,
+                limit: a.limit,
             })
         }
         "search" => {
             let pattern = str_arg("pattern")?;
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let max_limit = profile.search_hit_limit();
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(max_limit);
+            if !(1..=max_limit).contains(&limit) {
+                return Err(format!(
+                    "search requires limit between 1 and {max_limit} in this agent mode"
+                ));
+            }
             Ok(Action::Search {
                 pattern,
                 path: sandbox.resolve(path, true)?,
+                limit: limit as usize,
+                bounded: profile.is_workspace(),
             })
         }
         "write_file" => {
@@ -1296,7 +1485,59 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<
 
 // --- execution ------------------------------------------------------------
 
-fn read_file(path: &Path) -> ToolOutcome {
+fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -> ToolOutcome {
+    if start_line.is_some() || max_lines.is_some() {
+        if std::fs::metadata(path)
+            .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
+            .unwrap_or(false)
+        {
+            return ToolOutcome::Err(format!(
+                "ranged read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
+            ));
+        }
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+        };
+        let start = start_line.unwrap_or(1);
+        let limit = max_lines.unwrap_or(200);
+        let mut output = String::new();
+        let mut returned = 0usize;
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let line_number = index + 1;
+            if line_number < start {
+                continue;
+            }
+            if returned >= limit {
+                output.push_str(&format!("...[continue at start_line={line_number}]"));
+                break;
+            }
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+            };
+            let rendered = format!("{line_number}: {line}\n");
+            if output.len().saturating_add(rendered.len()) > MAX_READ_BYTES {
+                output.push_str(&format!("...[continue at start_line={line_number}]"));
+                break;
+            }
+            output.push_str(&rendered);
+            returned += 1;
+        }
+        return ToolOutcome::Ok(if output.is_empty() {
+            format!("(no lines at or after {start})")
+        } else {
+            output.trim_end().to_string()
+        });
+    }
+    if std::fs::metadata(path)
+        .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        return ToolOutcome::Err(format!(
+            "read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
+        ));
+    }
     match std::fs::read(path) {
         Ok(bytes) => {
             let truncated = bytes.len() > MAX_READ_BYTES;
@@ -1311,8 +1552,9 @@ fn read_file(path: &Path) -> ToolOutcome {
     }
 }
 
-fn list_dir(path: &Path) -> ToolOutcome {
-    let mut entries = Vec::new();
+fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
+    let mut entries = std::collections::BinaryHeap::new();
+    let mut capped = false;
     let read = match std::fs::read_dir(path) {
         Ok(r) => r,
         Err(e) => return ToolOutcome::Err(format!("list failed: {e}")),
@@ -1324,30 +1566,103 @@ fn list_dir(path: &Path) -> ToolOutcome {
             _ => "",
         };
         entries.push(format!("{name}{suffix}"));
+        if entries.len() > MAX_LIST_ENTRIES {
+            entries.pop();
+            capped = true;
+        }
     }
-    entries.sort();
-    ToolOutcome::Ok(if entries.is_empty() {
-        "(empty)".into()
+    let entries = entries.into_sorted_vec();
+    let total = entries.len();
+    let page_limit = limit.unwrap_or(total);
+    let page = entries
+        .into_iter()
+        .skip(offset)
+        .take(page_limit)
+        .collect::<Vec<_>>();
+    ToolOutcome::Ok(if page.is_empty() {
+        if capped {
+            format!(
+                "(no retained entries at offset {offset})\n...[listing capped after {MAX_LIST_ENTRIES} entries; additional entries exist and cannot be paged]"
+            )
+        } else {
+            "(empty)".into()
+        }
     } else {
-        entries.join("\n")
+        let mut output = page.join("\n");
+        let next = offset.saturating_add(page.len());
+        if next < total {
+            if capped {
+                output.push_str(&format!(
+                    "\n...[at least {total} entries observed; continue at offset={next} within retained entries]"
+                ));
+            } else {
+                output.push_str(&format!(
+                    "\n...[{total} entries total; continue at offset={next}]"
+                ));
+            }
+        } else if capped {
+            output.push_str(&format!(
+                "\n...[listing capped after {MAX_LIST_ENTRIES} entries; additional entries exist and cannot be paged]"
+            ));
+        }
+        output
     })
 }
 
-fn search(pattern: &str, root: &Path) -> ToolOutcome {
+fn search(
+    pattern: &str,
+    root: &Path,
+    limit: usize,
+    bounded: bool,
+    sandbox: &Sandbox,
+) -> ToolOutcome {
     let needle = pattern.to_lowercase();
+    let root = match std::fs::canonicalize(root) {
+        Ok(root) if sandbox.permits(&root) => root,
+        _ => return ToolOutcome::Err("search path is unavailable or outside the workspace".into()),
+    };
+    if root.is_file() {
+        return search_file(&needle, &root, limit, sandbox);
+    }
     let mut hits = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    let mut files_scanned = 0usize;
+    let started = Instant::now();
+    let mut truncated = false;
     while let Some(dir) = stack.pop() {
-        if hits.len() >= MAX_SEARCH_HITS {
+        if hits.len() >= limit
+            || (bounded
+                && (files_scanned >= MAX_SEARCH_FILES || started.elapsed() >= MAX_SEARCH_DURATION))
+        {
+            truncated = true;
             break;
+        }
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            continue;
+        };
+        if !sandbox.permits(&dir) || !visited.insert(dir.clone()) {
+            continue;
         }
         let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in read.flatten() {
-            let path = entry.path();
-            let ft = entry.file_type();
-            if matches!(&ft, Ok(t) if t.is_dir()) {
+            if hits.len() >= limit
+                || (bounded
+                    && (files_scanned >= MAX_SEARCH_FILES
+                        || started.elapsed() >= MAX_SEARCH_DURATION))
+            {
+                truncated = true;
+                break;
+            }
+            let Ok(path) = std::fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            if !sandbox.permits(&path) {
+                continue;
+            }
+            if path.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if SEARCH_SKIP_DIRS.contains(&name.as_ref()) {
@@ -1356,28 +1671,75 @@ fn search(pattern: &str, root: &Path) -> ToolOutcome {
                 stack.push(path);
                 continue;
             }
+            files_scanned += 1;
+            if std::fs::metadata(&path)
+                .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
+                .unwrap_or(true)
+            {
+                continue;
+            }
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            if bytes.len() > MAX_READ_BYTES * 8 {
-                continue;
-            }
             let text = String::from_utf8_lossy(&bytes);
             for (n, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
-                    hits.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
-                    if hits.len() >= MAX_SEARCH_HITS {
+                    hits.push(format!("{}:{}: {}", sandbox.rel(&path), n + 1, line.trim()));
+                    if hits.len() >= limit {
+                        truncated = true;
                         break;
                     }
                 }
             }
         }
     }
-    ToolOutcome::Ok(if hits.is_empty() {
+    let mut output = if hits.is_empty() {
         format!("no matches for {pattern:?}")
     } else {
         hits.join("\n")
-    })
+    };
+    if truncated {
+        output.push_str("\n...[search truncated; narrow pattern or path]");
+    }
+    ToolOutcome::Ok(output)
+}
+
+fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> ToolOutcome {
+    if std::fs::metadata(path)
+        .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
+        .unwrap_or(true)
+    {
+        return ToolOutcome::Err("search file is unreadable or exceeds the size limit".into());
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return ToolOutcome::Err(format!("search read failed: {error}")),
+    };
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    for (line_index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
+        if line.to_lowercase().contains(needle) {
+            hits.push(format!(
+                "{}:{}: {}",
+                sandbox.rel(path),
+                line_index + 1,
+                line.trim()
+            ));
+            if hits.len() >= limit {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    let mut output = if hits.is_empty() {
+        format!("no matches for {needle:?}")
+    } else {
+        hits.join("\n")
+    };
+    if truncated {
+        output.push_str(&format!("\n...[search stopped at {limit} hits]"));
+    }
+    ToolOutcome::Ok(output)
 }
 
 fn write_file(path: &Path, content: &str) -> ToolOutcome {
@@ -2049,6 +2411,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_profile_is_exactly_the_read_only_tool_set() {
+        let read_only = specs_for(
+            ToolProfile::WorkspaceReadOnly,
+            true,
+            ShellSandbox::Unrestricted,
+        )
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+        assert_eq!(read_only, vec!["read_file", "list_dir", "search"]);
+        assert!(!ToolProfile::WorkspaceReadOnly.allows("write_file"));
+    }
+
+    #[test]
+    fn workspace_observation_clip_is_bounded_and_utf8_safe() {
+        let mut text = "a".repeat(4 * 1024);
+        text.push('—');
+        let clipped = ToolOutcome::Ok(text).clipped(4 * 1024);
+        assert!(clipped.text().len() <= 4 * 1024);
+        assert!(clipped.text().ends_with("...[truncated for Workspace]"));
+    }
+
+    #[test]
     fn read_file_happy_path() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
@@ -2056,6 +2441,137 @@ mod tests {
         let action = validate(&call("read_file", json!({"path":"a.txt"})), &sb).unwrap();
         let out = action.execute(&sb);
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hello")));
+    }
+
+    #[test]
+    fn bare_read_rejects_oversized_file_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_RANGED_FILE_BYTES + 1).unwrap();
+
+        let outcome = read_file(&path, None, None);
+        assert!(outcome.is_err());
+        assert!(outcome.text().contains("exceeds"));
+    }
+
+    #[test]
+    fn search_limits_are_profile_specific() {
+        let full = specs_for(ToolProfile::Full, false, ShellSandbox::Disabled)
+            .into_iter()
+            .find(|tool| tool.name == "search")
+            .unwrap();
+        let workspace = specs_for(
+            ToolProfile::WorkspaceReadOnly,
+            false,
+            ShellSandbox::Disabled,
+        )
+        .into_iter()
+        .find(|tool| tool.name == "search")
+        .unwrap();
+        assert_eq!(full.params["properties"]["limit"]["maximum"], 100);
+        assert_eq!(workspace.params["properties"]["limit"]["maximum"], 20);
+
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let request = call("search", json!({"pattern":"x","limit":100}));
+        assert!(validate_for(ToolProfile::Full, &request, &sb).is_ok());
+        assert!(validate_for(ToolProfile::WorkspaceReadOnly, &request, &sb).is_err());
+    }
+
+    #[test]
+    fn bounded_file_tools_disclose_coordinates_and_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        let sb = sandbox(dir.path());
+
+        let read = validate(
+            &call(
+                "read_file",
+                json!({"path":"a.txt","start_line":2,"max_lines":2}),
+            ),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert!(read.text().contains("2: two"));
+        assert!(read.text().contains("3: three"));
+        assert!(read.text().contains("continue at start_line=4"));
+
+        let list = validate(
+            &call("list_dir", json!({"path":".","offset":1,"limit":2})),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert_eq!(list.text().lines().take(2).count(), 2);
+        assert!(list.text().contains("continue at offset=3"));
+
+        let search = validate(
+            &call("search", json!({"pattern":"o","path":".","limit":1})),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert_eq!(search.text().lines().count(), 2);
+        assert!(search.text().contains("search truncated"));
+    }
+
+    #[test]
+    fn search_accepts_an_individual_file_path_and_reports_literal_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "alpha\nneedle here\nomega\nneedle again\n",
+        )
+        .unwrap();
+        let sb = sandbox(dir.path());
+        let hits = validate(
+            &call(
+                "search",
+                json!({"pattern":"needle","path":"README.md","limit":1}),
+            ),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert!(hits.text().contains("README.md:2: needle here"));
+        assert!(hits.text().contains("search stopped at 1 hits"));
+
+        let missing = validate(
+            &call(
+                "search",
+                json!({"pattern":"absent","path":"README.md","limit":5}),
+            ),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert_eq!(missing.text(), "no matches for \"absent\"");
+    }
+
+    #[test]
+    fn capped_directory_listing_discloses_unpageable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_LIST_ENTRIES {
+            std::fs::write(dir.path().join(format!("entry-{index:04}.md")), "x").unwrap();
+        }
+        let output = list_dir(dir.path(), MAX_LIST_ENTRIES - 1, Some(2));
+        let retained = output.text().lines().next().unwrap();
+        assert_eq!(retained, "entry-4095.md");
+        assert!(!output.text().contains("entry-4096.md"));
+        assert!(output
+            .text()
+            .contains("additional entries exist and cannot be paged"));
+
+        let beyond = list_dir(dir.path(), MAX_LIST_ENTRIES, Some(1));
+        assert!(beyond.text().contains("no retained entries"));
+        assert!(beyond
+            .text()
+            .contains("additional entries exist and cannot be paged"));
     }
 
     #[test]
@@ -2098,6 +2614,28 @@ mod tests {
     }
 
     #[test]
+    fn fs_unrestricted_allows_search_outside_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("note.txt");
+        std::fs::write(&target, "outside needle").unwrap();
+        let free = sandbox(root.path()).with_fs_unrestricted(true);
+        let action = validate_for(
+            ToolProfile::Full,
+            &call(
+                "search",
+                json!({"path": target.to_str().unwrap(), "pattern": "needle"}),
+            ),
+            &free,
+        )
+        .unwrap();
+
+        let outcome = action.execute(&free);
+        assert!(!outcome.is_err(), "{}", outcome.text());
+        assert!(outcome.text().contains("outside needle"));
+    }
+
+    #[test]
     fn write_then_edit_within_sandbox() {
         let _cp = super::super::checkpoint::tests::cp_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -2123,6 +2661,24 @@ mod tests {
         assert!(matches!(e.execute(&sb), ToolOutcome::Ok(_)));
         let body = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
         assert!(body.contains("three") && !body.contains("two"));
+    }
+
+    #[test]
+    fn write_approval_is_bounded_to_path_and_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let action = validate(
+            &call(
+                "write_file",
+                json!({"path":"greeting.txt","content":"hello there"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        let detail = action.approval_detail(&sb);
+        assert!(detail.contains("write_file → greeting.txt"));
+        assert!(detail.contains("create: 1 lines"));
+        assert!(!detail.contains("hello there"));
     }
 
     #[test]
@@ -2161,23 +2717,18 @@ mod tests {
         assert!(validate(&call("http_fetch", json!({"url":"http://x"})), &sb).is_err());
     }
 
-    /// The advertised tool set is what the model is told it may do, and every
-    /// existing test here asks only "does it contain X". Pin the whole set, so
-    /// adding or removing a tool is a deliberate edit to this list rather than
-    /// an invisible widening of the agent's surface.
     #[test]
     fn advertised_tool_set_is_pinned() {
         use super::ShellSandbox;
-        // specs() also advertises whatever MCP has adopted; this pin is about
-        // the native set, and the lock keeps a concurrent MCP test out of it.
         let _guard = super::super::mcp::tests::registry_lock();
-
         let names = |net, shell| {
-            let mut v: Vec<String> = specs(net, shell).iter().map(|t| t.name.clone()).collect();
-            v.sort_unstable();
-            v
+            let mut names = specs(net, shell)
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            names
         };
-
         // Baseline: no net, no shell, and `subagent::is_enabled()` false — which
         // it is under test, because no subagent config has been installed. The
         // orchestration tools (spawn_subagent / check_subagent_status) therefore
@@ -2305,14 +2856,10 @@ mod tests {
         assert!(!urlencode("../../etc/passwd").contains('/'));
     }
 
-    /// `search` must not index the agent's own scratch dir. A subagent result
-    /// (or, later, a checkpoint or saved transcript) is untrusted tool output;
-    /// surfacing it as a workspace search hit would relabel it as source.
     #[test]
     fn search_skips_the_agent_scratch_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let sb = sandbox(dir.path());
-
+        let sandbox = sandbox(dir.path());
         std::fs::create_dir_all(dir.path().join(".camelid/subagents")).unwrap();
         std::fs::write(
             dir.path().join(".camelid/subagents/result_x.json"),
@@ -2320,22 +2867,16 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("real.txt"), "NEEDLE_marker in real source").unwrap();
-
-        let out = validate(&call("search", json!({"pattern":"NEEDLE_marker"})), &sb)
-            .unwrap()
-            .execute(&sb);
-        let text = out.text();
-
-        assert!(text.contains("real.txt"), "real file should be found");
-        assert!(
-            !text.contains(".camelid"),
-            "search leaked the agent's own scratch state: {text}"
-        );
+        let outcome = validate(
+            &call("search", json!({"pattern":"NEEDLE_marker"})),
+            &sandbox,
+        )
+        .unwrap()
+        .execute(&sandbox);
+        assert!(outcome.text().contains("real.txt"));
+        assert!(!outcome.text().contains(".camelid"));
     }
 
-    /// The orchestration tools are advertised only once a subagent config is
-    /// installed. Unconfigured — the state every test and every plain `chat
-    /// --agent` session starts in — the model is never offered them.
     #[test]
     fn subagent_tools_gated_on_configuration() {
         use super::ShellSandbox;
@@ -2346,32 +2887,30 @@ mod tests {
             ShellSandbox::Sandboxed,
             ShellSandbox::Unrestricted,
         ] {
-            let names: Vec<String> = specs(false, shell).iter().map(|t| t.name.clone()).collect();
-            assert!(!names.iter().any(|n| n == "spawn_subagent"));
-            assert!(!names.iter().any(|n| n == "check_subagent_status"));
+            let names = specs(false, shell)
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            assert!(!names.iter().any(|name| name == "spawn_subagent"));
+            assert!(!names.iter().any(|name| name == "check_subagent_status"));
         }
     }
 
-    /// Every advertised tool must be reachable through `validate`. A spec with no
-    /// validation arm is a tool the model is offered and can never successfully
-    /// call; a validation arm with no spec is a tool it was never told about.
     #[test]
     fn every_advertised_tool_has_a_validation_arm() {
         use super::ShellSandbox;
         let _guard = super::super::mcp::tests::registry_lock();
         let dir = tempfile::tempdir().unwrap();
-        let sb = sandbox(dir.path());
-        for t in specs(false, ShellSandbox::Sandboxed) {
-            // Empty args: the arm may reject them, but "unknown tool" means the
-            // name never reached a match arm at all.
-            let err = match validate(&call(&t.name, json!({})), &sb) {
+        let sandbox = sandbox(dir.path());
+        for tool in specs(false, ShellSandbox::Sandboxed) {
+            let error = match validate(&call(&tool.name, json!({})), &sandbox) {
                 Ok(_) => continue,
-                Err(e) => e.to_string(),
+                Err(error) => error,
             };
             assert!(
-                !err.contains("unknown tool"),
+                !error.contains("unknown tool"),
                 "{} is advertised but has no validation arm",
-                t.name
+                tool.name
             );
         }
     }

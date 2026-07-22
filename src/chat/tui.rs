@@ -563,8 +563,7 @@ impl<'a> App<'a> {
 
         match op {
             Suspend::Pull(alias) => {
-                if let Err(err) =
-                    camelid::catalog::run_pull(Some(&alias), self.session.models_dir())
+                if let Err(err) = crate::catalog::run_pull(Some(&alias), self.session.models_dir())
                 {
                     self.status = format!("pull failed: {err}");
                 } else {
@@ -575,7 +574,7 @@ impl<'a> App<'a> {
                 if let Some(PickEntry::Catalog(row)) = self.picker.entries.get(index) {
                     if let Some(item) = row.catalog.as_ref() {
                         let id = row.id.clone();
-                        match camelid::catalog::run_pull(
+                        match crate::catalog::run_pull(
                             Some(item.catalog_id),
                             self.session.models_dir(),
                         ) {

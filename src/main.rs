@@ -15,7 +15,7 @@ extern "C" {
 }
 
 use camelid::{
-    api,
+    api, chat,
     cluster::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
@@ -37,8 +37,6 @@ use camelid::{
 use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
-
-mod chat;
 
 // Prefer the git describe stamped in by build.rs (e.g. "v0.1.1" or
 // "v0.1.1-3-gabcdef-dirty"); fall back to the crate version for builds without
@@ -7319,56 +7317,71 @@ fn write_step_logits(dir: &std::path::Path, step: usize, logits: &[f32]) -> std:
 mod basalt_forced_decode_tests {
     use super::*;
 
+    fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn CLI parse test")
+            .join()
+            .expect("CLI parse test panicked");
+    }
+
     #[test]
     fn gemma4_generate_parses_forced_decode_flags() {
-        let cli = Cli::try_parse_from([
-            "camelid",
-            "gemma4-generate",
-            "model.gguf",
-            "--force-tokens",
-            "toks.txt",
-            "--dump-step-logits",
-            "dumps",
-            "--max-tokens",
-            "8",
-        ])
-        .expect("parse");
-        match cli.command {
-            Some(Command::Gemma4Generate {
-                path,
-                max_tokens,
-                force_tokens,
-                dump_step_logits,
-                ..
-            }) => {
-                assert_eq!(path, PathBuf::from("model.gguf"));
-                assert_eq!(max_tokens, 8);
-                assert_eq!(force_tokens, Some(PathBuf::from("toks.txt")));
-                assert_eq!(dump_step_logits, Some(PathBuf::from("dumps")));
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "gemma4-generate",
+                "model.gguf",
+                "--force-tokens",
+                "toks.txt",
+                "--dump-step-logits",
+                "dumps",
+                "--max-tokens",
+                "8",
+            ])
+            .expect("parse");
+            match cli.command {
+                Some(Command::Gemma4Generate {
+                    path,
+                    max_tokens,
+                    force_tokens,
+                    dump_step_logits,
+                    ..
+                }) => {
+                    assert_eq!(path, PathBuf::from("model.gguf"));
+                    assert_eq!(max_tokens, 8);
+                    assert_eq!(force_tokens, Some(PathBuf::from("toks.txt")));
+                    assert_eq!(dump_step_logits, Some(PathBuf::from("dumps")));
+                }
+                other => panic!("expected Gemma4Generate, got {other:?}"),
             }
-            other => panic!("expected Gemma4Generate, got {other:?}"),
-        }
+        });
     }
 
     #[test]
     fn gemma4_generate_harness_flags_default_off() {
-        let cli = Cli::try_parse_from(["camelid", "gemma4-generate", "model.gguf"]).expect("parse");
-        match cli.command {
-            Some(Command::Gemma4Generate {
-                prompt,
-                max_tokens,
-                force_tokens,
-                dump_step_logits,
-                ..
-            }) => {
-                // Default behavior unchanged: no harness flags, prior defaults intact.
-                assert_eq!(force_tokens, None);
-                assert_eq!(dump_step_logits, None);
-                assert_eq!(prompt, "The capital of France is");
-                assert_eq!(max_tokens, 24);
+        on_cli_test_stack(|| {
+            let cli =
+                Cli::try_parse_from(["camelid", "gemma4-generate", "model.gguf"]).expect("parse");
+            match cli.command {
+                Some(Command::Gemma4Generate {
+                    prompt,
+                    max_tokens,
+                    force_tokens,
+                    dump_step_logits,
+                    ..
+                }) => {
+                    // Default behavior unchanged: no harness flags, prior defaults intact.
+                    assert_eq!(force_tokens, None);
+                    assert_eq!(dump_step_logits, None);
+                    assert_eq!(prompt, "The capital of France is");
+                    assert_eq!(max_tokens, 24);
+                }
+                other => panic!("expected Gemma4Generate, got {other:?}"),
             }
-            other => panic!("expected Gemma4Generate, got {other:?}"),
-        }
+        });
     }
 
     #[test]

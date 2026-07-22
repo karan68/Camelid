@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 mod engine;
+mod workspace;
 
 use crate::{
     execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
@@ -120,6 +121,10 @@ pub struct AppState {
     allow_local_model_delete: bool,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
+    workspace_sessions: workspace::WorkspaceSessionManager,
+    /// Actual listener address. Workspace is disabled when this is non-loopback
+    /// and uses it for the existing local HTTP model driver.
+    serve_addr: SocketAddr,
     /// The engine worker: the single thread where decode compute and
     /// resident-GPU-state mutations execute (see api/engine.rs). This
     /// replaces the old `generation_lock` — serialization is by construction
@@ -162,6 +167,8 @@ impl Default for AppState {
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             verification_reports: Arc::new(RwLock::new(HashMap::new())),
+            workspace_sessions: workspace::WorkspaceSessionManager::default(),
+            serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
             engine: engine::EngineHandle::spawn(),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
@@ -200,6 +207,11 @@ impl AppState {
     /// here, once, so it stays stable however the process was launched.
     pub fn with_models_dir(mut self, models_dir: Option<PathBuf>) -> Self {
         self.models_dir = resolve_models_dir(models_dir);
+        self
+    }
+
+    fn with_serve_addr(mut self, serve_addr: SocketAddr) -> Self {
+        self.serve_addr = serve_addr;
         self
     }
 
@@ -491,6 +503,9 @@ pub struct ChatCompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Optional hard ceiling for the exact rendered prompt plus generation.
+    /// Workspace sets this private extension; ordinary OpenAI callers omit it.
+    pub camelid_context_budget_tokens: Option<u32>,
     /// Opt-in: attach a parity receipt to the (non-streaming) response. The
     /// receipt is a claim of output for the verifier to check â€” no reference
     /// runs here, so its parity block is emitted as not-compared.
@@ -997,6 +1012,7 @@ pub struct GenerationSessionRequest {
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    pub camelid_context_budget_tokens: Option<u32>,
     /// Opt-in Qwen3/gemma4 thinking mode: when true the chat renderer emits the
     /// template's thinking generation prompt (the model produces its own
     /// `<think>â€¦</think>` block) instead of the deterministic thinking-disabled
@@ -1845,6 +1861,41 @@ pub fn router_with_state(state: AppState) -> Router {
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
         )
+        .route("/api/generation/preflight", post(preflight_generation))
+        .route(
+            "/api/agent/workspace/models",
+            get(workspace::compatible_models),
+        )
+        .route("/api/agent/workspace/threads", get(workspace::list_threads))
+        .route(
+            "/api/agent/workspace/threads/:id",
+            get(workspace::get_thread).delete(workspace::delete_thread),
+        )
+        .route(
+            "/api/agent/workspace/threads/:id/compact",
+            post(workspace::compact_thread).delete(workspace::undo_thread_compaction),
+        )
+        .route("/api/agent/workspace/browse", get(workspace::browse))
+        .route(
+            "/api/agent/workspace/sessions",
+            post(workspace::create_session),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id",
+            get(workspace::session_status).delete(workspace::cancel_session),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/events",
+            get(workspace::session_events),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/messages",
+            post(workspace::send_message),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/decisions",
+            post(workspace::decide),
+        )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
         .route("/api/models/runnable-receipt", get(runnable_receipt))
@@ -1886,7 +1937,8 @@ pub async fn serve(
     let state = AppState::with_configured_threads(configured_threads)
         .with_default_enable_thinking(default_enable_thinking)
         .with_local_model_delete(addr.ip().is_loopback())
-        .with_models_dir(models_dir);
+        .with_models_dir(models_dir)
+        .with_serve_addr(addr);
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
             tracing::error!(error=%err, "failed to load startup model");
@@ -2569,6 +2621,7 @@ async fn llama_server_completion(
         camelid_prompt_token_ids,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: req.unsupported_fields,
@@ -4195,6 +4248,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
             },
             SupportItem {
+                id: "web_workspace",
+                status: "supported_current_gate",
+                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Available only to supported exact rows with tool_capable=true. The historical Qwen3-4B-Q4_K_M bundle validates the underlying tool-call and sandbox path, but its write scenarios no longer describe the current read-only surface. No write, shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim.",
+            },
+            SupportItem {
                 id: "stream_options.include_usage",
                 status: "supported_current_gate",
                 notes: "chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/.",
@@ -4383,12 +4441,19 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
         // dedicated-lane redirect (e.g. `camelid diffusion-gemma-chat`).
-        Err(err) => api_error(
-            StatusCode::BAD_REQUEST,
-            backend_error_code(&err),
-            err.to_string(),
-            Some("path"),
-        ),
+        Err(err) => {
+            let status = if matches!(err, BackendError::ModelOperationInProgress) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            api_error(
+                status,
+                backend_error_code(&err),
+                err.to_string(),
+                Some("path"),
+            )
+        }
     }
 }
 
@@ -6734,6 +6799,9 @@ async fn load_model_from_path_with_activation(
     id: Option<String>,
     set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
+    if state.workspace_sessions.blocks_model_transition().await {
+        return Err(BackendError::ModelOperationInProgress);
+    }
     let _transition = state.model_transition.lock().await;
     let _reader = state.model_file_lifecycle.read().await;
     // Every load funnels through here, so resolve relative paths against the
@@ -6963,6 +7031,14 @@ async fn unload_model(
     State(state): State<AppState>,
     payload: Option<Json<UnloadModelRequest>>,
 ) -> Response {
+    if state.workspace_sessions.blocks_model_transition().await {
+        return api_error(
+            StatusCode::CONFLICT,
+            "model_operation_in_progress",
+            BackendError::ModelOperationInProgress.to_string(),
+            None,
+        );
+    }
     let _transition = state.model_transition.lock().await;
     let _exclusive = state.model_file_lifecycle.write().await;
     let model_id = if let Some(Json(req)) = payload {
@@ -7917,6 +7993,20 @@ async fn create_generation_session(
     }
 }
 
+async fn preflight_generation(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<GenerationSessionRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(err) => return malformed_json_error(err),
+    };
+    match validate_generation_request(&state, req).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(response) => response,
+    }
+}
+
 /// Every choice of an n>1 request, prepared upfront (KV caches allocate
 /// lazily, so n prepared sessions cost weights-Arc clones, not n KV buffers),
 /// sharing ONE cancel signal so a dropped handler stops whichever choice is
@@ -8183,6 +8273,7 @@ async fn completions(
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: req.unsupported_fields,
@@ -8576,6 +8667,7 @@ async fn chat_completions(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_context_budget_tokens: req.camelid_context_budget_tokens,
         // An explicit request value always wins; the server-wide default
         // (`serve --enable-thinking`) only fills in when the request is silent.
         camelid_enable_thinking: req
@@ -8978,6 +9070,7 @@ async fn replay_loaded_receipt_request(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: HashMap::new(),
@@ -9352,6 +9445,28 @@ fn binding_runs_on_cpu_wire_only(binding: &LlamaTensorBinding) -> bool {
     crate::inference::q4_k_cpu_block_dot_enabled() && binding_all_resident_quant_linears(binding)
 }
 
+fn enforce_context_budget(
+    prompt_tokens: usize,
+    max_tokens: u32,
+    budget_tokens: u32,
+) -> Result<(), String> {
+    let total = (prompt_tokens as u64).saturating_add(u64::from(max_tokens));
+    if total > u64::from(budget_tokens) {
+        return Err(format!(
+            "exact rendered prompt ({prompt_tokens} tokens) plus generation allowance \
+             ({max_tokens} tokens) exceeds the Workspace context budget ({budget_tokens} tokens)"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    model_id.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crate::Result<u64> {
     // Resident-GPU models load wire-only (packed Q8_0/Q4_K/Q6_K bytes the CUDA engine
     // reads in place) and never materialize the f32 weights this guard sizes. Bypass the
@@ -9381,6 +9496,7 @@ async fn prepare_generation(
     req: GenerationSessionRequest,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
+    let context_budget_tokens = req.camelid_context_budget_tokens;
     let request_tools = req.tools.clone();
     validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
@@ -9622,6 +9738,24 @@ async fn prepare_generation(
             ));
         }
     }
+    if let Some(budget_tokens) = context_budget_tokens {
+        if budget_tokens == 0 {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_context_budget",
+                "camelid_context_budget_tokens must be greater than zero".to_string(),
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+        if let Err(message) = enforce_context_budget(token_ids.len(), max_tokens, budget_tokens) {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "context_budget_exceeded",
+                message,
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+    }
 
     let weight_load_started = Instant::now();
     let cache_hit = state.cached_weights.read().await.contains_key(&model.id);
@@ -9644,14 +9778,8 @@ async fn prepare_generation(
     // Pin the GPU resident-decode engine cache to the model identity (not the
     // per-load weights Arc pointer), so every request for this model reuses the
     // uploaded weights instead of rebuilding the engine each time.
-    let resident_cache_key = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        model.id.hash(&mut hasher);
-        let key = hasher.finish();
-        session.set_resident_cache_key(key);
-        key
-    };
+    let resident_cache_key = model_resident_cache_key(&model.id);
+    session.set_resident_cache_key(resident_cache_key);
     timings.session_create = session_create_started.elapsed().as_millis();
 
     // GPU-runnable tier: an uncurated model whose plan routed it onto the resident path
@@ -15598,6 +15726,14 @@ mod tests {
     }
 
     #[test]
+    fn context_budget_counts_exact_prompt_and_generation_allowance() {
+        assert!(enforce_context_budget(1_536, 512, 2_048).is_ok());
+        let error = enforce_context_budget(1_537, 512, 2_048).unwrap_err();
+        assert!(error.contains("exact rendered prompt (1537 tokens)"));
+        assert!(error.contains("generation allowance (512 tokens)"));
+    }
+
+    #[test]
     fn cpu_weight_materialization_budget_rejects_invalid_env_limit() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV, "not-a-byte-count");
@@ -18844,6 +18980,7 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
     ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
     ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
     ("ornith-1.0-9b-Q3_K_M.gguf", "ornith_1_0_9b_q3_k_m"),
+    ("Qwen3-4B-Q4_K_M.gguf", "qwen3_4b_q4_k_m"),
 ];
 
 /// True when `filename` is the exact GGUF artifact of a curated row whose
@@ -18903,6 +19040,7 @@ fn backend_error_code(err: &BackendError) -> &'static str {
         BackendError::UnsupportedTensorType(_) => "unsupported_tensor_type",
         BackendError::InvalidTensorData(_) => "invalid_tensor_data",
         BackendError::Io { .. } => "model_io_error",
+        BackendError::ModelOperationInProgress => "model_operation_in_progress",
         _ => "invalid_model",
     }
 }

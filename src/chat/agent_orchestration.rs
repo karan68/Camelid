@@ -79,7 +79,7 @@ impl OrchestrationReceipt {
         if let Value::Object(map) = &mut value {
             map.remove("receipt_id");
         }
-        camelid::receipt::sha256_hex(camelid::receipt::canonical_json(&value).as_bytes())
+        crate::receipt::sha256_hex(crate::receipt::canonical_json(&value).as_bytes())
     }
     fn seal(&mut self) {
         self.receipt_id = self.compute_receipt_id();
@@ -513,6 +513,7 @@ fn run_real_model_battery(
         temperature: 0.0,
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: super::shell_sandbox::ShellSandbox::Unrestricted,
+        tool_profile: super::tools::ToolProfile::Full,
         // Gate harness: bounded by max_steps, and must stay reproducible.
         ctx_budget: None,
     };

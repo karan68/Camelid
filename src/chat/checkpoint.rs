@@ -75,14 +75,19 @@ pub fn all() -> Vec<Checkpoint> {
 /// user asked for, so problems are reported and swallowed. The one thing it
 /// will not do is write outside the jail.
 pub fn take(sandbox: &Sandbox, path: &Path, tool: &str) {
+    let raw = path.to_string_lossy();
+    let resolved = match sandbox.resolve(&raw, path.exists()) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
     // Only files inside the workspace are snapshotted. With --allow-fs the
     // agent may legitimately write elsewhere, but copying those into an
     // in-workspace store would pull outside content across the boundary the
     // store lives behind — so they get no undo, rather than a leak.
-    if !inside_root(sandbox, path) {
+    if !inside_root(sandbox, &resolved) {
         return;
     }
-    let rel = sandbox.rel(path);
+    let rel = sandbox.rel(&resolved);
     // Create the store first, then resolve it through the jail. `resolve` with
     // must_exist=false canonicalises the *parent*, so it cannot resolve a
     // two-level path whose first level does not exist yet — the store has to
@@ -95,7 +100,7 @@ pub fn take(sandbox: &Sandbox, path: &Path, tool: &str) {
         Err(_) => return, // outside the jail — never happens, never allowed
     };
 
-    let backup = if path.exists() {
+    let backup = if resolved.exists() {
         // A flat, collision-free name: the relative path with separators
         // replaced, prefixed by its position in the log so repeated edits to
         // one file each keep their own snapshot.
@@ -105,7 +110,7 @@ pub fn take(sandbox: &Sandbox, path: &Path, tool: &str) {
             .map(|c| if c == '/' || c == '\\' { '_' } else { c })
             .collect();
         let dest = dir.join(format!("{n:04}_{flat}"));
-        if std::fs::copy(path, &dest).is_err() {
+        if std::fs::copy(&resolved, &dest).is_err() {
             return;
         }
         Some(dest)
