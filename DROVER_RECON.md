@@ -436,6 +436,42 @@ CERT row and refresh that receipt, converting a staleness risk into current evid
 | G1 project context + prompt | `28501d5` | 103 → 112 |
 | G2 compaction | `974f0c8` | 112 → 120 |
 | G7 MCP (+ `a2908ac` retype prep) | `c88a82b` | 120 → 130 |
+| G3 plan surface | `521cf68` | 130 → 135 |
+| G8 web search + slash commands | `4e2c349` | 135 → 142 |
+| G4 headless `agent exec` | `71776ad` | 142 → 145 |
+| G5 checkpoint / diff / undo | `2cdf0c5` | 145 → 152 |
+| G6 session save / resume | `44cf547` | 152 → 159 |
+
+**All nine phases delivered.** `chat::` tests 91 → 159.
+
+### 7.4 CERT status
+
+- **G2 (`camelid.agent-context-receipt/v1`)** — not minted. Compaction is proven by HARNESS
+  (forced-overflow through a real `run_loop`), and the live `agent exec` run exercised the loop
+  end-to-end, but no long-task run crossed a compaction boundary on a real model. **INCONCLUSIVE**
+  under the campaign rule, never FAIL.
+- **G7 (`camelid.agent-mcp-receipt/v1`)** — not minted. HARNESS covers the full path against a stub
+  stdio server (namespacing, tier, approval routing, untrusted output, timeouts). A real-model
+  round-trip through an MCP tool was not run. **INCONCLUSIVE.**
+- **Promotion receipt refreshed** — `qa/agent-eval/Qwen3-4B-Q8_0-1784747759-PASS.json`. P0.5 changed
+  tool-result framing on every lane including `agent-eval`, so the committed receipt attested a
+  prompt that no longer ships. Re-run: **PASS on the full 3-case battery**, where the previous
+  receipt covered 1 case. Strictly stronger evidence than it replaces. An earlier attempt returned
+  INCONCLUSIVE on a contended box and correctly changed no flag.
+- **`agent exec` verified live** on the pinned row: read a workspace file, answered from it, exit 0.
+  `CAMELID_PRODUCTION=1 … --yolo` exits 1 with the refusal.
+
+### 7.5 Deliberately not done
+
+- **`/compact` and `/model`** (G8). The transcript is created per goal *inside* the loop, so a
+  REPL-level `/compact` has nothing to compact between goals; `/model` needs mid-session model
+  switching plus a fresh `tool_capable` re-check. Both are real work, not wiring.
+- **A2's exec-tier hole** (`agent_syscap.rs:198`) is still open — a second `action.execute()` with no
+  approver, no audit and no production check. `update_plan` and `web_search` are now reachable from
+  it. Neither is dangerous there (`update_plan` has no side effects; `web_search` needs
+  `sandbox.allow_net`, which that harness does not set), but the hole itself should be closed.
+- **A18** — `LoopEnd::StepCapped` maps to subagent exit **1**, not **3**. G4 defined the tri-state for
+  `exec` but did not retrofit `subagent.rs`, so the two disagree. Worth reconciling.
 
 The slash-command work went further than "add a pin" because the divergence the critic predicted was
 real: `/sidebar` was undocumented in **both** front ends and the inline `/help` omitted itself. Both
