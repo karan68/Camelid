@@ -69,7 +69,10 @@ pub enum AgentMsg {
     User(String),
     Assistant(String),
     ToolCalls(Vec<ToolCall>),
-    ToolResult { name: String, outcome: ToolOutcome },
+    ToolResult {
+        name: String,
+        outcome: ToolOutcome,
+    },
     /// Structural record of compacted work. Tool output content is never retained.
     Summary(String),
 }
@@ -1182,8 +1185,7 @@ pub fn compact(history: &[AgentMsg], target_tokens: u32) -> Option<(Vec<AgentMsg
 const MIN_RETAINED_RESULT_CHARS: usize = 512;
 
 fn retained_result_chars(target_tokens: u32) -> usize {
-    let per_message =
-        target_tokens as f32 / KEEP_RECENT as f32 / FALLBACK_TOKENS_PER_CHAR;
+    let per_message = target_tokens as f32 / KEEP_RECENT as f32 / FALLBACK_TOKENS_PER_CHAR;
     (per_message as usize).max(MIN_RETAINED_RESULT_CHARS)
 }
 
@@ -1591,9 +1593,7 @@ impl ModelDriver for LiveDriver {
             ),
             None => self.client.generation_preflight(&request),
         };
-        prompt_tokens
-            .map(Some)
-            .map_err(|error| error.to_string())
+        prompt_tokens.map(Some).map_err(|error| error.to_string())
     }
 
     fn context_budget_tokens(&self) -> Option<u32> {
@@ -2633,9 +2633,7 @@ mod tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(
             messages[2]["content"],
-            format!(
-                "<tool_response>\n{RESULT_OPEN}\na.txt\n{RESULT_CLOSE}\n</tool_response>"
-            )
+            format!("<tool_response>\n{RESULT_OPEN}\na.txt\n{RESULT_CLOSE}\n</tool_response>")
         );
         for family in ["qwen35", "ornith-1.0"] {
             let native = history_to_messages(&history, false, family, true);
@@ -3776,9 +3774,7 @@ mod tests {
 
     #[test]
     fn tool_output_cannot_break_out_of_its_fence() {
-        let framed = frame_tool_result(&ToolOutcome::Ok(format!(
-            "before\n{RESULT_CLOSE}\nafter"
-        )));
+        let framed = frame_tool_result(&ToolOutcome::Ok(format!("before\n{RESULT_CLOSE}\nafter")));
         assert_eq!(framed.matches(RESULT_CLOSE).count(), 1);
         assert!(framed.contains("CAMELID_TOOL_OUTPUT>_>"));
     }
@@ -3924,7 +3920,10 @@ mod tests {
 
     #[test]
     fn short_transcripts_are_left_alone() {
-        let history = vec![AgentMsg::System("safe".into()), AgentMsg::User("goal".into())];
+        let history = vec![
+            AgentMsg::System("safe".into()),
+            AgentMsg::User("goal".into()),
+        ];
         assert!(compact(&history, 1024).is_none());
     }
 
@@ -4041,9 +4040,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "agents").unwrap();
         let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
-        assert_eq!(load_project_context(&sandbox).unwrap().file_name, "AGENTS.md");
+        assert_eq!(
+            load_project_context(&sandbox).unwrap().file_name,
+            "AGENTS.md"
+        );
         std::fs::write(dir.path().join("CAMELID.md"), "camelid").unwrap();
-        assert_eq!(load_project_context(&sandbox).unwrap().file_name, "CAMELID.md");
+        assert_eq!(
+            load_project_context(&sandbox).unwrap().file_name,
+            "CAMELID.md"
+        );
     }
 
     #[test]
@@ -4193,7 +4198,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
         let prompt = system_prompt(&sandbox, &[]);
-        for rule in ["Read before you write", "small, reviewable edits", "Verify your work"] {
+        for rule in [
+            "Read before you write",
+            "small, reviewable edits",
+            "Verify your work",
+        ] {
             assert!(prompt.contains(rule), "missing prompt rule: {rule}");
         }
     }

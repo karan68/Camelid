@@ -2761,7 +2761,7 @@ mod tests {
         assert_eq!(names(false, ShellSandbox::Sandboxed), shell_expected);
 
         let mut network_expected = expected;
-    network_expected.extend(["http_fetch", "web_search"]);
+        network_expected.extend(["http_fetch", "web_search"]);
         network_expected.sort_unstable();
         assert_eq!(names(true, ShellSandbox::Disabled), network_expected);
     }
@@ -2851,9 +2851,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("real.txt"), "NEEDLE_marker in real source").unwrap();
-        let outcome = validate(&call("search", json!({"pattern":"NEEDLE_marker"})), &sandbox)
-            .unwrap()
-            .execute(&sandbox);
+        let outcome = validate(
+            &call("search", json!({"pattern":"NEEDLE_marker"})),
+            &sandbox,
+        )
+        .unwrap()
+        .execute(&sandbox);
         assert!(outcome.text().contains("real.txt"));
         assert!(!outcome.text().contains(".camelid"));
     }
