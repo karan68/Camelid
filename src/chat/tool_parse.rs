@@ -39,13 +39,53 @@ pub fn parse(text: &str, family: &str) -> Vec<ToolCall> {
         if !calls.is_empty() {
             return calls;
         }
-        return parse_json(text);
+        let calls = parse_json(text);
+        if !calls.is_empty() {
+            return calls;
+        }
+        return parse_bare_call(text);
     }
     let calls = parse_json(text);
     if !calls.is_empty() {
         return calls;
     }
-    parse_hermes(text)
+    let calls = parse_hermes(text);
+    if !calls.is_empty() {
+        return calls;
+    }
+    parse_bare_call(text)
+}
+
+/// Last resort, every family: the whole reply is one bare `tool_name({json})`
+/// pseudo-call. Models under context pressure degrade to this shape (observed
+/// live: a mid-task Qwen3 emitting `read_file({"path":"parts3.txt"})` as plain
+/// text, which would otherwise end the loop with a tool call as the "answer").
+/// Deliberately strict — the WHOLE trimmed text, one identifier, one balanced
+/// JSON object — so prose that merely mentions a call never matches.
+fn parse_bare_call(text: &str) -> Vec<ToolCall> {
+    let t = text.trim();
+    let Some(open) = t.find("({") else {
+        return Vec::new();
+    };
+    let name = &t[..open];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Vec::new();
+    }
+    let Some(rest) = t.strip_suffix(')') else {
+        return Vec::new();
+    };
+    let json_part = &rest[open + 1..];
+    match serde_json::from_str::<Value>(json_part) {
+        Ok(args @ Value::Object(_)) => vec![ToolCall {
+            name: name.to_string(),
+            args,
+        }],
+        _ => Vec::new(),
+    }
 }
 
 /// `[TOOL_CALLS] [{"name": …, "arguments": {…}}, …]` (Mistral Instruct v0.3+).
@@ -341,6 +381,31 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "read_file");
+    }
+
+    #[test]
+    fn bare_pseudo_call_is_recognised_for_every_family() {
+        for family in ["qwen", "llama", "hermes"] {
+            let calls = parse(r#"read_file({"path":"parts3.txt"})"#, family);
+            assert_eq!(calls.len(), 1, "family {family}");
+            assert_eq!(calls[0].name, "read_file");
+            assert_eq!(calls[0].args["path"], "parts3.txt");
+        }
+    }
+
+    #[test]
+    fn prose_mentioning_a_call_is_not_a_bare_call() {
+        for text in [
+            r#"I will now run read_file({"path":"a"}) to check."#,
+            r#"The answer is 42 (see notes)."#,
+            r#"read_file(not json)"#,
+            r#"Read_File({"path":"a"})"#,
+        ] {
+            assert!(
+                parse(text, "qwen").is_empty(),
+                "{text:?} must not parse as a call"
+            );
+        }
     }
 
     #[test]

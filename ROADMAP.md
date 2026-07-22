@@ -280,6 +280,17 @@ A **capacity** signal, deliberately separate from the support ledger: it estimat
 - It informs but never enforces: catalog download stays un-gated, and the pre-load fail-fast (`model_too_large_for_host`) fires only on a `wont_fit` verdict from a probed host and is overridable with `CAMELID_SKIP_FIT_CHECK=1`.
 - The authoritative capacity guards remain the runtime VRAM headroom check (mid-load) and the KV predict-and-abort budget (mid-generation); the advisor never relaxes them.
 
+### Agent mode lane (DROVER)
+
+The terminal coding agent (`camelid chat --agent`, headless `camelid agent exec`) is
+**Supported (experimental)** as of 2026-07-22 — scope contract in `COMPATIBILITY.md`, evidence in
+`qa/evidence-bundles/agent-mode-supported-experimental-20260722/`, decisions in `DECISIONS.md` D18.
+Remaining lane work before a full (non-experimental) claim: per-OS live-lane transcripts (Windows /
+Linux), a digest-verifiable receipt family with a `verify-receipt` arm, an agent smoke lane in CI,
+re-minting the stale pre-hardening `tool_capable` receipts (or recording accepted staleness), and
+an `api_features` row for the feature axis. `/compact` and `/model` in-session commands remain
+open items.
+
 ## Promotion rules
 
 A row may move forward only when all of the following are true:

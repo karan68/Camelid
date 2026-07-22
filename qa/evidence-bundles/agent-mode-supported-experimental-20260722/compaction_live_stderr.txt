@@ -1,0 +1,19 @@
+Loading /Volumes/Untitled/models/Qwen3-4B-Q8_0.gguf …
+  ▸ read_file(parts1.txt)
+  └ read_file: ok
+· compacted context: 4 messages → 4 (0 folded into a summary)
+  ▸ read_file(parts2.txt)
+  └ read_file: ok
+· compacted context: 6 messages → 6 (0 folded into a summary)
+  ▸ read_file(parts3.txt)
+  └ read_file: ok
+· compacted context: 8 messages → 8 (0 folded into a summary)
+  ▸ read_file(parts4.txt)
+  └ read_file: ok
+· compacted context: 10 messages → 9 (2 folded into a summary)
+  ▸ read_file(parts5.txt)
+  └ read_file: ok
+· compacted context: 11 messages → 10 (2 folded into a summary)
+  ▸ read_file(parts6.txt)
+  └ read_file: ok
+· compacted context: 12 messages → 11 (2 folded into a summary)

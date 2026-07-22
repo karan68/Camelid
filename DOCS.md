@@ -33,7 +33,8 @@ Read these first:
 - [`docs/VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — expected checks by change class
 - [`SECURITY.md`](SECURITY.md) — security reporting guidance
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — acknowledgements and license notices
-- [`DECISIONS.md`](docs/architecture/DECISIONS.md) — design decision log
+- [`DROVER_RECON.md`](DROVER_RECON.md) — the agent-mode campaign record: recon, gate ledger, amendment log
+- [`DECISIONS.md`](DECISIONS.md) — the live decision log (D1–D18; `docs/architecture/DECISIONS.md` is the frozen early-phase log)
 
 ## QA and acceptance docs
 

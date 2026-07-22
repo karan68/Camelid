@@ -190,6 +190,18 @@ See [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support for the release-
 - BASALT Phase 5 (Blackwell sm_120 tensor-core MMA) BLOCKED-HW — no Blackwell silicon on the target (`qa/evidence-bundles/basalt/phase0/hw_probe.json`); no forward-looking performance claim.
 - Raw `target/` paths below are drill-down artifacts only; they are not the sole public evidence anchor.
 
+## Agent mode — Supported (experimental)
+
+`camelid chat --agent` and headless `camelid agent exec` are promoted from preview to
+**Supported (experimental)**, scoped to the approval-gated loop on `tool_capable` ledger rows.
+The scope contract (claimed / boundary / not-claimed) lives in `COMPATIBILITY.md` under
+"Agent mode — Supported (experimental)"; the live-lane evidence is
+`qa/evidence-bundles/agent-mode-supported-experimental-20260722/` — a compaction-boundary run
+(six budget crossings, correct answer) and an end-to-end stdio MCP round-trip, both on the pinned
+`qwen3_4b_instruct_q8_0` row, whose agent-eval promotion receipt was re-minted post-hardening on
+the full 3-case battery (`qa/agent-eval/Qwen3-4B-Q8_0-1784747759-PASS.json`). The campaign record
+is `DROVER_RECON.md`; the binding decisions are `DECISIONS.md` D18.
+
 ## What changed in this support line
 
 Recent work moved the exact-row release ledger in a narrow, evidence-backed way:

@@ -72,6 +72,38 @@ Use this table when writing README copy, frontend readiness text, API summaries,
 | ornith-1.0-9b-Q4_K_M.gguf (in-house requant) | Supported exact-row smoke, fully GPU-resident CUDA lane (`CAMELID_QWEN35_CUDA=1`): 5-prompt greedy parity vs the pinned llama.cpp `acd79d6` CUDA oracle PASSES under the cross-backend tolerance policy — 2/5 token-identical at n=64, every flip probed and attributed to ≤0.33-nat soft positions where the oracle's own CPU/CUDA backends also flip (`qa/ornith/constrained-vram/RECEIPT_ITEM2_qwen35_parity_cuda.json` + committed probe/control artifacts); full read/list/write agent battery PASS on this exact file (`qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json`); 18.8 tok/s median via the device-side decode loop. | Short serve smoke + agent-eval at the default 8192-token GPU decode window; no bounded context pack. | Bit-exact parity on every prompt (near-tie flips are attributed, not eliminated), neighboring quants, model-native/larger context, broader templates, portability beyond a single 6 GiB-class GPU host, or any GPU-vs-GPU speed claim. |
 | ornith-1.0-9b-Q3_K_M.gguf (in-house imatrix requant) | Supported exact-row smoke, fully GPU-resident at 16K context (4747 MiB peak, 1397 MiB headroom on a 6144 MiB card, `qa/ornith/constrained-vram/RECEIPT_ITEM4_residency.json`): GPU generation greedy token-identical to the CPU runnable oracle (itself the lane certified vs llama.cpp `acd79d6`); held-out coding PPL 2.4693 vs Q6_K 2.3636 (`QUANT_QUALITY_TABLE.md`); 15.4 tok/s median via the device-side decode loop; the four q5_K tensors run natively on the `q5k_gemv` resident kernel at wire size (parity re-certified GPU==CPU-oracle single-token + greedy at 16K maxpos; previously upcast to Q8_0, ~+40 MiB, so the cited receipt's peak is a conservative upper bound). **Documented frontier:** no direct side-by-side llama.cpp receipt on this exact quant yet. | Single-session 16K-maxpos residency + parity smoke; no bounded context pack. | Direct cross-engine parity on this exact quant (documented frontier), tool-capability (no agent-eval receipt yet), neighboring quants, broader templates, portability, or broader/full support. |
 
+## Agent mode — Supported (experimental)
+
+`camelid chat --agent` (interactive; full-screen TUI or `--plain`) and
+`camelid agent exec "<goal>"` (headless, exit 0 answered / 1 failed / 3
+inconclusive) are **Supported (experimental)**, scoped exactly as follows.
+
+**Claimed.** The approval-gated tool-calling loop on `tool_capable` ledger rows
+only: file tools jailed to `--workdir`, run_shell under the shell-sandbox
+policy, opt-in network (`--allow-net`: `web_search` + `http_fetch`) and opt-in
+stdio MCP servers (`--allow-mcp`, always exec-tier), per-file checkpoints with
+`/diff`//`/undo`, session `/save`//`/resume` with model-identity re-validation,
+and transcript compaction. Evidence: the per-row `qa/agent-eval` PASS receipts
+(the promotion basis for `tool_capable`), and the live-lane bundle
+`qa/evidence-bundles/agent-mode-supported-experimental-20260722/` — one run
+crossing the compaction budget six times and answering correctly, and one run
+driving a namespaced MCP tool end to end, both on the pinned
+`qwen3_4b_instruct_q8_0` row.
+
+**Boundary.** The agent context envelope is the bounded 8192-token window the
+supported rows are validated to (compaction targets it); model quality beyond
+the receipted battery is not a claim — a 4B model remains a 4B model. macOS is
+the live-lane-evidenced host; Windows and Linux builds are CI-validated, and
+the Windows syscap tools additionally carry the `camelid.agent-syscap-receipt`
+gate.
+
+**Not claimed.** Rows without a current agent-eval PASS receipt (agent mode
+refuses them), unattended operation beyond the documented `--yolo` posture
+(refused under `CAMELID_PRODUCTION`), MCP transports beyond stdio, Windows or
+Linux live-lane agent transcripts, production throughput, or parity of any
+kind — agent mode is a client-side loop over the already-validated serve lane
+and adds no token-level claim.
+
 ## Locked next-family readiness language
 
 Use these phrases in public docs, API notes, and frontend hints until row-specific promotion evidence exists. They are intentionally about exact rows, not families.

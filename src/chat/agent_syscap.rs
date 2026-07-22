@@ -190,6 +190,18 @@ fn run_battery() -> (EvalOutcome, Vec<CaseResult>, String) {
     };
 
     let run = |name: &str, args: Value| -> ToolOutcome {
+        // This harness executes without an Approver by design (a scripted
+        // battery, not a model), which makes it the one direct execute path
+        // outside the loop. Allowlist it to exactly the two tools the battery
+        // exists to exercise, so no tool added to validate() later — plan,
+        // web_search, MCP, whatever comes next — is silently reachable through
+        // an ungated side door.
+        const BATTERY_TOOLS: [&str; 2] = ["run_windows_command", "inspect_system"];
+        if !BATTERY_TOOLS.contains(&name) {
+            return ToolOutcome::Err(format!(
+                "syscap battery may only execute {BATTERY_TOOLS:?}, not `{name}`"
+            ));
+        }
         let call = ToolCall {
             name: name.to_string(),
             args,

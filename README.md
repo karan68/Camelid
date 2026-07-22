@@ -108,14 +108,18 @@ Every interface talks to the same local engine — pick whichever fits your work
 | **Browser chat** | `camelid serve --model <gguf>` opens the web UI automatically | Everyday chatting in a familiar UI |
 | **Terminal UI** | `camelid chat` — full-screen; `--plain` for a line REPL over SSH | Working entirely in the shell |
 | **HTTP API** | OpenAI-style `/v1/*`, served alongside the UI on the same port | Wiring Camelid into your own apps |
-| **Agent mode** (preview) | `camelid chat --agent --model <gguf>` — approval-gated tool calls | Experimenting with tool-calling |
+| **Agent mode** | `camelid chat --agent --model <gguf>` — approval-gated tool calls | Coding-agent work in your own repo |
 
-**Agent mode (preview).** `camelid chat --agent` is an approval-gated tool-calling loop that can
+**Agent mode — Supported (experimental).** `camelid chat --agent` is an approval-gated
+tool-calling loop that can
 read, write, and search files and run shell commands, with opt-in URL fetch. File tools are confined
 to a workspace root (`--workdir`, default the current directory; path escapes are refused), and the
 network stays off unless you pass `--allow-net`. Tool results are treated as untrusted data, and
 only models the compatibility ledger marks `tool_capable` are eligible (promoted only after a
-`camelid agent-eval` PASS). Treat it as a preview and review every requested action.
+`camelid agent-eval` PASS). The supported scope — what is claimed, its boundary, and what is
+explicitly not claimed — is pinned in [COMPATIBILITY.md](COMPATIBILITY.md), backed by the live-lane
+bundle `qa/evidence-bundles/agent-mode-supported-experimental-20260722/`. Review every requested
+action: approval is the contract.
 
 With `--allow-net` the agent also gets `web_search` (ranked title/url/snippet results) alongside
 `http_fetch`. Results are untrusted data — reading one is a separate, separately-approved
@@ -126,10 +130,10 @@ Every file the agent writes or edits is snapshotted first, so `/diff` shows what
 `/undo` reverts the last change, and `/checkpoints` lists them. Snapshots are file copies under
 `.camelid/checkpoints/` in the workspace — the agent never touches your git state.
 
-`/save <id>` and `/resume <id>` carry an agent session across restarts, storing the transcript,
-plan, and approval grants under `.camelid/sessions/`. A resumed transcript is replayed as context
-and never re-executed, and resume is refused if the active model is not the one that recorded it,
-or is no longer marked `tool_capable`.
+`/save <id>` and `/resume <id>` carry an agent session across restarts, storing the transcript and
+plan under `.camelid/sessions/`. A resumed transcript is replayed as context and never re-executed;
+"always allow" grants are listed but never restored from a file; and resume is refused if the
+active model is not the one that recorded it, or is no longer marked `tool_capable`.
 
 In-session: `/init` scaffolds a `CAMELID.md`, `/plan` shows the agent's current checklist, `/copy`
 puts the last answer on the clipboard, and `/help` lists the rest.

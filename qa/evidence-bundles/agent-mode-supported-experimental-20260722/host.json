@@ -1,0 +1,9 @@
+{
+ "os": "macOS (Darwin 25.5.0)",
+ "hw": "Mac mini M4, 16 GiB",
+ "arch": "arm64",
+ "model_row": "qwen3_4b_instruct_q8_0",
+ "gguf": "Qwen3-4B-Q8_0.gguf",
+ "gguf_bytes": 4280404704,
+ "head": "94845b14415b58a0688747504587d935a06f8935"
+}

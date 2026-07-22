@@ -1084,3 +1084,18 @@ runtime-registered MCP tools retype them, so adding static tools first means wri
 compaction summary, a resumed transcript, MCP output, a search result — is untrusted data. The
 day one of them can change an approval tier, the sandbox, or the `tool_capable` gate, DROVER has
 regressed the thing it exists to protect.
+
+**D18 addendum 1 (2026-07-22, promotion to Supported (experimental)):** agent mode's
+"(preview)" label drops in favor of **Supported (experimental)**, scoped by the new
+"Agent mode" section of `COMPATIBILITY.md` and evidenced by
+`qa/evidence-bundles/agent-mode-supported-experimental-20260722/` (a live
+compaction-boundary run and a live end-to-end MCP round-trip on the pinned row, plus the
+re-minted 3-case agent-eval PASS). The full (non-experimental) claim is deliberately NOT
+made; its remaining preconditions are listed in the ROADMAP lane entry. Two recorded
+divergences ride along unresolved by choice: (1) `LoopEnd::StepCapped` maps to subagent
+exit 1 ("failed") but to `agent exec` exit 3 ("inconclusive") — the subagent mapping
+predates the tri-state contract and changing a shipped gate lane's exit codes does not
+belong in a promotion window; (2) the `api_features` ledger row for the feature axis is
+deferred with the FULLY milestone. The syscap harness's direct executor is now
+allowlisted to its two battery tools, closing the one execute path outside the
+approval loop.

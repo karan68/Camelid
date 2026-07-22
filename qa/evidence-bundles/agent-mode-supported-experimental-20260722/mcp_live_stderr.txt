@@ -1,0 +1,4 @@
+Loading /Volumes/Untitled/models/Qwen3-4B-Q8_0.gguf …
+MCP: 1 tool(s) loaded — each is approval-gated
+  ▸ mcp__parts__lookup_part({"part":"XJ-9"})
+  └ mcp__parts__lookup_part: ok

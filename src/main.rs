@@ -1067,7 +1067,6 @@ enum Command {
         gpc_matmul: Option<usize>,
     },
     /// Headless agent runs (e.g. `camelid agent exec "fix the failing test"`).
-    #[command(hide = true)]
     Agent {
         #[command(subcommand)]
         action: AgentAction,
