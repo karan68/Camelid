@@ -428,6 +428,15 @@ CERT row and refresh that receipt, converting a staleness risk into current evid
 `chat::` tests **91 → 103**. Baseline gates green throughout (`fmt`, `clippy --all-targets
 -D warnings`, `test`).
 
+### 7.3 Phase delivery
+
+| Gate | Commit | `chat::` |
+|---|---|---|
+| P0.5 | `7d718ff` `9d62750` `6085645` `59d2996` | 91 → 103 |
+| G1 project context + prompt | `28501d5` | 103 → 112 |
+| G2 compaction | `974f0c8` | 112 → 120 |
+| G7 MCP (+ `a2908ac` retype prep) | `c88a82b` | 120 → 130 |
+
 The slash-command work went further than "add a pin" because the divergence the critic predicted was
 real: `/sidebar` was undocumented in **both** front ends and the inline `/help` omitted itself. Both
 help surfaces now derive from one shared `SLASH_COMMANDS` table, so the pin has something true to
@@ -459,6 +468,9 @@ same commit that acts on the finding.
 | A15 | (found during P0.5) | The **orchestration tools are gated on `subagent::is_enabled()`**, which is false until a subagent config is installed. An ordinary `chat --agent` session is never offered `spawn_subagent` / `check_subagent_status`, and `inspect_system` is Windows-only — so the cross-platform baseline tool set is **five** tools, not the nine a reading of `specs()` suggests. Now pinned by `advertised_tool_set_is_pinned`. |
 | A16 | (found during P0.5) | `Sandbox::new(root, allow_net, timeout)`'s second parameter is **`allow_net`, not `fs_unrestricted`** — the latter is a builder (`with_fs_unrestricted`). Easy to misread when adding a sandboxed surface. |
 | A17 | (found during P0.5) | The `search` tool's parameter is **`pattern`**, not `query` (`tools.rs:350`). |
+| A19 | (found during G2) | Retaining N recent messages verbatim **does not bound the transcript**: one `read_file` may return 64 KiB (`tools.rs:216`), more than the whole 8192-token budget, so a tail of recent results can exceed it with nothing old left to elide. Compaction needs a second pass that clips oversized retained results in place. Found by the test, not by inspection. |
+| A20 | (found during G7) | A process that is not an MCP server **can still pass the handshake**: `cat` echoes the request back with a matching id, so `initialize` returns `Ok(null)`. Safe outcome (zero tools adopted, MCP stays disabled) but it means a successful handshake is not evidence of a real server. Pinned by `an_echo_server_adopts_no_tools`. |
+| A21 | (found during G7) | The MCP registry is process-wide, so its tests race the `tools.rs` tool-set pins under cargo's parallel runner — a pin can observe MCP tools appearing mid-assertion. Serialized by a shared test mutex. Any future process-global agent state inherits this hazard. |
 | A18 | (open question, deferred to G4) | `LoopEnd::StepCapped` maps to subagent status `"failed"` → exit **1**, not `"inconclusive"` → exit **3**. A step-capped run arguably did not fail. Left unchanged in P0.5 because it decides an exit code on a shipped gate lane; **G4 owns this call** when it defines the tri-state contract. |
 
 ---
