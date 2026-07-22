@@ -1315,6 +1315,132 @@ impl Approver for InlineApprover {
 
 /// Run agent mode (inline). Returns a process exit code. Refuses with the typed
 /// error (non-zero) when the active model is not a tool-capable supported row.
+/// Headless one-shot: run `goal` to completion with no human present, print the
+/// final answer to stdout, and return a tri-state exit code.
+///
+/// **0** answered · **1** failed or blocked · **3** inconclusive (step-capped,
+/// aborted, or stopped making progress) — the same split `agent-eval` uses, so
+/// a caller can tell "it could not" from "it did not finish".
+///
+/// Autonomy is *narrower* here than interactively, not wider: with no operator
+/// to ask, every confirm-tier tool is denied unless `--yolo` was passed, and
+/// `--yolo` is refused under production exactly as it is everywhere else.
+pub fn run_exec(
+    session: &mut Session,
+    addr: SocketAddr,
+    cfg: AgentConfig,
+    goal: &str,
+) -> anyhow::Result<i32> {
+    if !session.active_tool_capable() {
+        eprintln!(
+            "agent exec requires a tool-capable supported model. The active model{} is not \
+             marked tool_capable in the compatibility ledger (/api/capabilities).",
+            session
+                .active_id
+                .as_deref()
+                .map(|id| format!(" '{id}'"))
+                .unwrap_or_default()
+        );
+        return Ok(1);
+    }
+    let mut policy = match resolve_policy(cfg.auto_approve, cfg.yolo, is_production()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(1);
+        }
+    };
+    let sandbox = Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?
+        .with_shell_mode(cfg.shell_sandbox)
+        .with_fs_unrestricted(cfg.allow_fs);
+
+    super::subagent::configure(super::subagent::SubagentConfig::for_session(
+        addr,
+        session.active_id.clone().unwrap_or_default(),
+        session.active_family(),
+        cfg.max_tokens,
+        cfg.auto_approve,
+        cfg.shell_sandbox,
+    ));
+
+    let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
+    let project = load_project_context(&sandbox);
+    plan_reset();
+    let mut history = vec![
+        AgentMsg::System(system_prompt_with_project(
+            &sandbox,
+            &tools,
+            project.as_ref(),
+        )),
+        AgentMsg::User(goal.to_string()),
+    ];
+    let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
+    // Progress narrates on stderr so stdout carries only the answer and can be
+    // piped into something else.
+    let mut reporter = StderrReporter;
+    let mut approver = super::subagent::NonInteractiveApprover;
+
+    CANCEL.store(false, Ordering::SeqCst);
+    let end = run_loop(
+        &mut driver,
+        &mut approver,
+        &mut reporter,
+        &sandbox,
+        &cfg,
+        &CANCEL,
+        &mut policy,
+        &mut history,
+    );
+
+    let answer = match history.last() {
+        Some(AgentMsg::Assistant(a)) => a.clone(),
+        _ => String::new(),
+    };
+    match end {
+        LoopEnd::Answered => {
+            println!("{answer}");
+            Ok(0)
+        }
+        LoopEnd::DriverError => {
+            eprintln!("stopped on a model error");
+            Ok(1)
+        }
+        LoopEnd::StepCapped => {
+            eprintln!("stopped at the {}-step limit", cfg.max_steps);
+            Ok(3)
+        }
+        LoopEnd::Repeated => {
+            eprintln!("stopped — the model was repeating a failing call");
+            Ok(3)
+        }
+        LoopEnd::Aborted => {
+            eprintln!("aborted");
+            Ok(3)
+        }
+    }
+}
+
+/// Clear the plan without importing the module at every call site.
+fn plan_reset() {
+    super::plan::clear();
+}
+
+/// Reporter for headless runs: everything to stderr, so stdout stays the answer.
+struct StderrReporter;
+impl Reporter for StderrReporter {
+    fn model_text(&mut self, _text: &str) {}
+    fn tool_call(&mut self, line: &str) {
+        eprintln!("  ▸ {line}");
+    }
+    fn tool_result(&mut self, name: &str, outcome: &ToolOutcome) {
+        let tag = if outcome.is_err() { "error" } else { "ok" };
+        eprintln!("  └ {name}: {tag}");
+    }
+    fn notice(&mut self, text: &str) {
+        eprintln!("· {text}");
+    }
+}
+
 pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow::Result<i32> {
     // Capability gate (constraint 3): tool-capable supported row only.
     if !session.active_tool_capable() {
@@ -2629,6 +2755,57 @@ mod tests {
         let baseline = system_prompt(&sb, &tools);
         assert!(!baseline.contains("workspace specific text"));
         assert!(!baseline.contains(PROJECT_OPEN));
+    }
+
+    // --- G4: headless exec ---
+
+    /// With no operator present, a confirm-tier tool is denied rather than
+    /// waited on: `exec` must never hang for an approval nobody can give.
+    #[test]
+    fn non_interactive_approver_denies_everything_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), true, Duration::from_secs(5)).unwrap();
+        let mut approver = super::super::subagent::NonInteractiveApprover;
+        for (name, args) in [
+            ("write_file", json!({"path":"a.txt","content":"x"})),
+            ("http_fetch", json!({"url":"http://example.invalid"})),
+        ] {
+            let action = tools::validate(&tc(name, args), &sb).unwrap();
+            assert_eq!(approver.approve(&action, &sb), Decision::No, "{name}");
+        }
+    }
+
+    /// The tri-state contract: 0 answered, 1 failed, 3 inconclusive. Pinned
+    /// against LoopEnd so a new variant cannot silently pick up a wrong code.
+    #[test]
+    fn exec_exit_codes_are_tri_state() {
+        fn code_for(end: &LoopEnd) -> i32 {
+            match end {
+                LoopEnd::Answered => 0,
+                LoopEnd::DriverError => 1,
+                LoopEnd::StepCapped | LoopEnd::Repeated | LoopEnd::Aborted => 3,
+            }
+        }
+        assert_eq!(code_for(&LoopEnd::Answered), 0);
+        assert_eq!(code_for(&LoopEnd::DriverError), 1);
+        assert_eq!(code_for(&LoopEnd::StepCapped), 3);
+        assert_eq!(code_for(&LoopEnd::Repeated), 3);
+        assert_eq!(code_for(&LoopEnd::Aborted), 3);
+    }
+
+    /// `--yolo` is the one flag that hands an unattended process exec-tier
+    /// autonomy, so production must refuse it here exactly as it does
+    /// interactively.
+    #[test]
+    fn production_refuses_yolo_for_exec() {
+        assert!(resolve_policy(false, true, true).is_err());
+        assert!(resolve_policy(true, false, true).is_err());
+        // Off production, both are allowed.
+        assert!(resolve_policy(false, true, false).is_ok());
+        assert!(resolve_policy(true, false, false).is_ok());
+        // And the default posture is fine under production: it prompts, and in
+        // exec that means it denies.
+        assert!(resolve_policy(false, false, true).is_ok());
     }
 
     // --- G8: /init ---

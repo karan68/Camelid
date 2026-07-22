@@ -716,7 +716,10 @@ impl super::agent::Reporter for CaptureReporter {
 /// The child therefore cannot run an unattended shell or otherwise exceed the
 /// parent's posture — it is read-capable by default, and write/network-capable
 /// only when the parent explicitly opted into --auto-approve (non-production).
-struct NonInteractiveApprover;
+/// Denies everything that needs approval. Used wherever no human is present:
+/// a subagent worker, and `agent exec` without `--yolo`. "Nobody to ask" means
+/// *more* conservative, not less.
+pub(crate) struct NonInteractiveApprover;
 impl super::agent::Approver for NonInteractiveApprover {
     fn approve(
         &mut self,
