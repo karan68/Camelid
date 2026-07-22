@@ -124,6 +124,24 @@ network, GUI control, and subagents are unavailable. File inventories are ground
 directory entries, and reversible compaction keeps long threads within an exact context budget.
 Workspace requires a loaded exact model row that has earned `tool_capable: true`.
 
+**MCP servers (opt-in).** `--allow-mcp` loads the servers declared in a `camelid.mcp.json` at the
+workspace root (stdio transport) and offers their tools alongside the native ones, namespaced
+`mcp__<server>__<tool>` so none can shadow a built-in:
+
+```json
+{ "servers": { "git": { "command": "uvx", "args": ["mcp-server-git"] } } }
+```
+
+An MCP server is third-party code, so every MCP tool is classified exec-tier — always approval-gated,
+and *not* promoted by `--auto-approve` — its output is treated as untrusted data like any other tool
+result, and the whole feature is refused under `CAMELID_PRODUCTION`. A server that fails to start or
+never answers is dropped with a message; it does not stop your session.
+
+Drop a `CAMELID.md` (or `AGENTS.md`) at the workspace root to tell the agent about your project —
+build commands, layout, conventions. It is loaded into the agent's context as reference material,
+fenced and labelled as untrusted: it can inform the agent, but it cannot grant permissions, change
+an approval tier, or widen file access, and text inside it asking for any of those is ignored.
+
 ## Call the API
 
 The served model id comes from the GGUF's `general.name`. Run `GET /v1/models` to read the exact

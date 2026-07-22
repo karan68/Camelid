@@ -26,6 +26,7 @@ mod client;
 mod clipboard;
 mod inline;
 mod markdown;
+mod mcp;
 mod models;
 mod palette;
 mod server;
@@ -88,6 +89,9 @@ pub struct ChatOptions {
     /// `--allow-fs`: agent file tools may read/write anywhere on disk (still
     /// approval-gated), not just under the workspace root.
     pub allow_fs: bool,
+    /// `--allow-mcp`: load MCP servers from `camelid.mcp.json` and offer their
+    /// tools. Off by default; refused under production.
+    pub allow_mcp: bool,
     pub shell_timeout: u64,
     /// Opt-in thinking mode (`chat --enable-thinking`): the model emits its own
     /// `<think>…</think>` reasoning. NOT parity-locked (leading-trace lane only).
@@ -165,15 +169,48 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
             tool_profile: tools::ToolProfile::Full,
+            // The smaller of what the model was trained for and what the agent
+            // lane is validated to; falls back to the validated ceiling when the
+            // server has not reported a context length.
+            ctx_budget: Some(
+                session
+                    .active_ctx
+                    .unwrap_or(agent::AGENT_VALIDATED_CTX)
+                    .min(agent::AGENT_VALIDATED_CTX),
+            ),
         };
+        // MCP servers, if the user opted in. A broken MCP config costs you MCP,
+        // not your session, so problems are reported and the agent still runs.
+        if opts.allow_mcp {
+            match tools::Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout) {
+                Ok(sb) => {
+                    let native: Vec<String> = tools::specs(cfg.allow_net, shell_sandbox)
+                        .into_iter()
+                        .map(|t| t.name)
+                        .collect();
+                    match mcp::configure(&sb, true, agent::is_production(), &native) {
+                        Ok(0) => eprintln!(
+                            "--allow-mcp: no MCP tools loaded (no {} at the workspace root?)",
+                            mcp::CONFIG_FILE
+                        ),
+                        Ok(n) => eprintln!("MCP: {n} tool(s) loaded — each is approval-gated"),
+                        Err(e) => eprintln!("MCP: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("MCP: workspace unavailable: {e}"),
+            }
+        }
+
         // Full-screen TUI agent on a real terminal (default); the line renderer
         // is the fallback for --plain, pipes, and non-TTY runs (smoke/tests).
         let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
-        return if interactive && !opts.plain {
+        let code = if interactive && !opts.plain {
             agent_tui::run(&mut session, opts.addr, cfg)
         } else {
             agent::run_agent(&mut session, opts.addr, cfg)
         };
+        mcp::shutdown();
+        return code;
     }
 
     // Full-screen TUI when we have a real terminal on both ends and the user did

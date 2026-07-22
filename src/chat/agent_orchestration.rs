@@ -514,6 +514,8 @@ fn run_real_model_battery(
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: super::shell_sandbox::ShellSandbox::Unrestricted,
         tool_profile: super::tools::ToolProfile::Full,
+        // Gate harness: bounded by max_steps, and must stay reproducible.
+        ctx_budget: None,
     };
     let mut policy = agent::Policy::default();
     policy.set_auto_all(true);

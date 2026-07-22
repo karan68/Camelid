@@ -602,6 +602,9 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: shell_mode,
         tool_profile: super::tools::ToolProfile::Full,
+        // A subagent runs a real, open-ended goal, so it gets the same context
+        // protection the parent has.
+        ctx_budget: Some(agent::AGENT_VALIDATED_CTX),
     };
     // The parent's approval posture, with the production fail-closed honoured:
     // resolve_policy refuses blanket auto-approve under CAMELID_PRODUCTION, so a
@@ -610,8 +613,16 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
     // a child stays scoped + its NonInteractiveApprover denies any confirm-tier.
     let mut policy =
         agent::resolve_policy(task.auto_approve, false, agent::is_production()).unwrap_or_default();
+    // A subagent does real work in the user's workspace, so it gets the same
+    // project context its parent has. (The gate harnesses in agent_eval.rs and
+    // agent_orchestration.rs deliberately do not — see D-DROVER-6.)
+    let project = agent::load_project_context(&sandbox);
     let mut history = vec![
-        AgentMsg::System(agent::system_prompt(&sandbox, &tools)),
+        AgentMsg::System(agent::system_prompt_with_project(
+            &sandbox,
+            &tools,
+            project.as_ref(),
+        )),
         AgentMsg::User(task.goal.clone()),
     ];
 
@@ -658,10 +669,22 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         )
     };
 
+    // Exhaustive on purpose: this maps a loop outcome onto the subagent exit
+    // code (completed=0, inconclusive=3, everything else=1), so a new LoopEnd
+    // variant must be classified deliberately. Under the previous catch-all a
+    // new variant compiled silently and reported "failed" — a wrong answer for
+    // any outcome that is merely inconclusive.
+    //
+    // Classification below is unchanged from the catch-all it replaces.
+    // Whether StepCapped is really a *failure* rather than inconclusive is a
+    // live question, but it decides an exit code on a shipped gate lane, so it
+    // is left to the phase that defines the tri-state contract.
     let status = match end {
         agent::LoopEnd::Answered => "completed",
         agent::LoopEnd::Aborted => "inconclusive",
-        _ => "failed",
+        agent::LoopEnd::StepCapped | agent::LoopEnd::Repeated | agent::LoopEnd::DriverError => {
+            "failed"
+        }
     };
     SubagentResult {
         subtask_id: task.subtask_id.clone(),

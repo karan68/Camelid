@@ -460,6 +460,7 @@ pub(crate) fn run_live(
         audit: Box::new(NoopSink),
         shell_sandbox: ShellSandbox::Disabled,
         tool_profile: ToolProfile::WorkspaceReadOnly,
+        ctx_budget: None,
     };
     let end = run_loop(
         &mut driver,
@@ -583,6 +584,7 @@ mod tests {
             audit: Box::new(NoopSink),
             shell_sandbox: ShellSandbox::Disabled,
             tool_profile: ToolProfile::Full,
+            ctx_budget: None,
         }
     }
 
