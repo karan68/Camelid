@@ -217,6 +217,14 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_SEARCH_HITS: usize = 100;
 
+/// Directories `search` never descends into.
+///
+/// `.camelid` is the agent's own scratch dir (subagent task/result files today;
+/// checkpoints and saved sessions later). Indexing it would feed the agent's own
+/// prior output back to it as workspace content — laundering untrusted tool
+/// output into something that reads like a source file.
+const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
+
 impl Sandbox {
     /// Build a sandbox rooted at `root` (canonicalized). Fails if the root does
     /// not resolve to a real directory.
@@ -1217,7 +1225,7 @@ fn search(pattern: &str, root: &Path) -> ToolOutcome {
             if matches!(&ft, Ok(t) if t.is_dir()) {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name == ".git" || name == "target" || name == "node_modules" {
+                if SEARCH_SKIP_DIRS.contains(&name.as_ref()) {
                     continue;
                 }
                 stack.push(path);
@@ -1920,6 +1928,34 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(added, vec!["http_fetch"]);
+    }
+
+    /// `search` must not index the agent's own scratch dir. A subagent result
+    /// (or, later, a checkpoint or saved transcript) is untrusted tool output;
+    /// surfacing it as a workspace search hit would relabel it as source.
+    #[test]
+    fn search_skips_the_agent_scratch_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+
+        std::fs::create_dir_all(dir.path().join(".camelid/subagents")).unwrap();
+        std::fs::write(
+            dir.path().join(".camelid/subagents/result_x.json"),
+            r#"{"answer":"NEEDLE_marker from a prior run"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("real.txt"), "NEEDLE_marker in real source").unwrap();
+
+        let out = validate(&call("search", json!({"pattern":"NEEDLE_marker"})), &sb)
+            .unwrap()
+            .execute(&sb);
+        let text = out.text();
+
+        assert!(text.contains("real.txt"), "real file should be found");
+        assert!(
+            !text.contains(".camelid"),
+            "search leaked the agent's own scratch state: {text}"
+        );
     }
 
     /// The orchestration tools are advertised only once a subagent config is

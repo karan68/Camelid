@@ -11,6 +11,11 @@ frontend/dist/
 # Local agent scratch dir — measurement logs etc. carry host paths; never commit.
 /scratchpad/
 
+# Agent-mode per-workspace state (subagent task/result files, and later
+# checkpoints and saved sessions). Written into whatever workspace the agent is
+# pointed at, so it must never be committed there or here.
+.camelid/
+
 # Raw evidence bundle staging copies may contain private host/path details; publish only the sanitized *-public-* variants.
 qa/evidence-bundles/four-row-20260503T024119Z/
 qa/evidence-bundles/four-row-20260503T024327Z/
