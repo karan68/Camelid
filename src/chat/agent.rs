@@ -1378,7 +1378,7 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             for t in &tools {
                                 let auto = if !t.risk.needs_approval() {
                                     " (auto: read-only)"
-                                } else if granted.iter().any(|g| g == t.name) {
+                                } else if granted.contains(&t.name) {
                                     " (auto: allowed this session)"
                                 } else {
                                     ""
@@ -2076,7 +2076,7 @@ mod tests {
         assert!(p.contains(&dir.path().display().to_string()));
         // 2. It advertises every tool it was handed, and nothing it wasn't.
         for t in &specs {
-            assert!(p.contains(t.name), "prompt omits tool {}", t.name);
+            assert!(p.contains(t.name.as_str()), "prompt omits tool {}", t.name);
         }
         assert!(
             !p.contains("http_fetch"),

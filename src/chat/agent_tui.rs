@@ -524,7 +524,7 @@ impl<'a> App<'a> {
         for t in &specs {
             let tag = if !t.risk.needs_approval() {
                 " (auto: read-only)"
-            } else if granted.iter().any(|g| g == t.name) {
+            } else if granted.contains(&t.name) {
                 " (auto: allowed this session)"
             } else {
                 ""
