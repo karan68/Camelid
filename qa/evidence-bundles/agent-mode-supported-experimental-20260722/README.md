@@ -36,7 +36,8 @@ states; any model quality bar beyond the battery.
 
 ## Provenance
 
-Transcripts are verbatim tool output (`<home>` substituted for the operator
-home directory). The runs used the debug binary at the head recorded in
+Transcripts are verbatim tool output with two mechanical substitutions:
+`<home>` for the operator home directory and `<models-volume>` for the local
+model-store mount (the privacy audit forbids durable volume paths). The runs used the debug binary at the head recorded in
 `host.json`, with the default sandboxed shell, no `--allow-net`, and
 `--allow-mcp`/`--yolo` only in the MCP CERT as noted in its stderr.
