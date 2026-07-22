@@ -1189,16 +1189,18 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
-    /// Verify a parity receipt: self-digest, lane identity, an in-process
-    /// Camelid re-run, and a llama.cpp reference re-run. A verified receipt
-    /// proves one request matched the reference for one exact GGUF; it does
-    /// not change any support claim.
+    /// Verify a receipt. For a parity receipt: self-digest, lane identity, an
+    /// in-process Camelid re-run, and a llama.cpp reference re-run (requires
+    /// `--gguf`). For a sealed agent-family receipt (syscap / orchestration /
+    /// bench): a self-contained tamper-evidence + honest-scope check, no GGUF.
+    /// A verified receipt changes no support claim.
     VerifyReceipt {
         /// Path to the receipt JSON file.
         receipt: PathBuf,
-        /// The exact GGUF file the receipt names (its SHA-256 must match).
+        /// The exact GGUF the receipt names (its SHA-256 must match). Required
+        /// for a parity receipt; agent-family receipts need no GGUF.
         #[arg(long)]
-        gguf: PathBuf,
+        gguf: Option<PathBuf>,
         /// llama-server binary for the reference re-run (path or name in PATH).
         #[arg(long, default_value = "llama-server")]
         llama_server: String,
@@ -2516,7 +2518,31 @@ async fn main() -> anyhow::Result<()> {
             llama_port,
             threads,
         } => {
+            // Route a sealed agent-family receipt to its self-contained verifier
+            // (no model, no GGUF). Any doubt about the schema falls through to the
+            // parity path below, which is left unchanged.
+            let is_agent = std::fs::read_to_string(&receipt)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("schema")
+                        .and_then(|schema| schema.as_str())
+                        .map(camelid::receipt::agent::is_agent_schema)
+                })
+                .unwrap_or(false);
+            if is_agent {
+                let outcome = camelid::receipt::agent::run(&receipt);
+                std::process::exit(outcome.exit_code());
+            }
+
             configure_rayon_threads(threads)?;
+            let gguf = gguf.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "parity verification requires the exact GGUF via --gguf; agent-family \
+                     receipts (syscap / orchestration / bench) need no GGUF"
+                )
+            })?;
             let mode = if self_only {
                 camelid::receipt::verify::VerifyMode::SelfOnly
             } else if reference_only {

@@ -16,11 +16,14 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+// Only the Windows battery (`run_battery`) constructs `ToolCall` args as a
+// `Value`; off-Windows that code is `cfg`'d out, so the import would be unused.
+#[cfg(windows)]
 use serde_json::Value;
 
 use super::agent_eval::EvalOutcome;
 
-pub const RECEIPT_SCHEMA_V1: &str = "camelid.agent-syscap-receipt/v1";
+pub const RECEIPT_SCHEMA_V1: &str = crate::receipt::agent::SYSCAP_RECEIPT_SCHEMA_V1;
 
 pub struct SyscapConfig {
     pub receipt_dir: PathBuf,
@@ -58,15 +61,12 @@ struct SyscapReceipt {
 }
 
 impl SyscapReceipt {
-    /// SHA-256 of the canonical body (key-sorted, compact, `receipt_id` removed),
-    /// reusing the shared receipt helpers so the digest matches the rest of the
-    /// repo's tamper-evident artifacts.
+    /// The sealed `receipt_id`: SHA-256 over the canonical body (`receipt_id`
+    /// removed, recursively key-sorted, compact). Delegates to the shared
+    /// [`camelid::receipt::receipt_id_over`] primitive so this seal and the
+    /// standalone verifier compute the identical digest.
     fn compute_receipt_id(&self) -> String {
-        let mut value = serde_json::to_value(self).expect("receipt serializes to JSON");
-        if let Value::Object(map) = &mut value {
-            map.remove("receipt_id");
-        }
-        crate::receipt::sha256_hex(crate::receipt::canonical_json(&value).as_bytes())
+        crate::receipt::receipt_id_over(&serde_json::to_value(self).expect("receipt serializes"))
     }
 
     fn seal(&mut self) {

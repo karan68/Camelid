@@ -21,12 +21,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::agent_eval::EvalOutcome;
 use super::subagent::{self, SubagentConfig};
 
-pub const RECEIPT_SCHEMA_V1: &str = "camelid.agent-orchestration-receipt/v1";
+pub const RECEIPT_SCHEMA_V1: &str = crate::receipt::agent::ORCHESTRATION_RECEIPT_SCHEMA_V1;
 
 pub struct OrchestrationConfig {
     pub receipt_dir: PathBuf,
@@ -75,11 +74,7 @@ struct OrchestrationReceipt {
 
 impl OrchestrationReceipt {
     fn compute_receipt_id(&self) -> String {
-        let mut value = serde_json::to_value(self).expect("receipt serializes to JSON");
-        if let Value::Object(map) = &mut value {
-            map.remove("receipt_id");
-        }
-        crate::receipt::sha256_hex(crate::receipt::canonical_json(&value).as_bytes())
+        crate::receipt::receipt_id_over(&serde_json::to_value(self).expect("receipt serializes"))
     }
     fn seal(&mut self) {
         self.receipt_id = self.compute_receipt_id();
@@ -344,7 +339,13 @@ pub(super) fn family_for(model: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if name.contains("qwen") {
+    // Ornith / Qwen3.5 emit the custom `<function=…>` XML tool format, which routes
+    // to `parse_ornith`. Check before "qwen" (the model is Qwen3.5-derived but its
+    // tool grammar differs from Qwen2/Qwen3 JSON-in-`<tool_call>`). Mirrors
+    // `agent_eval::family_for` so the two gate harnesses classify a model identically.
+    if name.contains("ornith") || name.contains("qwen35") || name.contains("qwen3.5") {
+        "ornith".to_string()
+    } else if name.contains("qwen") {
         "qwen".to_string()
     } else if name.contains("mistral") {
         "mistral".to_string()
@@ -659,5 +660,18 @@ mod tests {
         let r = sample();
         assert!(!r.promotes_capability);
         assert!(!r.claims_speedup);
+    }
+
+    #[test]
+    fn family_for_routes_ornith_before_qwen() {
+        // Ornith / Qwen3.5 must classify as `ornith` (custom `<function=…>` XML tool
+        // grammar), not `qwen` — matching `agent_eval::family_for`. Regression for a
+        // missing arm that misrouted these models to the JSON tool parser.
+        assert_eq!(family_for(Path::new("Ornith-4B-Q8_0.gguf")), "ornith");
+        assert_eq!(family_for(Path::new("Qwen3.5-4B-Instruct.gguf")), "ornith");
+        assert_eq!(family_for(Path::new("qwen35-coder.gguf")), "ornith");
+        assert_eq!(family_for(Path::new("Qwen3-4B-Q4_K_M.gguf")), "qwen");
+        assert_eq!(family_for(Path::new("Mistral-7B.gguf")), "mistral");
+        assert_eq!(family_for(Path::new("Llama-3.2-3B.gguf")), "llama");
     }
 }
