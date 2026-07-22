@@ -12,6 +12,7 @@ import {
   getWorkspaceThreads,
   reduceWorkspaceEvent,
   sendWorkspaceMessage,
+  waitForWorkspaceSessionTerminal,
   WORKSPACE_IDLE_STATE,
   workspaceEndpoint,
 } from '../lib/workspaceAgent'
@@ -32,6 +33,8 @@ const PHASE_LABEL = {
   step_capped: 'Step limit reached',
   repeated: 'No progress',
   driver_error: 'Model error',
+  cancelling: 'Stopping',
+  cancel_error: 'Stop failed',
   error: 'Error',
 }
 
@@ -43,6 +46,7 @@ const TERMINAL_RESULT = {
   step_capped: { title: 'Reached the step limit', detail: 'Camelid ran out of steps before finishing. Try a narrower goal or fewer files.' },
   repeated: { title: 'Stopped — no progress', detail: 'Camelid was repeating itself, so it stopped. Try rephrasing the goal.' },
   driver_error: { title: 'The model had a problem', detail: 'The model could not complete the task. Try again or pick a different goal.' },
+  cancel_error: { title: 'Stop could not be confirmed', detail: 'The turn may still be running. Retry Stop before sending another request.' },
   error: { title: 'Something went wrong', detail: '' },
 }
 const DEFAULT_SETUP_PERCENT = 46
@@ -296,7 +300,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const target = compatibility?.target || null
   const toolCapable = Boolean(hasLoadedModel && compatibility?.exact && target?.tool_capable && String(target.status || '').startsWith('supported'))
   const runtimeReady = runtime?.status === 'online' && runtime?.loaded_now && runtime?.generation_ready
-  const running = ['starting', 'running'].includes(state.phase)
+  const running = ['starting', 'running', 'cancelling', 'cancel_error'].includes(state.phase)
+  const stopping = state.phase === 'cancelling'
   const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
   const conversation = state.turns
   const hiddenTurnCount = Math.max(0, conversation.length - MAX_RENDERED_TURNS)
@@ -468,18 +473,19 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }
 
   const stop = async () => {
-    if (!session) return
+    if (!session || stopping) return
+    dispatch({ event: 'turn.stopping' })
     try {
-      await cancelWorkspaceSession(apiBase, session.id)
+      const status = await cancelWorkspaceSession(apiBase, session.id)
+      if (status !== 404) await waitForWorkspaceSessionTerminal(apiBase, session.id)
       dispatch({ event: 'session.finished', outcome: 'cancelled' })
-    } catch (error) {
-      dispatch({ event: 'session.error', message: error.message })
-    } finally {
       if (eventSourceRef.current) {
         intentionalClosuresRef.current.add(eventSourceRef.current)
         eventSourceRef.current.close()
       }
       eventSourceRef.current = null
+    } catch (error) {
+      dispatch({ event: 'turn.stop_failed', message: error.message })
     }
   }
 
@@ -596,7 +602,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }
 
   const renderResult = () => {
-    const terminalError = state.phase === 'error' || state.phase === 'driver_error'
+    const terminalError = ['error', 'driver_error', 'cancel_error'].includes(state.phase)
     if (terminalError && conversation.length === 0) {
       const meta = TERMINAL_RESULT[state.phase]
       return (
@@ -813,7 +819,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
 
         <div className="workspace-setup__actions">
           {running ? (
-            <Button variant="outline" onClick={stop}><IconStop size={17} /> Stop</Button>
+            <Button variant="outline" onClick={stop} disabled={stopping} loading={stopping}><IconStop size={17} /> {stopping ? 'Stopping' : 'Stop'}</Button>
           ) : !session ? (
             <Button variant="primary" onClick={start} disabled={!canStart}><IconPlay size={17} /> Start Workspace</Button>
           ) : null}

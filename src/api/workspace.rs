@@ -287,6 +287,31 @@ impl ActiveWorkspaceSession {
         *current_turn = None;
         true
     }
+
+    fn persist_aborted_turn_and_finish(
+        &self,
+        run_config: &WorkspaceRunConfig,
+        evidence: &[EvidenceInput],
+    ) -> anyhow::Result<bool> {
+        let persisted = self.memory.append_terminal_turn(
+            &self.id,
+            &run_config.client_message_id,
+            &run_config.goal,
+            "",
+            "aborted",
+            evidence,
+        );
+        let finished = self.finish_turn_if_current(
+            &run_config.client_message_id,
+            if persisted.is_ok() {
+                TurnCompletion::Idle
+            } else {
+                TurnCompletion::Failed
+            },
+        );
+        persisted?;
+        Ok(finished)
+    }
 }
 
 fn arm_event_claim_deadline(session: &Arc<ActiveWorkspaceSession>, message_id: String) {
@@ -1349,14 +1374,11 @@ pub(super) async fn session_events(
                 }
             }
             if !persistence_attempted {
-                let _ = persist_session.memory.append_terminal_turn(
-                    &persist_session.id,
-                    &persisted_turn.client_message_id,
-                    &persisted_turn.goal,
-                    "",
-                    "aborted",
-                    &evidence,
-                );
+                if let Err(error) =
+                    persist_session.persist_aborted_turn_and_finish(&persisted_turn, &evidence)
+                {
+                    eprintln!("Workspace memory could not save an interrupted turn: {error}");
+                }
             }
         })
         .expect("spawn Workspace event forwarder");
@@ -2116,6 +2138,57 @@ mod tests {
             session.state.lock().map(|state| *state).unwrap(),
             WorkspaceSessionState::Cancelled
         );
+    }
+
+    #[test]
+    fn event_forwarder_fallback_persists_and_finishes_cancelled_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = WorkspaceMemoryStore::open(dir.path().join("memory.sqlite3")).unwrap();
+        memory.create_thread("thread", "root", "model").unwrap();
+        let session = ActiveWorkspaceSession {
+            id: "thread".into(),
+            workspace: dir.path().to_path_buf(),
+            model_id: "model".into(),
+            max_steps: 1,
+            max_tokens: 1,
+            temperature: 0.0,
+            allow_writes: false,
+            memory,
+            state: StdMutex::new(WorkspaceSessionState::Cancelling),
+            events: StdMutex::new(None),
+            worker: StdMutex::new(None),
+            run_config: StdMutex::new(None),
+            control: StdMutex::new(None),
+            current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+        };
+        let run_config = WorkspaceRunConfig {
+            addr: "127.0.0.1:8181".parse().unwrap(),
+            workspace: dir.path().to_path_buf(),
+            goal: "question".into(),
+            client_message_id: "message-1".into(),
+            turn_index: 0,
+            memory: Default::default(),
+            model_id: "model".into(),
+            family: "qwen3".into(),
+            max_steps: 1,
+            max_tokens: 1,
+            temperature: 0.0,
+        };
+
+        assert!(session
+            .persist_aborted_turn_and_finish(&run_config, &[])
+            .unwrap());
+        assert_eq!(
+            session.state.lock().map(|state| *state).unwrap(),
+            WorkspaceSessionState::Cancelled
+        );
+        assert_eq!(session.pending_message("message-1"), None);
+        let turn = session
+            .memory
+            .turn_by_client_message("thread", "message-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.terminal_outcome, "aborted");
     }
 
     #[test]

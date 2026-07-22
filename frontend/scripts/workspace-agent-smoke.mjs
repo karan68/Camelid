@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { reduceWorkspaceEvent, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
+import { reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
 
 let state = { ...WORKSPACE_IDLE_STATE, events: [] }
 state = reduceWorkspaceEvent(state, { event: 'session.started', model_id: 'tool-model', sequence: 1 })
@@ -45,6 +45,27 @@ assert.equal(state.events.length, 0)
 state = reduceWorkspaceEvent(state, { event: 'turn.starting' })
 assert.equal(state.phase, 'starting')
 assert.equal(state.turns.length, 1, 'starting a follow-up must preserve restored turns')
+state = reduceWorkspaceEvent(state, { event: 'turn.stopping' })
+assert.equal(state.phase, 'cancelling')
+assert.equal(state.turns.length, 1, 'stopping must preserve durable turns')
+state = reduceWorkspaceEvent(state, { event: 'turn.stop_failed', message: 'still running' })
+assert.equal(state.phase, 'cancel_error')
+assert.equal(state.error, 'still running')
+
+const originalFetch = globalThis.fetch
+const terminalStates = ['running', 'cancelling', 'cancelled']
+let statusReads = 0
+globalThis.fetch = async () => new Response(JSON.stringify({ state: terminalStates[statusReads++] }), {
+  status: 200,
+  headers: { 'Content-Type': 'application/json' },
+})
+try {
+  const settled = await waitForWorkspaceSessionTerminal('http://127.0.0.1:8181', 'thread-1', { timeoutMs: 1000, pollMs: 0 })
+  assert.equal(settled.state, 'cancelled')
+  assert.equal(statusReads, 3, 'follow-up must wait through running and cancelling states')
+} finally {
+  globalThis.fetch = originalFetch
+}
 
 let bounded = { ...WORKSPACE_IDLE_STATE, events: [], turns: [] }
 for (let index = 0; index < 300; index += 1) {

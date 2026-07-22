@@ -304,6 +304,8 @@ try {
     globalThis.EventSource = HangingEventSource
   })
   await cancelPage.setRequestInterception(true)
+  let cancelAttempts = 0
+  let cancelStatusReads = 0
   cancelPage.on('request', async (request) => {
     const url = request.url()
     if (request.method() === 'OPTIONS') {
@@ -321,7 +323,17 @@ try {
       return respondJson(request, { id: 'workspace-cancel-failure', workspace: 'C:/workspace', model_id: 'qwen3_4b_q4_k_m', state: 'waiting_for_events', max_steps: 12, max_tokens: 512, allow_writes: false }, 201)
     }
     if (url.endsWith('/api/agent/workspace/sessions/workspace-cancel-failure') && request.method() === 'DELETE') {
-      return respondJson(request, { error: { message: 'simulated cancel failure' } }, 500)
+      cancelAttempts += 1
+      if (cancelAttempts === 1) return respondJson(request, { error: { message: 'simulated cancel failure' } }, 500)
+      return request.respond({ status: 204, body: '' })
+    }
+    if (url.endsWith('/api/agent/workspace/sessions/workspace-cancel-failure') && request.method() === 'GET') {
+      cancelStatusReads += 1
+      return respondJson(request, {
+        id: 'workspace-cancel-failure', workspace: 'C:/workspace', model_id: 'qwen3_4b_q4_k_m',
+        state: cancelStatusReads < 4 ? 'cancelling' : 'cancelled', context_budget_tokens: 4096,
+        resident_cuda: null, allow_writes: false,
+      })
     }
     return request.continue()
   })
@@ -337,7 +349,7 @@ try {
   await cancelPage.waitForSelector('.workspace-setup__actions .cx-btn--outline')
   await cancelPage.click('.workspace-setup__actions .cx-btn--outline')
   try {
-    await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Error', { timeout: 5000 })
+    await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Stop failed', { timeout: 5000 })
   } catch {
     const diagnostic = await cancelPage.evaluate(() => ({
       status: document.querySelector('.workspace-status')?.textContent,
@@ -351,10 +363,25 @@ try {
     errorText: document.body.textContent.includes('simulated cancel failure'),
     followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
   }))
-  if (cancelState.status !== 'Error' || cancelState.stoppedText || !cancelState.errorText || !cancelState.followUpPresent) {
+  if (cancelState.status !== 'Stop failed' || cancelState.stoppedText || !cancelState.errorText || cancelState.followUpPresent) {
     throw new Error(`cancel failure was misreported: ${JSON.stringify(cancelState)}`)
   }
   console.log(`cancel-failure: PASS ${JSON.stringify(cancelState)}`)
+
+  await cancelPage.click('.workspace-setup__actions .cx-btn--outline')
+  await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Stopping', { timeout: 5000 })
+  const stoppingState = await cancelPage.evaluate(() => ({
+    status: document.querySelector('.workspace-status')?.textContent,
+    followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
+  }))
+  if (stoppingState.followUpPresent) throw new Error(`follow-up appeared while cancellation was settling: ${JSON.stringify(stoppingState)}`)
+  await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Stopped', { timeout: 5000 })
+  const settledState = await cancelPage.evaluate(() => ({
+    status: document.querySelector('.workspace-status')?.textContent,
+    followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
+  }))
+  if (!settledState.followUpPresent) throw new Error(`follow-up did not appear after cancellation settled: ${JSON.stringify(settledState)}`)
+  console.log(`cancel-settled: PASS ${JSON.stringify({ ...settledState, cancelAttempts, cancelStatusReads })}`)
   await cancelPage.close()
 } finally {
   await browser.close()

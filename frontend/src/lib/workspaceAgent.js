@@ -28,6 +28,10 @@ export function reduceWorkspaceEvent(state, envelope) {
   }
   if (event === 'session.starting') return { ...state, phase: 'starting', error: '' }
   if (event === 'turn.starting') return { ...state, phase: 'starting', error: '' }
+  if (event === 'turn.stopping') return { ...state, phase: 'cancelling', error: '' }
+  if (event === 'turn.stop_failed') {
+    return { ...state, phase: 'cancel_error', error: String(envelope.message || 'Workspace could not confirm that the turn stopped.') }
+  }
   if (event === 'turn.user') {
     return {
       ...state,
@@ -201,7 +205,18 @@ export async function getWorkspaceSession(apiBase, sessionId) {
   return response.json()
 }
 
+export async function waitForWorkspaceSessionTerminal(apiBase, sessionId, { timeoutMs = 10000, pollMs = 100 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const session = await getWorkspaceSession(apiBase, sessionId)
+    if (!['waiting_for_events', 'running', 'cancelling'].includes(session.state)) return session
+    if (Date.now() >= deadline) throw new Error('Workspace is still stopping. Retry Stop before sending another request.')
+    await new Promise((resolve) => globalThis.setTimeout(resolve, pollMs))
+  }
+}
+
 export async function cancelWorkspaceSession(apiBase, sessionId) {
   const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}`), { method: 'DELETE' })
   if (!response.ok && response.status !== 404) throw new Error(await readError(response, `Stop failed (${response.status}).`))
+  return response.status
 }
