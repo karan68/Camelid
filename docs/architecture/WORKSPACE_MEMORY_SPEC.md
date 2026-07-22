@@ -76,12 +76,15 @@ Do not treat any number in the "budget math" as ground truth — they are illust
 
 ## 1. Problem statement
 
-### 1.1 What Workspace is today **[VERIFIED]**
-The Web Agent Workspace is a **single‑shot, bounded agent task** over one local folder:
+### 1.1 What Workspace was when this proposal was drafted (2026‑07‑20) **[SUPERSEDED]**
+
+> **Correction (2026‑07‑22):** the shipped Workspace is server-enforced read-only. Its tool surface is exactly `read_file`, `list_dir`, and literal-content `search` (§2.3); no write or edit tool exists, so nothing is approval-gated, and follow-up turns with durable memory shipped with this design. The bullets below describe the five-tool write-capable prototype this proposal was drafted against, which the final Web Workspace PR replaced before merge. `COMPATIBILITY.md` states the governing rule.
+
+The Web Agent Workspace was a **single‑shot, bounded agent task** over one local folder:
 
 - The user picks **one canonical directory** and **one goal**, then Starts.
-- A plan‑act‑observe agent loop runs with exactly five file tools (see §2.3), read‑only tools auto‑run, every write is approval‑gated.
-- When the loop ends, the session is over. There is **no follow‑up turn and no memory** — each Start is a fresh session. The original 2026‑07‑17 Workspace design treated **"background persistence"** as *out of scope* for the first release, so the absence of memory was intentional for v1, not an accident.
+- A plan‑act‑observe agent loop ran with five file tools, read‑only tools auto‑run, every write approval‑gated.
+- When the loop ended, the session was over. There was **no follow‑up turn and no memory** — each Start was a fresh session. The original 2026‑07‑17 Workspace design treated **"background persistence"** as *out of scope* for the first release, so the absence of memory was intentional for v1, not an accident.
 
 ### 1.2 The product gap
 Users' natural mental model is **"chat with my folder"** — ask, get an answer, then follow up ("tell me more", "now look at the architecture folder"), with the assistant remembering the conversation. The current one‑shot model does not support this. The missing primitive is **conversational memory (continuity)**, both **within a session** (multi‑turn) and **across sessions** (resumable).
@@ -125,7 +128,7 @@ GET    /api/agent/workspace/sessions/:id        session_status
 DELETE /api/agent/workspace/sessions/:id        cancel_session
 GET    /api/agent/workspace/sessions/:id/events SSE event stream (event name: "workspace")
 POST   /api/agent/workspace/sessions/:id/messages idempotent follow-up turn
-POST   /api/agent/workspace/sessions/:id/decisions  approval decision
+POST   /api/agent/workspace/sessions/:id/decisions  vestigial approval decision (the read-only lane never creates an approval, so it can only answer 409)
 ```
 Auth: loopback-bound server + loopback `Host` + exact same-authority `Origin` or same-origin fetch metadata (`authorize` / `local_management_request_allowed`). **[VERIFIED]**
 
@@ -160,7 +163,7 @@ EVENT_CLAIM_TIMEOUT = 30 seconds
 ### 2.6 Frontend **[VERIFIED]**
 - `frontend/src/views/WorkspaceView.jsx` — the view. Recently redesigned to a **Result‑first** layout: a prominent markdown Answer panel (`AssistantMarkdown` + `copyText` from `frontend/src/lib/markdown.jsx`) with a collapsible **"What Camelid did"** timeline (`<details>`).
 - `frontend/src/lib/workspaceAgent.js` — API client + `reduceWorkspaceEvent(state, envelope)` reducer + endpoint helpers (`workspaceEndpoint`, `workspaceModelsEndpoint`, `workspaceBrowseEndpoint`, `createWorkspaceSession`, `browseWorkspaceFolders`, etc.).
-- Event vocabulary handled by the reducer **[VERIFIED]**: `session.starting`, `session.started`, `model.delta`→`model.live`, `tool.call`, `approval.required`, `tool.result`, `model.answer`, `session.finished`, `session.error`, `session.notice`, `approval.resolved`, `session.reset`.
+- Event vocabulary handled by the reducer **[VERIFIED 2026‑07‑22]**: `session.starting`, `session.started`, `turn.starting`, `turn.user`, `turn.stopping`, `turn.stop_failed`, `thread.restored`, `model.delta`→`model.live`, `tool.call`, `tool.result`, `model.answer`, `session.finished`, `session.error`, `session.reset`; `session.notice`, `memory.updated`, and `memory.compacted` flow through the shared event log to the view. `approval.resolved` is no longer handled, and `approval.required` fails closed: the read-only reducer surfaces it as a session error, not an approval prompt.
 - One session at a time; SSE via `EventSource`.
 
 ### 2.7 Signals that already exist and this design depends on **[VERIFIED / TO‑VERIFY]**
