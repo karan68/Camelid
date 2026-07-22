@@ -685,12 +685,14 @@ mod tests {
             next: 0,
         };
         let mut history = vec![AgentMsg::User("read note.txt".to_string())];
+        let mut read_only_config = config(root.path());
+        read_only_config.tool_profile = ToolProfile::WorkspaceReadOnly;
         let end = run_loop(
             &mut driver,
             &mut worker.approver,
             &mut worker.reporter,
             &sandbox,
-            &config(root.path()),
+            &read_only_config,
             &AtomicBool::new(false),
             &mut Policy::default(),
             &mut history,
@@ -720,12 +722,14 @@ mod tests {
             next: 0,
         };
         let mut history = vec![AgentMsg::User("run a command".to_string())];
+        let mut read_only_config = config(root.path());
+        read_only_config.tool_profile = ToolProfile::WorkspaceReadOnly;
         let end = run_loop(
             &mut driver,
             &mut worker.approver,
             &mut worker.reporter,
             &sandbox,
-            &config(root.path()),
+            &read_only_config,
             &AtomicBool::new(false),
             &mut Policy::default(),
             &mut history,
