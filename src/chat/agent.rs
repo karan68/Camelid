@@ -680,6 +680,50 @@ pub fn load_project_context(sandbox: &Sandbox) -> Option<ProjectContext> {
     None
 }
 
+/// The `CAMELID.md` `/init` writes when a workspace has none. Deliberately a
+/// prompt for the human rather than a guess by us: an invented description is
+/// worse than an empty heading, because the agent will believe it.
+pub const PROJECT_TEMPLATE: &str = "\
+# Project notes for the Camelid agent
+
+Anything here is loaded into the agent's context as reference material. Keep it
+short — it costs context on every step.
+
+## What this project is
+
+<one or two sentences>
+
+## Build, test, run
+
+```
+<the commands you actually use>
+```
+
+## Conventions
+
+- <e.g. formatting, error handling, where tests live>
+
+## Gotchas
+
+- <anything that will waste the agent's time if it does not know>
+";
+
+/// Write `CAMELID.md` at the workspace root unless one already exists.
+pub fn init_project_file(sandbox: &Sandbox) -> Result<std::path::PathBuf, String> {
+    if let Some(existing) = load_project_context(sandbox) {
+        return Err(format!(
+            "{} already exists at the workspace root — edit it instead",
+            existing.file_name
+        ));
+    }
+    let path = sandbox.resolve(PROJECT_FILES[0], false)?;
+    if path.exists() {
+        return Err(format!("{} already exists", PROJECT_FILES[0]));
+    }
+    std::fs::write(&path, PROJECT_TEMPLATE).map_err(|e| format!("could not write: {e}"))?;
+    Ok(path)
+}
+
 /// Render the project block: labelled, fenced, and explicitly stripped of any
 /// authority. The workspace owner wrote this file, but by the time it reaches
 /// the model it is still just text that arrived from the filesystem — so it is
@@ -1029,6 +1073,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         tui_only: false,
     },
     SlashCommand {
+        name: "init",
+        alias: None,
+        help: "scaffold a CAMELID.md for this workspace",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "copy",
+        alias: None,
+        help: "copy the last answer to the clipboard",
+        tui_only: false,
+    },
+    SlashCommand {
         name: "plan",
         alias: None,
         help: "show the agent's current task plan",
@@ -1374,6 +1430,8 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
 
     let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
     let mut rl = rustyline::DefaultEditor::new()?;
+    // The most recent final answer, for `/copy`.
+    let mut last_answer = String::new();
     let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     let mut reporter = InlineReporter;
     let mut approver = InlineApprover;
@@ -1418,6 +1476,25 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             "{}",
                             banner::dim(&format!("step budget: {} per goal", cfg.max_steps))
                         ),
+                        "init" => match init_project_file(&sandbox) {
+                            Ok(p) => println!(
+                                "{}",
+                                banner::dim(&format!(
+                                    "wrote {} — fill it in and the agent will read it",
+                                    sandbox.rel(&p)
+                                ))
+                            ),
+                            Err(e) => println!("{}", banner::dim(&e)),
+                        },
+                        "copy" => {
+                            if last_answer.is_empty() {
+                                println!("{}", banner::dim("nothing to copy yet"));
+                            } else if super::clipboard::copy(&last_answer) {
+                                println!("{}", banner::dim("copied the last answer"));
+                            } else {
+                                println!("{}", banner::dim("could not reach the clipboard"));
+                            }
+                        }
                         "plan" => {
                             let steps = super::plan::get();
                             println!(
@@ -1475,6 +1552,10 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                     &mut policy,
                     &mut history,
                 );
+                // Keep the final answer for /copy.
+                if let Some(AgentMsg::Assistant(a)) = history.last() {
+                    last_answer = a.clone();
+                }
                 reporter.notice(match end {
                     LoopEnd::Answered => "done",
                     LoopEnd::Aborted => "stopped",
@@ -2154,6 +2235,11 @@ mod tests {
         // The only TUI-only commands are the ones that need chrome to act on.
         let tui_only: Vec<_> = tui.iter().filter(|n| !line.contains(n)).copied().collect();
         assert_eq!(tui_only, vec!["theme", "sidebar"]);
+        // The G8 additions are available in both front ends.
+        for n in ["init", "copy", "plan"] {
+            assert!(line.contains(&n), "/{n} should be in the line renderer");
+            assert!(tui.contains(&n), "/{n} should be in the TUI");
+        }
 
         // No duplicate spellings across names and aliases.
         let mut sorted = tui.clone();
@@ -2543,6 +2629,33 @@ mod tests {
         let baseline = system_prompt(&sb, &tools);
         assert!(!baseline.contains("workspace specific text"));
         assert!(!baseline.contains(PROJECT_OPEN));
+    }
+
+    // --- G8: /init ---
+
+    #[test]
+    fn init_writes_a_template_the_agent_then_reads() {
+        let (_d, sb) = sb_with(&[]);
+        let path = init_project_file(&sb).expect("should write");
+        assert!(path.ends_with("CAMELID.md"));
+
+        // Round trip: what /init wrote is what the loader picks up.
+        let ctx = load_project_context(&sb).expect("loaded");
+        assert_eq!(ctx.file_name, "CAMELID.md");
+        assert!(ctx.body.contains("Build, test, run"));
+        assert!(prompt_with_project(&sb).contains("Build, test, run"));
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_an_existing_file() {
+        let (_d, sb) = sb_with(&[("CAMELID.md", "my own notes")]);
+        assert!(init_project_file(&sb).is_err());
+        assert_eq!(load_project_context(&sb).unwrap().body, "my own notes");
+
+        // Also refuses when only the fallback exists, so /init cannot quietly
+        // shadow an AGENTS.md the workspace already relies on.
+        let (_d2, sb2) = sb_with(&[("AGENTS.md", "existing agents file")]);
+        assert!(init_project_file(&sb2).is_err());
     }
 
     #[test]

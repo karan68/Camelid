@@ -117,6 +117,14 @@ network stays off unless you pass `--allow-net`. Tool results are treated as unt
 only models the compatibility ledger marks `tool_capable` are eligible (promoted only after a
 `camelid agent-eval` PASS). Treat it as a preview and review every requested action.
 
+With `--allow-net` the agent also gets `web_search` (ranked title/url/snippet results) alongside
+`http_fetch`. Results are untrusted data — reading one is a separate, separately-approved
+`http_fetch`. Point it at a different engine with `CAMELID_SEARCH_URL` (a template containing
+`{query}`).
+
+In-session: `/init` scaffolds a `CAMELID.md`, `/plan` shows the agent's current checklist, `/copy`
+puts the last answer on the clipboard, and `/help` lists the rest.
+
 **MCP servers (opt-in).** `--allow-mcp` loads the servers declared in a `camelid.mcp.json` at the
 workspace root (stdio transport) and offers their tools alongside the native ones, namespaced
 `mcp__<server>__<tool>` so none can shadow a built-in:

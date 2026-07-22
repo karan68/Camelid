@@ -487,6 +487,26 @@ impl<'a> App<'a> {
                 }
             }
             "steps" => self.status = format!("step budget: {} per goal", self.max_steps),
+            "init" => {
+                self.status = match self.engine.as_ref() {
+                    Some(e) => match agent::init_project_file(&e.sandbox) {
+                        Ok(p) => format!("wrote {}", e.sandbox.rel(&p)),
+                        Err(err) => err,
+                    },
+                    None => "busy — try /init when idle".into(),
+                };
+            }
+            "copy" => {
+                let last = self.transcript.iter().rev().find_map(|e| match e {
+                    Entry::Model(t) => Some(t.clone()),
+                    _ => None,
+                });
+                self.status = match last {
+                    Some(t) if super::clipboard::copy(&t) => "copied the last answer".into(),
+                    Some(_) => "could not reach the clipboard".into(),
+                    None => "nothing to copy yet".into(),
+                };
+            }
             "plan" => {
                 let steps = super::plan::get();
                 self.push(Entry::Notice(format!(
