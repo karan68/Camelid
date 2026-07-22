@@ -217,6 +217,13 @@ jobs:
       - name: Tests
         env:
           CAMELID_REQUIRE_METAL_TESTS: ${{ runner.os == 'macOS' && '1' || '' }}
+          # Debug-build CLI-parsing tests carry the whole 40-variant clap
+          # Command tree in one unoptimized frame (rustc does not merge stack
+          # slots across match arms in debug), and the tree's growth pushed
+          # gemma4_generate_harness_flags_default_off over the default 2 MiB
+          # libtest thread stack on Linux. 8 MiB matches the main-thread stack
+          # the shipped binary parses with; release builds are unaffected.
+          RUST_MIN_STACK: 8388608
         run: cargo test --all-targets ${{ matrix.features }}
 
       # Report, in the log, whether this runner can actually execute the macOS Metal test

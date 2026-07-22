@@ -475,7 +475,8 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
                 description:
                     "Windows only: send a key chord to the focused window, e.g. \"ctrl+s\", \
                               \"win+r\", \"alt+f4\", \"enter\". One main key plus optional \
-                              ctrl/shift/alt/win modifiers joined by '+'. Exec tier — gated.",
+                              ctrl/shift/alt/win modifiers joined by '+'. Exec tier — gated."
+                        .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
                     "keys":{"type":"string","description":"Key chord like ctrl+s, win+r, enter, f5"}
