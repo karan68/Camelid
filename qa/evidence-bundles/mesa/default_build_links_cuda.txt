@@ -9,7 +9,7 @@ RTX Linux box (§6 hardware gate).
 ## Windows DEFAULT build (the shipped host) — real, full compile ####################
 
 $ cargo build --bin camelid            # NO --features
-   Compiling camelid v0.3.1 (C:\Users\timto\Camelid)
+   Compiling camelid v0.3.1 (.../Camelid)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 52.51s
 -> Windows default build is CUDA-on and unaffected (G6). The binary then ran the
    G3 runtime test on the RTX 3060 (see serve_gpu_help_and_states.json).

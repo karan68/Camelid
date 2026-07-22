@@ -5,7 +5,7 @@ $ cargo fmt --all -- --check
   -> clean (no diffs)
 
 $ cargo clippy --all-targets --all-features -- -D warnings
-   Compiling camelid v0.3.1 (C:\Users\timto\Camelid)
+   Compiling camelid v0.3.1 (.../Camelid)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 33.11s
   -> clean under -D warnings (compiles all MESA code incl. the --gpu path with cuda on)
 
