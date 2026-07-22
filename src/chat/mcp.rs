@@ -110,24 +110,65 @@ struct Server {
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
+    /// Windows: ties the server's whole process tree to this handle, so
+    /// killing the direct child cannot orphan grandchildren (an `npx` shim
+    /// spawns the real server as its own child). Mirrors the subagent spawner.
+    #[cfg(windows)]
+    _job: Option<super::win_job::JobObject>,
 }
 
 impl Server {
     fn spawn(name: &str, cfg: &ServerConfig, cwd: &std::path::Path) -> Result<Self, String> {
-        let mut cmd = Command::new(&cfg.command);
-        cmd.args(&cfg.args)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // The protocol is on stdout; a server's logging on stderr is not
-            // ours to interleave into the terminal.
-            .stderr(Stdio::null());
-        for (k, v) in &cfg.env {
-            cmd.env(k, v);
-        }
-        let mut child = cmd
-            .spawn()
+        let build = |program: &str, prefix_args: &[&str]| {
+            let mut cmd = Command::new(program);
+            cmd.args(prefix_args)
+                .arg(&cfg.command)
+                .args(&cfg.args)
+                .current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                // The protocol is on stdout; a server's logging on stderr is
+                // not ours to interleave into the terminal.
+                .stderr(Stdio::null());
+            for (k, v) in &cfg.env {
+                cmd.env(k, v);
+            }
+            cmd
+        };
+        // Direct spawn first. On Windows, `npx`/`uvx`-installed servers are
+        // .cmd shims that CreateProcess cannot start directly (NotFound), so
+        // retry through `cmd /C`, which resolves PATHEXT.
+        let spawned = {
+            let mut cmd = Command::new(&cfg.command);
+            cmd.args(&cfg.args)
+                .current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            for (k, v) in &cfg.env {
+                cmd.env(k, v);
+            }
+            cmd.spawn()
+        };
+        #[cfg(windows)]
+        let spawned = match spawned {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => build("cmd", &["/C"]).spawn(),
+            other => other,
+        };
+        #[cfg(not(windows))]
+        let _ = &build; // one builder, used only on the Windows retry path
+        let mut child = spawned
             .map_err(|e| format!("could not start MCP server '{name}' ({}): {e}", cfg.command))?;
+
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            let j = super::win_job::JobObject::new().ok();
+            if let Some(ref jj) = j {
+                let _ = jj.assign(child.as_raw_handle());
+            }
+            j
+        };
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -146,6 +187,8 @@ impl Server {
             stdin,
             lines,
             next_id: 1,
+            #[cfg(windows)]
+            _job: job,
         })
     }
 
@@ -173,8 +216,16 @@ impl Server {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                 continue; // not JSON — a stray log line; ignore
             };
+            // A message carrying `method` is a server-initiated request or
+            // notification, NOT a response — even when its id collides with
+            // ours (both sides count from 1, and e.g. `ping` is exempt from
+            // capability negotiation). Matching on id alone would consume it
+            // as our answer and hand the model a null "success".
+            if msg.get("method").is_some() {
+                continue;
+            }
             if msg.get("id").and_then(Value::as_u64) != Some(id) {
-                continue; // a notification or another response
+                continue; // another response
             }
             if let Some(err) = msg.get("error") {
                 let m = err
@@ -573,6 +624,9 @@ for line in sys.stdin:
             {"name":"boom","description":"Always fails."}
         ]}})
     elif m == "tools/call":
+        # B11 regression: a server-initiated request whose id COLLIDES with the
+        # client's in-flight id must not be consumed as the response.
+        send({"jsonrpc":"2.0","id":i,"method":"ping","params":{}})
         p = msg.get("params", {})
         if p.get("name") == "boom":
             send({"jsonrpc":"2.0","id":i,"result":{"isError":True,
@@ -652,12 +706,13 @@ for line in sys.stdin:
     }
 
     /// A process that is not an MCP server at all must not become one. `cat`
-    /// echoes our own request back — id and all — so the handshake "succeeds"
-    /// with a null result. What matters is that it yields no tools and leaves
-    /// MCP disabled rather than adopting garbage.
+    /// echoes our own request back — id and all. Before the method-skip fix
+    /// that echo "passed" the handshake with a null result; now the echoed
+    /// request is recognised as a request (it carries `method`) and skipped,
+    /// so initialize times out and the server is reported, not adopted.
     #[cfg(unix)]
     #[test]
-    fn an_echo_server_adopts_no_tools() {
+    fn an_echo_server_is_refused_not_adopted() {
         let _guard = registry_lock();
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -666,7 +721,8 @@ for line in sys.stdin:
         )
         .unwrap();
         shutdown();
-        assert_eq!(configure(&sandbox(d.path()), true, false, &[]).unwrap(), 0);
+        let err = configure(&sandbox(d.path()), true, false, &[]).unwrap_err();
+        assert!(err.contains("initialize"), "{err}");
         assert!(!is_enabled());
         assert!(specs().is_empty());
         shutdown();

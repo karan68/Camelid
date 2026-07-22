@@ -1516,6 +1516,55 @@ const DEFAULT_SEARCH_URL: &str = "https://lite.duckduckgo.com/lite/?q={query}";
 /// Most results a single search returns to the model.
 const MAX_SEARCH_RESULTS: usize = 8;
 
+/// Percent-decode a URL component (the inverse of [`urlencode`], plus `+`).
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Unwrap a search engine's redirect link to the destination it points at.
+/// DDG-lite hrefs are protocol-relative `//duckduckgo.com/l/?uddg=<encoded>`;
+/// the result the model needs is the decoded `uddg` target, not the redirect.
+fn unwrap_redirect(href: &str) -> Option<String> {
+    let abs = if let Some(rest) = href.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        href.to_string()
+    };
+    if let Some(q) = abs.find("uddg=") {
+        let tail = &abs[q + 5..];
+        let end = tail.find('&').unwrap_or(tail.len());
+        let target = urldecode(&tail[..end]);
+        if target.starts_with("http") {
+            return Some(target);
+        }
+    }
+    abs.starts_with("http").then_some(abs)
+}
+
 /// Percent-encode a query for a URL query string.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1588,10 +1637,11 @@ fn parse_results(html: &str) -> Vec<Hit> {
         let Some(url_end) = rest.find(quote) else {
             continue;
         };
-        let url = detag(&rest[..url_end]);
-        if !url.starts_with("http") {
+        // The href may be a redirect wrapper (and is HTML-escaped: `&amp;`).
+        let raw_href = detag(&rest[..url_end]);
+        let Some(url) = unwrap_redirect(&raw_href) else {
             continue;
-        }
+        };
         let after = &tag[tag_end + 1..];
         let title = detag(after.split("</a>").next().unwrap_or(""));
         // The snippet follows in a result-snippet cell.
@@ -2282,6 +2332,66 @@ mod tests {
         assert_eq!(ws.risk, Risk::Network);
         assert!(ws.risk.needs_approval());
         assert_eq!(ws.risk.default_tier(), ApprovalTier::Confirm);
+    }
+
+    /// The shipped default endpoint's REAL shape, captured live 2026-07-22:
+    /// protocol-relative redirect hrefs with the destination percent-encoded in
+    /// `uddg=`. The previous fixture tested a shape the real page never emits,
+    /// which is how "returns no results for every query" shipped green.
+    #[test]
+    fn real_ddg_lite_capture_parses_to_destinations() {
+        let html = include_str!("../../tests/fixtures/websearch/ddg_lite_two_results.html");
+        let hits = parse_results(html);
+        assert!(!hits.is_empty(), "the live capture must parse");
+        assert_eq!(
+            hits[0].url, "https://blog.logrocket.com/introducing-rust-borrow-checker/",
+            "redirect not unwrapped: {}",
+            hits[0].url
+        );
+        assert!(hits[0].title.contains("borrow checker"));
+        assert!(
+            hits[0].snippet.contains("code safety"),
+            "snippet lost: {}",
+            hits[0].snippet
+        );
+    }
+
+    /// Live-lane check, ignored by default (network). Run explicitly:
+    /// `cargo test --bin camelid web_search_live -- --ignored`.
+    #[test]
+    #[ignore = "network: hits the real default search endpoint"]
+    fn web_search_live_returns_real_results() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path(), true, std::time::Duration::from_secs(35)).unwrap();
+        let out = web_search(&sb, "rust borrow checker");
+        let text = out.text();
+        assert!(!out.is_err(), "{text}");
+        assert!(text.contains("1. "), "no ranked results: {text}");
+        assert!(text.contains("http"), "no urls: {text}");
+        assert!(
+            !text.contains("duckduckgo.com/l/"),
+            "redirects leaked: {text}"
+        );
+    }
+
+    #[test]
+    fn redirect_unwrapping_handles_the_shapes_engines_emit() {
+        // DDG-lite: protocol-relative + uddg param (already detag'd, so & not &amp;).
+        assert_eq!(
+            unwrap_redirect(
+                "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%2Db&rut=deadbeef"
+            )
+            .as_deref(),
+            Some("https://example.com/a-b")
+        );
+        // A direct link (another engine via CAMELID_SEARCH_URL) passes through.
+        assert_eq!(
+            unwrap_redirect("https://example.com/direct").as_deref(),
+            Some("https://example.com/direct")
+        );
+        // Garbage yields nothing rather than a bogus hit.
+        assert_eq!(unwrap_redirect("javascript:alert(1)"), None);
+        assert_eq!(unwrap_redirect("/relative/path"), None);
     }
 
     #[test]

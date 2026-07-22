@@ -265,14 +265,14 @@ fn generate(session: &mut Session) -> Gen {
     });
     println!();
     match result {
-        Ok((StreamEnd::Done, deltas)) => {
+        Ok((StreamEnd::Done, deltas, _)) => {
             session.last_prompt_tokens = None;
             session.last_completion_tokens = Some(deltas);
             session.push_assistant(assistant);
             print_stats(session, Some(deltas), started);
             Gen::Done
         }
-        Ok((StreamEnd::Cancelled, _)) => {
+        Ok((StreamEnd::Cancelled, _, _)) => {
             println!(
                 "{}",
                 banner::dim("^C — interrupted; this turn was discarded")

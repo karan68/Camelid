@@ -253,7 +253,7 @@ impl Client {
         request: &Value,
         cancel: &AtomicBool,
         mut on_delta: impl FnMut(&str),
-    ) -> anyhow::Result<(StreamEnd, u32)> {
+    ) -> anyhow::Result<(StreamEnd, u32, Option<u32>)> {
         // A short read timeout lets the loop wake to check `cancel` even while
         // the server is mid-generation and no bytes are arriving.
         let mut stream = self.connect(Duration::from_millis(250))?;
@@ -269,7 +269,7 @@ impl Client {
 
         let mut reader = SseReader::new(stream);
         if reader.read_headers(cancel)? {
-            return Ok((StreamEnd::Cancelled, 0));
+            return Ok((StreamEnd::Cancelled, 0, None));
         }
         if reader.status != 200 {
             let message = reader.drain_error_body();
@@ -277,6 +277,9 @@ impl Client {
         }
 
         let mut deltas: u32 = 0;
+        // From the terminal usage chunk, when the request opted in via
+        // stream_options.include_usage (agent lane); absent otherwise.
+        let mut prompt_tokens: Option<u32> = None;
         let end = reader.stream(cancel, |line| {
             if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
@@ -293,11 +296,17 @@ impl Client {
                             on_delta(content);
                         }
                     }
+                    if let Some(pt) = chunk
+                        .pointer("/usage/prompt_tokens")
+                        .and_then(Value::as_u64)
+                    {
+                        prompt_tokens = Some(pt as u32);
+                    }
                 }
             }
             SseControl::Continue
         })?;
-        Ok((end, deltas))
+        Ok((end, deltas, prompt_tokens))
     }
 
     /// POST a chat request and return the full assistant turn: text content PLUS

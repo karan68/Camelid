@@ -242,7 +242,7 @@ pub fn run_loop(
                 // Compact down to half the budget, so one pass buys many steps
                 // rather than re-firing every turn.
                 let target = budget / 2;
-                if let Some((compacted, report)) = compact(history, target) {
+                if let Some((compacted, report)) = compact(history, target, calibration) {
                     *history = compacted;
                     reporter.notice(&format!(
                         "compacted context: {} messages → {} ({} folded into a summary)",
@@ -508,7 +508,11 @@ pub struct Compaction {
 /// the same untrusted output, just less of it.
 ///
 /// Returns `None` when there is nothing to elide and nothing to clip.
-pub fn compact(history: &[AgentMsg], target_tokens: u32) -> Option<(Vec<AgentMsg>, Compaction)> {
+pub fn compact(
+    history: &[AgentMsg],
+    target_tokens: u32,
+    calibration: Option<f32>,
+) -> Option<(Vec<AgentMsg>, Compaction)> {
     let keep_from = history.len().saturating_sub(KEEP_RECENT);
 
     let mut head: Vec<AgentMsg> = Vec::new();
@@ -534,7 +538,7 @@ pub fn compact(history: &[AgentMsg], target_tokens: u32) -> Option<(Vec<AgentMsg
     // clipping rather than giving up.
     if middle.len() < 2 {
         let mut out: Vec<AgentMsg> = history.to_vec();
-        let clipped = clip_retained(&mut out, target_tokens);
+        let clipped = clip_retained(&mut out, target_tokens, calibration);
         return clipped.then(|| {
             let report = Compaction {
                 before: history.len(),
@@ -562,7 +566,7 @@ pub fn compact(history: &[AgentMsg], target_tokens: u32) -> Option<(Vec<AgentMsg
     out.push(AgentMsg::Summary(summary));
     out.extend(head[pinned_prefix..].iter().cloned());
 
-    clip_retained(&mut out, target_tokens);
+    clip_retained(&mut out, target_tokens, calibration);
 
     let report = Compaction {
         before: history.len(),
@@ -585,14 +589,14 @@ fn retained_result_chars(target_tokens: u32) -> usize {
 
 /// Clip oversized tool results in place until the transcript fits, largest
 /// first. Returns whether anything changed.
-fn clip_retained(msgs: &mut [AgentMsg], target_tokens: u32) -> bool {
+fn clip_retained(msgs: &mut [AgentMsg], target_tokens: u32, calibration: Option<f32>) -> bool {
     let mut changed = false;
     // A clipped result still exceeds the cap (it is the cap plus a marker), so
     // eligibility must be tracked explicitly — re-clipping it would never
     // shrink it and the loop would not terminate.
     let mut done: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let cap = retained_result_chars(target_tokens);
-    while estimate_tokens(msgs, None) > target_tokens {
+    while estimate_tokens(msgs, calibration) > target_tokens {
         // Find the biggest not-yet-clipped result still over the cap.
         let victim = msgs
             .iter()
@@ -995,14 +999,21 @@ impl LiveDriver {
         fold_system: bool,
         stream: bool,
     ) -> Value {
-        json!({
+        let mut req = json!({
             "model": self.model_id,
             "messages": history_to_messages(history, fold_system),
             "tools": tool_defs,
             "stream": stream,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-        })
+        });
+        if stream {
+            // The terminal usage chunk (validated server surface, oracle-matched)
+            // is the streaming lane's only source of real prompt-token counts —
+            // without it every TUI session compacts on the character fallback.
+            req["stream_options"] = json!({"include_usage": true});
+        }
+        req
     }
 
     /// Streaming step (TUI lane): stream the model's raw output, forwarding each
@@ -1027,7 +1038,8 @@ impl LiveDriver {
                 }
             });
         self.on_delta = sink; // restore for the next step
-        let (end, content) = outcome?;
+        let (end, content, prompt_tokens) = outcome?;
+        self.last_prompt_tokens = prompt_tokens;
         if end == StreamEnd::Cancelled {
             // run_loop re-checks the cancel flag right after step and aborts; the
             // partial text is discarded there.
@@ -1049,10 +1061,10 @@ impl LiveDriver {
         tool_defs: &[Value],
         fold_system: bool,
         sink: &mut Option<DeltaSink>,
-    ) -> Result<(StreamEnd, String), String> {
+    ) -> Result<(StreamEnd, String, Option<u32>), String> {
         let req = self.request(history, tool_defs, fold_system, true);
         let mut content = String::new();
-        let (end, _deltas) = self
+        let (end, _deltas, prompt_tokens) = self
             .client
             .chat_stream(&req, &CANCEL, |d| {
                 content.push_str(d);
@@ -1061,7 +1073,7 @@ impl LiveDriver {
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok((end, content))
+        Ok((end, content, prompt_tokens))
     }
 }
 
@@ -2605,7 +2617,7 @@ mod tests {
     #[test]
     fn compaction_keeps_the_safety_spine_and_the_goal() {
         let h = long_history();
-        let (out, report) = compact(&h, 100_000).expect("should compact");
+        let (out, report) = compact(&h, 100_000, None).expect("should compact");
 
         assert!(report.after < report.before);
         assert!(report.elided > 0);
@@ -2645,7 +2657,7 @@ mod tests {
                 ),
             },
         );
-        let (out, _) = compact(&h, 100_000).expect("should compact");
+        let (out, _) = compact(&h, 100_000, None).expect("should compact");
         let summary = out
             .iter()
             .find_map(|m| match m {
@@ -2662,7 +2674,7 @@ mod tests {
     fn compaction_shrinks_the_rendered_prompt() {
         let h = long_history();
         let before = estimate_tokens(&h, None);
-        let (out, _) = compact(&h, 100_000).unwrap();
+        let (out, _) = compact(&h, 100_000, None).unwrap();
         let after = estimate_tokens(&out, None);
         assert!(after < before / 2, "before {before} after {after}");
     }
@@ -2673,7 +2685,7 @@ mod tests {
             AgentMsg::System("rules".into()),
             AgentMsg::User("goal".into()),
         ];
-        assert!(compact(&h, 100_000).is_none());
+        assert!(compact(&h, 100_000, None).is_none());
     }
 
     #[test]
@@ -2773,7 +2785,7 @@ mod tests {
                 outcome: ToolOutcome::Ok("A".repeat(60_000)),
             },
         ];
-        let (out, _) = compact(&h, 500).expect("should clip even with nothing to elide");
+        let (out, _) = compact(&h, 500, None).expect("should clip even with nothing to elide");
 
         let rendered = history_to_messages(&out, false);
         let tool = rendered.iter().find(|m| m["role"] == "tool").unwrap();
@@ -2834,7 +2846,7 @@ mod tests {
         for _ in 0..6 {
             h.push(big_result("read_file", 200));
         }
-        let (out, _) = compact(&h, 100_000).expect("should compact");
+        let (out, _) = compact(&h, 100_000, None).expect("should compact");
         assert!(out
             .iter()
             .any(|m| matches!(m, AgentMsg::User(u) if u == "the original goal")));
@@ -2849,7 +2861,7 @@ mod tests {
     #[test]
     fn a_second_compaction_keeps_the_first_summary() {
         let h = long_history();
-        let (once, _) = compact(&h, 100_000).expect("first pass");
+        let (once, _) = compact(&h, 100_000, None).expect("first pass");
         let marker = once
             .iter()
             .find_map(|m| match m {
@@ -2867,7 +2879,7 @@ mod tests {
             }]));
             grown.push(big_result("read_file", 200));
         }
-        let (twice, _) = compact(&grown, 100_000).expect("second pass");
+        let (twice, _) = compact(&grown, 100_000, None).expect("second pass");
         assert!(
             twice
                 .iter()

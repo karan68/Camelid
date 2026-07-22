@@ -200,8 +200,8 @@ impl<'a> App<'a> {
                 let _ = forward.send(StreamMsg::Delta(delta.to_string()));
             });
             let _ = match result {
-                Ok((StreamEnd::Done, n)) => tx.send(StreamMsg::Done(n)),
-                Ok((StreamEnd::Cancelled, _)) => tx.send(StreamMsg::Cancelled),
+                Ok((StreamEnd::Done, n, _)) => tx.send(StreamMsg::Done(n)),
+                Ok((StreamEnd::Cancelled, _, _)) => tx.send(StreamMsg::Cancelled),
                 Err(err) => tx.send(StreamMsg::Error(err.to_string())),
             };
         });

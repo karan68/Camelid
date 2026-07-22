@@ -199,7 +199,7 @@ mod tests {
         set(vec![step(Status::InProgress, "still going")]);
         // Compaction operates on Vec<AgentMsg>; the plan is elsewhere entirely.
         let history = vec![crate::chat::agent::AgentMsg::User("goal".into())];
-        let _ = crate::chat::agent::compact(&history, 10);
+        let _ = crate::chat::agent::compact(&history, 10, None);
         assert_eq!(get().len(), 1);
         assert_eq!(get()[0].text, "still going");
         clear();
