@@ -61,7 +61,7 @@ pub enum ModelStep {
 }
 
 /// One message in the agent's transcript (model-agnostic).
-#[derive(Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AgentMsg {
     System(String),
     User(String),
@@ -1073,6 +1073,24 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         tui_only: false,
     },
     SlashCommand {
+        name: "save",
+        alias: None,
+        help: "save this agent session (/save <id>)",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "resume",
+        alias: None,
+        help: "restore a saved agent session (/resume <id>)",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "sessions",
+        alias: None,
+        help: "list saved agent sessions",
+        tui_only: false,
+    },
+    SlashCommand {
         name: "diff",
         alias: None,
         help: "show what the agent changed on disk",
@@ -1581,6 +1599,15 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
     let mut rl = rustyline::DefaultEditor::new()?;
     // The most recent final answer, for `/copy`.
     let mut last_answer = String::new();
+    // The ledger identity of the active model, recorded into saved sessions and
+    // re-checked on resume.
+    let session_model = session
+        .active_id
+        .clone()
+        .unwrap_or_else(|| session.active_label.clone());
+    // The transcript carried across goals for /save and /resume. A resumed
+    // transcript seeds the next goal's history; it is never re-executed.
+    let mut saved_transcript: Vec<AgentMsg> = Vec::new();
     let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     let mut reporter = InlineReporter;
     let mut approver = InlineApprover;
@@ -1625,6 +1652,74 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             "{}",
                             banner::dim(&format!("step budget: {} per goal", cfg.max_steps))
                         ),
+                        "save" => {
+                            let id = cmd.split_whitespace().nth(1).unwrap_or("").to_string();
+                            let saved = super::agent_session::SavedAgentSession {
+                                id: id.clone(),
+                                model_id: session_model.clone(),
+                                tool_capable: true,
+                                workspace: sandbox.root().display().to_string(),
+                                transcript: saved_transcript.clone(),
+                                plan: super::plan::get(),
+                                grants: policy.granted(),
+                            };
+                            match super::agent_session::save(&sandbox, &saved) {
+                                Ok(p) => println!(
+                                    "{}",
+                                    banner::dim(&format!("saved {} → {}", id, sandbox.rel(&p)))
+                                ),
+                                Err(e) => println!("{}", banner::dim(&e)),
+                            }
+                        }
+                        "resume" => {
+                            let id = cmd.split_whitespace().nth(1).unwrap_or("");
+                            match super::agent_session::load(&sandbox, id) {
+                                Err(e) => println!("{}", banner::dim(&e)),
+                                Ok(s) => {
+                                    // The identity gate crossing a process
+                                    // boundary: a transcript is evidence about
+                                    // the model that produced it.
+                                    match super::agent_session::check_identity(
+                                        &s,
+                                        &session_model,
+                                        true,
+                                    ) {
+                                        Err(refusal) => {
+                                            println!("{}", banner::dim(&refusal.to_string()))
+                                        }
+                                        Ok(()) => {
+                                            // Replayed as context. Never re-executed.
+                                            saved_transcript = s.transcript.clone();
+                                            super::plan::set(s.plan.clone());
+                                            for g in &s.grants {
+                                                policy.grant(g);
+                                            }
+                                            println!(
+                                                "{}",
+                                                banner::dim(&format!(
+                                                    "resumed {} — {} message(s) replayed as \
+                                                     context (nothing re-run), {} grant(s)",
+                                                    s.id,
+                                                    s.transcript.len(),
+                                                    s.grants.len()
+                                                ))
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "sessions" => {
+                            let ids = super::agent_session::list(&sandbox);
+                            println!(
+                                "{}",
+                                banner::dim(&if ids.is_empty() {
+                                    "no saved sessions".to_string()
+                                } else {
+                                    ids.join("  ")
+                                })
+                            );
+                        }
                         "diff" => println!("{}", banner::dim(&super::checkpoint::diff(&sandbox))),
                         "undo" => match super::checkpoint::undo(&sandbox) {
                             Ok(m) => println!("{}", banner::dim(&m)),
@@ -1691,14 +1786,21 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                 let project = load_project_context(&sandbox);
                 // Each goal gets a fresh plan; a stale one is worse than none.
                 super::plan::clear();
-                let mut history = vec![
-                    AgentMsg::System(system_prompt_with_project(
-                        &sandbox,
-                        &tools,
-                        project.as_ref(),
-                    )),
-                    AgentMsg::User(goal.to_string()),
-                ];
+                let mut history = if saved_transcript.is_empty() {
+                    vec![
+                        AgentMsg::System(system_prompt_with_project(
+                            &sandbox,
+                            &tools,
+                            project.as_ref(),
+                        )),
+                        AgentMsg::User(goal.to_string()),
+                    ]
+                } else {
+                    // Resumed: keep the restored context and append the new goal.
+                    let mut h = saved_transcript.clone();
+                    h.push(AgentMsg::User(goal.to_string()));
+                    h
+                };
                 let end = run_loop(
                     &mut driver,
                     &mut approver,
@@ -1709,10 +1811,11 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                     &mut policy,
                     &mut history,
                 );
-                // Keep the final answer for /copy.
+                // Keep the final answer for /copy, and the transcript for /save.
                 if let Some(AgentMsg::Assistant(a)) = history.last() {
                     last_answer = a.clone();
                 }
+                saved_transcript = history.clone();
                 reporter.notice(match end {
                     LoopEnd::Answered => "done",
                     LoopEnd::Aborted => "stopped",
@@ -2393,7 +2496,17 @@ mod tests {
         let tui_only: Vec<_> = tui.iter().filter(|n| !line.contains(n)).copied().collect();
         assert_eq!(tui_only, vec!["theme", "sidebar"]);
         // The G8 additions are available in both front ends.
-        for n in ["init", "copy", "plan", "diff", "undo", "checkpoints"] {
+        for n in [
+            "init",
+            "copy",
+            "plan",
+            "diff",
+            "undo",
+            "checkpoints",
+            "save",
+            "resume",
+            "sessions",
+        ] {
             assert!(line.contains(&n), "/{n} should be in the line renderer");
             assert!(tui.contains(&n), "/{n} should be in the TUI");
         }

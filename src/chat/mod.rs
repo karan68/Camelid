@@ -18,6 +18,7 @@ mod agent;
 mod agent_bench;
 mod agent_eval;
 mod agent_orchestration;
+mod agent_session;
 mod agent_syscap;
 mod agent_tui;
 mod audit;

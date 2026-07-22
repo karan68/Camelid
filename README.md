@@ -126,6 +126,11 @@ Every file the agent writes or edits is snapshotted first, so `/diff` shows what
 `/undo` reverts the last change, and `/checkpoints` lists them. Snapshots are file copies under
 `.camelid/checkpoints/` in the workspace — the agent never touches your git state.
 
+`/save <id>` and `/resume <id>` carry an agent session across restarts, storing the transcript,
+plan, and approval grants under `.camelid/sessions/`. A resumed transcript is replayed as context
+and never re-executed, and resume is refused if the active model is not the one that recorded it,
+or is no longer marked `tool_capable`.
+
 In-session: `/init` scaffolds a `CAMELID.md`, `/plan` shows the agent's current checklist, `/copy`
 puts the last answer on the clipboard, and `/help` lists the rest.
 

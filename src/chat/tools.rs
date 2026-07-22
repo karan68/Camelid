@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::shell_sandbox::{self, ShellSandbox};
@@ -178,14 +178,14 @@ pub struct ToolSpec {
 }
 
 /// A tool call the model emitted (already parsed to name + JSON args).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
     pub args: Value,
 }
 
 /// The result of running a tool — text the model consumes as data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutcome {
     Ok(String),
     Err(String),
