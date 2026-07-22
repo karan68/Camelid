@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { existsSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { join, resolve } from 'node:path'
 import puppeteer from 'puppeteer-core'
 
 const executablePath = [
@@ -15,6 +18,10 @@ const executablePath = [
 if (!executablePath) throw new Error('Chrome or Edge is required for Workspace visual smoke')
 
 const baseUrl = process.env.CAMELID_CAPTURE_URL || 'http://127.0.0.1:4175'
+const outputDir = process.env.CAMELID_CAPTURE_DIR
+  ? resolve(process.env.CAMELID_CAPTURE_DIR)
+  : fileURLToPath(new URL('../../target/', import.meta.url))
+await mkdir(outputDir, { recursive: true })
 const browser = await puppeteer.launch({ executablePath, headless: 'new' })
 const markdownFiles = [
   'CONFIGURATION.md',
@@ -270,11 +277,11 @@ try {
     if (result.documentWidth[0] !== result.documentWidth[1] || result.answerWidth[0] !== result.answerWidth[1]) throw new Error(`${viewport.name}: horizontal overflow ${JSON.stringify(result)}`)
     if (sessionBodies.length !== 1 || sessionBodies[0].allow_writes !== false) throw new Error(`${viewport.name}: session was not explicitly read-only ${JSON.stringify(sessionBodies)}`)
 
-    await page.screenshot({ path: `../target/workspace-readonly-format-${viewport.name}.png`, fullPage: true })
+    await page.screenshot({ path: join(outputDir, `workspace-readonly-format-${viewport.name}.png`), fullPage: true })
     if (viewport.name === 'desktop') {
       await page.click('.workspace-context-inspector > summary')
       await page.waitForSelector('.workspace-context-inspector[open] .workspace-context-inspector__panel')
-      await page.screenshot({ path: '../target/workspace-readonly-context-desktop.png', fullPage: true })
+      await page.screenshot({ path: join(outputDir, 'workspace-readonly-context-desktop.png'), fullPage: true })
     }
     console.log(`${viewport.name}: PASS ${JSON.stringify(result)}`)
     await page.close()
