@@ -501,7 +501,13 @@ impl<'a> App<'a> {
             }
             "sidebar" => self.sidebar = !self.sidebar,
             "help" => self.help = true,
-            other => self.status = format!("unknown command /{other} — F1 for help"),
+            other => {
+                debug_assert!(
+                    !super::agent::slash_names(true).contains(&other),
+                    "SLASH_COMMANDS advertises /{other} but the TUI has no arm for it"
+                );
+                self.status = format!("unknown command /{other} — F1 for help");
+            }
         }
     }
 
@@ -1002,7 +1008,7 @@ impl<'a> App<'a> {
         let th = self.theme;
         let rect = centered(area, 64, 72);
         f.render_widget(Clear, rect);
-        let lines = vec![
+        let mut lines = vec![
             help_row("Enter", "run the goal · Alt+Enter newline", th),
             help_row("Ctrl-C", "stop the running goal / clear input", th),
             help_row("Ctrl-D", "quit", th),
@@ -1010,15 +1016,17 @@ impl<'a> App<'a> {
             help_row("Tab", "toggle the sidebar", th),
             help_row("Up/Down", "input history", th),
             Line::from(""),
-            help_row("/tools", "list tools + approval tiers", th),
-            help_row("/steps", "show the per-goal step budget", th),
-            help_row("/subagents", "list this session's subagents", th),
-            help_row("/stop", "cancel the running goal", th),
-            help_row("/theme", "cycle the color theme", th),
-            help_row("/exit", "quit", th),
-            Line::from(""),
-            help_row("approval", "y yes · n no · a always · q abort", th),
         ];
+        // Derived from the shared table so a new command cannot ship undocumented.
+        for c in super::agent::SLASH_COMMANDS {
+            lines.push(help_row(&format!("/{}", c.name), c.help, th));
+        }
+        lines.push(Line::from(""));
+        lines.push(help_row(
+            "approval",
+            "y yes · n no · a always · q abort",
+            th,
+        ));
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(th.primary()))

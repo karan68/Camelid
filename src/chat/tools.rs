@@ -1865,6 +1865,104 @@ mod tests {
         assert!(validate(&call("http_fetch", json!({"url":"http://x"})), &sb).is_err());
     }
 
+    /// The advertised tool set is what the model is told it may do, and every
+    /// existing test here asks only "does it contain X". Pin the whole set, so
+    /// adding or removing a tool is a deliberate edit to this list rather than
+    /// an invisible widening of the agent's surface.
+    #[test]
+    fn advertised_tool_set_is_pinned() {
+        use super::ShellSandbox;
+
+        let names = |net, shell| {
+            let mut v: Vec<&str> = specs(net, shell).iter().map(|t| t.name).collect();
+            v.sort_unstable();
+            v
+        };
+
+        // Baseline: no net, no shell, and `subagent::is_enabled()` false — which
+        // it is under test, because no subagent config has been installed. The
+        // orchestration tools (spawn_subagent / check_subagent_status) therefore
+        // do not appear here; `subagent_tools_gated_on_configuration` covers them.
+        let mut expected = vec!["edit_file", "list_dir", "read_file", "search", "write_file"];
+        if cfg!(windows) {
+            expected.extend([
+                "inspect_system",
+                "mouse_click",
+                "mouse_move",
+                "press_keys",
+                "run_windows_command",
+                "screenshot",
+                "type_text",
+                "ui_click",
+                "ui_inspect",
+            ]);
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            names(false, ShellSandbox::Disabled),
+            expected,
+            "the advertised tool set changed — update this pin deliberately"
+        );
+
+        // The two documented widenings, and nothing else rides along with them.
+        let with_shell = names(false, ShellSandbox::Sandboxed);
+        let added: Vec<_> = with_shell
+            .iter()
+            .filter(|n| !expected.contains(n))
+            .copied()
+            .collect();
+        assert_eq!(added, vec!["run_shell"]);
+
+        let with_net = names(true, ShellSandbox::Disabled);
+        let added: Vec<_> = with_net
+            .iter()
+            .filter(|n| !expected.contains(n))
+            .copied()
+            .collect();
+        assert_eq!(added, vec!["http_fetch"]);
+    }
+
+    /// The orchestration tools are advertised only once a subagent config is
+    /// installed. Unconfigured — the state every test and every plain `chat
+    /// --agent` session starts in — the model is never offered them.
+    #[test]
+    fn subagent_tools_gated_on_configuration() {
+        use super::ShellSandbox;
+        assert!(!super::subagent::is_enabled());
+        for shell in [
+            ShellSandbox::Disabled,
+            ShellSandbox::Sandboxed,
+            ShellSandbox::Unrestricted,
+        ] {
+            let names: Vec<&str> = specs(false, shell).iter().map(|t| t.name).collect();
+            assert!(!names.contains(&"spawn_subagent"));
+            assert!(!names.contains(&"check_subagent_status"));
+        }
+    }
+
+    /// Every advertised tool must be reachable through `validate`. A spec with no
+    /// validation arm is a tool the model is offered and can never successfully
+    /// call; a validation arm with no spec is a tool it was never told about.
+    #[test]
+    fn every_advertised_tool_has_a_validation_arm() {
+        use super::ShellSandbox;
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        for t in specs(false, ShellSandbox::Sandboxed) {
+            // Empty args: the arm may reject them, but "unknown tool" means the
+            // name never reached a match arm at all.
+            let err = match validate(&call(t.name, json!({})), &sb) {
+                Ok(_) => continue,
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                !err.contains("unknown tool"),
+                "{} is advertised but has no validation arm",
+                t.name
+            );
+        }
+    }
+
     #[test]
     fn disabled_shell_mode_unregisters_run_shell() {
         use super::ShellSandbox;

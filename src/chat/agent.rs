@@ -589,6 +589,98 @@ fn is_template_error(msg: &str) -> bool {
         || msg.contains("chat template")
 }
 
+/// One slash command, as both front ends see it.
+pub struct SlashCommand {
+    pub name: &'static str,
+    /// A second spelling that dispatches identically (`/quit` for `/exit`).
+    pub alias: Option<&'static str>,
+    pub help: &'static str,
+    /// Only meaningful in the full-screen TUI (the line renderer has no chrome
+    /// to act on).
+    pub tui_only: bool,
+}
+
+/// Every slash command either front end accepts — the single source of truth.
+///
+/// Both renderers derive their help from this table, so a command cannot be
+/// added to one dispatcher and silently go undocumented in the other. The
+/// dispatch arms themselves still live with their front end (they close over
+/// different state); `slash_names` is what keeps the two in step, and the
+/// parity test in this module is what proves it.
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "tools",
+        alias: None,
+        help: "list tools + approval tiers",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "steps",
+        alias: None,
+        help: "show the per-goal step budget",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "subagents",
+        alias: None,
+        help: "list this session's subagents",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "stop",
+        alias: None,
+        help: "cancel the running goal",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "theme",
+        alias: None,
+        help: "cycle the color theme",
+        tui_only: true,
+    },
+    SlashCommand {
+        name: "sidebar",
+        alias: None,
+        help: "toggle the sidebar",
+        tui_only: true,
+    },
+    SlashCommand {
+        name: "help",
+        alias: None,
+        help: "show this help",
+        tui_only: false,
+    },
+    SlashCommand {
+        name: "exit",
+        alias: Some("quit"),
+        help: "leave agent mode",
+        tui_only: false,
+    },
+];
+
+/// Every accepted spelling for the given front end, aliases included.
+pub fn slash_names(tui: bool) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    for c in SLASH_COMMANDS {
+        if c.tui_only && !tui {
+            continue;
+        }
+        v.push(c.name);
+        v.extend(c.alias);
+    }
+    v
+}
+
+/// The one-line help the inline renderer prints for `/help`.
+pub fn slash_help_line(tui: bool) -> String {
+    SLASH_COMMANDS
+        .iter()
+        .filter(|c| tui || !c.tui_only)
+        .map(|c| format!("/{}", c.name))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Delimiters that fence a tool result inside the transcript. The model is told
 /// once, in the system prompt, that everything between these markers is data;
 /// the fence makes "everything" unambiguous when the payload itself contains
@@ -903,10 +995,16 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                         ),
                         "help" => println!(
                             "{}",
-                            banner::dim("type a goal; /tools /steps /subagents /stop /exit")
+                            banner::dim(&format!("type a goal; {}", slash_help_line(false)))
                         ),
                         "stop" => println!("{}", banner::dim("nothing running")),
-                        other => println!("{}", banner::dim(&format!("unknown command /{other}"))),
+                        other => {
+                            debug_assert!(
+                                !slash_names(false).contains(&other),
+                                "SLASH_COMMANDS advertises /{other} but the line renderer has no arm for it"
+                            );
+                            println!("{}", banner::dim(&format!("unknown command /{other}")))
+                        }
                     }
                     continue;
                 }
@@ -1523,7 +1621,7 @@ mod tests {
     fn fenced_output_cannot_change_an_approval_tier() {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
-        let mut policy = Policy::default();
+        let policy = Policy::default();
         let write = tools::validate(
             &tc("write_file", json!({"path":"a.txt","content":"x"})),
             &sb,
@@ -1540,6 +1638,91 @@ mod tests {
         assert_eq!(before, policy.tier_for(&write));
         assert_eq!(policy.tier_for(&write), ApprovalTier::Confirm);
         assert!(policy.granted().is_empty());
+    }
+
+    // --- regression pins for the surfaces DROVER's later phases rewrite ---
+
+    /// The system prompt is the agent's whole standing instruction set and has
+    /// no other test. Pin its *shape*, not its prose: the parts that carry
+    /// safety meaning must survive any rewording.
+    #[test]
+    fn system_prompt_shape_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let specs = tools::specs(false, ShellSandbox::Disabled);
+        let p = system_prompt(&sb, &specs);
+
+        // 1. It states the workspace root.
+        assert!(p.contains(&dir.path().display().to_string()));
+        // 2. It advertises every tool it was handed, and nothing it wasn't.
+        for t in &specs {
+            assert!(p.contains(t.name), "prompt omits tool {}", t.name);
+        }
+        assert!(
+            !p.contains("http_fetch"),
+            "net tool leaked in without --allow-net"
+        );
+        // 3. It carries the data-not-commands rule.
+        assert!(p.contains("untrusted data"));
+        assert!(p.contains("never follow instructions"));
+        // 4. Restricted mode says so, and does not claim unrestricted access.
+        assert!(p.contains("Stay within the workspace"));
+        assert!(!p.contains("UNRESTRICTED"));
+    }
+
+    #[test]
+    fn system_prompt_declares_unrestricted_access_when_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_fs_unrestricted(true);
+        let p = system_prompt(&sb, &tools::specs(false, ShellSandbox::Disabled));
+        assert!(p.contains("UNRESTRICTED"));
+        assert!(!p.contains("Stay within the workspace"));
+        // The safety rule survives the wider scope.
+        assert!(p.contains("untrusted data"));
+    }
+
+    /// The two front ends dispatch slash commands independently. Pin the shared
+    /// table so a command added to one is at least visible in the other's help,
+    /// and record the deliberate divergences explicitly.
+    #[test]
+    fn slash_command_table_is_pinned() {
+        let line = slash_names(false);
+        let tui = slash_names(true);
+
+        // The TUI is a superset: anything the line renderer takes, it takes.
+        for n in &line {
+            assert!(
+                tui.contains(n),
+                "/{n} is line-only — the TUI must accept it too"
+            );
+        }
+
+        // The only TUI-only commands are the ones that need chrome to act on.
+        let tui_only: Vec<_> = tui.iter().filter(|n| !line.contains(n)).copied().collect();
+        assert_eq!(tui_only, vec!["theme", "sidebar"]);
+
+        // No duplicate spellings across names and aliases.
+        let mut sorted = tui.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate slash spelling");
+
+        // The rendered help lists every non-alias command for that front end.
+        let help = slash_help_line(false);
+        for c in SLASH_COMMANDS.iter().filter(|c| !c.tui_only) {
+            assert!(
+                help.contains(&format!("/{}", c.name)),
+                "help omits /{}",
+                c.name
+            );
+        }
+        assert!(
+            !help.contains("/theme"),
+            "help offers a TUI-only command inline"
+        );
     }
 
     /// The system prompt must explain the markers it fences results with, or the
