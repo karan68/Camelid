@@ -493,10 +493,13 @@ impl<'a> App<'a> {
                 let text = match self.engine.as_ref() {
                     Some(e) => match cmd.split_whitespace().next().unwrap_or("") {
                         "diff" => super::checkpoint::diff(&e.sandbox),
-                        "undo" => match super::checkpoint::undo(&e.sandbox) {
-                            Ok(m) => m,
-                            Err(err) => err,
-                        },
+                        "undo" => {
+                            let force = cmd.split_whitespace().nth(1) == Some("force");
+                            match super::checkpoint::undo(&e.sandbox, force) {
+                                Ok(m) => m,
+                                Err(err) => err,
+                            }
+                        }
                         _ => super::checkpoint::summary(),
                     },
                     None => "busy — try again when idle".into(),

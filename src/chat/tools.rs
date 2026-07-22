@@ -889,14 +889,20 @@ impl Action {
             Action::Search { pattern, path } => search(pattern, path),
             // Snapshot before every mutation, at the execution site rather than
             // on the model's say-so, so undo is available whether or not the
-            // model thought to ask for it.
+            // model thought to ask for it. The snapshot only becomes a
+            // checkpoint if the mutation succeeds — a failed call must not
+            // hand /undo a phantom entry.
             Action::WriteFile { path, content, .. } => {
-                super::checkpoint::take(sandbox, path, "write_file");
-                write_file(path, content)
+                let pending = super::checkpoint::prepare(sandbox, path, "write_file");
+                let out = write_file(path, content);
+                super::checkpoint::finish(pending, !out.is_err());
+                out
             }
             Action::EditFile { path, old, new } => {
-                super::checkpoint::take(sandbox, path, "edit_file");
-                edit_file(path, old, new)
+                let pending = super::checkpoint::prepare(sandbox, path, "edit_file");
+                let out = edit_file(path, old, new);
+                super::checkpoint::finish(pending, !out.is_err());
+                out
             }
             Action::RunShell { command } => run_shell(sandbox, command),
             Action::HttpFetch { method, url } => http_fetch(sandbox, method, url),
@@ -950,6 +956,22 @@ struct PathArg {
     path: String,
 }
 
+/// The agent's own per-workspace state (checkpoints, saved sessions, subagent
+/// task/result files). Model-driven writes here are refused at validation: a
+/// checkpoint the model can rewrite is no checkpoint, and a session file it can
+/// author is a transcript it gets to forge before a /resume replays it.
+fn refuse_agent_state_write(sandbox: &Sandbox, resolved: &Path) -> Result<(), String> {
+    let store = sandbox.root().join(".camelid");
+    if resolved.starts_with(&store) {
+        return Err(
+            ".camelid/ holds the agent's own state (checkpoints, sessions); it is not \
+             writable through the file tools"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate a parsed tool call against the schema + sandbox. Returns a typed
 /// error string (→ tool-error result the model can recover from) rather than
 /// panicking, for unknown tools, bad args, or sandbox escapes.
@@ -986,6 +1008,7 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
             let path_raw = str_arg("path")?;
             let content = str_arg("content")?;
             let path = sandbox.resolve(&path_raw, false)?;
+            refuse_agent_state_write(sandbox, &path)?;
             let summary = write_summary(&path, &content);
             Ok(Action::WriteFile {
                 path,
@@ -995,6 +1018,7 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
         }
         "edit_file" => {
             let path = sandbox.resolve(&str_arg("path")?, true)?;
+            refuse_agent_state_write(sandbox, &path)?;
             Ok(Action::EditFile {
                 path,
                 old: str_arg("old")?,

@@ -1725,19 +1725,32 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                                             // Replayed as context. Never re-executed.
                                             saved_transcript = s.transcript.clone();
                                             super::plan::set(s.plan.clone());
-                                            for g in &s.grants {
-                                                policy.grant(g);
-                                            }
+                                            // Grants are NOT restored. An "always
+                                            // allow" is a live operator's keypress;
+                                            // a file the agent can influence must
+                                            // not be able to carry that authority
+                                            // into a new session. The saved list is
+                                            // shown so re-granting is one 'a' away.
                                             println!(
                                                 "{}",
                                                 banner::dim(&format!(
                                                     "resumed {} — {} message(s) replayed as \
-                                                     context (nothing re-run), {} grant(s)",
+                                                     context (nothing re-run)",
                                                     s.id,
                                                     s.transcript.len(),
-                                                    s.grants.len()
                                                 ))
                                             );
+                                            if !s.grants.is_empty() {
+                                                println!(
+                                                    "{}",
+                                                    banner::dim(&format!(
+                                                        "grants are not carried across sessions; \
+                                                         previously allowed: {} — press 'a' at \
+                                                         the next prompt to re-grant",
+                                                        s.grants.join(", ")
+                                                    ))
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1755,10 +1768,13 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             );
                         }
                         "diff" => println!("{}", banner::dim(&super::checkpoint::diff(&sandbox))),
-                        "undo" => match super::checkpoint::undo(&sandbox) {
-                            Ok(m) => println!("{}", banner::dim(&m)),
-                            Err(e) => println!("{}", banner::dim(&e)),
-                        },
+                        "undo" => {
+                            let force = cmd.split_whitespace().nth(1) == Some("force");
+                            match super::checkpoint::undo(&sandbox, force) {
+                                Ok(m) => println!("{}", banner::dim(&m)),
+                                Err(e) => println!("{}", banner::dim(&e)),
+                            }
+                        }
                         "checkpoints" => {
                             println!("{}", banner::dim(&super::checkpoint::summary()))
                         }

@@ -27,6 +27,33 @@ pub struct Checkpoint {
     /// exist yet (undo therefore means "delete it again").
     pub backup: Option<PathBuf>,
     pub tool: String,
+    /// Hash of the file as the agent left it, recorded when the mutation
+    /// committed. If the file no longer matches at undo time, someone else --
+    /// usually the user, by hand -- changed it since, and a blind restore
+    /// would destroy their work.
+    pub post_hash: Option<u64>,
+}
+
+/// A snapshot taken before a mutation that has not happened yet. It becomes a
+/// [`Checkpoint`] only if the mutation succeeds; a failed tool call must not
+/// leave a phantom entry for /undo to "revert".
+pub struct Pending {
+    rel: String,
+    backup: Option<PathBuf>,
+    tool: String,
+    target: PathBuf,
+}
+
+/// A cheap, dependency-free content hash (FNV-1a). Collision resistance is not
+/// the point; detecting "this file changed since the agent wrote it" is.
+fn content_hash(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    Some(h)
 }
 
 /// Whether `path` resolves inside the sandbox root. Canonicalises the parent so
@@ -69,66 +96,122 @@ pub fn all() -> Vec<Checkpoint> {
     log().lock().map(|g| g.clone()).unwrap_or_default()
 }
 
-/// Snapshot `path` before it is written.
+/// Snapshot `path` before it is written. Pair with [`finish`].
 ///
 /// Best-effort by design: a failure to snapshot must not block the edit the
-/// user asked for, so problems are reported and swallowed. The one thing it
-/// will not do is write outside the jail.
-pub fn take(sandbox: &Sandbox, path: &Path, tool: &str) {
+/// user asked for, so problems are swallowed. The one thing it will not do is
+/// write outside the jail.
+pub fn prepare(sandbox: &Sandbox, path: &Path, tool: &str) -> Option<Pending> {
     // Only files inside the workspace are snapshotted. With --allow-fs the
     // agent may legitimately write elsewhere, but copying those into an
     // in-workspace store would pull outside content across the boundary the
     // store lives behind — so they get no undo, rather than a leak.
     if !inside_root(sandbox, path) {
-        return;
+        return None;
     }
     let rel = sandbox.rel(path);
     // Create the store first, then resolve it through the jail. `resolve` with
     // must_exist=false canonicalises the *parent*, so it cannot resolve a
     // two-level path whose first level does not exist yet — the store has to
     // exist before it can be checked, not after.
-    if std::fs::create_dir_all(sandbox.root().join(DIR)).is_err() {
-        return;
-    }
-    let dir = match sandbox.resolve(DIR, true) {
-        Ok(d) => d,
-        Err(_) => return, // outside the jail — never happens, never allowed
-    };
+    std::fs::create_dir_all(sandbox.root().join(DIR)).ok()?;
+    let dir = sandbox.resolve(DIR, true).ok()?;
 
     let backup = if path.exists() {
-        // A flat, collision-free name: the relative path with separators
-        // replaced, prefixed by its position in the log so repeated edits to
-        // one file each keep their own snapshot.
-        let n = all().len();
+        // Collision-proof across processes: a subagent shares this store, and
+        // a name derived from the process-local log length would let two
+        // processes silently clobber each other's backups. Pid + a process
+        // atomic counter + the flattened path can collide with nothing.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let flat: String = rel
             .chars()
             .map(|c| if c == '/' || c == '\\' { '_' } else { c })
             .collect();
-        let dest = dir.join(format!("{n:04}_{flat}"));
-        if std::fs::copy(path, &dest).is_err() {
-            return;
-        }
+        let dest = dir.join(format!("{}_{seq:04}_{flat}", std::process::id()));
+        std::fs::copy(path, &dest).ok()?;
         Some(dest)
     } else {
         None
     };
 
+    Some(Pending {
+        rel,
+        backup,
+        tool: tool.to_string(),
+        target: path.to_path_buf(),
+    })
+}
+
+/// Commit or discard a prepared snapshot, depending on whether the mutation
+/// succeeded. A failed write leaves the file untouched, so recording a
+/// checkpoint for it would hand /undo a no-op that LOOKS like a revert while
+/// the real last change stays applied.
+pub fn finish(pending: Option<Pending>, mutated: bool) {
+    let Some(p) = pending else { return };
+    if !mutated {
+        if let Some(b) = &p.backup {
+            let _ = std::fs::remove_file(b);
+        }
+        return;
+    }
+    let post_hash = content_hash(&p.target);
     if let Ok(mut g) = log().lock() {
         g.push(Checkpoint {
-            rel,
-            backup,
-            tool: tool.to_string(),
+            rel: p.rel,
+            backup: p.backup,
+            tool: p.tool,
+            post_hash,
         });
     }
 }
 
 /// Undo the most recent checkpoint. Returns what it did.
-pub fn undo(sandbox: &Sandbox) -> Result<String, String> {
+///
+/// Refuses (without `force`) when the file no longer matches the state the
+/// agent left it in: that means the user edited it since, and a blind restore
+/// would destroy their work to revert the agent's. Before any restore, the
+/// current state is parked in the store (`undone_*`), so even a forced undo
+/// destroys nothing irrecoverably.
+pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
     let cp = {
-        let mut g = log().lock().map_err(|_| "checkpoint log poisoned")?;
-        g.pop().ok_or("nothing to undo")?
+        let g = log().lock().map_err(|_| "checkpoint log poisoned")?;
+        g.last().cloned().ok_or("nothing to undo")?
     };
     let target = sandbox.resolve(&cp.rel, false)?;
+
+    if !force {
+        if let (Some(expected), Some(now)) = (cp.post_hash, content_hash(&target)) {
+            if expected != now {
+                return Err(format!(
+                    "{} was changed after the agent wrote it (by you?). /undo would overwrite \
+                     those changes — use `/undo force` if that is what you want",
+                    cp.rel
+                ));
+            }
+        }
+    }
+
+    // Park what is being overwritten, outside the LIFO log (pushing it onto
+    // the log would turn walk-back into a toggle).
+    if target.exists() {
+        if let Ok(dir) = sandbox.resolve(DIR, true) {
+            let flat: String = cp
+                .rel
+                .chars()
+                .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+                .collect();
+            let _ = std::fs::copy(
+                &target,
+                dir.join(format!("undone_{}_{flat}", std::process::id())),
+            );
+        }
+    }
+
+    // Only pop once the guard has passed.
+    if let Ok(mut g) = log().lock() {
+        g.pop();
+    }
     match &cp.backup {
         Some(b) => {
             std::fs::copy(b, &target).map_err(|e| format!("restore failed: {e}"))?;
@@ -177,33 +260,66 @@ pub fn diff(sandbox: &Sandbox) -> String {
     out
 }
 
-/// A minimal line diff: lines only in `before` are `-`, only in `after` are `+`.
-/// Not Myers — enough to show what changed without pulling in a diff crate.
+/// A positional line diff via LCS. A set-membership diff cannot see a moved or
+/// duplicated line and would print an affirmatively false "(no textual
+/// change)" for a reorder; this one is order-aware. Inputs beyond the DP cap
+/// fall back to an honest coarse marker rather than a wrong diff.
 fn line_diff(before: &str, after: &str) -> String {
+    const MAX_LINES: usize = 400;
+    const MAX_SHOWN: usize = 80;
+
+    if before == after {
+        return "(identical)\n".to_string();
+    }
     let b: Vec<&str> = before.lines().collect();
     let a: Vec<&str> = after.lines().collect();
+    if b.len() > MAX_LINES || a.len() > MAX_LINES {
+        return format!(
+            "(files differ; too large for an inline diff — {} → {} lines)\n",
+            b.len(),
+            a.len()
+        );
+    }
+
+    // LCS table, then walk back emitting -/+ in order.
+    let mut dp = vec![vec![0u16; a.len() + 1]; b.len() + 1];
+    for i in (0..b.len()).rev() {
+        for j in (0..a.len()).rev() {
+            dp[i][j] = if b[i] == a[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
     let mut out = String::new();
     let mut shown = 0;
-    for line in &b {
-        if !a.contains(line) {
-            out.push_str(&format!("- {line}\n"));
-            shown += 1;
-        }
-        if shown >= 40 {
+    let mut truncated = false;
+    while i < b.len() || j < a.len() {
+        if shown >= MAX_SHOWN {
+            truncated = true;
             break;
+        }
+        if i < b.len() && j < a.len() && b[i] == a[j] {
+            i += 1;
+            j += 1;
+        } else if j < a.len() && (i >= b.len() || dp[i][j + 1] >= dp[i + 1][j]) {
+            out.push_str(&format!("+ {}\n", a[j]));
+            j += 1;
+            shown += 1;
+        } else {
+            out.push_str(&format!("- {}\n", b[i]));
+            i += 1;
+            shown += 1;
         }
     }
-    for line in &a {
-        if !b.contains(line) {
-            out.push_str(&format!("+ {line}\n"));
-            shown += 1;
-        }
-        if shown >= 80 {
-            break;
-        }
+    if truncated {
+        out.push_str("…(diff truncated)\n");
     }
     if out.is_empty() {
-        out.push_str("(no textual change)\n");
+        // Bytes differ but no line does: trailing newline or whitespace change.
+        out.push_str("(line endings / trailing whitespace differ)\n");
     }
     out
 }
@@ -245,11 +361,12 @@ pub(crate) mod tests {
         let original = "line one\nline two\nline three\n";
         std::fs::write(&f, original).unwrap();
 
-        take(&sandbox, &f, "edit_file");
+        let pending = prepare(&sandbox, &f, "edit_file");
         std::fs::write(&f, "totally different\n").unwrap();
+        finish(pending, true);
         assert_ne!(std::fs::read_to_string(&f).unwrap(), original);
 
-        undo(&sandbox).unwrap();
+        undo(&sandbox, false).unwrap();
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
             original,
@@ -266,11 +383,12 @@ pub(crate) mod tests {
         let sandbox = sb(d.path());
         let f = d.path().join("new.txt");
 
-        take(&sandbox, &f, "write_file"); // does not exist yet
+        let pending = prepare(&sandbox, &f, "write_file"); // does not exist yet
         std::fs::write(&f, "created by the agent").unwrap();
+        finish(pending, true);
         assert!(f.exists());
 
-        undo(&sandbox).unwrap();
+        undo(&sandbox, false).unwrap();
         assert!(!f.exists(), "a newly created file should be removed");
         clear();
     }
@@ -284,16 +402,18 @@ pub(crate) mod tests {
         let f = d.path().join("a.txt");
         std::fs::write(&f, "v1").unwrap();
 
-        take(&sandbox, &f, "edit_file");
+        let p1 = prepare(&sandbox, &f, "edit_file");
         std::fs::write(&f, "v2").unwrap();
-        take(&sandbox, &f, "edit_file");
+        finish(p1, true);
+        let p2 = prepare(&sandbox, &f, "edit_file");
         std::fs::write(&f, "v3").unwrap();
+        finish(p2, true);
 
-        undo(&sandbox).unwrap();
+        undo(&sandbox, false).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2");
-        undo(&sandbox).unwrap();
+        undo(&sandbox, false).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
-        assert!(undo(&sandbox).is_err(), "nothing left to undo");
+        assert!(undo(&sandbox, false).is_err(), "nothing left to undo");
         clear();
     }
 
@@ -306,8 +426,9 @@ pub(crate) mod tests {
         let f = d.path().join("a.txt");
         std::fs::write(&f, "keep\nremove me\n").unwrap();
 
-        take(&sandbox, &f, "edit_file");
+        let pending = prepare(&sandbox, &f, "edit_file");
         std::fs::write(&f, "keep\nadded line\n").unwrap();
+        finish(pending, true);
 
         let out = diff(&sandbox);
         assert!(out.contains("- remove me"), "{out}");
@@ -318,6 +439,95 @@ pub(crate) mod tests {
         );
         assert!(summary().contains("1 change(s)"));
         clear();
+    }
+
+    /// B12: a failed mutation must not leave a checkpoint. A phantom entry
+    /// hands /undo a no-op that LOOKS like a revert while the real last change
+    /// stays applied.
+    #[test]
+    fn failed_mutations_leave_no_checkpoint() {
+        use super::super::tools::{validate, ToolCall};
+        use serde_json::json;
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        std::fs::write(d.path().join("a.txt"), "one two one").unwrap();
+
+        // edit_file with a non-unique needle fails; no checkpoint may remain.
+        let out = validate(
+            &ToolCall {
+                name: "edit_file".into(),
+                args: json!({"path":"a.txt","old":"one","new":"three"}),
+            },
+            &sandbox,
+        )
+        .unwrap()
+        .execute(&sandbox);
+        assert!(out.is_err());
+        assert!(all().is_empty(), "failed edit left a phantom checkpoint");
+        assert!(undo(&sandbox, false).is_err(), "nothing to undo");
+        clear();
+    }
+
+    /// B15: /undo must not silently destroy the user's own hand-edits made
+    /// after the agent's write.
+    #[test]
+    fn undo_refuses_when_the_user_edited_the_file_since() {
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, "original").unwrap();
+
+        let pending = prepare(&sandbox, &f, "write_file");
+        std::fs::write(&f, "agent version").unwrap();
+        finish(pending, true);
+
+        // The user hand-edits afterwards.
+        std::fs::write(&f, "user's careful manual fix").unwrap();
+
+        let err = undo(&sandbox, false).unwrap_err();
+        assert!(err.contains("changed after the agent wrote it"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "user's careful manual fix",
+            "refused undo must not touch the file"
+        );
+
+        // Forced, it proceeds — but parks the overwritten state first.
+        undo(&sandbox, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+        let parked: Vec<_> = std::fs::read_dir(d.path().join(".camelid/checkpoints"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("undone_"))
+            .collect();
+        assert_eq!(parked.len(), 1, "the overwritten state must be parked");
+        let saved = std::fs::read_to_string(parked[0].path()).unwrap();
+        assert_eq!(saved, "user's careful manual fix");
+        clear();
+    }
+
+    /// B14: a reorder is a real change. The old set-membership diff printed
+    /// "(no textual change)" for it — an affirmatively false answer.
+    #[test]
+    fn diff_sees_reordered_and_duplicated_lines() {
+        // LCS anchors on one common line and shows the others moving; the old
+        // set-membership diff saw the same multiset and reported no change.
+        let d = line_diff("alpha\nbeta\ngamma\n", "gamma\nbeta\nalpha\n");
+        assert!(
+            d.contains("+ gamma") && d.contains("- gamma"),
+            "reorder invisible: {d}"
+        );
+        assert!(!d.contains("no textual change") && !d.contains("identical"));
+
+        let dup = line_diff("x\ny\n", "x\nx\ny\n");
+        assert!(dup.contains("+ x"), "duplicated line invisible: {dup}");
+
+        // Identical inputs are still identified as such.
+        assert!(line_diff("same\n", "same\n").contains("identical"));
     }
 
     /// The hook lives at the execution site, so an edit made by the model is
@@ -359,12 +569,12 @@ pub(crate) mod tests {
             "second\n"
         );
 
-        undo(&sandbox).unwrap();
+        undo(&sandbox, false).unwrap();
         assert_eq!(
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
             "first\n"
         );
-        undo(&sandbox).unwrap();
+        undo(&sandbox, false).unwrap();
         assert!(!d.path().join("a.txt").exists());
         clear();
     }
@@ -407,13 +617,13 @@ pub(crate) mod tests {
         std::fs::write(&victim, "not yours").unwrap();
 
         // Snapshotting a path outside the root records nothing.
-        take(&sandbox, &victim, "write_file");
+        finish(prepare(&sandbox, &victim, "write_file"), true);
         assert!(all().is_empty(), "snapshotted a file outside the workspace");
 
         // And every snapshot that IS taken lands under the workspace.
         let f = d.path().join("a.txt");
         std::fs::write(&f, "x").unwrap();
-        take(&sandbox, &f, "write_file");
+        finish(prepare(&sandbox, &f, "write_file"), true);
         for cp in all() {
             if let Some(b) = &cp.backup {
                 let canon = std::fs::canonicalize(b).unwrap();

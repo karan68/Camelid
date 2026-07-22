@@ -239,6 +239,56 @@ mod tests {
         assert!(check_identity(&s, "qwen3_4b_instruct_q8_0", false).is_err());
     }
 
+    /// B5: the agent's own state store is not writable through the file tools.
+    /// A session file the model can author is a transcript it gets to forge
+    /// before a /resume replays it; a checkpoint it can rewrite is no
+    /// checkpoint.
+    #[test]
+    fn model_writes_into_the_state_store_are_refused() {
+        use crate::chat::tools::{validate, ToolCall};
+        use serde_json::json;
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        // The store has to exist for edit_file's must_exist resolve to reach
+        // the carve-out rather than fail earlier.
+        save(&sandbox, &sample("bait")).unwrap();
+
+        for (tool, args) in [
+            (
+                "write_file",
+                json!({"path":".camelid/sessions/bait.json","content":"{}"}),
+            ),
+            (
+                "write_file",
+                json!({"path":".camelid/checkpoints/0001_x","content":"forged"}),
+            ),
+            (
+                "edit_file",
+                json!({"path":".camelid/sessions/bait.json","old":"qwen3","new":"other"}),
+            ),
+        ] {
+            let err = validate(
+                &ToolCall {
+                    name: tool.into(),
+                    args,
+                },
+                &sandbox,
+            )
+            .unwrap_err();
+            assert!(err.contains(".camelid"), "{tool}: {err}");
+        }
+
+        // Reading its own state stays allowed — results are fenced anyway.
+        assert!(validate(
+            &ToolCall {
+                name: "read_file".into(),
+                args: json!({"path":".camelid/sessions/bait.json"}),
+            },
+            &sandbox,
+        )
+        .is_ok());
+    }
+
     #[test]
     fn session_ids_are_filename_safe() {
         let d = tempfile::tempdir().unwrap();
