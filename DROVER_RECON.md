@@ -416,6 +416,23 @@ Four independent concerns, one commit each, all HARNESS-provable with no model:
 the instruction that elicits tool use. Mitigation: after landing, re-run `agent-eval` on the primary
 CERT row and refresh that receipt, converting a staleness risk into current evidence.
 
+### 7.2 P0.5 — delivered
+
+| Commit | Concern | Tests |
+|---|---|---|
+| `7d718ff` | Fence tool results as untrusted data; system prompt names the markers | +5 |
+| `9d62750` | Pin the system prompt shape, the advertised tool set, and the slash-command table | +7 |
+| `6085645` | `.camelid/` out of `.gitignore` and out of the `search` index | +1 |
+| `59d2996` | `LoopEnd` catch-all → exhaustive match (behavior unchanged) | 0 |
+
+`chat::` tests **91 → 103**. Baseline gates green throughout (`fmt`, `clippy --all-targets
+-D warnings`, `test`).
+
+The slash-command work went further than "add a pin" because the divergence the critic predicted was
+real: `/sidebar` was undocumented in **both** front ends and the inline `/help` omitted itself. Both
+help surfaces now derive from one shared `SLASH_COMMANDS` table, so the pin has something true to
+pin. `/theme` and `/sidebar` remain deliberately TUI-only and the test asserts exactly that pair.
+
 ---
 
 ## 8. Amendment log
@@ -439,6 +456,10 @@ same commit that acts on the finding.
 | A12 | DECISIONS numbering | Root sequence is **non-monotonic** (D5 after D6/D7; D6/D7/D11 duplicated); last plain number is **D17**. `DOCS.md:36` links the *stale* decision log. §6.3 |
 | A13 | Extend `scripts/chat-terminal-smoke.sh` and "the agent smoke lane" | **There is no agent smoke lane**, and the chat smoke **is not run by CI**. §6.4 |
 | A14 | The TUI agent is "a documented follow-up" (`agent.rs:7-9`, `DECISIONS.md:395`) | It shipped and is the **default** (`mod.rs:169-170`). `RECON_AGENT.md:41`'s `/agent` toggle does not exist. §4.8 |
+| A15 | (found during P0.5) | The **orchestration tools are gated on `subagent::is_enabled()`**, which is false until a subagent config is installed. An ordinary `chat --agent` session is never offered `spawn_subagent` / `check_subagent_status`, and `inspect_system` is Windows-only — so the cross-platform baseline tool set is **five** tools, not the nine a reading of `specs()` suggests. Now pinned by `advertised_tool_set_is_pinned`. |
+| A16 | (found during P0.5) | `Sandbox::new(root, allow_net, timeout)`'s second parameter is **`allow_net`, not `fs_unrestricted`** — the latter is a builder (`with_fs_unrestricted`). Easy to misread when adding a sandboxed surface. |
+| A17 | (found during P0.5) | The `search` tool's parameter is **`pattern`**, not `query` (`tools.rs:350`). |
+| A18 | (open question, deferred to G4) | `LoopEnd::StepCapped` maps to subagent status `"failed"` → exit **1**, not `"inconclusive"` → exit **3**. A step-capped run arguably did not fail. Left unchanged in P0.5 because it decides an exit code on a shipped gate lane; **G4 owns this call** when it defines the tri-state contract. |
 
 ---
 
