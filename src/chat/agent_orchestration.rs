@@ -339,7 +339,13 @@ pub(super) fn family_for(model: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if name.contains("qwen") {
+    // Ornith / Qwen3.5 emit the custom `<function=…>` XML tool format, which routes
+    // to `parse_ornith`. Check before "qwen" (the model is Qwen3.5-derived but its
+    // tool grammar differs from Qwen2/Qwen3 JSON-in-`<tool_call>`). Mirrors
+    // `agent_eval::family_for` so the two gate harnesses classify a model identically.
+    if name.contains("ornith") || name.contains("qwen35") || name.contains("qwen3.5") {
+        "ornith".to_string()
+    } else if name.contains("qwen") {
         "qwen".to_string()
     } else if name.contains("mistral") {
         "mistral".to_string()
@@ -654,5 +660,18 @@ mod tests {
         let r = sample();
         assert!(!r.promotes_capability);
         assert!(!r.claims_speedup);
+    }
+
+    #[test]
+    fn family_for_routes_ornith_before_qwen() {
+        // Ornith / Qwen3.5 must classify as `ornith` (custom `<function=…>` XML tool
+        // grammar), not `qwen` — matching `agent_eval::family_for`. Regression for a
+        // missing arm that misrouted these models to the JSON tool parser.
+        assert_eq!(family_for(Path::new("Ornith-4B-Q8_0.gguf")), "ornith");
+        assert_eq!(family_for(Path::new("Qwen3.5-4B-Instruct.gguf")), "ornith");
+        assert_eq!(family_for(Path::new("qwen35-coder.gguf")), "ornith");
+        assert_eq!(family_for(Path::new("Qwen3-4B-Q4_K_M.gguf")), "qwen");
+        assert_eq!(family_for(Path::new("Mistral-7B.gguf")), "mistral");
+        assert_eq!(family_for(Path::new("Llama-3.2-3B.gguf")), "llama");
     }
 }
