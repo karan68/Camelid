@@ -401,6 +401,13 @@ enum Command {
         /// default (file tools are confined to the workspace root).
         #[arg(long, default_value_t = false)]
         allow_fs: bool,
+        /// Agent: load MCP servers declared in `camelid.mcp.json` at the
+        /// workspace root and offer their tools. Third-party code: every MCP
+        /// tool is approval-gated like a shell command, its output is treated
+        /// as untrusted data, and the whole feature is refused under
+        /// CAMELID_PRODUCTION. Off by default.
+        #[arg(long, default_value_t = false)]
+        allow_mcp: bool,
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
@@ -1276,6 +1283,7 @@ async fn main() -> anyhow::Result<()> {
             yolo,
             allow_net,
             allow_fs,
+            allow_mcp,
             shell_timeout,
             enable_thinking,
             audit_webhook,
@@ -1300,6 +1308,7 @@ async fn main() -> anyhow::Result<()> {
                 yolo,
                 allow_net,
                 allow_fs,
+                allow_mcp,
                 shell_timeout,
                 enable_thinking,
                 audit_webhook,

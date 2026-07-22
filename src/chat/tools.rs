@@ -525,6 +525,7 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
             },"required":["query_type"]}),
         });
     }
+    tools.extend(super::mcp::specs());
     tools
 }
 
@@ -671,6 +672,13 @@ pub enum Action {
     Screenshot {
         path: PathBuf,
     },
+    /// A tool provided by an MCP server (`mcp__<server>__<tool>`). The name is
+    /// runtime data, not a compile-time variant, because the tool set is
+    /// whatever the configured servers advertise.
+    McpCall {
+        name: String,
+        args: Value,
+    },
 }
 
 impl Action {
@@ -686,7 +694,10 @@ impl Action {
             | Action::MouseMove { .. }
             | Action::MouseClick { .. }
             | Action::UiClick { .. }
-            | Action::Screenshot { .. } => Risk::Exec,
+            | Action::Screenshot { .. }
+            // An MCP tool does whatever its third-party server does, so it is
+            // always gated and --auto-approve does not promote it.
+            | Action::McpCall { .. } => Risk::Exec,
             Action::HttpFetch { .. } => Risk::Network,
             Action::InspectSystem { .. }
             | Action::CheckSubagentStatus { .. }
@@ -694,7 +705,7 @@ impl Action {
         }
     }
 
-    pub fn tool_name(&self) -> &'static str {
+    pub fn tool_name(&self) -> &str {
         match self {
             Action::ReadFile { .. } => "read_file",
             Action::ListDir { .. } => "list_dir",
@@ -714,6 +725,7 @@ impl Action {
             Action::UiInspect { .. } => "ui_inspect",
             Action::UiClick { .. } => "ui_click",
             Action::Screenshot { .. } => "screenshot",
+            Action::McpCall { name, .. } => name,
         }
     }
 
@@ -771,6 +783,7 @@ impl Action {
                 None => format!("ui_click({name:?})"),
             },
             Action::Screenshot { path } => format!("screenshot({})", sandbox.rel(path)),
+            Action::McpCall { name, args } => format!("{name}({args})"),
         }
     }
 
@@ -862,6 +875,12 @@ impl Action {
             Action::UiInspect { window } => uia_inspect(window.as_deref()),
             Action::UiClick { window, name } => uia_click(window.as_deref(), name),
             Action::Screenshot { path } => uia_screenshot(path),
+            // The server's reply is untrusted data and reaches the model through
+            // the same fenced tool-result path as every native tool.
+            Action::McpCall { name, args } => match super::mcp::call(name, args) {
+                Ok(text) => ToolOutcome::Ok(clip(&text)),
+                Err(e) => ToolOutcome::Err(e),
+            },
         }
     }
 }
@@ -1165,6 +1184,25 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
                     path: sandbox.resolve(raw, false)?,
                 })
             }
+        }
+        // Anything namespaced mcp__ is a third-party tool from a configured
+        // server. The name is checked against the live registry rather than a
+        // match arm, and the args are passed through unvalidated *by us* --
+        // the server owns its own schema. What we own is the gate: this becomes
+        // an Exec-tier Action like any other and cannot skip approval.
+        other if other.starts_with(super::mcp::PREFIX) => {
+            if !super::mcp::is_enabled() {
+                return Err(format!(
+                    "`{other}` is an MCP tool but MCP is not enabled (start with --allow-mcp)"
+                ));
+            }
+            if !super::mcp::has_tool(other) {
+                return Err(format!("unknown MCP tool `{other}`"));
+            }
+            Ok(Action::McpCall {
+                name: other.to_string(),
+                args: call.args.clone(),
+            })
         }
         other => Err(format!("unknown tool `{other}`")),
     }
@@ -1885,6 +1923,9 @@ mod tests {
     #[test]
     fn advertised_tool_set_is_pinned() {
         use super::ShellSandbox;
+        // specs() also advertises whatever MCP has adopted; this pin is about
+        // the native set, and the lock keeps a concurrent MCP test out of it.
+        let _guard = super::super::mcp::tests::registry_lock();
 
         let names = |net, shell| {
             let mut v: Vec<String> = specs(net, shell).iter().map(|t| t.name.clone()).collect();
@@ -1962,6 +2003,7 @@ mod tests {
     #[test]
     fn subagent_tools_gated_on_configuration() {
         use super::ShellSandbox;
+        let _guard = super::super::mcp::tests::registry_lock();
         assert!(!super::subagent::is_enabled());
         for shell in [
             ShellSandbox::Disabled,
@@ -1980,6 +2022,7 @@ mod tests {
     #[test]
     fn every_advertised_tool_has_a_validation_arm() {
         use super::ShellSandbox;
+        let _guard = super::super::mcp::tests::registry_lock();
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path());
         for t in specs(false, ShellSandbox::Sandboxed) {
