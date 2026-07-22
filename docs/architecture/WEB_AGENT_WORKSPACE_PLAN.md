@@ -109,9 +109,9 @@ Every envelope carries a session ID and monotonically increasing sequence number
 - `$XDG_DATA_HOME/camelid/workspace-memory.sqlite3` or the standard home fallback elsewhere;
 - `CAMELID_WORKSPACE_MEMORY_DB` when an isolated path is explicitly configured.
 
-Schema v5 stores:
+Schema v6 stores:
 
-- threads keyed by ID, canonical root, model ID, and model SHA-256;
+- threads keyed by ID, canonical root, model ID, and model SHA-256, with a deterministic title from the first non-empty initial-prompt line (normalized and capped at 80 characters);
 - idempotent ordered turns keyed by `client_message_id`, including terminal outcome;
 - bounded tool evidence with SHA-256 observation integrity checks;
 - reversible compaction boundaries and history;

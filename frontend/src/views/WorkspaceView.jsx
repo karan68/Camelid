@@ -842,8 +842,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               <select value={selectedThreadId} onChange={(event) => setSelectedThreadId(event.target.value)} disabled={running || threadDeleteBusy}>
                 <option value="">Start a new conversation</option>
                 {savedThreads.map((thread) => (
-                  <option key={thread.id} value={thread.id}>
-                    Resume {thread.turn_count} {thread.turn_count === 1 ? 'turn' : 'turns'} · {new Date(thread.updated_at * 1000).toLocaleString()}
+                  <option key={thread.id} value={thread.id} title={thread.title || 'Workspace conversation'}>
+                    {thread.title || 'Workspace conversation'} · {thread.turn_count} {thread.turn_count === 1 ? 'turn' : 'turns'} · {new Date(thread.updated_at * 1000).toLocaleString()}
                   </option>
                 ))}
               </select>

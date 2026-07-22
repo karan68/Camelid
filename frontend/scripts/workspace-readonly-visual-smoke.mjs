@@ -309,7 +309,7 @@ try {
     if (url.includes('/api/agent/workspace/threads/workspace-preview?')) {
       return respondJson(request, {
         thread: {
-          id: 'workspace-preview', canonical_root: 'C:/workspace-preview', model_id: 'qwen3_4b_q4_k_m',
+          id: 'workspace-preview', title: 'Which file handles authentication?', canonical_root: 'C:/workspace-preview', model_id: 'qwen3_4b_q4_k_m',
           model_sha256: 'test-sha', compacted_through_turn: null, compaction_count: 0,
           updated_at: 1_784_733_939, turn_count: 2,
         },
@@ -321,7 +321,7 @@ try {
     }
     if (url.includes('/api/agent/workspace/threads?')) {
       return respondJson(request, { threads: [{
-        id: 'workspace-preview', canonical_root: 'C:/workspace-preview', model_id: 'qwen3_4b_q4_k_m',
+        id: 'workspace-preview', title: 'Which file handles authentication?', canonical_root: 'C:/workspace-preview', model_id: 'qwen3_4b_q4_k_m',
         model_sha256: 'test-sha', compacted_through_turn: null, compaction_count: 0,
         updated_at: 1_784_733_939, turn_count: 2,
       }] })
@@ -333,6 +333,7 @@ try {
   await resumePage.select('.workspace-thread-picker select', 'workspace-preview')
   await resumePage.waitForFunction(() => document.body.textContent.includes('Authentication is handled by auth.rs.'), { timeout: 5000 })
   const resumeState = await resumePage.evaluate(() => ({
+    selectedLabel: document.querySelector('.workspace-thread-picker select')?.selectedOptions[0]?.textContent.trim(),
     questions: [...document.querySelectorAll('.workspace-answer__question')].map((node) => node.textContent.trim()),
     answerText: document.querySelector('.workspace-result')?.textContent,
     followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
@@ -341,6 +342,9 @@ try {
   }))
   if (JSON.stringify(resumeState.questions) !== JSON.stringify(['Which file handles authentication?', 'Read every file before I stopped you.'])) {
     throw new Error(`saved conversation questions did not hydrate on selection: ${JSON.stringify(resumeState)}`)
+  }
+  if (!resumeState.selectedLabel.startsWith('Which file handles authentication? · 2 turns ·')) {
+    throw new Error(`saved conversation title was not rendered first: ${JSON.stringify(resumeState)}`)
   }
   if (!resumeState.answerText.includes('Authentication is handled by auth.rs.') || !resumeState.answerText.includes('Stopped')) {
     throw new Error(`saved conversation answers/outcomes did not hydrate on selection: ${JSON.stringify(resumeState)}`)

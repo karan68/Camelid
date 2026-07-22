@@ -1097,6 +1097,7 @@ pub(super) async fn create_session(
                 &memory_root,
                 &memory_model_id,
                 &memory_model_sha256,
+                &memory_goal,
             )?;
             (memory, id, Default::default(), 0)
         };

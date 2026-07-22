@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
+const MAX_THREAD_TITLE_CHARS: usize = 80;
 const MAX_EVIDENCE_PER_TURN: usize = 32 * 8;
 static INITIALIZE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -28,6 +29,7 @@ pub(crate) struct MemoryContext {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct StoredThread {
     pub id: String,
+    pub title: String,
     pub canonical_root: String,
     pub model_id: String,
     pub model_sha256: String,
@@ -94,14 +96,22 @@ impl WorkspaceMemoryStore {
         canonical_root: &str,
         model_id: &str,
         model_sha256: &str,
+        initial_goal: &str,
     ) -> anyhow::Result<()> {
         let connection = self.connect()?;
         let now = now_epoch_seconds();
         connection.execute(
             "INSERT INTO workspace_threads
-             (id, canonical_root, model_id, model_sha256, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![thread_id, canonical_root, model_id, model_sha256, now],
+             (id, title, canonical_root, model_id, model_sha256, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                thread_id,
+                workspace_thread_title(initial_goal),
+                canonical_root,
+                model_id,
+                model_sha256,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -113,7 +123,13 @@ impl WorkspaceMemoryStore {
         canonical_root: &str,
         model_id: &str,
     ) -> anyhow::Result<()> {
-        self.create_thread_for_model(thread_id, canonical_root, model_id, "test-model-sha256")
+        self.create_thread_for_model(
+            thread_id,
+            canonical_root,
+            model_id,
+            "test-model-sha256",
+            "Test conversation",
+        )
     }
 
     pub(crate) fn thread(&self, thread_id: &str) -> anyhow::Result<Option<StoredThread>> {
@@ -123,7 +139,7 @@ impl WorkspaceMemoryStore {
                 "SELECT th.id, th.canonical_root, th.model_id, th.model_sha256,
                     th.compacted_through_turn,
                     (SELECT COUNT(*) FROM workspace_compactions c WHERE c.thread_id = th.id),
-                    th.updated_at, COUNT(t.id)
+                    th.updated_at, COUNT(t.id), th.title
                  FROM workspace_threads AS th
                  LEFT JOIN workspace_turns AS t ON t.thread_id = th.id
                  WHERE th.id = ?1 GROUP BY th.id",
@@ -143,7 +159,7 @@ impl WorkspaceMemoryStore {
             "SELECT th.id, th.canonical_root, th.model_id, th.model_sha256,
                     th.compacted_through_turn,
                     (SELECT COUNT(*) FROM workspace_compactions c WHERE c.thread_id = th.id),
-                    th.updated_at, COUNT(t.id)
+                    th.updated_at, COUNT(t.id), th.title
              FROM workspace_threads AS th
              LEFT JOIN workspace_turns AS t ON t.thread_id = th.id
              WHERE th.canonical_root = ?1
@@ -585,6 +601,7 @@ fn stored_turn_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTurn>
 fn stored_thread_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredThread> {
     Ok(StoredThread {
         id: row.get(0)?,
+        title: row.get(8)?,
         canonical_root: row.get(1)?,
         model_id: row.get(2)?,
         model_sha256: row.get(3)?,
@@ -593,6 +610,21 @@ fn stored_thread_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredThr
         updated_at: row.get(6)?,
         turn_count: row.get(7)?,
     })
+}
+
+fn workspace_thread_title(initial_goal: &str) -> String {
+    let line = initial_goal
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Workspace conversation");
+    let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = normalized.chars().count();
+    if count <= MAX_THREAD_TITLE_CHARS {
+        return normalized;
+    }
+    let kept = MAX_THREAD_TITLE_CHARS.saturating_sub(3);
+    format!("{}...", normalized.chars().take(kept).collect::<String>())
 }
 
 fn compaction_count(connection: &Connection, thread_id: &str) -> anyhow::Result<u32> {
@@ -623,6 +655,7 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<bool> {
         transaction.execute_batch(
             "CREATE TABLE workspace_threads (
                id TEXT PRIMARY KEY,
+                             title TEXT NOT NULL,
                canonical_root TEXT NOT NULL,
                model_id TEXT NOT NULL,
                              model_sha256 TEXT NOT NULL,
@@ -666,7 +699,7 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<bool> {
                          );
                          CREATE INDEX workspace_compactions_thread
                              ON workspace_compactions(thread_id, id);
-                         PRAGMA user_version = 5;",
+                         PRAGMA user_version = 6;",
         )?;
     } else {
         if version < 2 {
@@ -710,6 +743,33 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<bool> {
                    CHECK(terminal_outcome IN ('answered', 'aborted', 'step_capped', 'repeated', 'driver_error'));",
             )?;
         }
+        if version < 6 {
+            transaction.execute_batch(
+                "ALTER TABLE workspace_threads
+                 ADD COLUMN title TEXT NOT NULL DEFAULT '';",
+            )?;
+            let existing = {
+                let mut statement = transaction.prepare(
+                    "SELECT th.id,
+                            COALESCE((SELECT t.user_text FROM workspace_turns t
+                                      WHERE t.thread_id = th.id
+                                      ORDER BY t.turn_index ASC LIMIT 1), '')
+                     FROM workspace_threads th WHERE th.title = ''",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            for (thread_id, first_prompt) in existing {
+                transaction.execute(
+                    "UPDATE workspace_threads SET title = ?2 WHERE id = ?1",
+                    params![thread_id, workspace_thread_title(&first_prompt)],
+                )?;
+            }
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     transaction.commit()?;
@@ -738,6 +798,7 @@ fn verify_schema(connection: &Connection) -> anyhow::Result<()> {
             "workspace_threads",
             &[
                 "id",
+                "title",
                 "canonical_root",
                 "model_id",
                 "model_sha256",
@@ -930,6 +991,19 @@ mod tests {
     }
 
     #[test]
+    fn thread_title_uses_first_nonempty_prompt_line_and_is_bounded() {
+        assert_eq!(
+            workspace_thread_title("\n  Review   authentication flow  \nIgnore this line"),
+            "Review authentication flow"
+        );
+        assert_eq!(workspace_thread_title("\n \t"), "Workspace conversation");
+        let long = "é".repeat(MAX_THREAD_TITLE_CHARS + 10);
+        let title = workspace_thread_title(&long);
+        assert_eq!(title.chars().count(), MAX_THREAD_TITLE_CHARS);
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
     fn turns_are_transactional_idempotent_and_thread_scoped() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -1081,7 +1155,15 @@ mod tests {
         let path = dir.path().join("memory.sqlite3");
         {
             let store = WorkspaceMemoryStore::open(&path).unwrap();
-            store.create_thread("a", "C:/repo", "qwen").unwrap();
+            store
+                .create_thread_for_model(
+                    "a",
+                    "C:/repo",
+                    "qwen",
+                    "test-model-sha256",
+                    "\n  Review   authentication flow  \nIgnore this line",
+                )
+                .unwrap();
             store
                 .append_turn("a", "1", "first question", "first answer")
                 .unwrap();
@@ -1090,6 +1172,7 @@ mod tests {
         let threads = reopened.threads_for_root("C:/repo", 10).unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "a");
+        assert_eq!(threads[0].title, "Review authentication flow");
         assert_eq!(threads[0].model_id, "qwen");
         assert_eq!(threads[0].model_sha256, "test-model-sha256");
         assert_eq!(threads[0].turn_count, 1);
@@ -1181,6 +1264,12 @@ mod tests {
                  CREATE VIRTUAL TABLE workspace_turns_fts USING fts5(
                    thread_id UNINDEXED, user_text, assistant_text
                  );
+                                 INSERT INTO workspace_threads
+                                     (id, canonical_root, model_id, created_at, updated_at)
+                                     VALUES ('legacy', 'C:/repo', 'qwen', 1, 1);
+                                 INSERT INTO workspace_turns
+                                     (thread_id, turn_index, client_message_id, user_text, assistant_text, created_at)
+                                     VALUES ('legacy', 0, 'message-1', 'Migrated title', 'answer', 1);
                  PRAGMA user_version = 1;",
             )
             .unwrap();
@@ -1190,7 +1279,15 @@ mod tests {
         let version: i64 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
+        let title: String = migrated
+            .query_row(
+                "SELECT title FROM workspace_threads WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Migrated title");
         let evidence_exists: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='workspace_evidence')",
@@ -1227,7 +1324,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("memory.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 5).unwrap();
+        connection.pragma_update(None, "user_version", 6).unwrap();
         drop(connection);
         let error = WorkspaceMemoryStore::open(path).err().unwrap();
         assert!(error.to_string().contains("schema is missing"));
