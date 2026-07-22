@@ -143,6 +143,8 @@ The Workspace request carries the private `camelid_context_budget_tokens` field.
 
 File-inspection requests must obtain a successful observation before the final answer. The model cannot turn a positive observation into an unsupported absence claim.
 
+When the user explicitly names an existing file path, Workspace resolves it through the sandbox and requires a successful `read_file` observation for that exact file before accepting a final answer. Broader requests remain bounded by the step limit and must disclose inspected and uninspected scope rather than claim complete coverage.
+
 For immediate non-recursive extension inventories, Camelid derives the answer from successful `list_dir` output:
 
 - replacement is limited to unqualified list requests with exactly one directory observation;

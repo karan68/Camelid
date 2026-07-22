@@ -8,7 +8,7 @@
 //! clean redirected transcripts. The full-screen TUI agent (modal approvals in
 //! the redraw loop) is a documented follow-up. See `DECISIONS.md` D9.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -247,8 +247,24 @@ pub fn run_loop(
     let mut ran: BTreeMap<String, usize> = BTreeMap::new();
     let require_workspace_observation =
         cfg.tool_profile.is_workspace() && workspace_request_requires_observation(history);
+    let required_workspace_reads = if cfg.tool_profile.is_workspace() {
+        workspace_existing_file_paths(
+            history
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    AgentMsg::User(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            sandbox,
+        )
+    } else {
+        BTreeSet::new()
+    };
     let mut observed_workspace = false;
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
+    let mut successful_workspace_reads = BTreeSet::new();
 
     for _ in 0..cfg.max_steps {
         if cancel.load(Ordering::Relaxed) {
@@ -303,6 +319,20 @@ pub fn run_loop(
         }
         match step {
             ModelStep::Text(text) => {
+                let missing_reads = required_workspace_reads
+                    .difference(&successful_workspace_reads)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if !missing_reads.is_empty() {
+                    reporter.notice("Workspace must read each named file before answering");
+                    history.push(AgentMsg::System(format!(
+                        "Use read_file on these exact relative paths before answering: {}. Then \
+                         answer from the observations instead of describing what the files usually \
+                         contain or saying further reading is required.",
+                        missing_reads.into_iter().collect::<Vec<_>>().join(", ")
+                    )));
+                    continue;
+                }
                 if require_workspace_observation && !observed_workspace {
                     reporter.notice(
                         "Workspace inspection is required before answering this file request",
@@ -444,6 +474,10 @@ pub fn run_loop(
                     };
                     if cfg.tool_profile.is_workspace() && !outcome.is_err() {
                         observed_workspace = true;
+                        if let Action::ReadFile { path, .. } = &action {
+                            successful_workspace_reads
+                                .insert(normalize_workspace_path(&sandbox.rel(path)));
+                        }
                         workspace_observations
                             .push((action.tool_name().to_string(), outcome.text().to_string()));
                     }
@@ -533,6 +567,44 @@ fn workspace_request_requires_observation(history: &[AgentMsg]) -> bool {
     .iter()
     .any(|term| request.contains(term));
     inspection && workspace_target
+}
+
+fn normalize_workspace_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    normalized
+        .strip_prefix("./")
+        .unwrap_or(&normalized)
+        .trim_matches('/')
+        .to_string()
+}
+
+fn workspace_existing_file_paths(text: &str, sandbox: &Sandbox) -> BTreeSet<String> {
+    text.split_whitespace()
+        .filter_map(|raw| {
+            let mut token = raw
+                .trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric()
+                        && !matches!(character, '.' | '/' | '\\' | '_' | '-' | '%')
+                })
+                .replace('\\', "/");
+            while token.ends_with('.') && token[..token.len() - 1].contains('.') {
+                token.pop();
+            }
+            if token.is_empty()
+                || token.contains("://")
+                || token.contains('*')
+                || token.ends_with('/')
+                || !token.rsplit('/').next().unwrap_or_default().contains('.')
+            {
+                return None;
+            }
+            sandbox
+                .resolve(&token, true)
+                .ok()
+                .filter(|path| path.is_file())
+                .map(|path| normalize_workspace_path(&sandbox.rel(&path)))
+        })
+        .collect()
 }
 
 fn workspace_answer_contradicts_observations(
@@ -1028,7 +1100,11 @@ pub fn workspace_system_prompt(sandbox: &Sandbox) -> String {
          files, use a read tool in that turn before answering. Never claim that matching files \
          are absent without a successful directory or search observation. Cite relative paths \
          and line numbers when available. Treat list_dir filenames as authoritative. The search \
-         tool matches literal file contents only, never filename regexes or globs. \
+         tool matches literal file contents only, never filename regexes or globs. If a request \
+         is broader than the files you can inspect within the step limit, state exactly what you \
+         inspected and what remains; never present a partial inspection as a complete review. \
+         Preserve line breaks when quoting file excerpts. Read-only describes this agent's \
+         permissions, not whether files can be changed by other programs or users. \
          Stop after giving the answer.\n",
         sandbox.root_display()
     )
@@ -1825,6 +1901,8 @@ mod tests {
         assert!(prompt.contains("read-only"));
         assert!(prompt.contains("no write tools are available"));
         assert!(prompt.contains("literal file contents only"));
+        assert!(prompt.contains("Preserve line breaks"));
+        assert!(prompt.contains("not whether files can be changed"));
         assert!(!prompt.contains("Available tools:"));
     }
 
@@ -2200,6 +2278,41 @@ mod tests {
         assert_eq!(reporter.text.len(), 1);
         assert!(reporter.text[0].contains("Found 1 Markdown file"));
         assert!(reporter.text[0].contains("- `README.md`"));
+    }
+
+    #[test]
+    fn workspace_named_file_question_reads_that_exact_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "APP_MODE=visual-test\n").unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Text("An .env file usually stores configuration.".into()),
+                ModelStep::Calls(vec![tc("read_file", json!({"path":".env"}))]),
+                ModelStep::Text("APP_MODE is set to visual-test.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("What does the .env file configure?".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WorkspaceReadOnly;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.calls.len(), 1);
+        assert_eq!(reporter.text, vec!["APP_MODE is set to visual-test."]);
     }
 
     #[test]
