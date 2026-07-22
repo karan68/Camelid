@@ -162,6 +162,15 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             temperature: opts.temperature,
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
+            // The smaller of what the model was trained for and what the agent
+            // lane is validated to; falls back to the validated ceiling when the
+            // server has not reported a context length.
+            ctx_budget: Some(
+                session
+                    .active_ctx
+                    .unwrap_or(agent::AGENT_VALIDATED_CTX)
+                    .min(agent::AGENT_VALIDATED_CTX),
+            ),
         };
         // Full-screen TUI agent on a real terminal (default); the line renderer
         // is the fallback for --plain, pipes, and non-TTY runs (smoke/tests).

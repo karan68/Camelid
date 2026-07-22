@@ -303,6 +303,10 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             // The promotion harness audits nothing (controlled fixture, no sink).
             audit: Box::new(super::audit::NoopSink),
             shell_sandbox: super::shell_sandbox::ShellSandbox::Unrestricted,
+            // No compaction: a promotion receipt must attest a transcript the
+            // harness fully determines. Cases are short and cannot approach the
+            // budget anyway (D-DROVER-6).
+            ctx_budget: None,
         };
         // Auto-approve posture (write/network auto; run_shell still gated, which
         // the AutoApprove approver allows). Production was already refused above.

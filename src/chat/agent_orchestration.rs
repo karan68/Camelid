@@ -513,6 +513,8 @@ fn run_real_model_battery(
         temperature: 0.0,
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: super::shell_sandbox::ShellSandbox::Unrestricted,
+        // Gate harness: bounded by max_steps, and must stay reproducible.
+        ctx_budget: None,
     };
     let mut policy = agent::Policy::default();
     policy.set_auto_all(true);
