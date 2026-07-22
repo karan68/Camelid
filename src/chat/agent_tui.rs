@@ -435,7 +435,10 @@ impl<'a> App<'a> {
         session::CANCEL.store(false, Ordering::SeqCst);
         std::thread::spawn(move || {
             let tools = super::tools::specs(engine.cfg.allow_net, engine.sandbox.shell_mode());
-            let system = agent::system_prompt(&engine.sandbox, &tools);
+            // Re-read per goal: the project file may be edited mid-session.
+            let project = agent::load_project_context(&engine.sandbox);
+            let system =
+                agent::system_prompt_with_project(&engine.sandbox, &tools, project.as_ref());
             let mut history = vec![AgentMsg::System(system), AgentMsg::User(goal)];
             let mut reporter = ChannelReporter { tx: tx.clone() };
             let mut approver = ChannelApprover { tx: tx.clone() };

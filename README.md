@@ -117,6 +117,11 @@ network stays off unless you pass `--allow-net`. Tool results are treated as unt
 only models the compatibility ledger marks `tool_capable` are eligible (promoted only after a
 `camelid agent-eval` PASS). Treat it as a preview and review every requested action.
 
+Drop a `CAMELID.md` (or `AGENTS.md`) at the workspace root to tell the agent about your project —
+build commands, layout, conventions. It is loaded into the agent's context as reference material,
+fenced and labelled as untrusted: it can inform the agent, but it cannot grant permissions, change
+an approval tier, or widen file access, and text inside it asking for any of those is ignored.
+
 ## Call the API
 
 The served model id comes from the GGUF's `general.name`. Run `GET /v1/models` to read the exact

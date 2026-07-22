@@ -609,8 +609,16 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
     // a child stays scoped + its NonInteractiveApprover denies any confirm-tier.
     let mut policy =
         agent::resolve_policy(task.auto_approve, false, agent::is_production()).unwrap_or_default();
+    // A subagent does real work in the user's workspace, so it gets the same
+    // project context its parent has. (The gate harnesses in agent_eval.rs and
+    // agent_orchestration.rs deliberately do not — see D-DROVER-6.)
+    let project = agent::load_project_context(&sandbox);
     let mut history = vec![
-        AgentMsg::System(agent::system_prompt(&sandbox, &tools)),
+        AgentMsg::System(agent::system_prompt_with_project(
+            &sandbox,
+            &tools,
+            project.as_ref(),
+        )),
         AgentMsg::User(task.goal.clone()),
     ];
 

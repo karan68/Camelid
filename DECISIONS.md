@@ -1040,3 +1040,47 @@ covered-set change, IQ4_XS precedent); BF16 runnable loads f32-materialize (memo
 runnable-lane memory policy, not an engine refusal; M-B5 HOLD stands on host grounds);
 (5) NO support-status / smoke / `oracle_qualified` / eligibility change — the pilot's bucket
 stays `not_anchored`. Implementation is a bounded pass; scheduled separately.
+
+## D18 — DROVER: finishing the `camelid chat --agent` coding agent (2026-07-22)
+
+**Decision:** take agent mode from a correct sandboxed tool-calling loop to a daily-drivable
+terminal coding agent, in gated phases over the existing `run_loop` / `tools.rs` / `Sandbox` /
+`LiveDriver` machinery. No token-level generation path is touched and no parity receipt is
+affected; DROVER is client-side loop, UX, and tests. Reconnaissance and the signed phase roster
+are in `DROVER_RECON.md`.
+
+**Order (signed 2026-07-22):** P0.5 → G1 project context → G2 compaction → G7 MCP → G3 plan
+surface → G8 web search + slash commands → G4 headless exec → G5 checkpoint/diff/undo →
+G6 session resume. G7 precedes G3/G8 because `ToolSpec::name`/`description` are `&'static str`;
+runtime-registered MCP tools retype them, so adding static tools first means writing them twice.
+
+- **D-DROVER-1 — Compaction retains the safety spine.** The system prompt and the
+  data-not-commands rule are never compacted, and a summary of untrusted output is itself
+  untrusted. The budget is 80% of the row's *validated context envelope* (8192 on the pinned
+  row), not the model's `n_ctx`: a transcript past the validated window is outside the row's
+  support claim even where the server accepts it.
+- **D-DROVER-2 — `agent exec` is a subcommand, not a binary.** Tri-state exit (0 answered /
+  1 failed-blocked / 3 inconclusive), non-interactive approver, `--yolo` refused under
+  `CAMELID_PRODUCTION`.
+- **D-DROVER-3 — MCP is opt-in, Confirm-tier, production-off, namespaced, output-untrusted.**
+  stdio transport only in v1, servers declared solely by a workspace-local `camelid.mcp.json`.
+  An external MCP config is not read: importing server declarations the user never placed in
+  this workspace contradicts the opt-in posture.
+- **D-DROVER-4 — Resume re-validates model identity** and never re-executes historical tool
+  calls. A resumed transcript is replayed as context; its old tool results stay untrusted.
+- **D-DROVER-5 — Checkpoint and session stores are content snapshots under the sandbox root**
+  and pass the same canonical-prefix jail check as any other path. The git-stash variant is
+  rejected: one code path is easier to prove, and the agent must not mutate git state the
+  sandbox does not own.
+- **D-DROVER-6 — The promotion harness attests the baseline prompt.** `agent-eval` and
+  `agent-orchestration-eval` call `agent::system_prompt`, which carries no workspace content;
+  only user-facing lanes call `system_prompt_with_project`. The ledger states `tool_capable` is
+  earned only by those receipts, so the prompt they attest must be fixed and reproducible rather
+  than whatever `CAMELID.md` a workspace happens to carry. Enforced by construction — the
+  project block arrives through a separate function, so a gate lane cannot pick it up by
+  forgetting a flag — and pinned by `baseline_prompt_never_carries_project_context`.
+
+**Invariant across every phase:** each new road into the model — a project file, a plan, a
+compaction summary, a resumed transcript, MCP output, a search result — is untrusted data. The
+day one of them can change an approval tier, the sandbox, or the `tool_capable` gate, DROVER has
+regressed the thing it exists to protect.
