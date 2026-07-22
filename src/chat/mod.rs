@@ -29,6 +29,7 @@ mod markdown;
 mod mcp;
 mod models;
 mod palette;
+mod plan;
 mod server;
 mod session;
 mod shell_sandbox;

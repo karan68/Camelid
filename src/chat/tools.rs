@@ -31,6 +31,9 @@ pub enum Risk {
     Write,
     Exec,
     Network,
+    /// Touches only the agent's own visible plan — no filesystem, no network,
+    /// no process. Runs without approval because there is nothing to approve.
+    Plan,
 }
 
 impl Risk {
@@ -40,11 +43,12 @@ impl Risk {
             Risk::Write => "write",
             Risk::Exec => "exec",
             Risk::Network => "network",
+            Risk::Plan => "plan",
         }
     }
     /// Read-only tools may run without prompting (configurable); the rest gate.
     pub fn needs_approval(self) -> bool {
-        self != Risk::Read
+        !matches!(self, Risk::Read | Risk::Plan)
     }
     /// The default approval tier for this risk class (Phase 4 / Task 2). This is
     /// *policy* (what to do about the risk), distinct from `Risk` (what the risk
@@ -53,7 +57,7 @@ impl Risk {
     /// `--auto-approve` (see [`ApprovalPolicy::tier_for`]).
     pub fn default_tier(self) -> ApprovalTier {
         match self {
-            Risk::Read => ApprovalTier::Auto,
+            Risk::Read | Risk::Plan => ApprovalTier::Auto,
             Risk::Write | Risk::Network | Risk::Exec => ApprovalTier::Confirm,
         }
     }
@@ -348,6 +352,21 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
             description: "Search file contents for a substring within the workspace.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}),
+        },
+        ToolSpec {
+            name: "update_plan".into(),
+            description: "Record or update your task plan for this goal: an ordered list of \
+                          short steps, each pending | in_progress | done. Call it when you \
+                          start, and again whenever a step's status changes. The user sees \
+                          it. It has no side effects."
+                .into(),
+            risk: Risk::Plan,
+            params: json!({"type":"object","properties":{
+                "steps":{"type":"array","items":{"type":"object","properties":{
+                    "status":{"type":"string","enum":["pending","in_progress","done"]},
+                    "text":{"type":"string"}
+                },"required":["status","text"]}}
+            },"required":["steps"]}),
         },
         ToolSpec {
             name: "write_file".into(),
@@ -679,6 +698,10 @@ pub enum Action {
         name: String,
         args: Value,
     },
+    /// Replace the agent's visible plan. Affects nothing outside it.
+    UpdatePlan {
+        steps: Vec<super::plan::Step>,
+    },
 }
 
 impl Action {
@@ -702,6 +725,7 @@ impl Action {
             Action::InspectSystem { .. }
             | Action::CheckSubagentStatus { .. }
             | Action::UiInspect { .. } => Risk::Read,
+            Action::UpdatePlan { .. } => Risk::Plan,
         }
     }
 
@@ -726,6 +750,7 @@ impl Action {
             Action::UiClick { .. } => "ui_click",
             Action::Screenshot { .. } => "screenshot",
             Action::McpCall { name, .. } => name,
+            Action::UpdatePlan { .. } => "update_plan",
         }
     }
 
@@ -784,6 +809,7 @@ impl Action {
             },
             Action::Screenshot { path } => format!("screenshot({})", sandbox.rel(path)),
             Action::McpCall { name, args } => format!("{name}({args})"),
+            Action::UpdatePlan { steps } => format!("update_plan({} steps)", steps.len()),
         }
     }
 
@@ -875,6 +901,10 @@ impl Action {
             Action::UiInspect { window } => uia_inspect(window.as_deref()),
             Action::UiClick { window, name } => uia_click(window.as_deref(), name),
             Action::Screenshot { path } => uia_screenshot(path),
+            Action::UpdatePlan { steps } => {
+                let stored = super::plan::set(steps.clone());
+                ToolOutcome::Ok(format!("plan updated\n{}", super::plan::render(&stored)))
+            }
             // The server's reply is untrusted data and reaches the model through
             // the same fenced tool-result path as every native tool.
             Action::McpCall { name, args } => match super::mcp::call(name, args) {
@@ -1184,6 +1214,14 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
                     path: sandbox.resolve(raw, false)?,
                 })
             }
+        }
+        "update_plan" => {
+            #[derive(Deserialize)]
+            struct Args {
+                steps: Vec<super::plan::Step>,
+            }
+            let a: Args = parse_args(&call.args, "update_plan")?;
+            Ok(Action::UpdatePlan { steps: a.steps })
         }
         // Anything namespaced mcp__ is a third-party tool from a configured
         // server. The name is checked against the live registry rather than a
@@ -1937,7 +1975,14 @@ mod tests {
         // it is under test, because no subagent config has been installed. The
         // orchestration tools (spawn_subagent / check_subagent_status) therefore
         // do not appear here; `subagent_tools_gated_on_configuration` covers them.
-        let mut expected = vec!["edit_file", "list_dir", "read_file", "search", "write_file"];
+        let mut expected = vec![
+            "edit_file",
+            "list_dir",
+            "read_file",
+            "search",
+            "update_plan",
+            "write_file",
+        ];
         if cfg!(windows) {
             expected.extend([
                 "inspect_system",

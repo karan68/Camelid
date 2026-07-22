@@ -1029,6 +1029,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         tui_only: false,
     },
     SlashCommand {
+        name: "plan",
+        alias: None,
+        help: "show the agent's current task plan",
+        tui_only: false,
+    },
+    SlashCommand {
         name: "subagents",
         alias: None,
         help: "list this session's subagents",
@@ -1187,7 +1193,20 @@ impl Reporter for InlineReporter {
     fn tool_call(&mut self, line: &str) {
         println!("{}", banner::dim(&format!("  ▸ {line}")));
     }
-    fn tool_result(&mut self, _name: &str, outcome: &ToolOutcome) {
+    fn tool_result(&mut self, name: &str, outcome: &ToolOutcome) {
+        // The plan is a UI surface, not a wall of tool output: render it as a
+        // panel instead of echoing the result body.
+        if name == "update_plan" && !outcome.is_err() {
+            let steps = super::plan::get();
+            println!(
+                "{}",
+                banner::dim(&format!("  └ plan ({}):", super::plan::progress(&steps)))
+            );
+            for line in super::plan::render(&steps).lines() {
+                println!("{}", banner::dim(&format!("    {line}")));
+            }
+            return;
+        }
         let body = outcome.text();
         let total = body.lines().count();
         let tag = if outcome.is_err() { "error" } else { "result" };
@@ -1399,6 +1418,17 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             "{}",
                             banner::dim(&format!("step budget: {} per goal", cfg.max_steps))
                         ),
+                        "plan" => {
+                            let steps = super::plan::get();
+                            println!(
+                                "{}",
+                                banner::dim(&format!(
+                                    "plan ({}):\n{}",
+                                    super::plan::progress(&steps),
+                                    super::plan::render(&steps)
+                                ))
+                            );
+                        }
                         // List this session's subagents (live + finished). Their
                         // output is untrusted data, surfaced compact + truncated.
                         "subagents" => println!(
@@ -1425,6 +1455,8 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                 // Re-read per goal: the project file may be edited mid-session,
                 // including by the agent itself.
                 let project = load_project_context(&sandbox);
+                // Each goal gets a fresh plan; a stale one is worse than none.
+                super::plan::clear();
                 let mut history = vec![
                     AgentMsg::System(system_prompt_with_project(
                         &sandbox,

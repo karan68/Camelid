@@ -437,6 +437,7 @@ impl<'a> App<'a> {
             let tools = super::tools::specs(engine.cfg.allow_net, engine.sandbox.shell_mode());
             // Re-read per goal: the project file may be edited mid-session.
             let project = agent::load_project_context(&engine.sandbox);
+            super::plan::clear();
             let system =
                 agent::system_prompt_with_project(&engine.sandbox, &tools, project.as_ref());
             let mut history = vec![AgentMsg::System(system), AgentMsg::User(goal)];
@@ -486,6 +487,16 @@ impl<'a> App<'a> {
                 }
             }
             "steps" => self.status = format!("step budget: {} per goal", self.max_steps),
+            "plan" => {
+                let steps = super::plan::get();
+                self.push(Entry::Notice(format!(
+                    "plan ({}):",
+                    super::plan::progress(&steps)
+                )));
+                for line in super::plan::render(&steps).lines() {
+                    self.push(Entry::Notice(format!("  {line}")));
+                }
+            }
             "tools" => self.show_tools(),
             "subagents" => {
                 let root = self.engine.as_ref().map(|e| e.sandbox.root().to_path_buf());
@@ -930,7 +941,7 @@ impl<'a> App<'a> {
             ShellSandbox::Sandboxed => "sandboxed",
             ShellSandbox::Unrestricted => "unrestricted",
         };
-        let lines = vec![
+        let mut lines = vec![
             kv("model", &self.session.active_label, th),
             kv("posture", &self.session.active_posture, th),
             Line::from(""),
@@ -963,6 +974,30 @@ impl<'a> App<'a> {
             kv("theme", self.theme.name(), th),
             kv("server", &self.addr.to_string(), th),
         ];
+
+        // The plan panel: the agent's own checklist for this goal. Rendered
+        // only when it has one, so an agent that never plans costs no space.
+        let steps = super::plan::get();
+        if !steps.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("plan — {}", super::plan::progress(&steps)),
+                Style::default().fg(th.title()).add_modifier(Modifier::BOLD),
+            )));
+            for s in &steps {
+                // Model-authored text: rendered, never interpreted.
+                let color = match s.status {
+                    super::plan::Status::Done => th.dim(),
+                    super::plan::Status::InProgress => th.primary(),
+                    super::plan::Status::Pending => th.dim(),
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{} {}", s.status.marker(), s.text),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+
         f.render_widget(Paragraph::new(lines), inner);
     }
 
