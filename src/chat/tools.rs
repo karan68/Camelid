@@ -839,12 +839,29 @@ impl Action {
             Action::WriteFile { path, summary, .. } => {
                 format!("write_file → {}\n{summary}", sandbox.rel(path))
             }
-            Action::EditFile { path, old, new } => format!(
-                "edit_file → {}\n  - {}\n  + {}",
-                sandbox.rel(path),
-                first_line(old),
-                first_line(new),
-            ),
+            Action::EditFile { path, old, new } => {
+                // The full replacement, - then +, bounded: unique-replace
+                // needles are short by construction, and an approval that
+                // shows only first lines is approving on faith.
+                let clip_block = |s: &str, sign: char| {
+                    let lines: Vec<&str> = s.lines().take(8).collect();
+                    let more = s.lines().count().saturating_sub(lines.len());
+                    let mut out: String = lines
+                        .iter()
+                        .map(|l| format!("  {sign} {l}\n"))
+                        .collect();
+                    if more > 0 {
+                        out.push_str(&format!("  …({more} more lines)\n"));
+                    }
+                    out
+                };
+                format!(
+                    "edit_file → {}\n{}{}",
+                    sandbox.rel(path),
+                    clip_block(old, '-'),
+                    clip_block(new, '+'),
+                )
+            }
             Action::RunShell { command } => format!(
                 "run_shell in {}:\n  $ {command}",
                 sandbox.rel(sandbox.root())
@@ -2095,15 +2112,30 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").to_string()
 }
 
+/// What the operator sees in the approval prompt for a write. "37 lines →
+/// 40 lines" is not reviewable; the actual delta is, so show it (bounded by
+/// the diff's own truncation markers).
 fn write_summary(path: &Path, content: &str) -> String {
     let new_lines = content.lines().count();
     match std::fs::read_to_string(path) {
         Ok(existing) => format!(
-            "  overwrite: {} lines → {} lines",
+            "  overwrite: {} lines → {} lines\n{}",
             existing.lines().count(),
-            new_lines
+            new_lines,
+            super::checkpoint::line_diff(&existing, content)
         ),
-        Err(_) => format!("  create: {new_lines} lines"),
+        Err(_) => {
+            // A create shows its head: enough to see what is being written
+            // without scrolling a modal off the screen.
+            let head: Vec<&str> = content.lines().take(20).collect();
+            let more = new_lines.saturating_sub(head.len());
+            let tail = if more > 0 {
+                format!("\n  …({more} more lines)")
+            } else {
+                String::new()
+            };
+            format!("  create: {new_lines} lines\n{}{tail}", head.join("\n"))
+        }
     }
 }
 

@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -58,6 +58,11 @@ struct Engine {
     sandbox: Sandbox,
     cfg: AgentConfig,
     policy: Policy,
+    /// The agent transcript, carried across goals so "now do the same for the
+    /// other file" refers to something. Also what /save persists and /resume
+    /// restores. Seeded per goal through [`agent::seed_history`], which
+    /// rebuilds the System message fresh and drops any carried one.
+    transcript: Vec<AgentMsg>,
 }
 
 /// A transcript entry, rendered to width-aware lines each frame.
@@ -149,15 +154,20 @@ impl Approver for ChannelApprover {
 pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow::Result<i32> {
     // Capability gate (constraint 3): tool-capable supported row only.
     if !session.active_tool_capable() {
+        let rows = session.tool_capable_rows();
         eprintln!(
             "agent mode requires a tool-capable supported model. The active model{} is not \
-             marked tool_capable in the compatibility ledger (/api/capabilities). Load a \
-             tool-capable supported row and retry.",
+             marked tool_capable in the compatibility ledger (/api/capabilities).{}",
             session
                 .active_id
                 .as_deref()
                 .map(|id| format!(" '{id}'"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if rows.is_empty() {
+                String::new()
+            } else {
+                format!(" Tool-capable rows: {}.", rows.join(", "))
+            }
         );
         return Ok(2);
     }
@@ -191,11 +201,17 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         sandbox,
         cfg,
         policy,
+        transcript: Vec::new(),
     });
 
     enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let mut app = App::new(session, addr, engine);
@@ -205,7 +221,8 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     result.map(|()| 0)
@@ -303,6 +320,15 @@ impl<'a> App<'a> {
             if event::poll(Duration::from_millis(timeout))? {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
+                    // A paste is text, not keystrokes: newlines inside it must
+                    // not submit the goal mid-paste.
+                    Event::Paste(text) => {
+                        for c in text.chars() {
+                            let c = if c == '\r' { '\n' } else { c };
+                            self.input.insert(self.cursor, c);
+                            self.cursor += c.len_utf8();
+                        }
+                    }
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => self.scroll_up(3),
                         MouseEventKind::ScrollDown => self.scroll_down(3),
@@ -439,10 +465,14 @@ impl<'a> App<'a> {
             let tools = super::tools::specs(engine.cfg.allow_net, engine.sandbox.shell_mode());
             // Re-read per goal: the project file may be edited mid-session.
             let project = agent::load_project_context(&engine.sandbox);
-            super::plan::clear();
+            if engine.transcript.is_empty() {
+                // A fresh session gets a fresh plan; a continuing one keeps
+                // what it was carrying (a /resume restored it).
+                super::plan::clear();
+            }
             let system =
                 agent::system_prompt_with_project(&engine.sandbox, &tools, project.as_ref());
-            let mut history = vec![AgentMsg::System(system), AgentMsg::User(goal)];
+            let mut history = agent::seed_history(&engine.transcript, system, &goal);
             let mut reporter = ChannelReporter { tx: tx.clone() };
             let mut approver = ChannelApprover { tx: tx.clone() };
             // Stream the model's tokens live into the redraw loop's `live` buffer.
@@ -461,6 +491,7 @@ impl<'a> App<'a> {
                 &mut history,
             );
             engine.driver.set_delta_sink(None);
+            engine.transcript = history;
             let _ = tx.send(Ev::Done {
                 end,
                 engine: Box::new(engine),
@@ -489,6 +520,90 @@ impl<'a> App<'a> {
                 }
             }
             "steps" => self.status = format!("step budget: {} per goal", self.max_steps),
+            "save" => {
+                let id = cmd.split_whitespace().nth(1).unwrap_or("").to_string();
+                self.status = match self.engine.as_ref() {
+                    None => "busy — /save when idle".into(),
+                    Some(e) => {
+                        let saved = super::agent_session::SavedAgentSession {
+                            id: id.clone(),
+                            model_id: self
+                                .session
+                                .active_id
+                                .clone()
+                                .unwrap_or_else(|| self.session.active_label.clone()),
+                            tool_capable: true,
+                            workspace: e.sandbox.root().display().to_string(),
+                            transcript: e.transcript.clone(),
+                            plan: super::plan::get(),
+                            grants: e.policy.granted(),
+                        };
+                        match super::agent_session::save(&e.sandbox, &saved) {
+                            Ok(p) => format!("saved {} → {}", id, e.sandbox.rel(&p)),
+                            Err(err) => err,
+                        }
+                    }
+                };
+            }
+            "resume" => {
+                let id = cmd.split_whitespace().nth(1).unwrap_or("").to_string();
+                let model = self
+                    .session
+                    .active_id
+                    .clone()
+                    .unwrap_or_else(|| self.session.active_label.clone());
+                let mut notices: Vec<String> = Vec::new();
+                self.status = match self.engine.as_mut() {
+                    None => "busy — /resume when idle".into(),
+                    Some(e) => match super::agent_session::load(&e.sandbox, &id) {
+                        Err(err) => err,
+                        Ok(s) => match super::agent_session::check_identity(&s, &model, true) {
+                            Err(refusal) => refusal.to_string(),
+                            Ok(()) => {
+                                // Replayed as context, never re-executed; grants
+                                // are NOT restored (a file cannot carry a live
+                                // operator's authority) — list them instead.
+                                e.transcript = s.transcript.clone();
+                                super::plan::set(s.plan.clone());
+                                if !s.grants.is_empty() {
+                                    notices.push(format!(
+                                        "grants are not carried across sessions; previously \
+                                         allowed: {} — press 'a' at the next prompt to re-grant",
+                                        s.grants.join(", ")
+                                    ));
+                                }
+                                format!(
+                                    "resumed {} — {} message(s) replayed as context",
+                                    s.id,
+                                    s.transcript.len()
+                                )
+                            }
+                        },
+                    },
+                };
+                for n in notices {
+                    self.push(Entry::Notice(n));
+                }
+            }
+            "sessions" => {
+                let ids = self
+                    .engine
+                    .as_ref()
+                    .map(|e| super::agent_session::list(&e.sandbox))
+                    .unwrap_or_default();
+                self.status = if ids.is_empty() {
+                    "no saved sessions".into()
+                } else {
+                    ids.join("  ")
+                };
+            }
+            "clear" => {
+                if let Some(e) = self.engine.as_mut() {
+                    e.transcript.clear();
+                }
+                super::plan::clear();
+                self.status = "context cleared — the next goal starts fresh".into();
+            }
             "diff" | "undo" | "checkpoints" => {
                 let text = match self.engine.as_ref() {
                     Some(e) => match cmd.split_whitespace().next().unwrap_or("") {
@@ -1056,10 +1171,20 @@ impl<'a> App<'a> {
             )),
             Line::from(""),
         ];
-        for raw in p.detail.lines() {
+        // Bound the detail to what the modal can show, with an honest marker —
+        // silent clipping would mean approving text the operator never saw.
+        let max_detail = (area.height as usize).saturating_sub(10).max(6);
+        let total = p.detail.lines().count();
+        for raw in p.detail.lines().take(max_detail) {
             lines.push(Line::from(Span::styled(
                 format!("  {raw}"),
                 Style::default().fg(th.primary()),
+            )));
+        }
+        if total > max_detail {
+            lines.push(Line::from(Span::styled(
+                format!("  …({} more lines not shown)", total - max_detail),
+                Style::default().fg(th.dim()),
             )));
         }
         lines.push(Line::from(""));

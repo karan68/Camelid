@@ -1119,6 +1119,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         tui_only: false,
     },
     SlashCommand {
+        name: "clear",
+        alias: None,
+        help: "drop the carried context; the next goal starts fresh",
+        tui_only: false,
+    },
+    SlashCommand {
         name: "save",
         alias: None,
         help: "save this agent session (/save <id>)",
@@ -1527,15 +1533,21 @@ impl Reporter for StderrReporter {
 pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow::Result<i32> {
     // Capability gate (constraint 3): tool-capable supported row only.
     if !session.active_tool_capable() {
+        let rows = session.tool_capable_rows();
         eprintln!(
             "agent mode requires a tool-capable supported model. The active model{} is not \
              marked tool_capable in the compatibility ledger (/api/capabilities), so Camelid \
-             will not drive an agent loop with it. Load a tool-capable supported row and retry.",
+             will not drive an agent loop with it.{}",
             session
                 .active_id
                 .as_deref()
                 .map(|id| format!(" '{id}'"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if rows.is_empty() {
+                String::new()
+            } else {
+                format!(" Tool-capable rows: {}.", rows.join(", "))
+            }
         );
         return Ok(2);
     }
@@ -1698,6 +1710,14 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             "{}",
                             banner::dim(&format!("step budget: {} per goal", cfg.max_steps))
                         ),
+                        "clear" => {
+                            saved_transcript.clear();
+                            super::plan::clear();
+                            println!(
+                                "{}",
+                                banner::dim("context cleared — the next goal starts fresh")
+                            );
+                        }
                         "save" => {
                             let id = cmd.split_whitespace().nth(1).unwrap_or("").to_string();
                             let saved = super::agent_session::SavedAgentSession {
@@ -2562,6 +2582,7 @@ mod tests {
             "save",
             "resume",
             "sessions",
+            "clear",
         ] {
             assert!(line.contains(&n), "/{n} should be in the line renderer");
             assert!(tui.contains(&n), "/{n} should be in the TUI");

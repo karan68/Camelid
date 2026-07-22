@@ -264,7 +264,7 @@ pub fn diff(sandbox: &Sandbox) -> String {
 /// duplicated line and would print an affirmatively false "(no textual
 /// change)" for a reorder; this one is order-aware. Inputs beyond the DP cap
 /// fall back to an honest coarse marker rather than a wrong diff.
-fn line_diff(before: &str, after: &str) -> String {
+pub fn line_diff(before: &str, after: &str) -> String {
     const MAX_LINES: usize = 400;
     const MAX_SHOWN: usize = 80;
 

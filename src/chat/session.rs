@@ -202,6 +202,16 @@ impl Session {
         })
     }
 
+    /// Every ledger row promoted for agent mode — for refusal messages that
+    /// tell the user what WOULD work instead of only what does not.
+    pub fn tool_capable_rows(&self) -> Vec<String> {
+        self.ledger
+            .iter()
+            .filter(|r| r.tool_capable)
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
     /// Support posture for a model id, read from the ledger ("supported" or the
     /// raw status; "loaded" when the id is not a ledger row).
     pub fn posture_for(&self, id: &str) -> String {
