@@ -18,10 +18,12 @@ pub(crate) mod agent;
 mod agent_bench;
 mod agent_eval;
 mod agent_orchestration;
+mod agent_session;
 mod agent_syscap;
 mod agent_tui;
 mod audit;
 mod banner;
+mod checkpoint;
 mod client;
 mod clipboard;
 mod inline;
@@ -29,6 +31,7 @@ mod markdown;
 mod mcp;
 mod models;
 mod palette;
+mod plan;
 mod server;
 mod session;
 mod shell_sandbox;
@@ -101,6 +104,9 @@ pub struct ChatOptions {
     pub audit_webhook: Option<String>,
     /// `run_shell` confinement: `disabled` | `sandboxed` (default) | `unrestricted`.
     pub shell_sandbox: String,
+    /// Headless one-shot (`camelid agent exec`): run this goal to completion and
+    /// exit, instead of opening a REPL. Implies `agent` + `plain`.
+    pub exec_goal: Option<String>,
 }
 
 /// Entry point for the `Chat` subcommand. Returns a process exit code (0 = ok,
@@ -199,6 +205,13 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
                 }
                 Err(e) => eprintln!("MCP: workspace unavailable: {e}"),
             }
+        }
+
+        // Headless one-shot: no REPL, tri-state exit, answer on stdout.
+        if let Some(goal) = opts.exec_goal.as_deref() {
+            let code = agent::run_exec(&mut session, opts.addr, cfg, goal);
+            mcp::shutdown();
+            return code;
         }
 
         // Full-screen TUI agent on a real terminal (default); the line renderer

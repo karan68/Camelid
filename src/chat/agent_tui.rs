@@ -183,6 +183,8 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         cfg.shell_sandbox,
     ));
 
+    super::checkpoint::clear();
+
     let driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     let engine = Box::new(Engine {
         driver,
@@ -437,6 +439,7 @@ impl<'a> App<'a> {
             let tools = super::tools::specs(engine.cfg.allow_net, engine.sandbox.shell_mode());
             // Re-read per goal: the project file may be edited mid-session.
             let project = agent::load_project_context(&engine.sandbox);
+            super::plan::clear();
             let system =
                 agent::system_prompt_with_project(&engine.sandbox, &tools, project.as_ref());
             let mut history = vec![AgentMsg::System(system), AgentMsg::User(goal)];
@@ -486,6 +489,52 @@ impl<'a> App<'a> {
                 }
             }
             "steps" => self.status = format!("step budget: {} per goal", self.max_steps),
+            "diff" | "undo" | "checkpoints" => {
+                let text = match self.engine.as_ref() {
+                    Some(e) => match cmd.split_whitespace().next().unwrap_or("") {
+                        "diff" => super::checkpoint::diff(&e.sandbox),
+                        "undo" => match super::checkpoint::undo(&e.sandbox) {
+                            Ok(m) => m,
+                            Err(err) => err,
+                        },
+                        _ => super::checkpoint::summary(),
+                    },
+                    None => "busy — try again when idle".into(),
+                };
+                for line in text.lines() {
+                    self.push(Entry::Notice(line.to_string()));
+                }
+            }
+            "init" => {
+                self.status = match self.engine.as_ref() {
+                    Some(e) => match agent::init_project_file(&e.sandbox) {
+                        Ok(p) => format!("wrote {}", e.sandbox.rel(&p)),
+                        Err(err) => err,
+                    },
+                    None => "busy — try /init when idle".into(),
+                };
+            }
+            "copy" => {
+                let last = self.transcript.iter().rev().find_map(|e| match e {
+                    Entry::Model(t) => Some(t.clone()),
+                    _ => None,
+                });
+                self.status = match last {
+                    Some(t) if super::clipboard::copy(&t) => "copied the last answer".into(),
+                    Some(_) => "could not reach the clipboard".into(),
+                    None => "nothing to copy yet".into(),
+                };
+            }
+            "plan" => {
+                let steps = super::plan::get();
+                self.push(Entry::Notice(format!(
+                    "plan ({}):",
+                    super::plan::progress(&steps)
+                )));
+                for line in super::plan::render(&steps).lines() {
+                    self.push(Entry::Notice(format!("  {line}")));
+                }
+            }
             "tools" => self.show_tools(),
             "subagents" => {
                 let root = self.engine.as_ref().map(|e| e.sandbox.root().to_path_buf());
@@ -930,7 +979,7 @@ impl<'a> App<'a> {
             ShellSandbox::Sandboxed => "sandboxed",
             ShellSandbox::Unrestricted => "unrestricted",
         };
-        let lines = vec![
+        let mut lines = vec![
             kv("model", &self.session.active_label, th),
             kv("posture", &self.session.active_posture, th),
             Line::from(""),
@@ -963,6 +1012,30 @@ impl<'a> App<'a> {
             kv("theme", self.theme.name(), th),
             kv("server", &self.addr.to_string(), th),
         ];
+
+        // The plan panel: the agent's own checklist for this goal. Rendered
+        // only when it has one, so an agent that never plans costs no space.
+        let steps = super::plan::get();
+        if !steps.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("plan — {}", super::plan::progress(&steps)),
+                Style::default().fg(th.title()).add_modifier(Modifier::BOLD),
+            )));
+            for s in &steps {
+                // Model-authored text: rendered, never interpreted.
+                let color = match s.status {
+                    super::plan::Status::Done => th.dim(),
+                    super::plan::Status::InProgress => th.primary(),
+                    super::plan::Status::Pending => th.dim(),
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{} {}", s.status.marker(), s.text),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+
         f.render_widget(Paragraph::new(lines), inner);
     }
 

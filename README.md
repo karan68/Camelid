@@ -124,6 +124,28 @@ network, GUI control, and subagents are unavailable. File inventories are ground
 directory entries, and reversible compaction keeps long threads within an exact context budget.
 Workspace requires a loaded exact model row that has earned `tool_capable: true`.
 
+With `--allow-net` the agent also gets `web_search` (ranked title/url/snippet results) alongside
+`http_fetch`. Results are untrusted data — reading one is a separate, separately-approved
+`http_fetch`. Point it at a different engine with `CAMELID_SEARCH_URL` (a template containing
+`{query}`).
+
+Every file the agent writes or edits is snapshotted first, so `/diff` shows what it changed,
+`/undo` reverts the last change, and `/checkpoints` lists them. Snapshots are file copies under
+`.camelid/checkpoints/` in the workspace — the agent never touches your git state.
+
+`/save <id>` and `/resume <id>` carry an agent session across restarts, storing the transcript,
+plan, and approval grants under `.camelid/sessions/`. A resumed transcript is replayed as context
+and never re-executed, and resume is refused if the active model is not the one that recorded it,
+or is no longer marked `tool_capable`.
+
+In-session: `/init` scaffolds a `CAMELID.md`, `/plan` shows the agent's current checklist, `/copy`
+puts the last answer on the clipboard, and `/help` lists the rest.
+
+**Headless.** `camelid agent exec "<goal>" --model <gguf>` runs one goal to completion with no
+prompts, prints the answer to stdout (progress goes to stderr), and exits 0 answered / 1 failed /
+3 inconclusive. With no operator to approve anything, every gated tool is denied unless you pass
+`--yolo`.
+
 **MCP servers (opt-in).** `--allow-mcp` loads the servers declared in a `camelid.mcp.json` at the
 workspace root (stdio transport) and offers their tools alongside the native ones, namespaced
 `mcp__<server>__<tool>` so none can shadow a built-in:

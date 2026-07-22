@@ -252,6 +252,53 @@ fn pin_to_high_performance_gpu() {}
 
 /// `camelid gait <action>` — GAIT cache maintenance subcommands.
 #[derive(Debug, Subcommand)]
+enum AgentAction {
+    /// Run one goal to completion with no human present, print the final answer
+    /// to stdout, and exit 0 (answered) / 1 (failed or blocked) / 3
+    /// (inconclusive: step-capped, aborted, or no longer making progress).
+    ///
+    /// Progress narrates on stderr so stdout carries only the answer. With no
+    /// operator to confirm anything, every approval-gated tool is DENIED unless
+    /// --yolo is passed, and --yolo is refused under CAMELID_PRODUCTION.
+    Exec {
+        /// The goal. Omit to read it from stdin.
+        goal: Option<String>,
+        /// GGUF to drive. Must be a tool-capable supported row.
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8231")]
+        addr: SocketAddr,
+        /// Sandbox root for the agent's file tools (default: cwd).
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        #[arg(long, default_value_t = 25)]
+        max_steps: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_tokens: u32,
+        /// Auto-approve write/network tools (exec tools still gated). Refused
+        /// under CAMELID_PRODUCTION.
+        #[arg(long, default_value_t = false)]
+        auto_approve: bool,
+        /// Auto-approve everything including exec tools. Refused under
+        /// CAMELID_PRODUCTION.
+        #[arg(long, default_value_t = false)]
+        yolo: bool,
+        #[arg(long, default_value_t = false)]
+        allow_net: bool,
+        #[arg(long, default_value_t = false)]
+        allow_fs: bool,
+        #[arg(long, default_value_t = false)]
+        allow_mcp: bool,
+        #[arg(long, default_value = "sandboxed")]
+        shell_sandbox: String,
+        #[arg(long, default_value_t = 30)]
+        shell_timeout: u64,
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum GaitAction {
     /// Clear the GAIT cache (profiles, quarantine, in-progress markers, and the
     /// DISABLE kill-file) under %LOCALAPPDATA%\Camelid\gait, fully reverting to
@@ -1017,6 +1064,12 @@ enum Command {
         #[arg(long)]
         gpc_matmul: Option<usize>,
     },
+    /// Headless agent runs (e.g. `camelid agent exec "fix the failing test"`).
+    #[command(hide = true)]
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
     /// GAIT cache maintenance (e.g. `camelid gait reset`).
     #[command(hide = true)]
     Gait {
@@ -1299,6 +1352,7 @@ async fn main() -> anyhow::Result<()> {
                 no_stream,
                 plain,
                 models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
+                exec_goal: None,
                 agent,
                 workdir,
                 max_steps,
@@ -2308,6 +2362,66 @@ async fn main() -> anyhow::Result<()> {
                 gpc_matmul,
             )?;
         }
+        Command::Agent { action } => match action {
+            AgentAction::Exec {
+                goal,
+                model,
+                addr,
+                workdir,
+                max_steps,
+                max_tokens,
+                auto_approve,
+                yolo,
+                allow_net,
+                allow_fs,
+                allow_mcp,
+                shell_sandbox,
+                shell_timeout,
+                models_dir,
+            } => {
+                // The goal may come from stdin so a caller can pipe a long or
+                // generated prompt in without shell quoting.
+                let goal = match goal {
+                    Some(g) => g,
+                    None => {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                        buf
+                    }
+                };
+                if goal.trim().is_empty() {
+                    eprintln!("agent exec needs a goal (as an argument or on stdin)");
+                    std::process::exit(1);
+                }
+                let code = chat::run_chat(chat::ChatOptions {
+                    model: Some(model),
+                    addr,
+                    system: None,
+                    max_tokens,
+                    temperature: 0.0,
+                    top_p: None,
+                    top_k: None,
+                    seed: None,
+                    no_stream: true,
+                    models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
+                    plain: true,
+                    agent: true,
+                    workdir,
+                    max_steps,
+                    auto_approve,
+                    yolo,
+                    allow_net,
+                    allow_fs,
+                    allow_mcp,
+                    shell_timeout,
+                    enable_thinking: false,
+                    audit_webhook: None,
+                    shell_sandbox,
+                    exec_goal: Some(goal),
+                })?;
+                std::process::exit(code);
+            }
+        },
         Command::Gait { action } => match action {
             GaitAction::Reset => run_gait_reset()?,
         },
