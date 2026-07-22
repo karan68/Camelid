@@ -98,8 +98,8 @@ the Windows syscap tools additionally carry the `camelid.agent-syscap-receipt`
 gate.
 
 **Not claimed.** Rows without a current agent-eval PASS receipt (agent mode
-refuses them), unattended operation beyond the documented `--yolo` posture
-(refused under `CAMELID_PRODUCTION`), MCP transports beyond stdio, Windows or
+refuses them), unattended operation beyond the documented `--today-is-a-good-day-to-die` posture (alias
+`--yolo`; refused under `CAMELID_PRODUCTION`), MCP transports beyond stdio, Windows or
 Linux live-lane agent transcripts, production throughput, or parity of any
 kind — agent mode is a client-side loop over the already-validated serve lane
 and adds no token-level claim.

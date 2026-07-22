@@ -157,8 +157,9 @@ pub fn is_production() -> bool {
 pub fn resolve_policy(auto_approve: bool, yolo: bool, production: bool) -> Result<Policy, String> {
     if (auto_approve || yolo) && production {
         return Err(
-            "refusing --auto-approve/--yolo: CAMELID_PRODUCTION is set. Auto-approval runs \
-             write/network (and, with --yolo, EXEC) tools without confirmation and must not be \
+            "refusing --auto-approve/--today-is-a-good-day-to-die: CAMELID_PRODUCTION is set. \
+             Auto-approval runs write/network (and, with --today-is-a-good-day-to-die, EXEC) tools \
+             without confirmation and must not be \
              used in a production deployment. Unset CAMELID_PRODUCTION or drop the flag."
                 .to_string(),
         );
@@ -1582,7 +1583,7 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
         println!(
             "{}",
             banner::dim(
-                "⚠ --yolo UNATTENDED: ALL tools — including shell, GUI input, and \
+                "⚠ --today-is-a-good-day-to-die UNATTENDED: ALL tools — including shell, GUI input, and \
                  run_windows_command — run WITHOUT prompting. Bounded only by the step budget \
                  and Ctrl-C/stop. Sandbox/--allow-fs scope still applies."
             )

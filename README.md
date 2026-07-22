@@ -141,7 +141,7 @@ puts the last answer on the clipboard, and `/help` lists the rest.
 **Headless.** `camelid agent exec "<goal>" --model <gguf>` runs one goal to completion with no
 prompts, prints the answer to stdout (progress goes to stderr), and exits 0 answered / 1 failed /
 3 inconclusive. With no operator to approve anything, every gated tool is denied unless you pass
-`--yolo`.
+`--today-is-a-good-day-to-die` (alias: `--yolo`).
 
 **MCP servers (opt-in).** `--allow-mcp` loads the servers declared in a `camelid.mcp.json` at the
 workspace root (stdio transport) and offers their tools alongside the native ones, namespaced

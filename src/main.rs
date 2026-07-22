@@ -261,7 +261,8 @@ enum AgentAction {
     ///
     /// Progress narrates on stderr so stdout carries only the answer. With no
     /// operator to confirm anything, every approval-gated tool is DENIED unless
-    /// --yolo is passed, and --yolo is refused under CAMELID_PRODUCTION.
+    /// --today-is-a-good-day-to-die (alias --yolo) is passed, and that flag is
+    /// refused under CAMELID_PRODUCTION.
     Exec {
         /// The goal. Omit to read it from stdin.
         goal: Option<String>,
@@ -281,9 +282,14 @@ enum AgentAction {
         /// under CAMELID_PRODUCTION.
         #[arg(long, default_value_t = false)]
         auto_approve: bool,
-        /// Auto-approve everything including exec tools. Refused under
-        /// CAMELID_PRODUCTION.
-        #[arg(long, default_value_t = false)]
+        /// UNATTENDED: auto-approve everything including exec tools — today is
+        /// a good day to die. Refused under CAMELID_PRODUCTION. (`--yolo` is a
+        /// compatible alias.)
+        #[arg(
+            long = "today-is-a-good-day-to-die",
+            visible_alias = "yolo",
+            default_value_t = false
+        )]
         yolo: bool,
         #[arg(long, default_value_t = false)]
         allow_net: bool,
@@ -436,9 +442,14 @@ enum Command {
         auto_approve: bool,
         /// Agent: UNATTENDED — auto-approve EVERYTHING including exec tools
         /// (shell, GUI input, run_windows_command, spawn_subagent) so the agent
-        /// runs a whole task without prompting. Bounded by --max-steps and /stop.
-        /// Refused under CAMELID_PRODUCTION. Powerful + dangerous; opt-in.
-        #[arg(long, default_value_t = false)]
+        /// runs a whole task without prompting — today is a good day to die.
+        /// Bounded by --max-steps and /stop. Refused under CAMELID_PRODUCTION.
+        /// Powerful + dangerous; opt-in. (`--yolo` is a compatible alias.)
+        #[arg(
+            long = "today-is-a-good-day-to-die",
+            visible_alias = "yolo",
+            default_value_t = false
+        )]
         yolo: bool,
         /// Agent: offer the network tool (`http_fetch`). Off by default.
         #[arg(long, default_value_t = false)]
