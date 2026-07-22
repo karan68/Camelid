@@ -145,7 +145,8 @@ File-inspection requests must obtain a successful observation before the final a
 
 For immediate non-recursive extension inventories, Camelid derives the answer from successful `list_dir` output:
 
-- matching filenames are case-folded for deduplication;
+- replacement is limited to unqualified list requests with exactly one directory observation;
+- case-distinct matching filenames remain distinct;
 - results are lexically sorted;
 - directories and nonmatching entries are excluded;
 - the result is rendered as stable Markdown bullets;
@@ -157,7 +158,7 @@ Directory listing retains at most 4,096 observed entries and explicitly says whe
 
 ## Cancellation and Deadlines
 
-Cancellation is turn-scoped rather than process-global. The model client uses an absolute 90-second deadline covering both HTTP header wait and SSE body streaming, with periodic wakeups to observe cancellation.
+Cancellation is turn-scoped rather than process-global. The model client uses one absolute 90-second deadline starting with the first prompt preflight and covering every fitting retry, HTTP header wait, and SSE body stream, with periodic wakeups to observe cancellation.
 
 The agent checks cancellation before work and again after each model step. If cancellation arrives during streaming, partial text is discarded before reporting a final answer or committing a turn. The API also protects cancellation state from stale worker completion and event-claim races.
 

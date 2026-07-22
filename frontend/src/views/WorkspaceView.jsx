@@ -596,7 +596,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }
 
   const renderResult = () => {
-    if (state.phase === 'error' || state.phase === 'driver_error') {
+    const terminalError = state.phase === 'error' || state.phase === 'driver_error'
+    if (terminalError && conversation.length === 0) {
       const meta = TERMINAL_RESULT[state.phase]
       return (
         <div className="workspace-result__status is-error">
@@ -616,8 +617,16 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
       )
     }
     if (conversation.length > 0) {
+      const errorMeta = terminalError ? TERMINAL_RESULT[state.phase] : null
       return (
         <div className="workspace-conversation">
+          {errorMeta ? (
+            <div className="workspace-result__status is-error">
+              <IconError size={20} />
+              <strong>{errorMeta.title}</strong>
+              <span>{state.error || errorMeta.detail}</span>
+            </div>
+          ) : null}
           {hiddenTurnCount ? <p className="workspace-conversation__truncated">{hiddenTurnCount} older turns remain saved in this conversation.</p> : null}
           {visibleConversation.map((turn, index) => (
             <article className="workspace-answer" key={`answer-${hiddenTurnCount + index}-${turn.assistant.length}`}>

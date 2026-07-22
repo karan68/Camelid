@@ -10,7 +10,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -167,6 +167,64 @@ impl Client {
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw)?;
         parse_http_response(&raw).map_err(|err| anyhow::anyhow!(err))
+    }
+
+    fn request_with_control(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> anyhow::Result<(u16, Value)> {
+        let deadline = Instant::now() + timeout;
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("request cancelled");
+        }
+        let connect_timeout = timeout.min(Duration::from_secs(2));
+        if connect_timeout.is_zero() {
+            anyhow::bail!("request exceeded its deadline");
+        }
+        let mut stream = TcpStream::connect_timeout(&self.addr, connect_timeout)?;
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        stream.set_write_timeout(Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(30)),
+        ))?;
+        let raw_request = encode_request(
+            method,
+            path,
+            &self.addr.to_string(),
+            body,
+            "application/json",
+        )?;
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("request cancelled");
+        }
+        stream.write_all(&raw_request.0)?;
+        stream.write_all(&raw_request.1)?;
+
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("request cancelled");
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("request exceeded its deadline");
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    raw.extend_from_slice(&chunk[..read]);
+                    anyhow::ensure!(raw.len() <= 1024 * 1024, "control response exceeded 1 MiB");
+                }
+                Err(error) if is_timeout(&error) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        parse_http_response(&raw).map_err(|error| anyhow::anyhow!(error))
     }
 
     /// `GET /v1/health`. Returns `None` when the server is unreachable or
@@ -370,6 +428,29 @@ impl Client {
             "/api/generation/preflight",
             Some(request),
             Duration::from_secs(30),
+        )?;
+        if status != 200 {
+            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        let count = body
+            .get("prompt_token_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
+        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
+    }
+
+    pub fn generation_preflight_with_control(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> anyhow::Result<u32> {
+        let (status, body) = self.request_with_control(
+            "POST",
+            "/api/generation/preflight",
+            Some(request),
+            cancel,
+            timeout,
         )?;
         if status != 200 {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
@@ -913,6 +994,35 @@ mod tests {
             .to_string()
             .contains("chat stream exceeded its model-step deadline"));
         let _ = release_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn generation_preflight_control_honors_cancellation_and_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(listener.local_addr().unwrap());
+        let cancelled = client
+            .generation_preflight_with_control(
+                &json!({}),
+                &AtomicBool::new(true),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(cancelled.to_string().contains("cancelled"));
+
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::park_timeout(Duration::from_secs(1));
+        });
+        let error = client
+            .generation_preflight_with_control(
+                &json!({}),
+                &AtomicBool::new(false),
+                Duration::from_millis(30),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        server.thread().unpark();
         server.join().unwrap();
     }
 

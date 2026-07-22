@@ -8,7 +8,7 @@
 //! instructions (constraint 6). `run_shell` is cwd-pinned + approval-gated, not a
 //! filesystem jail (Decision C / DECISIONS D9).
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -1355,25 +1355,61 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<
 
 // --- execution ------------------------------------------------------------
 
+fn open_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    operation: &str,
+) -> Result<std::fs::File, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("{operation} failed: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{operation} failed: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{operation} refused: path is not a regular file"));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{operation} refused: file exceeds {max_bytes} bytes"
+        ));
+    }
+    Ok(file)
+}
+
+fn read_open_file_bounded(
+    file: std::fs::File,
+    max_bytes: usize,
+    operation: &str,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{operation} failed: {error}"))?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    Ok((bytes, truncated))
+}
+
 fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -> ToolOutcome {
     if start_line.is_some() || max_lines.is_some() {
-        if std::fs::metadata(path)
-            .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
-            .unwrap_or(false)
-        {
+        let file = match open_regular_file(path, MAX_RANGED_FILE_BYTES, "ranged read") {
+            Ok(file) => file,
+            Err(error) => return ToolOutcome::Err(error),
+        };
+        let (bytes, exceeded) =
+            match read_open_file_bounded(file, MAX_RANGED_FILE_BYTES as usize, "ranged read") {
+                Ok(result) => result,
+                Err(error) => return ToolOutcome::Err(error),
+            };
+        if exceeded {
             return ToolOutcome::Err(format!(
                 "ranged read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
             ));
         }
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
-        };
         let start = start_line.unwrap_or(1);
         let limit = max_lines.unwrap_or(200);
         let mut output = String::new();
         let mut returned = 0usize;
-        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        for (index, line) in std::io::Cursor::new(bytes).lines().enumerate() {
             let line_number = index + 1;
             if line_number < start {
                 continue;
@@ -1400,25 +1436,19 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
             output.trim_end().to_string()
         });
     }
-    if std::fs::metadata(path)
-        .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
-        .unwrap_or(false)
-    {
-        return ToolOutcome::Err(format!(
-            "read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
-        ));
-    }
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let truncated = bytes.len() > MAX_READ_BYTES;
-            let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
-            let mut text = String::from_utf8_lossy(slice).into_owned();
+    let file = match open_regular_file(path, MAX_RANGED_FILE_BYTES, "read") {
+        Ok(file) => file,
+        Err(error) => return ToolOutcome::Err(error),
+    };
+    match read_open_file_bounded(file, MAX_READ_BYTES, "read") {
+        Ok((bytes, truncated)) => {
+            let mut text = String::from_utf8_lossy(&bytes).into_owned();
             if truncated {
                 text.push_str(&format!("\n…[truncated at {MAX_READ_BYTES} bytes]"));
             }
             ToolOutcome::Ok(text)
         }
-        Err(e) => ToolOutcome::Err(format!("read failed: {e}")),
+        Err(error) => ToolOutcome::Err(error),
     }
 }
 
@@ -1542,15 +1572,16 @@ fn search(
                 continue;
             }
             files_scanned += 1;
-            if std::fs::metadata(&path)
-                .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(file) = open_regular_file(&path, (MAX_READ_BYTES * 8) as u64, "search") else {
                 continue;
             };
+            let Ok((bytes, exceeded)) = read_open_file_bounded(file, MAX_READ_BYTES * 8, "search")
+            else {
+                continue;
+            };
+            if exceeded {
+                continue;
+            }
             let text = String::from_utf8_lossy(&bytes);
             for (n, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
@@ -1575,16 +1606,17 @@ fn search(
 }
 
 fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> ToolOutcome {
-    if std::fs::metadata(path)
-        .map(|metadata| metadata.len() > (MAX_READ_BYTES * 8) as u64)
-        .unwrap_or(true)
-    {
-        return ToolOutcome::Err("search file is unreadable or exceeds the size limit".into());
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => return ToolOutcome::Err(format!("search read failed: {error}")),
+    let file = match open_regular_file(path, (MAX_READ_BYTES * 8) as u64, "search") {
+        Ok(file) => file,
+        Err(error) => return ToolOutcome::Err(error),
     };
+    let (bytes, exceeded) = match read_open_file_bounded(file, MAX_READ_BYTES * 8, "search") {
+        Ok(result) => result,
+        Err(error) => return ToolOutcome::Err(error),
+    };
+    if exceeded {
+        return ToolOutcome::Err("search refused: file exceeds the size limit".into());
+    }
     let mut hits = Vec::new();
     let mut truncated = false;
     for (line_index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
@@ -2163,6 +2195,16 @@ mod tests {
         let outcome = read_file(&path, None, None);
         assert!(outcome.is_err());
         assert!(outcome.text().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tools_reject_non_regular_infinite_devices() {
+        let path = Path::new("/dev/zero");
+        assert!(read_file(path, None, None).is_err());
+
+        let sandbox = Sandbox::new(Path::new("/dev"), false, Duration::from_secs(5)).unwrap();
+        assert!(search_file("needle", path, 1, &sandbox).is_err());
     }
 
     #[test]

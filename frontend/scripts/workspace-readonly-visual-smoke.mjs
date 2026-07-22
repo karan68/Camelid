@@ -349,8 +349,9 @@ try {
     status: document.querySelector('.workspace-status')?.textContent,
     stoppedText: document.body.textContent.includes('Session stopped'),
     errorText: document.body.textContent.includes('simulated cancel failure'),
+    followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
   }))
-  if (cancelState.status !== 'Error' || cancelState.stoppedText || !cancelState.errorText) {
+  if (cancelState.status !== 'Error' || cancelState.stoppedText || !cancelState.errorText || !cancelState.followUpPresent) {
     throw new Error(`cancel failure was misreported: ${JSON.stringify(cancelState)}`)
   }
   console.log(`cancel-failure: PASS ${JSON.stringify(cancelState)}`)

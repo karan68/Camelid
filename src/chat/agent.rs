@@ -265,6 +265,10 @@ pub fn run_loop(
         ) {
             Ok(result) => result,
             Err(error) => {
+                if cfg.tool_profile.is_workspace() && cancel.load(Ordering::Relaxed) {
+                    reporter.notice("aborted");
+                    return LoopEnd::Aborted;
+                }
                 reporter.notice(&format!("context budget error: {error}"));
                 return LoopEnd::DriverError;
             }
@@ -659,27 +663,6 @@ fn canonical_workspace_inventory(
 }
 
 fn workspace_request_is_immediate_inventory(request: &str) -> bool {
-    let asks_for_contents = [
-        "summarize",
-        "analyse",
-        "analyze",
-        "audit",
-        "review contents",
-        "read all",
-        "inspect contents",
-    ]
-    .iter()
-    .any(|phrase| request.contains(phrase));
-    let asks_recursively = [
-        "recursive",
-        "recursively",
-        "nested",
-        "subfolder",
-        "sub-folder",
-        "subdirector",
-    ]
-    .iter()
-    .any(|phrase| request.contains(phrase));
     let asks_for_inventory = [
         "list all",
         "show all",
@@ -692,7 +675,36 @@ fn workspace_request_is_immediate_inventory(request: &str) -> bool {
     let asks_for_files = request
         .split(|character: char| !character.is_ascii_alphanumeric())
         .any(|word| word == "files");
-    asks_for_inventory && asks_for_files && !asks_for_contents && !asks_recursively
+    let extension_words = workspace_requested_extensions(request)
+        .into_iter()
+        .map(|extension| extension.trim_start_matches('.').to_string())
+        .collect::<std::collections::HashSet<_>>();
+    let only_inventory_words = request
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .all(|word| {
+            extension_words.contains(word)
+                || matches!(
+                    word,
+                    "list"
+                        | "show"
+                        | "find"
+                        | "me"
+                        | "all"
+                        | "the"
+                        | "file"
+                        | "files"
+                        | "in"
+                        | "this"
+                        | "selected"
+                        | "current"
+                        | "folder"
+                        | "directory"
+                        | "and"
+                        | "markdown"
+                )
+        });
+    asks_for_inventory && asks_for_files && only_inventory_words
 }
 
 fn workspace_requested_extensions(request: &str) -> Vec<String> {
@@ -1040,6 +1052,7 @@ pub struct LiveDriver {
     last_step_metrics: Option<ModelStepMetrics>,
     stream_cancel: Option<std::sync::Arc<AtomicBool>>,
     stream_timeout: Option<Duration>,
+    step_deadline: Option<Instant>,
     native_tool_history: bool,
     /// Optional live-token sink. When set (the TUI), `step` streams the model's
     /// output via `chat_stream`, forwards each delta here, and parses tool calls
@@ -1062,6 +1075,7 @@ impl LiveDriver {
             last_step_metrics: None,
             stream_cancel: None,
             stream_timeout: None,
+            step_deadline: None,
             native_tool_history: false,
             on_delta: None,
         }
@@ -1086,6 +1100,7 @@ impl LiveDriver {
             last_step_metrics: None,
             stream_cancel: None,
             stream_timeout: None,
+            step_deadline: None,
             native_tool_history: false,
             on_delta: None,
         }
@@ -1118,7 +1133,9 @@ impl ModelDriver for LiveDriver {
         // TUI lane: stream the model's output live, then parse tool calls from the
         // accumulated raw content (the structured-tool_calls path is non-streaming).
         if self.on_delta.is_some() {
-            return self.step_streamed(history, &tool_defs);
+            let result = self.step_streamed(history, &tool_defs);
+            self.step_deadline = None;
+            return result;
         }
         // First try with a standalone system role (Llama 3.x etc. — unchanged).
         let started = Instant::now();
@@ -1181,10 +1198,20 @@ impl ModelDriver for LiveDriver {
         if let Some(object) = request.as_object_mut() {
             object.remove("camelid_context_budget_tokens");
         }
-        self.client
-            .generation_preflight(&request)
-            .map(Some)
-            .map_err(|error| error.to_string())
+        let count = match (&self.stream_cancel, self.stream_timeout) {
+            (Some(cancel), Some(timeout)) => {
+                let deadline = *self
+                    .step_deadline
+                    .get_or_insert_with(|| Instant::now() + timeout);
+                self.client.generation_preflight_with_control(
+                    &request,
+                    cancel,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+            }
+            _ => self.client.generation_preflight(&request),
+        };
+        count.map(Some).map_err(|error| error.to_string())
     }
 
     fn context_budget_tokens(&self) -> Option<u32> {
@@ -1277,9 +1304,13 @@ impl LiveDriver {
         let req = self.request(history, tool_defs, fold_system, true);
         let mut content = String::new();
         let cancel = self.stream_cancel.as_deref().unwrap_or(&CANCEL);
+        let timeout = self
+            .step_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .or(self.stream_timeout);
         let stats = self
             .client
-            .chat_stream_timed_with_timeout(&req, cancel, self.stream_timeout, |d| {
+            .chat_stream_timed_with_timeout(&req, cancel, timeout, |d| {
                 content.push_str(d);
                 if let Some(cb) = sink.as_mut() {
                     cb(d);
@@ -2378,6 +2409,8 @@ mod tests {
             "Which .rs file implements the parser?",
             "What is the .git directory for?",
             "Check all the .rs files for unsafe code.",
+            "List all .rs files implementing authentication.",
+            "Show me all .md files mentioning CUDA.",
         ] {
             let history = vec![AgentMsg::User(request.into())];
             assert!(
