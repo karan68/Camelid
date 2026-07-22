@@ -21,12 +21,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::agent_eval::EvalOutcome;
 use super::subagent::{self, SubagentConfig};
 
-pub const RECEIPT_SCHEMA_V1: &str = "camelid.agent-orchestration-receipt/v1";
+pub const RECEIPT_SCHEMA_V1: &str = crate::receipt::agent::ORCHESTRATION_RECEIPT_SCHEMA_V1;
 
 pub struct OrchestrationConfig {
     pub receipt_dir: PathBuf,
@@ -75,11 +74,7 @@ struct OrchestrationReceipt {
 
 impl OrchestrationReceipt {
     fn compute_receipt_id(&self) -> String {
-        let mut value = serde_json::to_value(self).expect("receipt serializes to JSON");
-        if let Value::Object(map) = &mut value {
-            map.remove("receipt_id");
-        }
-        crate::receipt::sha256_hex(crate::receipt::canonical_json(&value).as_bytes())
+        crate::receipt::receipt_id_over(&serde_json::to_value(self).expect("receipt serializes"))
     }
     fn seal(&mut self) {
         self.receipt_id = self.compute_receipt_id();
