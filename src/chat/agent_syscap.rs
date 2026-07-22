@@ -16,6 +16,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+// Only the Windows battery (`run_battery`) constructs `ToolCall` args as a
+// `Value`; off-Windows that code is `cfg`'d out, so the import would be unused.
+#[cfg(windows)]
 use serde_json::Value;
 
 use super::agent_eval::EvalOutcome;
