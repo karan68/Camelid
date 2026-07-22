@@ -577,14 +577,16 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     }
   }
 
-  const statusLabel = state.phase === 'idle'
+  const statusLabel = stopPending
+    ? 'Stopping'
+    : state.phase === 'idle'
     ? !toolCapable
       ? 'Model required'
       : runtimeReady
         ? 'Ready'
         : 'Model not ready'
     : PHASE_LABEL[state.phase] || state.phase
-  const statusClass = state.phase === 'idle' && !toolCapable ? 'blocked' : state.phase
+  const statusClass = stopPending ? 'cancelling' : state.phase === 'idle' && !toolCapable ? 'blocked' : state.phase
 
   const openEvidence = (rowId) => {
     window.dispatchEvent(new CustomEvent('camelid:open-ledger', { detail: { rowId } }))

@@ -63,7 +63,11 @@ export function reduceWorkspaceEvent(state, envelope) {
     } else {
       events.push({ ...envelope, event: 'model.live', content })
     }
-    return { ...state, phase: 'running', events: events.slice(-MAX_WORKSPACE_ACTIVITY_EVENTS) }
+    return {
+      ...state,
+      phase: state.phase === 'cancel_error' ? state.phase : 'running',
+      events: events.slice(-MAX_WORKSPACE_ACTIVITY_EVENTS),
+    }
   }
 
   if (event === 'tool.call' || event === 'model.answer') withoutLiveTail()
@@ -84,7 +88,7 @@ export function reduceWorkspaceEvent(state, envelope) {
     return { ...state, phase: 'error', events, turns, error: 'Read-only Workspace received an unexpected approval request.' }
   }
   if (event === 'tool.result') {
-    return { ...state, phase: 'running', events, turns }
+    return { ...state, phase: state.phase === 'cancel_error' ? state.phase : 'running', events, turns }
   }
   if (event === 'session.finished') {
     if (envelope.outcome !== 'answered' && turns.length) {
@@ -96,7 +100,12 @@ export function reduceWorkspaceEvent(state, envelope) {
   if (event === 'session.error') {
     return { ...state, phase: 'error', events, turns, error: String(envelope.message || 'Workspace stopped.') }
   }
-  return { ...state, phase: event === 'session.started' ? 'running' : state.phase, events, turns }
+  return {
+    ...state,
+    phase: event === 'session.started' && state.phase !== 'cancel_error' ? 'running' : state.phase,
+    events,
+    turns,
+  }
 }
 
 export function workspaceEndpoint(apiBase, suffix = '') {

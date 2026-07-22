@@ -355,6 +355,7 @@ try {
   await cancelPage.setViewport({ width: 1280, height: 800 })
   await cancelPage.evaluateOnNewDocument(() => {
     localStorage.setItem('camelid-theme', 'dark')
+    localStorage.removeItem('camelid.workspacePath')
     class HangingEventSource {
       constructor() { this.listeners = new Map(); this.closed = false }
       addEventListener(type, callback) {
@@ -430,7 +431,7 @@ try {
       status: document.querySelector('.workspace-status')?.textContent,
       text: document.querySelector('.workspace-view')?.textContent,
     }))
-    throw new Error(`cancel failure did not reach Error state: ${JSON.stringify(diagnostic)}`)
+    throw new Error(`cancel failure did not reach Stop failed state: ${JSON.stringify(diagnostic)}`)
   }
   const cancelState = await cancelPage.evaluate(() => ({
     status: document.querySelector('.workspace-status')?.textContent,

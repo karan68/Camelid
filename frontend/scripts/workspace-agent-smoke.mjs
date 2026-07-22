@@ -53,6 +53,10 @@ assert.equal(state.turns.length, 1, 'stopping must preserve durable turns')
 state = reduceWorkspaceEvent(state, { event: 'turn.stop_failed', message: 'still running' })
 assert.equal(state.phase, 'cancel_error')
 assert.equal(state.error, 'still running')
+state = reduceWorkspaceEvent(state, { event: 'session.started', model_id: 'late-model' })
+state = reduceWorkspaceEvent(state, { event: 'model.delta', content: 'late delta' })
+state = reduceWorkspaceEvent(state, { event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'late result' })
+assert.equal(state.phase, 'cancel_error', 'late nonterminal SSE events must not erase a failed Stop')
 
 const originalFetch = globalThis.fetch
 const terminalStates = ['running', 'cancelling', 'cancelled']
