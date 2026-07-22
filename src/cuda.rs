@@ -26,6 +26,17 @@ compile_error!(
      declare cudarc as a non-optional Windows dependency."
 );
 
+// MESA: the same default-on guarantee on x86_64 Linux. `build.rs` injects the `cuda`
+// cfg and Cargo.toml declares cudarc non-optional for this target, so a bare `cargo
+// build` can never silently drop to the CPU-only path here either. (aarch64 Linux / Pi
+// and BSD keep CUDA opt-in and are intentionally not guarded.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "cuda")))]
+compile_error!(
+    "CUDA must be enabled by default on x86_64 Linux (MESA): build.rs should emit \
+     `cargo:rustc-cfg=feature=\"cuda\"` for this target and Cargo.toml should declare \
+     cudarc as a non-optional x86_64-linux dependency."
+);
+
 /// Result of probing for a usable CUDA device at startup.
 #[derive(Debug, Clone, Default)]
 pub struct CudaDeviceInfo {

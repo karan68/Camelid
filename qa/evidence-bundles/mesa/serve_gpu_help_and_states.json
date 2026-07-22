@@ -1,0 +1,29 @@
+{
+  "gate": "G3 — `serve --gpu auto|on|off` (env CAMELID_GPU) seeds the runtime switches",
+  "host": "x86_64-pc-windows-msvc (RTX 3060 Laptop present)",
+  "note": "Ran on a REAL CUDA box, so this is a stronger check than the campaign's GPU-less expectation: with a device present, `--gpu off` still forces enabled=false, proving the CPU reference path is genuinely pinned. Endpoint = GET /api/runtime/gpu. No model loaded (empty models dir); switches are seeded before model load. All three server processes killed by PID afterward — no orphans.",
+  "serve_help_gpu": {
+    "flag": "--gpu <GPU>",
+    "env": "CAMELID_GPU",
+    "default": "auto",
+    "possible_values": ["auto", "on", "off"]
+  },
+  "runtime_states": [
+    {
+      "mode": "auto",
+      "startup_log": "camelid gpu mode resolved gpu_mode=Auto cuda_available=true gpu_enabled=true",
+      "GET /api/runtime/gpu": {"available": true, "enabled": true, "device": "NVIDIA GeForce RTX 3060 Laptop GPU", "backend": "cuda", "run_count": 0}
+    },
+    {
+      "mode": "on",
+      "startup_log": "camelid gpu mode resolved gpu_mode=On cuda_available=true gpu_enabled=true",
+      "GET /api/runtime/gpu": {"available": true, "enabled": true, "device": "NVIDIA GeForce RTX 3060 Laptop GPU", "backend": "cuda", "run_count": 0}
+    },
+    {
+      "mode": "off",
+      "startup_log": "camelid gpu mode resolved gpu_mode=Off cuda_available=true gpu_enabled=false",
+      "GET /api/runtime/gpu": {"available": true, "enabled": false, "device": "NVIDIA GeForce RTX 3060 Laptop GPU", "backend": "cuda", "run_count": 0}
+    }
+  ],
+  "result": "PASS — enabled follows the mode (auto→device-driven, on→true, off→false); UI toggle POST /api/runtime/gpu remains able to flip state live afterward (unchanged)."
+}

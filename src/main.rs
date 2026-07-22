@@ -79,6 +79,10 @@ fn default_launch_command() -> Command {
         deterministic: false,
         enable_thinking: false,
         models_dir: std::env::var_os("CAMELID_MODELS_DIR").map(PathBuf::from),
+        // The double-click launch bypasses clap parsing, so the `env` on the `--gpu`
+        // arg does not apply here; read CAMELID_GPU explicitly, like the sibling
+        // env-backed fields above. Default (and any unrecognised value) is Auto.
+        gpu: GpuMode::from_env(),
     }
 }
 
@@ -459,6 +463,38 @@ enum GaitAction {
     Reset,
 }
 
+/// GPU acceleration mode for `serve` (`--gpu`, env `CAMELID_GPU`). Seeds the runtime
+/// GPU switches at startup for headless/agent use where there is no UI to click; the
+/// UI toggle (`POST /api/runtime/gpu`) can still flip state live afterwards.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum GpuMode {
+    /// Use the GPU when a CUDA device is detected; fall back to CPU otherwise (default).
+    /// Leaves the switches to lazy-seed exactly as today (gpu_accel from is_available(),
+    /// hybrid Q8 matmul from CAMELID_CUDA_Q8).
+    Auto,
+    /// Force the GPU path on (still no-ops at runtime without a device).
+    On,
+    /// Force the CPU reference path; never use the GPU even if one is present.
+    Off,
+}
+
+impl GpuMode {
+    /// Resolve from `CAMELID_GPU` for the double-click launch path, which bypasses clap
+    /// arg parsing (so the `env` on the `--gpu` arg does not apply there). Values match
+    /// the clap value names (`auto`/`on`/`off`, case-insensitive); an unset or
+    /// unrecognised value falls back to `Auto`, identical to the clap default.
+    fn from_env() -> Self {
+        match std::env::var("CAMELID_GPU") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "on" => GpuMode::On,
+                "off" => GpuMode::Off,
+                _ => GpuMode::Auto,
+            },
+            Err(_) => GpuMode::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the local HTTP API server.
@@ -530,6 +566,12 @@ enum Command {
         /// to `./models`.
         #[arg(long, env = "CAMELID_MODELS_DIR")]
         models_dir: Option<PathBuf>,
+        /// GPU acceleration mode. `auto` (default) uses the GPU when a CUDA device is
+        /// present, `on` forces it, `off` pins the CPU reference path. Seeds the runtime
+        /// switches at startup for headless/agent runs with no UI; `on`/`off` override the
+        /// env seed, and the Settings toggle can still flip state live after startup.
+        #[arg(long = "gpu", value_enum, default_value_t = GpuMode::Auto, env = "CAMELID_GPU")]
+        gpu: GpuMode,
     },
     /// Interactive terminal chat REPL over the local Camelid API.
     ///
@@ -1472,6 +1514,7 @@ async fn main() -> anyhow::Result<()> {
             deterministic,
             enable_thinking,
             models_dir,
+            gpu,
         } => {
             configure_rayon_threads(threads)?;
             camelid::capability::HardwareProfile::detect().log();
@@ -1491,6 +1534,31 @@ async fn main() -> anyhow::Result<()> {
             if log_acceleration {
                 log_acceleration_state();
             }
+            // Seed the runtime GPU switches from --gpu / CAMELID_GPU before any model
+            // load, for headless/agent runs with no Settings UI to click. `auto` (default)
+            // leaves the atomics uninitialised so they lazy-seed exactly as today
+            // (gpu_accel from is_available(), hybrid Q8 from CAMELID_CUDA_Q8). `on`/`off`
+            // are authoritative at startup and override the env seed; the UI
+            // `POST /api/runtime/gpu` can still flip state live afterwards. Deterministic
+            // mode and CAMELID_CUDA_RESIDENT_DECODE=0 still force the GPU off at their own
+            // call sites regardless of this seed.
+            match gpu {
+                GpuMode::Auto => {}
+                GpuMode::On => {
+                    camelid::cuda::set_gpu_accel_enabled(true);
+                    camelid::cuda::set_runtime_enabled(true);
+                }
+                GpuMode::Off => {
+                    camelid::cuda::set_gpu_accel_enabled(false);
+                    camelid::cuda::set_runtime_enabled(false);
+                }
+            }
+            tracing::info!(
+                gpu_mode = ?gpu,
+                cuda_available = camelid::cuda::is_available(),
+                gpu_enabled = camelid::cuda::gpu_accel_enabled(),
+                "camelid gpu mode resolved"
+            );
             #[cfg(target_os = "macos")]
             unsafe {
                 pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)

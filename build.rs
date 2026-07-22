@@ -38,6 +38,15 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=camelid=/STACK:8388608");
     }
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    // MESA: CUDA is part of the DEFAULT build on x86_64 Linux too (mirrors the Windows
+    // block above). Pairs with the non-optional x86_64-linux `cudarc` in Cargo.toml so a
+    // bare `cargo build` compiles the GPU backend with no `--features cuda`. Driver/NVRTC
+    // load dynamically at runtime (no CUDA SDK to build; no-ops without a device). aarch64
+    // Linux (Pi) is deliberately excluded here and stays opt-in. No Optimus/`/STACK` link
+    // args — those are Windows-only and stay in the windows block above.
+    if target_os == "linux" && target_arch == "x86_64" {
+        println!("cargo:rustc-cfg=feature=\"cuda\"");
+    }
     if target_os != "linux" || target_arch != "x86_64" {
         return;
     }
