@@ -56,29 +56,46 @@ fn content_hash(path: &Path) -> Option<u64> {
     Some(h)
 }
 
-/// Whether `path` resolves inside the sandbox root. Canonicalises the parent so
-/// a symlinked final component cannot smuggle the target outside.
-fn inside_root(sandbox: &Sandbox, path: &Path) -> bool {
-    let Ok(root) = std::fs::canonicalize(sandbox.root()) else {
-        return false;
-    };
-    let canon = match std::fs::canonicalize(path) {
-        Ok(c) => c,
+/// Canonical form of `path` (resolving the parent when the file does not exist
+/// yet, so a symlinked final component cannot smuggle the target elsewhere).
+fn canonical_target(path: &Path) -> Option<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(c) => Some(c),
         Err(_) => {
-            // Does not exist yet: resolve its parent instead.
-            let Some(parent) = path.parent() else {
-                return false;
-            };
-            let Ok(p) = std::fs::canonicalize(parent) else {
-                return false;
-            };
-            match path.file_name() {
-                Some(f) => p.join(f),
-                None => return false,
-            }
+            let p = std::fs::canonicalize(path.parent()?).ok()?;
+            Some(p.join(path.file_name()?))
         }
-    };
-    canon.starts_with(&root)
+    }
+}
+
+/// The workspace-relative path of `target`, computed canonical-to-canonical.
+///
+/// Both sides MUST be canonicalised together: a raw path may arrive in a
+/// different spelling of the same location (macOS `/var` vs `/private/var`;
+/// Windows 8.3 short names like `RUNNERA~1` vs the long form), and a mismatch
+/// silently falls back to an absolute path — whose drive colon then lands in a
+/// flattened backup filename, which NTFS parses as an alternate-data-stream
+/// name and fails with os error 87.
+fn canonical_rel(sandbox: &Sandbox, target: &Path) -> Option<(PathBuf, String)> {
+    let root = std::fs::canonicalize(sandbox.root()).ok()?;
+    let canon = canonical_target(target)?;
+    let rel = canon.strip_prefix(&root).ok()?.display().to_string();
+    Some((canon, rel))
+}
+
+/// A flattened path safe as a single filename component on every platform:
+/// anything outside [A-Za-z0-9._-] becomes '_' (colons would be NTFS stream
+/// syntax; separators would be directories).
+fn flat_name(rel: &str) -> String {
+    rel.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn log() -> &'static Mutex<Vec<Checkpoint>> {
@@ -102,14 +119,12 @@ pub fn all() -> Vec<Checkpoint> {
 /// user asked for, so problems are swallowed. The one thing it will not do is
 /// write outside the jail.
 pub fn prepare(sandbox: &Sandbox, path: &Path, tool: &str) -> Option<Pending> {
-    // Only files inside the workspace are snapshotted. With --allow-fs the
-    // agent may legitimately write elsewhere, but copying those into an
-    // in-workspace store would pull outside content across the boundary the
-    // store lives behind — so they get no undo, rather than a leak.
-    if !inside_root(sandbox, path) {
-        return None;
-    }
-    let rel = sandbox.rel(path);
+    // Only files inside the workspace are snapshotted (canonical_rel returns
+    // None for anything outside the canonical root). With --allow-fs the agent
+    // may legitimately write elsewhere, but copying those into an in-workspace
+    // store would pull outside content across the boundary the store lives
+    // behind — so they get no undo, rather than a leak.
+    let (target_canon, rel) = canonical_rel(sandbox, path)?;
     // Create the store first, then resolve it through the jail. `resolve` with
     // must_exist=false canonicalises the *parent*, so it cannot resolve a
     // two-level path whose first level does not exist yet — the store has to
@@ -124,12 +139,9 @@ pub fn prepare(sandbox: &Sandbox, path: &Path, tool: &str) -> Option<Pending> {
         // atomic counter + the flattened path can collide with nothing.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let flat: String = rel
-            .chars()
-            .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-            .collect();
+        let flat = flat_name(&rel);
         let dest = dir.join(format!("{}_{seq:04}_{flat}", std::process::id()));
-        std::fs::copy(path, &dest).ok()?;
+        std::fs::copy(&target_canon, &dest).ok()?;
         Some(dest)
     } else {
         None
@@ -139,7 +151,7 @@ pub fn prepare(sandbox: &Sandbox, path: &Path, tool: &str) -> Option<Pending> {
         rel,
         backup,
         tool: tool.to_string(),
-        target: path.to_path_buf(),
+        target: target_canon,
     })
 }
 
@@ -179,6 +191,7 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
         g.last().cloned().ok_or("nothing to undo")?
     };
     let target = sandbox.resolve(&cp.rel, false)?;
+    let target = canonical_target(&target).unwrap_or(target);
 
     if !force {
         if let (Some(expected), Some(now)) = (cp.post_hash, content_hash(&target)) {
