@@ -2588,6 +2588,7 @@ mod tests {
 
     #[test]
     fn fs_unrestricted_allows_writes_outside_the_root() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
         // The default sandbox jails to its root; --allow-fs lifts that so a
         // computer-control agent can write to e.g. the Desktop. The approval gate
         // (tested elsewhere) is the remaining backstop.
@@ -2636,6 +2637,7 @@ mod tests {
 
     #[test]
     fn write_then_edit_within_sandbox() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path());
         let w = validate(
@@ -2681,6 +2683,7 @@ mod tests {
 
     #[test]
     fn edit_non_unique_is_a_clean_error() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("d.txt"), "x x x").unwrap();
         let sb = sandbox(dir.path());
@@ -2739,15 +2742,29 @@ mod tests {
             "write_file",
         ];
         if cfg!(windows) {
+            // Only the two READ-tier Windows tools are unconditional; the
+            // exec-tier GUI/shell set rides the shell gate below.
             expected.extend(["inspect_system", "ui_inspect"]);
         }
         expected.sort_unstable();
-        assert_eq!(names(false, ShellSandbox::Disabled), expected);
+        assert_eq!(
+            names(false, ShellSandbox::Disabled),
+            expected,
+            "the advertised tool set changed — update this pin deliberately"
+        );
 
-        let mut shell_expected = expected.clone();
-        shell_expected.push("run_shell");
+        // The two documented widenings, and nothing else rides along with them.
+        let added = |got: &[String]| -> Vec<String> {
+            got.iter()
+                .filter(|n| !expected.contains(&n.as_str()))
+                .cloned()
+                .collect()
+        };
+        let mut shell_added = vec!["run_shell"];
         if cfg!(windows) {
-            shell_expected.extend([
+            // Grouped under the same exec kill-switch as the shell (tools.rs
+            // registers them inside the `shell_mode != Disabled` block).
+            shell_added.extend([
                 "mouse_click",
                 "mouse_move",
                 "press_keys",
@@ -2757,13 +2774,12 @@ mod tests {
                 "ui_click",
             ]);
         }
-        shell_expected.sort_unstable();
-        assert_eq!(names(false, ShellSandbox::Sandboxed), shell_expected);
-
-        let mut network_expected = expected;
-        network_expected.extend(["http_fetch", "web_search"]);
-        network_expected.sort_unstable();
-        assert_eq!(names(true, ShellSandbox::Disabled), network_expected);
+        shell_added.sort_unstable();
+        assert_eq!(added(&names(false, ShellSandbox::Sandboxed)), shell_added);
+        assert_eq!(
+            added(&names(true, ShellSandbox::Disabled)),
+            ["http_fetch", "web_search"]
+        );
     }
 
     #[test]
