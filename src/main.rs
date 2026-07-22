@@ -15,7 +15,7 @@ extern "C" {
 }
 
 use camelid::{
-    api,
+    api, chat,
     cluster::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
@@ -37,8 +37,6 @@ use camelid::{
 use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
-
-mod chat;
 
 // Prefer the git describe stamped in by build.rs (e.g. "v0.1.1" or
 // "v0.1.1-3-gabcdef-dirty"); fall back to the crate version for builds without
@@ -1201,16 +1199,18 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
-    /// Verify a parity receipt: self-digest, lane identity, an in-process
-    /// Camelid re-run, and a llama.cpp reference re-run. A verified receipt
-    /// proves one request matched the reference for one exact GGUF; it does
-    /// not change any support claim.
+    /// Verify a receipt. For a parity receipt: self-digest, lane identity, an
+    /// in-process Camelid re-run, and a llama.cpp reference re-run (requires
+    /// `--gguf`). For a sealed agent-family receipt (syscap / orchestration /
+    /// bench): a self-contained tamper-evidence + honest-scope check, no GGUF.
+    /// A verified receipt changes no support claim.
     VerifyReceipt {
         /// Path to the receipt JSON file.
         receipt: PathBuf,
-        /// The exact GGUF file the receipt names (its SHA-256 must match).
+        /// The exact GGUF the receipt names (its SHA-256 must match). Required
+        /// for a parity receipt; agent-family receipts need no GGUF.
         #[arg(long)]
-        gguf: PathBuf,
+        gguf: Option<PathBuf>,
         /// llama-server binary for the reference re-run (path or name in PATH).
         #[arg(long, default_value = "llama-server")]
         llama_server: String,
@@ -2528,7 +2528,31 @@ async fn main() -> anyhow::Result<()> {
             llama_port,
             threads,
         } => {
+            // Route a sealed agent-family receipt to its self-contained verifier
+            // (no model, no GGUF). Any doubt about the schema falls through to the
+            // parity path below, which is left unchanged.
+            let is_agent = std::fs::read_to_string(&receipt)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("schema")
+                        .and_then(|schema| schema.as_str())
+                        .map(camelid::receipt::agent::is_agent_schema)
+                })
+                .unwrap_or(false);
+            if is_agent {
+                let outcome = camelid::receipt::agent::run(&receipt);
+                std::process::exit(outcome.exit_code());
+            }
+
             configure_rayon_threads(threads)?;
+            let gguf = gguf.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "parity verification requires the exact GGUF via --gguf; agent-family \
+                     receipts (syscap / orchestration / bench) need no GGUF"
+                )
+            })?;
             let mode = if self_only {
                 camelid::receipt::verify::VerifyMode::SelfOnly
             } else if reference_only {
@@ -7329,56 +7353,71 @@ fn write_step_logits(dir: &std::path::Path, step: usize, logits: &[f32]) -> std:
 mod basalt_forced_decode_tests {
     use super::*;
 
+    fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn CLI parse test")
+            .join()
+            .expect("CLI parse test panicked");
+    }
+
     #[test]
     fn gemma4_generate_parses_forced_decode_flags() {
-        let cli = Cli::try_parse_from([
-            "camelid",
-            "gemma4-generate",
-            "model.gguf",
-            "--force-tokens",
-            "toks.txt",
-            "--dump-step-logits",
-            "dumps",
-            "--max-tokens",
-            "8",
-        ])
-        .expect("parse");
-        match cli.command {
-            Some(Command::Gemma4Generate {
-                path,
-                max_tokens,
-                force_tokens,
-                dump_step_logits,
-                ..
-            }) => {
-                assert_eq!(path, PathBuf::from("model.gguf"));
-                assert_eq!(max_tokens, 8);
-                assert_eq!(force_tokens, Some(PathBuf::from("toks.txt")));
-                assert_eq!(dump_step_logits, Some(PathBuf::from("dumps")));
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "gemma4-generate",
+                "model.gguf",
+                "--force-tokens",
+                "toks.txt",
+                "--dump-step-logits",
+                "dumps",
+                "--max-tokens",
+                "8",
+            ])
+            .expect("parse");
+            match cli.command {
+                Some(Command::Gemma4Generate {
+                    path,
+                    max_tokens,
+                    force_tokens,
+                    dump_step_logits,
+                    ..
+                }) => {
+                    assert_eq!(path, PathBuf::from("model.gguf"));
+                    assert_eq!(max_tokens, 8);
+                    assert_eq!(force_tokens, Some(PathBuf::from("toks.txt")));
+                    assert_eq!(dump_step_logits, Some(PathBuf::from("dumps")));
+                }
+                other => panic!("expected Gemma4Generate, got {other:?}"),
             }
-            other => panic!("expected Gemma4Generate, got {other:?}"),
-        }
+        });
     }
 
     #[test]
     fn gemma4_generate_harness_flags_default_off() {
-        let cli = Cli::try_parse_from(["camelid", "gemma4-generate", "model.gguf"]).expect("parse");
-        match cli.command {
-            Some(Command::Gemma4Generate {
-                prompt,
-                max_tokens,
-                force_tokens,
-                dump_step_logits,
-                ..
-            }) => {
-                // Default behavior unchanged: no harness flags, prior defaults intact.
-                assert_eq!(force_tokens, None);
-                assert_eq!(dump_step_logits, None);
-                assert_eq!(prompt, "The capital of France is");
-                assert_eq!(max_tokens, 24);
+        on_cli_test_stack(|| {
+            let cli =
+                Cli::try_parse_from(["camelid", "gemma4-generate", "model.gguf"]).expect("parse");
+            match cli.command {
+                Some(Command::Gemma4Generate {
+                    prompt,
+                    max_tokens,
+                    force_tokens,
+                    dump_step_logits,
+                    ..
+                }) => {
+                    // Default behavior unchanged: no harness flags, prior defaults intact.
+                    assert_eq!(force_tokens, None);
+                    assert_eq!(dump_step_logits, None);
+                    assert_eq!(prompt, "The capital of France is");
+                    assert_eq!(max_tokens, 24);
+                }
+                other => panic!("expected Gemma4Generate, got {other:?}"),
             }
-            other => panic!("expected Gemma4Generate, got {other:?}"),
-        }
+        });
     }
 
     #[test]

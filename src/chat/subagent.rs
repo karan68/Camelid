@@ -601,6 +601,7 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         temperature: 0.0,
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: shell_mode,
+        tool_profile: super::tools::ToolProfile::Full,
         // A subagent runs a real, open-ended goal, so it gets the same context
         // protection the parent has.
         ctx_budget: Some(agent::AGENT_VALIDATED_CTX),

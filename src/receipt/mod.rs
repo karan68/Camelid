@@ -18,6 +18,7 @@
 //! body (sorted keys, no insignificant whitespace, `receipt_id` excluded), so
 //! a receipt can be cited by fingerprint and trivially checked for tampering.
 
+pub mod agent;
 pub mod distributed;
 pub mod verify;
 
@@ -611,6 +612,23 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex_lower(&hasher.finalize())
 }
 
+/// The sealed `receipt_id` a JSON receipt body must carry: the lowercase-hex
+/// SHA-256 over the canonical serialization (recursively key-sorted, compact) of
+/// the body with the top-level `receipt_id` field removed.
+///
+/// This is the single definition of the repo's tamper-evident receipt digest.
+/// [`ParityReceipt::compute_receipt_id`] computes the identical value from its
+/// typed body (a unit test locks the two together), and the sealed agent-family
+/// receipts in `chat/` plus the standalone [`agent`] verifier all go through
+/// here — so a digest and its later check can never drift.
+pub fn receipt_id_over(body: &Value) -> String {
+    let mut value = body.clone();
+    if let Value::Object(map) = &mut value {
+        map.remove("receipt_id");
+    }
+    sha256_hex(canonical_json(&value).as_bytes())
+}
+
 /// Lowercase hex SHA-256 of a file, computed with a streaming reader so large
 /// GGUFs are never held in memory.
 pub fn sha256_file_hex(path: &Path) -> Result<String, ReceiptError> {
@@ -754,6 +772,26 @@ mod tests {
         receipt
             .verify_self_digest()
             .expect("legacy digest verifies");
+    }
+
+    #[test]
+    fn receipt_id_over_matches_the_parity_convention() {
+        // `receipt_id_over` is the single digest primitive shared by the
+        // agent-family emitters and the standalone agent verifier. Lock it to the
+        // ParityReceipt convention so the two implementations can never diverge.
+        let mut receipt = sample_receipt();
+        receipt.seal().expect("seal");
+        let body = serde_json::to_value(&receipt).expect("receipt serializes");
+        assert_eq!(
+            receipt_id_over(&body),
+            receipt.receipt_id,
+            "the shared primitive must reproduce the sealed receipt_id"
+        );
+        assert_eq!(
+            receipt_id_over(&body),
+            receipt.compute_receipt_id().expect("compute"),
+            "the shared primitive must equal ParityReceipt::compute_receipt_id"
+        );
     }
 
     #[test]

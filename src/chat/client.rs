@@ -10,7 +10,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -120,6 +120,18 @@ pub enum StreamEnd {
     Cancelled,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct StreamStats {
+    pub end: StreamEnd,
+    pub deltas: u32,
+    pub total_ms: u64,
+    pub ttft_ms: Option<u64>,
+    /// Server-reported prompt tokens from the terminal usage chunk, present
+    /// when the request opted in via `stream_options.include_usage` (the agent
+    /// lane's calibration signal); `None` otherwise.
+    pub prompt_tokens: Option<u32>,
+}
+
 #[derive(Clone)]
 pub struct Client {
     addr: SocketAddr,
@@ -159,6 +171,64 @@ impl Client {
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw)?;
         parse_http_response(&raw).map_err(|err| anyhow::anyhow!(err))
+    }
+
+    fn request_with_control(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> anyhow::Result<(u16, Value)> {
+        let deadline = Instant::now() + timeout;
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("request cancelled");
+        }
+        let connect_timeout = timeout.min(Duration::from_secs(2));
+        if connect_timeout.is_zero() {
+            anyhow::bail!("request exceeded its deadline");
+        }
+        let mut stream = TcpStream::connect_timeout(&self.addr, connect_timeout)?;
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        stream.set_write_timeout(Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(30)),
+        ))?;
+        let raw_request = encode_request(
+            method,
+            path,
+            &self.addr.to_string(),
+            body,
+            "application/json",
+        )?;
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("request cancelled");
+        }
+        stream.write_all(&raw_request.0)?;
+        stream.write_all(&raw_request.1)?;
+
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("request cancelled");
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("request exceeded its deadline");
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    raw.extend_from_slice(&chunk[..read]);
+                    anyhow::ensure!(raw.len() <= 1024 * 1024, "control response exceeded 1 MiB");
+                }
+                Err(error) if is_timeout(&error) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        parse_http_response(&raw).map_err(|error| anyhow::anyhow!(error))
     }
 
     /// `GET /v1/health`. Returns `None` when the server is unreachable or
@@ -252,8 +322,30 @@ impl Client {
         &self,
         request: &Value,
         cancel: &AtomicBool,
+        on_delta: impl FnMut(&str),
+    ) -> anyhow::Result<(StreamEnd, u32)> {
+        let stats = self.chat_stream_timed(request, cancel, on_delta)?;
+        Ok((stats.end, stats.deltas))
+    }
+
+    pub fn chat_stream_timed(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+        on_delta: impl FnMut(&str),
+    ) -> anyhow::Result<StreamStats> {
+        self.chat_stream_timed_with_timeout(request, cancel, None, on_delta)
+    }
+
+    pub fn chat_stream_timed_with_timeout(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+        timeout: Option<Duration>,
         mut on_delta: impl FnMut(&str),
-    ) -> anyhow::Result<(StreamEnd, u32, Option<u32>)> {
+    ) -> anyhow::Result<StreamStats> {
+        let started = std::time::Instant::now();
+        let deadline = timeout.map(|timeout| started + timeout);
         // A short read timeout lets the loop wake to check `cancel` even while
         // the server is mid-generation and no bytes are arriving.
         let mut stream = self.connect(Duration::from_millis(250))?;
@@ -268,8 +360,14 @@ impl Client {
         stream.write_all(&body)?;
 
         let mut reader = SseReader::new(stream);
-        if reader.read_headers(cancel)? {
-            return Ok((StreamEnd::Cancelled, 0, None));
+        if reader.read_headers(cancel, deadline)? {
+            return Ok(StreamStats {
+                end: StreamEnd::Cancelled,
+                deltas: 0,
+                total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                ttft_ms: None,
+                prompt_tokens: None,
+            });
         }
         if reader.status != 200 {
             let message = reader.drain_error_body();
@@ -277,10 +375,11 @@ impl Client {
         }
 
         let mut deltas: u32 = 0;
+        let mut ttft_ms = None;
         // From the terminal usage chunk, when the request opted in via
         // stream_options.include_usage (agent lane); absent otherwise.
         let mut prompt_tokens: Option<u32> = None;
-        let end = reader.stream(cancel, |line| {
+        let end = reader.stream(cancel, deadline, |line| {
             if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
                 if payload == "[DONE]" {
@@ -292,6 +391,9 @@ impl Client {
                         .and_then(Value::as_str)
                     {
                         if !content.is_empty() {
+                            ttft_ms.get_or_insert_with(|| {
+                                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                            });
                             deltas += 1;
                             on_delta(content);
                         }
@@ -306,7 +408,13 @@ impl Client {
             }
             SseControl::Continue
         })?;
-        Ok((end, deltas, prompt_tokens))
+        Ok(StreamStats {
+            end,
+            deltas,
+            total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            ttft_ms,
+            prompt_tokens,
+        })
     }
 
     /// POST a chat request and return the full assistant turn: text content PLUS
@@ -327,6 +435,46 @@ impl Client {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
         }
         Ok(parse_chat_turn(&body))
+    }
+
+    pub fn generation_preflight(&self, request: &Value) -> anyhow::Result<u32> {
+        let (status, body) = self.request(
+            "POST",
+            "/api/generation/preflight",
+            Some(request),
+            Duration::from_secs(30),
+        )?;
+        if status != 200 {
+            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        let count = body
+            .get("prompt_token_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
+        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
+    }
+
+    pub fn generation_preflight_with_control(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> anyhow::Result<u32> {
+        let (status, body) = self.request_with_control(
+            "POST",
+            "/api/generation/preflight",
+            Some(request),
+            cancel,
+            timeout,
+        )?;
+        if status != 200 {
+            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        let count = body
+            .get("prompt_token_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
+        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
     }
 
     /// Text-only convenience over [`chat_turn`] for the plain chat UI (which never
@@ -458,7 +606,11 @@ impl SseReader {
     /// leaving any post-header body bytes in `pending`. Returns `true` if Ctrl-C
     /// cancelled while waiting (the server may prefill for many seconds before the
     /// first byte, so a read timeout here is normal and is retried, not an error).
-    fn read_headers(&mut self, cancel: &AtomicBool) -> anyhow::Result<bool> {
+    fn read_headers(
+        &mut self,
+        cancel: &AtomicBool,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<bool> {
         let mut scratch = [0u8; 4096];
         loop {
             if let Some(end) = find(&self.pending, b"\r\n\r\n") {
@@ -486,6 +638,9 @@ impl SseReader {
             }
             if cancel.load(Ordering::Relaxed) {
                 return Ok(true);
+            }
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                anyhow::bail!("chat stream exceeded its model-step deadline");
             }
             match self.stream.read(&mut scratch) {
                 Ok(0) => anyhow::bail!("connection closed before HTTP headers completed"),
@@ -540,6 +695,7 @@ impl SseReader {
     fn stream(
         &mut self,
         cancel: &AtomicBool,
+        deadline: Option<std::time::Instant>,
         mut on_line: impl FnMut(&str) -> SseControl,
     ) -> anyhow::Result<StreamEnd> {
         let mut decoder = ChunkDecoder::new(self.chunked);
@@ -553,6 +709,9 @@ impl SseReader {
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(StreamEnd::Cancelled);
+            }
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                anyhow::bail!("chat stream exceeded its model-step deadline");
             }
             match self.stream.read(&mut scratch) {
                 Ok(0) => return Ok(StreamEnd::Done),
@@ -743,6 +902,8 @@ fn decode_chunked(mut raw: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
 
     #[test]
     fn parse_chat_turn_reads_structured_tool_calls() {
@@ -822,6 +983,62 @@ mod tests {
         }
         assert!(done_seen, "stream must terminate on [DONE]");
         assert_eq!(collected, "Certainly");
+    }
+
+    #[test]
+    fn sse_header_read_honors_model_step_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut reader = SseReader::new(stream);
+        let error = reader
+            .read_headers(
+                &AtomicBool::new(false),
+                Some(std::time::Instant::now() + Duration::from_millis(30)),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("chat stream exceeded its model-step deadline"));
+        let _ = release_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn generation_preflight_control_honors_cancellation_and_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(listener.local_addr().unwrap());
+        let cancelled = client
+            .generation_preflight_with_control(
+                &json!({}),
+                &AtomicBool::new(true),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(cancelled.to_string().contains("cancelled"));
+
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::park_timeout(Duration::from_secs(1));
+        });
+        let error = client
+            .generation_preflight_with_control(
+                &json!({}),
+                &AtomicBool::new(false),
+                Duration::from_millis(30),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        server.thread().unpark();
+        server.join().unwrap();
     }
 
     #[test]

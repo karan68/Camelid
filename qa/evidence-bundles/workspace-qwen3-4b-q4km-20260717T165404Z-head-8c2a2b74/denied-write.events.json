@@ -1,0 +1,680 @@
+[
+  {
+    "sequence": 1,
+    "session_id": "<session_id>",
+    "event": "session.started",
+    "workspace": "<workspace>",
+    "model_id": "qwen3_4b_q4_k_m"
+  },
+  {
+    "sequence": 2,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "<tool_call>"
+  },
+  {
+    "sequence": 3,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\n"
+  },
+  {
+    "sequence": 4,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "{\""
+  },
+  {
+    "sequence": 5,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "name"
+  },
+  {
+    "sequence": 6,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 7,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 8,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "write"
+  },
+  {
+    "sequence": 9,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "_file"
+  },
+  {
+    "sequence": 10,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\","
+  },
+  {
+    "sequence": 11,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 12,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "arguments"
+  },
+  {
+    "sequence": 13,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 14,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " {\""
+  },
+  {
+    "sequence": 15,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "content"
+  },
+  {
+    "sequence": 16,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 17,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 18,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "DEN"
+  },
+  {
+    "sequence": 19,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "IED"
+  },
+  {
+    "sequence": 20,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " MUST"
+  },
+  {
+    "sequence": 21,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " NOT"
+  },
+  {
+    "sequence": 22,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " EX"
+  },
+  {
+    "sequence": 23,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "IST"
+  },
+  {
+    "sequence": 24,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\","
+  },
+  {
+    "sequence": 25,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 26,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "path"
+  },
+  {
+    "sequence": 27,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 28,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 29,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "den"
+  },
+  {
+    "sequence": 30,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "ied"
+  },
+  {
+    "sequence": 31,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": ".txt"
+  },
+  {
+    "sequence": 32,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\"}}\n"
+  },
+  {
+    "sequence": 33,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "</tool_call>"
+  },
+  {
+    "sequence": 34,
+    "session_id": "<session_id>",
+    "event": "tool.call",
+    "detail": "write_file(denied.txt, 21 bytes)"
+  },
+  {
+    "sequence": 35,
+    "session_id": "<session_id>",
+    "event": "approval.required",
+    "approval_id": "<approval_id>",
+    "tool": "write_file",
+    "risk": "write",
+    "detail": "write_file → denied.txt\n  create: 1 lines\n--- proposed content ---\nDENIED MUST NOT EXIST"
+  },
+  {
+    "sequence": 36,
+    "session_id": "<session_id>",
+    "event": "tool.result",
+    "tool": "write_file",
+    "outcome": "error",
+    "content": "the user denied this action"
+  },
+  {
+    "sequence": 37,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "The"
+  },
+  {
+    "sequence": 38,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " action"
+  },
+  {
+    "sequence": 39,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " to"
+  },
+  {
+    "sequence": 40,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " create"
+  },
+  {
+    "sequence": 41,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 42,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " file"
+  },
+  {
+    "sequence": 43,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " `"
+  },
+  {
+    "sequence": 44,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "den"
+  },
+  {
+    "sequence": 45,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "ied"
+  },
+  {
+    "sequence": 46,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": ".txt"
+  },
+  {
+    "sequence": 47,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "`"
+  },
+  {
+    "sequence": 48,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " with"
+  },
+  {
+    "sequence": 49,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 50,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " exact"
+  },
+  {
+    "sequence": 51,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " contents"
+  },
+  {
+    "sequence": 52,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 53,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "DEN"
+  },
+  {
+    "sequence": 54,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "IED"
+  },
+  {
+    "sequence": 55,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " MUST"
+  },
+  {
+    "sequence": 56,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " NOT"
+  },
+  {
+    "sequence": 57,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " EX"
+  },
+  {
+    "sequence": 58,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "IST"
+  },
+  {
+    "sequence": 59,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\""
+  },
+  {
+    "sequence": 60,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " was"
+  },
+  {
+    "sequence": 61,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " denied"
+  },
+  {
+    "sequence": 62,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "."
+  },
+  {
+    "sequence": 63,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " This"
+  },
+  {
+    "sequence": 64,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " could"
+  },
+  {
+    "sequence": 65,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " be"
+  },
+  {
+    "sequence": 66,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " due"
+  },
+  {
+    "sequence": 67,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " to"
+  },
+  {
+    "sequence": 68,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " a"
+  },
+  {
+    "sequence": 69,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " policy"
+  },
+  {
+    "sequence": 70,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " or"
+  },
+  {
+    "sequence": 71,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " restriction"
+  },
+  {
+    "sequence": 72,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " in"
+  },
+  {
+    "sequence": 73,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 74,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " sandbox"
+  },
+  {
+    "sequence": 75,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "ed"
+  },
+  {
+    "sequence": 76,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " environment"
+  },
+  {
+    "sequence": 77,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " that"
+  },
+  {
+    "sequence": 78,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " prevents"
+  },
+  {
+    "sequence": 79,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " certain"
+  },
+  {
+    "sequence": 80,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " file"
+  },
+  {
+    "sequence": 81,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " operations"
+  },
+  {
+    "sequence": 82,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "."
+  },
+  {
+    "sequence": 83,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " If"
+  },
+  {
+    "sequence": 84,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " you"
+  },
+  {
+    "sequence": 85,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " need"
+  },
+  {
+    "sequence": 86,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " to"
+  },
+  {
+    "sequence": 87,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " create"
+  },
+  {
+    "sequence": 88,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 89,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " file"
+  },
+  {
+    "sequence": 90,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": ","
+  },
+  {
+    "sequence": 91,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " you"
+  },
+  {
+    "sequence": 92,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " may"
+  },
+  {
+    "sequence": 93,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " need"
+  },
+  {
+    "sequence": 94,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " to"
+  },
+  {
+    "sequence": 95,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " check"
+  },
+  {
+    "sequence": 96,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 97,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " permissions"
+  },
+  {
+    "sequence": 98,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " or"
+  },
+  {
+    "sequence": 99,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " policies"
+  },
+  {
+    "sequence": 100,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " of"
+  },
+  {
+    "sequence": 101,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 102,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " workspace"
+  },
+  {
+    "sequence": 103,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " and"
+  },
+  {
+    "sequence": 104,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " ensure"
+  },
+  {
+    "sequence": 105,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " that"
+  },
+  {
+    "sequence": 106,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 107,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " operation"
+  },
+  {
+    "sequence": 108,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " is"
+  },
+  {
+    "sequence": 109,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " allowed"
+  },
+  {
+    "sequence": 110,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "."
+  },
+  {
+    "sequence": 111,
+    "session_id": "<session_id>",
+    "event": "model.answer",
+    "content": "The action to create the file `denied.txt` with the exact contents \"DENIED MUST NOT EXIST\" was denied. This could be due to a policy or restriction in the sandboxed environment that prevents certain file operations. If you need to create the file, you may need to check the permissions or policies of the workspace and ensure that the operation is allowed."
+  },
+  {
+    "sequence": 112,
+    "session_id": "<session_id>",
+    "event": "session.finished",
+    "outcome": "answered"
+  }
+]

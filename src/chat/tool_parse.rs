@@ -88,19 +88,105 @@ fn parse_bare_call(text: &str) -> Vec<ToolCall> {
     }
 }
 
+/// Parse JSON leniently for model-emitted tool calls. On Windows, models often
+/// place paths like `C:\workspace\docs` or `\\?\C:\x` inside JSON string values without
+/// escaping the backslashes — invalid JSON. When a strict parse fails, repair any
+/// backslash that does not begin a valid JSON escape by doubling it, then retry
+/// once. Returns `None` if it still will not parse.
+fn json_from_str_lenient(s: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(s) {
+        return Some(value);
+    }
+    serde_json::from_str::<Value>(&repair_path_backslashes(s)).ok()
+}
+
+/// Public wrapper for the structured-`tool_calls` path: parse an arguments string
+/// leniently, defaulting to an empty object.
+pub(crate) fn json_args_lenient(s: &str) -> Value {
+    json_from_str_lenient(s).unwrap_or_else(|| Value::Object(Default::default()))
+}
+
+/// Repair unescaped Windows separators only in path-shaped JSON fields. Other
+/// strings may contain valid escapes such as `\n` or `\uXXXX`; rewriting the
+/// entire arguments object would silently change file content and patterns.
+fn repair_path_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut cursor = 0usize;
+    let mut repair_next_string = false;
+    while cursor < s.len() {
+        let Some(relative_start) = s[cursor..].find('"') else {
+            out.push_str(&s[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        out.push_str(&s[cursor..start]);
+        let Some(end) = json_string_end(s, start) else {
+            out.push_str(&s[start..]);
+            break;
+        };
+        let token = &s[start..=end];
+        let next = s[end + 1..].trim_start().chars().next();
+        if next == Some(':') {
+            let key = serde_json::from_str::<String>(token).unwrap_or_default();
+            repair_next_string = matches!(key.as_str(), "path" | "cwd");
+            out.push_str(token);
+        } else if repair_next_string {
+            out.push_str(&repair_path_string(token));
+            repair_next_string = false;
+        } else {
+            out.push_str(token);
+        }
+        cursor = end + 1;
+    }
+    out
+}
+
+fn json_string_end(s: &str, start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, character) in s[start + 1..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some(start + 1 + offset);
+        }
+    }
+    None
+}
+
+fn repair_path_string(token: &str) -> String {
+    let mut out = String::with_capacity(token.len() + 4);
+    let mut chars = token.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            match chars.peek() {
+                Some('"' | '\\') => {
+                    out.push('\\');
+                    out.push(chars.next().unwrap());
+                }
+                _ => out.push_str("\\\\"),
+            }
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
 /// `[TOOL_CALLS] [{"name": …, "arguments": {…}}, …]` (Mistral Instruct v0.3+).
 fn parse_mistral(text: &str) -> Vec<ToolCall> {
     let marker = "[TOOL_CALLS]";
     if let Some(idx) = text.find(marker) {
         let rest = text[idx + marker.len()..].trim();
-        if let Ok(value) = serde_json::from_str::<Value>(rest) {
+        if let Some(value) = json_from_str_lenient(rest) {
             return calls_from_value(&value);
         }
         // The model sometimes appends an EOS token or trailing text after the array;
         // try to extract the first balanced [...] substring.
         if let Some(start) = rest.find('[') {
             let slice = &rest[start..];
-            if let Ok(value) = serde_json::from_str::<Value>(slice) {
+            if let Some(value) = json_from_str_lenient(slice) {
                 return calls_from_value(&value);
             }
         }
@@ -108,7 +194,7 @@ fn parse_mistral(text: &str) -> Vec<ToolCall> {
     // Mistral v0.3 GGUF emits bare JSON arrays without [TOOL_CALLS] marker.
     // Extract the first balanced [...] block, ignoring trailing prose.
     if let Some(arr_slice) = first_json_array(text.trim()) {
-        if let Ok(value) = serde_json::from_str::<Value>(arr_slice) {
+        if let Some(value) = json_from_str_lenient(arr_slice) {
             let calls = calls_from_value(&value);
             if !calls.is_empty() {
                 return calls;
@@ -132,7 +218,7 @@ fn parse_hermes(text: &str) -> Vec<ToolCall> {
             }
             None => rest,
         };
-        if let Ok(value) = serde_json::from_str::<Value>(inner.trim()) {
+        if let Some(value) = json_from_str_lenient(inner.trim()) {
             if let Some(call) = call_from_obj(&value) {
                 calls.push(call);
             }
@@ -205,12 +291,12 @@ fn parse_ornith(text: &str) -> Vec<ToolCall> {
 fn parse_json(text: &str) -> Vec<ToolCall> {
     let cleaned = strip_markers(text);
     let trimmed = cleaned.trim();
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+    if let Some(value) = json_from_str_lenient(trimmed) {
         return calls_from_value(&value);
     }
     // Otherwise try to extract the first balanced {…} object.
     if let Some(slice) = first_json_object(trimmed) {
-        if let Ok(value) = serde_json::from_str::<Value>(slice) {
+        if let Some(value) = json_from_str_lenient(slice) {
             return calls_from_value(&value);
         }
     }
@@ -371,6 +457,49 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "list_dir");
         assert_eq!(out[0].args["path"], ".");
+    }
+
+    #[test]
+    fn parses_windows_path_with_unescaped_backslashes() {
+        // Qwen echoes a Windows workspace path with single (JSON-invalid) backslashes.
+        let out = parse(
+            r#"<tool_call>{"name": "list_dir", "arguments": {"path": "C:\workspace\docs"}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "list_dir");
+        assert_eq!(out[0].args["path"], r"C:\workspace\docs");
+    }
+
+    #[test]
+    fn lenient_parse_preserves_valid_escapes() {
+        // Valid JSON (with legitimate \n and \") must parse strictly and be untouched.
+        let out = parse(
+            r#"<tool_call>{"name":"write_file","arguments":{"path":"a.txt","content":"line1\nline2 \"q\""}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].args["content"], "line1\nline2 \"q\"");
+    }
+
+    #[test]
+    fn lenient_path_repair_does_not_corrupt_other_string_escapes() {
+        let out = parse(
+            r#"<tool_call>{"name":"write_file","arguments":{"path":"C:\workspace\note.txt","content":"line1\nline2\t\u263A"}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].args["path"], r"C:\workspace\note.txt");
+        assert_eq!(out[0].args["content"], "line1\nline2\t☺");
+    }
+
+    #[test]
+    fn json_args_lenient_repairs_or_defaults() {
+        assert_eq!(json_args_lenient(r#"{"path":"C:\a\b"}"#)["path"], r"C:\a\b");
+        assert_eq!(
+            json_args_lenient("not json"),
+            Value::Object(Default::default())
+        );
     }
 
     #[test]

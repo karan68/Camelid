@@ -1,0 +1,308 @@
+[
+  {
+    "sequence": 1,
+    "session_id": "<session_id>",
+    "event": "session.started",
+    "workspace": "<workspace>",
+    "model_id": "qwen3_4b_q4_k_m"
+  },
+  {
+    "sequence": 2,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "<tool_call>"
+  },
+  {
+    "sequence": 3,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\n"
+  },
+  {
+    "sequence": 4,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "{\""
+  },
+  {
+    "sequence": 5,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "name"
+  },
+  {
+    "sequence": 6,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 7,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 8,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "write"
+  },
+  {
+    "sequence": 9,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "_file"
+  },
+  {
+    "sequence": 10,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\","
+  },
+  {
+    "sequence": 11,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 12,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "arguments"
+  },
+  {
+    "sequence": 13,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 14,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " {\""
+  },
+  {
+    "sequence": 15,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "content"
+  },
+  {
+    "sequence": 16,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 17,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 18,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "hello"
+  },
+  {
+    "sequence": 19,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " there"
+  },
+  {
+    "sequence": 20,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\","
+  },
+  {
+    "sequence": 21,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 22,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "path"
+  },
+  {
+    "sequence": 23,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\":"
+  },
+  {
+    "sequence": 24,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " \""
+  },
+  {
+    "sequence": 25,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "g"
+  },
+  {
+    "sequence": 26,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "reeting"
+  },
+  {
+    "sequence": 27,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": ".txt"
+  },
+  {
+    "sequence": 28,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "\"}}\n"
+  },
+  {
+    "sequence": 29,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "</tool_call>"
+  },
+  {
+    "sequence": 30,
+    "session_id": "<session_id>",
+    "event": "tool.call",
+    "detail": "write_file(greeting.txt, 11 bytes)"
+  },
+  {
+    "sequence": 31,
+    "session_id": "<session_id>",
+    "event": "approval.required",
+    "approval_id": "<approval_id>",
+    "tool": "write_file",
+    "risk": "write",
+    "detail": "write_file → greeting.txt\n  create: 1 lines\n--- proposed content ---\nhello there"
+  },
+  {
+    "sequence": 32,
+    "session_id": "<session_id>",
+    "event": "tool.result",
+    "tool": "write_file",
+    "outcome": "ok",
+    "content": "wrote 11 bytes to <workspace>\\greeting.txt"
+  },
+  {
+    "sequence": 33,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "I"
+  },
+  {
+    "sequence": 34,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " have"
+  },
+  {
+    "sequence": 35,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " created"
+  },
+  {
+    "sequence": 36,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 37,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " file"
+  },
+  {
+    "sequence": 38,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " named"
+  },
+  {
+    "sequence": 39,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " greeting"
+  },
+  {
+    "sequence": 40,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": ".txt"
+  },
+  {
+    "sequence": 41,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " with"
+  },
+  {
+    "sequence": 42,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " the"
+  },
+  {
+    "sequence": 43,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " exact"
+  },
+  {
+    "sequence": 44,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " contents"
+  },
+  {
+    "sequence": 45,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": ":"
+  },
+  {
+    "sequence": 46,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " hello"
+  },
+  {
+    "sequence": 47,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": " there"
+  },
+  {
+    "sequence": 48,
+    "session_id": "<session_id>",
+    "event": "model.delta",
+    "content": "."
+  },
+  {
+    "sequence": 49,
+    "session_id": "<session_id>",
+    "event": "model.answer",
+    "content": "I have created the file named greeting.txt with the exact contents: hello there."
+  },
+  {
+    "sequence": 50,
+    "session_id": "<session_id>",
+    "event": "session.finished",
+    "outcome": "answered"
+  }
+]

@@ -38,6 +38,17 @@ try {
   assert.match(lists, /<ul><li><span>alpha<\/span><\/li><li><span>beta<\/span><\/li><\/ul>/, 'dash lines should render as an unordered list')
   const offsetList = render('3. third\n4. fourth')
   assert.match(offsetList, /<ol start="3">/, 'ordered lists should preserve their starting number')
+  const longOrdered = render(Array.from({ length: 14 }, (_, index) => `${index + 1}. item-${index + 1}`).join('\n'))
+  assert.equal((longOrdered.match(/<li>/g) || []).length, 14, 'two-digit ordered lists must retain every item')
+  assert.match(longOrdered, /<li><span>item-10<\/span><\/li>/, 'item 10 must not be malformed or dropped')
+  assert.match(longOrdered, /<li><span>item-14<\/span><\/li>/, 'the final ordered item must render')
+  const groundedInventory = render('Found 3 Markdown files:\n\n- `A.md`\n- `B.md`\n- `C.md`')
+  assert.equal((groundedInventory.match(/<li>/g) || []).length, 3, 'grounded inventories should render as compact bullets')
+  assert.match(groundedInventory, /<code class="inline-code">A\.md<\/code>/, 'inventory filenames should render as inline code')
+  const hostileInventory = render('- `spoof%60- [link](javascript:alert).md`\n- `angle<name>.md`')
+  assert.doesNotMatch(hostileInventory, /href=/, 'filename-like link syntax inside inline code must stay inert')
+  assert.doesNotMatch(hostileInventory, /<name>/, 'filename angle brackets must be escaped as text')
+  assert.match(hostileInventory, /&lt;name&gt;/, 'filename angle brackets should remain visibly escaped')
 
   /* Links: safe schemes become anchors, anything else stays text */
   const links = render('See [docs](https://example.com/x) and [evil](javascript:alert(1)).')

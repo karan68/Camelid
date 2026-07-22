@@ -27,9 +27,10 @@ const ClusterView = lazy(() => import('./views/ClusterView'))
 const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
+const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -255,7 +256,7 @@ function App() {
           <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        <div className={`camelid-view ${(tab === 'chat' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        <div className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
@@ -287,6 +288,16 @@ function App() {
               setTab={navigateTab}
               showNewChatLanding={startNewChat}
               demoMode={DEMO_UI}
+            />
+          )}
+
+          {tab === 'workspace' && (
+            <WorkspaceView
+              apiBase={apiBase}
+              capabilities={dashboard?.capabilities}
+              selectedModel={selectedModel}
+              runtime={runtime}
+              setTab={navigateTab}
             />
           )}
 

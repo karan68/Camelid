@@ -109,6 +109,7 @@ Every interface talks to the same local engine — pick whichever fits your work
 | **Terminal UI** | `camelid chat` — full-screen; `--plain` for a line REPL over SSH | Working entirely in the shell |
 | **HTTP API** | OpenAI-style `/v1/*`, served alongside the UI on the same port | Wiring Camelid into your own apps |
 | **Agent mode** | `camelid chat --agent --model <gguf>` — approval-gated tool calls | Coding-agent work in your own repo |
+| **Workspace** (preview) | Open **Workspace** in the Web UI | Read-only, resumable analysis of a local folder |
 
 **Agent mode — Supported (experimental).** `camelid chat --agent` is an approval-gated
 tool-calling loop that can
@@ -120,6 +121,12 @@ only models the compatibility ledger marks `tool_capable` are eligible (promoted
 explicitly not claimed — is pinned in [COMPATIBILITY.md](COMPATIBILITY.md), backed by the live-lane
 bundle `qa/evidence-bundles/agent-mode-supported-experimental-20260722/`. Review every requested
 action: approval is the contract.
+
+**Workspace (preview).** Choose one local directory and ask follow-up questions across a durable
+conversation. Workspace can only list, read, and search within that canonical root; writes, shell,
+network, GUI control, and subagents are unavailable. File inventories are grounded in observed
+directory entries, and reversible compaction keeps long threads within an exact context budget.
+Workspace requires a loaded exact model row that has earned `tool_capable: true`.
 
 With `--allow-net` the agent also gets `web_search` (ranked title/url/snippet results) alongside
 `http_fetch`. Results are untrusted data — reading one is a separate, separately-approved

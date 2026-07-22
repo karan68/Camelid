@@ -184,7 +184,7 @@ fn dispatch(session: &mut Session, rl: &mut DefaultEditor, command: &str) -> any
         "pull" => {
             if arg.is_empty() {
                 println!("usage: /pull <alias>   (e.g. /pull tinyllama)");
-            } else if let Err(err) = camelid::catalog::run_pull(Some(arg), session.models_dir()) {
+            } else if let Err(err) = crate::catalog::run_pull(Some(arg), session.models_dir()) {
                 eprintln!("pull failed: {err}");
             } else {
                 println!("{}", banner::dim("downloaded — use /models to load it"));
@@ -265,14 +265,14 @@ fn generate(session: &mut Session) -> Gen {
     });
     println!();
     match result {
-        Ok((StreamEnd::Done, deltas, _)) => {
+        Ok((StreamEnd::Done, deltas)) => {
             session.last_prompt_tokens = None;
             session.last_completion_tokens = Some(deltas);
             session.push_assistant(assistant);
             print_stats(session, Some(deltas), started);
             Gen::Done
         }
-        Ok((StreamEnd::Cancelled, _, _)) => {
+        Ok((StreamEnd::Cancelled, _)) => {
             println!(
                 "{}",
                 banner::dim("^C — interrupted; this turn was discarded")
@@ -467,7 +467,7 @@ fn select_row(
             if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
                 return Ok(());
             }
-            camelid::catalog::run_pull(Some(item.catalog_id), session.models_dir())?;
+            crate::catalog::run_pull(Some(item.catalog_id), session.models_dir())?;
             load_row(session, row);
         }
     }

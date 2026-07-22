@@ -10925,6 +10925,29 @@ struct ResidentCudaSlot {
     range: std::ops::Range<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ResidentCudaStatus {
+    pub max_positions: usize,
+    pub filled_positions: usize,
+    pub offloaded: bool,
+}
+
+#[cfg(feature = "cuda")]
+pub fn resident_cuda_status(model_cache_key: u64) -> Option<ResidentCudaStatus> {
+    let cache = resident_cuda_cache().try_lock().ok()?;
+    let slot = cache.as_ref()?;
+    (slot.key == model_cache_key as usize).then(|| ResidentCudaStatus {
+        max_positions: slot.engine.max_pos(),
+        filled_positions: slot.engine.filled(),
+        offloaded: slot.engine.is_offloaded(),
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn resident_cuda_status(_model_cache_key: u64) -> Option<ResidentCudaStatus> {
+    None
+}
+
 #[cfg(feature = "cuda")]
 fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =

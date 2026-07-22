@@ -6,6 +6,18 @@ import { connect as netConnect } from 'node:net'
 import { hostname as osHostname, platform as osPlatform } from 'node:os'
 import { join, resolve } from 'node:path'
 
+const DEV_API_TARGET = process.env.VITE_CAMELID_PROXY_TARGET || 'http://127.0.0.1:8181'
+
+function apiProxy() {
+  return {
+    target: DEV_API_TARGET,
+    changeOrigin: true,
+    configure(proxy) {
+      proxy.on('proxyReq', (request) => request.setHeader('Origin', DEV_API_TARGET))
+    },
+  }
+}
+
 /* Probe common locations for a built `camelid` binary so Settings can suggest a
    working launch command (the binary often isn't on the dev server's PATH). */
 function detectCamelidCommand(repoRoot) {
@@ -161,6 +173,10 @@ export default defineConfig({
   server: {
     host: '127.0.0.1',
     port: 4175,
+    proxy: {
+      '/api': apiProxy(),
+      '/v1': apiProxy(),
+    },
   },
   preview: {
     host: '127.0.0.1',
