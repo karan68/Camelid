@@ -284,6 +284,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const [compatibleModelsError, setCompatibleModelsError] = useState('')
   const [setupPercent, setSetupPercent] = useState(initialSetupPercent)
   const [resizing, setResizing] = useState(false)
+  const [stopPending, setStopPending] = useState(false)
   const workspaceRef = useRef(null)
   const eventSourceRef = useRef(null)
   const sessionRef = useRef(null)
@@ -300,8 +301,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const target = compatibility?.target || null
   const toolCapable = Boolean(hasLoadedModel && compatibility?.exact && target?.tool_capable && String(target.status || '').startsWith('supported'))
   const runtimeReady = runtime?.status === 'online' && runtime?.loaded_now && runtime?.generation_ready
-  const running = ['starting', 'running', 'cancelling', 'cancel_error'].includes(state.phase)
-  const stopping = state.phase === 'cancelling'
+  const running = stopPending || ['starting', 'running', 'cancelling', 'cancel_error'].includes(state.phase)
+  const stopping = stopPending
   const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
   const conversation = state.turns
   const hiddenTurnCount = Math.max(0, conversation.length - MAX_RENDERED_TURNS)
@@ -474,6 +475,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
 
   const stop = async () => {
     if (!session || stopping) return
+    setStopPending(true)
     dispatch({ event: 'turn.stopping' })
     try {
       const status = await cancelWorkspaceSession(apiBase, session.id)
@@ -486,6 +488,8 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
       eventSourceRef.current = null
     } catch (error) {
       dispatch({ event: 'turn.stop_failed', message: error.message })
+    } finally {
+      setStopPending(false)
     }
   }
 

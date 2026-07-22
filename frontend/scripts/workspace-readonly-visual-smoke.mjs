@@ -301,7 +301,18 @@ try {
       }
       close() { this.closed = true }
     }
-    globalThis.EventSource = HangingEventSource
+    globalThis.__emitWorkspace = (payload) => {
+      const source = globalThis.__workspaceSource
+      const callback = source?.listeners.get('workspace')
+      if (callback && !source.closed) callback({ data: JSON.stringify(payload) })
+    }
+    const OriginalEventSource = HangingEventSource
+    globalThis.EventSource = class extends OriginalEventSource {
+      constructor(...args) {
+        super(...args)
+        globalThis.__workspaceSource = this
+      }
+    }
   })
   await cancelPage.setRequestInterception(true)
   let cancelAttempts = 0
@@ -370,12 +381,14 @@ try {
 
   await cancelPage.click('.workspace-setup__actions .cx-btn--outline')
   await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Stopping', { timeout: 5000 })
+  await cancelPage.evaluate(() => globalThis.__emitWorkspace({ sequence: 3, event: 'session.finished', outcome: 'aborted' }))
   const stoppingState = await cancelPage.evaluate(() => ({
     status: document.querySelector('.workspace-status')?.textContent,
     followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
   }))
   if (stoppingState.followUpPresent) throw new Error(`follow-up appeared while cancellation was settling: ${JSON.stringify(stoppingState)}`)
   await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Stopped', { timeout: 5000 })
+  await cancelPage.waitForSelector('.workspace-follow-up', { timeout: 5000 })
   const settledState = await cancelPage.evaluate(() => ({
     status: document.querySelector('.workspace-status')?.textContent,
     followUpPresent: Boolean(document.querySelector('.workspace-follow-up')),
