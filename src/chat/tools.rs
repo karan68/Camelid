@@ -256,6 +256,8 @@ const MAX_RANGED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 4_096;
 const MAX_SEARCH_FILES: usize = 5_000;
 const MAX_SEARCH_DURATION: Duration = Duration::from_secs(2);
+const FULL_SEARCH_HITS: u64 = 100;
+const WORKSPACE_SEARCH_HITS: u64 = 20;
 
 impl Sandbox {
     /// Build a sandbox rooted at `root` (canonicalized). Fails if the root does
@@ -301,6 +303,10 @@ impl Sandbox {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn permits(&self, path: &Path) -> bool {
+        self.fs_unrestricted || path == self.root || path.starts_with(&self.root)
     }
 
     /// The workspace root as a clean display string with the Windows extended-length
@@ -373,30 +379,32 @@ impl Sandbox {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolProfile {
     Full,
-    WorkspaceFiles,
     WorkspaceReadOnly,
 }
 
 impl ToolProfile {
     pub fn allows(self, tool: &str) -> bool {
         self == ToolProfile::Full
-            || (self == ToolProfile::WorkspaceFiles
-                && matches!(
-                    tool,
-                    "read_file" | "list_dir" | "search" | "write_file" | "edit_file"
-                ))
             || (self == ToolProfile::WorkspaceReadOnly
                 && matches!(tool, "read_file" | "list_dir" | "search"))
     }
 
     pub fn is_workspace(self) -> bool {
-        matches!(self, Self::WorkspaceFiles | Self::WorkspaceReadOnly)
+        self == Self::WorkspaceReadOnly
     }
 
     pub fn observation_limit(self) -> Option<usize> {
         match self {
             Self::Full => None,
-            Self::WorkspaceFiles | Self::WorkspaceReadOnly => Some(2 * 1024),
+            Self::WorkspaceReadOnly => Some(2 * 1024),
+        }
+    }
+
+    fn search_hit_limit(self) -> u64 {
+        if self.is_workspace() {
+            WORKSPACE_SEARCH_HITS
+        } else {
+            FULL_SEARCH_HITS
         }
     }
 }
@@ -426,7 +434,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             name: "search",
             description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex or glob syntax.",
             risk: Risk::Read,
-            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"required":["pattern"]}),
+            params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
         ToolSpec {
             name: "write_file",
@@ -442,10 +450,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
     ];
     if profile == ToolProfile::WorkspaceReadOnly {
-        tools.truncate(3);
-        return tools;
-    }
-    if profile == ToolProfile::WorkspaceFiles {
+        tools.retain(|tool| profile.allows(tool.name));
         return tools;
     }
     if shell_mode != ShellSandbox::Disabled {
@@ -667,6 +672,7 @@ pub enum Action {
         pattern: String,
         path: PathBuf,
         limit: usize,
+        bounded: bool,
     },
     WriteFile {
         path: PathBuf,
@@ -830,6 +836,7 @@ impl Action {
                 pattern,
                 path,
                 limit,
+                ..
             } => {
                 format!("search({pattern:?}, {}, limit={limit})", sandbox.rel(path))
             }
@@ -885,15 +892,8 @@ impl Action {
     /// The full, verbatim approval text — exactly what will happen.
     pub fn approval_detail(&self, sandbox: &Sandbox) -> String {
         match self {
-            Action::WriteFile {
-                path,
-                content,
-                summary,
-            } => {
-                format!(
-                    "write_file → {}\n{summary}\n--- proposed content ---\n{content}",
-                    sandbox.rel(path)
-                )
+            Action::WriteFile { path, summary, .. } => {
+                format!("write_file → {}\n{summary}", sandbox.rel(path))
             }
             Action::EditFile { path, old, new } => format!(
                 "edit_file → {}\n  - {}\n  + {}",
@@ -954,7 +954,8 @@ impl Action {
                 pattern,
                 path,
                 limit,
-            } => search(pattern, path, *limit, sandbox),
+                bounded,
+            } => search(pattern, path, *limit, *bounded, sandbox),
             Action::WriteFile { path, content, .. } => write_file(path, content),
             Action::EditFile { path, old, new } => edit_file(path, old, new),
             Action::RunShell { command } => run_shell(sandbox, command),
@@ -1064,14 +1065,21 @@ pub fn validate_for(
         "search" => {
             let pattern = str_arg("pattern")?;
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
-            if !(1..=20).contains(&limit) {
-                return Err("search requires limit between 1 and 20".into());
+            let max_limit = profile.search_hit_limit();
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(max_limit);
+            if !(1..=max_limit).contains(&limit) {
+                return Err(format!(
+                    "search requires limit between 1 and {max_limit} in this agent mode"
+                ));
             }
             Ok(Action::Search {
                 pattern,
                 path: sandbox.resolve(path, true)?,
                 limit: limit as usize,
+                bounded: profile.is_workspace(),
             })
         }
         "write_file" => {
@@ -1392,6 +1400,14 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
             output.trim_end().to_string()
         });
     }
+    if std::fs::metadata(path)
+        .map(|metadata| metadata.len() > MAX_RANGED_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        return ToolOutcome::Err(format!(
+            "read refused: file exceeds {MAX_RANGED_FILE_BYTES} bytes"
+        ));
+    }
     match std::fs::read(path) {
         Ok(bytes) => {
             let truncated = bytes.len() > MAX_READ_BYTES;
@@ -1407,25 +1423,25 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
 }
 
 fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
-    let mut entries = Vec::new();
+    let mut entries = std::collections::BinaryHeap::new();
     let mut capped = false;
     let read = match std::fs::read_dir(path) {
         Ok(r) => r,
         Err(e) => return ToolOutcome::Err(format!("list failed: {e}")),
     };
     for entry in read.flatten() {
-        if entries.len() >= MAX_LIST_ENTRIES {
-            capped = true;
-            break;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let suffix = match entry.file_type() {
             Ok(t) if t.is_dir() => "/",
             _ => "",
         };
         entries.push(format!("{name}{suffix}"));
+        if entries.len() > MAX_LIST_ENTRIES {
+            entries.pop();
+            capped = true;
+        }
     }
-    entries.sort();
+    let entries = entries.into_sorted_vec();
     let total = entries.len();
     let page_limit = limit.unwrap_or(total);
     let page = entries
@@ -1463,10 +1479,16 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     })
 }
 
-fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOutcome {
+fn search(
+    pattern: &str,
+    root: &Path,
+    limit: usize,
+    bounded: bool,
+    sandbox: &Sandbox,
+) -> ToolOutcome {
     let needle = pattern.to_lowercase();
     let root = match std::fs::canonicalize(root) {
-        Ok(root) if root == sandbox.root || root.starts_with(&sandbox.root) => root,
+        Ok(root) if sandbox.permits(&root) => root,
         _ => return ToolOutcome::Err("search path is unavailable or outside the workspace".into()),
     };
     if root.is_file() {
@@ -1480,8 +1502,8 @@ fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOu
     let mut truncated = false;
     while let Some(dir) = stack.pop() {
         if hits.len() >= limit
-            || files_scanned >= MAX_SEARCH_FILES
-            || started.elapsed() >= MAX_SEARCH_DURATION
+            || (bounded
+                && (files_scanned >= MAX_SEARCH_FILES || started.elapsed() >= MAX_SEARCH_DURATION))
         {
             truncated = true;
             break;
@@ -1489,8 +1511,7 @@ fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOu
         let Ok(dir) = std::fs::canonicalize(dir) else {
             continue;
         };
-        if !(dir == sandbox.root || dir.starts_with(&sandbox.root)) || !visited.insert(dir.clone())
-        {
+        if !sandbox.permits(&dir) || !visited.insert(dir.clone()) {
             continue;
         }
         let Ok(read) = std::fs::read_dir(&dir) else {
@@ -1498,8 +1519,9 @@ fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOu
         };
         for entry in read.flatten() {
             if hits.len() >= limit
-                || files_scanned >= MAX_SEARCH_FILES
-                || started.elapsed() >= MAX_SEARCH_DURATION
+                || (bounded
+                    && (files_scanned >= MAX_SEARCH_FILES
+                        || started.elapsed() >= MAX_SEARCH_DURATION))
             {
                 truncated = true;
                 break;
@@ -1507,7 +1529,7 @@ fn search(pattern: &str, root: &Path, limit: usize, sandbox: &Sandbox) -> ToolOu
             let Ok(path) = std::fs::canonicalize(entry.path()) else {
                 continue;
             };
-            if !(path == sandbox.root || path.starts_with(&sandbox.root)) {
+            if !sandbox.permits(&path) {
                 continue;
             }
             if path.is_dir() {
@@ -2099,19 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_profile_is_exactly_the_scoped_file_tool_set() {
-        let names = specs_for(
-            ToolProfile::WorkspaceFiles,
-            true,
-            ShellSandbox::Unrestricted,
-        )
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["read_file", "list_dir", "search", "write_file", "edit_file"]
-        );
+    fn workspace_profile_is_exactly_the_read_only_tool_set() {
         let read_only = specs_for(
             ToolProfile::WorkspaceReadOnly,
             true,
@@ -2141,6 +2151,42 @@ mod tests {
         let action = validate(&call("read_file", json!({"path":"a.txt"})), &sb).unwrap();
         let out = action.execute(&sb);
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hello")));
+    }
+
+    #[test]
+    fn bare_read_rejects_oversized_file_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_RANGED_FILE_BYTES + 1).unwrap();
+
+        let outcome = read_file(&path, None, None);
+        assert!(outcome.is_err());
+        assert!(outcome.text().contains("exceeds"));
+    }
+
+    #[test]
+    fn search_limits_are_profile_specific() {
+        let full = specs_for(ToolProfile::Full, false, ShellSandbox::Disabled)
+            .into_iter()
+            .find(|tool| tool.name == "search")
+            .unwrap();
+        let workspace = specs_for(
+            ToolProfile::WorkspaceReadOnly,
+            false,
+            ShellSandbox::Disabled,
+        )
+        .into_iter()
+        .find(|tool| tool.name == "search")
+        .unwrap();
+        assert_eq!(full.params["properties"]["limit"]["maximum"], 100);
+        assert_eq!(workspace.params["properties"]["limit"]["maximum"], 20);
+
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let request = call("search", json!({"pattern":"x","limit":100}));
+        assert!(validate_for(ToolProfile::Full, &request, &sb).is_ok());
+        assert!(validate_for(ToolProfile::WorkspaceReadOnly, &request, &sb).is_err());
     }
 
     #[test]
@@ -2225,7 +2271,8 @@ mod tests {
         }
         let output = list_dir(dir.path(), MAX_LIST_ENTRIES - 1, Some(2));
         let retained = output.text().lines().next().unwrap();
-        assert!(retained.starts_with("entry-") && retained.ends_with(".md"));
+        assert_eq!(retained, "entry-4095.md");
+        assert!(!output.text().contains("entry-4096.md"));
         assert!(output
             .text()
             .contains("additional entries exist and cannot be paged"));
@@ -2276,6 +2323,28 @@ mod tests {
     }
 
     #[test]
+    fn fs_unrestricted_allows_search_outside_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("note.txt");
+        std::fs::write(&target, "outside needle").unwrap();
+        let free = sandbox(root.path()).with_fs_unrestricted(true);
+        let action = validate_for(
+            ToolProfile::Full,
+            &call(
+                "search",
+                json!({"path": target.to_str().unwrap(), "pattern": "needle"}),
+            ),
+            &free,
+        )
+        .unwrap();
+
+        let outcome = action.execute(&free);
+        assert!(!outcome.is_err(), "{}", outcome.text());
+        assert!(outcome.text().contains("outside needle"));
+    }
+
+    #[test]
     fn write_then_edit_within_sandbox() {
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path());
@@ -2303,7 +2372,7 @@ mod tests {
     }
 
     #[test]
-    fn write_approval_discloses_exact_path_and_content() {
+    fn write_approval_is_bounded_to_path_and_summary() {
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path());
         let action = validate(
@@ -2316,7 +2385,8 @@ mod tests {
         .unwrap();
         let detail = action.approval_detail(&sb);
         assert!(detail.contains("write_file → greeting.txt"));
-        assert!(detail.contains("--- proposed content ---\nhello there"));
+        assert!(detail.contains("create: 1 lines"));
+        assert!(!detail.contains("hello there"));
     }
 
     #[test]

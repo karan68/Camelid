@@ -441,6 +441,7 @@ pub(crate) fn run_live(
         config.temperature,
     );
     driver.set_context_budget(Some(WORKSPACE_CONTEXT_BUDGET_TOKENS));
+    driver.set_native_tool_history(true);
     driver.set_stream_control(Arc::clone(&worker.cancel), WORKSPACE_MODEL_STEP_TIMEOUT);
     let delta_reporter = worker.reporter.clone();
     driver.set_delta_sink(Some(Box::new(move |delta| {
@@ -581,7 +582,7 @@ mod tests {
             temperature: 0.0,
             audit: Box::new(NoopSink),
             shell_sandbox: ShellSandbox::Disabled,
-            tool_profile: ToolProfile::WorkspaceFiles,
+            tool_profile: ToolProfile::Full,
         }
     }
 

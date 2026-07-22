@@ -4,7 +4,7 @@ import { IconClose } from './icons'
 import { IconButton } from './IconButton'
 
 /* Modal — accessible dialog with backdrop, Esc-to-close, scroll lock, focus capture. */
-export function Modal({ open, onClose, title, children, footer = null, labelledById, size = 'md', className = '', overlayClassName = '' }) {
+export function Modal({ open, onClose, title, children, footer = null, labelledById, size = 'md', className = '' }) {
   const panelRef = useRef(null)
 
   useEffect(() => {
@@ -32,7 +32,7 @@ export function Modal({ open, onClose, title, children, footer = null, labelledB
   if (!open || typeof document === 'undefined') return null
 
   return createPortal(
-    <div className={`cx-modal-overlay ${overlayClassName}`.trim()} onMouseDown={(e) => { if (e.target === e.currentTarget) onClose?.() }}>
+    <div className="cx-modal-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose?.() }}>
       <div
         ref={panelRef}
         className={`cx-modal cx-modal--${size} ${className}`.trim()}

@@ -107,7 +107,7 @@ This makes a *small, fast* window behave like a *large, persistent* memory, and 
 - `src/api/workspace.rs` — Workspace HTTP handlers + `WorkspaceSessionManager` (one active session), request/response structs, loopback `authorize` guard, the browse endpoint, `simplify_path` (Windows `\\?\` stripping).
 - `src/chat/workspace_bridge.rs` — `run_live(...)`, `WorkspaceRunConfig`, the bounded event bridge (`bridge`, `WorkspaceEvent`, `WorkspaceBridgeControl`), and construction of the `Sandbox` + system prompt + `AgentConfig`.
 - `src/chat/agent.rs` — the agent loop (`run_loop`), traits `ModelDriver`/`Reporter`/`Approver`, `LiveDriver` (calls the chat API), `system_prompt(sandbox, tools)`, `history_to_messages(...)`, `AgentMsg` enum.
-- `src/chat/tools.rs` — `Sandbox` (canonical‑root confinement, `resolve`, `rel`, `root`, `root_display`), `ToolProfile` (`Full`, `WorkspaceFiles`), tool specs, tool execution, size caps.
+- `src/chat/tools.rs` — `Sandbox` (canonical-root confinement, `resolve`, `rel`, `root`, `root_display`), `ToolProfile` (`Full`, `WorkspaceReadOnly`), tool specs, tool execution, size caps.
 - `src/chat/tool_parse.rs` — parses model output into `ToolCall`s (Qwen/Hermes `<tool_call>{json}</tool_call>`, Llama JSON, Mistral, Ornith XML), plus the lenient Windows‑path JSON repair added on this branch.
 
 ### 2.2 HTTP routes (current) **[VERIFIED]**
@@ -115,29 +115,38 @@ This makes a *small, fast* window behave like a *large, persistent* memory, and 
 POST   /api/agent/workspace/sessions            create_session (one active session; 409 if busy)
 GET    /api/agent/workspace/models              compatible_models (tool_capable exact rows)
 GET    /api/agent/workspace/browse              browse (read-only dir listing; loopback-guarded)
+GET    /api/agent/workspace/threads             list saved threads for one canonical root
+GET    /api/agent/workspace/threads/:id         load a saved transcript
+DELETE /api/agent/workspace/threads/:id         delete an inactive saved thread
+POST   /api/agent/workspace/threads/:id/compact compact completed turns
+DELETE /api/agent/workspace/threads/:id/compact undo the latest compaction
 GET    /api/agent/workspace/sessions/:id        session_status
 DELETE /api/agent/workspace/sessions/:id        cancel_session
 GET    /api/agent/workspace/sessions/:id/events SSE event stream (event name: "workspace")
+POST   /api/agent/workspace/sessions/:id/messages idempotent follow-up turn
 POST   /api/agent/workspace/sessions/:id/decisions  approval decision
 ```
-Auth: loopback host + same‑origin/loopback origin (`authorize` / `local_management_request_allowed`). **[VERIFIED]**
+Auth: loopback-bound server + loopback `Host` + exact same-authority `Origin` or same-origin fetch metadata (`authorize` / `local_management_request_allowed`). **[VERIFIED]**
 
-### 2.3 The five tools (WorkspaceFiles profile) **[VERIFIED]**
-`read_file`, `list_dir`, `search`, `write_file`, `edit_file`. All confined to the canonical workspace root by `Sandbox::resolve(raw, must_exist)` which joins relative paths to root, canonicalizes, and rejects anything not under root. Reads auto‑run; writes/edits are approval‑gated.
+### 2.3 The three tools (WorkspaceReadOnly profile) **[VERIFIED]**
+`read_file`, `list_dir`, and literal-content `search`. All are confined to the canonical workspace root by `Sandbox::resolve(raw, must_exist)`, which joins relative paths to the root, canonicalizes after symlink resolution, and rejects anything not under the root. No write/edit/exec/network tool is advertised or accepted.
 
 Relevant caps in `src/chat/tools.rs` **[VERIFIED]**:
 ```
 MAX_READ_BYTES   = 64 * 1024   // read_file output cap
 MAX_OUTPUT_BYTES = 16 * 1024
-MAX_SEARCH_HITS  = 100
+MAX_RANGED_FILE_BYTES = 8 * 1024 * 1024
+MAX_LIST_ENTRIES = 4096
+Workspace search = 20 hits, 5000 files, 2 seconds
 ```
 
 ### 2.4 Session limits (`src/api/workspace.rs`) **[VERIFIED]**
 ```
 DEFAULT_MAX_STEPS = 12    MAX_STEPS  = 32
-DEFAULT_MAX_TOKENS= 800   MAX_TOKENS = 4096
-MAX_GOAL_BYTES    = 16 * 1024
+DEFAULT_MAX_TOKENS= 512   MAX_TOKENS = 1024
+MAX_GOAL_BYTES    = 4 * 1024
 EVENT_BACKLOG     = 128   EVENT_STREAM_BUFFER = 128
+EVENT_CLAIM_TIMEOUT = 30 seconds
 ```
 
 ### 2.5 Agent loop shape **[VERIFIED, with specifics TO‑VERIFY]**
@@ -167,9 +176,9 @@ EVENT_BACKLOG     = 128   EVENT_STREAM_BUFFER = 128
 1. **Multi‑turn conversation** over one folder: ask → answer → follow‑up, with continuity.
 2. **Cross‑session memory**: resume a folder conversation later (persisted memo).
 3. **Bounded, fast context**: the live prompt never exceeds the device's resident window → no CPU‑fallback hang.
-4. **No engine work for v1**: implement as a manager layer over the existing five tools + token counting + existing hardware/fit signals.
+4. **No engine work for v1**: implement as a manager layer over the three read-only tools, exact token counting, and existing hardware/fit signals.
 5. **Graceful degradation**: when memory pressure hits, trim/summarize with a visible signal — never hang, never silently corrupt.
-6. **Preserve the safety contract**: still one folder, five tools, approval‑gated writes, loopback‑only, no shell/network/GUI/subagents/unattended.
+6. **Preserve the safety contract**: still one folder, three read-only tools, exact-origin loopback management, no writes/shell/network/GUI/subagents/unattended.
 
 ### 3.2 Non‑goals (explicitly out of scope for this design)
 - Becoming an IDE (no editor, diff view, run/debug).

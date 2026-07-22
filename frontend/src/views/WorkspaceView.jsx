@@ -26,7 +26,6 @@ const PHASE_LABEL = {
   idle: 'Ready',
   starting: 'Starting',
   running: 'Running',
-  awaiting_approval: 'Approval needed',
   finished: 'Complete',
   aborted: 'Stopped',
   cancelled: 'Stopped',
@@ -50,6 +49,7 @@ const DEFAULT_SETUP_PERCENT = 46
 const MIN_SETUP_PX = 360
 const MIN_ACTIVITY_PX = 400
 const SPLITTER_PX = 10
+const MAX_RENDERED_TURNS = 100
 
 function initialSetupPercent() {
   const saved = Number.parseFloat(window.localStorage.getItem('camelid.workspaceSetupPercent') || '')
@@ -64,7 +64,7 @@ function clampSetupPercentForWidth(percent, width) {
 }
 
 function initialWorkspaceState() {
-  return { ...WORKSPACE_IDLE_STATE, events: [] }
+  return { ...WORKSPACE_IDLE_STATE, events: [], turns: [] }
 }
 
 function eventKey(event, index) {
@@ -130,12 +130,16 @@ function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const requestId = useRef(0)
+  const abortRef = useRef(null)
 
   const load = useCallback((path, fallbackToRoots = false) => {
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
     const id = ++requestId.current
     setLoading(true)
     setError('')
-    browseWorkspaceFolders(apiBase, path)
+    browseWorkspaceFolders(apiBase, path, { signal: controller.signal })
       .then((data) => {
         if (id !== requestId.current) return
         setView(data)
@@ -143,13 +147,17 @@ function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
       })
       .catch((err) => {
         if (id !== requestId.current) return
+        if (err.name === 'AbortError') return
         if (fallbackToRoots && path) { load(null); return }
         setError(err.message || 'Could not open that folder.')
         setLoading(false)
       })
   }, [apiBase])
 
-  useEffect(() => { load(initialPath || null, true) }, [load, initialPath])
+  useEffect(() => {
+    load(initialPath || null, true)
+    return () => abortRef.current?.abort()
+  }, [load, initialPath])
 
   const atRoots = Boolean(view && view.path === null)
   const canGoUp = Boolean(view && (view.parent !== null || (view.hasRoots && view.path !== null)))
@@ -166,7 +174,6 @@ function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
       title="Choose workspace folder"
       labelledById="workspace-folder-title"
       size="md"
-      className="workspace-folder-modal"
       footer={
         <div className="folder-picker__actions">
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
@@ -275,6 +282,9 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const [resizing, setResizing] = useState(false)
   const workspaceRef = useRef(null)
   const eventSourceRef = useRef(null)
+  const sessionRef = useRef(null)
+  const apiBaseRef = useRef(apiBase)
+  const copyTimerRef = useRef(null)
   const intentionalClosuresRef = useRef(new WeakSet())
   const timelineRef = useRef(null)
   const hasLoadedModel = Boolean(runtime?.loaded_now)
@@ -286,21 +296,11 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const target = compatibility?.target || null
   const toolCapable = Boolean(hasLoadedModel && compatibility?.exact && target?.tool_capable && String(target.status || '').startsWith('supported'))
   const runtimeReady = runtime?.status === 'online' && runtime?.loaded_now && runtime?.generation_ready
-  const running = ['starting', 'running', 'awaiting_approval'].includes(state.phase)
+  const running = ['starting', 'running'].includes(state.phase)
   const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
-  const conversation = useMemo(
-    () => state.events.reduce((turns, event) => {
-      if (event.event === 'turn.user') {
-        turns.push({ user: String(event.content || ''), assistant: '' })
-      } else if (event.event === 'model.answer') {
-        const current = turns.at(-1)
-        if (current && !current.assistant) current.assistant = String(event.content || '')
-        else turns.push({ user: '', assistant: String(event.content || '') })
-      }
-      return turns
-    }, []),
-    [state.events],
-  )
+  const conversation = state.turns
+  const hiddenTurnCount = Math.max(0, conversation.length - MAX_RENDERED_TURNS)
+  const visibleConversation = hiddenTurnCount ? conversation.slice(-MAX_RENDERED_TURNS) : conversation
   const answers = conversation.map((turn) => turn.assistant).filter(Boolean)
   const finalAnswer = answers.at(-1) || ''
   const stepCount = useMemo(
@@ -353,6 +353,11 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }, [workspacePath])
 
   useEffect(() => {
+    sessionRef.current = session
+    apiBaseRef.current = apiBase
+  }, [apiBase, session])
+
+  useEffect(() => {
     window.localStorage.setItem('camelid.workspaceSetupPercent', String(setupPercent))
   }, [setupPercent])
 
@@ -377,6 +382,10 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   }, [running, state.phase, finalAnswer])
 
   useEffect(() => () => {
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current)
+    if (sessionRef.current) {
+      cancelWorkspaceSession(apiBaseRef.current, sessionRef.current.id).catch(() => {})
+    }
     if (eventSourceRef.current) {
       intentionalClosuresRef.current.add(eventSourceRef.current)
       eventSourceRef.current.close()
@@ -388,6 +397,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     const source = new EventSource(url)
     eventSourceRef.current = source
     source.addEventListener('workspace', (message) => {
+      if (eventSourceRef.current !== source) return
       try {
         const envelope = JSON.parse(message.data)
         if (envelope.event === 'memory.compacted') setCompaction(envelope)
@@ -461,14 +471,15 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
     if (!session) return
     try {
       await cancelWorkspaceSession(apiBase, session.id)
+      dispatch({ event: 'session.finished', outcome: 'cancelled' })
+    } catch (error) {
+      dispatch({ event: 'session.error', message: error.message })
+    } finally {
       if (eventSourceRef.current) {
         intentionalClosuresRef.current.add(eventSourceRef.current)
         eventSourceRef.current.close()
       }
       eventSourceRef.current = null
-      dispatch({ event: 'session.finished', outcome: 'cancelled' })
-    } catch (error) {
-      dispatch({ event: 'session.error', message: error.message })
     }
   }
 
@@ -577,7 +588,11 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
   const copyAnswer = async () => {
     await copyText(finalAnswer)
     setAnswerCopied(true)
-    window.setTimeout(() => setAnswerCopied(false), 1500)
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = window.setTimeout(() => {
+      copyTimerRef.current = null
+      setAnswerCopied(false)
+    }, 1500)
   }
 
   const renderResult = () => {
@@ -592,26 +607,24 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
       )
     }
     if (running && conversation.length === 0) {
-      const waiting = state.phase === 'awaiting_approval'
       return (
         <div className="workspace-result__working">
           <span className="workspace-result__spinner" aria-hidden="true" />
-          <strong>{waiting ? 'Waiting for your approval' : 'Camelid is working…'}</strong>
-          <span>{waiting
-            ? 'Review the pending change to continue.'
-            : 'Reading your files and preparing the answer. Watch each step under “What Camelid did”.'}</span>
+          <strong>Camelid is working…</strong>
+          <span>Reading your files and preparing the answer. Watch each step under “What Camelid did”.</span>
         </div>
       )
     }
     if (conversation.length > 0) {
       return (
         <div className="workspace-conversation">
-          {conversation.map((turn, index) => (
-            <article className="workspace-answer" key={`answer-${index}-${turn.assistant.length}`}>
+          {hiddenTurnCount ? <p className="workspace-conversation__truncated">{hiddenTurnCount} older turns remain saved in this conversation.</p> : null}
+          {visibleConversation.map((turn, index) => (
+            <article className="workspace-answer" key={`answer-${hiddenTurnCount + index}-${turn.assistant.length}`}>
               {turn.user ? <p className="workspace-answer__question">{turn.user}</p> : null}
               <div className="workspace-answer__bar">
                 <span className="workspace-answer__label"><IconCheckCircle size={15} /> Answer {index + 1}</span>
-                {turn.assistant && index === conversation.length - 1 && !running ? (
+                {turn.assistant && index === visibleConversation.length - 1 && !running ? (
                   <button type="button" className="workspace-answer__copy" onClick={copyAnswer}>
                     {answerCopied ? 'Copied' : 'Copy'}
                   </button>
@@ -620,7 +633,9 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
               <div className="workspace-answer__body">
                 {turn.assistant
                   ? <AssistantMarkdown content={turn.assistant} />
-                  : <span className="workspace-answer__pending">Camelid is working…</span>}
+                  : running && index === visibleConversation.length - 1
+                    ? <span className="workspace-answer__pending">Camelid is working…</span>
+                    : <span className="workspace-answer__pending">{PHASE_LABEL[turn.outcome] || 'No answer was saved.'}</span>}
               </div>
             </article>
           ))}

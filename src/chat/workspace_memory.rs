@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_EVIDENCE_PER_TURN: usize = 32 * 8;
 static INITIALIZE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -15,6 +15,7 @@ pub(crate) struct StoredTurn {
     pub turn_index: u32,
     pub user_text: String,
     pub assistant_text: String,
+    pub terminal_outcome: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -79,8 +80,11 @@ impl WorkspaceMemoryStore {
             std::fs::create_dir_all(parent)?;
         }
         let mut connection = store.connect()?;
-        migrate(&mut connection)?;
+        let migrated = migrate(&mut connection)?;
         verify_schema(&connection)?;
+        if migrated {
+            verify_foreign_keys(&connection)?;
+        }
         Ok(store)
     }
 
@@ -278,12 +282,58 @@ impl WorkspaceMemoryStore {
         self.append_turn_with_evidence(thread_id, client_message_id, user_text, assistant_text, &[])
     }
 
+    #[cfg(test)]
     pub(crate) fn append_turn_with_evidence(
         &self,
         thread_id: &str,
         client_message_id: &str,
         user_text: &str,
         assistant_text: &str,
+        evidence: &[EvidenceInput],
+    ) -> anyhow::Result<AppendTurn> {
+        self.append_turn_record(
+            thread_id,
+            client_message_id,
+            user_text,
+            assistant_text,
+            "answered",
+            evidence,
+        )
+    }
+
+    pub(crate) fn append_terminal_turn(
+        &self,
+        thread_id: &str,
+        client_message_id: &str,
+        user_text: &str,
+        assistant_text: &str,
+        terminal_outcome: &str,
+        evidence: &[EvidenceInput],
+    ) -> anyhow::Result<AppendTurn> {
+        anyhow::ensure!(
+            matches!(
+                terminal_outcome,
+                "answered" | "aborted" | "step_capped" | "repeated" | "driver_error"
+            ),
+            "unsupported Workspace terminal outcome {terminal_outcome}"
+        );
+        self.append_turn_record(
+            thread_id,
+            client_message_id,
+            user_text,
+            assistant_text,
+            terminal_outcome,
+            evidence,
+        )
+    }
+
+    fn append_turn_record(
+        &self,
+        thread_id: &str,
+        client_message_id: &str,
+        user_text: &str,
+        assistant_text: &str,
+        terminal_outcome: &str,
         evidence: &[EvidenceInput],
     ) -> anyhow::Result<AppendTurn> {
         let mut connection = self.connect()?;
@@ -309,14 +359,16 @@ impl WorkspaceMemoryStore {
         let now = now_epoch_seconds();
         transaction.execute(
             "INSERT INTO workspace_turns
-             (thread_id, turn_index, client_message_id, user_text, assistant_text, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (thread_id, turn_index, client_message_id, user_text, assistant_text,
+              terminal_outcome, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 thread_id,
                 next_index,
                 client_message_id,
                 user_text,
                 assistant_text,
+                terminal_outcome,
                 now
             ],
         )?;
@@ -361,7 +413,7 @@ impl WorkspaceMemoryStore {
         }
         let connection = self.connect()?;
         let mut statement = connection.prepare(
-            "SELECT id, turn_index, user_text, assistant_text
+            "SELECT id, turn_index, user_text, assistant_text, terminal_outcome
              FROM workspace_turns WHERE thread_id = ?1
              ORDER BY turn_index DESC LIMIT ?2",
         )?;
@@ -380,7 +432,7 @@ impl WorkspaceMemoryStore {
         let connection = self.connect()?;
         Ok(connection
             .query_row(
-                "SELECT id, turn_index, user_text, assistant_text
+                "SELECT id, turn_index, user_text, assistant_text, terminal_outcome
                  FROM workspace_turns
                  WHERE thread_id = ?1 AND client_message_id = ?2",
                 params![thread_id, client_message_id],
@@ -403,10 +455,11 @@ impl WorkspaceMemoryStore {
         }
         let connection = self.connect()?;
         let mut statement = connection.prepare(
-            "SELECT t.id, t.turn_index, t.user_text, t.assistant_text
+            "SELECT t.id, t.turn_index, t.user_text, t.assistant_text, t.terminal_outcome
              FROM workspace_turns_fts AS f
              JOIN workspace_turns AS t ON t.id = f.rowid
-             WHERE workspace_turns_fts MATCH ?1 AND f.thread_id = ?2
+                         WHERE workspace_turns_fts MATCH ?1 AND f.thread_id = ?2
+                             AND t.terminal_outcome = 'answered'
              ORDER BY bm25(workspace_turns_fts), t.turn_index DESC
              LIMIT ?3",
         )?;
@@ -463,11 +516,12 @@ impl WorkspaceMemoryStore {
         }
         let connection = self.connect()?;
         let mut statement = connection.prepare(
-            "SELECT t.id, t.turn_index, t.user_text, t.assistant_text
+            "SELECT t.id, t.turn_index, t.user_text, t.assistant_text, t.terminal_outcome
              FROM workspace_turns t
              JOIN workspace_threads th ON th.id = t.thread_id
              WHERE t.thread_id = ?1
                AND t.turn_index > COALESCE(th.compacted_through_turn, -1)
+                    AND t.terminal_outcome = 'answered'
              ORDER BY t.turn_index DESC LIMIT ?2",
         )?;
         let mut turns = statement
@@ -524,6 +578,7 @@ fn stored_turn_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTurn>
         turn_index: row.get(1)?,
         user_text: row.get(2)?,
         assistant_text: row.get(3)?,
+        terminal_outcome: row.get(4)?,
     })
 }
 
@@ -557,7 +612,7 @@ fn stored_evidence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredE
     })
 }
 
-fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
+fn migrate(connection: &mut Connection) -> anyhow::Result<bool> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     anyhow::ensure!(
@@ -582,6 +637,8 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
                client_message_id TEXT NOT NULL,
                user_text TEXT NOT NULL,
                assistant_text TEXT NOT NULL,
+                             terminal_outcome TEXT NOT NULL DEFAULT 'answered'
+                                 CHECK(terminal_outcome IN ('answered', 'aborted', 'step_capped', 'repeated', 'driver_error')),
                created_at INTEGER NOT NULL,
                UNIQUE(thread_id, turn_index),
                UNIQUE(thread_id, client_message_id)
@@ -609,7 +666,7 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
                          );
                          CREATE INDEX workspace_compactions_thread
                              ON workspace_compactions(thread_id, id);
-                         PRAGMA user_version = 4;",
+                         PRAGMA user_version = 5;",
         )?;
     } else {
         if version < 2 {
@@ -646,10 +703,17 @@ fn migrate(connection: &mut Connection) -> anyhow::Result<()> {
                                      ON workspace_compactions(thread_id, id);",
                         )?;
         }
+        if version < 5 {
+            transaction.execute_batch(
+                "ALTER TABLE workspace_turns
+                 ADD COLUMN terminal_outcome TEXT NOT NULL DEFAULT 'answered'
+                   CHECK(terminal_outcome IN ('answered', 'aborted', 'step_capped', 'repeated', 'driver_error'));",
+            )?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     transaction.commit()?;
-    Ok(())
+    Ok(version < SCHEMA_VERSION)
 }
 
 fn verify_schema(connection: &Connection) -> anyhow::Result<()> {
@@ -690,6 +754,7 @@ fn verify_schema(connection: &Connection) -> anyhow::Result<()> {
                 "client_message_id",
                 "user_text",
                 "assistant_text",
+                "terminal_outcome",
             ][..],
         ),
         (
@@ -744,6 +809,10 @@ fn verify_schema(connection: &Connection) -> anyhow::Result<()> {
             .contains("workspace_compactions(thread_id,id)"),
         "Workspace compaction index does not target thread_id,id"
     );
+    Ok(())
+}
+
+fn verify_foreign_keys(connection: &Connection) -> anyhow::Result<()> {
     let foreign_key_error: Option<String> = connection
         .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
         .optional()?;
@@ -777,6 +846,7 @@ fn bound_context(
     recent: Vec<StoredTurn>,
     max_chars: usize,
 ) -> MemoryContext {
+    let had_recent = !recent.is_empty();
     let mut used = 0usize;
     let mut kept_recent = Vec::new();
     for turn in recent.into_iter().rev() {
@@ -787,18 +857,22 @@ fn bound_context(
         if used.saturating_add(size) <= max_chars {
             used += size;
             kept_recent.push(turn);
+        } else {
+            break;
         }
     }
     kept_recent.reverse();
     let mut kept_relevant = Vec::new();
-    for turn in relevant {
-        let size = turn
-            .user_text
-            .len()
-            .saturating_add(turn.assistant_text.len());
-        if used.saturating_add(size) <= max_chars {
-            used += size;
-            kept_relevant.push(turn);
+    if !had_recent || !kept_recent.is_empty() {
+        for turn in relevant {
+            let size = turn
+                .user_text
+                .len()
+                .saturating_add(turn.assistant_text.len());
+            if used.saturating_add(size) <= max_chars {
+                used += size;
+                kept_relevant.push(turn);
+            }
         }
     }
     kept_relevant.sort_by_key(|turn| turn.turn_index);
@@ -879,6 +953,49 @@ mod tests {
     }
 
     #[test]
+    fn terminal_attempts_are_durable_idempotent_and_not_model_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.create_thread("a", "C:/repo", "qwen").unwrap();
+        let inserted = store
+            .append_terminal_turn("a", "message-1", "Summarize all files", "", "aborted", &[])
+            .unwrap();
+        let duplicate = store
+            .append_terminal_turn("a", "message-1", "changed", "changed", "driver_error", &[])
+            .unwrap();
+
+        assert_eq!(
+            duplicate,
+            AppendTurn::Duplicate(match inserted {
+                AppendTurn::Inserted(id) => id,
+                AppendTurn::Duplicate(_) => unreachable!(),
+            })
+        );
+        let turns = store.recent_turns("a", 10).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_text, "Summarize all files");
+        assert_eq!(turns[0].assistant_text, "");
+        assert_eq!(turns[0].terminal_outcome, "aborted");
+        assert_eq!(
+            store
+                .turn_by_client_message("a", "message-1")
+                .unwrap()
+                .unwrap()
+                .terminal_outcome,
+            "aborted"
+        );
+        assert!(store
+            .context_for("a", "Summarize files", 10_000)
+            .unwrap()
+            .recent
+            .is_empty());
+        assert!(store
+            .search_turns("a", "Summarize files", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn lexical_search_returns_relevant_older_turns_only_from_the_thread() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -937,6 +1054,25 @@ mod tests {
         let bounded = store.context_for("a", "authentication", 20).unwrap();
         assert!(bounded.relevant.is_empty());
         assert!(bounded.recent.len() <= 1);
+    }
+
+    #[test]
+    fn oversized_newest_turn_does_not_fall_back_to_stale_context() {
+        let turn = |id, turn_index, user_text: &str| StoredTurn {
+            id,
+            turn_index,
+            user_text: user_text.to_string(),
+            assistant_text: String::new(),
+            terminal_outcome: "answered".to_string(),
+        };
+        let context = bound_context(
+            vec![turn(3, 0, "old retrieved")],
+            vec![turn(1, 0, "old"), turn(2, 1, "newest is too large")],
+            8,
+        );
+
+        assert!(context.recent.is_empty());
+        assert!(context.relevant.is_empty());
     }
 
     #[test]
@@ -1054,7 +1190,7 @@ mod tests {
         let version: i64 = migrated
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let evidence_exists: bool = migrated
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='workspace_evidence')",
@@ -1091,7 +1227,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("memory.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
         drop(connection);
         let error = WorkspaceMemoryStore::open(path).err().unwrap();
         assert!(error.to_string().contains("schema is missing"));

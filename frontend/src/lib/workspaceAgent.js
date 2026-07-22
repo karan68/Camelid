@@ -1,24 +1,41 @@
+const MAX_WORKSPACE_ACTIVITY_EVENTS = 240
+
 export const WORKSPACE_IDLE_STATE = Object.freeze({
   phase: 'idle',
   events: [],
-  pendingApproval: null,
+  turns: [],
   error: '',
 })
+
+function appendActivity(events, event) {
+  const next = [...events, event]
+  return next.length > MAX_WORKSPACE_ACTIVITY_EVENTS
+    ? next.slice(-MAX_WORKSPACE_ACTIVITY_EVENTS)
+    : next
+}
 
 export function reduceWorkspaceEvent(state, envelope) {
   const event = envelope?.event
   if (!event) return state
-  if (event === 'session.reset') return { ...WORKSPACE_IDLE_STATE, events: [] }
+  if (event === 'session.reset') return { ...WORKSPACE_IDLE_STATE, events: [], turns: [] }
   if (event === 'thread.restored') {
-    const restored = (Array.isArray(envelope.turns) ? envelope.turns : []).flatMap((turn, index) => [
-      { event: 'turn.user', content: String(turn.user_text || ''), sequence: `restored-user-${index}` },
-      { event: 'model.answer', content: String(turn.assistant_text || ''), sequence: `restored-answer-${index}` },
-    ])
-    return { ...state, phase: 'idle', events: restored, pendingApproval: null, error: '' }
+    const turns = (Array.isArray(envelope.turns) ? envelope.turns : []).map((turn) => ({
+      user: String(turn.user_text || ''),
+      assistant: String(turn.assistant_text || ''),
+      outcome: String(turn.terminal_outcome || 'answered'),
+    }))
+    return { ...state, phase: 'idle', events: [], turns, error: '' }
   }
   if (event === 'session.starting') return { ...state, phase: 'starting', error: '' }
-  if (event === 'turn.starting') return { ...state, phase: 'starting', error: '', pendingApproval: null }
-  if (event === 'approval.resolved') return { ...state, phase: 'running', pendingApproval: null }
+  if (event === 'turn.starting') return { ...state, phase: 'starting', error: '' }
+  if (event === 'turn.user') {
+    return {
+      ...state,
+      phase: 'running',
+      events: appendActivity(state.events, envelope),
+      turns: [...state.turns, { user: String(envelope.content || ''), assistant: '', outcome: '' }],
+    }
+  }
   const events = [...state.events]
   const withoutLiveTail = () => {
     if (events.at(-1)?.event === 'model.live') events.pop()
@@ -33,25 +50,40 @@ export function reduceWorkspaceEvent(state, envelope) {
     } else {
       events.push({ ...envelope, event: 'model.live', content })
     }
-    return { ...state, phase: 'running', events }
+    return { ...state, phase: 'running', events: events.slice(-MAX_WORKSPACE_ACTIVITY_EVENTS) }
   }
 
   if (event === 'tool.call' || event === 'model.answer') withoutLiveTail()
   events.push(envelope)
+  if (events.length > MAX_WORKSPACE_ACTIVITY_EVENTS) {
+    events.splice(0, events.length - MAX_WORKSPACE_ACTIVITY_EVENTS)
+  }
+
+  let turns = state.turns
+  if (event === 'model.answer') {
+    turns = [...state.turns]
+    const last = turns.at(-1)
+    if (last && !last.assistant) turns[turns.length - 1] = { ...last, assistant: String(envelope.content || ''), outcome: 'answered' }
+    else turns.push({ user: '', assistant: String(envelope.content || ''), outcome: 'answered' })
+  }
 
   if (event === 'approval.required') {
-    return { ...state, phase: 'awaiting_approval', events, pendingApproval: envelope }
+    return { ...state, phase: 'error', events, turns, error: 'Read-only Workspace received an unexpected approval request.' }
   }
   if (event === 'tool.result') {
-    return { ...state, phase: 'running', events, pendingApproval: null }
+    return { ...state, phase: 'running', events, turns }
   }
   if (event === 'session.finished') {
-    return { ...state, phase: envelope.outcome === 'answered' ? 'finished' : envelope.outcome, events, pendingApproval: null }
+    if (envelope.outcome !== 'answered' && turns.length) {
+      turns = [...turns]
+      turns[turns.length - 1] = { ...turns.at(-1), outcome: envelope.outcome }
+    }
+    return { ...state, phase: envelope.outcome === 'answered' ? 'finished' : envelope.outcome, events, turns }
   }
   if (event === 'session.error') {
-    return { ...state, phase: 'error', events, pendingApproval: null, error: String(envelope.message || 'Workspace stopped.') }
+    return { ...state, phase: 'error', events, turns, error: String(envelope.message || 'Workspace stopped.') }
   }
-  return { ...state, phase: event === 'session.started' ? 'running' : state.phase, events }
+  return { ...state, phase: event === 'session.started' ? 'running' : state.phase, events, turns }
 }
 
 export function workspaceEndpoint(apiBase, suffix = '') {
@@ -167,15 +199,6 @@ export async function getWorkspaceSession(apiBase, sessionId) {
   const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}`))
   if (!response.ok) throw new Error(await readError(response, `Workspace status failed (${response.status}).`))
   return response.json()
-}
-
-export async function decideWorkspaceApproval(apiBase, sessionId, approvalId, decision) {
-  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}/decisions`), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ approval_id: approvalId, decision }),
-  })
-  if (!response.ok) throw new Error(await readError(response, `Approval failed (${response.status}).`))
 }
 
 export async function cancelWorkspaceSession(apiBase, sessionId) {

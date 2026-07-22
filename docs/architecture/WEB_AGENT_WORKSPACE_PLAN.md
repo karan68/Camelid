@@ -38,7 +38,7 @@ The CLI/TUI agent remains a separate preview surface with its existing broader, 
 
 1. **Additive surface.** Removing the Workspace routes, view, memory module, and capability entry restores the prior product without changing ordinary Chat or CLI/TUI agent behavior.
 2. **Exact model gate.** The loaded artifact must match an existing supported row with `tool_capable: true`. Saved threads also bind the model ID and exact GGUF SHA-256.
-3. **Loopback management boundary.** Workspace routes require a loopback-bound server, a loopback `Host`, and same-origin fetch metadata or an allowed loopback `Origin`.
+3. **Loopback management boundary.** Workspace routes require a loopback-bound server, a loopback `Host`, and exact same-authority `Origin` or same-origin fetch metadata. Vite development reaches the backend through a same-origin proxy.
 4. **Server-owned sandbox.** The server canonicalizes the selected root. Every tool path is resolved under that root and escapes fail closed.
 5. **Read-only enforcement at both layers.** The API rejects legacy write mode, and `ToolProfile::WorkspaceReadOnly` advertises and validates only the three read tools.
 6. **Untrusted observations.** Persisted conversation memory and tool evidence enter prompts as user-role, explicitly untrusted data, never as system policy.
@@ -79,7 +79,7 @@ The active session state is one of:
 - `cancelled`;
 - `failed`.
 
-A new or follow-up turn is installed as `waiting_for_events`. Claiming its event stream moves it to `running`. A successful persisted answer returns the session to `idle`, where it no longer blocks model transitions and can accept another message. Cancellation preserves `cancelled` even when it races event-stream claim or worker completion. A failed turn becomes `failed`.
+A new or follow-up turn is installed as `waiting_for_events`. Claiming its event stream within 30 seconds moves it to `running`; an unclaimed turn is persisted as aborted and becomes `cancelled`. A successful persisted answer returns the session to `idle`. Cancellation preserves `cancelled` even when it races event-stream claim or worker completion, and a failed turn becomes `failed`. `idle`, `cancelled`, and `failed` can all accept a follow-up, so terminal outcomes are turn-scoped rather than thread-fatal.
 
 Only `waiting_for_events`, `running`, and `cancelling` block model load or unload transitions.
 
@@ -109,17 +109,17 @@ Every envelope carries a session ID and monotonically increasing sequence number
 - `$XDG_DATA_HOME/camelid/workspace-memory.sqlite3` or the standard home fallback elsewhere;
 - `CAMELID_WORKSPACE_MEMORY_DB` when an isolated path is explicitly configured.
 
-Schema v4 stores:
+Schema v5 stores:
 
 - threads keyed by ID, canonical root, model ID, and model SHA-256;
-- idempotent ordered turns keyed by `client_message_id`;
+- idempotent ordered turns keyed by `client_message_id`, including terminal outcome;
 - bounded tool evidence with SHA-256 observation integrity checks;
 - reversible compaction boundaries and history;
 - an FTS5 index over user and assistant turn text.
 
 Writes use immediate transactions. Unknown newer schema versions and malformed current schemas fail closed. Foreign keys use cascade deletion and connections enable WAL mode with a bounded busy timeout.
 
-For a turn, memory retrieval keeps up to three recent uncompacted turns, lexically retrieves up to six older relevant turns, then includes bounded evidence associated with selected turns. Raw unbounded tool output, hidden reasoning, and approval grants are not persisted.
+For a turn, memory retrieval keeps up to three recent uncompacted answered turns, lexically retrieves up to six older relevant answered turns, then includes bounded evidence associated with selected turns. Aborted, capped, repeated, and failed attempts remain visible and idempotent but do not enter future model context. Raw unbounded tool output, hidden reasoning, and approval grants are not persisted.
 
 Compaction changes which completed turns are always recent; it does not delete their transcript, FTS entry, or evidence. Undo restores the previous boundary. Automatic compaction runs only after a successful durable turn when there are at least four turns and exact prompt plus reserved generation reaches 75% of the Workspace envelope.
 

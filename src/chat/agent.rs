@@ -293,7 +293,7 @@ pub fn run_loop(
         if let Some(metrics) = driver.take_step_metrics() {
             reporter.model_timing(metrics);
         }
-        if cancel.load(Ordering::Relaxed) {
+        if cfg.tool_profile.is_workspace() && cancel.load(Ordering::Relaxed) {
             reporter.notice("aborted");
             return LoopEnd::Aborted;
         }
@@ -312,12 +312,14 @@ pub fn run_loop(
                     ));
                     continue;
                 }
-                if let Some(inventory) =
-                    canonical_workspace_inventory(history, &workspace_observations)
-                {
-                    reporter.model_text(&inventory);
-                    history.push(AgentMsg::Assistant(inventory));
-                    return LoopEnd::Answered;
+                if cfg.tool_profile.is_workspace() {
+                    if let Some(inventory) =
+                        canonical_workspace_inventory(history, &workspace_observations)
+                    {
+                        reporter.model_text(&inventory);
+                        history.push(AgentMsg::Assistant(inventory));
+                        return LoopEnd::Answered;
+                    }
                 }
                 if cfg.tool_profile.is_workspace()
                     && workspace_answer_contradicts_observations(
@@ -570,7 +572,7 @@ fn workspace_answer_contradicts_observations(
 fn markdown_safe_inventory_filename(filename: &str) -> String {
     let mut escaped = String::new();
     for character in filename.chars() {
-        if character.is_control() || matches!(character, '%' | '`') {
+        if character.is_control() || character == '`' {
             let mut bytes = [0_u8; 4];
             for byte in character.encode_utf8(&mut bytes).as_bytes() {
                 escaped.push_str(&format!("%{byte:02X}"));
@@ -599,11 +601,11 @@ fn canonical_workspace_inventory(
         .filter(|(tool, _)| tool == "list_dir")
         .map(|(_, observation)| observation)
         .collect::<Vec<_>>();
-    if listings.is_empty() {
+    if listings.len() != 1 {
         return None;
     }
 
-    let mut files = std::collections::BTreeMap::new();
+    let mut files = std::collections::BTreeSet::new();
     let mut truncated = false;
     for listing in listings {
         for raw_entry in listing.lines() {
@@ -612,7 +614,7 @@ fn canonical_workspace_inventory(
                 truncated = true;
                 continue;
             }
-            if entry.is_empty() || entry.ends_with('/') || entry.contains(['\r', '\n']) {
+            if entry.is_empty() || entry.ends_with('/') {
                 continue;
             }
             let lower = entry.to_ascii_lowercase();
@@ -620,7 +622,7 @@ fn canonical_workspace_inventory(
                 .iter()
                 .any(|extension| lower.ends_with(extension))
             {
-                files.entry(lower).or_insert_with(|| entry.to_string());
+                files.insert(entry.to_string());
             }
         }
     }
@@ -642,7 +644,7 @@ fn canonical_workspace_inventory(
         "Found {qualifier}{} {label} {noun} in the selected folder:\n\n",
         files.len()
     );
-    for file in files.values() {
+    for file in &files {
         answer.push_str(&format!("- `{}`\n", markdown_safe_inventory_filename(file)));
     }
     answer.push_str(
@@ -679,17 +681,18 @@ fn workspace_request_is_immediate_inventory(request: &str) -> bool {
     .iter()
     .any(|phrase| request.contains(phrase));
     let asks_for_inventory = [
-        "list",
-        "show",
-        "which",
-        "what",
+        "list all",
+        "show all",
         "find all",
-        "check all",
-        "all the",
+        "list the",
+        "show me all",
     ]
     .iter()
     .any(|phrase| request.contains(phrase));
-    asks_for_inventory && !asks_for_contents && !asks_recursively
+    let asks_for_files = request
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word == "files");
+    asks_for_inventory && asks_for_files && !asks_for_contents && !asks_recursively
 }
 
 fn workspace_requested_extensions(request: &str) -> Vec<String> {
@@ -876,6 +879,9 @@ fn fit_history_to_budget(
             Ok(Some(_)) if remove_oldest_optional_context(&mut history) => {
                 trimmed = true;
             }
+            Ok(Some(_)) if shrink_largest_tool_observation(&mut history) => {
+                trimmed = true;
+            }
             Ok(Some(prompt_tokens)) => {
                 return Err(format!(
                     "required prompt ({prompt_tokens} tokens) plus generation allowance \
@@ -907,6 +913,31 @@ fn remove_oldest_optional_context(history: &mut Vec<AgentMsg>) -> bool {
     });
     if let Some(index) = pair {
         history.drain(index..=index + 1);
+        return true;
+    }
+    false
+}
+
+fn shrink_largest_tool_observation(history: &mut [AgentMsg]) -> bool {
+    const MIN_TOOL_OBSERVATION_BYTES: usize = 128;
+    let Some((index, length)) = history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            AgentMsg::ToolResult { outcome, .. }
+                if outcome.text().len() > MIN_TOOL_OBSERVATION_BYTES =>
+            {
+                Some((index, outcome.text().len()))
+            }
+            _ => None,
+        })
+        .max_by_key(|(_, length)| *length)
+    else {
+        return false;
+    };
+    let target = (length / 2).max(MIN_TOOL_OBSERVATION_BYTES);
+    if let AgentMsg::ToolResult { outcome, .. } = &mut history[index] {
+        *outcome = outcome.clone().clipped(target);
         return true;
     }
     false
@@ -1009,6 +1040,7 @@ pub struct LiveDriver {
     last_step_metrics: Option<ModelStepMetrics>,
     stream_cancel: Option<std::sync::Arc<AtomicBool>>,
     stream_timeout: Option<Duration>,
+    native_tool_history: bool,
     /// Optional live-token sink. When set (the TUI), `step` streams the model's
     /// output via `chat_stream`, forwards each delta here, and parses tool calls
     /// from the accumulated raw content (`tool_parse`, every family). When `None`
@@ -1030,6 +1062,7 @@ impl LiveDriver {
             last_step_metrics: None,
             stream_cancel: None,
             stream_timeout: None,
+            native_tool_history: false,
             on_delta: None,
         }
     }
@@ -1053,6 +1086,7 @@ impl LiveDriver {
             last_step_metrics: None,
             stream_cancel: None,
             stream_timeout: None,
+            native_tool_history: false,
             on_delta: None,
         }
     }
@@ -1070,6 +1104,10 @@ impl LiveDriver {
     pub fn set_stream_control(&mut self, cancel: std::sync::Arc<AtomicBool>, timeout: Duration) {
         self.stream_cancel = Some(cancel);
         self.stream_timeout = Some(timeout);
+    }
+
+    pub fn set_native_tool_history(&mut self, enabled: bool) {
+        self.native_tool_history = enabled;
     }
 }
 
@@ -1168,7 +1206,12 @@ impl LiveDriver {
     ) -> Value {
         let mut request = json!({
             "model": self.model_id,
-            "messages": history_to_messages(history, fold_system, &self.family),
+            "messages": history_to_messages(
+                history,
+                fold_system,
+                &self.family,
+                self.native_tool_history,
+            ),
             "tools": tool_defs,
             "stream": stream,
             "max_tokens": self.max_tokens,
@@ -1206,7 +1249,7 @@ impl LiveDriver {
         self.last_step_metrics = Some(ModelStepMetrics {
             total_ms: stats.total_ms,
             ttft_ms: stats.ttft_ms,
-            output_tokens: Some(stats.deltas),
+            output_tokens: None,
         });
         let end = stats.end;
         if end == StreamEnd::Cancelled {
@@ -1262,7 +1305,12 @@ fn is_template_error(msg: &str) -> bool {
 /// retain the established standard-role history shape.
 /// When `fold_system` is set, the system prompt is merged into the first user
 /// message instead of a standalone `system` role (for templates that reject it).
-fn history_to_messages(history: &[AgentMsg], fold_system: bool, family: &str) -> Vec<Value> {
+fn history_to_messages(
+    history: &[AgentMsg],
+    fold_system: bool,
+    family: &str,
+    native_tool_history: bool,
+) -> Vec<Value> {
     let system: String = history
         .iter()
         .filter_map(|m| match m {
@@ -1273,7 +1321,9 @@ fn history_to_messages(history: &[AgentMsg], fold_system: bool, family: &str) ->
         .join("\n\n");
     let mut fold_pending = fold_system && !system.is_empty();
     let mut out = Vec::new();
-    let qwen_native_tools = family.eq_ignore_ascii_case("qwen3");
+    let family = family.to_ascii_lowercase();
+    let qwen_native_tools =
+        native_tool_history && (family.contains("qwen3") || family.contains("ornith"));
     for msg in history {
         match msg {
             AgentMsg::System(t) => {
@@ -1707,7 +1757,7 @@ mod tests {
                 outcome: ToolOutcome::Ok("a.txt".into()),
             },
         ];
-        let messages = history_to_messages(&history, false, "qwen3");
+        let messages = history_to_messages(&history, false, "qwen3", true);
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(
             messages[1]["content"],
@@ -1718,8 +1768,17 @@ mod tests {
             messages[2]["content"],
             "<tool_response>\na.txt\n</tool_response>"
         );
+        for family in ["qwen35", "ornith-1.0"] {
+            let native = history_to_messages(&history, false, family, true);
+            assert_eq!(native[1], messages[1], "family {family}");
+            assert_eq!(native[2], messages[2], "family {family}");
+        }
 
-        let llama = history_to_messages(&history, false, "llama_bpe_decoder");
+        let standard_qwen = history_to_messages(&history, false, "qwen3", false);
+        assert_eq!(standard_qwen[1]["content"], "list_dir({\"path\":\".\"})");
+        assert_eq!(standard_qwen[2]["role"], "tool");
+
+        let llama = history_to_messages(&history, false, "llama_bpe_decoder", false);
         assert_eq!(llama[1]["content"], "list_dir({\"path\":\".\"})");
         assert_eq!(llama[2]["role"], "tool");
         assert_eq!(llama[2]["name"], "list_dir");
@@ -1755,7 +1814,7 @@ mod tests {
                 outcome: ToolOutcome::Ok("fn login() {}".into()),
             },
         ];
-        let compiled = compile_history_for_step(&history, tools::ToolProfile::WorkspaceFiles);
+        let compiled = compile_history_for_step(&history, tools::ToolProfile::WorkspaceReadOnly);
         assert!(compiled.iter().any(|message| matches!(
             message,
             AgentMsg::Memory(text) if text.contains("src/auth.rs:10")
@@ -1822,7 +1881,7 @@ mod tests {
             history,
             &[],
             40,
-            tools::ToolProfile::WorkspaceFiles,
+            tools::ToolProfile::WorkspaceReadOnly,
         )
         .unwrap();
         assert!(trimmed);
@@ -1836,6 +1895,92 @@ mod tests {
         assert!(fitted.iter().any(
             |message| matches!(message, AgentMsg::Assistant(text) if text == "older assistant")
         ));
+    }
+
+    #[test]
+    fn workspace_budget_fitter_clips_tool_observations_without_breaking_pairs() {
+        struct CharacterDriver;
+        impl ModelDriver for CharacterDriver {
+            fn step(
+                &mut self,
+                _history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                unreachable!()
+            }
+
+            fn prompt_tokens(
+                &mut self,
+                history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<Option<u32>, String> {
+                let chars = history
+                    .iter()
+                    .map(|message| match message {
+                        AgentMsg::System(text)
+                        | AgentMsg::Memory(text)
+                        | AgentMsg::User(text)
+                        | AgentMsg::Assistant(text) => text.len(),
+                        AgentMsg::ToolCalls(calls) => calls
+                            .iter()
+                            .map(|call| call.name.len() + call.args.to_string().len())
+                            .sum(),
+                        AgentMsg::ToolResult { name, outcome } => name.len() + outcome.text().len(),
+                    })
+                    .sum::<usize>();
+                Ok(Some(chars as u32))
+            }
+
+            fn context_budget_tokens(&self) -> Option<u32> {
+                Some(3_584)
+            }
+        }
+
+        let calls = (0..6)
+            .map(|index| tc("read_file", json!({"path": format!("file-{index}.md")})))
+            .collect::<Vec<_>>();
+        let mut history = vec![
+            AgentMsg::System("system".into()),
+            AgentMsg::User("summarize these files".into()),
+            AgentMsg::ToolCalls(calls),
+        ];
+        for index in 0..6 {
+            history.push(AgentMsg::ToolResult {
+                name: "read_file".into(),
+                outcome: ToolOutcome::Ok(format!("file-{index}: {}", "x".repeat(2_000))),
+            });
+        }
+
+        let (fitted, trimmed, prompt_tokens) = fit_history_to_budget(
+            &mut CharacterDriver,
+            history,
+            &[],
+            512,
+            tools::ToolProfile::WorkspaceReadOnly,
+        )
+        .unwrap();
+
+        assert!(trimmed);
+        assert!(prompt_tokens.unwrap() + 512 <= 3_584);
+        assert_eq!(
+            fitted
+                .iter()
+                .filter(|message| matches!(message, AgentMsg::ToolCalls(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fitted
+                .iter()
+                .filter(|message| matches!(message, AgentMsg::ToolResult { .. }))
+                .count(),
+            6
+        );
+        assert!(fitted.iter().any(|message| matches!(
+            message,
+            AgentMsg::ToolResult { outcome, .. }
+                if outcome.text().contains("truncated for Workspace")
+        )));
     }
 
     #[test]
@@ -1875,7 +2020,7 @@ mod tests {
             ],
             &[],
             10,
-            tools::ToolProfile::WorkspaceFiles,
+            tools::ToolProfile::WorkspaceReadOnly,
         ) {
             Err(error) => error,
             Ok(_) => panic!("preflight error should fail without trimming"),
@@ -1899,7 +2044,7 @@ mod tests {
                 },
             ],
             &tools::specs_for(
-                tools::ToolProfile::WorkspaceFiles,
+                tools::ToolProfile::WorkspaceReadOnly,
                 false,
                 ShellSandbox::Disabled,
             ),
@@ -1939,7 +2084,7 @@ mod tests {
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User("list many directories".into())];
         let mut config = cfg(dir.path(), false);
-        config.tool_profile = tools::ToolProfile::WorkspaceFiles;
+        config.tool_profile = tools::ToolProfile::WorkspaceReadOnly;
         let end = run_loop(
             &mut driver,
             &mut approver,
@@ -2004,7 +2149,7 @@ mod tests {
         let mut approver = ScriptApprover(vec![], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User(
-            "Check all the Markdown files in this folder.".into(),
+            "List all the Markdown files in this folder.".into(),
         )];
         let mut config = cfg(dir.path(), false);
         config.tool_profile = tools::ToolProfile::WorkspaceReadOnly;
@@ -2051,7 +2196,7 @@ mod tests {
         let mut approver = ScriptApprover(vec![], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User(
-            "Check all the md files in this folder.".into(),
+            "List all the md files in this folder.".into(),
         )];
         let mut config = cfg(dir.path(), false);
         config.tool_profile = tools::ToolProfile::WorkspaceReadOnly;
@@ -2088,7 +2233,7 @@ mod tests {
         let mut approver = ScriptApprover(vec![], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User(
-            "Check all the md files in this folder.".into(),
+            "List all the md files in this folder.".into(),
         )];
         let mut config = cfg(dir.path(), false);
         config.tool_profile = tools::ToolProfile::WorkspaceReadOnly;
@@ -2110,33 +2255,36 @@ mod tests {
     }
 
     #[test]
-    fn canonical_inventory_filters_sorts_and_deduplicates_case_insensitively() {
+    fn canonical_inventory_filters_sorts_and_preserves_case_distinct_files() {
         let history = vec![AgentMsg::User(
-            "Check all the md files in this folder.".into(),
+            "List all the md files in this folder.".into(),
         )];
         let observations = vec![(
             "list_dir".into(),
             "zeta.md\narchitecture/\nREADME.MD\nnotes.txt\nreadme.md\nAlpha.md".into(),
         )];
         let answer = canonical_workspace_inventory(&history, &observations).unwrap();
-        assert!(answer.starts_with("Found 3 Markdown files"));
+        assert!(answer.starts_with("Found 4 Markdown files"));
         assert!(answer.find("`Alpha.md`").unwrap() < answer.find("`README.MD`").unwrap());
-        assert!(answer.find("`README.MD`").unwrap() < answer.find("`zeta.md`").unwrap());
+        assert!(answer.find("`README.MD`").unwrap() < answer.find("`readme.md`").unwrap());
+        assert!(answer.find("`readme.md`").unwrap() < answer.find("`zeta.md`").unwrap());
         assert_eq!(answer.matches("README.MD").count(), 1);
+        assert_eq!(answer.matches("readme.md").count(), 1);
         assert!(!answer.contains("architecture/"));
         assert!(!answer.contains("notes.txt"));
         assert!(answer.contains("Nested folders were not searched"));
     }
 
     #[test]
-    fn canonical_inventory_percent_encodes_markdown_active_filename_characters() {
+    fn canonical_inventory_escapes_backticks_but_preserves_literal_percent() {
         let history = vec![AgentMsg::User("List all .md files.".into())];
         let observations = vec![(
             "list_dir".into(),
-            "normal.md\nspoof`- [link](javascript:alert).md\nangle<name>.md\nback\\slash.md".into(),
+            "normal.md\n100%-done.md\nspoof`- [link](javascript:alert).md\nangle<name>.md\nback\\slash.md".into(),
         )];
         let answer = canonical_workspace_inventory(&history, &observations).unwrap();
         assert!(answer.contains("- `normal.md`"));
+        assert!(answer.contains("- `100%-done.md`"));
         assert!(answer.contains("spoof%60- [link](javascript:alert).md"));
         assert!(answer.contains("angle<name>.md"));
         assert!(answer.contains("back\\slash.md"));
@@ -2184,7 +2332,7 @@ mod tests {
     #[test]
     fn canonical_inventory_supports_multiple_extensions_and_punctuation() {
         let history = vec![AgentMsg::User(
-            "Which .MD and .txt files are in this folder?".into(),
+            "List all .MD and .txt files in this folder.".into(),
         )];
         let observations = vec![("list_dir".into(), "README.md\nnotes.TXT\nimage.png".into())];
         let answer = canonical_workspace_inventory(&history, &observations).unwrap();
@@ -2223,6 +2371,33 @@ mod tests {
     }
 
     #[test]
+    fn canonical_inventory_does_not_replace_semantic_file_questions() {
+        let observations = vec![("list_dir".into(), ".env\nparser.rs\nother.rs".into())];
+        for request in [
+            "What does the .env file configure?",
+            "Which .rs file implements the parser?",
+            "What is the .git directory for?",
+            "Check all the .rs files for unsafe code.",
+        ] {
+            let history = vec![AgentMsg::User(request.into())];
+            assert!(
+                canonical_workspace_inventory(&history, &observations).is_none(),
+                "semantic request should remain model-owned: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_inventory_does_not_merge_unqualified_directory_listings() {
+        let history = vec![AgentMsg::User("List all .md files.".into())];
+        let observations = vec![
+            ("list_dir".into(), "README.md".into()),
+            ("list_dir".into(), "README.md".into()),
+        ];
+        assert!(canonical_workspace_inventory(&history, &observations).is_none());
+    }
+
+    #[test]
     fn cancellation_during_model_step_discards_partial_answer() {
         struct CancellingDriver {
             cancel: std::sync::Arc<AtomicBool>,
@@ -2248,6 +2423,51 @@ mod tests {
         let mut approver = ScriptApprover(vec![], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User("answer at length".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WorkspaceReadOnly;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            cancel.as_ref(),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Aborted);
+        assert!(reporter.text.is_empty());
+        assert!(!history
+            .iter()
+            .any(|message| matches!(message, AgentMsg::Assistant(_))));
+    }
+
+    #[test]
+    fn full_profile_preserves_completed_model_step_when_cancel_arrives() {
+        struct CancellingDriver {
+            cancel: std::sync::Arc<AtomicBool>,
+        }
+
+        impl ModelDriver for CancellingDriver {
+            fn step(
+                &mut self,
+                _history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.cancel.store(true, Ordering::Release);
+                Ok(ModelStep::Text("completed answer".into()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let mut driver = CancellingDriver {
+            cancel: std::sync::Arc::clone(&cancel),
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("answer".into())];
         let end = run_loop(
             &mut driver,
             &mut approver,
@@ -2258,11 +2478,8 @@ mod tests {
             &mut Policy::default(),
             &mut history,
         );
-        assert_eq!(end, LoopEnd::Aborted);
-        assert!(reporter.text.is_empty());
-        assert!(!history
-            .iter()
-            .any(|message| matches!(message, AgentMsg::Assistant(_))));
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.text, vec!["completed answer"]);
     }
 
     #[test]

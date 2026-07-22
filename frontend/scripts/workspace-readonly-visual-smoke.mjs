@@ -4,9 +4,14 @@ import { existsSync } from 'node:fs'
 import puppeteer from 'puppeteer-core'
 
 const executablePath = [
+  process.env.PUPPETEER_EXECUTABLE_PATH,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-].find(existsSync)
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+].filter(Boolean).find(existsSync)
 if (!executablePath) throw new Error('Chrome or Edge is required for Workspace visual smoke')
 
 const baseUrl = process.env.CAMELID_CAPTURE_URL || 'http://127.0.0.1:4175'
@@ -324,7 +329,15 @@ try {
   await cancelPage.click('.workspace-setup__actions .cx-btn--primary')
   await cancelPage.waitForSelector('.workspace-setup__actions .cx-btn--outline')
   await cancelPage.click('.workspace-setup__actions .cx-btn--outline')
-  await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Error', { timeout: 5000 })
+  try {
+    await cancelPage.waitForFunction(() => document.querySelector('.workspace-status')?.textContent === 'Error', { timeout: 5000 })
+  } catch {
+    const diagnostic = await cancelPage.evaluate(() => ({
+      status: document.querySelector('.workspace-status')?.textContent,
+      text: document.querySelector('.workspace-view')?.textContent,
+    }))
+    throw new Error(`cancel failure did not reach Error state: ${JSON.stringify(diagnostic)}`)
+  }
   const cancelState = await cancelPage.evaluate(() => ({
     status: document.querySelector('.workspace-status')?.textContent,
     stoppedText: document.body.textContent.includes('Session stopped'),

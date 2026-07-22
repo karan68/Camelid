@@ -23,10 +23,16 @@ state = reduceWorkspaceEvent(state, {
 })
 assert.equal(state.events.at(-1).event, 'memory.compacted')
 assert.equal(state.events.at(-1).archived_turns, 4)
-assert.equal(state.pendingApproval, null, 'read-only Workspace must never acquire write approval state')
 
 state = reduceWorkspaceEvent(state, { event: 'session.finished', outcome: 'answered', sequence: 9 })
 assert.equal(state.phase, 'finished')
+
+const impossibleApproval = reduceWorkspaceEvent(
+  { ...WORKSPACE_IDLE_STATE, events: [] },
+  { event: 'approval.required', approval_id: 'unexpected' },
+)
+assert.equal(impossibleApproval.phase, 'error')
+assert.match(impossibleApproval.error, /unexpected approval request/)
 
 state = reduceWorkspaceEvent(state, { event: 'session.reset' })
 assert.deepEqual(state, { ...WORKSPACE_IDLE_STATE, events: [] })
@@ -34,11 +40,18 @@ state = reduceWorkspaceEvent(state, {
   event: 'thread.restored',
   turns: [{ user_text: 'Where is login?', assistant_text: 'In src/auth.rs.' }],
 })
-assert.equal(state.events[0].event, 'turn.user')
-assert.equal(state.events[1].event, 'model.answer')
+assert.deepEqual(state.turns, [{ user: 'Where is login?', assistant: 'In src/auth.rs.', outcome: 'answered' }])
+assert.equal(state.events.length, 0)
 state = reduceWorkspaceEvent(state, { event: 'turn.starting' })
 assert.equal(state.phase, 'starting')
-assert.equal(state.events.length, 2, 'starting a follow-up must preserve restored turns')
+assert.equal(state.turns.length, 1, 'starting a follow-up must preserve restored turns')
+
+let bounded = { ...WORKSPACE_IDLE_STATE, events: [], turns: [] }
+for (let index = 0; index < 300; index += 1) {
+  bounded = reduceWorkspaceEvent(bounded, { event: 'session.notice', content: `event-${index}` })
+}
+assert.equal(bounded.events.length, 240, 'activity history must remain bounded during long sessions')
+assert.equal(bounded.events[0].content, 'event-60')
 assert.equal(workspaceEndpoint('http://127.0.0.1:8181/', '/abc/events'), 'http://127.0.0.1:8181/api/agent/workspace/sessions/abc/events')
 assert.equal(workspaceModelsEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.1:8181/api/agent/workspace/models')
 assert.equal(workspaceBrowseEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.1:8181/api/agent/workspace/browse')

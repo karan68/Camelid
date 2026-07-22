@@ -57,7 +57,7 @@ fn json_from_str_lenient(s: &str) -> Option<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(s) {
         return Some(value);
     }
-    serde_json::from_str::<Value>(&escape_lone_backslashes(s)).ok()
+    serde_json::from_str::<Value>(&repair_path_backslashes(s)).ok()
 }
 
 /// Public wrapper for the structured-`tool_calls` path: parse an arguments string
@@ -66,40 +66,69 @@ pub(crate) fn json_args_lenient(s: &str) -> Value {
     json_from_str_lenient(s).unwrap_or_else(|| Value::Object(Default::default()))
 }
 
-/// Repair backslashes inside JSON string literals for model tool calls that
-/// failed a strict parse. Because strict parsing already handles fully-valid
-/// escapes, reaching here means the JSON is invalid — overwhelmingly from a
-/// Windows path whose separators were not escaped (`C:\workspace\new` → the `\w`,
-/// `\n` are literal, not escapes). So every backslash is treated as a literal
-/// separator and doubled, EXCEPT an already-escaped quote (`\"`) or an
-/// already-doubled backslash (`\\`), which are kept intact so string boundaries
-/// and valid pairs survive. Turns `"C:\workspace\new"` into the valid
-/// `"C:\\workspace\\new"`; text outside string literals is untouched.
-fn escape_lone_backslashes(s: &str) -> String {
+/// Repair unescaped Windows separators only in path-shaped JSON fields. Other
+/// strings may contain valid escapes such as `\n` or `\uXXXX`; rewriting the
+/// entire arguments object would silently change file content and patterns.
+fn repair_path_backslashes(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
-    let mut in_string = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                in_string = !in_string;
-                out.push('"');
-            }
-            '\\' if in_string => match chars.peek() {
-                // Escaped quote or already-escaped backslash: keep the pair intact
-                // (consume both) so the string boundary and valid `\\` are preserved.
+    let mut cursor = 0usize;
+    let mut repair_next_string = false;
+    while cursor < s.len() {
+        let Some(relative_start) = s[cursor..].find('"') else {
+            out.push_str(&s[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        out.push_str(&s[cursor..start]);
+        let Some(end) = json_string_end(s, start) else {
+            out.push_str(&s[start..]);
+            break;
+        };
+        let token = &s[start..=end];
+        let next = s[end + 1..].trim_start().chars().next();
+        if next == Some(':') {
+            let key = serde_json::from_str::<String>(token).unwrap_or_default();
+            repair_next_string = matches!(key.as_str(), "path" | "cwd");
+            out.push_str(token);
+        } else if repair_next_string {
+            out.push_str(&repair_path_string(token));
+            repair_next_string = false;
+        } else {
+            out.push_str(token);
+        }
+        cursor = end + 1;
+    }
+    out
+}
+
+fn json_string_end(s: &str, start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, character) in s[start + 1..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some(start + 1 + offset);
+        }
+    }
+    None
+}
+
+fn repair_path_string(token: &str) -> String {
+    let mut out = String::with_capacity(token.len() + 4);
+    let mut chars = token.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            match chars.peek() {
                 Some('"' | '\\') => {
                     out.push('\\');
                     out.push(chars.next().unwrap());
                 }
-                // Any other backslash is a literal Windows separator the model
-                // failed to escape (`\C`, `\a`, `\n`, `\t`, ...): double it.
-                _ => {
-                    out.push('\\');
-                    out.push('\\');
-                }
-            },
-            _ => out.push(c),
+                _ => out.push_str("\\\\"),
+            }
+        } else {
+            out.push(character);
         }
     }
     out
@@ -411,6 +440,17 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].args["content"], "line1\nline2 \"q\"");
+    }
+
+    #[test]
+    fn lenient_path_repair_does_not_corrupt_other_string_escapes() {
+        let out = parse(
+            r#"<tool_call>{"name":"write_file","arguments":{"path":"C:\workspace\note.txt","content":"line1\nline2\t\u263A"}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].args["path"], r"C:\workspace\note.txt");
+        assert_eq!(out[0].args["content"], "line1\nline2\t☺");
     }
 
     #[test]
