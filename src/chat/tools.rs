@@ -1847,14 +1847,47 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         Ok(c) => c,
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
+
+    // Drain stdout/stderr on their own threads (W1). Nothing read these until
+    // after the child exited, so a command that emitted more than one pipe
+    // buffer — 64 KiB per pipe on Windows (std sys/process/windows/child_pipe.rs
+    // PIPE_BUFFER_CAPACITY), and the same order on Linux — blocked forever in
+    // write(), never exited, and was then reported to the model as a timeout
+    // with every captured byte discarded. `git log` in this repo clears that in
+    // one command. Both pipes get their own quota, so either one alone can wedge
+    // the child; both must be drained. This mirrors run_windows_command, which
+    // has had the fix since it was written.
+    let out_reader = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+            buf
+        })
+    });
+    let err_reader = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+            buf
+        })
+    });
+
     let deadline = std::time::Instant::now() + sandbox.shell_timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Killing the child closes the write ends → the readers hit
+                    // EOF. Join them so neither thread outlives this call.
+                    if let Some(h) = out_reader {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = err_reader {
+                        let _ = h.join();
+                    }
                     return ToolOutcome::Err(format!(
                         "command timed out after {}s",
                         sandbox.shell_timeout.as_secs()
@@ -1864,23 +1897,27 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
             }
             Err(e) => return ToolOutcome::Err(format!("wait failed: {e}")),
         }
-    }
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return ToolOutcome::Err(format!("output failed: {e}")),
     };
+
+    let stdout_bytes = out_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr_bytes = err_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+
     let mut text = String::new();
-    let code = output.status.code().unwrap_or(-1);
+    let code = status.code().unwrap_or(-1);
     text.push_str(&format!("exit: {code}\n"));
-    let stdout = clip(&String::from_utf8_lossy(&output.stdout));
-    let stderr = clip(&String::from_utf8_lossy(&output.stderr));
+    let stdout = clip(&String::from_utf8_lossy(&stdout_bytes));
+    let stderr = clip(&String::from_utf8_lossy(&stderr_bytes));
     if !stdout.is_empty() {
         text.push_str(&format!("stdout:\n{stdout}\n"));
     }
     if !stderr.is_empty() {
         text.push_str(&format!("stderr:\n{stderr}\n"));
     }
-    if output.status.success() {
+    if status.success() {
         ToolOutcome::Ok(text)
     } else {
         ToolOutcome::Err(text)
@@ -3504,7 +3541,6 @@ mod tests {
         println!("[{finding}] {key} = {value}");
     }
 
-    #[cfg(windows)]
     fn outcome_variant(o: &ToolOutcome) -> &'static str {
         if o.is_err() {
             "ToolOutcome::Err"
@@ -3513,97 +3549,108 @@ mod tests {
         }
     }
 
-    /// W1 — `run_shell` never drains its pipes (tools.rs:1818-1867).
-    ///
-    /// Windows anonymous pipes are created with PIPE_BUFFER_CAPACITY = 64 KiB
-    /// (std 1.95.0: sys/process/windows/child_pipe.rs:56). A child that emits
-    /// more than that before exiting blocks in WriteFile; `try_wait()` never
-    /// returns Some; the deadline fires; the output is discarded.
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
-    fn hardpan_w1_run_shell_wedges_past_the_pipe_buffer() {
-        const PIPE_BUFFER: usize = 64 * 1024;
-        const TIMEOUT_SECS: u64 = 10;
-        let dir = tempfile::tempdir().unwrap();
-
-        // ~410 KiB — comfortably past the 64 KiB pipe buffer, and the shape of
-        // output a real `cargo build` / `git log` produces immediately.
+    /// ~410 KiB of line-oriented output — comfortably past the 64 KiB per-pipe
+    /// buffer, and the shape a real `git log` / `cargo build` produces at once.
+    /// Every line is numbered so a truncated capture is detectable.
+    fn oversized_payload() -> String {
         let mut payload = String::new();
         for i in 0..4096 {
-            payload.push_str(&format!("{i:06} {}\r\n", "X".repeat(93)));
+            payload.push_str(&format!("{i:06} {}\n", "X".repeat(93)));
         }
-        std::fs::write(dir.path().join("big.txt"), &payload).unwrap();
+        payload
+    }
 
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(TIMEOUT_SECS))
+    /// Drive `run_shell` over a file, on whichever platform we are.
+    fn run_shell_cat(dir: &Path, file: &str, to_stderr: bool) -> (ToolOutcome, Duration) {
+        #[cfg(unix)]
+        let base = format!("cat {file}");
+        #[cfg(windows)]
+        let base = format!("type {file}");
+        let command = if to_stderr {
+            format!("{base} 1>&2")
+        } else {
+            base
+        };
+        // 15s: a working drain finishes in well under a second, so this is a
+        // liveness backstop. A regression re-wedges and burns the whole budget.
+        let sb = Sandbox::new(dir, false, Duration::from_secs(15))
             .unwrap()
             .with_shell_mode(ShellSandbox::Unrestricted);
-        let a = validate(&call("run_shell", json!({"command": "type big.txt"})), &sb).unwrap();
-
+        let a = validate(&call("run_shell", json!({ "command": command })), &sb).unwrap();
         let t0 = std::time::Instant::now();
         let out = a.execute(&sb);
-        let elapsed = t0.elapsed();
+        (out, t0.elapsed())
+    }
 
-        ev("W1", "pipe_buffer_bytes", PIPE_BUFFER);
-        ev("W1", "payload_bytes", payload.len());
-        ev("W1", "shell_timeout_secs", TIMEOUT_SECS);
-        ev("W1", "elapsed_ms", elapsed.as_millis());
-        ev("W1", "outcome", outcome_variant(&out));
-        ev("W1", "returned_text_bytes", out.text().len());
-        ev(
-            "W1",
-            "returned_text_head",
-            out.text()
-                .chars()
-                .take(70)
-                .collect::<String>()
-                .escape_debug(),
+    /// W1 regression — `run_shell` must drain a child that emits more than one
+    /// pipe buffer (tools.rs run_shell).
+    ///
+    /// Before the fix nothing read either pipe until after the child exited, so
+    /// a child emitting >64 KiB (std 1.95.0 PIPE_BUFFER_CAPACITY,
+    /// sys/process/windows/child_pipe.rs:56; same order on Linux) blocked in
+    /// write() forever and the tool reported a *successful* command as
+    /// `command timed out after Ns` with every captured byte discarded.
+    /// Measured pre-fix on Windows: 417,792 B -> Err, 0 payload bytes, 10,075 ms.
+    #[test]
+    fn run_shell_drains_more_than_a_pipe_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = oversized_payload();
+        assert!(
+            payload.len() > 64 * 1024,
+            "payload must exceed one pipe buffer"
         );
-        ev(
-            "W1",
-            "captured_any_payload",
-            out.text().contains("000000") || out.text().contains("XXXX"),
+        std::fs::write(dir.path().join("big.txt"), &payload).unwrap();
+
+        let (out, elapsed) = run_shell_cat(dir.path(), "big.txt", false);
+        println!(
+            "[W1] payload={} elapsed_ms={} outcome={} text_bytes={}",
+            payload.len(),
+            elapsed.as_millis(),
+            outcome_variant(&out),
+            out.text().len()
+        );
+
+        assert!(
+            matches!(out, ToolOutcome::Ok(_)),
+            "a command emitting {} bytes must succeed, got {out:?}",
+            payload.len()
+        );
+        assert!(
+            out.text().contains("000000"),
+            "captured output must contain the payload's first line"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "must not burn the timeout budget (took {elapsed:?})"
         );
     }
 
-    /// W1 control — the SAME command shape, under the pipe buffer. Proves the
-    /// discriminator is the 64 KiB buffer and not `type` or the sandbox.
-    #[cfg(windows)]
+    /// W1 regression, stderr leg — the 64 KiB quota is PER PIPE, so a chatty
+    /// stderr wedges the child exactly as stdout does. Both readers must exist.
     #[test]
-    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
-    fn hardpan_w1_control_under_the_pipe_buffer() {
-        const TIMEOUT_SECS: u64 = 10;
+    fn run_shell_drains_more_than_a_pipe_buffer_on_stderr() {
         let dir = tempfile::tempdir().unwrap();
+        let payload = oversized_payload();
+        std::fs::write(dir.path().join("big.txt"), &payload).unwrap();
 
-        // ~32 KiB — half the pipe buffer, so the child can exit without blocking.
-        let mut payload = String::new();
-        for i in 0..320 {
-            payload.push_str(&format!("{i:06} {}\r\n", "X".repeat(93)));
-        }
-        std::fs::write(dir.path().join("small.txt"), &payload).unwrap();
-
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(TIMEOUT_SECS))
-            .unwrap()
-            .with_shell_mode(ShellSandbox::Unrestricted);
-        let a = validate(
-            &call("run_shell", json!({"command": "type small.txt"})),
-            &sb,
-        )
-        .unwrap();
-
-        let t0 = std::time::Instant::now();
-        let out = a.execute(&sb);
-        let elapsed = t0.elapsed();
-
-        ev("W1-control", "payload_bytes", payload.len());
-        ev("W1-control", "elapsed_ms", elapsed.as_millis());
-        ev("W1-control", "outcome", outcome_variant(&out));
-        ev("W1-control", "returned_text_bytes", out.text().len());
-        ev(
-            "W1-control",
-            "captured_any_payload",
-            out.text().contains("000000"),
+        let (out, elapsed) = run_shell_cat(dir.path(), "big.txt", true);
+        println!(
+            "[W1-stderr] elapsed_ms={} outcome={} text_bytes={}",
+            elapsed.as_millis(),
+            outcome_variant(&out),
+            out.text().len()
         );
+
+        assert!(
+            !out.text().contains("timed out"),
+            "stderr past one pipe buffer must not wedge the child: {}",
+            out.text()
+        );
+        assert!(
+            out.text().contains("000000"),
+            "stderr payload must be captured"
+        );
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
     }
 
     /// PIDs of every live PING.EXE, via an absolute-path tasklist. Used to spot
