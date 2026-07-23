@@ -326,6 +326,7 @@ SIROCCO/STAMPEDE precedent. **Do not report W9 as a win.**
 | **A8** | Phase 2 | **`pwsh.exe` is not installed on this host.** The "prefer PowerShell 7" option cannot be validated here; if taken, it ships untested. | 2 |
 | **A9** | `ratatui-0.29.0/src/terminal/terminal.rs:198-205`, `backend/crossterm.rs:211` | W9's premise is contradicted at the source: ratatui writes **diffs only** and `execute!` already flushes once per frame. | 4 |
 | **A10** | `qa/hardpan/input-probe/` | New evidence instrument added (standalone, workspace-detached, `crossterm =0.28.1`). Reusable as the Phase 3 CERT harness. | 0 |
+| **A11 (W10)** | `src/chat/win_uia.rs` `run_ps` | Discovered during Phase 2: shares W3(a)'s **output leg** — its embedded scripts are pure ASCII (input leg safe), but UIA output (window titles, control names) can be non-ASCII and returns through the same OEM-CP437 windowless console mojibake'd. Its exit-code handling is already correct for its use (errors on non-zero). Not fixed inline per campaign rule 5b; the Phase 2 preamble pattern transplants directly if promoted. | follow-up |
 
 ---
 

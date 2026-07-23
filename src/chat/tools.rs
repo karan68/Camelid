@@ -2206,12 +2206,52 @@ fn system32(relative: &str) -> PathBuf {
     Path::new(&root).join("System32").join(relative)
 }
 
+/// Base64 (standard alphabet, padded) for the W3 stdin preamble. Deliberately a
+/// local copy of the encoder in `clipboard.rs` rather than a shared helper —
+/// GATE 0 ruled clipboard.rs out of scope for this campaign, and the two call
+/// sites must be free to drift independently.
+#[cfg(windows)]
+fn base64_ascii(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18 & 63) as usize] as char);
+        out.push(TABLE[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Windows PowerShell exec with a dedicated confinement (Decision: a Windows-only
 /// path, NOT the seccomp shell-sandbox). The command is fed to PowerShell over
-/// stdin, so no quoting survives the Rust→Windows→PowerShell round trip; the run
-/// is cwd-pinned, hard-timed, has stdout/stderr drained concurrently (so a chatty
-/// command can't wedge on a full pipe), and is assigned to a kill-on-close job
-/// object so a timeout tears down the whole process tree.
+/// stdin as base64 inside a pure-ASCII preamble (W3a: a console-less child sits
+/// on the OEM code page, so raw UTF-8 would be mojibake'd both ways; ASCII
+/// survives any code page, and the preamble flips the child's output to UTF-8
+/// before decoding the real command). A trailing guard re-raises $LASTEXITCODE
+/// so a failing native command is reported with its true exit code even when a
+/// later statement succeeded (W3b). The run is cwd-pinned, hard-timed, has
+/// stdout/stderr drained concurrently (so a chatty command can't wedge on a full
+/// pipe), and is assigned to a kill-on-close job object so a timeout tears down
+/// the whole process tree.
+///
+/// Interpreter: Windows PowerShell 5.1 by absolute System32 path, deliberately
+/// not "prefer pwsh.exe when present" — 5.1 ships on every Windows install so
+/// the behavior is uniform, the preamble makes 5.1 UTF-8-correct anyway, and the
+/// primary dev host has no pwsh to validate a second branch against (HARDPAN A8:
+/// an untestable branch ships untested, so it doesn't ship).
 #[cfg(windows)]
 fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> ToolOutcome {
     use std::io::{Read, Write};
@@ -2268,9 +2308,37 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
     });
 
     // Feed the command, then EOF so PowerShell executes it and exits.
+    //
+    // W3(a): the command rides in as base64 inside a pure-ASCII preamble. A
+    // CREATE_NO_WINDOW child gets a fresh windowless console on the OEM code
+    // page (437 on this host) — not the parent console's CP and not UTF-8 — so
+    // raw UTF-8 command bytes were mojibake'd on the way in (6 codepoints
+    // arrived as 16) and non-ASCII output came back irreversibly lossy ('日'
+    // → '?', a valid ASCII byte from_utf8_lossy can never flag). ASCII decodes
+    // identically under every code page, so the preamble always survives; it
+    // sets the child's output side to UTF-8, then decodes and runs the real
+    // command. Still stdin delivery — NOT -EncodedCommand, which would
+    // reintroduce the ~32 KiB command-line ceiling stdin was chosen to avoid.
+    //
+    // W3(b): `powershell -Command` drops a native command's non-zero exit
+    // status whenever a later statement succeeds, so a failed `cargo build`
+    // followed by any successful statement reported exit 0 → ToolOutcome::Ok
+    // and the model proceeded on a false premise. The trailing guard re-raises
+    // $LASTEXITCODE (the true code — pre-fix even a *last* failing native
+    // command was flattened to 1). When no native command ran, $LASTEXITCODE
+    // is $null and the host's own status stands: 0 on success, 1 on a
+    // terminating error. Residual, documented: $LASTEXITCODE tracks only the
+    // LAST native command, so `cmd /c exit 3; cmd /c exit 0` reports 0 both
+    // before and after this fix.
+    let script = format!(
+        "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\r\n\
+         $c = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))\r\n\
+         Invoke-Expression $c\r\n\
+         if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}\r\n",
+        base64_ascii(command.as_bytes())
+    );
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(command.as_bytes());
-        let _ = stdin.write_all(b"\r\n");
+        let _ = stdin.write_all(script.as_bytes());
         // stdin drops here → EOF.
     }
 
@@ -3562,26 +3630,17 @@ mod tests {
     }
 
     // =====================================================================
-    // HARDPAN Phase 0 — reproduction harness (evidence instrument).
+    // HARDPAN — exec-surface regression tests.
     //
-    // These probes MEASURE the current Windows behavior of the exec surface.
-    // They deliberately assert nothing about correctness, so `cargo test`
-    // stays green on a tree that still has the defect; the observation IS the
-    // deliverable. They are #[ignore]d and run explicitly:
+    // Phase 0 landed these as #[ignore]d evidence probes that measured the
+    // then-current (broken) behavior; Phases 1 and 2 converted them into the
+    // asserting regression tests below as each fix landed. The pre-fix
+    // measurements they replaced are preserved in qa/hardpan/REPRO.md and the
+    // per-finding receipts under qa/hardpan/phase*/.
     //
-    //   cargo test --release --lib -- --ignored --nocapture hardpan_
-    //
-    // Phase 1 (W1/W2) and Phase 2 (W3) convert these into asserting
-    // regression tests once the fixes land. Findings and anchors are recorded
-    // in qa/hardpan/REPRO.md.
+    // Still #[ignore]d (spawns a real cold rustc; run explicitly):
+    //   cargo test --release --lib -- --ignored --nocapture gate1_
     // =====================================================================
-
-    /// Emit one `key = value` evidence line, so a receipt can be grepped out of
-    /// the test log without parsing prose.
-    #[cfg(windows)]
-    fn ev(finding: &str, key: &str, value: impl std::fmt::Display) {
-        println!("[{finding}] {key} = {value}");
-    }
 
     fn outcome_variant(o: &ToolOutcome) -> &'static str {
         if o.is_err() {
@@ -3874,33 +3933,40 @@ mod tests {
         );
     }
 
-    /// W3(a) — PowerShell round-trip encoding (tools.rs:2192 writes raw UTF-8,
-    /// tools.rs:2231 decodes with from_utf8_lossy).
-    ///
-    /// Two legs are measured separately: what the child EMITS, and what the
-    /// child RECEIVES. The received-codepoint leg is the decisive one — an
-    /// echo test can round-trip byte-transparently while the child still sees
-    /// mojibake.
+    /// The preamble's own transport: RFC 4648 vectors covering all three padding
+    /// shapes. A broken encoder would also fail the round-trip tests below (the
+    /// child's FromBase64String throws), but this pins the cause.
     #[cfg(windows)]
     #[test]
-    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
-    fn hardpan_w3a_powershell_encoding_round_trip() {
+    fn base64_ascii_matches_known_vectors() {
+        assert_eq!(base64_ascii(b""), "");
+        assert_eq!(base64_ascii(b"f"), "Zg==");
+        assert_eq!(base64_ascii(b"fo"), "Zm8=");
+        assert_eq!(base64_ascii(b"foo"), "Zm9v");
+        assert_eq!(base64_ascii(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// W3(a) regression — GATE 2: non-ASCII round-trips byte-identical through
+    /// run_windows_command's stdin preamble.
+    ///
+    /// Two legs asserted separately: what the child EMITS (output leg, built
+    /// from codepoints so nothing depends on input) and what the child RECEIVES
+    /// (input leg, reported as codepoints — the decisive one, since an echo can
+    /// round-trip byte-transparently while the child still sees mojibake).
+    /// Pre-fix (Phase 0, same commands): output leg came back as
+    /// `ef bf bd … 3f 3f` (U+FFFD + '?'), input leg delivered 16 codepoints for
+    /// these 6, child sat on IBM437.
+    #[cfg(windows)]
+    #[test]
+    fn run_windows_command_round_trips_non_ascii() {
         let _serial = ps_serial();
         let dir = tempfile::tempdir().unwrap();
         let sb = win_sandbox(dir.path());
 
         // U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC
         let vector = "éü—✓日€";
-        let want_hex = vector
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        ev("W3a", "test_vector_utf8_hex", &want_hex);
 
-        // Leg 1 — OUTPUT ONLY: the non-ASCII originates inside the child, built
-        // from codepoints, so nothing depends on the input leg.
+        // Leg 1 — OUTPUT: the non-ASCII originates inside the child.
         let emit = "$s = -join @([char]0x00E9,[char]0x00FC,[char]0x2014,[char]0x2713,\
                     [char]0x65E5,[char]0x20AC); Write-Output $s";
         let out = validate(
@@ -3909,24 +3975,22 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
+        assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
         let body = out.text();
         let got = body
             .lines()
-            .find(|l| !l.starts_with("exit:") && !l.starts_with("stdout:"));
-        let got_hex = got
+            .find(|l| !l.starts_with("exit:") && !l.starts_with("stdout:"))
             .unwrap_or("")
-            .trim()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        ev("W3a", "output_leg_got_hex", &got_hex);
-        ev("W3a", "output_leg_matches", got_hex == want_hex);
-        ev(
-            "W3a",
-            "output_leg_has_replacement_char",
-            body.contains('\u{FFFD}'),
+            .trim();
+        assert_eq!(
+            got.as_bytes(),
+            vector.as_bytes(),
+            "output leg must be byte-identical (got {:?})",
+            got
+        );
+        assert!(
+            !body.contains('\u{FFFD}'),
+            "no replacement characters allowed: {body}"
         );
 
         // Leg 2 — INPUT: the non-ASCII rides in the command text; the child
@@ -3948,68 +4012,66 @@ mod tests {
             .unwrap_or("")
             .trim()
             .to_string();
-        ev(
-            "W3a",
-            "input_leg_want_codepoints",
-            "U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC",
-        );
-        ev("W3a", "input_leg_got_codepoints", &recv);
-        ev(
-            "W3a",
-            "input_leg_matches",
-            recv == "U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC",
-        );
-
-        // What encoding does the console-less child actually settle on?
-        let enc = "Write-Output (\"Out=\" + [Console]::OutputEncoding.WebName + \" In=\" + \
-                   [Console]::InputEncoding.WebName)";
-        let out3 = validate(&call("run_windows_command", json!({ "command": enc })), &sb)
-            .unwrap()
-            .execute(&sb);
-        ev(
-            "W3a",
-            "child_encodings",
-            out3.text()
-                .lines()
-                .find(|l| l.contains("Out="))
-                .unwrap_or("")
-                .trim(),
+        assert_eq!(
+            recv, "U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC",
+            "child must receive exactly the 6 codepoints sent (pre-fix: 16 mojibake codepoints)"
         );
     }
 
-    /// W3(b) — `powershell -Command` does not propagate a native command's
-    /// non-zero exit status (tools.rs:2242 branches on status.success()).
+    /// W3(b) regression — GATE 2: a failing native command returns
+    /// ToolOutcome::Err with the child's REAL exit code.
+    ///
+    /// Pre-fix (Phase 0, same commands): `cmd /c exit 3; Write-Output done`
+    /// reported `exit: 0` → Ok (the defect — a later success erased the
+    /// failure), and a *last* failing native command was flattened to 1.
     #[cfg(windows)]
     #[test]
-    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
-    fn hardpan_w3b_native_exit_code_is_swallowed() {
+    fn run_windows_command_propagates_native_exit_codes() {
         let _serial = ps_serial();
         let dir = tempfile::tempdir().unwrap();
         let sb = win_sandbox(dir.path());
 
-        let probe = |label: &str, cmd: &str| {
-            let out = validate(&call("run_windows_command", json!({ "command": cmd })), &sb)
+        let run = |cmd: &str| {
+            validate(&call("run_windows_command", json!({ "command": cmd })), &sb)
                 .unwrap()
-                .execute(&sb);
-            let exit_line = out
-                .text()
-                .lines()
-                .find(|l| l.starts_with("exit:"))
-                .unwrap_or("exit: ?")
-                .to_string();
-            ev("W3b", &format!("{label}.command"), cmd);
-            ev("W3b", &format!("{label}.reported"), &exit_line);
-            ev("W3b", &format!("{label}.outcome"), outcome_variant(&out));
+                .execute(&sb)
         };
 
-        // The load-bearing case: a failing native command followed by ANY
-        // successful statement. The failure vanishes entirely.
-        probe("failure_not_last", "cmd /c exit 3; Write-Output done");
-        // The real exit code is flattened even when the failure IS last.
-        probe("failure_last_code3", "cmd /c exit 3");
-        probe("failure_last_code42", "cmd /c exit 42");
-        // Controls.
-        probe("success", "Write-Output ok");
-        probe("throw", "throw 'boom'");
+        // The load-bearing case: a failing native command followed by a
+        // successful statement. Pre-fix: exit: 0 → Ok.
+        let out = run("cmd /c exit 3; Write-Output done");
+        assert!(out.is_err(), "the failure must not be erased: {out:?}");
+        assert!(
+            out.text().contains("exit: 3"),
+            "true code, got: {}",
+            out.text()
+        );
+        assert!(
+            out.text().contains("done"),
+            "output around the failure is still captured: {}",
+            out.text()
+        );
+
+        // The true code survives even when the failure is last (pre-fix: 1).
+        let out = run("cmd /c exit 42");
+        assert!(out.is_err());
+        assert!(out.text().contains("exit: 42"), "got: {}", out.text());
+
+        // No false failures: a pure-cmdlet success stays 0/Ok.
+        let out = run("Write-Output ok");
+        assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
+        assert!(out.text().contains("exit: 0"));
+        assert!(out.text().contains("ok"));
+
+        // A terminating error still fails.
+        let out = run("throw 'boom'");
+        assert!(out.is_err(), "throw must stay non-zero: {out:?}");
+
+        // Documented residual, asserted so a change is noticed: $LASTEXITCODE
+        // tracks only the LAST native command, so a failure followed by a
+        // native success reports 0 — before and after the fix.
+        let out = run("cmd /c exit 3; cmd /c exit 0");
+        assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
+        assert!(out.text().contains("exit: 0"));
     }
 }
