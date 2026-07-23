@@ -7,6 +7,7 @@
 //! - `agent-syscap-eval` → `camelid.agent-syscap-receipt/v1`
 //! - `agent-orchestration-eval` → `camelid.agent-orchestration-receipt/v1`
 //! - `agent-orchestration-bench` → `camelid.agent-orchestration-bench/v1`
+//! - `agent-eval` → `camelid.agent_eval/v1` (the tool-capable promotion gate)
 //!
 //! Unlike a parity receipt there is no model to re-run: verification is a
 //! self-contained **tamper-evidence + honest-scope** check.
@@ -14,14 +15,17 @@
 //! 1. *Tamper-evidence* — the document's canonical body (every field except
 //!    `receipt_id`, recursively key-sorted and compact) must hash to the stored
 //!    `receipt_id`. Any added, removed, or altered field breaks the match.
-//! 2. *Honest-scope* — a well-formed but over-claiming receipt is rejected. These
-//!    gates promote no capability and (for orchestration) claim no speedup; a
-//!    receipt whose own scope fields say otherwise is not a valid artifact of the
-//!    gate that supposedly produced it.
+//! 2. *Honest-scope* — a well-formed but over-claiming receipt is rejected. The
+//!    syscap / orchestration / bench gates promote no capability (and
+//!    orchestration claims no speedup); the eval gate is the one
+//!    promotion-bearing receipt, so its scope check is internal consistency —
+//!    `promotion_eligible` must equal `outcome == "PASS"`. A receipt whose scope
+//!    fields say otherwise is not a valid artifact of the gate that produced it.
 //!
-//! A verified agent receipt attests that the document is intact and claims
-//! nothing it should not. Like every receipt in this crate, it promotes no
-//! support claim.
+//! Verifying a receipt attests only that the document is intact and internally
+//! honest; it changes no support-ledger row. Agent-eval receipts minted before
+//! sealing carry no `receipt_id`; those are reported as unsealed legacy receipts
+//! (their tamper-evidence cannot be established), never as verified.
 
 use std::path::Path;
 
@@ -35,12 +39,15 @@ pub const SYSCAP_RECEIPT_SCHEMA_V1: &str = "camelid.agent-syscap-receipt/v1";
 pub const ORCHESTRATION_RECEIPT_SCHEMA_V1: &str = "camelid.agent-orchestration-receipt/v1";
 /// Schema stamped into an `agent-orchestration-bench` receipt.
 pub const ORCHESTRATION_BENCH_SCHEMA_V1: &str = "camelid.agent-orchestration-bench/v1";
+/// Schema stamped into an `agent-eval` receipt (the tool-capable promotion gate).
+pub const EVAL_RECEIPT_SCHEMA_V1: &str = "camelid.agent_eval/v1";
 
 /// Every agent-family schema this verifier understands.
-pub const RECOGNIZED_SCHEMAS: [&str; 3] = [
+pub const RECOGNIZED_SCHEMAS: [&str; 4] = [
     SYSCAP_RECEIPT_SCHEMA_V1,
     ORCHESTRATION_RECEIPT_SCHEMA_V1,
     ORCHESTRATION_BENCH_SCHEMA_V1,
+    EVAL_RECEIPT_SCHEMA_V1,
 ];
 
 /// True when `schema` names an agent-family receipt this module can verify.
@@ -60,6 +67,8 @@ pub enum AgentReceiptClass {
     Orchestration,
     /// `camelid.agent-orchestration-bench/v1`.
     OrchestrationBench,
+    /// `camelid.agent_eval/v1` — the tool-capable promotion gate.
+    Eval,
 }
 
 impl AgentReceiptClass {
@@ -68,6 +77,7 @@ impl AgentReceiptClass {
             SYSCAP_RECEIPT_SCHEMA_V1 => Some(Self::Syscap),
             ORCHESTRATION_RECEIPT_SCHEMA_V1 => Some(Self::Orchestration),
             ORCHESTRATION_BENCH_SCHEMA_V1 => Some(Self::OrchestrationBench),
+            EVAL_RECEIPT_SCHEMA_V1 => Some(Self::Eval),
             _ => None,
         }
     }
@@ -76,7 +86,7 @@ impl AgentReceiptClass {
     /// eval gates (PASS/FAIL/INCONCLUSIVE), `verdict` for the wall-clock bench.
     fn result_field(self) -> &'static str {
         match self {
-            Self::Syscap | Self::Orchestration => "outcome",
+            Self::Syscap | Self::Orchestration | Self::Eval => "outcome",
             Self::OrchestrationBench => "verdict",
         }
     }
@@ -111,6 +121,42 @@ impl AgentReceiptClass {
                             .to_string(),
                     })?;
                 Ok(format!("speedup_claimed_for={claimed:?}"))
+            }
+            Self::Eval => {
+                // The eval gate is the ONE agent receipt that may justify a
+                // promotion: a PASS is `promotion_eligible`. Honest-scope here is
+                // internal consistency — `promotion_eligible` must equal
+                // `outcome == "PASS"`. A receipt claiming eligibility without a
+                // PASS (or denying it after one) is dishonest.
+                let outcome =
+                    obj.get("outcome")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| AgentVerifyError {
+                            phase: "honest-scope",
+                            reason: "agent_eval receipt is missing the string `outcome` field"
+                                .to_string(),
+                        })?;
+                let eligible = obj
+                    .get("promotion_eligible")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| AgentVerifyError {
+                        phase: "honest-scope",
+                        reason: "agent_eval receipt is missing the boolean \
+                                 `promotion_eligible` field"
+                            .to_string(),
+                    })?;
+                if eligible != (outcome == "PASS") {
+                    return Err(AgentVerifyError {
+                        phase: "honest-scope",
+                        reason: format!(
+                            "promotion_eligible={eligible} is inconsistent with \
+                             outcome={outcome:?} (only a PASS is promotion-eligible)"
+                        ),
+                    });
+                }
+                Ok(format!(
+                    "promotion_eligible={eligible} (consistent with outcome={outcome:?})"
+                ))
             }
         }
     }
@@ -174,8 +220,9 @@ pub struct AgentReceiptSummary {
     pub result: String,
     /// Human-readable summary of the honest-scope fields that were checked.
     pub scope_note: String,
-    /// `os/arch` or `os/arch (hostname)` from the receipt's `host` block.
-    pub host: String,
+    /// `os/arch` (optionally with `(hostname)`) from the receipt's `host` block,
+    /// or `None` when the receipt has no host block (e.g. `agent_eval`).
+    pub host: Option<String>,
 }
 
 /// Pure verification: no I/O, no printing. Returns what the receipt attests, or
@@ -201,14 +248,26 @@ pub fn check(value: &Value) -> Result<AgentReceiptSummary, AgentVerifyError> {
         ),
     })?;
 
-    // Receipt id — must be a 64-char lowercase-hex SHA-256.
-    let receipt_id = obj
-        .get("receipt_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AgentVerifyError {
-            phase: "self-digest",
-            reason: "receipt has no string `receipt_id` field".to_string(),
-        })?;
+    // Receipt id — must be a 64-char lowercase-hex SHA-256. Agent-eval receipts
+    // minted before sealing carry none; report those as unsealed legacy receipts
+    // rather than as a malformed body.
+    let receipt_id = match obj.get("receipt_id").and_then(Value::as_str) {
+        Some(id) => id,
+        None => {
+            let reason = if class == AgentReceiptClass::Eval {
+                "unsealed legacy agent_eval receipt (no `receipt_id`): it predates receipt \
+                 sealing, so its tamper-evidence cannot be established — re-run agent-eval \
+                 to mint a sealed receipt"
+                    .to_string()
+            } else {
+                "receipt has no string `receipt_id` field".to_string()
+            };
+            return Err(AgentVerifyError {
+                phase: "self-digest",
+                reason,
+            });
+        }
+    };
     if !is_sha256_hex(receipt_id) {
         return Err(AgentVerifyError {
             phase: "self-digest",
@@ -260,17 +319,20 @@ pub fn verify_value(value: &Value) -> AgentVerifyOutcome {
                 "PASS self-digest: receipt_id matches the canonical body ({})",
                 summary.receipt_id
             );
-            println!(
-                "PASS honest-scope: {} (this gate promotes no capability)",
-                summary.scope_note
-            );
-            println!(
-                "NOTE receipt: {}={}; host {}",
-                summary.class.result_field(),
-                summary.result,
-                summary.host
-            );
-            println!("AGENT RECEIPT VERIFIED (tamper-evident; promotes no capability)");
+            println!("PASS honest-scope: {}", summary.scope_note);
+            match &summary.host {
+                Some(host) => println!(
+                    "NOTE receipt: {}={}; host {host}",
+                    summary.class.result_field(),
+                    summary.result,
+                ),
+                None => println!(
+                    "NOTE receipt: {}={}",
+                    summary.class.result_field(),
+                    summary.result,
+                ),
+            }
+            println!("AGENT RECEIPT VERIFIED (tamper-evident; changes no support-ledger row)");
             AgentVerifyOutcome::Verified
         }
         Err(err) => {
@@ -308,22 +370,18 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// `os/arch` or `os/arch (hostname)` from the receipt's `host` block, with `?`
-/// standing in for any absent piece.
-fn host_line(obj: &Map<String, Value>) -> String {
-    let host = obj.get("host").and_then(Value::as_object);
-    let field = |key: &str| {
-        host.and_then(|h| h.get(key))
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_string()
-    };
+/// `os/arch` (optionally with `(hostname)`) from the receipt's `host` block, or
+/// `None` when the receipt carries no host block. A present-but-partial block
+/// renders `?` for the missing piece.
+fn host_line(obj: &Map<String, Value>) -> Option<String> {
+    let host = obj.get("host").and_then(Value::as_object)?;
+    let field = |key: &str| host.get(key).and_then(Value::as_str).unwrap_or("?");
     let os = field("os");
     let arch = field("arch");
-    match host.and_then(|h| h.get("hostname")).and_then(Value::as_str) {
+    Some(match host.get("hostname").and_then(Value::as_str) {
         Some(name) => format!("{os}/{arch} ({name})"),
         None => format!("{os}/{arch}"),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -396,14 +454,74 @@ mod tests {
         })
     }
 
+    /// Mirrors the fields `agent_eval::finish` emits (a PASS is promotion-eligible).
+    fn eval_body() -> Value {
+        json!({
+            "schema": EVAL_RECEIPT_SCHEMA_V1,
+            "receipt_id": "",
+            "outcome": "PASS",
+            "model_id": "qwen3-4b",
+            "gguf": "C:\\models\\Qwen3-4B-Q8_0.gguf",
+            "gguf_bytes": 4_000_000_000u64,
+            "quantization": "Q8_0",
+            "note": "full 3-case battery",
+            "cases": [ { "name": "read_notes", "tool": "read_file", "pass": true } ],
+            "host_loadavg_1m": null,
+            "timestamp_unix": 1_784_747_762u64,
+            "promotion_eligible": true
+        })
+    }
+
     #[test]
-    fn recognizes_exactly_the_three_agent_schemas() {
+    fn recognizes_exactly_the_four_agent_schemas() {
         assert!(is_agent_schema(SYSCAP_RECEIPT_SCHEMA_V1));
         assert!(is_agent_schema(ORCHESTRATION_RECEIPT_SCHEMA_V1));
         assert!(is_agent_schema(ORCHESTRATION_BENCH_SCHEMA_V1));
+        assert!(is_agent_schema(EVAL_RECEIPT_SCHEMA_V1));
         assert!(!is_agent_schema("camelid.parity-receipt/v1"));
+        // The eval schema uses an underscore; the hyphenated spelling is not it.
         assert!(!is_agent_schema("camelid.agent-eval/v1"));
         assert!(!is_agent_schema(""));
+    }
+
+    #[test]
+    fn verifies_a_sealed_eval_receipt() {
+        let receipt = seal(eval_body());
+        let summary = check(&receipt).expect("verifies");
+        assert_eq!(summary.class, AgentReceiptClass::Eval);
+        assert_eq!(summary.result, "PASS");
+        assert_eq!(
+            summary.scope_note,
+            "promotion_eligible=true (consistent with outcome=\"PASS\")"
+        );
+        assert_eq!(summary.host, None);
+        assert_eq!(verify_value(&receipt), AgentVerifyOutcome::Verified);
+    }
+
+    #[test]
+    fn a_sealed_eval_claiming_eligibility_without_pass_fails_honest_scope() {
+        // Seal WITH the inconsistency so the digest is intact; only the
+        // honest-scope guard should reject it.
+        let mut body = eval_body();
+        body["outcome"] = json!("FAIL");
+        // promotion_eligible stays true — inconsistent with a non-PASS outcome.
+        let receipt = seal(body);
+        let err = check(&receipt).expect_err("must fail");
+        assert_eq!(err.phase, "honest-scope");
+        assert!(err.reason.contains("promotion_eligible=true"));
+        assert!(err.reason.contains("outcome=\"FAIL\""));
+    }
+
+    #[test]
+    fn an_unsealed_legacy_eval_receipt_is_reported_as_such() {
+        // The 9 committed agent_eval receipts predate sealing: no `receipt_id`.
+        // They must be reported as unsealed legacy, not as a malformed body.
+        let mut legacy = eval_body();
+        legacy.as_object_mut().unwrap().remove("receipt_id");
+        let err = check(&legacy).expect_err("must fail");
+        assert_eq!(err.phase, "self-digest");
+        assert!(err.reason.contains("unsealed legacy"));
+        assert_eq!(verify_value(&legacy), AgentVerifyOutcome::NotVerified);
     }
 
     #[test]
@@ -413,7 +531,7 @@ mod tests {
         assert_eq!(summary.class, AgentReceiptClass::Syscap);
         assert_eq!(summary.result, "PASS");
         assert_eq!(summary.scope_note, "promotes_capability=false");
-        assert_eq!(summary.host, "windows/x86_64 (TEST-BOX)");
+        assert_eq!(summary.host.as_deref(), Some("windows/x86_64 (TEST-BOX)"));
         assert_eq!(verify_value(&receipt), AgentVerifyOutcome::Verified);
     }
 
@@ -427,7 +545,7 @@ mod tests {
             "promotes_capability=false, claims_speedup=false"
         );
         // No hostname in this fixture.
-        assert_eq!(summary.host, "linux/aarch64");
+        assert_eq!(summary.host.as_deref(), Some("linux/aarch64"));
         assert_eq!(verify_value(&receipt), AgentVerifyOutcome::Verified);
     }
 

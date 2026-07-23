@@ -387,7 +387,7 @@ fn finish(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let receipt = json!({
+    let mut receipt = json!({
         "schema": "camelid.agent_eval/v1",
         "outcome": outcome.label(),
         "model_id": model_id,
@@ -400,6 +400,14 @@ fn finish(
         "timestamp_unix": ts,
         "promotion_eligible": outcome == EvalOutcome::Pass,
     });
+    // Seal the receipt with the shared tamper-evident digest so `camelid
+    // verify-receipt` can prove it intact. `receipt_id_over` hashes the canonical
+    // body with any `receipt_id` field removed, so inserting it afterwards yields
+    // the same digest the verifier recomputes.
+    let receipt_id = crate::receipt::receipt_id_over(&receipt);
+    if let Some(obj) = receipt.as_object_mut() {
+        obj.insert("receipt_id".to_string(), Value::from(receipt_id.clone()));
+    }
     std::fs::create_dir_all(&cfg.receipt_dir)?;
     let stem = gguf
         .file_stem()
@@ -414,7 +422,7 @@ fn finish(
 
     eprintln!();
     eprintln!("{} — {note}", outcome.label());
-    eprintln!("receipt → {}", path.display());
+    eprintln!("receipt → {} ({receipt_id})", path.display());
     if outcome == EvalOutcome::Inconclusive {
         eprintln!("(inconclusive does NOT change any tool_capable flag — re-run on a quiet box)");
     }
