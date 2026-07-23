@@ -42,6 +42,8 @@ mod tool_parse;
 mod tools;
 mod tui;
 #[cfg(windows)]
+mod win_clipboard;
+#[cfg(windows)]
 mod win_console;
 #[cfg(windows)]
 mod win_input;

@@ -209,12 +209,12 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
     super::term_guard::install_panic_hook();
     let guard = super::term_guard::TerminalGuard::arm();
     let mut out = std::io::stdout();
-    execute!(
-        out,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // W5: bracketed paste is Unix-only value (crossterm 0.28 never constructs
+    // Event::Paste on Windows) and could in principle fail on an exotic host —
+    // non-fatal by design, on its own write so it can never abort setup. The
+    // guard above covers the `?`s regardless.
+    let _ = execute!(out, EnableBracketedPaste);
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let mut app = App::new(session, addr, engine);
@@ -317,7 +317,22 @@ impl<'a> App<'a> {
             let timeout = if self.running { 80 } else { 120 };
             if event::poll(Duration::from_millis(timeout))? {
                 match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        // W5: Windows terminals inject a paste as plain
+                        // keystrokes (crossterm never yields Event::Paste
+                        // there), so a multi-line paste arrives as text plus
+                        // real Enter presses — each of which used to fire a
+                        // goal. Near-simultaneous arrival is not human typing:
+                        // if more input is already queued the instant an Enter
+                        // is processed, it is a pasted newline, not a submit.
+                        // Measured live (Phase 0): a 3-line paste fired 2
+                        // goals. On Unix bracketed paste handles this and the
+                        // flag is constantly false — behavior preserved.
+                        let paste_burst = cfg!(windows)
+                            && key.code == KeyCode::Enter
+                            && event::poll(Duration::ZERO).unwrap_or(false);
+                        self.on_key(key, paste_burst);
+                    }
                     // A paste is text, not keystrokes: newlines inside it must
                     // not submit the goal mid-paste.
                     Event::Paste(text) => {
@@ -712,7 +727,7 @@ impl<'a> App<'a> {
 
     // ---- key handling ----------------------------------------------------
 
-    fn on_key(&mut self, key: KeyEvent) {
+    fn on_key(&mut self, key: KeyEvent, paste_burst: bool) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -749,11 +764,19 @@ impl<'a> App<'a> {
                     self.status = "Ctrl-D or /exit to quit".into();
                 }
             }
+            // W5: for hosts that pass Ctrl+V through instead of intercepting it
+            // (custom Windows Terminal keybindings, SSH from another box), read
+            // the clipboard directly and insert it as text, never keystrokes.
+            #[cfg(windows)]
+            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
             KeyCode::Tab => self.sidebar = !self.sidebar,
             KeyCode::F(1) => self.help = true,
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Enter if alt => self.insert_char('\n'),
+            // W5: an Enter that arrived glued to more queued input is a pasted
+            // newline (see the run loop), never a submit. Always false on Unix.
+            KeyCode::Enter if paste_burst => self.insert_char('\n'),
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Left => self.move_cursor(-1),
@@ -779,6 +802,20 @@ impl<'a> App<'a> {
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+    }
+
+    /// W5 — Ctrl+V on Windows: insert the clipboard as text. Same rule as the
+    /// `Event::Paste` arm: a paste is text, not keystrokes, so newlines are
+    /// normalized (`\r\n` and `\r` → `\n`) and never submit.
+    #[cfg(windows)]
+    fn paste_from_clipboard(&mut self) {
+        let Some(text) = super::win_clipboard::read_text() else {
+            return;
+        };
+        for c in text.replace("\r\n", "\n").chars() {
+            let c = if c == '\r' { '\n' } else { c };
+            self.insert_char(c);
+        }
     }
 
     fn backspace(&mut self) {
