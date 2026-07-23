@@ -72,6 +72,12 @@ struct PickerUi {
 
 pub fn run(session: &mut Session, addr: SocketAddr, spawned: bool) -> anyhow::Result<()> {
     enable_raw_mode()?;
+    // W6: arm the restore guard before anything else can fail, and route panics
+    // through the chaining hook — same discipline as the agent TUI. The
+    // `run_suspended` teardown/re-entry below is unaffected (restore is
+    // idempotent and only the final drop actually restores).
+    super::term_guard::install_panic_hook();
+    let guard = super::term_guard::TerminalGuard::arm();
     let mut out = std::io::stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
@@ -79,13 +85,7 @@ pub fn run(session: &mut Session, addr: SocketAddr, spawned: bool) -> anyhow::Re
     let mut app = App::new(session, addr, spawned);
     let result = app.run(&mut terminal);
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    drop(guard);
     result
 }
 

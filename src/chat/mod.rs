@@ -36,6 +36,7 @@ mod server;
 mod session;
 mod shell_sandbox;
 mod subagent;
+mod term_guard;
 mod theme;
 mod tool_parse;
 mod tools;

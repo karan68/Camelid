@@ -24,13 +24,11 @@ use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -205,6 +203,11 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
     });
 
     enable_raw_mode()?;
+    // W6: from here the terminal is raw — arm the restore guard before anything
+    // else can fail, and route panics through the chaining hook, so no `?` bail
+    // or TUI-thread panic can strand the console (cmd.exe has no `reset`).
+    super::term_guard::install_panic_hook();
+    let guard = super::term_guard::TerminalGuard::arm();
     let mut out = std::io::stdout();
     execute!(
         out,
@@ -217,14 +220,9 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
     let mut app = App::new(session, addr, engine);
     let result = app.run(&mut terminal);
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
-    terminal.show_cursor()?;
+    // Normal exit: the guard restores (same sequence the straight-line teardown
+    // used, best-effort) so `run`'s result is never masked by a teardown error.
+    drop(guard);
     result.map(|()| 0)
 }
 
