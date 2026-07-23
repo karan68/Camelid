@@ -1756,15 +1756,36 @@ fn workspace_not_found() -> Response {
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    if state.serve_addr.ip().is_loopback() && local_management_request_allowed(headers) {
+    if state.serve_addr.ip().is_loopback()
+        && workspace_request_allowed(headers, state.workspace_cli_token.as_deref())
+    {
         return None;
     }
     Some(api_error(
         StatusCode::FORBIDDEN,
         "local_management_forbidden",
-        "Workspace is available only from Camelid's loopback web UI".to_string(),
+        "Workspace requires Camelid's same-origin web UI or same-user CLI credential".to_string(),
         None,
     ))
+}
+
+fn workspace_request_allowed(headers: &HeaderMap, cli_token: Option<&str>) -> bool {
+    let loopback_host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<axum::http::uri::Authority>().ok())
+        .is_some_and(|authority| loopback_host(authority.host()));
+    if !loopback_host {
+        return false;
+    }
+    if local_management_request_allowed(headers) {
+        return true;
+    }
+    let provided = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    matches!((cli_token, provided), (Some(expected), Some(provided)) if crate::workspace_auth::token_matches(expected, provided))
 }
 
 fn local_management_request_allowed(headers: &HeaderMap) -> bool {
@@ -1971,6 +1992,36 @@ mod tests {
         headers.remove("origin");
         headers.remove("sec-fetch-site");
         assert!(!local_management_request_allowed(&headers));
+    }
+
+    #[test]
+    fn cli_authorization_requires_the_exact_token_and_loopback_host() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:8181".parse().unwrap());
+        assert!(!workspace_request_allowed(&headers, Some(token)));
+
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(workspace_request_allowed(&headers, Some(token)));
+        assert!(!workspace_request_allowed(&headers, Some(&"0".repeat(64))));
+        assert!(!workspace_request_allowed(&headers, None));
+
+        headers.insert("host", "example.com:8181".parse().unwrap());
+        assert!(!workspace_request_allowed(&headers, Some(token)));
+    }
+
+    #[test]
+    fn valid_cli_token_does_not_enable_a_non_loopback_listener() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let state = AppState {
+            serve_addr: "192.0.2.1:8181".parse().unwrap(),
+            workspace_cli_token: Some(Arc::from(token)),
+            ..AppState::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:8181".parse().unwrap());
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(authorize(&state, &headers).is_some());
     }
 
     #[test]

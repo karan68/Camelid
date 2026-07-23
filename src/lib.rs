@@ -37,6 +37,7 @@ pub mod tokenizer;
 pub mod verify;
 pub mod web_ui;
 pub mod wire_mmap;
+pub(crate) mod workspace_auth;
 
 pub use error::{BackendError, Result};
 

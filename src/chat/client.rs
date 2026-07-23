@@ -173,6 +173,94 @@ impl Client {
         parse_http_response(&raw).map_err(|err| anyhow::anyhow!(err))
     }
 
+    pub(super) fn workspace_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        token: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<(u16, Value)> {
+        anyhow::ensure!(
+            self.addr.ip().is_loopback(),
+            "Workspace CLI requires a loopback address"
+        );
+        let mut stream = self.connect(timeout)?;
+        let raw_request = encode_request_with_bearer(
+            method,
+            path,
+            &self.addr.to_string(),
+            body,
+            "application/json",
+            Some(token),
+        )?;
+        stream.write_all(&raw_request.0)?;
+        stream.write_all(&raw_request.1)?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw)?;
+        parse_http_response(&raw).map_err(|error| anyhow::anyhow!(error))
+    }
+
+    pub(super) fn workspace_events(
+        &self,
+        path: &str,
+        token: &str,
+        cancel: &AtomicBool,
+        timeout: Duration,
+        mut on_event: impl FnMut(&Value) -> bool,
+    ) -> anyhow::Result<StreamEnd> {
+        anyhow::ensure!(
+            self.addr.ip().is_loopback(),
+            "Workspace CLI requires a loopback address"
+        );
+        let deadline = Instant::now() + timeout;
+        let mut stream = self.connect(Duration::from_millis(250))?;
+        let (head, body) = encode_request_with_bearer(
+            "GET",
+            path,
+            &self.addr.to_string(),
+            None,
+            "text/event-stream",
+            Some(token),
+        )?;
+        stream.write_all(&head)?;
+        stream.write_all(&body)?;
+
+        let mut reader = SseReader::new(stream);
+        if reader.read_headers(cancel, Some(deadline))? {
+            return Ok(StreamEnd::Cancelled);
+        }
+        if reader.status != 200 {
+            anyhow::bail!(reader.drain_error_body());
+        }
+        anyhow::ensure!(
+            reader
+                .content_type
+                .as_deref()
+                .is_some_and(|value| value.starts_with("text/event-stream")),
+            "Workspace event endpoint did not return text/event-stream"
+        );
+
+        let mut parse_error = None;
+        let end = reader.stream(cancel, Some(deadline), |line| {
+            let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+                return SseControl::Continue;
+            };
+            match serde_json::from_str::<Value>(payload) {
+                Ok(event) if on_event(&event) => SseControl::Done,
+                Ok(_) => SseControl::Continue,
+                Err(error) => {
+                    parse_error = Some(error);
+                    SseControl::Done
+                }
+            }
+        })?;
+        if let Some(error) = parse_error {
+            anyhow::bail!("Workspace event stream returned invalid JSON: {error}");
+        }
+        Ok(end)
+    }
+
     fn request_with_control(
         &self,
         method: &str,
@@ -563,6 +651,17 @@ fn encode_request(
     body: Option<&Value>,
     accept: &str,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    encode_request_with_bearer(method, path, host, body, accept, None)
+}
+
+fn encode_request_with_bearer(
+    method: &str,
+    path: &str,
+    host: &str,
+    body: Option<&Value>,
+    accept: &str,
+    bearer: Option<&str>,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let body_bytes = match body {
         Some(value) => serde_json::to_vec(value)?,
         None => Vec::new(),
@@ -570,6 +669,15 @@ fn encode_request(
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: {accept}\r\nConnection: close\r\n"
     );
+    if let Some(token) = bearer {
+        anyhow::ensure!(
+            !token.is_empty() && !token.contains(['\r', '\n']),
+            "invalid bearer token"
+        );
+        head.push_str("Authorization: Bearer ");
+        head.push_str(token);
+        head.push_str("\r\n");
+    }
     if !body_bytes.is_empty() {
         head.push_str("Content-Type: application/json\r\n");
         head.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
@@ -585,6 +693,7 @@ struct SseReader {
     pending: Vec<u8>,
     status: u16,
     chunked: bool,
+    content_type: Option<String>,
 }
 
 enum SseControl {
@@ -599,6 +708,7 @@ impl SseReader {
             pending: Vec::new(),
             status: 0,
             chunked: false,
+            content_type: None,
         }
     }
 
@@ -626,10 +736,13 @@ impl SseReader {
                     })?;
                 for line in lines {
                     if let Some((name, value)) = line.split_once(':') {
-                        if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                        let name = name.trim();
+                        if name.eq_ignore_ascii_case("transfer-encoding")
                             && value.to_ascii_lowercase().contains("chunked")
                         {
                             self.chunked = true;
+                        } else if name.eq_ignore_ascii_case("content-type") {
+                            self.content_type = Some(value.trim().to_ascii_lowercase());
                         }
                     }
                 }
@@ -904,6 +1017,108 @@ mod tests {
     use serde_json::json;
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn workspace_request_encodes_bearer_without_browser_headers() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let (head, body) = encode_request_with_bearer(
+            "GET",
+            "/api/agent/workspace/threads?workspace=C%3A%5Cwork",
+            "127.0.0.1:8181",
+            None,
+            "application/json",
+            Some(token),
+        )
+        .unwrap();
+        let head = String::from_utf8(head).unwrap();
+        assert!(head.contains(&format!("Authorization: Bearer {token}\r\n")));
+        assert!(!head.contains("Origin:"));
+        assert!(!head.contains("Sec-Fetch-Site:"));
+        assert!(body.is_empty());
+        assert!(encode_request_with_bearer(
+            "GET",
+            "/",
+            "127.0.0.1:8181",
+            None,
+            "application/json",
+            Some("bad\r\ntoken")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn workspace_events_stream_authenticated_json_envelopes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let expected_authorization = format!("Authorization: Bearer {token}\r\n");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if read == 0 || find(&request, b"\r\n\r\n").is_some() {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.contains(&expected_authorization));
+            let event = "data: {\"sequence\":1,\"session_id\":\"workspace-1\",\"event\":\"session.finished\",\"outcome\":\"answered\"}\n\n";
+            let body = format!("{:X}\r\n{event}\r\n0\r\n\r\n", event.len());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            )
+            .unwrap();
+        });
+
+        let mut events = Vec::new();
+        let end = Client::new(addr)
+            .workspace_events(
+                "/api/agent/workspace/sessions/workspace-1/events",
+                token,
+                &AtomicBool::new(false),
+                Duration::from_secs(5),
+                |event| {
+                    events.push(event.clone());
+                    event["event"] == "session.finished"
+                },
+            )
+            .unwrap();
+        assert_eq!(end, StreamEnd::Done);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["outcome"], "answered");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn workspace_events_reject_a_non_sse_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .unwrap();
+        });
+        let error = Client::new(addr)
+            .workspace_events(
+                "/api/agent/workspace/sessions/workspace-1/events",
+                &"0".repeat(64),
+                &AtomicBool::new(false),
+                Duration::from_secs(5),
+                |_| false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("text/event-stream"));
+        server.join().unwrap();
+    }
 
     #[test]
     fn parse_chat_turn_reads_structured_tool_calls() {

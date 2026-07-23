@@ -305,6 +305,153 @@ enum AgentAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum WorkspaceAction {
+    /// Ask one grounded, read-only question. Use --thread to continue a saved conversation.
+    Ask {
+        /// Local folder that confines all Workspace file tools.
+        workspace: PathBuf,
+        /// Question or analysis request.
+        goal: String,
+        /// Resume this durable Workspace conversation.
+        #[arg(long)]
+        thread: Option<String>,
+        #[arg(long, default_value_t = 12)]
+        max_steps: usize,
+        #[arg(long, default_value_t = 512)]
+        max_tokens: u32,
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+    },
+    /// List durable conversations for a local folder and the active model.
+    Threads {
+        #[arg(default_value = ".")]
+        workspace: PathBuf,
+    },
+    /// Print a durable conversation transcript.
+    Show {
+        thread: String,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
+    /// Compact a durable conversation, or restore its previous compaction state.
+    Compact {
+        thread: String,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        #[arg(long, default_value_t = false)]
+        undo: bool,
+    },
+    /// Permanently delete one durable conversation.
+    Delete {
+        thread: String,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
+}
+
+#[cfg(test)]
+mod workspace_command_tests {
+    use super::*;
+
+    fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("workspace-cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn Workspace CLI parse test")
+            .join()
+            .expect("Workspace CLI parse test panicked");
+    }
+
+    #[test]
+    fn workspace_ask_parses_durable_resume_and_limits() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "workspace",
+                "ask",
+                ".",
+                "inspect README.md",
+                "--thread",
+                "workspace-123",
+                "--max-steps",
+                "8",
+                "--max-tokens",
+                "256",
+            ])
+            .unwrap();
+            match cli.command {
+                Some(Command::Workspace {
+                    action:
+                        WorkspaceAction::Ask {
+                            workspace,
+                            goal,
+                            thread,
+                            max_steps,
+                            max_tokens,
+                            ..
+                        },
+                    ..
+                }) => {
+                    assert_eq!(workspace, PathBuf::from("."));
+                    assert_eq!(goal, "inspect README.md");
+                    assert_eq!(thread.as_deref(), Some("workspace-123"));
+                    assert_eq!(max_steps, 8);
+                    assert_eq!(max_tokens, 256);
+                }
+                other => panic!("expected workspace ask, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn workspace_threads_uses_current_directory_and_json_is_global() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["camelid", "workspace", "threads", "--json"]).unwrap();
+            match cli.command {
+                Some(Command::Workspace {
+                    json: true,
+                    action: WorkspaceAction::Threads { workspace },
+                    ..
+                }) => assert_eq!(workspace, PathBuf::from(".")),
+                other => panic!("expected workspace threads, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn workspace_compaction_undo_is_explicit() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "workspace",
+                "compact",
+                "workspace-123",
+                "--workspace",
+                "project",
+                "--undo",
+            ])
+            .unwrap();
+            match cli.command {
+                Some(Command::Workspace {
+                    action:
+                        WorkspaceAction::Compact {
+                            thread,
+                            workspace,
+                            undo: true,
+                        },
+                    ..
+                }) => {
+                    assert_eq!(thread, "workspace-123");
+                    assert_eq!(workspace, PathBuf::from("project"));
+                }
+                other => panic!("expected workspace compact --undo, got {other:?}"),
+            }
+        });
+    }
+}
+
+#[derive(Debug, Subcommand)]
 enum GaitAction {
     /// Clear the GAIT cache (profiles, quarantine, in-progress markers, and the
     /// DISABLE kill-file) under %LOCALAPPDATA%\Camelid\gait, fully reverting to
@@ -1079,6 +1226,25 @@ enum Command {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+    /// Grounded, durable, read-only conversations with a local folder.
+    Workspace {
+        /// Address of an already-running loopback Camelid server.
+        #[arg(
+            long,
+            global = true,
+            default_value = "127.0.0.1:8181",
+            env = "CAMELID_ADDR"
+        )]
+        addr: SocketAddr,
+        /// Emit compact JSON (JSON Lines for `ask`).
+        #[arg(long, global = true, default_value_t = false)]
+        json: bool,
+        /// Maximum time to wait for one `ask` event stream.
+        #[arg(long, global = true, default_value_t = 1800)]
+        timeout_seconds: u64,
+        #[command(subcommand)]
+        action: WorkspaceAction,
     },
     /// GAIT cache maintenance (e.g. `camelid gait reset`).
     #[command(hide = true)]
@@ -2373,6 +2539,57 @@ async fn main() -> anyhow::Result<()> {
                 gpc_ffn,
                 gpc_matmul,
             )?;
+        }
+        Command::Workspace {
+            addr,
+            json,
+            timeout_seconds,
+            action,
+        } => {
+            let action = match action {
+                WorkspaceAction::Ask {
+                    workspace,
+                    goal,
+                    thread,
+                    max_steps,
+                    max_tokens,
+                    temperature,
+                } => chat::WorkspaceCliAction::Ask {
+                    workspace,
+                    goal,
+                    thread_id: thread,
+                    max_steps,
+                    max_tokens,
+                    temperature,
+                },
+                WorkspaceAction::Threads { workspace } => {
+                    chat::WorkspaceCliAction::Threads { workspace }
+                }
+                WorkspaceAction::Show { thread, workspace } => chat::WorkspaceCliAction::Show {
+                    workspace,
+                    thread_id: thread,
+                },
+                WorkspaceAction::Compact {
+                    thread,
+                    workspace,
+                    undo,
+                } => chat::WorkspaceCliAction::Compact {
+                    workspace,
+                    thread_id: thread,
+                    undo,
+                },
+                WorkspaceAction::Delete { thread, workspace } => chat::WorkspaceCliAction::Delete {
+                    workspace,
+                    thread_id: thread,
+                },
+            };
+            let code = chat::run_workspace_cli(chat::WorkspaceCliOptions {
+                addr,
+                json,
+                timeout: std::time::Duration::from_secs(timeout_seconds),
+                action,
+            })?;
+            std::process::exit(code);
         }
         Command::Agent { action } => match action {
             AgentAction::Exec {

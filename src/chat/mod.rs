@@ -49,7 +49,10 @@ mod win_job;
 #[cfg(windows)]
 mod win_uia;
 pub(crate) mod workspace_bridge;
+mod workspace_cli;
 pub(crate) mod workspace_memory;
+
+pub use workspace_cli::{run as run_workspace_cli, WorkspaceCliAction, WorkspaceCliOptions};
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;

@@ -122,6 +122,9 @@ pub struct AppState {
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
     workspace_sessions: workspace::WorkspaceSessionManager,
+    /// Process-rotated bearer capability for same-user Workspace CLI clients.
+    /// Browser requests continue to use the independent same-origin predicate.
+    workspace_cli_token: Option<Arc<str>>,
     /// Actual listener address. Workspace is disabled when this is non-loopback
     /// and uses it for the existing local HTTP model driver.
     serve_addr: SocketAddr,
@@ -168,6 +171,7 @@ impl Default for AppState {
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             verification_reports: Arc::new(RwLock::new(HashMap::new())),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
+            workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
             engine: engine::EngineHandle::spawn(),
             planner_env: PlannerEnv::capture(),
@@ -212,6 +216,11 @@ impl AppState {
 
     fn with_serve_addr(mut self, serve_addr: SocketAddr) -> Self {
         self.serve_addr = serve_addr;
+        self
+    }
+
+    fn with_workspace_cli_token(mut self, token: Option<&str>) -> Self {
+        self.workspace_cli_token = token.map(Arc::from);
         self
     }
 
@@ -1812,6 +1821,11 @@ pub fn router() -> Router {
     router_with_state(AppState::default())
 }
 
+#[cfg(test)]
+pub(crate) fn router_with_workspace_cli_token_for_tests(token: &str) -> Router {
+    router_with_state(AppState::default().with_workspace_cli_token(Some(token)))
+}
+
 pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1934,7 +1948,8 @@ pub async fn serve(
     default_enable_thinking: bool,
     models_dir: Option<PathBuf>,
 ) -> std::io::Result<()> {
-    let state = AppState::with_configured_threads(configured_threads)
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let mut state = AppState::with_configured_threads(configured_threads)
         .with_default_enable_thinking(default_enable_thinking)
         .with_local_model_delete(addr.ip().is_loopback())
         .with_models_dir(models_dir)
@@ -1949,7 +1964,25 @@ pub async fn serve(
             return Err(std::io::Error::other(err.to_string()));
         }
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let workspace_cli_credential = if addr.ip().is_loopback() {
+        match crate::workspace_auth::WorkspaceCliCredential::issue(addr) {
+            Ok(credential) => Some(credential),
+            Err(error) => {
+                tracing::warn!(%error, "Workspace CLI authentication is unavailable");
+                eprintln!(
+                    "  Workspace CLI unavailable: could not create its local credential ({error})"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    state = state.with_workspace_cli_token(
+        workspace_cli_credential
+            .as_ref()
+            .map(crate::workspace_auth::WorkspaceCliCredential::token),
+    );
     tracing::info!(%addr, "camelid server listening");
     let url = format!("http://{addr}");
 
@@ -1987,6 +2020,9 @@ pub async fn serve(
         warmup_generation_blocking(addr, model_id).await;
     }
     print_ready_banner(&url);
+    if workspace_cli_credential.is_some() {
+        eprintln!("  Workspace CLI: ready");
+    }
     if open_ui {
         crate::web_ui::open_in_browser(&url);
     }
