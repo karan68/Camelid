@@ -1,0 +1,517 @@
+//! Repo-wide integrity audit for the committed **sealed** receipts.
+//!
+//! [`super::verify`] and [`super::agent`] prove ONE receipt intact; this walks a
+//! directory tree and checks EVERY sealed receipt's self-digest, so a corrupted
+//! or hand-edited committed receipt cannot pass review unnoticed. It is the
+//! mechanical companion to the CI gate - the automatic layer under "git history
+//! + review" that the receipt scheme otherwise leans on entirely.
+//!
+//! Scope, deliberately narrow so the audit never false-fails:
+//! - Only receipts whose `schema` is one of the families sealed with the shared
+//!   [`receipt_id`](super::receipt_id_over) convention (parity, distributed, and
+//!   the agent family) are checked. Every other JSON file - the many unsealed
+//!   evidence / summary / prompt-pack schemas - is skipped.
+//! - A sealed-family receipt that carries no `receipt_id` (e.g. an `agent_eval`
+//!   receipt minted before sealing) is reported as *unsealed*, not failed.
+//! - Only a receipt whose stored `receipt_id` does not match its recomputed
+//!   digest is a failure. That is exactly the accidental-corruption / naive-edit
+//!   case the seal exists to catch; it is not forgery-resistance (see
+//!   [`super::agent`]).
+//!
+//! ## Tracked-debt baseline
+//!
+//! When first run against `qa/`, this audit surfaced [`BASELINE`] receipts whose
+//! seals were already broken before it existed - some by privacy scrubs that
+//! redacted paths/IPs after sealing without re-sealing, some sealed under an
+//! earlier serialization. Those are grandfathered by their exact
+//! `(stored, computed)` digest pair so the gate can enforce integrity going
+//! forward without rewriting historical provenance. The match is content-keyed,
+//! so any further edit to a baselined receipt changes its `computed` digest, no
+//! longer matches, and is reported as a real failure - the debt is suppressed,
+//! not the future.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+use super::receipt_id_over;
+
+/// One pre-existing broken seal, grandfathered by its exact digest pair. See the
+/// module "Tracked-debt baseline" note. `path` is documentation only; matching
+/// is on `(stored, computed)`, which a SHA-256 pair makes unique and
+/// move-independent.
+pub struct BaselineEntry {
+    pub path: &'static str,
+    pub stored: &'static str,
+    pub computed: &'static str,
+    pub reason: &'static str,
+}
+
+/// Sealed receipts already broken when this audit was introduced (2026-07-23),
+/// grandfathered so the gate enforces integrity forward without touching
+/// historical provenance. Any change to one of these files changes its
+/// `computed` digest, drops the match, and turns it back into a hard failure.
+pub const BASELINE: &[BaselineEntry] = &[
+    BaselineEntry {
+        path: "qa/agent-orchestration/bench-rung4-1782702313.json",
+        stored: "7c26a31bde23e41020565031beddfc74e959897cc08bd19b973d8399c06e3388",
+        computed: "1e757f79691e7b1f236cca109f589c22ad932310bfdb886e0836c18e1a134054",
+        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
+    },
+    BaselineEntry {
+        path: "qa/agent-syscap/syscap-1782688037-PASS.json",
+        stored: "06ac92dd39fb246525488ede277e4c11c166d3b4b308e2c83385eac580bfeaa4",
+        computed: "cfea544cfb3c49ce44649edf8e86be2ead9e6676c09540558f7cb1e82f426fb4",
+        reason: "privacy scrub replaced the Windows home path with `<home>` after sealing (commit d2825069); never re-sealed",
+    },
+    BaselineEntry {
+        path: "qa/capability/mac_ctx_out/llama-3.2-1b/parity-receipt.json",
+        stored: "cdd822e1aa6423ba840d1ada6388eb54db59afa64f083496defc434d85f66c52",
+        computed: "e19c09f87dd01f8f262543e0becde221f7fbe72e231f9e19bffec49360d01ccd",
+        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
+    },
+    BaselineEntry {
+        path: "qa/capability/mac_ctx_out/llama-3.2-3b/parity-receipt.json",
+        stored: "60284b8bb73cb57f37ad4daee0b382c98c13aca83479fc9e7fa5aee80b4d028d",
+        computed: "65d810343fe424219d4448025a656c6c183f8dc1bccab02ed907127e349d4004",
+        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
+    },
+    BaselineEntry {
+        path: "qa/capability/mac_sm_out/llama-3.2-1b/parity-receipt.json",
+        stored: "adcf1be9953378aedd31490f81fd07656f51a5948dbca2744bc05e5e50839602",
+        computed: "48e79bb79f04d93cfeac0495db67c5f909251b641f90db31ba47590015adba80",
+        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
+    },
+    BaselineEntry {
+        path: "qa/capability/mac_sm_out/llama-3.2-3b/parity-receipt.json",
+        stored: "56a8a31ebb57303016cb4ca32401130ad535362a82260096dfd1aa66a4e3d912",
+        computed: "a7286ebdb7b5e2a4f4653108501b0599785f9d525325ed19e52bb2f926b7fad9",
+        reason: "sealed once and never edited (single commit); the stored digest predates the current canonical serialization and is not reproduced by it - historical sealing drift, not a post-seal edit",
+    },
+    BaselineEntry {
+        path: "qa/distributed/hetero-mac-pi-tinyllama-q8.json",
+        stored: "11bbe0e14f38030bf4c3f55b221c79875aaabdc60b39c816e686754f3645ec9d",
+        computed: "236fe8fc23ed619a14f8c7e0356e2c6b86de701a7c83dd7af4911509ba59fced",
+        reason: "privacy scrub redacted LAN IPs / SSH-key path after sealing (commit cfaed035); never re-sealed",
+    },
+    BaselineEntry {
+        path: "qa/distributed/two-mac-tinyllama-q8.json",
+        stored: "33b79d8d0b99c729946de405009d4f293e364736d72b3985d47b3ae3587483be",
+        computed: "4e6276cb6e5fbca61bf1ba26242f31140de41a6ff32c07f2e76a04f2823e2004",
+        reason: "privacy scrub redacted LAN IPs / SSH-key path after sealing (commit cfaed035); never re-sealed",
+    },
+    BaselineEntry {
+        path: "qa/evidence-bundles/engine-inversion-gate4-recert-20260709T154139Z-head-d50e0ab4/receipt/tinyllama-oracle-receipt.json",
+        stored: "2691f637929b7f8d23f8bd8c043dea49305a461fc7e66b694a88c6f9680e05bc",
+        computed: "78af89e4c1d661ae7072cf8739e851a1e56d42662b995f2fc26f395e0ba2958f",
+        reason: "redacted for public scrub after sealing; body no longer matches the stored digest",
+    },
+];
+
+/// The receipt schemas sealed with the `receipt_id` self-digest convention,
+/// sourced from each family's own schema constant so the set cannot silently
+/// drift from what the emitters produce.
+pub fn sealed_schemas() -> Vec<&'static str> {
+    let mut schemas = vec![
+        super::RECEIPT_SCHEMA_V1,
+        super::distributed::DISTRIBUTED_RECEIPT_SCHEMA_V1,
+    ];
+    schemas.extend(super::agent::RECOGNIZED_SCHEMAS);
+    schemas
+}
+
+/// A committed sealed receipt whose stored digest does not match its body and is
+/// not grandfathered by [`BASELINE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestMismatch {
+    pub path: PathBuf,
+    pub stored: String,
+    pub computed: String,
+}
+
+/// A mismatch grandfathered by [`BASELINE`] - reported as tracked debt, never a
+/// failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowlistedMismatch {
+    pub path: PathBuf,
+    pub reason: &'static str,
+}
+
+/// The outcome of auditing a directory tree.
+#[derive(Debug, Default)]
+pub struct AuditReport {
+    /// `.json` files read.
+    pub scanned: usize,
+    /// Sealed receipts whose digest matched.
+    pub verified: usize,
+    /// Sealed-family receipts carrying no (or an empty) `receipt_id`.
+    pub unsealed: Vec<PathBuf>,
+    /// Mismatches grandfathered by [`BASELINE`] (tracked debt, not failures).
+    pub allowlisted: Vec<AllowlistedMismatch>,
+    /// Sealed receipts whose digest did not match and are NOT grandfathered.
+    pub mismatches: Vec<DigestMismatch>,
+    /// Indices into the baseline matched this run (for stale detection).
+    matched_baseline: HashSet<usize>,
+}
+
+impl AuditReport {
+    /// True when no un-grandfathered corruption was found.
+    pub fn ok(&self) -> bool {
+        self.mismatches.is_empty()
+    }
+
+    /// Process exit code: 0 when every sealed receipt is intact or grandfathered,
+    /// 1 otherwise.
+    pub fn exit_code(&self) -> i32 {
+        i32::from(!self.ok())
+    }
+}
+
+/// Classify and check a single already-parsed receipt found at `path`, updating
+/// `report`. No filesystem I/O, so it is exhaustively unit-testable.
+fn audit_value(
+    path: &Path,
+    value: &Value,
+    sealed: &[&str],
+    baseline: &[BaselineEntry],
+    report: &mut AuditReport,
+) {
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    let Some(schema) = obj.get("schema").and_then(Value::as_str) else {
+        return;
+    };
+    if !sealed.contains(&schema) {
+        return; // not a sealed family - it never carried a digest to check
+    }
+    let stored = match obj.get("receipt_id").and_then(Value::as_str) {
+        None | Some("") => {
+            report.unsealed.push(path.to_path_buf());
+            return;
+        }
+        Some(stored) => stored,
+    };
+    let computed = receipt_id_over(value);
+    if computed == stored {
+        report.verified += 1;
+        return;
+    }
+    // A mismatch: grandfathered by its exact (stored, computed) pair, or a real
+    // failure. Content-keyed, so any further edit drops the match.
+    match baseline
+        .iter()
+        .position(|entry| entry.stored == stored && entry.computed == computed)
+    {
+        Some(index) => {
+            report.matched_baseline.insert(index);
+            report.allowlisted.push(AllowlistedMismatch {
+                path: path.to_path_buf(),
+                reason: baseline[index].reason,
+            });
+        }
+        None => report.mismatches.push(DigestMismatch {
+            path: path.to_path_buf(),
+            stored: stored.to_string(),
+            computed,
+        }),
+    }
+}
+
+/// Baseline entries not encountered in this run (receipt re-sealed, removed, or
+/// edited further). Reported so the debt list can be pruned; never a failure.
+pub fn stale_baseline<'a>(
+    baseline: &'a [BaselineEntry],
+    report: &AuditReport,
+) -> Vec<&'a BaselineEntry> {
+    baseline
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !report.matched_baseline.contains(index))
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
+/// Recursively audit every `*.json` file under `dir`. Files that do not parse as
+/// JSON are counted as scanned and skipped (many `.json` under `qa/` are not
+/// receipts).
+pub fn audit_dir(dir: &Path) -> std::io::Result<AuditReport> {
+    let sealed = sealed_schemas();
+    let mut report = AuditReport::default();
+    audit_dir_inner(dir, &sealed, BASELINE, &mut report)?;
+    Ok(report)
+}
+
+fn audit_dir_inner(
+    dir: &Path,
+    sealed: &[&str],
+    baseline: &[BaselineEntry],
+    report: &mut AuditReport,
+) -> std::io::Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    // Deterministic order so the printed summary is stable across runs/hosts.
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            audit_dir_inner(&path, sealed, baseline, report)?;
+        } else if path.extension().is_some_and(|ext| ext == "json") {
+            report.scanned += 1;
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            audit_value(&path, &value, sealed, baseline, report);
+        }
+    }
+    Ok(())
+}
+
+/// CLI entry: audit `dir`, print a summary, and return the process exit code.
+pub fn run(dir: &Path) -> i32 {
+    let report = match audit_dir(dir) {
+        Ok(report) => report,
+        Err(err) => {
+            println!("FAIL: could not read {}: {err}", dir.display());
+            return 1;
+        }
+    };
+    for mismatch in &report.mismatches {
+        println!(
+            "FAIL digest: {} (stored {}, computed {})",
+            mismatch.path.display(),
+            mismatch.stored,
+            mismatch.computed
+        );
+    }
+    for entry in &report.allowlisted {
+        println!(
+            "NOTE tracked-debt (allowlisted): {} - {}",
+            entry.path.display(),
+            entry.reason
+        );
+    }
+    for path in &report.unsealed {
+        println!(
+            "NOTE unsealed (no receipt_id, not verifiable): {}",
+            path.display()
+        );
+    }
+    for entry in stale_baseline(BASELINE, &report) {
+        println!(
+            "NOTE stale baseline entry (not encountered - prune it?): {}",
+            entry.path
+        );
+    }
+    println!(
+        "scanned {} json file(s): {} verified, {} allowlisted debt, {} unsealed, {} failed",
+        report.scanned,
+        report.verified,
+        report.allowlisted.len(),
+        report.unsealed.len(),
+        report.mismatches.len()
+    );
+    if report.ok() {
+        println!(
+            "ALL SEALED RECEIPTS INTACT (excluding {} allowlisted)",
+            report.allowlisted.len()
+        );
+    } else {
+        println!(
+            "RECEIPT INTEGRITY CHECK FAILED ({} corrupted, not allowlisted)",
+            report.mismatches.len()
+        );
+    }
+    report.exit_code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn seal(mut body: Value) -> Value {
+        let id = crate::receipt::receipt_id_over(&body);
+        body.as_object_mut()
+            .expect("object")
+            .insert("receipt_id".to_string(), Value::String(id));
+        body
+    }
+
+    /// A minimal object stamped with a real sealed-family schema. The audit is
+    /// generic over the body, so a full typed receipt is unnecessary.
+    fn sealed_body() -> Value {
+        json!({
+            "schema": crate::receipt::RECEIPT_SCHEMA_V1,
+            "receipt_id": "",
+            "created_utc": "2026-01-01T00:00:00Z",
+            "nested": { "b": 2, "a": [1, 2, 3] }
+        })
+    }
+
+    fn report_of(value: &Value) -> AuditReport {
+        report_with_baseline(value, &[])
+    }
+
+    fn report_with_baseline(value: &Value, baseline: &[BaselineEntry]) -> AuditReport {
+        let sealed = sealed_schemas();
+        let mut report = AuditReport::default();
+        audit_value(Path::new("t.json"), value, &sealed, baseline, &mut report);
+        report
+    }
+
+    #[test]
+    fn sealed_schemas_covers_parity_distributed_and_agent() {
+        let s = sealed_schemas();
+        assert!(s.contains(&crate::receipt::RECEIPT_SCHEMA_V1));
+        assert!(s.contains(&crate::receipt::distributed::DISTRIBUTED_RECEIPT_SCHEMA_V1));
+        for schema in crate::receipt::agent::RECOGNIZED_SCHEMAS {
+            assert!(s.contains(&schema), "missing agent schema {schema}");
+        }
+    }
+
+    #[test]
+    fn a_sealed_receipt_verifies() {
+        let report = report_of(&seal(sealed_body()));
+        assert_eq!(report.verified, 1);
+        assert!(report.mismatches.is_empty());
+        assert!(report.allowlisted.is_empty());
+        assert!(report.unsealed.is_empty());
+    }
+
+    #[test]
+    fn a_tampered_sealed_receipt_is_a_mismatch() {
+        let mut receipt = seal(sealed_body());
+        receipt["created_utc"] = json!("2099-12-31T23:59:59Z");
+        let report = report_of(&receipt);
+        assert_eq!(report.verified, 0);
+        assert_eq!(report.mismatches.len(), 1);
+        assert!(!report.ok());
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_baselined_mismatch_is_tracked_debt_not_a_failure() {
+        let sealed = seal(sealed_body());
+        let stored = sealed["receipt_id"].as_str().unwrap().to_string();
+        let mut tampered = sealed;
+        tampered["created_utc"] = json!("2099-12-31T23:59:59Z");
+        let computed = receipt_id_over(&tampered);
+        let baseline = [BaselineEntry {
+            path: "t.json",
+            stored: stored.leak(),
+            computed: computed.leak(),
+            reason: "test debt",
+        }];
+
+        let report = report_with_baseline(&tampered, &baseline);
+        assert!(report.mismatches.is_empty());
+        assert_eq!(report.allowlisted.len(), 1);
+        assert_eq!(report.allowlisted[0].reason, "test debt");
+        assert!(report.ok());
+        assert_eq!(report.exit_code(), 0);
+        assert!(stale_baseline(&baseline, &report).is_empty());
+    }
+
+    #[test]
+    fn a_baseline_entry_that_no_longer_matches_is_stale() {
+        let baseline = [BaselineEntry {
+            path: "gone.json",
+            stored: "a".repeat(64).leak(),
+            computed: "b".repeat(64).leak(),
+            reason: "removed",
+        }];
+        let report = report_with_baseline(&seal(sealed_body()), &baseline);
+        assert_eq!(report.verified, 1);
+        assert!(report.ok());
+        assert_eq!(stale_baseline(&baseline, &report).len(), 1);
+    }
+
+    #[test]
+    fn a_further_edit_to_a_baselined_receipt_fails_again() {
+        // Grandfathering is keyed on the exact (stored, computed); a further edit
+        // changes computed, drops the match, and becomes a real failure.
+        let sealed = seal(sealed_body());
+        let stored = sealed["receipt_id"].as_str().unwrap().to_string();
+        let mut tampered = sealed;
+        tampered["created_utc"] = json!("2099-12-31T23:59:59Z");
+        let old_computed = receipt_id_over(&tampered);
+        let baseline = [BaselineEntry {
+            path: "t.json",
+            stored: stored.leak(),
+            computed: old_computed.leak(),
+            reason: "test debt",
+        }];
+        // Edit it further: computed changes, no longer matches the baseline.
+        tampered["nested"]["b"] = json!(999);
+        let report = report_with_baseline(&tampered, &baseline);
+        assert_eq!(report.mismatches.len(), 1, "further edit must fail");
+        assert!(report.allowlisted.is_empty());
+    }
+
+    #[test]
+    fn a_sealed_family_receipt_without_id_is_unsealed_not_failed() {
+        let mut body = sealed_body();
+        body.as_object_mut().unwrap().remove("receipt_id");
+        let report = report_of(&body);
+        assert_eq!(report.unsealed.len(), 1);
+        assert!(report.ok());
+    }
+
+    #[test]
+    fn an_unsealed_schema_is_skipped_even_with_a_receipt_id() {
+        let other = json!({
+            "schema": "camelid.speed-receipt/v1",
+            "receipt_id": "not-our-digest",
+            "x": 1
+        });
+        let report = report_of(&other);
+        assert_eq!(report.verified, 0);
+        assert!(report.mismatches.is_empty());
+        assert!(report.unsealed.is_empty());
+    }
+
+    #[test]
+    fn a_non_object_or_schemaless_value_is_ignored() {
+        assert!(report_of(&json!([1, 2, 3])).ok());
+        assert_eq!(report_of(&json!([1, 2, 3])).verified, 0);
+        let no_schema = json!({ "receipt_id": "x", "y": 1 });
+        assert_eq!(report_of(&no_schema).verified, 0);
+        assert!(report_of(&no_schema).unsealed.is_empty());
+    }
+
+    #[test]
+    fn audit_dir_walks_recursively_and_reports() {
+        let dir = std::env::temp_dir().join(format!("camelid-audit-{}", std::process::id()));
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        std::fs::write(
+            dir.join("good.json"),
+            serde_json::to_vec(&seal(sealed_body())).unwrap(),
+        )
+        .unwrap();
+        let mut bad = seal(sealed_body());
+        bad["created_utc"] = json!("2099-01-01T00:00:00Z");
+        std::fs::write(nested.join("bad.json"), serde_json::to_vec(&bad).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("other.json"),
+            b"{\"schema\":\"camelid.speed-receipt/v1\"}",
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.txt"), b"not json").unwrap();
+
+        let report = audit_dir(&dir).unwrap();
+        assert_eq!(report.verified, 1);
+        assert_eq!(report.mismatches.len(), 1);
+        assert!(report.mismatches[0].path.ends_with("bad.json"));
+        assert_eq!(report.scanned, 3); // good.json, bad.json, other.json (not the .txt)
+        assert_eq!(run(&dir), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
