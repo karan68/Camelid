@@ -3481,4 +3481,340 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("disabled"));
     }
+
+    // =====================================================================
+    // HARDPAN Phase 0 — reproduction harness (evidence instrument).
+    //
+    // These probes MEASURE the current Windows behavior of the exec surface.
+    // They deliberately assert nothing about correctness, so `cargo test`
+    // stays green on a tree that still has the defect; the observation IS the
+    // deliverable. They are #[ignore]d and run explicitly:
+    //
+    //   cargo test --release --lib -- --ignored --nocapture hardpan_
+    //
+    // Phase 1 (W1/W2) and Phase 2 (W3) convert these into asserting
+    // regression tests once the fixes land. Findings and anchors are recorded
+    // in qa/hardpan/REPRO.md.
+    // =====================================================================
+
+    /// Emit one `key = value` evidence line, so a receipt can be grepped out of
+    /// the test log without parsing prose.
+    #[cfg(windows)]
+    fn ev(finding: &str, key: &str, value: impl std::fmt::Display) {
+        println!("[{finding}] {key} = {value}");
+    }
+
+    #[cfg(windows)]
+    fn outcome_variant(o: &ToolOutcome) -> &'static str {
+        if o.is_err() {
+            "ToolOutcome::Err"
+        } else {
+            "ToolOutcome::Ok"
+        }
+    }
+
+    /// W1 — `run_shell` never drains its pipes (tools.rs:1818-1867).
+    ///
+    /// Windows anonymous pipes are created with PIPE_BUFFER_CAPACITY = 64 KiB
+    /// (std 1.95.0: sys/process/windows/child_pipe.rs:56). A child that emits
+    /// more than that before exiting blocks in WriteFile; `try_wait()` never
+    /// returns Some; the deadline fires; the output is discarded.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
+    fn hardpan_w1_run_shell_wedges_past_the_pipe_buffer() {
+        const PIPE_BUFFER: usize = 64 * 1024;
+        const TIMEOUT_SECS: u64 = 10;
+        let dir = tempfile::tempdir().unwrap();
+
+        // ~410 KiB — comfortably past the 64 KiB pipe buffer, and the shape of
+        // output a real `cargo build` / `git log` produces immediately.
+        let mut payload = String::new();
+        for i in 0..4096 {
+            payload.push_str(&format!("{i:06} {}\r\n", "X".repeat(93)));
+        }
+        std::fs::write(dir.path().join("big.txt"), &payload).unwrap();
+
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(TIMEOUT_SECS))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let a = validate(&call("run_shell", json!({"command": "type big.txt"})), &sb).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let out = a.execute(&sb);
+        let elapsed = t0.elapsed();
+
+        ev("W1", "pipe_buffer_bytes", PIPE_BUFFER);
+        ev("W1", "payload_bytes", payload.len());
+        ev("W1", "shell_timeout_secs", TIMEOUT_SECS);
+        ev("W1", "elapsed_ms", elapsed.as_millis());
+        ev("W1", "outcome", outcome_variant(&out));
+        ev("W1", "returned_text_bytes", out.text().len());
+        ev(
+            "W1",
+            "returned_text_head",
+            out.text()
+                .chars()
+                .take(70)
+                .collect::<String>()
+                .escape_debug(),
+        );
+        ev(
+            "W1",
+            "captured_any_payload",
+            out.text().contains("000000") || out.text().contains("XXXX"),
+        );
+    }
+
+    /// W1 control — the SAME command shape, under the pipe buffer. Proves the
+    /// discriminator is the 64 KiB buffer and not `type` or the sandbox.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
+    fn hardpan_w1_control_under_the_pipe_buffer() {
+        const TIMEOUT_SECS: u64 = 10;
+        let dir = tempfile::tempdir().unwrap();
+
+        // ~32 KiB — half the pipe buffer, so the child can exit without blocking.
+        let mut payload = String::new();
+        for i in 0..320 {
+            payload.push_str(&format!("{i:06} {}\r\n", "X".repeat(93)));
+        }
+        std::fs::write(dir.path().join("small.txt"), &payload).unwrap();
+
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(TIMEOUT_SECS))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let a = validate(
+            &call("run_shell", json!({"command": "type small.txt"})),
+            &sb,
+        )
+        .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let out = a.execute(&sb);
+        let elapsed = t0.elapsed();
+
+        ev("W1-control", "payload_bytes", payload.len());
+        ev("W1-control", "elapsed_ms", elapsed.as_millis());
+        ev("W1-control", "outcome", outcome_variant(&out));
+        ev("W1-control", "returned_text_bytes", out.text().len());
+        ev(
+            "W1-control",
+            "captured_any_payload",
+            out.text().contains("000000"),
+        );
+    }
+
+    /// PIDs of every live PING.EXE, via an absolute-path tasklist. Used to spot
+    /// grandchildren that outlived `run_shell`'s timeout.
+    #[cfg(windows)]
+    fn ping_pids() -> std::collections::BTreeSet<u32> {
+        let out = Command::new(system32("tasklist.exe"))
+            .args(["/FI", "IMAGENAME eq PING.EXE", "/FO", "CSV", "/NH"])
+            .stdin(Stdio::null())
+            .output();
+        let mut set = std::collections::BTreeSet::new();
+        if let Ok(o) = out {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                // "PING.EXE","1234","Console","1","4,000 K"
+                if let Some(pid) = line.split("\",\"").nth(1) {
+                    if let Ok(n) = pid.trim_matches('"').parse::<u32>() {
+                        set.insert(n);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// W2 — `run_shell` has no job object, so a timeout orphans the process tree
+    /// (tools.rs:1856 calls child.kill(), which reaps only cmd.exe).
+    ///
+    /// `run_shell` runs `cmd /C <command>`, so PING.EXE here is a GRANDCHILD.
+    /// The probe kills any orphan it created before returning — it never leaves
+    /// stray processes behind, and never blanket-kills by image name.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
+    fn hardpan_w2_run_shell_orphans_its_grandchildren() {
+        const TIMEOUT_SECS: u64 = 5;
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(TIMEOUT_SECS))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+
+        let before = ping_pids();
+        // ~120s of work: guaranteed to outlive the 5s deadline.
+        let a = validate(
+            &call("run_shell", json!({"command": "ping -n 120 127.0.0.1"})),
+            &sb,
+        )
+        .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let out = a.execute(&sb);
+        let elapsed = t0.elapsed();
+
+        // Give the OS a moment to reap anything that DID die with the child.
+        std::thread::sleep(Duration::from_millis(750));
+        let after = ping_pids();
+        let survivors: Vec<u32> = after.difference(&before).copied().collect();
+
+        ev("W2", "shell_timeout_secs", TIMEOUT_SECS);
+        ev("W2", "elapsed_ms", elapsed.as_millis());
+        ev("W2", "outcome", outcome_variant(&out));
+        ev("W2", "ping_pids_before", before.len());
+        ev("W2", "ping_pids_after", after.len());
+        ev("W2", "orphaned_grandchild_pids", format!("{survivors:?}"));
+        ev("W2", "orphan_count", survivors.len());
+
+        // Clean up exactly what we created — by PID, never by image name.
+        for pid in &survivors {
+            let _ = Command::new(system32("taskkill.exe"))
+                .args(["/PID", &pid.to_string(), "/F"])
+                .stdin(Stdio::null())
+                .output();
+        }
+        ev("W2", "cleaned_up_pids", format!("{survivors:?}"));
+    }
+
+    /// W3(a) — PowerShell round-trip encoding (tools.rs:2192 writes raw UTF-8,
+    /// tools.rs:2231 decodes with from_utf8_lossy).
+    ///
+    /// Two legs are measured separately: what the child EMITS, and what the
+    /// child RECEIVES. The received-codepoint leg is the decisive one — an
+    /// echo test can round-trip byte-transparently while the child still sees
+    /// mojibake.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
+    fn hardpan_w3a_powershell_encoding_round_trip() {
+        let _serial = ps_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = win_sandbox(dir.path());
+
+        // U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC
+        let vector = "éü—✓日€";
+        let want_hex = vector
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        ev("W3a", "test_vector_utf8_hex", &want_hex);
+
+        // Leg 1 — OUTPUT ONLY: the non-ASCII originates inside the child, built
+        // from codepoints, so nothing depends on the input leg.
+        let emit = "$s = -join @([char]0x00E9,[char]0x00FC,[char]0x2014,[char]0x2713,\
+                    [char]0x65E5,[char]0x20AC); Write-Output $s";
+        let out = validate(
+            &call("run_windows_command", json!({ "command": emit })),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        let body = out.text();
+        let got = body
+            .lines()
+            .find(|l| !l.starts_with("exit:") && !l.starts_with("stdout:"));
+        let got_hex = got
+            .unwrap_or("")
+            .trim()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        ev("W3a", "output_leg_got_hex", &got_hex);
+        ev("W3a", "output_leg_matches", got_hex == want_hex);
+        ev(
+            "W3a",
+            "output_leg_has_replacement_char",
+            body.contains('\u{FFFD}'),
+        );
+
+        // Leg 2 — INPUT: the non-ASCII rides in the command text; the child
+        // reports the codepoints it actually received.
+        let echo = format!(
+            "$r = \"{vector}\"; Write-Output ((($r.ToCharArray()) | ForEach-Object {{ \
+             \"U+{{0:X4}}\" -f [int]$_ }}) -join \" \")"
+        );
+        let out2 = validate(
+            &call("run_windows_command", json!({ "command": echo })),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        let recv = out2
+            .text()
+            .lines()
+            .find(|l| l.contains("U+"))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        ev(
+            "W3a",
+            "input_leg_want_codepoints",
+            "U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC",
+        );
+        ev("W3a", "input_leg_got_codepoints", &recv);
+        ev(
+            "W3a",
+            "input_leg_matches",
+            recv == "U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC",
+        );
+
+        // What encoding does the console-less child actually settle on?
+        let enc = "Write-Output (\"Out=\" + [Console]::OutputEncoding.WebName + \" In=\" + \
+                   [Console]::InputEncoding.WebName)";
+        let out3 = validate(&call("run_windows_command", json!({ "command": enc })), &sb)
+            .unwrap()
+            .execute(&sb);
+        ev(
+            "W3a",
+            "child_encodings",
+            out3.text()
+                .lines()
+                .find(|l| l.contains("Out="))
+                .unwrap_or("")
+                .trim(),
+        );
+    }
+
+    /// W3(b) — `powershell -Command` does not propagate a native command's
+    /// non-zero exit status (tools.rs:2242 branches on status.success()).
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
+    fn hardpan_w3b_native_exit_code_is_swallowed() {
+        let _serial = ps_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = win_sandbox(dir.path());
+
+        let probe = |label: &str, cmd: &str| {
+            let out = validate(&call("run_windows_command", json!({ "command": cmd })), &sb)
+                .unwrap()
+                .execute(&sb);
+            let exit_line = out
+                .text()
+                .lines()
+                .find(|l| l.starts_with("exit:"))
+                .unwrap_or("exit: ?")
+                .to_string();
+            ev("W3b", &format!("{label}.command"), cmd);
+            ev("W3b", &format!("{label}.reported"), &exit_line);
+            ev("W3b", &format!("{label}.outcome"), outcome_variant(&out));
+        };
+
+        // The load-bearing case: a failing native command followed by ANY
+        // successful statement. The failure vanishes entirely.
+        probe("failure_not_last", "cmd /c exit 3; Write-Output done");
+        // The real exit code is flattened even when the failure IS last.
+        probe("failure_last_code3", "cmd /c exit 3");
+        probe("failure_last_code42", "cmd /c exit 42");
+        // Controls.
+        probe("success", "Write-Output ok");
+        probe("throw", "throw 'boom'");
+    }
 }
