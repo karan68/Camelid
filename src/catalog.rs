@@ -198,6 +198,12 @@ fn print_catalog(entries: &[CatalogItem]) {
 /// `mistral_7b_instruct_v0_3_q8_0` id overflowed, and a SIZE header a column
 /// narrower than its `X.X GB` cells. Kept separate from `print_catalog` so the
 /// alignment can be unit-tested.
+///
+/// Widths are byte lengths, so alignment assumes ASCII cells. That holds here:
+/// only curated `CatalogItem`s (all `&'static str`, ASCII) reach this function;
+/// arbitrary/UTF-8 Hugging Face rows are the separate owned view type and are
+/// never printed here. A future caller passing non-ASCII names would need a
+/// display-width measure instead of `len()`.
 fn catalog_table_lines(
     entries: &[CatalogItem],
     hw: &crate::capability::HardwareProfile,
@@ -417,14 +423,16 @@ mod tests {
     }
 
     /// Proof the alignment assertions are non-tautological: the *original*
-    /// hardcoded-width rendering (28-wide id, 8-wide QUANT, 9-wide SIZE header vs
-    /// `{:>6.1} GB` cells) must be REJECTED by `assert_aligned`.
+    /// hardcoded-width rendering must be REJECTED by `assert_aligned`. These are
+    /// the exact format strings this PR removed: a 28-wide id column (which the
+    /// 29-char `mistral_7b_instruct_v0_3_q8_0` overflows) and an 8-wide SIZE
+    /// header against 9-char `{:>6.1} GB` cells.
     #[test]
     fn assert_aligned_rejects_the_original_buggy_layout() {
         let entries = curated_catalog();
         let hw = crate::capability::HardwareProfile::cached();
         let mut lines = vec![format!(
-            "  {:<28} {:<8} {:>9}  {:<15} NAME",
+            "  {:<28} {:<8} {:>8}  {:<15} NAME",
             "ID", "QUANT", "SIZE", "FIT (this host)"
         )];
         for item in &entries {
