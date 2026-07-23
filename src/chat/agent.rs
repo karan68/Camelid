@@ -3934,9 +3934,16 @@ mod tests {
         // 1. It states the workspace root. Compare the canonical form: the
         // sandbox canonicalises its root, and the raw tempdir spelling differs
         // on macOS (/var vs /private/var — a substring by luck) and on Windows
-        // (8.3 short names — not a substring at all).
+        // (8.3 short names — not a substring at all). Trim Windows' \\?\
+        // extended-length prefix from the needle: the prompt may render the
+        // root with or without it, and the trimmed form is a substring of both.
         let canon_root = std::fs::canonicalize(dir.path()).unwrap();
-        assert!(p.contains(&canon_root.display().to_string()));
+        let canon_root = canon_root.display().to_string();
+        let needle = canon_root.strip_prefix(r"\?").unwrap_or(&canon_root);
+        assert!(
+            p.contains(needle),
+            "prompt lacks the workspace root {needle}"
+        );
         // 2. It advertises every tool it was handed, and nothing it wasn't.
         for t in &specs {
             assert!(p.contains(t.name.as_str()), "prompt omits tool {}", t.name);
