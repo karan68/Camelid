@@ -3939,7 +3939,7 @@ mod tests {
         // root with or without it, and the trimmed form is a substring of both.
         let canon_root = std::fs::canonicalize(dir.path()).unwrap();
         let canon_root = canon_root.display().to_string();
-        let needle = canon_root.strip_prefix(r"\?").unwrap_or(&canon_root);
+        let needle = canon_root.strip_prefix(r"\\?\").unwrap_or(&canon_root);
         assert!(
             p.contains(needle),
             "prompt lacks the workspace root {needle}"
