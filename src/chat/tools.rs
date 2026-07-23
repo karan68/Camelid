@@ -3602,6 +3602,99 @@ mod tests {
         payload
     }
 
+    /// GATE 1 — the whole point of Phase 1. A REAL `cargo build` on a cold
+    /// target dir, driven through the real `run_shell` (validate + execute),
+    /// must return `Ok` with its output intact and inside the timeout.
+    ///
+    /// The generated crate emits >64 KiB of genuine compiler output (hundreds of
+    /// unused-variable warnings) so the build simultaneously exercises the W1
+    /// drain on a real workload — pre-fix, this exact command false-timed-out
+    /// with every byte discarded. `#[ignore]`d because it spawns a full cold
+    /// rustc; run explicitly:
+    ///   cargo test --release --lib -- --ignored --nocapture gate1_
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "GATE 1 — spawns a real cold cargo build; run with --ignored --nocapture"]
+    fn gate1_real_cold_cargo_build_through_run_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A minimal, dependency-free crate (no network) whose main.rs is
+        // generated to emit ~800 unused-variable warnings — real `cargo build`
+        // output well past the 64 KiB pipe buffer, without failing the build.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"hardpan_gate1\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"hardpan_gate1\"\npath = \"main.rs\"\n",
+        )
+        .unwrap();
+        let mut main = String::from("fn main() {\n");
+        for i in 0..800 {
+            // No leading underscore -> each is an `unused variable` warning.
+            main.push_str(&format!("    let gate1_unused_{i} = {i}u64;\n"));
+        }
+        main.push_str("}\n");
+        std::fs::write(root.join("main.rs"), main).unwrap();
+
+        // Cold: the crate has no target/ yet. 180s liveness backstop; a working
+        // drain finishes far sooner. Route cargo's target dir inside the temp so
+        // nothing touches the outer build.
+        let sb = Sandbox::new(root, false, Duration::from_secs(180))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let a = validate(
+            &call(
+                "run_shell",
+                json!({ "command": "cargo build --color never 2>&1" }),
+            ),
+            &sb,
+        )
+        .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let out = a.execute(&sb);
+        let elapsed = t0.elapsed();
+        let text = out.text();
+
+        // Transcript for the receipt.
+        let transcript = format!(
+            "$ cargo build --color never 2>&1   (cwd = fresh cold crate)\n\
+             outcome  = {}\n\
+             elapsed  = {} ms  (timeout budget 180000 ms)\n\
+             text_len = {} bytes (clipped to {} for the model)\n\
+             --- head ---\n{}\n--- tail ---\n{}\n",
+            outcome_variant(&out),
+            elapsed.as_millis(),
+            text.len(),
+            MAX_OUTPUT_BYTES,
+            text.chars().take(600).collect::<String>(),
+            text.chars()
+                .rev()
+                .take(400)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+        );
+        let _ = std::fs::write(
+            std::env::temp_dir().join("hardpan_gate1_transcript.txt"),
+            &transcript,
+        );
+        println!("{transcript}");
+
+        assert!(
+            matches!(out, ToolOutcome::Ok(_)),
+            "a real cold cargo build must return Ok, got {out:?}"
+        );
+        assert!(
+            text.contains("Compiling hardpan_gate1") || text.contains("Finished"),
+            "transcript must show the real build progressing"
+        );
+        assert!(
+            elapsed < Duration::from_secs(180),
+            "must finish inside the timeout (took {elapsed:?})"
+        );
+    }
+
     /// Drive `run_shell` over a file, on whichever platform we are.
     fn run_shell_cat(dir: &Path, file: &str, to_stderr: bool) -> (ToolOutcome, Duration) {
         #[cfg(unix)]
