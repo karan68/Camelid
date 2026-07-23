@@ -1828,7 +1828,24 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     };
     #[cfg(windows)]
     let mut builder = {
-        let mut c = Command::new("cmd");
+        // Absolute interpreter path (W4), matching run_windows_command's
+        // system32() discipline. Defense-in-depth only: std's process search
+        // already consults System32 *before* the parent PATH and never the
+        // current directory (sys/process/windows.rs search order), and this
+        // builder never mutates PATH — so bare "cmd" already resolved to
+        // %SystemRoot%\System32\cmd.exe. This makes that guarantee explicit
+        // rather than resting on a std implementation detail. NOT a vuln fix.
+        //
+        // The command stays a `cmd /C <command>` command line (symmetric with
+        // /bin/sh -c above), NOT a script fed over stdin the way
+        // run_windows_command does: run_shell's contract is one shell command
+        // line, and stdin delivery would change cmd's exit-code/echo semantics
+        // and diverge from the Unix path. std applies CRT-style quoting to the
+        // single `command` arg while cmd does not use CRT parsing, but the
+        // mismatch is not exploitable — std only emits `\` immediately before a
+        // `"`, which is an illegal Windows filename character, so a mangled path
+        // errors out rather than escaping the cwd pin (verified Phase 0, W4).
+        let mut c = Command::new(system32("cmd.exe"));
         c.arg("/C").arg(command);
         c
     };
