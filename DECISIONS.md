@@ -1111,3 +1111,21 @@ loop still never *reads* a plan step to decide anything, and the plan still cann
 the sandbox, or a tool choice — this only *writes* the model's own to-do to done at the natural
 completion point. It fires only on `Answered`; a step-capped, aborted, repeated, or errored run
 leaves the plan as the model left it, which is the honest signal that the run did not finish.
+
+**D18 addendum 3 (2026-07-24, reconciling the subagent exit code with the tri-state
+contract):** the divergence D18 addendum 1 parked -- `LoopEnd::StepCapped` (and `Repeated`)
+mapping to subagent exit 1 ("failed") but to `agent exec` exit 3 ("inconclusive") -- is now
+resolved in favour of the tri-state contract `agent exec` defines (`D-DROVER-2`). A step-capped
+or repeating run means the run ran out of budget or got stuck, not that the task failed; a
+re-run with more steps or a different model may still answer, so it is *inconclusive*, not a
+failure. Only a driver error remains a hard failure. The fix is structural: both lanes previously
+classified `LoopEnd` independently (and a third copy lived in a test), so they could drift; they
+now share one `agent::RunOutcome` classifier that owns the whole `0` completed / `1` failed / `3`
+inconclusive space (`2` stays reserved for the `tool_capable` refusal). The subagent worker carries
+that typed outcome beside its serialized report until it chooses the process exit code; status text
+is output, not control-flow input. Adding a `LoopEnd` variant forces a deliberate tier in that one
+exhaustive match. No token-level path, parity receipt, or approval tier is touched; the subagent
+worker's exit code moves from 1 to 3 for a step-capped or repeating child, matching what a headless
+`agent exec` already reported. Pinned by `exec_exit_codes_are_tri_state`,
+`run_outcome_status_and_exit_contract_is_pinned`, and the real canned-worker regression
+`worker_step_cap_is_inconclusive_in_status_and_exit_code`.

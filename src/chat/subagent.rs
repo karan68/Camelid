@@ -95,6 +95,14 @@ pub struct SubagentResult {
     pub note: String,
 }
 
+/// Internal worker result. Keep the typed outcome beside the serialized report
+/// until the process exit code is chosen; status text is an output boundary,
+/// not control-flow input.
+struct TaskExecution {
+    report: SubagentResult,
+    outcome: super::agent::RunOutcome,
+}
+
 /// Per-session orchestration settings, installed once at session start.
 #[derive(Clone)]
 pub struct SubagentConfig {
@@ -534,35 +542,34 @@ pub fn run_worker(task_file: &Path) -> anyhow::Result<i32> {
         );
     }
 
-    let result = execute_task(&task);
+    let execution = execute_task(&task);
 
     let dir = task_file.parent().unwrap_or_else(|| Path::new("."));
     let rpath = dir.join(format!("result_{}.json", task.subtask_id));
-    let mut j = serde_json::to_string_pretty(&result)?;
+    let mut j = serde_json::to_string_pretty(&execution.report)?;
     j.push('\n');
     write_result_atomic(&rpath, &j);
 
     // Consume the task file (cleanup); the result file remains for polling.
     let _ = std::fs::remove_file(task_file);
 
-    Ok(match result.status.as_str() {
-        "completed" => 0,
-        "inconclusive" => 3,
-        _ => 1,
-    })
+    Ok(execution.outcome.exit_code())
 }
 
-fn execute_task(task: &TaskSpec) -> SubagentResult {
+fn execute_task(task: &TaskSpec) -> TaskExecution {
     use super::agent::{self, AgentMsg, LiveDriver};
     use super::tools::Sandbox;
     use std::sync::atomic::AtomicBool;
 
-    let fail = |status: &str, note: String| SubagentResult {
-        subtask_id: task.subtask_id.clone(),
-        status: status.to_string(),
-        answer: String::new(),
-        tool_calls: Vec::new(),
-        note,
+    let fail = |outcome: agent::RunOutcome, note: String| TaskExecution {
+        report: SubagentResult {
+            subtask_id: task.subtask_id.clone(),
+            status: outcome.subagent_status().to_string(),
+            answer: String::new(),
+            tool_calls: Vec::new(),
+            note,
+        },
+        outcome,
     };
 
     // Inherit the parent's confinement posture — NEVER hardcode Unrestricted. A
@@ -578,7 +585,7 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
     let root = Path::new(&task.workdir);
     let sandbox = match Sandbox::new(root, false, Duration::from_secs(60)) {
         Ok(s) => s.with_shell_mode(shell_mode),
-        Err(e) => return fail("failed", format!("sandbox: {e}")),
+        Err(e) => return fail(agent::RunOutcome::Failed, format!("sandbox: {e}")),
     };
     let tools = super::tools::specs(false, sandbox.shell_mode());
 
@@ -643,12 +650,22 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         // Real path: attach to the parent's shared serve (resident model reused).
         let addr: SocketAddr = match task.addr.parse() {
             Ok(a) => a,
-            Err(e) => return fail("failed", format!("bad addr {:?}: {e}", task.addr)),
+            Err(e) => {
+                return fail(
+                    agent::RunOutcome::Failed,
+                    format!("bad addr {:?}: {e}", task.addr),
+                )
+            }
         };
         let client = super::client::Client::new(addr);
         let _server = match super::server::ServerHandle::ensure(addr, &client) {
             Ok(s) => s,
-            Err(e) => return fail("inconclusive", format!("shared serve unavailable: {e}")),
+            Err(e) => {
+                return fail(
+                    agent::RunOutcome::Inconclusive,
+                    format!("shared serve unavailable: {e}"),
+                )
+            }
         };
         let mut driver = LiveDriver::with(
             client,
@@ -669,29 +686,24 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         )
     };
 
-    // Exhaustive on purpose: this maps a loop outcome onto the subagent exit
-    // code (completed=0, inconclusive=3, everything else=1), so a new LoopEnd
-    // variant must be classified deliberately. Under the previous catch-all a
-    // new variant compiled silently and reported "failed" — a wrong answer for
-    // any outcome that is merely inconclusive.
-    //
-    // Classification below is unchanged from the catch-all it replaces.
-    // Whether StepCapped is really a *failure* rather than inconclusive is a
-    // live question, but it decides an exit code on a shipped gate lane, so it
-    // is left to the phase that defines the tri-state contract.
-    let status = match end {
-        agent::LoopEnd::Answered => "completed",
-        agent::LoopEnd::Aborted => "inconclusive",
-        agent::LoopEnd::StepCapped | agent::LoopEnd::Repeated | agent::LoopEnd::DriverError => {
-            "failed"
-        }
-    };
-    SubagentResult {
-        subtask_id: task.subtask_id.clone(),
-        status: status.to_string(),
-        answer: reporter.answer,
-        tool_calls: reporter.calls,
-        note: format!("loop ended: {end:?}"),
+    // A finished loop is classified in exactly one place -- the shared
+    // `RunOutcome` tri-state in `agent` -- so this worker and the headless
+    // `agent exec` front end can never disagree on what a step-capped or
+    // repeating run means. Both now call a step-capped or repeating run
+    // *inconclusive* (exit 3), not a failure: the run ran out of budget or got
+    // stuck, which re-running with more steps or a different model may resolve.
+    // Only a driver error is a hard failure here. (Resolves the divergence D18
+    // addendum 1 recorded; see D18 addendum 3.)
+    let outcome = agent::RunOutcome::classify(&end);
+    TaskExecution {
+        report: SubagentResult {
+            subtask_id: task.subtask_id.clone(),
+            status: outcome.subagent_status().to_string(),
+            answer: reporter.answer,
+            tool_calls: reporter.calls,
+            note: format!("loop ended: {end:?}"),
+        },
+        outcome,
     }
 }
 
@@ -878,6 +890,29 @@ mod tests {
         assert_eq!(res.status, "completed");
         assert!(res.answer.contains("WORKER-OK"), "{}", res.answer);
         assert!(res.tool_calls.iter().any(|c| c.contains("list_dir")));
+        assert!(!tpath.exists(), "task file should be consumed");
+    }
+
+    #[test]
+    fn worker_step_cap_is_inconclusive_in_status_and_exit_code() {
+        // One canned model step performs list_dir; there is no second step in
+        // which to answer, so this drives the real worker path to StepCapped.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(subagent_dir(root)).unwrap();
+        let tpath = task_path(root, "step-cap");
+        let mut task = canned_task(root, "step-cap");
+        task.max_steps = 1;
+        std::fs::write(&tpath, serde_json::to_string(&task).unwrap()).unwrap();
+
+        let code = run_worker(&tpath).unwrap();
+        assert_eq!(code, 3);
+        let res: SubagentResult =
+            serde_json::from_str(&std::fs::read_to_string(result_path(root, "step-cap")).unwrap())
+                .unwrap();
+        assert_eq!(res.status, "inconclusive");
+        assert_eq!(res.note, "loop ended: StepCapped");
+        assert!(res.tool_calls.iter().any(|call| call.contains("list_dir")));
         assert!(!tpath.exists(), "task file should be consumed");
     }
 
