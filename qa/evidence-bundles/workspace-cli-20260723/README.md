@@ -1,9 +1,7 @@
 # Workspace CLI review evidence
 
 Captured on Windows from feature commit `329c536d9203cd6cd647197b3c86f7fa78ef7669`.
-The PNGs contain rendered CLI receipts; they are not product UI mockups. The lifecycle output is
-verbatim. The conversation image condenses the long model prose while preserving the observed file,
-settings, thread ID, tool call, commands, and durable transcript result.
+The `raw/` directory contains direct command stdout/stderr receipts from the feature binary.
 No bearer value is shown or stored in this bundle.
 
 ## CLI surface
@@ -63,15 +61,20 @@ thread ID; `threads` reported two turns; `show` returned both durable turns. Man
 two turns, undo restored the previous state, and delete succeeded after a second disposable thread
 became active. The server intentionally refuses deletion of the currently active thread.
 
-See `cli-conversation.png` and `cli-lifecycle.png`.
+See:
+
+- `raw/01-ask.stdout.txt`
+- `raw/02-threads-show-compact-undo.txt`
+- `raw/03-resume.txt`
+
+Delete was exercised separately after moving active ownership to a disposable second thread, but it
+is not claimed by the raw receipt bundle because its standalone capture wrapper became unreliable.
 
 ## Checksums
 
 ```text
 3c5663363c362ca92b7304a5d536bcdb343fef7cbd88bfcad1e664355afebeef  cli-surface.png
 eedf80844a044fea6c53f86b9ff23fccca03459e89e54671abd55018b5f6057d  auth-boundary.png
-2ff1082b10da53b3387165e3bce6a357c9dc8803e0519eb2b7368a287b44cdc2  cli-conversation.png
-8bb5699e3de48ca28ce7f94ca962945af29ae93cabb26ae9b1f8b5c3aee53167  cli-lifecycle.png
 ```
 
 ## Validation context
