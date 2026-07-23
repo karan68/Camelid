@@ -1,0 +1,31 @@
+{
+  "schema": "camelid.speed-receipt.v1",
+  "row_id": "hardpan_w9_linewriter_buffering",
+  "generated_utc": "20260723T000000Z",
+  "host": "i7-11800H (16T) / RTX 3060 Laptop 6 GiB / Win11 26220.8925 / rustc 1.95.0",
+  "campaign": "HARDPAN W9 — 1 KiB LineWriter on the ratatui renderer (agent_tui.rs / tui.rs)",
+  "verdict": "NULL — downgraded at GATE 0; no product change lands",
+  "measurements": {
+    "console_write_cost_ab": {
+      "method": "Same total bytes per frame delivered as 8 x 1 KiB writes (LineWriter shape) vs 1 x 8 KiB write (BufWriter shape); 200 frames, cursor parked, real console window, [Console]::Out + Flush per frame",
+      "frames": 200,
+      "frame_bytes": 8192,
+      "many_small_writes_ms": 139,
+      "one_big_write_ms": 130,
+      "speedup_ratio": 1.07,
+      "per_frame_small_ms": 0.695,
+      "per_frame_big_ms": 0.65,
+      "note": "8x the WriteFile calls cost 1.07x the time — console cost on this host tracks bytes, not call count."
+    },
+    "ratatui_source_analysis": {
+      "diff_only_flush": "ratatui 0.29.0 Terminal::flush (terminal/terminal.rs:198-205) computes previous_buffer.diff(current_buffer) and writes ONLY changed cells; the agent TUI's steady-state diff (spinner + elapsed field + newly streamed chars) is far under 1024 bytes",
+      "already_one_write": "Terminal::draw always ends in show/hide-cursor via execute! (backend/crossterm.rs:211,:215,:226), which is queue-then-flush (crossterm macros.rs:114-117) — any frame whose diff is under the 1 KiB LineWriter buffer is ALREADY exactly one WriteFile today",
+      "residual": "Full-pane diffs (first draw, resize, overlay toggle, scroll, wrapped-line shift) are ~4-5 KB on a 120x40 console -> ~5 writes today vs ~1 buffered; a few syscalls, a few times per second, with identical byte volume delivered to the terminal either way"
+    }
+  },
+  "honest_framing": {
+    "premise_check": "The finding's low-level facts hold (Stdout IS a LineWriter; LineWriter::new IS 1024 bytes — std 1.95.0 io/buffered/linewriter.rs:90) but both operational claims fail: frames are diffs, not full screens, and sub-1KiB frames already coalesce to one write.",
+    "decision": "GATE 0 downgraded W9 to a documented null; per the SIROCCO/STAMPEDE precedent for unmeasured perf claims, no BufWriter change lands and W9 is closed as measured-null.",
+    "reopen_if": "A future renderer change starts emitting multi-KB frames every redraw (e.g. full-repaint animations), at which point the A/B above is the harness to rerun."
+  }
+}

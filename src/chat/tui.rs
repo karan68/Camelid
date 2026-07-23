@@ -72,6 +72,12 @@ struct PickerUi {
 
 pub fn run(session: &mut Session, addr: SocketAddr, spawned: bool) -> anyhow::Result<()> {
     enable_raw_mode()?;
+    // W6: arm the restore guard before anything else can fail, and route panics
+    // through the chaining hook — same discipline as the agent TUI. The
+    // `run_suspended` teardown/re-entry below is unaffected (restore is
+    // idempotent and only the final drop actually restores).
+    super::term_guard::install_panic_hook();
+    let guard = super::term_guard::TerminalGuard::arm();
     let mut out = std::io::stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
@@ -79,13 +85,7 @@ pub fn run(session: &mut Session, addr: SocketAddr, spawned: bool) -> anyhow::Re
     let mut app = App::new(session, addr, spawned);
     let result = app.run(&mut terminal);
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    drop(guard);
     result
 }
 
@@ -709,7 +709,10 @@ impl<'a> App<'a> {
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
-            KeyCode::Char(c) if !ctrl => self.insert_char(c),
+            // W8: accept AltGr compositions (CONTROL|ALT); see term_guard.
+            KeyCode::Char(c) if super::term_guard::char_inserts(key.modifiers) => {
+                self.insert_char(c)
+            }
             _ => {}
         }
     }

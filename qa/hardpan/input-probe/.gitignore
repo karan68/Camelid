@@ -1,0 +1,4 @@
+# The root .gitignore's `/target/` rule is anchored to the repo root, so this
+# standalone probe crate needs its own.
+/target/
+Cargo.lock

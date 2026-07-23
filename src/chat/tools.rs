@@ -1828,7 +1828,24 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     };
     #[cfg(windows)]
     let mut builder = {
-        let mut c = Command::new("cmd");
+        // Absolute interpreter path (W4), matching run_windows_command's
+        // system32() discipline. Defense-in-depth only: std's process search
+        // already consults System32 *before* the parent PATH and never the
+        // current directory (sys/process/windows.rs search order), and this
+        // builder never mutates PATH — so bare "cmd" already resolved to
+        // %SystemRoot%\System32\cmd.exe. This makes that guarantee explicit
+        // rather than resting on a std implementation detail. NOT a vuln fix.
+        //
+        // The command stays a `cmd /C <command>` command line (symmetric with
+        // /bin/sh -c above), NOT a script fed over stdin the way
+        // run_windows_command does: run_shell's contract is one shell command
+        // line, and stdin delivery would change cmd's exit-code/echo semantics
+        // and diverge from the Unix path. std applies CRT-style quoting to the
+        // single `command` arg while cmd does not use CRT parsing, but the
+        // mismatch is not exploitable — std only emits `\` immediately before a
+        // `"`, which is an illegal Windows filename character, so a mangled path
+        // errors out rather than escaping the cwd pin (verified Phase 0, W4).
+        let mut c = Command::new(system32("cmd.exe"));
         c.arg("/C").arg(command);
         c
     };
@@ -1847,14 +1864,72 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         Ok(c) => c,
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
+
+    // Assign the child to a kill-on-close job object (W2) so a timeout tears down
+    // the WHOLE process tree, not just cmd.exe. `child.kill()` on Windows reaps
+    // only the direct child; every descendant cmd spawned (rustc, node, a CUDA
+    // process holding VRAM) otherwise survives as an orphan. Descendants spawned
+    // after assignment are captured too. Best-effort — if creation/assignment
+    // fails, the child.kill() backstop still reaps the direct process. Mirrors
+    // run_windows_command; the Unix path is unaffected (/bin/sh's own process
+    // group is already torn down by kill()).
+    #[cfg(windows)]
+    let _job = {
+        use std::os::windows::io::AsRawHandle;
+        let job = JobObject::new().ok();
+        if let Some(ref j) = job {
+            let _ = j.assign(child.as_raw_handle());
+        }
+        job
+    };
+
+    // Drain stdout/stderr on their own threads (W1). Nothing read these until
+    // after the child exited, so a command that emitted more than one pipe
+    // buffer — 64 KiB per pipe on Windows (std sys/process/windows/child_pipe.rs
+    // PIPE_BUFFER_CAPACITY), and the same order on Linux — blocked forever in
+    // write(), never exited, and was then reported to the model as a timeout
+    // with every captured byte discarded. `git log` in this repo clears that in
+    // one command. Both pipes get their own quota, so either one alone can wedge
+    // the child; both must be drained. This mirrors run_windows_command, which
+    // has had the fix since it was written.
+    let out_reader = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+            buf
+        })
+    });
+    let err_reader = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+            buf
+        })
+    });
+
     let deadline = std::time::Instant::now() + sandbox.shell_timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
+                    // Tear down the whole tree (W2), then the direct-child
+                    // backstop. Terminating the job kills every descendant;
+                    // child.kill() covers the case where the job never assigned.
+                    #[cfg(windows)]
+                    if let Some(ref j) = _job {
+                        j.terminate();
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Killing the child closes the write ends → the readers hit
+                    // EOF. Join them so neither thread outlives this call.
+                    if let Some(h) = out_reader {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = err_reader {
+                        let _ = h.join();
+                    }
                     return ToolOutcome::Err(format!(
                         "command timed out after {}s",
                         sandbox.shell_timeout.as_secs()
@@ -1864,23 +1939,27 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
             }
             Err(e) => return ToolOutcome::Err(format!("wait failed: {e}")),
         }
-    }
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return ToolOutcome::Err(format!("output failed: {e}")),
     };
+
+    let stdout_bytes = out_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr_bytes = err_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+
     let mut text = String::new();
-    let code = output.status.code().unwrap_or(-1);
+    let code = status.code().unwrap_or(-1);
     text.push_str(&format!("exit: {code}\n"));
-    let stdout = clip(&String::from_utf8_lossy(&output.stdout));
-    let stderr = clip(&String::from_utf8_lossy(&output.stderr));
+    let stdout = clip(&String::from_utf8_lossy(&stdout_bytes));
+    let stderr = clip(&String::from_utf8_lossy(&stderr_bytes));
     if !stdout.is_empty() {
         text.push_str(&format!("stdout:\n{stdout}\n"));
     }
     if !stderr.is_empty() {
         text.push_str(&format!("stderr:\n{stderr}\n"));
     }
-    if output.status.success() {
+    if status.success() {
         ToolOutcome::Ok(text)
     } else {
         ToolOutcome::Err(text)
@@ -2127,12 +2206,52 @@ fn system32(relative: &str) -> PathBuf {
     Path::new(&root).join("System32").join(relative)
 }
 
+/// Base64 (standard alphabet, padded) for the W3 stdin preamble. Deliberately a
+/// local copy of the encoder in `clipboard.rs` rather than a shared helper —
+/// GATE 0 ruled clipboard.rs out of scope for this campaign, and the two call
+/// sites must be free to drift independently.
+#[cfg(windows)]
+fn base64_ascii(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18 & 63) as usize] as char);
+        out.push(TABLE[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Windows PowerShell exec with a dedicated confinement (Decision: a Windows-only
 /// path, NOT the seccomp shell-sandbox). The command is fed to PowerShell over
-/// stdin, so no quoting survives the Rust→Windows→PowerShell round trip; the run
-/// is cwd-pinned, hard-timed, has stdout/stderr drained concurrently (so a chatty
-/// command can't wedge on a full pipe), and is assigned to a kill-on-close job
-/// object so a timeout tears down the whole process tree.
+/// stdin as base64 inside a pure-ASCII preamble (W3a: a console-less child sits
+/// on the OEM code page, so raw UTF-8 would be mojibake'd both ways; ASCII
+/// survives any code page, and the preamble flips the child's output to UTF-8
+/// before decoding the real command). A trailing guard re-raises $LASTEXITCODE
+/// so a failing native command is reported with its true exit code even when a
+/// later statement succeeded (W3b). The run is cwd-pinned, hard-timed, has
+/// stdout/stderr drained concurrently (so a chatty command can't wedge on a full
+/// pipe), and is assigned to a kill-on-close job object so a timeout tears down
+/// the whole process tree.
+///
+/// Interpreter: Windows PowerShell 5.1 by absolute System32 path, deliberately
+/// not "prefer pwsh.exe when present" — 5.1 ships on every Windows install so
+/// the behavior is uniform, the preamble makes 5.1 UTF-8-correct anyway, and the
+/// primary dev host has no pwsh to validate a second branch against (HARDPAN A8:
+/// an untestable branch ships untested, so it doesn't ship).
 #[cfg(windows)]
 fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> ToolOutcome {
     use std::io::{Read, Write};
@@ -2189,9 +2308,37 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
     });
 
     // Feed the command, then EOF so PowerShell executes it and exits.
+    //
+    // W3(a): the command rides in as base64 inside a pure-ASCII preamble. A
+    // CREATE_NO_WINDOW child gets a fresh windowless console on the OEM code
+    // page (437 on this host) — not the parent console's CP and not UTF-8 — so
+    // raw UTF-8 command bytes were mojibake'd on the way in (6 codepoints
+    // arrived as 16) and non-ASCII output came back irreversibly lossy ('日'
+    // → '?', a valid ASCII byte from_utf8_lossy can never flag). ASCII decodes
+    // identically under every code page, so the preamble always survives; it
+    // sets the child's output side to UTF-8, then decodes and runs the real
+    // command. Still stdin delivery — NOT -EncodedCommand, which would
+    // reintroduce the ~32 KiB command-line ceiling stdin was chosen to avoid.
+    //
+    // W3(b): `powershell -Command` drops a native command's non-zero exit
+    // status whenever a later statement succeeds, so a failed `cargo build`
+    // followed by any successful statement reported exit 0 → ToolOutcome::Ok
+    // and the model proceeded on a false premise. The trailing guard re-raises
+    // $LASTEXITCODE (the true code — pre-fix even a *last* failing native
+    // command was flattened to 1). When no native command ran, $LASTEXITCODE
+    // is $null and the host's own status stands: 0 on success, 1 on a
+    // terminating error. Residual, documented: $LASTEXITCODE tracks only the
+    // LAST native command, so `cmd /c exit 3; cmd /c exit 0` reports 0 both
+    // before and after this fix.
+    let script = format!(
+        "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\r\n\
+         $c = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))\r\n\
+         Invoke-Expression $c\r\n\
+         if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}\r\n",
+        base64_ascii(command.as_bytes())
+    );
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(command.as_bytes());
-        let _ = stdin.write_all(b"\r\n");
+        let _ = stdin.write_all(script.as_bytes());
         // stdin drops here → EOF.
     }
 
@@ -3480,5 +3627,451 @@ mod tests {
         );
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("disabled"));
+    }
+
+    // =====================================================================
+    // HARDPAN — exec-surface regression tests.
+    //
+    // Phase 0 landed these as #[ignore]d evidence probes that measured the
+    // then-current (broken) behavior; Phases 1 and 2 converted them into the
+    // asserting regression tests below as each fix landed. The pre-fix
+    // measurements they replaced are preserved in qa/hardpan/REPRO.md and the
+    // per-finding receipts under qa/hardpan/phase*/.
+    //
+    // Still #[ignore]d (spawns a real cold rustc; run explicitly):
+    //   cargo test --release --lib -- --ignored --nocapture gate1_
+    // =====================================================================
+
+    fn outcome_variant(o: &ToolOutcome) -> &'static str {
+        if o.is_err() {
+            "ToolOutcome::Err"
+        } else {
+            "ToolOutcome::Ok"
+        }
+    }
+
+    /// ~410 KiB of line-oriented output — comfortably past the 64 KiB per-pipe
+    /// buffer, and the shape a real `git log` / `cargo build` produces at once.
+    /// Every line is numbered so a truncated capture is detectable.
+    fn oversized_payload() -> String {
+        let mut payload = String::new();
+        for i in 0..4096 {
+            payload.push_str(&format!("{i:06} {}\n", "X".repeat(93)));
+        }
+        payload
+    }
+
+    /// GATE 1 — the whole point of Phase 1. A REAL `cargo build` on a cold
+    /// target dir, driven through the real `run_shell` (validate + execute),
+    /// must return `Ok` with its output intact and inside the timeout.
+    ///
+    /// The generated crate emits >64 KiB of genuine compiler output (hundreds of
+    /// unused-variable warnings) so the build simultaneously exercises the W1
+    /// drain on a real workload — pre-fix, this exact command false-timed-out
+    /// with every byte discarded. `#[ignore]`d because it spawns a full cold
+    /// rustc; run explicitly:
+    ///   cargo test --release --lib -- --ignored --nocapture gate1_
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "GATE 1 — spawns a real cold cargo build; run with --ignored --nocapture"]
+    fn gate1_real_cold_cargo_build_through_run_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A minimal, dependency-free crate (no network) whose main.rs is
+        // generated to emit ~800 unused-variable warnings — real `cargo build`
+        // output well past the 64 KiB pipe buffer, without failing the build.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"hardpan_gate1\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"hardpan_gate1\"\npath = \"main.rs\"\n",
+        )
+        .unwrap();
+        let mut main = String::from("fn main() {\n");
+        for i in 0..800 {
+            // No leading underscore -> each is an `unused variable` warning.
+            main.push_str(&format!("    let gate1_unused_{i} = {i}u64;\n"));
+        }
+        main.push_str("}\n");
+        std::fs::write(root.join("main.rs"), main).unwrap();
+
+        // Cold: the crate has no target/ yet. 180s liveness backstop; a working
+        // drain finishes far sooner. Route cargo's target dir inside the temp so
+        // nothing touches the outer build.
+        let sb = Sandbox::new(root, false, Duration::from_secs(180))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let a = validate(
+            &call(
+                "run_shell",
+                json!({ "command": "cargo build --color never 2>&1" }),
+            ),
+            &sb,
+        )
+        .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let out = a.execute(&sb);
+        let elapsed = t0.elapsed();
+        let text = out.text();
+
+        // Transcript for the receipt.
+        let transcript = format!(
+            "$ cargo build --color never 2>&1   (cwd = fresh cold crate)\n\
+             outcome  = {}\n\
+             elapsed  = {} ms  (timeout budget 180000 ms)\n\
+             text_len = {} bytes (clipped to {} for the model)\n\
+             --- head ---\n{}\n--- tail ---\n{}\n",
+            outcome_variant(&out),
+            elapsed.as_millis(),
+            text.len(),
+            MAX_OUTPUT_BYTES,
+            text.chars().take(600).collect::<String>(),
+            text.chars()
+                .rev()
+                .take(400)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+        );
+        let _ = std::fs::write(
+            std::env::temp_dir().join("hardpan_gate1_transcript.txt"),
+            &transcript,
+        );
+        println!("{transcript}");
+
+        assert!(
+            matches!(out, ToolOutcome::Ok(_)),
+            "a real cold cargo build must return Ok, got {out:?}"
+        );
+        assert!(
+            text.contains("Compiling hardpan_gate1") || text.contains("Finished"),
+            "transcript must show the real build progressing"
+        );
+        assert!(
+            elapsed < Duration::from_secs(180),
+            "must finish inside the timeout (took {elapsed:?})"
+        );
+    }
+
+    /// Drive `run_shell` over a file, on whichever platform we are.
+    fn run_shell_cat(dir: &Path, file: &str, to_stderr: bool) -> (ToolOutcome, Duration) {
+        #[cfg(unix)]
+        let base = format!("cat {file}");
+        #[cfg(windows)]
+        let base = format!("type {file}");
+        let command = if to_stderr {
+            format!("{base} 1>&2")
+        } else {
+            base
+        };
+        // 15s: a working drain finishes in well under a second, so this is a
+        // liveness backstop. A regression re-wedges and burns the whole budget.
+        let sb = Sandbox::new(dir, false, Duration::from_secs(15))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let a = validate(&call("run_shell", json!({ "command": command })), &sb).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = a.execute(&sb);
+        (out, t0.elapsed())
+    }
+
+    /// W1 regression — `run_shell` must drain a child that emits more than one
+    /// pipe buffer (tools.rs run_shell).
+    ///
+    /// Before the fix nothing read either pipe until after the child exited, so
+    /// a child emitting >64 KiB (std 1.95.0 PIPE_BUFFER_CAPACITY,
+    /// sys/process/windows/child_pipe.rs:56; same order on Linux) blocked in
+    /// write() forever and the tool reported a *successful* command as
+    /// `command timed out after Ns` with every captured byte discarded.
+    /// Measured pre-fix on Windows: 417,792 B -> Err, 0 payload bytes, 10,075 ms.
+    #[test]
+    fn run_shell_drains_more_than_a_pipe_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = oversized_payload();
+        assert!(
+            payload.len() > 64 * 1024,
+            "payload must exceed one pipe buffer"
+        );
+        std::fs::write(dir.path().join("big.txt"), &payload).unwrap();
+
+        let (out, elapsed) = run_shell_cat(dir.path(), "big.txt", false);
+        println!(
+            "[W1] payload={} elapsed_ms={} outcome={} text_bytes={}",
+            payload.len(),
+            elapsed.as_millis(),
+            outcome_variant(&out),
+            out.text().len()
+        );
+
+        assert!(
+            matches!(out, ToolOutcome::Ok(_)),
+            "a command emitting {} bytes must succeed, got {out:?}",
+            payload.len()
+        );
+        assert!(
+            out.text().contains("000000"),
+            "captured output must contain the payload's first line"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "must not burn the timeout budget (took {elapsed:?})"
+        );
+    }
+
+    /// W1 regression, stderr leg — the 64 KiB quota is PER PIPE, so a chatty
+    /// stderr wedges the child exactly as stdout does. Both readers must exist.
+    #[test]
+    fn run_shell_drains_more_than_a_pipe_buffer_on_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = oversized_payload();
+        std::fs::write(dir.path().join("big.txt"), &payload).unwrap();
+
+        let (out, elapsed) = run_shell_cat(dir.path(), "big.txt", true);
+        println!(
+            "[W1-stderr] elapsed_ms={} outcome={} text_bytes={}",
+            elapsed.as_millis(),
+            outcome_variant(&out),
+            out.text().len()
+        );
+
+        assert!(
+            !out.text().contains("timed out"),
+            "stderr past one pipe buffer must not wedge the child: {}",
+            out.text()
+        );
+        assert!(
+            out.text().contains("000000"),
+            "stderr payload must be captured"
+        );
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+    }
+
+    /// PIDs of every live PING.EXE whose command line contains `marker`. Querying
+    /// the command line (not just the image name) lets a W2 test attribute an
+    /// orphan to ITS OWN `run_shell` invocation and never to an unrelated ping
+    /// that happened to be running — so the assertion cannot flake on background
+    /// noise, and cleanup targets exactly what the test created.
+    #[cfg(windows)]
+    fn pids_of_marked_ping(marker: &str) -> Vec<u32> {
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | \
+             Where-Object {{ $_.CommandLine -like '*{marker}*' }} | \
+             ForEach-Object {{ $_.ProcessId }}"
+        );
+        let out = Command::new(system32("WindowsPowerShell\\v1.0\\powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .output();
+        let mut pids = Vec::new();
+        if let Ok(o) = out {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Ok(n) = line.trim().parse::<u32>() {
+                    pids.push(n);
+                }
+            }
+        }
+        pids
+    }
+
+    /// Kill a PID and its tree, by PID (never by image name — the box also runs a
+    /// desktop sidecar). Best-effort cleanup for the W2 test.
+    #[cfg(windows)]
+    fn kill_tree(pid: u32) {
+        let _ = Command::new(system32("taskkill.exe"))
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .output();
+    }
+
+    /// W2 regression — a `run_shell` timeout must tear down the WHOLE process
+    /// tree, not just cmd.exe (tools.rs run_shell, job-object teardown).
+    ///
+    /// `run_shell` runs `cmd /C <command>`, so the `ping` is a GRANDCHILD. Before
+    /// the job object, `child.kill()` reaped only cmd.exe and the ping survived as
+    /// an orphan for its full duration (measured Phase 0: 1 survivor). The ping
+    /// count is a unique marker so the query attributes orphans to this test only.
+    #[cfg(windows)]
+    #[test]
+    fn run_shell_timeout_tears_down_the_process_tree() {
+        let _serial = ps_serial();
+        // -n 271 is a distinctive count (271 s of work >> the 3 s timeout) that no
+        // other test or probe uses, so `-like '*-n 271*'` matches only our ping.
+        let marker = "-n 271";
+        // Belt-and-suspenders: clear any stragglers from a previous aborted run.
+        for pid in pids_of_marked_ping(marker) {
+            kill_tree(pid);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(3))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let a = validate(
+            &call("run_shell", json!({ "command": "ping -n 271 127.0.0.1" })),
+            &sb,
+        )
+        .unwrap();
+
+        let out = a.execute(&sb);
+        assert!(
+            out.text().contains("timed out"),
+            "expected a timeout, got {out:?}"
+        );
+
+        // Let the OS finish reaping the killed tree.
+        std::thread::sleep(Duration::from_millis(1000));
+        let survivors = pids_of_marked_ping(marker);
+        // Never leak, even if the assertion below fails.
+        for pid in &survivors {
+            kill_tree(*pid);
+        }
+        println!("[W2] orphaned_grandchild_pids = {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "run_shell timeout left orphaned grandchildren: {survivors:?}"
+        );
+    }
+
+    /// The preamble's own transport: RFC 4648 vectors covering all three padding
+    /// shapes. A broken encoder would also fail the round-trip tests below (the
+    /// child's FromBase64String throws), but this pins the cause.
+    #[cfg(windows)]
+    #[test]
+    fn base64_ascii_matches_known_vectors() {
+        assert_eq!(base64_ascii(b""), "");
+        assert_eq!(base64_ascii(b"f"), "Zg==");
+        assert_eq!(base64_ascii(b"fo"), "Zm8=");
+        assert_eq!(base64_ascii(b"foo"), "Zm9v");
+        assert_eq!(base64_ascii(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// W3(a) regression — GATE 2: non-ASCII round-trips byte-identical through
+    /// run_windows_command's stdin preamble.
+    ///
+    /// Two legs asserted separately: what the child EMITS (output leg, built
+    /// from codepoints so nothing depends on input) and what the child RECEIVES
+    /// (input leg, reported as codepoints — the decisive one, since an echo can
+    /// round-trip byte-transparently while the child still sees mojibake).
+    /// Pre-fix (Phase 0, same commands): output leg came back as
+    /// `ef bf bd … 3f 3f` (U+FFFD + '?'), input leg delivered 16 codepoints for
+    /// these 6, child sat on IBM437.
+    #[cfg(windows)]
+    #[test]
+    fn run_windows_command_round_trips_non_ascii() {
+        let _serial = ps_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = win_sandbox(dir.path());
+
+        // U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC
+        let vector = "éü—✓日€";
+
+        // Leg 1 — OUTPUT: the non-ASCII originates inside the child.
+        let emit = "$s = -join @([char]0x00E9,[char]0x00FC,[char]0x2014,[char]0x2713,\
+                    [char]0x65E5,[char]0x20AC); Write-Output $s";
+        let out = validate(
+            &call("run_windows_command", json!({ "command": emit })),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
+        let body = out.text();
+        let got = body
+            .lines()
+            .find(|l| !l.starts_with("exit:") && !l.starts_with("stdout:"))
+            .unwrap_or("")
+            .trim();
+        assert_eq!(
+            got.as_bytes(),
+            vector.as_bytes(),
+            "output leg must be byte-identical (got {:?})",
+            got
+        );
+        assert!(
+            !body.contains('\u{FFFD}'),
+            "no replacement characters allowed: {body}"
+        );
+
+        // Leg 2 — INPUT: the non-ASCII rides in the command text; the child
+        // reports the codepoints it actually received.
+        let echo = format!(
+            "$r = \"{vector}\"; Write-Output ((($r.ToCharArray()) | ForEach-Object {{ \
+             \"U+{{0:X4}}\" -f [int]$_ }}) -join \" \")"
+        );
+        let out2 = validate(
+            &call("run_windows_command", json!({ "command": echo })),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        let recv = out2
+            .text()
+            .lines()
+            .find(|l| l.contains("U+"))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        assert_eq!(
+            recv, "U+00E9 U+00FC U+2014 U+2713 U+65E5 U+20AC",
+            "child must receive exactly the 6 codepoints sent (pre-fix: 16 mojibake codepoints)"
+        );
+    }
+
+    /// W3(b) regression — GATE 2: a failing native command returns
+    /// ToolOutcome::Err with the child's REAL exit code.
+    ///
+    /// Pre-fix (Phase 0, same commands): `cmd /c exit 3; Write-Output done`
+    /// reported `exit: 0` → Ok (the defect — a later success erased the
+    /// failure), and a *last* failing native command was flattened to 1.
+    #[cfg(windows)]
+    #[test]
+    fn run_windows_command_propagates_native_exit_codes() {
+        let _serial = ps_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = win_sandbox(dir.path());
+
+        let run = |cmd: &str| {
+            validate(&call("run_windows_command", json!({ "command": cmd })), &sb)
+                .unwrap()
+                .execute(&sb)
+        };
+
+        // The load-bearing case: a failing native command followed by a
+        // successful statement. Pre-fix: exit: 0 → Ok.
+        let out = run("cmd /c exit 3; Write-Output done");
+        assert!(out.is_err(), "the failure must not be erased: {out:?}");
+        assert!(
+            out.text().contains("exit: 3"),
+            "true code, got: {}",
+            out.text()
+        );
+        assert!(
+            out.text().contains("done"),
+            "output around the failure is still captured: {}",
+            out.text()
+        );
+
+        // The true code survives even when the failure is last (pre-fix: 1).
+        let out = run("cmd /c exit 42");
+        assert!(out.is_err());
+        assert!(out.text().contains("exit: 42"), "got: {}", out.text());
+
+        // No false failures: a pure-cmdlet success stays 0/Ok.
+        let out = run("Write-Output ok");
+        assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
+        assert!(out.text().contains("exit: 0"));
+        assert!(out.text().contains("ok"));
+
+        // A terminating error still fails.
+        let out = run("throw 'boom'");
+        assert!(out.is_err(), "throw must stay non-zero: {out:?}");
+
+        // Documented residual, asserted so a change is noticed: $LASTEXITCODE
+        // tracks only the LAST native command, so a failure followed by a
+        // native success reports 0 — before and after the fix.
+        let out = run("cmd /c exit 3; cmd /c exit 0");
+        assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
+        assert!(out.text().contains("exit: 0"));
     }
 }

@@ -1111,3 +1111,67 @@ loop still never *reads* a plan step to decide anything, and the plan still cann
 the sandbox, or a tool choice — this only *writes* the model's own to-do to done at the natural
 completion point. It fires only on `Answered`; a step-capped, aborted, repeated, or errored run
 leaves the plan as the model left it, which is the honest signal that the run did not finish.
+
+## D19 — HARDPAN: Windows agent-terminal parity fixes (2026-07-23)
+
+The full-screen agent terminal shipped assuming a Unix terminal; HARDPAN
+(`qa/hardpan/REPRO.md`) reproduced the Windows-specific failures live before
+fixing them, and every ruling below is receipt-backed rather than reasoned.
+
+**Exec surface (Class A).** (1) `run_shell` drains stdout/stderr on per-pipe
+reader threads — the poll-then-`wait_with_output` shape wedged any child
+emitting more than the 64 KiB per-pipe quota and reported a *successful*
+command to the model as a timeout with its output discarded. The fix lifts
+`run_windows_command`'s existing pattern verbatim; it is cross-platform (Linux
+has the same quota) and the regression tests run on both CI legs. (2) A
+kill-on-close job object tears down `run_shell`'s whole process tree on
+timeout. Ruled at GATE 0: the `CREATE_NO_WINDOW` half of the original finding
+was DROPPED as unreachable (no console-less surface registers `run_shell`), so
+no creation flags land. The negative control exposed a real coupling worth
+recording: without the job object, an orphaned grandchild holds the inherited
+pipe write-end, so the W1 drain-thread join wedges for the orphan's entire
+lifetime (274.79 s vs 4.76 s on the same test). Tree teardown is what makes a
+drained timeout path prompt — the two fixes are load-bearing together.
+(3) `run_windows_command` feeds PowerShell 5.1 a base64-inside-pure-ASCII
+stdin preamble and re-raises `$LASTEXITCODE`. Mechanism correction that
+matters for future work: a `CREATE_NO_WINDOW` child gets a fresh windowless
+console on the OEM code page (437 here), NOT "no console" and NOT the ANSI
+page — which is why `win_console::init()` can't help and why ASCII (identical
+under every code page) is the only airtight envelope. Deliberately NOT
+`-EncodedCommand` (would reintroduce the ~32 KiB command-line ceiling) and
+deliberately NOT "prefer pwsh.exe" (absent on the reference host — an
+untestable branch does not ship; 5.1 is pinned by absolute path and made
+UTF-8-correct by the preamble). Residual, asserted in tests: `$LASTEXITCODE`
+tracks only the last native command.
+
+**Terminal front ends (Class B).** (4) One shared RAII teardown guard +
+chaining panic hook (`term_guard.rs`) covers both TUIs; it restores only for
+panics on the arming thread, because agent-loop worker panics are survivable
+today and yanking a live TUI out of its alternate screen would be a
+regression. Known limit: non-unwinding deaths bypass any hook. (5) The W5
+paste fix deviates from the campaign's prescription, recorded as amendment
+A12: a Ctrl+V arm alone cannot fix paste on default Windows hosts, because the
+terminal intercepts the chord and injects the clipboard as keystrokes — the
+Phase 0 event log contains no Ctrl+V event at all. The shipped fix is
+three-part: non-fatal `EnableBracketedPaste`, a Ctrl+V clipboard-read arm (new
+read-only `win_clipboard.rs`; the OSC 52 write path is untouched), and a
+pasted-Enter guard — an Enter processed while more input is already queued is
+a pasted newline, not a submit. (6) AltGr: a `Char` carrying CONTROL|ALT is a
+composition and inserts; CONTROL alone stays a chord — one shared predicate,
+no per-character cases.
+
+**Struck / null, on evidence.** W7 (`/copy` lies) did not reproduce — OSC 52
+is honoured by this host's terminals in 2/2 real-console runs, so the tool
+told the truth and `clipboard.rs` is untouched. W9 (LineWriter buffering) is a
+measured null (8× the writes cost 1.07× the time; ratatui writes diffs and
+already flushes once per frame) — receipt under
+`qa/evidence-bundles/hardpan-windows-terminal-20260723/`, no product change,
+per the SIROCCO precedent for unmeasured perf claims.
+
+Boundaries held: no agent-loop, tool-schema, approval-policy, or parity-lane
+change; no new crate (two `windows-sys` features only, justified by the
+clipboard *read* path); Unix behavior preserved (the one deliberate
+cross-platform fix, W1, is a strict improvement there). Follow-ups on the
+amendment log: `win_uia.rs` shares W3(a)'s output leg (A11/W10); the real-TUI
+CERT rows of `qa/hardpan/MANUAL_CHECKLIST.md` are owed post-merge
+(merge-ahead authorized 2026-07-23).
