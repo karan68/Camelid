@@ -22,6 +22,18 @@ fn committed_sealed_receipts_are_intact_or_baselined() {
     let report = camelid::receipt::audit::audit_dir(&qa).expect("audit qa/");
 
     assert!(
+        report.unparseable.is_empty(),
+        "unparseable .json under qa/ — a receipt corrupted into invalid JSON (merge markers?):\n{:#?}\n\
+         If a file is intentionally non-JSON, add it to \
+         camelid::receipt::audit::UNPARSEABLE_ALLOWLIST with a reason.",
+        report.unparseable
+    );
+    assert!(
+        report.unreadable.is_empty(),
+        "unreadable .json under qa/ (I/O error or non-UTF-8):\n{:#?}",
+        report.unreadable
+    );
+    assert!(
         report.ok(),
         "committed sealed receipts are corrupted and NOT grandfathered:\n{:#?}\n\
          Fix the receipt (or re-seal it); only add a documented \

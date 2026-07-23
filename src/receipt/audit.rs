@@ -11,8 +11,10 @@
 //!   [`receipt_id`](super::receipt_id_over) convention (parity, distributed, and
 //!   the agent family) are checked. Every other JSON file - the many unsealed
 //!   evidence / summary / prompt-pack schemas - is skipped.
-//! - A sealed-family receipt that carries no `receipt_id` (e.g. an `agent_eval`
-//!   receipt minted before sealing) is reported as *unsealed*, not failed.
+//! - A sealed-family receipt that carries no `receipt_id` (some parity evidence
+//!   items, and pre-sealing `agent_eval` receipts) is reported as *unsealed*,
+//!   not failed: this gate checks the INTEGRITY of sealed receipts, not that
+//!   sealing happened - which it cannot tell from a legitimately unsealed one.
 //! - Only a receipt whose stored `receipt_id` does not match its recomputed
 //!   digest is a failure. That is exactly the accidental-corruption / naive-edit
 //!   case the seal exists to catch; it is not forgery-resistance (see
@@ -52,6 +54,13 @@ pub struct BaselineEntry {
 /// grandfathered so the gate enforces integrity forward without touching
 /// historical provenance. Any change to one of these files changes its
 /// `computed` digest, drops the match, and turns it back into a hard failure.
+///
+/// The `computed` values are outputs of the current `receipt_id_over`
+/// serialization. A `serde_json` change to number/float formatting would
+/// recompute them - and would equally break every committed receipt carrying a
+/// float, since the whole receipt scheme relies on that serialization being
+/// stable. Treat a `serde_json` bump (it is a loose `1` dependency) as a
+/// receipt-format event, and re-derive these values if it lands.
 pub const BASELINE: &[BaselineEntry] = &[
     BaselineEntry {
         path: "qa/agent-orchestration/bench-rung4-1782702313.json",
@@ -109,9 +118,42 @@ pub const BASELINE: &[BaselineEntry] = &[
     },
 ];
 
+/// `.json` files under `qa/` that are intentionally NOT JSON - misnamed
+/// artifacts, not receipts - excluded from the unparseable-failure set. Matched
+/// by path suffix (separator- and EOL-robust; these are fixed non-receipt
+/// artifacts). Keep this minimal: a NEW unparseable `.json` is a failure,
+/// because a receipt corrupted into invalid JSON (e.g. a leftover merge-conflict
+/// marker) is the exact threat this gate must not skip.
+const UNPARSEABLE_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "qa/evidence-bundles/backend-q8-stream-diagnostics-loop-20260518T2222Z-head-7bfba9ac68e1/artifacts/same-host-plan.json",
+        "benchmark plan in key=value text, not JSON (misnamed .json)",
+    ),
+    (
+        "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-current-head-sev1-20260514T124203Z-head-61e6e972a294/api/unload.json",
+        "empty (0-byte) API-unload capture, not a receipt",
+    ),
+];
+
+/// The documented reason a `.json` is allowed to be non-JSON, or `None` if an
+/// unparseable file at `path` is a real failure. Path-suffix match, separator-
+/// normalized so it holds regardless of how the audited directory was named.
+fn unparseable_allowlist_reason(path: &Path) -> Option<&'static str> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    UNPARSEABLE_ALLOWLIST
+        .iter()
+        .find(|(allow, _)| normalized.ends_with(allow))
+        .map(|(_, reason)| *reason)
+}
+
 /// The receipt schemas sealed with the `receipt_id` self-digest convention,
 /// sourced from each family's own schema constant so the set cannot silently
 /// drift from what the emitters produce.
+///
+/// KEEP IN SYNC: when a new receipt family starts sealing with `receipt_id`, add
+/// its schema constant here, or the gate will silently skip every receipt of
+/// that family. There is no registry of "schemas that carry a receipt_id" to
+/// derive this from.
 pub fn sealed_schemas() -> Vec<&'static str> {
     let mut schemas = vec![
         super::RECEIPT_SCHEMA_V1,
@@ -147,6 +189,16 @@ pub struct AuditReport {
     pub verified: usize,
     /// Sealed-family receipts carrying no (or an empty) `receipt_id`.
     pub unsealed: Vec<PathBuf>,
+    /// `.json` files that could not be read (I/O error or non-UTF-8). A receipt
+    /// corrupted into unreadable bytes lands here, so it is a failure.
+    pub unreadable: Vec<PathBuf>,
+    /// `.json` files that did not parse as JSON (e.g. a merge-conflict marker
+    /// left in a receipt). A failure: the seal cannot even be reached, and this
+    /// is exactly the "bad merge" shape the gate must not skip.
+    pub unparseable: Vec<PathBuf>,
+    /// Non-JSON `.json` files grandfathered by [`UNPARSEABLE_ALLOWLIST`]
+    /// (misnamed artifacts) - reported, never a failure.
+    pub unparseable_allowlisted: Vec<PathBuf>,
     /// Mismatches grandfathered by [`BASELINE`] (tracked debt, not failures).
     pub allowlisted: Vec<AllowlistedMismatch>,
     /// Sealed receipts whose digest did not match and are NOT grandfathered.
@@ -156,9 +208,11 @@ pub struct AuditReport {
 }
 
 impl AuditReport {
-    /// True when no un-grandfathered corruption was found.
+    /// True when no un-grandfathered corruption was found. An unreadable or
+    /// unparseable `.json` (a plausible corrupted-receipt shape) is a failure
+    /// too, so the gate does not fail open on a receipt broken into invalid JSON.
     pub fn ok(&self) -> bool {
-        self.mismatches.is_empty()
+        self.mismatches.is_empty() && self.unreadable.is_empty() && self.unparseable.is_empty()
     }
 
     /// Process exit code: 0 when every sealed receipt is intact or grandfathered,
@@ -259,13 +313,23 @@ fn audit_dir_inner(
             audit_dir_inner(&path, sealed, baseline, report)?;
         } else if path.extension().is_some_and(|ext| ext == "json") {
             report.scanned += 1;
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(_) => {
+                    report.unreadable.push(path);
+                    continue;
+                }
             };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            audit_value(&path, &value, sealed, baseline, report);
+            match serde_json::from_str::<Value>(&text) {
+                Ok(value) => audit_value(&path, &value, sealed, baseline, report),
+                Err(_) => {
+                    if unparseable_allowlist_reason(&path).is_some() {
+                        report.unparseable_allowlisted.push(path);
+                    } else {
+                        report.unparseable.push(path);
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -288,6 +352,21 @@ pub fn run(dir: &Path) -> i32 {
             mismatch.computed
         );
     }
+    for path in &report.unparseable {
+        println!(
+            "FAIL unparseable: {} (not valid JSON - corrupted receipt or merge markers?)",
+            path.display()
+        );
+    }
+    for path in &report.unreadable {
+        println!(
+            "FAIL unreadable: {} (I/O error or non-UTF-8)",
+            path.display()
+        );
+    }
+    for path in &report.unparseable_allowlisted {
+        println!("NOTE non-JSON (allowlisted): {}", path.display());
+    }
     for entry in &report.allowlisted {
         println!(
             "NOTE tracked-debt (allowlisted): {} - {}",
@@ -307,13 +386,14 @@ pub fn run(dir: &Path) -> i32 {
             entry.path
         );
     }
+    let failed = report.mismatches.len() + report.unparseable.len() + report.unreadable.len();
     println!(
         "scanned {} json file(s): {} verified, {} allowlisted debt, {} unsealed, {} failed",
         report.scanned,
         report.verified,
         report.allowlisted.len(),
         report.unsealed.len(),
-        report.mismatches.len()
+        failed
     );
     if report.ok() {
         println!(
@@ -321,10 +401,7 @@ pub fn run(dir: &Path) -> i32 {
             report.allowlisted.len()
         );
     } else {
-        println!(
-            "RECEIPT INTEGRITY CHECK FAILED ({} corrupted, not allowlisted)",
-            report.mismatches.len()
-        );
+        println!("RECEIPT INTEGRITY CHECK FAILED ({failed} problem(s), not allowlisted)");
     }
     report.exit_code()
 }
@@ -403,6 +480,8 @@ mod tests {
         let computed = receipt_id_over(&tampered);
         let baseline = [BaselineEntry {
             path: "t.json",
+            // Deliberate test-scoped leak to get the `&'static str` the field
+            // wants; the test process is short-lived.
             stored: stored.leak(),
             computed: computed.leak(),
             reason: "test debt",
@@ -485,13 +564,30 @@ mod tests {
     }
 
     #[test]
+    fn unparseable_allowlist_matches_only_the_documented_non_json_artifacts() {
+        assert!(unparseable_allowlist_reason(Path::new(
+            "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-current-head-sev1-20260514T124203Z-head-61e6e972a294/api/unload.json"
+        ))
+        .is_some());
+        // Windows separators and a leading dir still match (suffix, normalized).
+        assert!(unparseable_allowlist_reason(Path::new(
+            r"C:\repo\qa\evidence-bundles\backend-q8-stream-diagnostics-loop-20260518T2222Z-head-7bfba9ac68e1\artifacts\same-host-plan.json"
+        ))
+        .is_some());
+        assert!(
+            unparseable_allowlist_reason(Path::new("qa/receipts/anything-else.json")).is_none()
+        );
+    }
+
+    #[test]
     fn audit_dir_walks_recursively_and_reports() {
-        let dir = std::env::temp_dir().join(format!("camelid-audit-{}", std::process::id()));
-        let nested = dir.join("nested");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nested = root.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
 
         std::fs::write(
-            dir.join("good.json"),
+            root.join("good.json"),
             serde_json::to_vec(&seal(sealed_body())).unwrap(),
         )
         .unwrap();
@@ -499,19 +595,27 @@ mod tests {
         bad["created_utc"] = json!("2099-01-01T00:00:00Z");
         std::fs::write(nested.join("bad.json"), serde_json::to_vec(&bad).unwrap()).unwrap();
         std::fs::write(
-            dir.join("other.json"),
+            root.join("other.json"),
             b"{\"schema\":\"camelid.speed-receipt/v1\"}",
         )
         .unwrap();
-        std::fs::write(dir.join("notes.txt"), b"not json").unwrap();
+        std::fs::write(root.join("notes.txt"), b"not json").unwrap();
+        // A merge-conflict marker in a .json: must FAIL as unparseable, not skip.
+        std::fs::write(root.join("conflict.json"), b"{\n<<<<<<< HEAD\n}\n").unwrap();
 
-        let report = audit_dir(&dir).unwrap();
+        let report = audit_dir(root).unwrap();
         assert_eq!(report.verified, 1);
         assert_eq!(report.mismatches.len(), 1);
         assert!(report.mismatches[0].path.ends_with("bad.json"));
-        assert_eq!(report.scanned, 3); // good.json, bad.json, other.json (not the .txt)
-        assert_eq!(run(&dir), 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            report.unparseable.len(),
+            1,
+            "a conflict-marker .json must fail, not be silently skipped"
+        );
+        assert!(report.unparseable[0].ends_with("conflict.json"));
+        assert!(!report.ok());
+        assert_eq!(report.scanned, 4); // good, bad, other, conflict (not the .txt)
+        assert_eq!(run(root), 1);
+        // tempdir cleans up on drop, even on panic.
     }
 }
