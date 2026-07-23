@@ -170,4 +170,56 @@ mod tests {
             "drop restores and clears the flag"
         );
     }
+
+    /// GATE 3 row 4, live leg — a real panic on the armed thread must restore
+    /// the REAL console input mode, measured with GetConsoleMode before raw
+    /// mode and after the panic hook ran. Needs a real console on stdin, so it
+    /// is #[ignore]d; the CERT driver runs it inside a console window:
+    ///   <test-bin> --ignored --nocapture --exact chat::term_guard::tests::gate3_panic_restore_live
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real console window — run via the GATE 3 CERT driver"]
+    fn gate3_panic_restore_live() {
+        use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+        use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
+
+        // SAFETY: read-only query of the process stdin handle's console mode.
+        let mode_of = || unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0u32;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                None
+            } else {
+                Some(mode)
+            }
+        };
+        let Some(before) = mode_of() else {
+            panic!("no real console on stdin — run from the CERT driver in a console window");
+        };
+
+        install_panic_hook();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = TerminalGuard::arm();
+            enable_raw_mode().expect("raw mode");
+            let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+            let raw = mode_of().expect("console vanished under raw mode");
+            assert_ne!(raw, before, "raw mode must actually change the input mode");
+            panic!("gate3 deliberate panic with the terminal armed");
+        }));
+        assert!(result.is_err(), "the deliberate panic must have unwound");
+
+        let after = mode_of().expect("console vanished after restore");
+        println!(
+            "[GATE3-W6] mode_before=0x{before:08x} mode_after=0x{after:08x} restored={}",
+            after == before
+        );
+        assert_eq!(
+            after, before,
+            "the panic hook + guard must restore the console input mode"
+        );
+        assert!(
+            !TUI_ACTIVE.load(Ordering::SeqCst),
+            "restore cleared the flag"
+        );
+    }
 }

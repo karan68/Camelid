@@ -1,0 +1,19 @@
+=== HARDPAN GATE 3 - real-binary CERT take 2, chat TUI (2026-07-23T16:18:15.9086084-07:00) ===
+binary = %USERPROFILE%\cam-hardpan\target\release\camelid.exe
+tui pid=24936 hwnd(from foreground)=133156
+picker_closed = True
+
+--- ROW 3 (real binary): AltGr on a temporarily-added German layout ---
+row3.needle              = '@<euro>[]' (contiguous, immune to chrome)
+row3.input_box_has_run   = False
+row3.restored_layouts    = en-US
+
+--- ROW 5 (real binary): Tab toggles the sidebar ---
+row5.sidebar_before   = True
+row5.sidebar_after    = False   (must differ)
+row5.sidebar_restored = True   (must match before)
+row5.toggle_works     = True
+
+--- teardown: Ctrl+D quits; W6 guard restores; spawned server reaped ---
+quit.exited = True  code = 0
+leftover_camelid_procs = none (spawned server reaped)
