@@ -1,0 +1,11 @@
+
+running 1 test
+[?1049h[?1049l[?2004l
+thread 'chat::term_guard::tests::gate3_panic_restore_live' (28452) panicked at src\chat\term_guard.rs:207:13:
+gate3 deliberate panic with the terminal armed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[GATE3-W6] mode_before=0x000001f7 mode_after=0x000001f7 restored=true
+test chat::term_guard::tests::gate3_panic_restore_live ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1207 filtered out; finished in 0.00s
+
