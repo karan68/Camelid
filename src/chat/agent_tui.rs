@@ -785,7 +785,13 @@ impl<'a> App<'a> {
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
-            KeyCode::Char(c) if !ctrl => self.insert_char(c),
+            // W8: the predicate accepts AltGr compositions (CONTROL|ALT) that
+            // the old `!ctrl` guard silently swallowed — on a German layout
+            // that was every `@ \ { } [ ] €`. CONTROL-alone chords still never
+            // insert, and the Ctrl+C/Ctrl+V arms above match first regardless.
+            KeyCode::Char(c) if super::term_guard::char_inserts(key.modifiers) => {
+                self.insert_char(c)
+            }
             _ => {}
         }
     }

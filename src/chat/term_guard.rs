@@ -25,9 +25,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use ratatui::crossterm::cursor::Show;
-use ratatui::crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
+use ratatui::crossterm::event::{DisableBracketedPaste, DisableMouseCapture, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+
+/// W8 — should a `KeyCode::Char` key event insert its character into the input
+/// box? Shared by both front ends so the two guards cannot drift.
+///
+/// A `Char` carrying CONTROL|ALT is an AltGr composition, not a chord: Windows
+/// reports AltGr as LeftCtrl+RightAlt and crossterm folds the sides
+/// (parse.rs:82-83), so on DE/PL/FR/ES/SE layouts the only way to type
+/// `@ \ | { } [ ] €` arrives exactly this way — measured live in Phase 0, all
+/// four probed AltGr characters carried CONTROL|ALT and were dropped by the old
+/// `!ctrl` guard. A `Char` with CONTROL alone stays a chord and must not
+/// insert. ALT alone inserted before this change and still does. No individual
+/// characters are special-cased; the decision is on modifiers only.
+pub(crate) fn char_inserts(mods: KeyModifiers) -> bool {
+    !mods.contains(KeyModifiers::CONTROL) || mods.contains(KeyModifiers::ALT)
+}
 
 /// Whether a TUI currently owns the terminal (armed and not yet restored).
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -115,6 +130,30 @@ mod tests {
             PREV_RAN.load(Ordering::SeqCst) > before,
             "the pre-existing hook must still run after install_panic_hook"
         );
+    }
+
+    /// W8 — the insert predicate over every modifier shape that reaches the
+    /// guard (pure function; no terminal needed).
+    #[test]
+    fn char_insert_predicate_accepts_altgr_and_rejects_chords() {
+        let m = |bits| -> KeyModifiers { bits };
+        // Plain and shifted characters insert (unchanged behavior).
+        assert!(char_inserts(m(KeyModifiers::NONE)));
+        assert!(char_inserts(m(KeyModifiers::SHIFT)));
+        // ALT alone inserted before W8 and still does (unchanged behavior).
+        assert!(char_inserts(m(KeyModifiers::ALT)));
+        // AltGr = CONTROL|ALT — the W8 fix: these carried '@ € [ ]' in the
+        // live Phase 0 probe and were dropped.
+        assert!(char_inserts(m(KeyModifiers::CONTROL | KeyModifiers::ALT)));
+        // AltGr+Shift compositions exist on some layouts — SHIFT must not veto.
+        assert!(char_inserts(m(KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SHIFT)));
+        // CONTROL alone stays a chord: never insert.
+        assert!(!char_inserts(m(KeyModifiers::CONTROL)));
+        assert!(!char_inserts(
+            m(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        ));
     }
 
     /// W6 — restore is gated on the armed flag (no-op when idle) and arming /

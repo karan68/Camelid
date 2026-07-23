@@ -74,4 +74,24 @@ mod tests {
     fn read_text_never_panics() {
         let _ = read_text();
     }
+
+    /// GATE 3 evidence probe — round-trips a known value through the REAL
+    /// clipboard (mutates global state, so #[ignore]d; run explicitly):
+    ///   cargo test --release --lib -- --ignored --nocapture gate3_clipboard
+    #[test]
+    #[ignore = "mutates the real clipboard — run with --ignored --nocapture"]
+    fn gate3_clipboard_read_returns_real_content() {
+        let marker = "HARDPAN-GATE3-CLIPBOARD-\u{00E9}\u{20AC}-multi\r\nline";
+        // Seed via PowerShell (the same surface a user copies from), then read
+        // through the module under test.
+        let status = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('SEFSRFBBTi1HQVRFMy1DTElQQk9BUkQtw6nigqwtbXVsdGkNCmxpbmU=')))"])
+            .status()
+            .expect("spawn powershell");
+        assert!(status.success(), "Set-Clipboard failed");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let got = read_text().expect("clipboard should hold text");
+        println!("[GATE3-W5] clipboard_read = {got:?}");
+        assert_eq!(got.trim_end(), marker, "read must match what was copied");
+    }
 }

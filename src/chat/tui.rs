@@ -709,7 +709,10 @@ impl<'a> App<'a> {
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
-            KeyCode::Char(c) if !ctrl => self.insert_char(c),
+            // W8: accept AltGr compositions (CONTROL|ALT); see term_guard.
+            KeyCode::Char(c) if super::term_guard::char_inserts(key.modifiers) => {
+                self.insert_char(c)
+            }
             _ => {}
         }
     }
