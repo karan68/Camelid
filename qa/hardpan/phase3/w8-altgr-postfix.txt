@@ -1,0 +1,26 @@
+=== HARDPAN input probe (crossterm 0.28.1, POST-Phase-3 predicates) ===
+stdout_is_tty        = true
+window_secs          = 22
+enable_raw_mode      = Ok(())
+EnableBracketedPaste = Ok(())  (non-fatal in the real TUI since W5)
+
+--- events (paste multi-line text; press AltGr chars; ESC to finish) ---
+OTHER  FocusGained
+KEY    Char('@') mods=KeyModifiers(CONTROL | ALT) kind=Press  -> ALTGR-INSERT Char('@') mods=KeyModifiers(CONTROL | ALT)  [W8 fix live]
+KEY    Char('€') mods=KeyModifiers(CONTROL | ALT) kind=Press  -> ALTGR-INSERT Char('€') mods=KeyModifiers(CONTROL | ALT)  [W8 fix live]
+KEY    Char('[') mods=KeyModifiers(CONTROL | ALT) kind=Press  -> ALTGR-INSERT Char('[') mods=KeyModifiers(CONTROL | ALT)  [W8 fix live]
+KEY    Char(']') mods=KeyModifiers(CONTROL | ALT) kind=Press  -> ALTGR-INSERT Char(']') mods=KeyModifiers(CONTROL | ALT)  [W8 fix live]
+KEY    Char('a') mods=KeyModifiers(0x0) kind=Press  -> on_key: insert_char('a')
+KEY    Esc mods=KeyModifiers(0x0) kind=Press  -> (not a Char/Enter)
+(ESC pressed - finishing)
+
+=== SUMMARY (post-Phase-3 predicates) ===
+event_paste_count      = 0
+goals_fired            = 0   (W5: a multi-line paste must fire at most 1)
+pasted_newlines        = 0   (W5: interior Enters absorbed as text)
+chars_inserted         = 5
+  ALTGR-INSERT Char('@') mods=KeyModifiers(CONTROL | ALT)
+  ALTGR-INSERT Char('€') mods=KeyModifiers(CONTROL | ALT)
+  ALTGR-INSERT Char('[') mods=KeyModifiers(CONTROL | ALT)
+  ALTGR-INSERT Char(']') mods=KeyModifiers(CONTROL | ALT)
+chars_dropped_by_guard = 0   (W8: must be 0 for AltGr; CONTROL-only chords only)

@@ -1,17 +1,19 @@
-//! HARDPAN Phase 0 — Windows terminal input probe (evidence instrument).
+//! HARDPAN — Windows terminal input probe (evidence instrument).
 //!
-//! Answers two contested findings with observation instead of argument:
+//! Phase 0 ran this with the PRE-fix predicates and captured both defects live:
+//! a 3-line paste arrived as keystrokes whose 2 Enters each fired a goal (W5),
+//! and AltGr characters carrying CONTROL|ALT were 4/4 dropped (W8). The probe
+//! now mirrors the POST-fix Phase 3 predicates, so re-running the same drivers
+//! shows the flip — this is the GATE 3 CERT instrument:
 //!
-//! * **W5** — does a multi-line paste arrive as `Event::Paste`, or as key events
-//!   containing Enter? Each Enter that reaches `on_key` calls `submit()`
-//!   (agent_tui.rs:759), so the Enter count IS the count of goals that would fire.
-//! * **W8** — what modifiers ride along with an AltGr-produced character? The
-//!   agent TUI computes `ctrl = key.modifiers.contains(CONTROL)`
-//!   (agent_tui.rs:718) and inserts only `Char(c) if !ctrl` (agent_tui.rs:767),
-//!   so a Char carrying CONTROL is silently dropped.
+//! * **W5** — an Enter processed while more input is already queued
+//!   (`event::poll(0)`) is a pasted newline, not a submit. Mirrors the agent
+//!   TUI run loop's `paste_burst`.
+//! * **W8** — a `Char` carrying CONTROL|ALT is an AltGr composition and
+//!   inserts; CONTROL alone stays a chord. Mirrors `term_guard::char_inserts`.
 //!
-//! The probe reimplements those two predicates verbatim and prints the verdict
-//! next to each event. It writes a log file and always restores the terminal.
+//! The probe prints the verdict next to each event, writes a log file, and
+//! always restores the terminal.
 //!
 //! Run in a REAL console window (never a redirected pipe):
 //!   cargo run --release -- <logfile> [seconds]
@@ -26,14 +28,13 @@ use crossterm::event::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, tty::IsTty};
 
-/// Mirror of `agent_tui.rs:718` — the guard the real TUI applies.
-fn tui_ctrl(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-/// Mirror of `agent_tui.rs:767` — `KeyCode::Char(c) if !ctrl => insert_char(c)`.
+/// Mirror of `term_guard::char_inserts` — the POST-W8 shared guard: a Char
+/// carrying CONTROL|ALT is an AltGr composition (insert); CONTROL alone is a
+/// chord (drop).
 fn tui_would_insert(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char(_)) && !tui_ctrl(key)
+    matches!(key.code, KeyCode::Char(_))
+        && (!key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT))
 }
 
 fn main() {
@@ -46,27 +47,26 @@ fn main() {
         ($($a:tt)*) => {{ let s = format!($($a)*); println!("{s}\r"); log.push(s); }};
     }
 
-    rec!("=== HARDPAN input probe (crossterm 0.28.1) ===");
+    rec!("=== HARDPAN input probe (crossterm 0.28.1, POST-Phase-3 predicates) ===");
     rec!("stdout_is_tty        = {}", std::io::stdout().is_tty());
     rec!("window_secs          = {secs}");
 
-    // W5 second-order: does EnableBracketedPaste fail on this host? The real TUI
-    // puts this behind `?` at agent_tui.rs:214, AFTER raw mode + alternate screen
-    // are already active, so a failure here would strand the console.
     let raw = enable_raw_mode();
     rec!("enable_raw_mode      = {raw:?}");
+    // Mirrors the post-W5 setup: non-fatal, on its own write.
     let bp = execute!(std::io::stdout(), EnableBracketedPaste);
-    rec!("EnableBracketedPaste = {bp:?}");
-    rec!("  (Err here => the `?` at agent_tui.rs:214 would bail with raw mode ON)");
+    rec!("EnableBracketedPaste = {bp:?}  (non-fatal in the real TUI since W5)");
     rec!("");
     rec!("--- events (paste multi-line text; press AltGr chars; ESC to finish) ---");
 
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let mut enters = 0usize;
     let mut pastes = 0usize;
+    let mut goals_fired = 0usize;
+    let mut pasted_newlines = 0usize;
     let mut chars_inserted = 0usize;
     let mut chars_dropped = 0usize;
     let mut dropped_detail: Vec<String> = Vec::new();
+    let mut altgr_inserted: Vec<String> = Vec::new();
 
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -86,31 +86,44 @@ fn main() {
             }
         };
         match ev {
-            // On Windows this arm is expected to be unreachable: crossterm
-            // 0.28.1 constructs Event::Paste only in sys/unix/parse.rs.
+            // On Windows this arm stays unreachable in crossterm 0.28.1.
             Event::Paste(ref s) => {
                 pastes += 1;
                 rec!("PASTE  len={} lines={} :: {:?}", s.len(), s.lines().count(), s);
             }
             Event::Key(k) => {
-                // Windows delivers both Press and Release records; the TUI acts
-                // on Press only, so count that way.
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
                 let verdict = match k.code {
                     KeyCode::Enter => {
-                        enters += 1;
-                        "-> on_key: KeyCode::Enter => submit()  [FIRES A GOAL]".to_string()
+                        // Mirror of the agent TUI run loop (post-W5): an Enter
+                        // glued to more queued input is a pasted newline.
+                        let burst = event::poll(Duration::ZERO).unwrap_or(false);
+                        if burst {
+                            pasted_newlines += 1;
+                            "-> paste_burst: insert '\\n'  [NO goal fires]".to_string()
+                        } else {
+                            goals_fired += 1;
+                            "-> on_key: Enter => submit()  [FIRES A GOAL]".to_string()
+                        }
                     }
                     KeyCode::Char(c) => {
                         if tui_would_insert(&k) {
                             chars_inserted += 1;
-                            format!("-> on_key: insert_char({c:?})")
+                            if k.modifiers.contains(KeyModifiers::CONTROL)
+                                && k.modifiers.contains(KeyModifiers::ALT)
+                            {
+                                let d = format!("ALTGR-INSERT Char({c:?}) mods={:?}", k.modifiers);
+                                altgr_inserted.push(d.clone());
+                                format!("-> {d}  [W8 fix live]")
+                            } else {
+                                format!("-> on_key: insert_char({c:?})")
+                            }
                         } else {
                             chars_dropped += 1;
                             let d = format!(
-                                "DROPPED Char({c:?}) mods={:?} (guard `if !ctrl` at agent_tui.rs:767)",
+                                "DROPPED Char({c:?}) mods={:?} (CONTROL-only chord)",
                                 k.modifiers
                             );
                             dropped_detail.push(d.clone());
@@ -119,7 +132,13 @@ fn main() {
                     }
                     _ => "-> (not a Char/Enter)".to_string(),
                 };
-                rec!("KEY    {:?} mods={:?} kind={:?}  {}", k.code, k.modifiers, k.kind, verdict);
+                rec!(
+                    "KEY    {:?} mods={:?} kind={:?}  {}",
+                    k.code,
+                    k.modifiers,
+                    k.kind,
+                    verdict
+                );
                 if k.code == KeyCode::Esc {
                     rec!("(ESC pressed - finishing)");
                     break;
@@ -134,11 +153,21 @@ fn main() {
 
     let mut tail = Vec::new();
     tail.push(String::new());
-    tail.push("=== SUMMARY ===".into());
-    tail.push(format!("event_paste_count      = {pastes}   (W5: >0 means bracketed paste works here)"));
-    tail.push(format!("enter_key_count        = {enters}   (W5: goals that would fire from one paste)"));
+    tail.push("=== SUMMARY (post-Phase-3 predicates) ===".into());
+    tail.push(format!("event_paste_count      = {pastes}"));
+    tail.push(format!(
+        "goals_fired            = {goals_fired}   (W5: a multi-line paste must fire at most 1)"
+    ));
+    tail.push(format!(
+        "pasted_newlines        = {pasted_newlines}   (W5: interior Enters absorbed as text)"
+    ));
     tail.push(format!("chars_inserted         = {chars_inserted}"));
-    tail.push(format!("chars_dropped_by_guard = {chars_dropped}   (W8: AltGr characters lost)"));
+    for d in &altgr_inserted {
+        tail.push(format!("  {d}"));
+    }
+    tail.push(format!(
+        "chars_dropped_by_guard = {chars_dropped}   (W8: must be 0 for AltGr; CONTROL-only chords only)"
+    ));
     for d in &dropped_detail {
         tail.push(format!("  {d}"));
     }
