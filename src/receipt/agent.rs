@@ -26,6 +26,15 @@
 //! honest; it changes no support-ledger row. Agent-eval receipts minted before
 //! sealing carry no `receipt_id`; those are reported as unsealed legacy receipts
 //! (their tamper-evidence cannot be established), never as verified.
+//!
+//! *What the seal does and does not prove.* The `receipt_id` is an **unkeyed**
+//! SHA-256, not a signature. It makes accidental corruption and naive hand-edits
+//! of a committed receipt evident — the digest stops matching — and honest-scope
+//! catches a casual field flip the digest alone would miss (e.g. editing
+//! `outcome` without resealing). It is **not** forgery-resistant: anyone who can
+//! run `camelid` can mint a fresh, fully-consistent sealed receipt, so a
+//! determined forger who reseals is not detected here. Git history and review
+//! remain the integrity anchor for what a receipt attests.
 
 use std::path::Path;
 
@@ -522,6 +531,36 @@ mod tests {
         assert_eq!(err.phase, "self-digest");
         assert!(err.reason.contains("unsealed legacy"));
         assert_eq!(verify_value(&legacy), AgentVerifyOutcome::NotVerified);
+    }
+
+    #[test]
+    fn verifies_a_sealed_inconclusive_eval_receipt() {
+        // The noisy-box path: INCONCLUSIVE is not promotion-eligible, and a
+        // consistent receipt (eligible=false) must verify.
+        let mut body = eval_body();
+        body["outcome"] = json!("INCONCLUSIVE");
+        body["promotion_eligible"] = json!(false);
+        let receipt = seal(body);
+        let summary = check(&receipt).expect("verifies");
+        assert_eq!(summary.result, "INCONCLUSIVE");
+        assert_eq!(
+            summary.scope_note,
+            "promotion_eligible=false (consistent with outcome=\"INCONCLUSIVE\")"
+        );
+        assert_eq!(verify_value(&receipt), AgentVerifyOutcome::Verified);
+    }
+
+    #[test]
+    fn a_sealed_eval_with_a_float_loadavg_round_trips() {
+        // POSIX hosts record `host_loadavg_1m` as a float. Confirm the digest is
+        // stable across the f64 serialize/parse round-trip the on-disk path takes.
+        let mut body = eval_body();
+        body["host_loadavg_1m"] = json!(0.42);
+        let receipt = seal(body);
+        assert_eq!(check(&receipt).expect("verifies").result, "PASS");
+        let text = serde_json::to_string_pretty(&receipt).unwrap();
+        let reparsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(verify_value(&reparsed), AgentVerifyOutcome::Verified);
     }
 
     #[test]

@@ -405,9 +405,10 @@ fn finish(
     // body with any `receipt_id` field removed, so inserting it afterwards yields
     // the same digest the verifier recomputes.
     let receipt_id = crate::receipt::receipt_id_over(&receipt);
-    if let Some(obj) = receipt.as_object_mut() {
-        obj.insert("receipt_id".to_string(), Value::from(receipt_id.clone()));
-    }
+    receipt
+        .as_object_mut()
+        .expect("a json! object is always an object")
+        .insert("receipt_id".to_string(), Value::from(receipt_id.clone()));
     std::fs::create_dir_all(&cfg.receipt_dir)?;
     let stem = gguf
         .file_stem()
