@@ -4,40 +4,6 @@ Captured on Windows from feature commit `329c536d9203cd6cd647197b3c86f7fa78ef766
 The `raw/` directory contains direct command stdout/stderr receipts from the feature binary.
 No bearer value is shown or stored in this bundle.
 
-## CLI surface
-
-```powershell
-C:\camelid-workspace-cli-pr\target\debug\camelid.exe workspace --help
-```
-
-See `cli-surface.png`.
-
-## Live authentication boundary
-
-A disposable server was started on loopback port 8295 without a loaded model:
-
-```powershell
-camelid.exe serve --addr 127.0.0.1:8295 --no-open
-```
-
-The automatically authenticated CLI request crossed Workspace authorization and reached the
-model-readiness gate:
-
-```text
-camelid.exe workspace --addr 127.0.0.1:8295 threads C:\camelid-workspace-cli-pr
-Error: model_not_loaded: load a tool-capable model before starting Workspace
-exit=1
-```
-
-The same route without the CLI credential was rejected before model or path processing:
-
-```text
-GET /api/agent/workspace/threads?workspace=...
-HTTP 403
-```
-
-See `auth-boundary.png`. The forced-stop smoke credential was removed after capture.
-
 ## Real-model CLI workflow
 
 The feature binary loaded the exact `Qwen3-4B-Q4_K_M.gguf` model on a fresh loopback server. All 36
@@ -69,13 +35,6 @@ See:
 
 Delete was exercised separately after moving active ownership to a disposable second thread, but it
 is not claimed by the raw receipt bundle because its standalone capture wrapper became unreliable.
-
-## Checksums
-
-```text
-3c5663363c362ca92b7304a5d536bcdb343fef7cbd88bfcad1e664355afebeef  cli-surface.png
-eedf80844a044fea6c53f86b9ff23fccca03459e89e54671abd55018b5f6057d  auth-boundary.png
-```
 
 ## Validation context
 
