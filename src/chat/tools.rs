@@ -1848,6 +1848,24 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
 
+    // Assign the child to a kill-on-close job object (W2) so a timeout tears down
+    // the WHOLE process tree, not just cmd.exe. `child.kill()` on Windows reaps
+    // only the direct child; every descendant cmd spawned (rustc, node, a CUDA
+    // process holding VRAM) otherwise survives as an orphan. Descendants spawned
+    // after assignment are captured too. Best-effort — if creation/assignment
+    // fails, the child.kill() backstop still reaps the direct process. Mirrors
+    // run_windows_command; the Unix path is unaffected (/bin/sh's own process
+    // group is already torn down by kill()).
+    #[cfg(windows)]
+    let _job = {
+        use std::os::windows::io::AsRawHandle;
+        let job = JobObject::new().ok();
+        if let Some(ref j) = job {
+            let _ = j.assign(child.as_raw_handle());
+        }
+        job
+    };
+
     // Drain stdout/stderr on their own threads (W1). Nothing read these until
     // after the child exited, so a command that emitted more than one pipe
     // buffer — 64 KiB per pipe on Windows (std sys/process/windows/child_pipe.rs
@@ -1878,6 +1896,13 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
+                    // Tear down the whole tree (W2), then the direct-child
+                    // backstop. Terminating the job kills every descendant;
+                    // child.kill() covers the case where the job never assigned.
+                    #[cfg(windows)]
+                    if let Some(ref j) = _job {
+                        j.terminate();
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     // Killing the child closes the write ends → the readers hit
@@ -3653,77 +3678,90 @@ mod tests {
         assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
     }
 
-    /// PIDs of every live PING.EXE, via an absolute-path tasklist. Used to spot
-    /// grandchildren that outlived `run_shell`'s timeout.
+    /// PIDs of every live PING.EXE whose command line contains `marker`. Querying
+    /// the command line (not just the image name) lets a W2 test attribute an
+    /// orphan to ITS OWN `run_shell` invocation and never to an unrelated ping
+    /// that happened to be running — so the assertion cannot flake on background
+    /// noise, and cleanup targets exactly what the test created.
     #[cfg(windows)]
-    fn ping_pids() -> std::collections::BTreeSet<u32> {
-        let out = Command::new(system32("tasklist.exe"))
-            .args(["/FI", "IMAGENAME eq PING.EXE", "/FO", "CSV", "/NH"])
+    fn pids_of_marked_ping(marker: &str) -> Vec<u32> {
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | \
+             Where-Object {{ $_.CommandLine -like '*{marker}*' }} | \
+             ForEach-Object {{ $_.ProcessId }}"
+        );
+        let out = Command::new(system32("WindowsPowerShell\\v1.0\\powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .stdin(Stdio::null())
             .output();
-        let mut set = std::collections::BTreeSet::new();
+        let mut pids = Vec::new();
         if let Ok(o) = out {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
-                // "PING.EXE","1234","Console","1","4,000 K"
-                if let Some(pid) = line.split("\",\"").nth(1) {
-                    if let Ok(n) = pid.trim_matches('"').parse::<u32>() {
-                        set.insert(n);
-                    }
+                if let Ok(n) = line.trim().parse::<u32>() {
+                    pids.push(n);
                 }
             }
         }
-        set
+        pids
     }
 
-    /// W2 — `run_shell` has no job object, so a timeout orphans the process tree
-    /// (tools.rs:1856 calls child.kill(), which reaps only cmd.exe).
+    /// Kill a PID and its tree, by PID (never by image name — the box also runs a
+    /// desktop sidecar). Best-effort cleanup for the W2 test.
+    #[cfg(windows)]
+    fn kill_tree(pid: u32) {
+        let _ = Command::new(system32("taskkill.exe"))
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .output();
+    }
+
+    /// W2 regression — a `run_shell` timeout must tear down the WHOLE process
+    /// tree, not just cmd.exe (tools.rs run_shell, job-object teardown).
     ///
-    /// `run_shell` runs `cmd /C <command>`, so PING.EXE here is a GRANDCHILD.
-    /// The probe kills any orphan it created before returning — it never leaves
-    /// stray processes behind, and never blanket-kills by image name.
+    /// `run_shell` runs `cmd /C <command>`, so the `ping` is a GRANDCHILD. Before
+    /// the job object, `child.kill()` reaped only cmd.exe and the ping survived as
+    /// an orphan for its full duration (measured Phase 0: 1 survivor). The ping
+    /// count is a unique marker so the query attributes orphans to this test only.
     #[cfg(windows)]
     #[test]
-    #[ignore = "HARDPAN Phase 0 evidence probe — run with --ignored --nocapture"]
-    fn hardpan_w2_run_shell_orphans_its_grandchildren() {
-        const TIMEOUT_SECS: u64 = 5;
+    fn run_shell_timeout_tears_down_the_process_tree() {
+        let _serial = ps_serial();
+        // -n 271 is a distinctive count (271 s of work >> the 3 s timeout) that no
+        // other test or probe uses, so `-like '*-n 271*'` matches only our ping.
+        let marker = "-n 271";
+        // Belt-and-suspenders: clear any stragglers from a previous aborted run.
+        for pid in pids_of_marked_ping(marker) {
+            kill_tree(pid);
+        }
+
         let dir = tempfile::tempdir().unwrap();
-        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(TIMEOUT_SECS))
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(3))
             .unwrap()
             .with_shell_mode(ShellSandbox::Unrestricted);
-
-        let before = ping_pids();
-        // ~120s of work: guaranteed to outlive the 5s deadline.
         let a = validate(
-            &call("run_shell", json!({"command": "ping -n 120 127.0.0.1"})),
+            &call("run_shell", json!({ "command": "ping -n 271 127.0.0.1" })),
             &sb,
         )
         .unwrap();
 
-        let t0 = std::time::Instant::now();
         let out = a.execute(&sb);
-        let elapsed = t0.elapsed();
+        assert!(
+            out.text().contains("timed out"),
+            "expected a timeout, got {out:?}"
+        );
 
-        // Give the OS a moment to reap anything that DID die with the child.
-        std::thread::sleep(Duration::from_millis(750));
-        let after = ping_pids();
-        let survivors: Vec<u32> = after.difference(&before).copied().collect();
-
-        ev("W2", "shell_timeout_secs", TIMEOUT_SECS);
-        ev("W2", "elapsed_ms", elapsed.as_millis());
-        ev("W2", "outcome", outcome_variant(&out));
-        ev("W2", "ping_pids_before", before.len());
-        ev("W2", "ping_pids_after", after.len());
-        ev("W2", "orphaned_grandchild_pids", format!("{survivors:?}"));
-        ev("W2", "orphan_count", survivors.len());
-
-        // Clean up exactly what we created — by PID, never by image name.
+        // Let the OS finish reaping the killed tree.
+        std::thread::sleep(Duration::from_millis(1000));
+        let survivors = pids_of_marked_ping(marker);
+        // Never leak, even if the assertion below fails.
         for pid in &survivors {
-            let _ = Command::new(system32("taskkill.exe"))
-                .args(["/PID", &pid.to_string(), "/F"])
-                .stdin(Stdio::null())
-                .output();
+            kill_tree(*pid);
         }
-        ev("W2", "cleaned_up_pids", format!("{survivors:?}"));
+        println!("[W2] orphaned_grandchild_pids = {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "run_shell timeout left orphaned grandchildren: {survivors:?}"
+        );
     }
 
     /// W3(a) — PowerShell round-trip encoding (tools.rs:2192 writes raw UTF-8,
