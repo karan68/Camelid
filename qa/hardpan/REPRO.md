@@ -7,11 +7,12 @@
 **Pinned deps as resolved:** crossterm **0.28.1** (via `ratatui` 0.29.0 — `cargo tree -i crossterm`), ratatui **0.29.0**
 **Console:** ANSI code page 1252, OEM code page 437; Windows Terminal 1.24.11911.0 installed; `HKCU:\Console\%%Startup` absent (default delegation)
 
-> **Read this first.** Seven of the nine findings reproduce. **W7 does not reproduce and is proposed
-> for striking.** **W9's premise is contradicted** by both measurement and the ratatui source, and is
-> proposed for downgrade to a documented null. Three more findings (W1, W2, W3) reproduce but are
-> **materially narrower or differently caused** than the conductor states. Every correction is
-> evidenced below. Nothing here was taken on the strength of the conductor document.
+> **Read this first.** Seven of the nine findings reproduce. **W7 did not reproduce and was STRUCK at
+> GATE 0.** **W9's premise is contradicted** by both measurement and the ratatui source, and was
+> **downgraded to a documented null**. **W2's `CREATE_NO_WINDOW` half was dropped**, leaving it
+> job-object-only. Three findings (W1, W2, W3) reproduce but are **materially narrower or differently
+> caused** than the conductor states. Every correction is evidenced below. Nothing here was taken on
+> the strength of the conductor document. GATE 0 rulings are recorded at the foot of this file.
 
 ---
 
@@ -20,15 +21,15 @@
 | ID | Conductor's claim | Verdict | Evidence |
 |----|-------------------|---------|----------|
 | **W1** | `run_shell` never drains pipes → false timeout, output discarded | **CONFIRMED (live)** | 417,792 B → `Err("command timed out after 10s")`, 0 payload bytes, full 10,075 ms burned. Control at 32,640 B → `Ok` in **87 ms**. |
-| **W2** | No job object → orphans; no `CREATE_NO_WINDOW` | **CONFIRMED (live) / half CONTESTED** | 1 orphaned `PING.EXE` grandchild survived the timeout. The `CREATE_NO_WINDOW` half is likely **unreachable** — see A6. |
+| **W2** | No job object → orphans; no `CREATE_NO_WINDOW` | **job half CONFIRMED (live); console half DROPPED** | 1 orphaned `PING.EXE` grandchild survived the timeout. The `CREATE_NO_WINDOW` half is likely **unreachable** — see A6. |
 | **W3(a)** | UTF-8 mangled via ANSI code page | **CONFIRMED (live), wrong mechanism** | Child settles on **OEM 437**, not ANSI 1252. Input leg: 6 codepoints arrive as **16**. Output leg irreversibly lossy. |
 | **W3(b)** | Failing native command returns `Ok` → "build passed" | **CONFIRMED (live), but narrower** | True **only when the failure is not the last statement**. `cmd /c exit 3` alone → `Err`. Real code flattened 3/42 → **1**. |
 | **W4** | Bare `cmd`; hardening only | **REASONED — hardening null** | std searches **System32 before parent PATH**; threat-model delta ≈ 0. See A7. |
 | **W5** | Bracketed paste dead on Windows → partial goals | **CONFIRMED (live)** | 3-line paste → `Event::Paste = 0`, **2 Enter events = 2 goals fired**. Second-order `?`-bail **not** reproduced. |
 | **W6** | No panic/early-return guard wedges the console | **REASONED, not reproduced** (by design) | No panic hook in `src/`. Deliberately not reproduced — see the W6 row. |
-| **W7** | conhost ignores OSC 52 → `/copy` lies | **DOES NOT REPRODUCE → propose STRIKE** | OSC 52 **honoured**, clipboard updated, in 2/2 real-console runs. |
+| ~~**W7**~~ | conhost ignores OSC 52 → `/copy` lies | **STRUCK at GATE 0** — does not reproduce | OSC 52 **honoured**, clipboard updated, in 2/2 real-console runs. |
 | **W8** | AltGr characters silently swallowed | **CONFIRMED (live)** | `@ € [ ]` all arrive as `CONTROL\|ALT` → **4/4 dropped** by the guard. |
-| **W9** | 1 KiB `LineWriter` costs many console writes | **PREMISE CONTRADICTED → propose null** | 8× the writes cost **1.07×** the time. ratatui writes *diffs* and already flushes once per frame. |
+| **W9** | 1 KiB `LineWriter` costs many console writes | **DOWNGRADED at GATE 0 — documented null** | 8× the writes cost **1.07×** the time. ratatui writes *diffs* and already flushes once per frame. |
 
 ---
 
@@ -80,7 +81,7 @@ wrong or overstated. The **defect and its consequence are exactly as described.*
 
 ---
 
-## W2 — no job object, no `CREATE_NO_WINDOW`  ·  **job half CONFIRMED, console half CONTESTED**
+## W2 — no job object  ·  **CONFIRMED (live)** · console half DROPPED at GATE 0
 
 **Anchor:** `src/chat/tools.rs:1856` (`child.kill()` reaps only `cmd.exe`).
 **Verified:** `src/chat/shell_sandbox.rs` contains **no** `creation_flags`, `JobObject`, `win_job`, or
@@ -98,12 +99,12 @@ orphan_count              = 1
 The orphan **survives**; it is not killed by the read ends closing. The probe cleans up by PID only —
 never by image name.
 
-**Contested half → needs your call (A6):** adding `CREATE_NO_WINDOW` may be a pure regression. The
-adversarial pass argues `run_shell` is never registered on any console-less surface (desktop spawns
-`serve`, whose agent loop pins `ShellSandbox::Disabled` + `WorkspaceReadOnly`; the subagent worker
-hardcodes `yolo: false` + an approver that always denies Exec). If so the flag would only mint a
-hidden console per invocation on the surfaces where `run_shell` *does* run. **Not independently
-re-verified by me** — flagged, not accepted.
+**Console half — DROPPED at GATE 0 (A6).** The adversarial pass argued `run_shell` is never
+registered on any console-less surface (desktop spawns `serve`, whose agent loop pins
+`ShellSandbox::Disabled` + `WorkspaceReadOnly`; the subagent worker hardcodes `yolo: false` plus an
+approver that always denies Exec), so `CREATE_NO_WINDOW` would only mint a hidden console per
+invocation on the surfaces where `run_shell` *does* run — pure regression risk for no observed
+benefit. **Tim dropped it.** W2's fix is the job object alone; Phase 1 sets no creation flags.
 
 ---
 
@@ -233,7 +234,7 @@ exactly the role the conductor assigns it — but it should not be sold as fixin
 
 ---
 
-## W7 — `/copy` reports success on a clipboard it never wrote  ·  **DOES NOT REPRODUCE — propose STRIKE**
+## ~~W7 — `/copy` reports success on a clipboard it never wrote~~  ·  **STRUCK AT GATE 0**
 
 The finding's user-visible consequence rests on one premise: *"conhost ignores OSC 52 outright."*
 **That premise is false on this host.** Two independent runs in real console windows, emitting
@@ -252,7 +253,7 @@ OSC 52 writes by default since v1.2 (2020) and conhost itself gained it in 2025 
 succeeded, so it cannot in principle know whether the terminal acted. That is worth fixing if the
 Win32 clipboard path lands anyway for W5's Ctrl+V paste — but on this host `/copy` **tells the
 truth**, and per the conductor's own rule ("anything that does not reproduce is struck from scope"),
-**W7's headline consequence should be struck.**
+**W7 was struck at GATE 0.** `clipboard.rs` and its OSC 52 write path are out of scope for this campaign — no fix, no HOLD.
 
 Note this also removes the stated justification for adding `Win32_System_DataExchange` +
 `Win32_System_Memory` to `Cargo.toml`. Those features are still needed **if** you want the Ctrl+V
@@ -286,7 +287,7 @@ the goal box. The counter-hypothesis that Windows Terminal/ConPTY would strip th
 
 ---
 
-## W9 — 1 KiB `LineWriter` on the renderer  ·  **PREMISE CONTRADICTED — propose documented null**
+## W9 — 1 KiB `LineWriter` on the renderer  ·  **DOWNGRADED AT GATE 0 to a documented null**
 
 Source-verified: `LineWriter::new` does use a 1024-byte buffer (std 1.95.0,
 `io/buffered/linewriter.rs:90`) and `Stdout` is a `LineWriter`.
@@ -328,10 +329,22 @@ SIROCCO/STAMPEDE precedent. **Do not report W9 as a win.**
 
 ---
 
-## What GATE 0 is asking you to sign
+## GATE 0 — SIGNED (Tim, 2026-07-23)
 
-1. **Seven findings reproduce**: W1, W2 (job half), W3(a), W3(b), W5, W8 — plus W4/W6 accepted as reasoned-only per the conductor's own carve-out.
-2. **Strike W7.** Its premise is false on this host; `/copy` currently tells the truth.
-3. **Downgrade W9** to a measured null before Phase 3 spends effort on it.
-4. **Decide A6** — does the `CREATE_NO_WINDOW` half of W2 stay in scope?
-5. **Accept the narrowed scope of W3(b)** — the bug is "a success after a failure erases it", not "failures always report success".
+| # | Question | Ruling |
+|---|----------|--------|
+| 1 | Seven findings reproduce: W1, W2 (job half), W3(a), W3(b), W5, W8; W4/W6 reasoned-only | **Accepted** |
+| 2 | Strike W7 — premise false on this host, `/copy` tells the truth | **STRUCK** — out of scope, no fix, no HOLD |
+| 3 | Downgrade W9 to a measured null | **DOWNGRADED** — Phase 4 records the null, does not chase it |
+| 4 | A6 — does W2's `CREATE_NO_WINDOW` half stay in scope? | **DROPPED** — W2 is now **job-object-only** |
+| 5 | Accept W3(b)'s narrowed scope | **Accepted** — the bug is "a later success erases the failure" |
+
+**Resulting scope.** Phase 1 = W1 (drain) → W2 (job object only) → W4 (system32, hardening only,
+no security claim). Phase 2 = W3(a)+(b). Phase 3 = W5, W6, W8 (**W7 struck**, so the Win32
+clipboard module is justified only by W5's Ctrl+V *read* path — and with W7 gone, `clipboard.rs`
+and its OSC 52 write path are **not** to be touched). Phase 4 = W9 null receipt.
+
+Two consequences worth stating plainly, because they remove work the conductor had planned:
+* `Win32_System_DataExchange` / `Win32_System_Memory` are added **only if** Phase 3 implements
+  Ctrl+V paste. There is no longer a `/copy` reason to add them.
+* Nothing in Phase 1 sets creation flags. The Unix path stays untouched throughout.
