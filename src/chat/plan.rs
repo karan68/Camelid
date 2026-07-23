@@ -75,6 +75,27 @@ pub fn clear() {
     }
 }
 
+/// Mark every step done, returning how many changed.
+///
+/// Called by the front ends when the agent gives a final answer: a run that
+/// just said "done" should not leave its own to-do showing `[~]` in progress
+/// because a small model forgot the closing `update_plan` call. This writes the
+/// plan; nothing ever *reads* a step to make a decision, so the G3 inertness
+/// invariant (plan text can't change a tier, the sandbox, or any tool choice)
+/// is untouched. Idempotent — 0 when there is no plan or it is already done.
+pub fn complete_all() -> usize {
+    let mut changed = 0;
+    if let Ok(mut g) = state().lock() {
+        for s in g.iter_mut() {
+            if s.status != Status::Done {
+                s.status = Status::Done;
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
 /// One line per step, for the line renderer and for the tool's own reply.
 pub fn render(steps: &[Step]) -> String {
     if steps.is_empty() {
@@ -215,5 +236,32 @@ mod tests {
         assert_eq!(stored.len(), MAX_STEPS);
         assert!(stored[0].text.chars().count() <= MAX_STEP_CHARS + 1);
         clear();
+    }
+
+    /// A final answer closes out the plan the model left open: pending and
+    /// in-progress steps both become done, an already-done step is untouched,
+    /// and the count returned is exactly what changed. Idempotent on a second
+    /// call.
+    #[test]
+    fn complete_all_marks_every_open_step_done() {
+        let _guard = plan_lock();
+        set(vec![
+            step(Status::Pending, "a"),
+            step(Status::InProgress, "b"),
+            step(Status::Done, "c"),
+        ]);
+        assert_eq!(complete_all(), 2, "only the two open steps change");
+        let steps = get();
+        assert!(steps.iter().all(|s| s.status == Status::Done));
+        assert_eq!(progress(&steps), "3/3 done");
+        assert_eq!(complete_all(), 0, "idempotent once everything is done");
+        clear();
+    }
+
+    #[test]
+    fn complete_all_is_a_noop_with_no_plan() {
+        let _guard = plan_lock();
+        clear();
+        assert_eq!(complete_all(), 0);
     }
 }

@@ -2632,6 +2632,11 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                     last_answer = a.clone();
                 }
                 saved_transcript = history.clone();
+                // A final answer means the goal was met; close out any plan
+                // steps the model left showing in-progress (§ plan::complete_all).
+                if end == LoopEnd::Answered && super::plan::complete_all() > 0 {
+                    reporter.notice("plan complete");
+                }
                 reporter.notice(match end {
                     LoopEnd::Answered => "done",
                     LoopEnd::Aborted => "stopped",

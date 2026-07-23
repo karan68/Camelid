@@ -416,6 +416,12 @@ impl<'a> App<'a> {
                 self.rx = None;
                 self.approval = None;
                 self.live.clear();
+                // A final answer means the goal was met; close out any plan
+                // steps the model left in-progress so the sidebar stops
+                // showing "N/N done" short of the total on a successful run.
+                if matches!(end, LoopEnd::Answered) {
+                    super::plan::complete_all();
+                }
                 self.push(Entry::Notice(end_label(end).to_string()));
                 self.status = "describe a goal · /tools /steps /subagents · F1 help".into();
             }

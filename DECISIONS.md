@@ -1099,3 +1099,15 @@ belong in a promotion window; (2) the `api_features` ledger row for the feature 
 deferred with the FULLY milestone. The syscap harness's direct executor is now
 allowlisted to its two battery tools, closing the one execute path outside the
 approval loop.
+
+**D18 addendum 2 (2026-07-22, plan auto-completion on a final answer):** the interactive
+front ends (`agent::run_agent` line renderer, `agent_tui`) now call `plan::complete_all()` when
+`run_loop` returns `LoopEnd::Answered`, so a successful run does not leave the plan panel showing
+e.g. "0/1 done" because a small model set a step `[~]` in-progress, did the work, and answered
+without the closing `update_plan` call. This lives in the front ends, NOT in `run_loop`, so the
+promotion/gate harnesses (`agent-eval`, `agent-orchestration-eval`, the subagent worker) stay
+byte-identical and untouched by plan state. It does not weaken the G3 inertness invariant: the
+loop still never *reads* a plan step to decide anything, and the plan still cannot change a tier,
+the sandbox, or a tool choice — this only *writes* the model's own to-do to done at the natural
+completion point. It fires only on `Answered`; a step-capped, aborted, repeated, or errored run
+leaves the plan as the model left it, which is the honest signal that the run did not finish.
