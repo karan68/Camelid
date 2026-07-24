@@ -18007,6 +18007,31 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
+            // First non-Q8_0 curated row. `qwen3_4b_q4_k_m` is a
+            // `supported_exact_row_smoke` contract row (tool_capable), but it was
+            // absent from this catalog, so `camelid pull qwen3_4b_q4_k_m`, the TUI
+            // picker, and the Web UI browse all saw it as supported yet could not
+            // fetch it (upstream #469). The certified GGUF (sha256 7485fe6f...) is
+            // the official Qwen upload, so it downloads from the same repo as the
+            // Q8_0 row above. catalog_id MUST equal the ledger row id
+            // `qwen3_4b_q4_k_m`: the picker joins the two by exact id, and the
+            // server's supported-row check anchors on the exact filename.
+            catalog_id: "qwen3_4b_q4_k_m",
+            name: "Qwen3 4B Q4_K_M",
+            repo_id: "Qwen/Qwen3-4B-GGUF",
+            filename: "Qwen3-4B-Q4_K_M.gguf",
+            // HuggingFace resolve Content-Length (verified 2026-07-23); matches the
+            // certified parity bundle's recorded size. Must stay exact or pull's
+            // skip-if-complete/resume check misfires.
+            size_bytes: 2497280256,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
+            architecture: "qwen3",
+            license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
             catalog_id: "qwen3_8b_instruct_q8_0",
             name: "Qwen3 8B Q8_0",
             repo_id: "Qwen/Qwen3-8B-GGUF",
@@ -18980,7 +19005,9 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
     ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
     ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
     ("ornith-1.0-9b-Q3_K_M.gguf", "ornith_1_0_9b_q3_k_m"),
-    ("Qwen3-4B-Q4_K_M.gguf", "qwen3_4b_q4_k_m"),
+    // NB: Qwen3-4B-Q4_K_M.gguf is intentionally NOT here -- it is an official
+    // Qwen/Qwen3-4B-GGUF upload, so it lives in curated_catalog() and is covered
+    // by the curated-catalog branch of filename_is_supported_exact_row.
 ];
 
 /// True when `filename` is the exact GGUF artifact of a curated row whose

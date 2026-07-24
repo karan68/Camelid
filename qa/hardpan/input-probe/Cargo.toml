@@ -1,0 +1,20 @@
+# HARDPAN Phase 0 evidence instrument — NOT part of the camelid build.
+#
+# A standalone probe that reports exactly what crossterm delivers on this Windows
+# host for a multi-line paste (W5) and for AltGr-produced characters (W8). It is
+# detached from the parent workspace (empty [workspace] table below) so `cargo
+# build` / clippy / CI at the repo root never see it.
+#
+# crossterm is pinned to the SAME version camelid resolves through ratatui 0.29.0
+# (`cargo tree -i crossterm` -> crossterm v0.28.1), so the parse path exercised
+# here is byte-for-byte the one agent_tui.rs runs.
+[package]
+name = "hardpan-input-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+crossterm = "=0.28.1"
