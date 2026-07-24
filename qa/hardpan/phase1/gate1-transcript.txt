@@ -1,0 +1,37 @@
+$ cargo build --color never 2>&1   (cwd = fresh cold crate)
+outcome  = ToolOutcome::Ok
+elapsed  = 461 ms  (timeout budget 180000 ms)
+text_len = 16416 bytes (clipped to 16384 for the model)
+--- head ---
+exit: 0
+stdout:
+   Compiling hardpan_gate1 v0.0.0 (%TEMP%\.tmp0tf4Wg)
+warning: unused variable: `gate1_unused_0`
+ --> main.rs:2:9
+  |
+2 |     let gate1_unused_0 = 0u64;
+  |         ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gate1_unused_0`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `gate1_unused_1`
+ --> main.rs:3:9
+  |
+3 |     let gate1_unused_1 = 1u64;
+  |         ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gate1_unused_1`
+
+warning: 
+--- tail ---
+ed variable: `gate1_unused_74`
+  --> main.rs:76:9
+   |
+76 |     let gate1_unused_74 = 74u64;
+   |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_gate1_unused_74`
+
+warning: unused variable: `gate1_unused_75`
+  --> main.rs:77:9
+   |
+77 |     let gate1_unused_75 = 75u64;
+   |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an u
+…[truncated]
+

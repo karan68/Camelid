@@ -36,10 +36,13 @@ mod server;
 mod session;
 mod shell_sandbox;
 mod subagent;
+mod term_guard;
 mod theme;
 mod tool_parse;
 mod tools;
 mod tui;
+#[cfg(windows)]
+mod win_clipboard;
 #[cfg(windows)]
 mod win_console;
 #[cfg(windows)]

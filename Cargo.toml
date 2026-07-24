@@ -76,6 +76,12 @@ windows-sys = { version = "0.59", features = [
     # src/chat/win_input.rs.
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # HARDPAN W5: read the clipboard for the agent TUI's Ctrl+V paste path
+    # (crossterm 0.28 never produces Event::Paste on Windows). Read side only —
+    # the OSC 52 write path in src/chat/clipboard.rs is deliberately untouched
+    # (GATE 0 struck W7: OSC 52 writes are honoured on supported hosts).
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 # Windows: CUDA is part of the DEFAULT build (the primary dev host is a CUDA box).
 # cudarc is non-optional here and `build.rs` turns on the `cuda` cfg, so a bare
