@@ -19,6 +19,7 @@
 //! a receipt can be cited by fingerprint and trivially checked for tampering.
 
 pub mod agent;
+pub mod audit;
 pub mod distributed;
 pub mod verify;
 

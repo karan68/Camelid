@@ -1233,6 +1233,15 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Audit the self-digest of every sealed receipt under a directory tree
+    /// (parity / distributed / agent families). A corrupted or hand-edited
+    /// committed receipt fails; unsealed and non-receipt JSON is skipped. This is
+    /// the mechanical companion to review for the receipt evidence base.
+    VerifyReceipts {
+        /// Directory walked recursively for `*.json` receipts.
+        #[arg(default_value = "qa")]
+        dir: PathBuf,
+    },
     /// Recompute and stamp `receipt_id` on a receipt body. Emitters (e.g. the
     /// chat-parity harness) delegate sealing here so canonical serialization
     /// and digesting live in exactly one implementation.
@@ -2571,6 +2580,9 @@ async fn main() -> anyhow::Result<()> {
             })
             .await;
             std::process::exit(outcome.exit_code());
+        }
+        Command::VerifyReceipts { dir } => {
+            std::process::exit(camelid::receipt::audit::run(&dir));
         }
         Command::SealReceipt { input, output } => {
             let raw = std::fs::read_to_string(&input)?;
