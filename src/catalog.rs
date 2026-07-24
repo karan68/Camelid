@@ -233,4 +233,19 @@ mod tests {
         let entries = curated_catalog();
         assert!(resolve(&entries, "gpt-9-turbo").is_err());
     }
+
+    #[test]
+    fn qwen3_4b_q4_k_m_is_pullable_by_its_ledger_id() {
+        // Regression for upstream #469: the supported `qwen3_4b_q4_k_m` exact row
+        // appeared in the ledger, the TUI picker, and the Web UI browse but was
+        // missing from the pull catalog, so `camelid pull qwen3_4b_q4_k_m` failed
+        // with "no supported model matches". Its catalog id must equal the ledger
+        // row id (the picker joins on it) and point at the official Qwen upload.
+        let entries = curated_catalog();
+        let item = resolve(&entries, "qwen3_4b_q4_k_m").expect("row must resolve");
+        assert_eq!(item.catalog_id, "qwen3_4b_q4_k_m");
+        assert_eq!(item.repo_id, "Qwen/Qwen3-4B-GGUF");
+        assert_eq!(item.filename, "Qwen3-4B-Q4_K_M.gguf");
+        assert_eq!(item.quant, "Q4_K_M");
+    }
 }
