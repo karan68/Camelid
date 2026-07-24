@@ -49,6 +49,7 @@ These documents are working notes, not support ledgers. When a note and a public
 `COMPATIBILITY.md` and `STATUS.md` win.
 
 - [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md)
+- [`WORKSPACE_CLI.md`](docs/architecture/WORKSPACE_CLI.md) — durable read-only Workspace commands and the same-user loopback authentication contract
 - [`SPECULATIVE_DECODE.md`](docs/architecture/SPECULATIVE_DECODE.md) — default-off lossless greedy speculation: proven byte-exact, faster than the default stack on repetitive output (measured envelope inside), CPU-vanilla floor elsewhere
 - [`FORGELOCAL_INTEGRATION.md`](docs/architecture/FORGELOCAL_INTEGRATION.md)
 - [`INFERENCE_RECON.md`](docs/recon/INFERENCE_RECON.md)

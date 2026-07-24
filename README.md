@@ -128,6 +128,35 @@ network, GUI control, and subagents are unavailable. File inventories are ground
 directory entries, and reversible compaction keeps long threads within an exact context budget.
 Workspace requires a loaded exact model row that has earned `tool_capable: true`.
 
+The same read-only Workspace is available from a terminal while `camelid serve` is running:
+
+```bash
+camelid workspace ask . "Which files configure authentication?"
+camelid workspace threads .
+camelid workspace show workspace-123 --workspace .
+camelid workspace ask . "What changed our conclusion?" --thread workspace-123
+camelid workspace compact workspace-123 --workspace .
+camelid workspace compact workspace-123 --workspace . --undo
+camelid workspace delete workspace-123 --workspace .
+```
+
+Use `camelid workspace --json ...` for compact JSON; `ask` emits one JSON event per line. The CLI
+is a client of the existing Workspace API, not a second agent: it uses the same three-tool profile,
+canonical root confinement, SQLite/FTS5 threads, grounding checks, cancellation behavior, and exact
+context budget as the web UI.
+
+Browser authorization remains same-origin. At each loopback server start Camelid also rotates a
+256-bit Workspace CLI bearer credential and stores it in the current user's runtime directory
+(`%LOCALAPPDATA%\camelid\runtime` on Windows, `$XDG_RUNTIME_DIR/camelid/runtime` or
+`~/.cache/camelid/runtime` on Unix). Unix files are created mode `0600`; Windows files inherit the
+current user's LocalAppData ACL. `CAMELID_WORKSPACE_TOKEN_FILE` can override the location. The token
+is never accepted on a non-loopback listener or with a non-loopback `Host`, and a clean shutdown
+removes it when destructors run. After a crash or forced termination a stale file may remain, but
+no server is present to honor it; the next server replaces it only after binding the same loopback
+address and completing startup model loading. This capability protects against browser cross-site
+requests; like the model files themselves, it does not defend against another process already
+running as the same OS user.
+
 With `--allow-net` the agent also gets `web_search` (ranked title/url/snippet results) alongside
 `http_fetch`. Results are untrusted data — reading one is a separate, separately-approved
 `http_fetch`. Point it at a different engine with `CAMELID_SEARCH_URL` (a template containing
