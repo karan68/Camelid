@@ -103,18 +103,50 @@ pub fn resolve_engine_path(resource_dir: Option<PathBuf>) -> Result<PathBuf, Eng
         if let Some(dir) = exe.parent() {
             let beside = dir.join(&file);
             if beside.is_file() {
-                return Ok(beside);
+                return Ok(simplify_extended_path(beside));
             }
         }
     }
     if let Some(res) = resource_dir {
         let bundled = res.join("sidecar").join(&file);
         if bundled.is_file() {
-            return Ok(bundled);
+            return Ok(simplify_extended_path(bundled));
         }
     }
     // Fall back to PATH resolution by bare name; spawn will surface a clear error if absent.
     Ok(PathBuf::from(file))
+}
+
+/// Strip the Windows `\\?\` extended-length ("verbatim") prefix from a path.
+///
+/// Tauri's `resource_dir()` can return a verbatim path (`\\?\C:\...`). Win32 does
+/// NOT separator-normalize verbatim paths, so once such a path becomes the
+/// sidecar's `--models-dir` and the web UI joins it with a forward slash
+/// (`<models_dir>/<file>.gguf`) the result is an invalid name and the engine's
+/// open fails with os error 123. Handing the sidecar a normal path avoids that.
+/// The engine binary itself is derived from the same resolved path, so stripping
+/// here keeps every downstream path (models dir, catalog downloads) normalized.
+///
+/// No-op off Windows, and for anything that is not a plain drive (`C:\...`) or UNC
+/// verbatim path (`\\?\UNC\server\share`).
+#[cfg(windows)]
+fn simplify_extended_path(p: PathBuf) -> PathBuf {
+    let Some(s) = p.to_str() else { return p };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+
+#[cfg(not(windows))]
+fn simplify_extended_path(p: PathBuf) -> PathBuf {
+    p
 }
 
 /// Reserve an OS-assigned ephemeral port on loopback. We bind, read the assigned port, then
@@ -363,5 +395,36 @@ mod tests {
         // The PATH-resolution fallback: no directory to anchor to, so the engine's own
         // exe-relative default must stay in charge.
         assert_eq!(sidecar_models_dir(Path::new("camelid.exe")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefix_is_stripped_so_the_models_dir_stays_a_normal_path() {
+        use super::simplify_extended_path;
+        // A `\\?\` drive path (what Tauri's resource_dir can hand back) is normalized...
+        let engine = simplify_extended_path(PathBuf::from(
+            r"\\?\C:\Apps\Camelid Desktop\sidecar\camelid.exe",
+        ));
+        assert_eq!(
+            engine,
+            PathBuf::from(r"C:\Apps\Camelid Desktop\sidecar\camelid.exe")
+        );
+        // ...so the derived models dir carries no verbatim prefix. A later
+        // `<models_dir>/<file>` join by the web UI is then a normal (separator-
+        // normalized) path, not the os-error-123 verbatim+slash mix.
+        let models = sidecar_models_dir(&engine).expect("absolute engine path yields a models dir");
+        assert!(!models.to_string_lossy().contains(r"\\?\"));
+        assert_eq!(
+            models,
+            PathBuf::from(r"C:\Apps\Camelid Desktop\sidecar\models")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_verbatim_paths_pass_through_unchanged() {
+        use super::simplify_extended_path;
+        let plain = PathBuf::from(r"C:\Apps\Camelid\camelid.exe");
+        assert_eq!(simplify_extended_path(plain.clone()), plain);
     }
 }

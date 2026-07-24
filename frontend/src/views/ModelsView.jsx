@@ -109,7 +109,12 @@ export default function ModelsView({
     setUsingFilename(filename)
     setLaneError('')
     setBlocker(null)
-    const path = `${spine.local?.models_dir || 'models'}/${filename}`
+    // Send a models-relative path, NOT the engine's absolute models_dir joined
+    // with '/'. On Windows the reported models_dir can be a `\\?\` verbatim path,
+    // and Win32 does not normalize a '/' inside a verbatim path, so the old
+    // concatenation produced an invalid name (os error 123). The backend resolves
+    // this relative path against its configured models directory.
+    const path = `models/${filename}`
     let activeStage = 'checking'
     try {
       onStage?.('checking')
