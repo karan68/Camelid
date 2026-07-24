@@ -170,6 +170,68 @@ pub enum LoopEnd {
     DriverError,
 }
 
+/// The terminal tier a finished run collapses to, and the single place a
+/// [`LoopEnd`] is classified. The headless exec and subagent workers carry this
+/// typed outcome through to their exit code, so they agree by construction.
+///
+/// Two lanes used to classify independently and drifted: the headless
+/// `agent exec` contract (`D-DROVER-2`) maps a step-capped or repeating run to
+/// exit 3 (*inconclusive* -- more budget or a different model might still
+/// answer), while the subagent worker, whose mapping predated that contract,
+/// reported the same outcomes as `failed` (exit 1). Both now classify here,
+/// resolving the divergence in favour of the tri-state contract.
+///
+/// The exit space is `0` completed / `1` failed / `3` inconclusive. `2` is
+/// reserved elsewhere for the `tool_capable` refusal and is intentionally not
+/// produced here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunOutcome {
+    /// The run produced a final answer.
+    Completed,
+    /// The run stopped without answering for a reason that is not itself a
+    /// defect of the run: the operator aborted it, it hit the step budget, or
+    /// it was broken out of a repeating call. Re-running (more budget, a
+    /// different model) might still answer, so callers must not read this as a
+    /// definitive negative.
+    Inconclusive,
+    /// The run could not proceed: the model driver errored.
+    Failed,
+}
+
+impl RunOutcome {
+    /// Classify a finished loop. Exhaustive on purpose: a new [`LoopEnd`]
+    /// variant must be given a tier here rather than silently defaulting.
+    pub(super) fn classify(end: &LoopEnd) -> Self {
+        match end {
+            LoopEnd::Answered => RunOutcome::Completed,
+            LoopEnd::Aborted | LoopEnd::StepCapped | LoopEnd::Repeated => RunOutcome::Inconclusive,
+            LoopEnd::DriverError => RunOutcome::Failed,
+        }
+    }
+
+    /// The serialized status and process exit code are one contract. Keeping
+    /// both projections in this match prevents them from drifting internally.
+    fn terminal_contract(self) -> (&'static str, i32) {
+        match self {
+            RunOutcome::Completed => ("completed", 0),
+            RunOutcome::Failed => ("failed", 1),
+            RunOutcome::Inconclusive => ("inconclusive", 3),
+        }
+    }
+
+    /// The process exit code scripts branch on.
+    pub(super) fn exit_code(self) -> i32 {
+        self.terminal_contract().1
+    }
+
+    /// The token a subagent worker writes to its result file (`completed` /
+    /// `failed` / `inconclusive`), which the parent reads back as untrusted
+    /// status text.
+    pub(super) fn subagent_status(self) -> &'static str {
+        self.terminal_contract().0
+    }
+}
+
 /// The session approval policy: per-tool tiers + the `a` ("always allow") grants
 /// that persist across goals within one session. This is the tier-aware
 /// [`tools::ApprovalPolicy`]; the alias keeps the agent-facing name stable.
@@ -2231,28 +2293,18 @@ pub fn run_exec(
         Some(AgentMsg::Assistant(a)) => a.clone(),
         _ => String::new(),
     };
-    match end {
-        LoopEnd::Answered => {
-            println!("{answer}");
-            Ok(0)
-        }
-        LoopEnd::DriverError => {
-            eprintln!("stopped on a model error");
-            Ok(1)
-        }
-        LoopEnd::StepCapped => {
-            eprintln!("stopped at the {}-step limit", cfg.max_steps);
-            Ok(3)
-        }
-        LoopEnd::Repeated => {
-            eprintln!("stopped — the model was repeating a failing call");
-            Ok(3)
-        }
-        LoopEnd::Aborted => {
-            eprintln!("aborted");
-            Ok(3)
-        }
+    // stdout is reserved for the answer so a headless run can be piped; every
+    // other outcome narrates on stderr. The exit code itself is not decided
+    // here -- it comes from the shared `RunOutcome` classifier the subagent
+    // worker also uses, so the two lanes cannot drift apart again.
+    match &end {
+        LoopEnd::Answered => println!("{answer}"),
+        LoopEnd::DriverError => eprintln!("stopped on a model error"),
+        LoopEnd::StepCapped => eprintln!("stopped at the {}-step limit", cfg.max_steps),
+        LoopEnd::Repeated => eprintln!("stopped — the model was repeating a failing call"),
+        LoopEnd::Aborted => eprintln!("aborted"),
     }
+    Ok(RunOutcome::classify(&end).exit_code())
 }
 
 /// Clear the plan without importing the module at every call site.
@@ -4486,21 +4538,30 @@ mod tests {
     }
 
     /// The tri-state contract: 0 answered, 1 failed, 3 inconclusive. Pinned
-    /// against LoopEnd so a new variant cannot silently pick up a wrong code.
+    /// against LoopEnd through the single `RunOutcome` classifier both the
+    /// headless `agent exec` front end and the subagent worker share, so a new
+    /// variant cannot silently pick up a wrong code and the two lanes cannot
+    /// drift apart.
     #[test]
     fn exec_exit_codes_are_tri_state() {
-        fn code_for(end: &LoopEnd) -> i32 {
-            match end {
-                LoopEnd::Answered => 0,
-                LoopEnd::DriverError => 1,
-                LoopEnd::StepCapped | LoopEnd::Repeated | LoopEnd::Aborted => 3,
-            }
+        let code = |end: &LoopEnd| RunOutcome::classify(end).exit_code();
+        assert_eq!(code(&LoopEnd::Answered), 0);
+        assert_eq!(code(&LoopEnd::DriverError), 1);
+        assert_eq!(code(&LoopEnd::StepCapped), 3);
+        assert_eq!(code(&LoopEnd::Repeated), 3);
+        assert_eq!(code(&LoopEnd::Aborted), 3);
+    }
+
+    #[test]
+    fn run_outcome_status_and_exit_contract_is_pinned() {
+        for (outcome, status, code) in [
+            (RunOutcome::Completed, "completed", 0),
+            (RunOutcome::Failed, "failed", 1),
+            (RunOutcome::Inconclusive, "inconclusive", 3),
+        ] {
+            assert_eq!(outcome.subagent_status(), status);
+            assert_eq!(outcome.exit_code(), code);
         }
-        assert_eq!(code_for(&LoopEnd::Answered), 0);
-        assert_eq!(code_for(&LoopEnd::DriverError), 1);
-        assert_eq!(code_for(&LoopEnd::StepCapped), 3);
-        assert_eq!(code_for(&LoopEnd::Repeated), 3);
-        assert_eq!(code_for(&LoopEnd::Aborted), 3);
     }
 
     /// `--yolo` is the one flag that hands an unattended process exec-tier
