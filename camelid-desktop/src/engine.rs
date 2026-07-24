@@ -403,11 +403,11 @@ mod tests {
         use super::simplify_extended_path;
         // A `\\?\` drive path (what Tauri's resource_dir can hand back) is normalized...
         let engine = simplify_extended_path(PathBuf::from(
-            r"\\?\C:\Users\t\AppData\Local\Camelid Desktop\sidecar\camelid.exe",
+            r"\\?\C:\Apps\Camelid Desktop\sidecar\camelid.exe",
         ));
         assert_eq!(
             engine,
-            PathBuf::from(r"C:\Users\t\AppData\Local\Camelid Desktop\sidecar\camelid.exe")
+            PathBuf::from(r"C:\Apps\Camelid Desktop\sidecar\camelid.exe")
         );
         // ...so the derived models dir carries no verbatim prefix. A later
         // `<models_dir>/<file>` join by the web UI is then a normal (separator-
@@ -416,7 +416,7 @@ mod tests {
         assert!(!models.to_string_lossy().contains(r"\\?\"));
         assert_eq!(
             models,
-            PathBuf::from(r"C:\Users\t\AppData\Local\Camelid Desktop\sidecar\models")
+            PathBuf::from(r"C:\Apps\Camelid Desktop\sidecar\models")
         );
     }
 
