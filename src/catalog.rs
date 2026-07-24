@@ -185,21 +185,82 @@ fn print_catalog(entries: &[CatalogItem]) {
     // Annotate each row with a capacity verdict for THIS host (fit axis only — not
     // a support claim). Probed once, reused across rows.
     let hw = crate::capability::HardwareProfile::cached();
-    eprintln!(
-        "  {:<28} {:<8} {:>8}  {:<15} NAME",
-        "ID", "QUANT", "SIZE", "FIT (this host)"
-    );
-    for item in entries {
-        let verdict = crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes));
-        eprintln!(
-            "  {:<28} {:<8} {:>6.1} GB  {:<15} {}",
-            item.catalog_id,
-            item.quant,
-            item.size_bytes as f64 / 1e9,
-            verdict.cli_label(),
-            item.name,
-        );
+    for line in catalog_table_lines(entries, hw) {
+        eprintln!("{line}");
     }
+}
+
+/// Render the catalog as aligned table lines (header first).
+///
+/// Every column is sized to the wider of its header and its widest cell, so no
+/// value can overflow a hardcoded width and shove a row's later columns out of
+/// line -- the original code hardcoded a 28-wide id column, which the 29-char
+/// `mistral_7b_instruct_v0_3_q8_0` id overflowed, and a SIZE header a column
+/// narrower than its `X.X GB` cells. Kept separate from `print_catalog` so the
+/// alignment can be unit-tested.
+///
+/// Widths are byte lengths, so alignment assumes ASCII cells. That holds here:
+/// only curated `CatalogItem`s (all `&'static str`, ASCII) reach this function;
+/// arbitrary/UTF-8 Hugging Face rows are the separate owned view type and are
+/// never printed here. A future caller passing non-ASCII names would need a
+/// display-width measure instead of `len()`.
+fn catalog_table_lines(
+    entries: &[CatalogItem],
+    hw: &crate::capability::HardwareProfile,
+) -> Vec<String> {
+    const ID_H: &str = "ID";
+    const QUANT_H: &str = "QUANT";
+    const SIZE_H: &str = "SIZE";
+    const FIT_H: &str = "FIT (this host)";
+    const NAME_H: &str = "NAME";
+
+    // Materialize each row's rendered cells up front so the column widths can be
+    // measured from the real strings (not guessed).
+    struct Cells {
+        id: String,
+        quant: String,
+        size: String,
+        fit: String,
+        name: String,
+    }
+    let rows: Vec<Cells> = entries
+        .iter()
+        .map(|item| {
+            let verdict = crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes));
+            Cells {
+                id: item.catalog_id.to_string(),
+                quant: item.quant.to_string(),
+                size: format!("{:.1} GB", item.size_bytes as f64 / 1e9),
+                fit: verdict.cli_label().to_string(),
+                name: item.name.to_string(),
+            }
+        })
+        .collect();
+
+    let width = |header: &str, cell: fn(&Cells) -> &str| {
+        rows.iter()
+            .map(|r| cell(r).len())
+            .max()
+            .unwrap_or(0)
+            .max(header.len())
+    };
+    let id_w = width(ID_H, |r| r.id.as_str());
+    let quant_w = width(QUANT_H, |r| r.quant.as_str());
+    let size_w = width(SIZE_H, |r| r.size.as_str());
+    let fit_w = width(FIT_H, |r| r.fit.as_str());
+
+    // SIZE is right-aligned (numbers), the rest left-aligned. Two spaces set the
+    // FIT column off from SIZE; single spaces separate the others.
+    let row_line = |id: &str, quant: &str, size: &str, fit: &str, name: &str| {
+        format!("  {id:<id_w$} {quant:<quant_w$} {size:>size_w$}  {fit:<fit_w$} {name}")
+    };
+
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(row_line(ID_H, QUANT_H, SIZE_H, FIT_H, NAME_H));
+    for r in &rows {
+        lines.push(row_line(&r.id, &r.quant, &r.size, &r.fit, &r.name));
+    }
+    lines
 }
 
 fn normalize(value: &str) -> String {
@@ -232,6 +293,177 @@ mod tests {
     fn unknown_query_is_an_error() {
         let entries = curated_catalog();
         assert!(resolve(&entries, "gpt-9-turbo").is_err());
+    }
+
+    /// Build a throwaway catalog row for alignment tests. Only the fields the
+    /// table renders (`catalog_id`, `quant`, `size_bytes`, `name`) matter; the
+    /// rest are filler.
+    fn synthetic(
+        catalog_id: &'static str,
+        quant: &'static str,
+        size_bytes: u64,
+        name: &'static str,
+    ) -> CatalogItem {
+        CatalogItem {
+            catalog_id,
+            name,
+            repo_id: "org/repo",
+            filename: "model.gguf",
+            size_bytes,
+            downloads: 0,
+            likes: 0,
+            quant,
+            architecture: "llama",
+            license: "apache-2.0",
+            task_tags: &["general"],
+        }
+    }
+
+    /// Assert the header and every data row share the same column geometry.
+    ///
+    /// Column offsets are read from the header, then checked against each row:
+    /// a left-aligned column's content must begin exactly under its header
+    /// label (with a separating space just before it), and SIZE (right-aligned)
+    /// must end exactly two spaces before the FIT column. If any earlier cell
+    /// overflowed its width, these offsets shift and the assertions fire. All
+    /// rendered content is ASCII, so byte indices equal display columns.
+    fn assert_aligned(lines: &[String]) {
+        assert!(!lines.is_empty(), "expected at least a header line");
+        let header = &lines[0];
+        let quant_col = header.find("QUANT").expect("header names QUANT");
+        let size_end = header.find("  FIT (this host)").expect("header names FIT");
+        let fit_col = header.find("FIT (this host)").expect("header names FIT");
+        let name_col = header.rfind("NAME").expect("header names NAME");
+
+        for line in &lines[1..] {
+            let b = line.as_bytes();
+            assert!(
+                b.len() > name_col,
+                "row is shorter than the header columns: {line:?}"
+            );
+            // QUANT (left-aligned) begins under its header label.
+            assert_eq!(
+                b[quant_col - 1],
+                b' ',
+                "no separator before QUANT: {line:?}"
+            );
+            assert_ne!(b[quant_col], b' ', "QUANT overflowed by the id: {line:?}");
+            // SIZE (right-aligned) ends exactly two spaces before FIT.
+            assert_eq!(b[size_end], b' ', "SIZE/FIT gap wrong: {line:?}");
+            assert_eq!(b[size_end + 1], b' ', "SIZE/FIT gap wrong: {line:?}");
+            assert_ne!(
+                b[size_end - 1],
+                b' ',
+                "SIZE right edge misaligned: {line:?}"
+            );
+            // FIT (left-aligned) begins under its header label.
+            assert_eq!(b[fit_col - 1], b' ', "no separator before FIT: {line:?}");
+            assert_ne!(b[fit_col], b' ', "FIT column misaligned: {line:?}");
+            // NAME (left-aligned) begins under its header label.
+            assert_eq!(b[name_col - 1], b' ', "no separator before NAME: {line:?}");
+            assert_ne!(b[name_col], b' ', "NAME column misaligned: {line:?}");
+        }
+    }
+
+    #[test]
+    fn catalog_table_columns_stay_aligned() {
+        // Regression: `mistral_7b_instruct_v0_3_q8_0` (29 chars) used to overflow
+        // a hardcoded 28-wide id column and push that row's later columns one
+        // space right of the header, and the SIZE header was a column narrower
+        // than the rendered `X.X GB` cells.
+        let entries = curated_catalog();
+        let hw = crate::capability::HardwareProfile::cached();
+        let lines = catalog_table_lines(&entries, hw);
+        assert_eq!(lines.len(), entries.len() + 1, "header + one line per row");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.catalog_id == "mistral_7b_instruct_v0_3_q8_0"),
+            "the longest id must still be in the catalog for this regression to bite"
+        );
+        assert_aligned(&lines);
+    }
+
+    #[test]
+    fn long_id_and_quant_do_not_overflow() {
+        let hw = crate::capability::HardwareProfile::cached();
+        let entries = vec![
+            synthetic("short_q8_0", "Q8_0", 1_300_000_000, "Short Model"),
+            synthetic(
+                "an_extremely_long_catalog_id_that_would_overflow_q8_0",
+                "Q4_K_M",
+                7_700_000_000,
+                "Long Id Model",
+            ),
+            synthetic(
+                "mid_q4_0",
+                "A_VERY_LONG_QUANT_LABEL",
+                3_400_000_000,
+                "Mid Model",
+            ),
+        ];
+        let lines = catalog_table_lines(&entries, hw);
+        assert_eq!(lines.len(), entries.len() + 1);
+        assert_aligned(&lines);
+    }
+
+    #[test]
+    fn oversized_size_value_keeps_columns_aligned() {
+        let hw = crate::capability::HardwareProfile::cached();
+        let entries = vec![
+            synthetic("small_q8_0", "Q8_0", 900_000_000, "Small"), // "0.9 GB"
+            synthetic("huge_q8_0", "Q8_0", 123_456_789_000, "Huge"), // "123.5 GB"
+        ];
+        let lines = catalog_table_lines(&entries, hw);
+        assert_aligned(&lines);
+        assert!(
+            lines.iter().any(|l| l.contains("123.5 GB")),
+            "the wide size cell must render and widen its column"
+        );
+    }
+
+    /// Proof the alignment assertions are non-tautological: the *original*
+    /// hardcoded-width rendering must be REJECTED by `assert_aligned`. These are
+    /// the exact format strings this PR removed: a 28-wide id column (which the
+    /// 29-char `mistral_7b_instruct_v0_3_q8_0` overflows) and an 8-wide SIZE
+    /// header against 9-char `{:>6.1} GB` cells.
+    #[test]
+    fn assert_aligned_rejects_the_original_buggy_layout() {
+        let entries = curated_catalog();
+        let hw = crate::capability::HardwareProfile::cached();
+        let mut lines = vec![format!(
+            "  {:<28} {:<8} {:>8}  {:<15} NAME",
+            "ID", "QUANT", "SIZE", "FIT (this host)"
+        )];
+        for item in &entries {
+            let verdict = crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes));
+            lines.push(format!(
+                "  {:<28} {:<8} {:>6.1} GB  {:<15} {}",
+                item.catalog_id,
+                item.quant,
+                item.size_bytes as f64 / 1e9,
+                verdict.cli_label(),
+                item.name,
+            ));
+        }
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(|| assert_aligned(&lines));
+        std::panic::set_hook(prev);
+        assert!(
+            caught.is_err(),
+            "assert_aligned should reject the original misaligned layout"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_renders_header_only() {
+        let hw = crate::capability::HardwareProfile::cached();
+        let lines = catalog_table_lines(&[], hw);
+        assert_eq!(lines.len(), 1, "no rows means header only, no panic");
+        for label in ["ID", "QUANT", "SIZE", "FIT (this host)", "NAME"] {
+            assert!(lines[0].contains(label), "header missing {label}");
+        }
     }
 
     #[test]
