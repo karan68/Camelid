@@ -1390,9 +1390,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setLoadingModelId(id)
     showNotice(`Loading ${model.name || id} into Camelid…`, 'info')
     try {
+      // replace: swap models rather than stacking a second resident copy, so the
+      // fit preflight judges this model against a host that has released the last one.
       const loaded = await fetchJson(`${normalizedApiBase}/api/models/load`, {
         method: 'POST',
-        body: JSON.stringify({ id, path: model.model_path }),
+        body: JSON.stringify({ id, path: model.model_path, replace: true }),
       })
       const loadedId = loaded?.id || id
       const loadedPath = getModelPath(loaded) || model.model_path
@@ -1480,7 +1482,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     try {
       const loaded = await fetchJson(`${normalizedApiBase}/api/models/load`, {
         method: 'POST',
-        body: JSON.stringify({ id: derivedId, path: modelPath }),
+        body: JSON.stringify({ id: derivedId, path: modelPath, replace: true }),
       })
       const loadedId = loaded?.id || derivedId
       const loadedPath = getModelPath(loaded) || modelPath

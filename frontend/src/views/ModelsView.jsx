@@ -138,10 +138,14 @@ export default function ModelsView({
       // Only an inspected, implemented model reaches the authoritative load.
       activeStage = 'loading'
       onStage?.('loading')
+      // replace: picking a model in the app is a SWAP, not a second resident
+      // copy. Without it the previous model keeps its RAM and VRAM, and the
+      // fit preflight refuses the new one on a host that could hold it alone.
+      // The engine releases the old model first, then re-probes live memory.
       const res = await fetch(`${spine.base}/api/models/load`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: filename, path }),
+        body: JSON.stringify({ id: filename, path, replace: true }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
