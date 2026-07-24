@@ -340,6 +340,16 @@ pub struct TokenizerConfigSummary {
 pub struct LoadModelRequest {
     pub path: PathBuf,
     pub id: Option<String>,
+    /// Release every OTHER resident model before loading this one ("switch
+    /// model" semantics), then re-probe live memory and re-run the fit
+    /// preflight against the freed state.
+    ///
+    /// Defaults to `false`, so an existing API client's behavior is unchanged:
+    /// models still accumulate unless it opts in. The web UI sends `true`,
+    /// which is what makes picking a model in the app a swap rather than a
+    /// second resident copy that the fit guard then refuses.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -4370,25 +4380,66 @@ fn best_fitting_catalog_suggestion(hw: &crate::capability::HardwareProfile) -> O
 /// fit `footprint`, else `None`. `size_bytes` is the on-disk size, used only for the
 /// human-readable number. Split from the IO wrapper so it is unit-testable with a
 /// synthetic host and footprint.
+/// What releasing the currently-resident models would give back. `bytes` is an
+/// ESTIMATE (the sum of their weight files) used only to word the error — never
+/// to decide a verdict. The `replace` path does not trust it: it releases the
+/// models for real and then re-probes live memory, so a wrong estimate can never
+/// turn into a false "fits" and an OOM.
+#[derive(Debug, Clone, Default)]
+pub struct ResidentReclaim {
+    pub ids: Vec<String>,
+    pub bytes: u64,
+}
+
+impl ResidentReclaim {
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty() || self.bytes == 0
+    }
+}
+
+/// The refusal for a `WontFit` verdict: a stable error code plus its message.
+///
+/// A host that is out of room *because something else is already loaded* is a
+/// different situation from a host that is too small for the model, and it has a
+/// different remedy (release the other model vs. pick a smaller one). Reporting
+/// both as `model_too_large_for_host` is what made the advisor dead-end: it told
+/// the operator the machine could not hold a model the machine plainly could.
 fn fit_preload_message(
     hw: &crate::capability::HardwareProfile,
     footprint: &crate::fit::FitInputs,
     size_bytes: u64,
-) -> Option<String> {
+    reclaim: Option<&ResidentReclaim>,
+) -> Option<(&'static str, String)> {
     if crate::fit::assess(hw, footprint) != crate::fit::FitVerdict::WontFit {
         return None;
     }
-    let base = format!(
-        "This model (~{:.1} GB) is larger than this machine can hold in memory.",
-        size_bytes as f64 / 1e9
-    );
-    Some(match best_fitting_catalog_suggestion(hw) {
-        Some(alt) => format!(
-            "{base} The largest catalog model that fits here is {alt}. \
-             Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
-        ),
-        None => format!("{base} Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."),
-    })
+    let size_gb = size_bytes as f64 / 1e9;
+    // Something else is resident: name it, and point at the remedy that works.
+    if let Some(r) = reclaim.filter(|r| !r.is_empty()) {
+        let names = r.ids.join(", ");
+        let freed = r.bytes as f64 / 1e9;
+        return Some((
+            "model_requires_unload",
+            format!(
+                "This model (~{size_gb:.1} GB) does not fit while {names} is still loaded. \
+                 Releasing it frees ~{freed:.1} GB, which should be enough. \
+                 Retry with \"replace\": true to swap models in one step (the app's \
+                 Load button does this), or POST /api/models/unload first."
+            ),
+        ));
+    }
+    let base =
+        format!("This model (~{size_gb:.1} GB) is larger than this machine can hold in memory.");
+    Some((
+        "model_too_large_for_host",
+        match best_fitting_catalog_suggestion(hw) {
+            Some(alt) => format!(
+                "{base} The largest catalog model that fits here is {alt}. \
+                 Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+            ),
+            None => format!("{base} Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."),
+        },
+    ))
 }
 
 /// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
@@ -4407,7 +4458,10 @@ fn fit_check_skipped(raw: Option<&str>) -> bool {
     raw.map(str::trim) == Some("1")
 }
 
-fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
+fn fit_preload_guard(
+    path: &std::path::Path,
+    reclaim: Option<&ResidentReclaim>,
+) -> Option<Response> {
     if fit_check_skipped(std::env::var("CAMELID_SKIP_FIT_CHECK").ok().as_deref()) {
         return None;
     }
@@ -4431,10 +4485,10 @@ fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
         }
         None => crate::fit::advisory_footprint(size),
     };
-    let message = fit_preload_message(&hw, &footprint, size)?;
+    let (code, message) = fit_preload_message(&hw, &footprint, size, reclaim)?;
     Some(api_error(
         StatusCode::UNPROCESSABLE_ENTITY,
-        "model_too_large_for_host",
+        code,
         message,
         Some("path"),
     ))
@@ -4454,6 +4508,53 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             )
         }
     };
+    // What is resident BESIDES the model being requested. A second copy of the
+    // same file is not reclaimable room (the load would be idempotent), so it is
+    // excluded — otherwise a repeat load would offer to release itself.
+    let mut reclaim = ResidentReclaim::default();
+    for (id, loaded) in state.loaded_models.read().await.iter() {
+        if loaded.path == path {
+            continue;
+        }
+        reclaim.bytes += std::fs::metadata(&loaded.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        reclaim.ids.push(id.clone());
+    }
+    reclaim.ids.sort();
+
+    // "Switch model" semantics. Release the other residents FIRST, then let the
+    // preflight below re-probe. The verdict is therefore reclaim-aware without
+    // ever estimating reclaimable bytes: the memory is genuinely back before the
+    // decision is made, so this cannot manufacture a false "fits" (this host has
+    // OOM'd under memory pressure, so the guard must never be optimistic).
+    if req.replace && !reclaim.ids.is_empty() {
+        if state.workspace_sessions.blocks_model_transition().await {
+            return api_error(
+                StatusCode::CONFLICT,
+                "model_operation_in_progress",
+                BackendError::ModelOperationInProgress.to_string(),
+                None,
+            );
+        }
+        let ids = reclaim.ids.clone();
+        {
+            let _transition = state.model_transition.lock().await;
+            let _exclusive = state.model_file_lifecycle.write().await;
+            for id in &ids {
+                if let Err(resp) = release_model(&state, Some(id.clone())).await {
+                    return *resp;
+                }
+            }
+        }
+        tracing::info!(
+            released = %ids.join(", "),
+            "replace: released resident model(s) to make room for the requested load"
+        );
+        // The room is real now, so there is nothing left to suggest releasing.
+        reclaim = ResidentReclaim::default();
+    }
+
     // Advisory fail-fast (fit axis, never a support claim): steer away from a
     // near-certain OOM before the expensive load. Overridable via
     // CAMELID_SKIP_FIT_CHECK=1; only fires on a WontFit verdict from a probed host.
@@ -4467,7 +4568,8 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     {
         let _reader = state.model_file_lifecycle.read().await;
         if let Ok(Some(resp)) =
-            tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path)).await
+            tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path, Some(&reclaim)))
+                .await
         {
             return resp;
         }
@@ -7089,7 +7191,27 @@ async fn unload_model(
         state.active_model_id.read().await.clone()
     };
 
-    if let Some(id) = target_id {
+    if let Err(resp) = release_model(&state, target_id).await {
+        return *resp;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Drop a model (`Some(id)`) or every model (`None`) from the registries and
+/// release the GPU state the engine holds for it.
+///
+/// Shared by `/api/models/unload` and the `replace` load path so both free the
+/// SAME things. That sharing is load-bearing, not tidiness: the registry clears
+/// below are CPU-side only, and the resident decode engine keeps its weights in
+/// process-global caches. Skipping `reset_resident_caches` leaves ~4.7 GB parked
+/// on the device, which starves the next model into an NVIDIA sysmem spill and
+/// makes decode ~20x slower — so a `replace` that hand-rolled the teardown would
+/// silently reintroduce exactly the bug this reset exists to prevent.
+///
+/// The caller must already hold the model-transition lock and an exclusive
+/// `model_file_lifecycle` guard. `Err` carries a ready-to-return response.
+async fn release_model(state: &AppState, target: Option<String>) -> Result<(), Box<Response>> {
+    if let Some(id) = target {
         state.loaded_models.write().await.remove(&id);
         state.gemma4_runtimes.write().await.remove(&id);
         state.runnable_runtimes.write().await.remove(&id);
@@ -7113,7 +7235,7 @@ async fn unload_model(
         *state.active_model_id.write().await = None;
     }
 
-    clear_prompt_prefix_cache(&state);
+    clear_prompt_prefix_cache(state);
     // Free the GPU VRAM held by the resident decode engine. The clears above only drop
     // the CPU-side registries; the Llama resident engine lives in process-global caches
     // (see inference::reset_resident_caches) that unload never touched, so its ~4.7 GB
@@ -7129,9 +7251,9 @@ async fn unload_model(
         .run_exclusive(crate::inference::reset_resident_caches)
         .await
     {
-        return *engine_post_error_response(err);
+        return Err(engine_post_error_response(err));
     }
-    StatusCode::NO_CONTENT.into_response()
+    Ok(())
 }
 
 async fn current_model(State(state): State<AppState>) -> Response {
@@ -20158,17 +20280,63 @@ mod catalog_fit_tests {
         // 8 GB RAM, no GPU: a 40 GB model won't fit → actionable message.
         let hw = host(false, 0, 8 * GIB, 5 * GIB);
         let fp = crate::fit::advisory_footprint(40 * GIB);
-        let msg = super::fit_preload_message(&hw, &fp, 40 * GIB).expect("won't fit -> message");
+        let (code, msg) =
+            super::fit_preload_message(&hw, &fp, 40 * GIB, None).expect("won't fit -> message");
+        assert_eq!(code, "model_too_large_for_host");
         assert!(msg.contains("larger than this machine"));
         assert!(msg.contains("camelid pull"));
         assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"));
     }
 
     #[test]
+    fn preload_message_blames_the_resident_model_when_releasing_it_would_help() {
+        // Same oversized verdict, but something else is loaded. The remedy is to
+        // release THAT, not to go find a smaller model — so the code and the
+        // wording must both change.
+        let hw = host(false, 0, 8 * GIB, 5 * GIB);
+        let fp = crate::fit::advisory_footprint(40 * GIB);
+        let reclaim = super::ResidentReclaim {
+            ids: vec!["Llama-3.2-1B-Instruct-Q8_0.gguf".to_string()],
+            bytes: 3 * GIB,
+        };
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 40 * GIB, Some(&reclaim))
+            .expect("won't fit -> message");
+        assert_eq!(code, "model_requires_unload");
+        assert!(msg.contains("Llama-3.2-1B-Instruct-Q8_0.gguf"), "{msg}");
+        assert!(msg.contains("replace"), "{msg}");
+        // The dead-end wording must be gone: the machine CAN hold this model.
+        assert!(!msg.contains("larger than this machine"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_reclaim_falls_back_to_the_plain_too_large_message() {
+        // Nothing else resident (or nothing measurable) → no false promise that
+        // releasing something would help.
+        let hw = host(false, 0, 8 * GIB, 5 * GIB);
+        let fp = crate::fit::advisory_footprint(40 * GIB);
+        let empty = super::ResidentReclaim::default();
+        let (code, _) = super::fit_preload_message(&hw, &fp, 40 * GIB, Some(&empty))
+            .expect("won't fit -> message");
+        assert_eq!(code, "model_too_large_for_host");
+    }
+
+    #[test]
     fn preload_message_is_none_when_the_model_fits() {
         let hw = host(false, 0, 64 * GIB, 48 * GIB);
         let fp = crate::fit::advisory_footprint(2 * GIB);
-        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, None).is_none());
+    }
+
+    #[test]
+    fn a_resident_model_never_turns_a_fitting_verdict_into_a_refusal() {
+        // Reclaim info only WORDS a refusal; it must never create one.
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let fp = crate::fit::advisory_footprint(2 * GIB);
+        let reclaim = super::ResidentReclaim {
+            ids: vec!["other.gguf".to_string()],
+            bytes: 3 * GIB,
+        };
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB, Some(&reclaim)).is_none());
     }
 
     #[test]
@@ -20176,7 +20344,7 @@ mod catalog_fit_tests {
         // Unknown verdict must never hard-block a load.
         let hw = host(false, 0, 0, 0);
         let fp = crate::fit::advisory_footprint(40 * GIB);
-        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB).is_none());
+        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB, None).is_none());
     }
 
     #[test]
@@ -20195,7 +20363,19 @@ mod catalog_fit_tests {
             crate::fit::ADVISORY_CONTEXT_TOKENS,
             crate::fit::KvDtype::F32,
         );
-        assert!(super::fit_preload_message(&hw, &fp, 5 * GIB).is_some());
+        assert!(super::fit_preload_message(&hw, &fp, 5 * GIB, None).is_some());
+    }
+
+    #[test]
+    fn load_request_replace_defaults_to_false_for_existing_api_clients() {
+        // Back-compat: a body without `replace` must not start evicting models.
+        let req: super::LoadModelRequest =
+            serde_json::from_str(r#"{"path":"models/x.gguf"}"#).expect("legacy body parses");
+        assert!(!req.replace);
+        let opted: super::LoadModelRequest =
+            serde_json::from_str(r#"{"path":"models/x.gguf","replace":true}"#)
+                .expect("replace body parses");
+        assert!(opted.replace);
     }
 
     #[test]
