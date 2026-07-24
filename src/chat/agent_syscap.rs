@@ -4,7 +4,7 @@
 //! `inspect_system`) directly against a controlled temp sandbox and emits a
 //! **tamper-evident** receipt (`camelid.agent-syscap-receipt/v1`): a sealed
 //! SHA-256 digest over the canonical body, mirroring the parity-receipt family
-//! (NOT the digest-less `agent_eval/v1` shape).
+//! (as every agent-family receipt now does, including `agent_eval/v1`).
 //!
 //! Scope discipline (the claims ladder): this is a *rung-1* artifact. It attests
 //! that the syscap tools behave under the gate/sandbox on this box. It promotes
