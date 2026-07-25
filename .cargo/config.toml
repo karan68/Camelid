@@ -13,3 +13,23 @@
 # target feature`). aarch64 keeps its defaults (NEON is baseline there).
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# x86_64 Linux additionally gets `$ORIGIN` on the run-time search path, so a
+# release tarball can ship the NVRTC pair BESIDE the binary and have it found with
+# no LD_LIBRARY_PATH from the user. Windows solves the same problem in code
+# (`ensure_cuda_runtime_on_path` prepends the exe dir to PATH), but that cannot
+# work here: glibc fixes the loader search path at process start, so mutating the
+# environment in-process has no effect on later dlopen calls. RUNPATH of the
+# calling object IS consulted for dlopen, so this is the working equivalent.
+#
+# `$ORIGIN` is passed through literally — Cargo spawns rustc without a shell, so
+# there is nothing to expand it prematurely. The `-C target-cpu` flag is repeated
+# here deliberately: if Cargo ever stops merging rustflags across matching
+# `target.cfg` tables, this section must not silently drop the AVX2 baseline.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))']
+rustflags = [
+    "-C",
+    "target-cpu=x86-64-v3",
+    "-C",
+    "link-arg=-Wl,-rpath,$ORIGIN",
+]
