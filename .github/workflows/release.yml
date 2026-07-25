@@ -64,6 +64,21 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --bin camelid
 
+      # Linux x86_64 only: CUDA is compiled into this target's DEFAULT build, and the
+      # resident engine compiles its kernels through NVRTC at runtime. NVRTC ships with
+      # the CUDA *Toolkit*, not the driver, so without this the downloaded tarball
+      # detects the GPU and then falls back to CPU on every ordinary driver-only host.
+      # Mirrors what build-windows already does for the Windows ZIP. Only the NVRTC
+      # component is installed — the driver itself is the user's and is not
+      # redistributable.
+      - name: Install CUDA NVRTC (packaging source)
+        if: matrix.label == 'linux-x86_64'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvrtc"]'
+
       - name: Package
         run: |
           set -euo pipefail
@@ -72,6 +87,17 @@ jobs:
           strip target/release/camelid || true
           cp target/release/camelid "$dist/"
           cp README.md LICENSE THIRD_PARTY_NOTICES.md "$dist/"
+          # Stage the NVRTC redistributables beside the binary. The binary is linked
+          # with `-Wl,-rpath,$ORIGIN` (.cargo/config.toml), so its own directory is on
+          # the run-time search path and dlopen finds this pair with no LD_LIBRARY_PATH
+          # from the user. Fail loudly rather than shipping a tarball that silently
+          # cannot reach the GPU.
+          # Invoked through `bash` rather than as ./script, matching how ci.yml runs
+          # its shell gates: that does not depend on the executable bit surviving in
+          # the index (it does not, when the file is authored on Windows).
+          if [ "${{ matrix.label }}" = "linux-x86_64" ]; then
+            bash scripts/package-linux-cuda.sh "$dist"
+          fi
           tar -czf "$dist.tar.gz" "$dist"
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
 

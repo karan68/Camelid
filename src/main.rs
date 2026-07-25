@@ -209,6 +209,38 @@ fn dir_has_nvrtc(dir: &std::path::Path) -> bool {
 #[cfg(not(all(windows, feature = "cuda")))]
 fn ensure_cuda_runtime_on_path() {}
 
+/// Stop cudarc's missing-library panics from printing, without silencing anything
+/// else.
+///
+/// cudarc's lazy loaders panic when a CUDA library cannot be dlopen'd. We already
+/// catch those and fall back to the CPU path, so on a host with an NVIDIA driver
+/// but no CUDA toolkit the fallback is *working as designed* — but the default
+/// panic hook still prints the panic plus a `RUST_BACKTRACE` hint on the way
+/// through, so a healthy CPU-only start reads like a crash. That population is
+/// now large: CUDA is compiled into the default x86_64 Linux build, and NVRTC
+/// ships with the toolkit rather than the driver.
+///
+/// Installed ONCE, and it filters by panic origin rather than swapping the hook
+/// around each call: a scoped swap would be process-global for its duration and
+/// could swallow an unrelated thread's panic message (model loads run while the
+/// server handles other requests). Every non-cudarc panic reaches the previous
+/// hook untouched.
+fn quiet_cudarc_loader_panics() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let from_cudarc = info
+                .location()
+                .is_some_and(|loc| loc.file().replace('\\', "/").contains("/cudarc-"));
+            if !from_cudarc {
+                previous(info);
+            }
+        }));
+    });
+}
+
 // Optimus / Enduro hint variables, exported from the exe via build.rs. A laptop's
 // hybrid-graphics driver reads these at process start and routes the process to
 // the discrete NVIDIA / AMD GPU rather than the integrated Intel one. Without this
@@ -1470,6 +1502,9 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Both before ANY CUDA probe: the hook must be in place before cudarc's lazy
+    // loaders can panic, or the first (caught, handled) miss still prints.
+    quiet_cudarc_loader_panics();
     // Make the GPU runtime discoverable before anything probes for a device, so
     // the shipped app needs no PATH setup (no-op off Windows / without CUDA).
     ensure_cuda_runtime_on_path();
