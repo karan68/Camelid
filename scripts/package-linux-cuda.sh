@@ -56,7 +56,12 @@ for pattern in 'libnvrtc.so*' 'libnvrtc-builtins.so*'; do
     # `.alt.` variants are an alternate JIT backend cudarc never asks for; skipping
     # them keeps ~90 MB out of every download.
     case "$(basename "$lib")" in *.alt.so*) continue ;; esac
-    cp -L "$lib" "$dist/"
+    # -P, NOT -L. A toolkit ships libnvrtc.so.<major> as a SYMLINK to
+    # libnvrtc.so.<major>.<minor>.<patch>, and this glob matches both, so
+    # dereferencing copied the same 106 MB library twice — v0.4.3 shipped 113 MB of
+    # duplication that way. Preserving the link keeps one real file plus a cheap
+    # symlink beside it, which resolves identically under $ORIGIN.
+    cp -P "$lib" "$dist/"
     echo "  + $(basename "$lib")"
     copied=$((copied + 1))
   done
@@ -69,4 +74,26 @@ if ! compgen -G "$dist/libnvrtc.so.*" > /dev/null; then
   exit 1
 fi
 
+# A symlink that resolves nowhere is worse than no symlink: dlopen would fail and the
+# GPU would silently never engage. Every staged link must land on a staged file.
+for link in "$dist"/libnvrtc*.so*; do
+  [ -L "$link" ] || continue
+  if [ ! -e "$dist/$(basename "$(readlink "$link")")" ]; then
+    echo "package-linux-cuda: $(basename "$link") -> $(readlink "$link") is dangling" >&2
+    exit 1
+  fi
+done
+
+# Regression guard for the v0.4.3 duplication: two staged REAL files of identical size
+# means a symlink was dereferenced again. Cheap to check, and it fails the release
+# rather than quietly doubling every download.
+dupes=$(find "$dist" -maxdepth 1 -type f -name 'libnvrtc*.so*' -printf '%s\n' | sort | uniq -d | wc -l)
+if [ "$dupes" -ne 0 ]; then
+  echo "package-linux-cuda: staged duplicate NVRTC payloads (same-size real files);" >&2
+  echo "package-linux-cuda: symlinks must be preserved with cp -P, not followed." >&2
+  find "$dist" -maxdepth 1 -name 'libnvrtc*.so*' -printf '  %y %10s %f\n' >&2
+  exit 1
+fi
+
 echo "package-linux-cuda: staged $copied NVRTC file(s) into $dist"
+du -sh "$dist" | awk '{print "package-linux-cuda: dist is " $1}'
