@@ -1,0 +1,7 @@
+{
+  "relay_protocol": "camelid.relay/v1",
+  "route_id": "AAAAAAAAAAAAAAAAAAAAAA",
+  "connection_id": "connection-1",
+  "frame_type": "handshake",
+  "payload_base64": "AAECAwQ="
+}

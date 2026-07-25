@@ -1,0 +1,19 @@
+[package]
+name = "camelid-remote-crypto-ffi"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+description = "Swift and Kotlin bindings for Camelid remote cryptography"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+camelid-remote-crypto = { path = "../camelid-remote-crypto" }
+thiserror = "1"
+uniffi = { version = "=0.32.0", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"

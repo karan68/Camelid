@@ -16,8 +16,22 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use camelid_remote_protocol::{
+    ApprovalAction, ApprovalRecord, ApprovalRisk, ResolvedTarget, ShellEnforcement,
+    ShellMode as ApprovalShellMode, APPROVAL_RECORD_SCHEMA,
+};
+
 use super::shell_sandbox::{self, ShellSandbox};
 use super::subagent;
+
+#[derive(Clone, Copy)]
+pub(crate) enum ToolState<'a> {
+    Global,
+    Runtime {
+        plan: &'a camelid_agent_runtime::PlanState,
+        checkpoints: &'a camelid_agent_runtime::CheckpointStore,
+    },
+}
 #[cfg(windows)]
 use super::win_input;
 #[cfg(windows)]
@@ -385,23 +399,41 @@ impl Sandbox {
 pub enum ToolProfile {
     Full,
     WorkspaceReadOnly,
+    RemoteV1,
 }
 
 impl ToolProfile {
     pub fn allows(self, tool: &str) -> bool {
-        self == ToolProfile::Full
-            || (self == ToolProfile::WorkspaceReadOnly
-                && matches!(tool, "read_file" | "list_dir" | "search"))
+        match self {
+            Self::Full => true,
+            Self::WorkspaceReadOnly => matches!(tool, "read_file" | "list_dir" | "search"),
+            Self::RemoteV1 => matches!(
+                tool,
+                "read_file"
+                    | "list_dir"
+                    | "search"
+                    | "update_plan"
+                    | "write_file"
+                    | "edit_file"
+                    | "run_shell"
+                    | "http_fetch"
+                    | "web_search"
+            ),
+        }
     }
 
     pub fn is_workspace(self) -> bool {
         self == Self::WorkspaceReadOnly
     }
 
+    pub fn discards_cancelled_step(self) -> bool {
+        self != Self::Full
+    }
+
     pub fn observation_limit(self) -> Option<usize> {
         match self {
             Self::Full => None,
-            Self::WorkspaceReadOnly => Some(2 * 1024),
+            Self::WorkspaceReadOnly | Self::RemoteV1 => Some(2 * 1024),
         }
     }
 
@@ -1023,8 +1055,107 @@ impl Action {
         }
     }
 
+    pub fn remote_approval_record(&self, sandbox: &Sandbox) -> Result<ApprovalRecord, String> {
+        let target = |path: &Path| ResolvedTarget {
+            canonical_native: display_path(path),
+            workspace_display: sandbox.rel(path).replace('\\', "/"),
+        };
+        let (tool, risk, action) = match self {
+            Action::WriteFile { path, content, .. } => (
+                "write_file",
+                ApprovalRisk::Write,
+                ApprovalAction::WriteFile {
+                    target: target(path),
+                    content: content.clone(),
+                },
+            ),
+            Action::EditFile { path, old, new } => (
+                "edit_file",
+                ApprovalRisk::Write,
+                ApprovalAction::EditFile {
+                    target: target(path),
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            ),
+            Action::RunShell { command } => {
+                let enforcement = match sandbox.shell_mode() {
+                    ShellSandbox::Disabled => return Err("run_shell is disabled".into()),
+                    ShellSandbox::Unrestricted => ShellEnforcement {
+                        platform: std::env::consts::OS.into(),
+                        mode: ApprovalShellMode::Unrestricted,
+                        enforced_layers: vec!["cwd-pin".into(), "wall-timeout".into()],
+                        note: Some(
+                            "working-directory pinned and timed; otherwise unconfined".into(),
+                        ),
+                    },
+                    ShellSandbox::Sandboxed => {
+                        let actual = shell_sandbox::describe_sandboxed(sandbox.root())?;
+                        ShellEnforcement {
+                            platform: std::env::consts::OS.into(),
+                            mode: ApprovalShellMode::Sandboxed,
+                            enforced_layers: actual
+                                .layers
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect(),
+                            note: actual.note,
+                        }
+                    }
+                };
+                (
+                    "run_shell",
+                    ApprovalRisk::Exec,
+                    ApprovalAction::RunShell {
+                        command: command.clone(),
+                        workdir: target(sandbox.root()),
+                        timeout_ms: sandbox
+                            .shell_timeout
+                            .as_millis()
+                            .try_into()
+                            .map_err(|_| "shell timeout is too large".to_string())?,
+                        enforcement,
+                    },
+                )
+            }
+            Action::HttpFetch { method, url } => (
+                "http_fetch",
+                ApprovalRisk::Network,
+                ApprovalAction::HttpFetch {
+                    method: method.clone(),
+                    url: url.clone(),
+                },
+            ),
+            Action::WebSearch { query } => (
+                "web_search",
+                ApprovalRisk::Network,
+                ApprovalAction::WebSearch {
+                    query: query.clone(),
+                },
+            ),
+            _ => return Err("action is not confirm-capable in remote v1".into()),
+        };
+        let record = ApprovalRecord {
+            schema: APPROVAL_RECORD_SCHEMA.into(),
+            tool: tool.into(),
+            risk,
+            action,
+        };
+        record.validate().map_err(|error| error.to_string())?;
+        Ok(record)
+    }
+
     /// Execute the (already approved) action.
+    #[allow(dead_code)]
     pub fn execute(&self, sandbox: &Sandbox) -> ToolOutcome {
+        self.execute_with_state(sandbox, ToolState::Global)
+    }
+
+    pub(crate) fn execute_with_state(
+        &self,
+        sandbox: &Sandbox,
+        state: ToolState<'_>,
+    ) -> ToolOutcome {
         match self {
             Action::ReadFile {
                 path,
@@ -1050,13 +1181,23 @@ impl Action {
             Action::WriteFile { path, content, .. } => {
                 let pending = super::checkpoint::prepare(sandbox, path, "write_file");
                 let out = write_file(path, content);
-                super::checkpoint::finish(pending, !out.is_err());
+                match state {
+                    ToolState::Global => super::checkpoint::finish(pending, !out.is_err()),
+                    ToolState::Runtime { checkpoints, .. } => {
+                        let _ = super::checkpoint::finish_in(checkpoints, pending, !out.is_err());
+                    }
+                }
                 out
             }
             Action::EditFile { path, old, new } => {
                 let pending = super::checkpoint::prepare(sandbox, path, "edit_file");
                 let out = edit_file(path, old, new);
-                super::checkpoint::finish(pending, !out.is_err());
+                match state {
+                    ToolState::Global => super::checkpoint::finish(pending, !out.is_err()),
+                    ToolState::Runtime { checkpoints, .. } => {
+                        let _ = super::checkpoint::finish_in(checkpoints, pending, !out.is_err());
+                    }
+                }
                 out
             }
             Action::RunShell { command } => run_shell(sandbox, command),
@@ -1093,8 +1234,18 @@ impl Action {
             Action::Screenshot { path } => uia_screenshot(path),
             Action::WebSearch { query } => web_search(sandbox, query),
             Action::UpdatePlan { steps } => {
-                let stored = super::plan::set(steps.clone());
-                ToolOutcome::Ok(format!("plan updated\n{}", super::plan::render(&stored)))
+                let stored = match state {
+                    ToolState::Global => Ok(super::plan::set(steps.clone())),
+                    ToolState::Runtime { plan, .. } => {
+                        super::plan::set_in(plan, steps.clone()).map_err(|error| error.to_string())
+                    }
+                };
+                match stored {
+                    Ok(stored) => {
+                        ToolOutcome::Ok(format!("plan updated\n{}", super::plan::render(&stored)))
+                    }
+                    Err(error) => ToolOutcome::Err(error),
+                }
             }
             // The server's reply is untrusted data and reaches the model through
             // the same fenced tool-result path as every native tool.

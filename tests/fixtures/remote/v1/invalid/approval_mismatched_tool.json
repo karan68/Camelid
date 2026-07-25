@@ -1,0 +1,14 @@
+{
+  "schema": "camelid.approval-record/v1",
+  "tool": "read_file",
+  "risk": "write",
+  "action": {
+    "kind": "edit_file",
+    "target": {
+      "canonical_native": "C:\\work\\project\\src\\lib.rs",
+      "workspace_display": "src/lib.rs"
+    },
+    "old": "fn old_name() {}",
+    "new": "fn new_name() {}"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.invalid/schema/remote/v1/inner-message.schema.json",
+  "type": "object",
+  "required": ["protocol", "message_id", "kind", "host_id", "device_id", "session_id", "sent_at_unix_ms", "payload"],
+  "properties": {
+    "protocol": { "const": "camelid.remote/v1" },
+    "message_id": { "type": "string", "format": "uuid" },
+    "kind": {
+      "enum": ["command", "command_result", "event_batch", "replay_request", "replay_end", "ping", "pong", "error"]
+    },
+    "host_id": { "type": "string", "format": "uuid" },
+    "device_id": { "type": "string", "format": "uuid" },
+    "session_id": {
+      "oneOf": [
+        { "type": "string", "format": "uuid" },
+        { "type": "null" }
+      ]
+    },
+    "sent_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": true,
+  "$comment": "Authoritative decoders reject the reassembled UTF-8 message above 1114112 bytes before JSON parsing."
+}

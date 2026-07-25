@@ -338,6 +338,180 @@ enum AgentAction {
         #[arg(long)]
         models_dir: Option<PathBuf>,
     },
+    /// Arm one local coding-agent session for end-to-end encrypted control by
+    /// an explicitly paired mobile device.
+    Host {
+        /// GGUF to drive. Must be a tool-capable supported row.
+        #[arg(long)]
+        model: PathBuf,
+        /// Server to attach to, or spawn on if nothing is listening there.
+        #[arg(long, default_value = "127.0.0.1:8231")]
+        addr: SocketAddr,
+        /// Canonical sandbox root exposed to the remote-safe tool profile.
+        #[arg(long)]
+        workdir: PathBuf,
+        /// HTTPS base URL of the blind relay service.
+        #[arg(long, env = "CAMELID_RELAY_URL")]
+        relay_url: String,
+        /// Durable local authority database. Defaults under the OS application
+        /// data directory when omitted.
+        #[arg(long, env = "CAMELID_REMOTE_DB")]
+        db_path: Option<PathBuf>,
+        #[arg(long, default_value_t = 25)]
+        max_steps: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_tokens: u32,
+        /// Opt into the network fetch tool. Off by default.
+        #[arg(long, default_value_t = false)]
+        allow_net: bool,
+        /// Opt into the sandboxed shell tool. Off by default.
+        #[arg(long, default_value_t = false)]
+        allow_shell: bool,
+        #[arg(long, default_value_t = 30)]
+        shell_timeout: u64,
+        #[arg(long)]
+        models_dir: Option<PathBuf>,
+        /// Initial relay reconnect delay in milliseconds. Required until release
+        /// load testing establishes supported defaults.
+        #[arg(long, env = "CAMELID_REMOTE_RECONNECT_INITIAL_MS")]
+        reconnect_initial_ms: u64,
+        /// Maximum relay reconnect delay in milliseconds.
+        #[arg(long, env = "CAMELID_REMOTE_RECONNECT_MAX_MS")]
+        reconnect_max_ms: u64,
+        /// Symmetric reconnect jitter percentage, from 0 through 50.
+        #[arg(long, env = "CAMELID_REMOTE_RECONNECT_JITTER_PERCENT")]
+        reconnect_jitter_percent: u8,
+        /// WebSocket ping interval in milliseconds. Required until relay load
+        /// testing establishes a supported default.
+        #[arg(long, env = "CAMELID_REMOTE_KEEPALIVE_MS")]
+        relay_keepalive_ms: u64,
+    },
+    /// Inspect or revoke paired remote devices using local durable authority.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RemoteAction {
+    /// List paired and revoked devices without exposing keys or relay credentials.
+    Devices {
+        #[arg(long, env = "CAMELID_REMOTE_DB")]
+        db_path: Option<PathBuf>,
+    },
+    /// Revoke one paired device. A running host closes it on the next authority poll.
+    Revoke {
+        device_id: uuid::Uuid,
+        #[arg(long, env = "CAMELID_REMOTE_DB")]
+        db_path: Option<PathBuf>,
+    },
+    /// Emergency disable: revoke every device and cancel work controlled by a revoked device.
+    Disable {
+        #[arg(long, env = "CAMELID_REMOTE_DB")]
+        db_path: Option<PathBuf>,
+    },
+}
+
+#[cfg(test)]
+mod remote_host_cli_tests {
+    use super::*;
+
+    fn on_large_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn agent_host_parses_only_the_remote_safe_capability_surface() {
+        on_large_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "agent",
+                "host",
+                "--model",
+                "model.gguf",
+                "--workdir",
+                "workspace",
+                "--relay-url",
+                "wss://relay.example.test",
+                "--allow-net",
+                "--allow-shell",
+                "--reconnect-initial-ms",
+                "250",
+                "--reconnect-max-ms",
+                "5000",
+                "--reconnect-jitter-percent",
+                "20",
+                "--relay-keepalive-ms",
+                "15000",
+            ])
+            .unwrap();
+            let Some(Command::Agent {
+                action:
+                    AgentAction::Host {
+                        allow_net,
+                        allow_shell,
+                        ..
+                    },
+            }) = cli.command
+            else {
+                panic!("agent host did not parse to the host action");
+            };
+            assert!(allow_net);
+            assert!(allow_shell);
+        });
+    }
+
+    #[test]
+    fn agent_host_refuses_unrestricted_and_unattended_agent_flags() {
+        on_large_stack(|| {
+            for flag in ["--yolo", "--allow-fs", "--allow-mcp", "--auto-approve"] {
+                let result = Cli::try_parse_from([
+                    "camelid",
+                    "agent",
+                    "host",
+                    "--model",
+                    "model.gguf",
+                    "--workdir",
+                    "workspace",
+                    "--relay-url",
+                    "wss://relay.example.test",
+                    flag,
+                    "--reconnect-initial-ms",
+                    "250",
+                    "--reconnect-max-ms",
+                    "5000",
+                    "--reconnect-jitter-percent",
+                    "20",
+                    "--relay-keepalive-ms",
+                    "15000",
+                ]);
+                assert!(
+                    result.is_err(),
+                    "unsafe host flag unexpectedly parsed: {flag}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn remote_admin_subcommands_parse_without_remote_capability_flags() {
+        on_large_stack(|| {
+            let device_id = "11111111-1111-4111-8111-111111111111";
+            for args in [
+                vec!["camelid", "agent", "remote", "devices"],
+                vec!["camelid", "agent", "remote", "revoke", device_id],
+                vec!["camelid", "agent", "remote", "disable"],
+            ] {
+                assert!(Cli::try_parse_from(args).is_ok());
+            }
+        });
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2762,6 +2936,54 @@ async fn main() -> anyhow::Result<()> {
                 })?;
                 std::process::exit(code);
             }
+            AgentAction::Host {
+                model,
+                addr,
+                workdir,
+                relay_url,
+                db_path,
+                max_steps,
+                max_tokens,
+                allow_net,
+                allow_shell,
+                shell_timeout,
+                models_dir,
+                reconnect_initial_ms,
+                reconnect_max_ms,
+                reconnect_jitter_percent,
+                relay_keepalive_ms,
+            } => {
+                let code = chat::run_remote_host(chat::RemoteHostOptions {
+                    model,
+                    addr,
+                    workdir,
+                    relay_url,
+                    db_path,
+                    max_steps,
+                    max_tokens,
+                    allow_net,
+                    allow_shell,
+                    shell_timeout,
+                    models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
+                    reconnect_initial_ms,
+                    reconnect_max_ms,
+                    reconnect_jitter_percent,
+                    relay_keepalive_ms,
+                })
+                .await?;
+                std::process::exit(code);
+            }
+            AgentAction::Remote { action } => match action {
+                RemoteAction::Devices { db_path } => {
+                    chat::list_remote_devices(chat::RemoteAdminOptions { db_path })?;
+                }
+                RemoteAction::Revoke { device_id, db_path } => {
+                    chat::revoke_remote_device(chat::RemoteAdminOptions { db_path }, device_id)?;
+                }
+                RemoteAction::Disable { db_path } => {
+                    chat::disable_remote_devices(chat::RemoteAdminOptions { db_path })?;
+                }
+            },
         },
         Command::Gait { action } => match action {
             GaitAction::Reset => run_gait_reset()?,

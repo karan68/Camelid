@@ -1196,3 +1196,182 @@ cross-platform fix, W1, is a strict improvement there). Follow-ups on the
 amendment log: `win_uia.rs` shares W3(a)'s output leg (A11/W10); the real-TUI
 CERT rows of `qa/hardpan/MANUAL_CHECKLIST.md` are owed post-merge
 (merge-ahead authorized 2026-07-23).
+
+## D20 — Remote agent control Phase 0 protocol and crypto boundary (2026-07-24)
+
+Remote control remains unshipped. Phase 0 pins only the internal protocol, approval digest,
+bounded Noise record chunking, and a development crypto/binding spike. It adds no host command,
+relay route, mobile product, capability row, or public claim.
+
+The fixed suite is `Noise_IK_25519_ChaChaPoly_BLAKE2s` through `snow` 0.10.0 with default
+features disabled and only Curve25519, ChaChaPoly, BLAKE2, and OS randomness enabled. One
+standalone Rust core owns the host, Swift, and Kotlin handshake logic; UniFFI 0.32.0 generates
+opaque bindings. Mobile callers cannot select a pattern or primitive. Private key generation is
+an opaque one-shot handoff rather than a foreign-language record, and authentication failure
+invalidates the connection.
+
+Noise's 65,535-byte record ceiling is binding. Larger inner JSON uses at most 18 strictly ordered,
+encrypted chunks with a fixed 64-byte header and whole-message SHA-256; duplicate, omitted,
+reordered, cross-message, overlong, and digest-mismatched sequences fail closed. The canonical
+approval record remains capped at 1 MiB and is never approved from truncated content.
+
+The dependency is not called audited: `snow` says it has no formal audit. Independent review of
+the wrapper, dependency configuration, key handling, and authorization boundary remains a Phase 5
+release blocker. Linux Swift/Kotlin interoperability and Android-optimized source compilation are
+development evidence only, not iOS/Android device qualification. The source of truth and detailed
+candidate review are `docs/architecture/REMOTE_AGENT_CONTROL.md` and
+`docs/architecture/REMOTE_AGENT_CONTROL_CRYPTO_REVIEW.md`.
+
+## D21 — Remote agent control Phase 1 runtime and authority boundary (2026-07-24)
+
+Remote v1 gets one session-owned `AgentRuntime`: cancellation, transcript, plan, and checkpoint
+state no longer depend on the process-global UI stores in the TUI, inline, or headless front ends.
+Runtime clones share exactly one session; independently constructed runtimes share no mutable
+state. Existing eval and test adapters retain legacy global state only as explicit adapters, not as
+the remote authority path.
+
+The remote loop is a separate typed entry that refuses any profile except `RemoteV1`. That profile
+contains read/list/search/plan/write/edit by default and only locally opted-in shell and Camelid
+network tools; Windows system control, GUI, MCP, subagents, unrestricted files, and persistent
+approval grants are unavailable. A confirm event cannot be built from model prose: it requires an
+`ApprovalRecord` derived after `Action` validation, with complete executable fields and a computed
+canonical digest. Structured sink failure stops before approval or mutation.
+
+Local session resume continues to persist historical grant names for display but no longer restores
+their authority. Model writes into `.camelid` session/checkpoint state remain refused. This phase
+adds no host command, SQLite store, relay, mobile product, capability row, or public claim.
+
+## D22 — Remote agent control Phase 2 durable local authority (2026-07-24)
+
+The local remote host persists authority in a separate bundled-SQLite database outside the
+workspace. WAL, foreign keys, a bounded busy timeout, explicit schema versioning, and refusal of
+newer schemas are mandatory. Session transitions, one-active-turn acceptance, command deduplication,
+approval insertion/settlement, cancellation, terminal turn settlement, transcript/plan snapshots,
+and event sequence allocation use immediate transactions. Live broadcast happens only after the
+store returns a committed `StoredEvent`; subscribers are best effort and replay is truth.
+
+Approval commands bind device, session, turn, call, approval, and action digest. First valid
+settlement wins; duplicate identical commands return durable results and conflicting ID reuse fails.
+Timeout, cancellation, and restart invalidate pending approval before execution. Restart marks active
+turns interrupted and never resumes a tool call. Hydration requires exact canonical root, model ID,
+artifact hash, and immutable capability snapshot.
+
+The model-free integration harness drives real remote protocol envelopes through the structured
+agent loop and proves read-before-write, allow-once, read-after-write verification, denial,
+idempotency, replay after subscriber loss, cancellation during inference and approval, database
+failure before approval, device revocation, and identity mismatch refusal. This phase adds no relay,
+network listener, public CLI command, mobile product, capability row, or shipped claim.
+
+## D23 — Remote agent control Phase 3 blind relay and E2EE transport boundary (2026-07-24)
+
+The relay is a separate workspace service with no dependency on inference, tools, SQLite, or the
+decrypted Camelid protocol. It forwards only bounded binary records and routing metadata through
+bounded Tokio channels. It never queues device frames while the host is offline. The 128-bit
+base64url QR `route_id` is the device-side routing capability; the host uses a distinct bearer.
+This corrects an invalid intermediate design that generated an additional device bearer absent
+from the strict pairing QR, which would have made a scanned QR unable to connect. Possession of
+the route token permits only a connection attempt: Noise IK and a non-revoked local device grant
+remain mandatory before application commands can be opened.
+
+The host creates fresh Noise state per relay connection ID. Authentication or transport tamper is
+connection-terminal. Unknown keys may enter only the bounded pairing path, where a short-lived
+single-use secret, exact relay connection ID, authenticated device static key, and Noise transcript
+fingerprint are bound to explicit local confirmation. Durable registration occurs before the
+second handshake message can promote the connection. Rejection, expiry, cancellation, restart,
+five valid-but-wrong secret attempts, or confirmation mismatch destroys pending authority.
+
+Reconnect uses caller-configured bounded exponential delay with jitter and cancellation; no
+production timing defaults are invented before load testing. Reconnect clears old Noise and
+pending-pairing state, while transcript, plan, grants, and committed events remain solely in local
+SQLite. When `CAMELID_RELAY_STATE` is configured, the relay atomically restores opaque route/host
+capability pairs after restart; it still stores no ciphertext or inner event data. The host stores
+the route as metadata and its host bearer only through the Windows DPAPI secret adapter. A missing
+or stale route requires explicit re-enrollment/re-pairing; it never queues commands. Revocation
+removes the durable grant, drops every matching Noise session, and sends a routing-only close
+control for each live device.
+
+The Phase 3 development receipt records 70 passing tests, clean formatting, and strict Clippy:
+`docs/architecture/REMOTE_AGENT_CONTROL_PHASE3_RECEIPT.md`. This phase adds no public host command,
+mobile UI, production relay deployment, OS credential-store adapter, capability row, support
+promotion, or shipped claim. Independent cryptographic/security review remains a Phase 5 blocker.
+
+## D24 — Remote agent control Phase 4 mobile foundation remains unpromoted (2026-07-24)
+
+The mobile client is one Expo SDK 57 React Native development-build project, not Expo Go and not a
+browser security surface. Native Swift/Kotlin modules are the only boundary allowed to own device
+private keys and Rust Noise objects. Their JavaScript API uses branded opaque references for keys,
+handshakes, and transports and exposes public keys and encrypted/public data only. Android now links
+sealed Rust/UniFFI artifacts and wraps static private keys with Android Keystore AES-256-GCM keys;
+the Swift module remains fail-closed until Apple artifacts and Keychain handling are linked.
+
+The QR `relay_url` is the device-connect base and the 128-bit `route_id` is appended as one path
+segment. The relay therefore exposes `/v1/connect/:route_id` as an alias to its existing blind
+device bridge. This resolves the QR example/API mismatch without adding a bearer or plaintext
+surface. A stolen route still cannot create an application session without an authorized Noise key.
+
+Pure mobile state is deliberately separate from native secrets. Protected metadata contains only
+host ID, pinned host public key, route, assigned device/session IDs, label, and monotonic replay
+cursor. The reducer treats gaps as replay requests, unknown events as observations, settled
+approvals as inert, schema-mismatched approvals as non-authoritative, and conflicting reuse of an
+approval ID as a terminal protocol error. Outbound commands use canonical JSON and only v1's
+start, cancel, one-shot decision, and replay payloads.
+
+The foundation receipt records 59 mobile tests, 17 shared-protocol tests, 11 relay tests, 30 root
+remote tests, 19 store tests, local and network pairing tests, TypeScript, Expo
+lint/config/autolinking, strict Rust Clippy, Windows DPAPI compile/round-trip, and zero npm
+production audit findings: `docs/architecture/REMOTE_AGENT_CONTROL_PHASE4_FOUNDATION.md`. The
+Android development APK, emulator instrumentation, native UI launch, and sealed artifact hashes are
+recorded separately in `docs/architecture/REMOTE_AGENT_CONTROL_PHASE4_ANDROID_RECEIPT.md`. Phase 4
+is not complete: iOS, physical-device lifecycle/biometrics, push integration, local host management,
+production relay/operator choices, and independent security review remain open. No capability or
+support claim changes.
+
+## D25 — Remote pairing is asynchronous local authority, not a terminal gate (2026-07-25)
+
+`camelid agent host` owns its loopback API and remote runtime in one process. The Remote view sends
+typed commands to the relay-owning host loop; SQLite is durable truth but never the live control
+plane. Pairing no longer blocks startup or reads stdin. The host loop creates one offer, receives an
+authenticated Noise request, publishes only device label/fingerprint/expiry for local review, and
+promotes the pending transport only after an exact confirmation ID is accepted.
+
+The secret-bearing QR payload is returned only by the explicit same-origin `POST /pairing` response
+with `Cache-Control: no-store`; it is never included in status polling and the Web UI retains only a
+generated QR data URL in component memory. An active offer cannot be silently replaced: it must be
+cancelled or expire. Relay reconnect destroys an awaiting, connection-bound confirmation but leaves
+an unclaimed offer valid until its original expiry. If durable device registration succeeds but the
+encrypted response cannot be delivered, the grant remains authoritative and the temporary pairing
+state is destroyed; retrying pairing cannot create an ambiguous second grant.
+
+The local status view exposes the immutable session capability snapshot, including exact workspace
+scope, tools, Camelid network-tool authority, and shell enforcement. Revoke and emergency disable
+execute inside the host loop and close live connections; they are not database-only UI effects.
+The host and relay require explicit WebSocket keepalive intervals, just as the host requires
+explicit reconnect bounds; no production heartbeat default is claimed before relay load and
+idle-timeout qualification. The host pings its relay socket, while the relay pings both host and
+device sockets because React Native cannot originate WebSocket control frames. Ping failure enters
+the same bounded reconnect path and clears connection-bound Noise state.
+This is development evidence only. Production relay operation, push, retention UX, packaging,
+platform qualification, and independent security review remain separate release gates.
+
+## D26 — Remote history uses many durable histories and one active execution session (2026-07-25)
+
+Remote v1 exposes a bounded, revision-pinned, host-scoped catalog of histories for the exact host
+and canonical workspace, while retaining exactly one active execution session. Selecting a dormant
+history is replay-only. `CreateSession` and `ActivateSession` are privileged, digest-bound,
+idempotent commands that atomically refuse unfinished work, update the schema-v3 active pointer and
+generation, and preserve every previous history. Commands, approvals, cancellation, and tool
+authority remain scoped to the active session only.
+
+Mobile keeps separate protected replay cursors and projections per history. Active-session changes
+are accepted only from authenticated host catalogs; another device's switch updates authority but
+does not force navigation away from a dormant history the user is inspecting. Catalogs refresh
+after committed event bursts so titles, states, and cursors remain current, while a revision change
+during an in-flight pagination sequence still fails closed. Local management reads the durable
+active pointer, never the merely most recently updated session row.
+
+Existing CLI saved-agent files are projected into deterministic replay-only histories. Their system,
+memory, and summary records are not shown as chat, tool activity remains non-authoritative, and
+saved grants are ignored. Legacy saves lack an exact model artifact digest, so they cannot be
+continued; continuation requires a future saved-session schema that persists and revalidates exact
+workspace, model ID, artifact SHA-256, and live tool capability. This is Android development
+evidence, not a support promotion or permission for parallel active sessions.

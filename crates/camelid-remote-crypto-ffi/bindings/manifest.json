@@ -1,0 +1,27 @@
+{
+  "schema": "camelid.remote-crypto-bindings/v1",
+  "generator": "uniffi/0.32.0",
+  "crate": "camelid-remote-crypto-ffi/0.0.0",
+  "files": [
+    {
+      "path": "CamelidRemoteCrypto.swift",
+      "bytes": 42614,
+      "sha256": "a792a03bc045757a27bbf20adaa261b02ed4aac730082fb149365e3bcf4c1aed"
+    },
+    {
+      "path": "CamelidRemoteCryptoFFI.h",
+      "bytes": 35861,
+      "sha256": "91f7c2887b167d75e001ef553ba409b49c1633e8cbe2c3bb6c779001faa610c2"
+    },
+    {
+      "path": "CamelidRemoteCryptoFFI.modulemap",
+      "bytes": 154,
+      "sha256": "3b4f1eaf2a86de8de792e3156d4f5fc0a9543fb8eff531afc5303cd7f4f1f70b"
+    },
+    {
+      "path": "ai/camelid/remote/crypto/camelid_remote_crypto_ffi.kt",
+      "bytes": 95676,
+      "sha256": "88855faf6cfc0890ea831ca308783100c1bbde18fd025ed0a760d1687019c728"
+    }
+  ]
+}

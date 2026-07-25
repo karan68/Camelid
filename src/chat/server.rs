@@ -72,3 +72,45 @@ impl Drop for ServerHandle {
         }
     }
 }
+
+pub struct RemoteHostServerHandle {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl RemoteHostServerHandle {
+    pub async fn start(
+        addr: SocketAddr,
+        client: &Client,
+        models_dir: std::path::PathBuf,
+        remote_management: super::remote_control::RemoteManagementHandle,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            client.health().is_none(),
+            "remote host requires an unused --addr so it can own its local management API"
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::api::serve_remote_host(addr, models_dir, remote_management, server_shutdown)
+                    .await
+            {
+                tracing::error!(%error, "remote host local API stopped");
+            }
+        });
+        for _ in 0..150 {
+            if client.health().is_some() {
+                return Ok(Self { shutdown });
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        shutdown.cancel();
+        anyhow::bail!("remote host local API did not become healthy at {addr} within 30s");
+    }
+}
+
+impl Drop for RemoteHostServerHandle {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}

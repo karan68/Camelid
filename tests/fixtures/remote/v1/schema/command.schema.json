@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.invalid/schema/remote/v1/command.schema.json",
+  "type": "object",
+  "oneOf": [
+    {
+      "required": ["command", "command_id", "turn_id", "text"],
+      "properties": {
+        "command": { "const": "start_turn" },
+        "command_id": { "type": "string", "format": "uuid" },
+        "turn_id": { "type": "string", "format": "uuid" },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "Authoritative decoders enforce at most 4096 UTF-8 bytes, not code points."
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "required": ["command", "command_id", "turn_id", "call_id", "approval_id", "action_digest", "decision"],
+      "properties": {
+        "command": { "const": "approval_decision" },
+        "command_id": { "type": "string", "format": "uuid" },
+        "turn_id": { "type": "string", "format": "uuid" },
+        "call_id": { "type": "string", "format": "uuid" },
+        "approval_id": { "type": "string", "format": "uuid" },
+        "action_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "decision": { "enum": ["allow_once", "deny", "abort_turn"] }
+      },
+      "additionalProperties": false
+    },
+    {
+      "required": ["command", "command_id", "turn_id"],
+      "properties": {
+        "command": { "const": "cancel_turn" },
+        "command_id": { "type": "string", "format": "uuid" },
+        "turn_id": { "type": "string", "format": "uuid" }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

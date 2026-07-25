@@ -1,0 +1,15 @@
+{
+  "protocol": "camelid.remote/v1",
+  "message_id": "10000000-0000-4000-8000-000000000001",
+  "kind": "command",
+  "host_id": "20000000-0000-4000-8000-000000000002",
+  "device_id": "30000000-0000-4000-8000-000000000003",
+  "session_id": "40000000-0000-4000-8000-000000000004",
+  "sent_at_unix_ms": 1780000000000,
+  "payload": {
+    "command": "start_turn",
+    "command_id": "50000000-0000-4000-8000-000000000005",
+    "turn_id": "60000000-0000-4000-8000-000000000006",
+    "text": "Run the focused tests and fix the failure"
+  }
+}

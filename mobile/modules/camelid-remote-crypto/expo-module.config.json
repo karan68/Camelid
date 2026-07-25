@@ -1,0 +1,9 @@
+{
+  "platforms": ["android", "apple"],
+  "apple": {
+    "modules": ["CamelidRemoteCryptoModule"]
+  },
+  "android": {
+    "modules": ["ai.camelid.remote.crypto.expo.CamelidRemoteCryptoModule"]
+  }
+}

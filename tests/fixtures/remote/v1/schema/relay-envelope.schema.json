@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.invalid/schema/remote/v1/relay-envelope.schema.json",
+  "type": "object",
+  "required": ["relay_protocol", "route_id", "connection_id", "frame_type", "payload_base64"],
+  "properties": {
+    "relay_protocol": { "const": "camelid.relay/v1" },
+    "route_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$" },
+    "connection_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "frame_type": { "enum": ["handshake", "transport"] },
+    "payload_base64": { "type": "string" }
+  },
+  "additionalProperties": false,
+  "description": "Semantic JSON form only. One production payload is one Noise record of at most 65535 bytes; larger inner messages use authenticated ordered chunks inside separate records."
+}

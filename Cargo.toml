@@ -6,7 +6,17 @@
 # `--bin camelid`, which never pulls the desktop member into its graph, so the shipped
 # server binary stays byte-for-byte unaffected. See DECISIONS.md D11.
 [workspace]
-members = ["camelid-desktop"]
+members = [
+    "camelid-desktop",
+    "crates/camelid-agent-runtime",
+    "crates/camelid-agent-events",
+    "crates/camelid-remote-protocol",
+    "crates/camelid-remote-crypto",
+    "crates/camelid-remote-crypto-ffi",
+    "crates/camelid-remote-store",
+    "services/camelid-relay",
+    "tools/remote-crypto-bindgen",
+]
 default-members = ["."]
 resolver = "2"
 
@@ -26,6 +36,12 @@ categories = ["api-bindings", "command-line-utilities"]
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.7"
+base64 = "0.22"
+camelid-agent-events = { path = "crates/camelid-agent-events" }
+camelid-agent-runtime = { path = "crates/camelid-agent-runtime" }
+camelid-remote-crypto = { path = "crates/camelid-remote-crypto" }
+camelid-remote-protocol = { path = "crates/camelid-remote-protocol" }
+camelid-remote-store = { path = "crates/camelid-remote-store" }
 clap = { version = "4.5", features = ["derive", "env"] }
 getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -34,18 +50,22 @@ sha2 = "0.10"
 minijinja = { version = "2", features = ["json"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 libc = "0.2"
+futures-util = "0.3"
 rayon = "1"
 ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustyline = "14"
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # CancellationToken for the generation paths: guard/compute lifetime equivalence
 # (see docs/recon/ENGINE_INVERSION_CONDUCTOR.md). sync-only, no extra features.
 tokio-util = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -59,6 +79,7 @@ memmap2 = "0.9"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
@@ -137,6 +158,8 @@ cuda = ["dep:cudarc"]
 alloc-gate = []
 
 [dev-dependencies]
+camelid-relay = { path = "services/camelid-relay" }
+camelid-remote-store = { path = "crates/camelid-remote-store", features = ["test-hooks"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 

@@ -119,6 +119,7 @@ pub struct AppState {
     /// Destructive local-file management is available only when the listener
     /// itself is bound to loopback.
     allow_local_model_delete: bool,
+    remote_management: Option<crate::chat::remote_control::RemoteManagementHandle>,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
     workspace_sessions: workspace::WorkspaceSessionManager,
@@ -168,6 +169,7 @@ impl Default for AppState {
             #[cfg(windows)]
             model_delete_nonce: Arc::from(uuid::Uuid::new_v4().to_string()),
             allow_local_model_delete: false,
+            remote_management: None,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             verification_reports: Arc::new(RwLock::new(HashMap::new())),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
@@ -201,6 +203,14 @@ impl AppState {
 
     fn with_local_model_delete(mut self, allow: bool) -> Self {
         self.allow_local_model_delete = allow;
+        self
+    }
+
+    fn with_remote_management(
+        mut self,
+        remote_management: crate::chat::remote_control::RemoteManagementHandle,
+    ) -> Self {
+        self.remote_management = Some(remote_management);
         self
     }
 
@@ -1920,6 +1930,21 @@ pub fn router_with_state(state: AppState) -> Router {
             "/api/agent/workspace/sessions/:id/decisions",
             post(workspace::decide),
         )
+        .route("/api/agent/remote/status", get(remote_management_status))
+        .route("/api/agent/remote/pairing", post(create_remote_pairing))
+        .route(
+            "/api/agent/remote/pairing/cancel",
+            post(cancel_remote_pairing),
+        )
+        .route(
+            "/api/agent/remote/pairing/:confirmation_id/confirm",
+            post(confirm_remote_pairing),
+        )
+        .route(
+            "/api/agent/remote/devices/:device_id/revoke",
+            post(revoke_remote_management_device),
+        )
+        .route("/api/agent/remote/disable", post(emergency_disable_remote))
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
         .route("/api/models/runnable-receipt", get(runnable_receipt))
@@ -1993,6 +2018,40 @@ pub async fn serve(
             .as_ref()
             .map(crate::workspace_auth::WorkspaceCliCredential::token),
     );
+    serve_with_state(
+        addr,
+        listener,
+        state,
+        open_ui,
+        None,
+        workspace_cli_credential,
+    )
+    .await
+}
+
+pub(crate) async fn serve_remote_host(
+    addr: SocketAddr,
+    models_dir: PathBuf,
+    remote_management: crate::chat::remote_control::RemoteManagementHandle,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let state = AppState::default()
+        .with_local_model_delete(addr.ip().is_loopback())
+        .with_models_dir(Some(models_dir))
+        .with_remote_management(remote_management)
+        .with_serve_addr(addr);
+    serve_with_state(addr, listener, state, false, Some(shutdown), None).await
+}
+
+async fn serve_with_state(
+    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    open_ui: bool,
+    shutdown: Option<tokio_util::sync::CancellationToken>,
+    workspace_cli_credential: Option<crate::workspace_auth::WorkspaceCliCredential>,
+) -> std::io::Result<()> {
     tracing::info!(%addr, "camelid server listening");
     let url = format!("http://{addr}");
 
@@ -2017,7 +2076,17 @@ pub async fn serve(
     // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
     // to the old lazy build and is not fatal.
     let warm_model_id = state.active_model_id.read().await.clone();
-    let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
+    let server = tokio::spawn(async move {
+        let application = axum::serve(listener, router_with_state(state));
+        match shutdown {
+            Some(shutdown) => {
+                application
+                    .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                    .await
+            }
+            None => application.await,
+        }
+    });
     if let Some(model_id) = warm_model_id {
         // Word the banner for the device that will actually serve â€” saying "GPU"
         // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
@@ -18522,7 +18591,6 @@ struct DeleteLocalModelResponse {
     bytes_freed: u64,
 }
 
-#[cfg(windows)]
 fn local_management_request_allowed(headers: &HeaderMap) -> bool {
     let authority = headers
         .get("host")
@@ -18557,6 +18625,204 @@ fn local_management_request_allowed(headers: &HeaderMap) -> bool {
             .get("sec-fetch-site")
             .and_then(|value| value.to_str().ok())
             == Some("same-origin")
+}
+
+async fn remote_management_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.allow_local_model_delete || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "remote management is available only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    let Some(management) = state.remote_management.as_ref() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "remote_management_unavailable",
+            "this local API is not owned by a remote host".to_string(),
+            None,
+        );
+    };
+    match management.status() {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote_management_unavailable",
+            format!("remote management is unavailable: {error:?}"),
+            None,
+        ),
+    }
+}
+
+async fn create_remote_pairing(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.allow_local_model_delete || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "remote pairing is available only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    let Some(management) = state.remote_management.as_ref() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "remote_management_unavailable",
+            "this local API is not owned by a remote host".to_string(),
+            None,
+        );
+    };
+    match management.create_pairing_offer().await {
+        Ok(offer) => {
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store, max-age=0"),
+            );
+            response_headers.insert(
+                axum::http::header::PRAGMA,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            (response_headers, Json(offer)).into_response()
+        }
+        Err(_) => api_error(
+            StatusCode::CONFLICT,
+            "pairing_offer_active",
+            "cancel the current pairing offer or wait for it to expire before creating another"
+                .to_string(),
+            None,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmRemotePairingRequest {
+    accepted: bool,
+}
+
+async fn confirm_remote_pairing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(confirmation_id): AxumPath<uuid::Uuid>,
+    Json(request): Json<ConfirmRemotePairingRequest>,
+) -> Response {
+    if !state.allow_local_model_delete || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "remote pairing is available only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    let Some(management) = state.remote_management.as_ref() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "remote_management_unavailable",
+            "this local API is not owned by a remote host".to_string(),
+            None,
+        );
+    };
+    match management
+        .confirm_pairing(confirmation_id, request.accepted)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => api_error(
+            StatusCode::CONFLICT,
+            "pairing_confirmation_stale",
+            "the pending pairing no longer matches this confirmation".to_string(),
+            None,
+        ),
+    }
+}
+
+async fn cancel_remote_pairing(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.allow_local_model_delete || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "remote pairing is available only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    let Some(management) = state.remote_management.as_ref() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "remote_management_unavailable",
+            "this local API is not owned by a remote host".to_string(),
+            None,
+        );
+    };
+    match management.cancel_pairing().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => api_error(
+            StatusCode::CONFLICT,
+            "pairing_cancel_failed",
+            "the running remote host could not cancel pairing".to_string(),
+            None,
+        ),
+    }
+}
+
+async fn revoke_remote_management_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(device_id): AxumPath<uuid::Uuid>,
+) -> Response {
+    if !state.allow_local_model_delete || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "remote management is available only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    let Some(management) = state.remote_management.as_ref() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "remote_management_unavailable",
+            "this local API is not owned by a remote host".to_string(),
+            None,
+        );
+    };
+    match management.revoke_device(device_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => api_error(
+            StatusCode::CONFLICT,
+            "remote_device_revoke_failed",
+            "the device could not be revoked by the running remote host".to_string(),
+            None,
+        ),
+    }
+}
+
+async fn emergency_disable_remote(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.allow_local_model_delete || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "remote management is available only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    let Some(management) = state.remote_management.as_ref() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "remote_management_unavailable",
+            "this local API is not owned by a remote host".to_string(),
+            None,
+        );
+    };
+    match management.emergency_disable().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => api_error(
+            StatusCode::CONFLICT,
+            "remote_emergency_disable_failed",
+            "the running remote host could not complete emergency disable".to_string(),
+            None,
+        ),
+    }
 }
 
 #[cfg(windows)]
@@ -19174,14 +19440,23 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
 /// gated, so an exact-filename match is the honest server-side "is this a supported
 /// row?" test. Deliberately conservative: a supported model loaded under a
 /// non-curated filename classifies as experimental, never falsely as supported.
-fn filename_is_supported_exact_row(filename: &str) -> bool {
+pub(crate) fn supported_compatibility_row_id_for_filename(filename: &str) -> Option<&'static str> {
     let supported = supported_compatibility_row_ids();
-    curated_catalog()
+    let row_id = curated_catalog()
         .iter()
-        .any(|c| c.filename == filename && supported.contains(c.catalog_id))
-        || NON_CATALOG_SUPPORTED_ARTIFACTS
-            .iter()
-            .any(|(artifact, row_id)| *artifact == filename && supported.contains(row_id))
+        .find(|item| item.filename == filename)
+        .map(|item| item.catalog_id)
+        .or_else(|| {
+            NON_CATALOG_SUPPORTED_ARTIFACTS
+                .iter()
+                .find(|(artifact, _)| *artifact == filename)
+                .map(|(_, row_id)| *row_id)
+        })?;
+    supported.contains(row_id).then_some(row_id)
+}
+
+fn filename_is_supported_exact_row(filename: &str) -> bool {
+    supported_compatibility_row_id_for_filename(filename).is_some()
 }
 
 /// Classify a model from real header metadata. `architecture` is the parsed

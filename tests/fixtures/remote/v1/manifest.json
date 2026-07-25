@@ -1,0 +1,16 @@
+{
+  "protocol": "camelid.remote/v1",
+  "approval_record_schema": "camelid.approval-record/v1",
+  "noise_suite_candidate": "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+  "schema_count": 6,
+  "max_noise_record_bytes": 65535,
+  "noise_tag_bytes": 16,
+  "chunk_header_bytes": 64,
+  "max_chunk_data_bytes": 65455,
+  "max_message_chunks": 18,
+  "max_inner_message_bytes": 1114112,
+  "max_turn_text_utf8_bytes": 4096,
+  "max_approval_record_bytes": 1048576,
+  "max_replay_events": 256,
+  "approval_fixture_digest": "sha256:995876c30076bb24a3273e215dcd0839eceef86fcb97bce4c9a1a8038fab6fdd"
+}

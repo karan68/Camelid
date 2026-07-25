@@ -1,0 +1,2 @@
+[crate-roots]
+camelid_remote_crypto_ffi = "../../crates/camelid-remote-crypto-ffi"

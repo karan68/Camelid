@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "relay_url": "wss://relay.example.test/v1/connect",
+  "route_id": "AAAAAAAAAAAAAAAAAAAAAA",
+  "host_id": "20000000-0000-4000-8000-000000000002",
+  "host_noise_public": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "pairing_secret": "BBBBBBBBBBBBBBBBBBBBBB",
+  "expires_at_unix_ms": 1780000300000
+}

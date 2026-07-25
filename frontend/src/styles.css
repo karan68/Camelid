@@ -10,5 +10,6 @@
 @import './styles/chat.css';
 @import './styles/workspace.css';
 @import './styles/views.css';
+@import './styles/remote.css';
 @import './styles/cluster.css';
 @import './styles/observatory.css';

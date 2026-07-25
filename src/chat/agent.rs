@@ -16,6 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use uuid::Uuid;
+
+use camelid_agent_events::{
+    AgentEvent, AgentEventSink, ApprovalDecision as EventApprovalDecision, ApprovalSettlement,
+    ApprovalTier as EventApprovalTier, ModelTiming, ToolResultRecord, ToolRisk, ValidatedToolCall,
+};
 
 use super::audit::{self, AuditEvent, AuditSink};
 use super::banner;
@@ -128,11 +134,31 @@ pub enum Decision {
     AlwaysTool,
     /// Abort the whole loop.
     Abort,
+    /// The remote approval deadline elapsed.
+    Expired,
+    /// Cancellation or restart settled the approval before a device decision.
+    InvalidatedByCancel,
 }
 
 /// Approves (or denies) gated actions, shown the *validated* action.
 pub trait Approver {
     fn approve(&mut self, action: &Action, sandbox: &Sandbox) -> Decision;
+
+    fn approve_scoped(
+        &mut self,
+        action: &Action,
+        sandbox: &Sandbox,
+        _scope: ApprovalScope<'_>,
+    ) -> Decision {
+        self.approve(action, sandbox)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalScope<'a> {
+    pub approval_id: Uuid,
+    pub call_id: Uuid,
+    pub action_digest: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -323,6 +349,33 @@ pub fn run_loop(
     policy: &mut Policy,
     history: &mut Vec<AgentMsg>,
 ) -> LoopEnd {
+    run_loop_in(
+        driver,
+        approver,
+        reporter,
+        sandbox,
+        cfg,
+        cancel,
+        policy,
+        history,
+        tools::ToolState::Global,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop_in(
+    driver: &mut dyn ModelDriver,
+    approver: &mut dyn Approver,
+    reporter: &mut dyn Reporter,
+    sandbox: &Sandbox,
+    cfg: &AgentConfig,
+    cancel: &AtomicBool,
+    policy: &mut Policy,
+    history: &mut Vec<AgentMsg>,
+    tool_state: tools::ToolState<'_>,
+    mut event_sink: Option<&mut dyn AgentEventSink>,
+) -> LoopEnd {
     let tools = tools::specs_for(cfg.tool_profile, cfg.allow_net, sandbox.shell_mode());
     // Per-call (count, last_result): the no-progress guard is result-aware (see
     // `note_no_progress`).
@@ -405,6 +458,19 @@ pub fn run_loop(
         };
         if let Some(metrics) = driver.take_step_metrics() {
             reporter.model_timing(metrics);
+            if !emit_structured(
+                &mut event_sink,
+                AgentEvent::Timing {
+                    metrics: ModelTiming {
+                        total_ms: metrics.total_ms,
+                        ttft_ms: metrics.ttft_ms,
+                        output_tokens: metrics.output_tokens,
+                    },
+                },
+                reporter,
+            ) {
+                return LoopEnd::DriverError;
+            }
         }
         // Ctrl-C lands DURING a step more often than between steps (a streamed
         // answer takes seconds). A TRUNCATED step is discarded whole, always:
@@ -414,7 +480,7 @@ pub fn run_loop(
         // helps nobody) — the workspace lane discards unconditionally, matching
         // its stricter turn-settlement contract.
         if cancel.load(Ordering::Relaxed)
-            && (driver.last_step_truncated() || cfg.tool_profile.is_workspace())
+            && (driver.last_step_truncated() || cfg.tool_profile.discards_cancelled_step())
         {
             reporter.notice("aborted");
             return LoopEnd::Aborted;
@@ -502,6 +568,15 @@ pub fn run_loop(
                     continue;
                 }
                 reporter.model_text(&text);
+                if !emit_structured(
+                    &mut event_sink,
+                    AgentEvent::ModelAnswer {
+                        content: text.clone(),
+                    },
+                    reporter,
+                ) {
+                    return LoopEnd::DriverError;
+                }
                 history.push(AgentMsg::Assistant(text));
                 return LoopEnd::Answered;
             }
@@ -552,15 +627,130 @@ pub fn run_loop(
                     // approver; Deny never runs. The sandbox already validated the
                     // action regardless of tier (auto relaxes *prompting* only).
                     let tier = policy.tier_for(&action);
+                    let call_id = Uuid::new_v4();
+                    let event_call = if tier == ApprovalTier::Confirm {
+                        match action.remote_approval_record(sandbox).and_then(|record| {
+                            ValidatedToolCall::gated(
+                                call_id,
+                                record,
+                                action.approval_detail(sandbox),
+                            )
+                            .map_err(|error| error.to_string())
+                        }) {
+                            Ok(record) => Some(record),
+                            Err(error) if event_sink.is_some() => {
+                                reporter.notice(&format!(
+                                    "structured approval record unavailable: {error}"
+                                ));
+                                return LoopEnd::DriverError;
+                            }
+                            Err(_) => None,
+                        }
+                    } else if event_sink.is_some() {
+                        match ValidatedToolCall::ungated(
+                            call_id,
+                            action.tool_name(),
+                            event_tool_risk(action.risk()),
+                            event_approval_tier(tier),
+                            action.call_line(sandbox),
+                        ) {
+                            Ok(record) => Some(record),
+                            Err(error) => {
+                                reporter.notice(&format!(
+                                    "structured tool record unavailable: {error}"
+                                ));
+                                return LoopEnd::DriverError;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(record) = event_call.as_ref() {
+                        if !emit_structured(
+                            &mut event_sink,
+                            AgentEvent::ToolCall {
+                                record: record.clone(),
+                            },
+                            reporter,
+                        ) {
+                            return LoopEnd::DriverError;
+                        }
+                    }
+                    let approval_id = if tier == ApprovalTier::Confirm {
+                        let approval_id = Uuid::new_v4();
+                        if let Some(record) = event_call.as_ref() {
+                            if !emit_structured(
+                                &mut event_sink,
+                                AgentEvent::ApprovalRequired {
+                                    approval_id,
+                                    record: record.clone(),
+                                },
+                                reporter,
+                            ) {
+                                return LoopEnd::DriverError;
+                            }
+                        }
+                        Some(approval_id)
+                    } else {
+                        None
+                    };
                     let decision = match tier {
                         ApprovalTier::Auto => Decision::Once,
-                        ApprovalTier::Confirm => approver.approve(&action, sandbox),
+                        ApprovalTier::Confirm => match (approval_id, event_call.as_ref()) {
+                            (Some(approval_id), Some(record)) => approver.approve_scoped(
+                                &action,
+                                sandbox,
+                                ApprovalScope {
+                                    approval_id,
+                                    call_id,
+                                    action_digest: record.action_digest().unwrap_or_default(),
+                                },
+                            ),
+                            _ => approver.approve(&action, sandbox),
+                        },
                         ApprovalTier::Deny => Decision::No,
                     };
+                    let decision = if event_sink.is_some() && decision == Decision::AlwaysTool {
+                        reporter.notice("remote v1 does not allow persistent approval grants");
+                        Decision::No
+                    } else {
+                        decision
+                    };
+                    if let (Some(approval_id), Some(record)) = (approval_id, event_call.as_ref()) {
+                        let settlement = ApprovalSettlement {
+                            approval_id,
+                            call_id,
+                            action_digest: record.action_digest().unwrap_or_default().to_string(),
+                            decision: match decision {
+                                Decision::Once => EventApprovalDecision::AllowOnce,
+                                Decision::No | Decision::AlwaysTool => EventApprovalDecision::Deny,
+                                Decision::Abort => EventApprovalDecision::AbortTurn,
+                                Decision::Expired => EventApprovalDecision::Expired,
+                                Decision::InvalidatedByCancel => {
+                                    EventApprovalDecision::InvalidatedByCancel
+                                }
+                            },
+                        };
+                        if !emit_structured(
+                            &mut event_sink,
+                            AgentEvent::ApprovalSettled { settlement },
+                            reporter,
+                        ) {
+                            return LoopEnd::DriverError;
+                        }
+                    }
 
                     let outcome = match decision {
                         Decision::Abort => {
                             reporter.notice("aborted by user");
+                            return LoopEnd::Aborted;
+                        }
+                        Decision::Expired => {
+                            reporter.notice("approval expired");
+                            return LoopEnd::Aborted;
+                        }
+                        Decision::InvalidatedByCancel => {
+                            reporter.notice("cancelled while waiting for approval");
                             return LoopEnd::Aborted;
                         }
                         Decision::No => {
@@ -576,11 +766,23 @@ pub fn run_loop(
                         }
                         Decision::AlwaysTool => {
                             policy.grant(action.tool_name());
-                            execute_audited(&action, sandbox, tier, &call.args, cfg.audit.as_ref())
+                            execute_audited(
+                                &action,
+                                sandbox,
+                                tier,
+                                &call.args,
+                                cfg.audit.as_ref(),
+                                tool_state,
+                            )
                         }
-                        Decision::Once => {
-                            execute_audited(&action, sandbox, tier, &call.args, cfg.audit.as_ref())
-                        }
+                        Decision::Once => execute_audited(
+                            &action,
+                            sandbox,
+                            tier,
+                            &call.args,
+                            cfg.audit.as_ref(),
+                            tool_state,
+                        ),
                     };
                     let outcome = match cfg.tool_profile.observation_limit() {
                         Some(max_bytes) => outcome.clipped(max_bytes),
@@ -597,6 +799,35 @@ pub fn run_loop(
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
+                    if !emit_structured(
+                        &mut event_sink,
+                        AgentEvent::ToolResult {
+                            record: ToolResultRecord {
+                                call_id,
+                                tool: name.to_string(),
+                                is_error: outcome.is_err(),
+                                content: outcome.text().to_string(),
+                            },
+                        },
+                        reporter,
+                    ) {
+                        return LoopEnd::DriverError;
+                    }
+                    if name == "update_plan" && !outcome.is_err() {
+                        let steps = match tool_state {
+                            tools::ToolState::Runtime { plan, .. } => plan.snapshot().ok(),
+                            tools::ToolState::Global => None,
+                        };
+                        if let Some(steps) = steps {
+                            if !emit_structured(
+                                &mut event_sink,
+                                AgentEvent::PlanUpdated { steps },
+                                reporter,
+                            ) {
+                                return LoopEnd::DriverError;
+                            }
+                        }
+                    }
                     // Result-aware no-progress guard: stop only if the SAME call has
                     // returned the SAME result REPEAT_LIMIT times in a row. A call
                     // whose result keeps changing — e.g. polling
@@ -627,6 +858,130 @@ pub fn run_loop(
         cfg.max_steps
     ));
     LoopEnd::StepCapped
+}
+
+pub fn run_loop_with_runtime(
+    driver: &mut dyn ModelDriver,
+    approver: &mut dyn Approver,
+    reporter: &mut dyn Reporter,
+    sandbox: &Sandbox,
+    cfg: &AgentConfig,
+    policy: &mut Policy,
+    runtime: &camelid_agent_runtime::AgentRuntime<AgentMsg>,
+) -> LoopEnd {
+    run_loop_with_runtime_cancel(
+        driver,
+        approver,
+        reporter,
+        sandbox,
+        cfg,
+        runtime.cancel().as_atomic(),
+        policy,
+        runtime,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_loop_with_runtime_events(
+    driver: &mut dyn ModelDriver,
+    approver: &mut dyn Approver,
+    reporter: &mut dyn Reporter,
+    sandbox: &Sandbox,
+    cfg: &AgentConfig,
+    policy: &mut Policy,
+    runtime: &camelid_agent_runtime::AgentRuntime<AgentMsg>,
+    event_sink: &mut dyn AgentEventSink,
+) -> LoopEnd {
+    if cfg.tool_profile != tools::ToolProfile::RemoteV1 {
+        reporter.notice("structured remote events require the remote-v1 tool profile");
+        return LoopEnd::DriverError;
+    }
+    run_loop_with_runtime_cancel(
+        driver,
+        approver,
+        reporter,
+        sandbox,
+        cfg,
+        runtime.cancel().as_atomic(),
+        policy,
+        runtime,
+        Some(event_sink),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop_with_runtime_cancel(
+    driver: &mut dyn ModelDriver,
+    approver: &mut dyn Approver,
+    reporter: &mut dyn Reporter,
+    sandbox: &Sandbox,
+    cfg: &AgentConfig,
+    cancel: &AtomicBool,
+    policy: &mut Policy,
+    runtime: &camelid_agent_runtime::AgentRuntime<AgentMsg>,
+    event_sink: Option<&mut dyn AgentEventSink>,
+) -> LoopEnd {
+    let mut history = match runtime.transcript().snapshot() {
+        Ok(history) => history,
+        Err(_) => {
+            reporter.notice("agent runtime transcript is unavailable");
+            return LoopEnd::DriverError;
+        }
+    };
+    let end = run_loop_in(
+        driver,
+        approver,
+        reporter,
+        sandbox,
+        cfg,
+        cancel,
+        policy,
+        &mut history,
+        tools::ToolState::Runtime {
+            plan: runtime.plan(),
+            checkpoints: runtime.checkpoints(),
+        },
+        event_sink,
+    );
+    if runtime.transcript().replace(history).is_err() {
+        reporter.notice("agent runtime transcript is unavailable");
+        return LoopEnd::DriverError;
+    }
+    end
+}
+
+fn emit_structured(
+    sink: &mut Option<&mut dyn AgentEventSink>,
+    event: AgentEvent,
+    reporter: &mut dyn Reporter,
+) -> bool {
+    let Some(sink) = sink.as_deref_mut() else {
+        return true;
+    };
+    if sink.emit(event).is_err() {
+        reporter.notice("structured agent event sink is unavailable");
+        return false;
+    }
+    true
+}
+
+fn event_approval_tier(tier: ApprovalTier) -> EventApprovalTier {
+    match tier {
+        ApprovalTier::Auto => EventApprovalTier::Auto,
+        ApprovalTier::Confirm => EventApprovalTier::Confirm,
+        ApprovalTier::Deny => EventApprovalTier::Deny,
+    }
+}
+
+fn event_tool_risk(risk: tools::Risk) -> ToolRisk {
+    match risk {
+        tools::Risk::Read => ToolRisk::Read,
+        tools::Risk::Write => ToolRisk::Write,
+        tools::Risk::Exec => ToolRisk::Exec,
+        tools::Risk::Network => ToolRisk::Network,
+        tools::Risk::Plan => ToolRisk::Plan,
+    }
 }
 
 fn workspace_request_requires_observation(history: &[AgentMsg]) -> bool {
@@ -1143,12 +1498,13 @@ fn execute_audited(
     tier: ApprovalTier,
     raw_args: &Value,
     sink: &dyn AuditSink,
+    tool_state: tools::ToolState<'_>,
 ) -> ToolOutcome {
     let tool = action.tool_name();
     let digest = audit::digest_args(raw_args);
     sink.emit(&AuditEvent::call(tool, tier.label(), digest.clone()));
     let start = Instant::now();
-    let outcome = action.execute(sandbox);
+    let outcome = action.execute_with_state(sandbox, tool_state);
     sink.emit(&AuditEvent::result(
         tool,
         tier.label(),
@@ -1648,6 +2004,10 @@ impl LiveDriver {
     pub fn set_stream_control(&mut self, cancel: std::sync::Arc<AtomicBool>, timeout: Duration) {
         self.stream_cancel = Some(cancel);
         self.stream_timeout = Some(timeout);
+    }
+
+    pub fn set_stream_cancel(&mut self, cancel: std::sync::Arc<AtomicBool>) {
+        self.stream_cancel = Some(cancel);
     }
 
     pub fn set_native_tool_history(&mut self, enabled: bool) {

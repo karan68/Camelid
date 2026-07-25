@@ -1,0 +1,23 @@
+[package]
+name = "camelid-remote-crypto"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+description = "Fixed-suite Noise core for Camelid remote control"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+snow = { version = "=0.10.0", default-features = false, features = [
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-getrandom",
+] }
+thiserror = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

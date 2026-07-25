@@ -11,6 +11,7 @@ import {
 
 const NAV = [
   { tab: 'workspace', label: 'Workspace', Icon: IconBolt },
+  { tab: 'remote', label: 'Remote control', Icon: IconNetwork },
   { tab: 'library', label: 'Models', Icon: IconModels },
   { tab: 'history', label: 'Chat history', Icon: IconHistory },
   { tab: 'analytics', label: 'Analytics', Icon: IconAnalytics },

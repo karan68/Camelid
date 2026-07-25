@@ -18,10 +18,10 @@
 
 use std::io::Stdout;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use camelid_agent_runtime::AgentRuntime;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -38,7 +38,7 @@ use ratatui::{Frame, Terminal};
 use super::agent::{
     self, AgentConfig, AgentMsg, Approver, Decision, LiveDriver, LoopEnd, Policy, Reporter,
 };
-use super::session::{self, Session};
+use super::session::Session;
 use super::shell_sandbox::ShellSandbox;
 use super::theme::Theme;
 use super::tools::{Action, Sandbox, ToolOutcome};
@@ -60,7 +60,7 @@ struct Engine {
     /// other file" refers to something. Also what /save persists and /resume
     /// restores. Seeded per goal through [`agent::seed_history`], which
     /// rebuilds the System message fresh and drops any carried one.
-    transcript: Vec<AgentMsg>,
+    runtime: AgentRuntime<AgentMsg>,
 }
 
 /// A transcript entry, rendered to width-aware lines each frame.
@@ -191,15 +191,13 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         cfg.shell_sandbox,
     ));
 
-    super::checkpoint::clear();
-
     let driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     let engine = Box::new(Engine {
         driver,
         sandbox,
         cfg,
         policy,
-        transcript: Vec::new(),
+        runtime: AgentRuntime::default(),
     });
 
     enable_raw_mode()?;
@@ -256,6 +254,7 @@ struct App<'a> {
     engine: Option<Box<Engine>>,
     rx: Option<Receiver<Ev>>,
     running: bool,
+    active_runtime: Option<AgentRuntime<AgentMsg>>,
     started: Option<Instant>,
     approval: Option<PendingApproval>,
 
@@ -300,6 +299,7 @@ impl<'a> App<'a> {
             engine: Some(engine),
             rx: None,
             running: false,
+            active_runtime: None,
             started: None,
             approval: None,
             in_hist: Vec::new(),
@@ -353,7 +353,7 @@ impl<'a> App<'a> {
         }
         // On quit, cancel any running goal and release a pending approval so the
         // detached worker unwinds instead of blocking on the approval channel.
-        session::CANCEL.store(true, Ordering::SeqCst);
+        self.request_stop();
         if let Some(p) = self.approval.take() {
             let _ = p.reply.send(Decision::Abort);
         }
@@ -387,6 +387,7 @@ impl<'a> App<'a> {
         if disconnected && self.running {
             self.running = false;
             self.rx = None;
+            self.active_runtime = None;
             self.approval = None;
             self.status = "agent stopped unexpectedly".into();
         }
@@ -433,8 +434,11 @@ impl<'a> App<'a> {
                 // steps the model left in-progress so the sidebar stops
                 // showing "N/N done" short of the total on a successful run.
                 if matches!(end, LoopEnd::Answered) {
-                    super::plan::complete_all();
+                    if let Some(engine) = &self.engine {
+                        let _ = super::plan::complete_all_in(engine.runtime.plan());
+                    }
                 }
+                self.active_runtime = None;
                 self.push(Entry::Notice(end_label(end).to_string()));
                 self.status = "describe a goal · /tools /steps /subagents · F1 help".into();
             }
@@ -477,40 +481,59 @@ impl<'a> App<'a> {
         };
         // Move the engine out of its box so the worker borrows disjoint fields.
         let mut engine: Engine = *boxed;
+        let carried = match engine.runtime.transcript().snapshot() {
+            Ok(transcript) => transcript,
+            Err(_) => {
+                self.engine = Some(Box::new(engine));
+                self.status = "agent runtime transcript is unavailable".into();
+                return;
+            }
+        };
         self.push(Entry::Goal(goal.clone()));
         let (tx, rx) = std::sync::mpsc::channel();
-        session::CANCEL.store(false, Ordering::SeqCst);
+        let cancel = engine.runtime.cancel().clone();
+        cancel.reset();
+        self.active_runtime = Some(engine.runtime.clone());
         std::thread::spawn(move || {
             let tools = super::tools::specs(engine.cfg.allow_net, engine.sandbox.shell_mode());
             // Re-read per goal: the project file may be edited mid-session.
             let project = agent::load_project_context(&engine.sandbox);
-            if engine.transcript.is_empty() {
+            if carried.is_empty() {
                 // A fresh session gets a fresh plan; a continuing one keeps
                 // what it was carrying (a /resume restored it).
-                super::plan::clear();
+                let _ = super::plan::clear_in(engine.runtime.plan());
             }
             let system =
                 agent::system_prompt_with_project(&engine.sandbox, &tools, project.as_ref());
-            let mut history = agent::seed_history(&engine.transcript, system, &goal);
+            let history = agent::seed_history(&carried, system, &goal);
+            if engine.runtime.transcript().replace(history).is_err() {
+                let _ = tx.send(Ev::Notice("agent runtime transcript is unavailable".into()));
+                let _ = tx.send(Ev::Done {
+                    end: LoopEnd::DriverError,
+                    engine: Box::new(engine),
+                });
+                return;
+            }
             let mut reporter = ChannelReporter { tx: tx.clone() };
             let mut approver = ChannelApprover { tx: tx.clone() };
+            engine
+                .driver
+                .set_stream_cancel(engine.runtime.cancel().as_atomic_arc());
             // Stream the model's tokens live into the redraw loop's `live` buffer.
             let delta_tx = tx.clone();
             engine.driver.set_delta_sink(Some(Box::new(move |d: &str| {
                 let _ = delta_tx.send(Ev::Delta(d.to_string()));
             })));
-            let end = agent::run_loop(
+            let end = agent::run_loop_with_runtime(
                 &mut engine.driver,
                 &mut approver,
                 &mut reporter,
                 &engine.sandbox,
                 &engine.cfg,
-                &session::CANCEL,
                 &mut engine.policy,
-                &mut history,
+                &engine.runtime,
             );
             engine.driver.set_delta_sink(None);
-            engine.transcript = history;
             let _ = tx.send(Ev::Done {
                 end,
                 engine: Box::new(engine),
@@ -529,7 +552,7 @@ impl<'a> App<'a> {
             "exit" | "quit" => self.quit = true,
             "stop" => {
                 if self.running {
-                    session::CANCEL.store(true, Ordering::SeqCst);
+                    self.request_stop();
                     if let Some(p) = self.approval.take() {
                         let _ = p.reply.send(Decision::Abort);
                     }
@@ -544,6 +567,20 @@ impl<'a> App<'a> {
                 self.status = match self.engine.as_ref() {
                     None => "busy — /save when idle".into(),
                     Some(e) => {
+                        let transcript = match e.runtime.transcript().snapshot() {
+                            Ok(transcript) => transcript,
+                            Err(_) => {
+                                self.status = "agent runtime transcript is unavailable".into();
+                                return;
+                            }
+                        };
+                        let plan = match super::plan::get_in(e.runtime.plan()) {
+                            Ok(plan) => plan,
+                            Err(_) => {
+                                self.status = "agent runtime plan is unavailable".into();
+                                return;
+                            }
+                        };
                         let saved = super::agent_session::SavedAgentSession {
                             id: id.clone(),
                             model_id: self
@@ -553,8 +590,8 @@ impl<'a> App<'a> {
                                 .unwrap_or_else(|| self.session.active_label.clone()),
                             tool_capable: true,
                             workspace: e.sandbox.root().display().to_string(),
-                            transcript: e.transcript.clone(),
-                            plan: super::plan::get(),
+                            transcript,
+                            plan,
                             grants: e.policy.granted(),
                         };
                         match super::agent_session::save(&e.sandbox, &saved) {
@@ -582,8 +619,18 @@ impl<'a> App<'a> {
                                 // Replayed as context, never re-executed; grants
                                 // are NOT restored (a file cannot carry a live
                                 // operator's authority) — list them instead.
-                                e.transcript = s.transcript.clone();
-                                super::plan::set(s.plan.clone());
+                                if e.runtime
+                                    .transcript()
+                                    .replace(s.transcript.clone())
+                                    .is_err()
+                                {
+                                    self.status = "agent runtime transcript is unavailable".into();
+                                    return;
+                                }
+                                if super::plan::set_in(e.runtime.plan(), s.plan.clone()).is_err() {
+                                    self.status = "agent runtime plan is unavailable".into();
+                                    return;
+                                }
                                 if !s.grants.is_empty() {
                                     notices.push(format!(
                                         "grants are not carried across sessions; previously \
@@ -618,23 +665,29 @@ impl<'a> App<'a> {
             }
             "clear" => {
                 if let Some(e) = self.engine.as_mut() {
-                    e.transcript.clear();
+                    let _ = e.runtime.transcript().clear();
+                    let _ = super::plan::clear_in(e.runtime.plan());
                 }
-                super::plan::clear();
                 self.status = "context cleared — the next goal starts fresh".into();
             }
             "diff" | "undo" | "checkpoints" => {
                 let text = match self.engine.as_ref() {
                     Some(e) => match cmd.split_whitespace().next().unwrap_or("") {
-                        "diff" => super::checkpoint::diff(&e.sandbox),
+                        "diff" => super::checkpoint::diff_in(e.runtime.checkpoints(), &e.sandbox)
+                            .unwrap_or_else(|error| error.to_string()),
                         "undo" => {
                             let force = cmd.split_whitespace().nth(1) == Some("force");
-                            match super::checkpoint::undo(&e.sandbox, force) {
+                            match super::checkpoint::undo_in(
+                                e.runtime.checkpoints(),
+                                &e.sandbox,
+                                force,
+                            ) {
                                 Ok(m) => m,
                                 Err(err) => err,
                             }
                         }
-                        _ => super::checkpoint::summary(),
+                        _ => super::checkpoint::summary_in(e.runtime.checkpoints())
+                            .unwrap_or_else(|error| error.to_string()),
                     },
                     None => "busy — try again when idle".into(),
                 };
@@ -663,7 +716,7 @@ impl<'a> App<'a> {
                 };
             }
             "plan" => {
-                let steps = super::plan::get();
+                let steps = self.current_plan();
                 self.push(Entry::Notice(format!(
                     "plan ({}):",
                     super::plan::progress(&steps)
@@ -755,7 +808,7 @@ impl<'a> App<'a> {
         match key.code {
             KeyCode::Char('c') if ctrl => {
                 if self.running {
-                    session::CANCEL.store(true, Ordering::SeqCst);
+                    self.request_stop();
                     self.status = "stopping…".into();
                 } else if !self.input.is_empty() {
                     self.input.clear();
@@ -800,9 +853,27 @@ impl<'a> App<'a> {
         if let Some(p) = self.approval.take() {
             let _ = p.reply.send(d);
             if d == Decision::Abort {
-                session::CANCEL.store(true, Ordering::SeqCst);
+                self.request_stop();
             }
         }
+    }
+
+    fn request_stop(&self) {
+        if let Some(runtime) = &self.active_runtime {
+            runtime.cancel().request();
+        }
+    }
+
+    fn runtime(&self) -> Option<&AgentRuntime<AgentMsg>> {
+        self.active_runtime
+            .as_ref()
+            .or_else(|| self.engine.as_ref().map(|engine| &engine.runtime))
+    }
+
+    fn current_plan(&self) -> Vec<super::plan::Step> {
+        self.runtime()
+            .and_then(|runtime| super::plan::get_in(runtime.plan()).ok())
+            .unwrap_or_default()
     }
 
     fn insert_char(&mut self, c: char) {
@@ -1180,7 +1251,7 @@ impl<'a> App<'a> {
 
         // The plan panel: the agent's own checklist for this goal. Rendered
         // only when it has one, so an agent that never plans costs no space.
-        let steps = super::plan::get();
+        let steps = self.current_plan();
         if !steps.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

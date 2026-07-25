@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.invalid/schema/remote/v1/pairing-qr.schema.json",
+  "type": "object",
+  "required": ["v", "relay_url", "route_id", "host_id", "host_noise_public", "pairing_secret", "expires_at_unix_ms"],
+  "properties": {
+    "v": { "const": 1 },
+    "relay_url": { "type": "string", "format": "uri", "pattern": "^wss://", "maxLength": 2048 },
+    "route_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$" },
+    "host_id": { "type": "string", "format": "uuid" },
+    "host_noise_public": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "pairing_secret": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$" },
+    "expires_at_unix_ms": { "type": "integer", "minimum": 1 }
+  },
+  "additionalProperties": false
+}

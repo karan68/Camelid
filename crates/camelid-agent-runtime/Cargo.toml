@@ -1,0 +1,15 @@
+[package]
+name = "camelid-agent-runtime"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+description = "Session-owned mutable state for Camelid agent runtimes"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

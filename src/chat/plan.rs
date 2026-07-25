@@ -12,6 +12,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use camelid_agent_runtime::{PlanState, PlanStatus, PlanStep, RuntimeStateError};
 use serde::{Deserialize, Serialize};
 
 /// How far along one step is.
@@ -50,8 +51,34 @@ fn state() -> &'static Mutex<Vec<Step>> {
 
 /// Replace the plan. Returns the stored (clamped) steps.
 pub fn set(mut steps: Vec<Step>) -> Vec<Step> {
+    normalize(&mut steps);
+    if let Ok(mut g) = state().lock() {
+        g.clone_from(&steps);
+    }
+    steps
+}
+
+pub fn set_in(runtime: &PlanState, mut steps: Vec<Step>) -> Result<Vec<Step>, RuntimeStateError> {
+    normalize(&mut steps);
+    runtime.replace(steps.into_iter().map(to_runtime).collect())?;
+    get_in(runtime)
+}
+
+pub fn get_in(runtime: &PlanState) -> Result<Vec<Step>, RuntimeStateError> {
+    Ok(runtime.snapshot()?.into_iter().map(from_runtime).collect())
+}
+
+pub fn clear_in(runtime: &PlanState) -> Result<(), RuntimeStateError> {
+    runtime.clear()
+}
+
+pub fn complete_all_in(runtime: &PlanState) -> Result<usize, RuntimeStateError> {
+    runtime.complete_all()
+}
+
+fn normalize(steps: &mut Vec<Step>) {
     steps.truncate(MAX_STEPS);
-    for s in &mut steps {
+    for s in steps {
         let t = s.text.trim();
         s.text = if t.chars().count() > MAX_STEP_CHARS {
             t.chars().take(MAX_STEP_CHARS).collect::<String>() + "…"
@@ -59,10 +86,28 @@ pub fn set(mut steps: Vec<Step>) -> Vec<Step> {
             t.to_string()
         };
     }
-    if let Ok(mut g) = state().lock() {
-        g.clone_from(&steps);
+}
+
+fn to_runtime(step: Step) -> PlanStep {
+    PlanStep {
+        status: match step.status {
+            Status::Pending => PlanStatus::Pending,
+            Status::InProgress => PlanStatus::InProgress,
+            Status::Done => PlanStatus::Done,
+        },
+        text: step.text,
     }
-    steps
+}
+
+fn from_runtime(step: PlanStep) -> Step {
+    Step {
+        status: match step.status {
+            PlanStatus::Pending => Status::Pending,
+            PlanStatus::InProgress => Status::InProgress,
+            PlanStatus::Done => Status::Done,
+        },
+        text: step.text,
+    }
 }
 
 pub fn get() -> Vec<Step> {
@@ -236,6 +281,25 @@ mod tests {
         assert_eq!(stored.len(), MAX_STEPS);
         assert!(stored[0].text.chars().count() <= MAX_STEP_CHARS + 1);
         clear();
+    }
+
+    #[test]
+    fn runtime_plans_are_isolated_and_use_the_same_normalization() {
+        let first = PlanState::default();
+        let second = PlanState::default();
+        let stored = set_in(
+            &first,
+            vec![step(Status::InProgress, "  runtime-owned plan  ")],
+        )
+        .unwrap();
+
+        assert_eq!(stored[0].text, "runtime-owned plan");
+        assert_eq!(get_in(&first).unwrap().len(), 1);
+        assert!(get_in(&second).unwrap().is_empty());
+        assert_eq!(complete_all_in(&first).unwrap(), 1);
+        assert_eq!(get_in(&first).unwrap()[0].status, Status::Done);
+        clear_in(&first).unwrap();
+        assert!(get_in(&first).unwrap().is_empty());
     }
 
     /// A final answer closes out the plan the model left open: pending and

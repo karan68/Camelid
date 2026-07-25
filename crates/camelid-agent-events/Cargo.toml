@@ -1,0 +1,18 @@
+[package]
+name = "camelid-agent-events"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+description = "Structured validated event boundary for Camelid agents"
+
+[dependencies]
+camelid-agent-runtime = { path = "../camelid-agent-runtime" }
+camelid-remote-protocol = { path = "../camelid-remote-protocol" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+uuid = { version = "1", features = ["serde"] }
+
+[lints.rust]
+unsafe_code = "forbid"

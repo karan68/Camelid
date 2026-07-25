@@ -1,0 +1,8 @@
+[crate-roots]
+camelid_remote_crypto_ffi = "../../crates/camelid-remote-crypto-ffi"
+
+[crates.camelid_remote_crypto_ffi.bindings.kotlin]
+package_name = "ai.camelid.remote.crypto"
+cdylib_name = "camelid_remote_crypto_ffi"
+android = false
+generate_immutable_records = true

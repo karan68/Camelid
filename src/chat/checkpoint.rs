@@ -14,6 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use camelid_agent_runtime::{CheckpointRecord, CheckpointStore, RuntimeStateError};
+
 use super::tools::Sandbox;
 
 const DIR: &str = ".camelid/checkpoints";
@@ -113,6 +115,19 @@ pub fn all() -> Vec<Checkpoint> {
     log().lock().map(|g| g.clone()).unwrap_or_default()
 }
 
+pub fn all_in(store: &CheckpointStore) -> Result<Vec<Checkpoint>, RuntimeStateError> {
+    Ok(store
+        .snapshot()?
+        .into_iter()
+        .map(|record| Checkpoint {
+            rel: record.relative_path,
+            backup: record.backup,
+            tool: record.tool,
+            post_hash: record.post_hash,
+        })
+        .collect())
+}
+
 /// Snapshot `path` before it is written. Pair with [`finish`].
 ///
 /// Best-effort by design: a failure to snapshot must not block the edit the
@@ -178,6 +193,34 @@ pub fn finish(pending: Option<Pending>, mutated: bool) {
     }
 }
 
+pub fn finish_in(
+    store: &CheckpointStore,
+    pending: Option<Pending>,
+    mutated: bool,
+) -> Result<(), RuntimeStateError> {
+    let Some(p) = pending else { return Ok(()) };
+    if !mutated {
+        if let Some(backup) = &p.backup {
+            let _ = std::fs::remove_file(backup);
+        }
+        return Ok(());
+    }
+    let record = CheckpointRecord {
+        relative_path: p.rel,
+        backup: p.backup,
+        tool: p.tool,
+        post_hash: content_hash(&p.target),
+    };
+    let backup = record.backup.clone();
+    if let Err(error) = store.push(record) {
+        if let Some(backup) = backup {
+            let _ = std::fs::remove_file(backup);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Undo the most recent checkpoint. Returns what it did.
 ///
 /// Refuses (without `force`) when the file no longer matches the state the
@@ -190,6 +233,40 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
         let g = log().lock().map_err(|_| "checkpoint log poisoned")?;
         g.last().cloned().ok_or("nothing to undo")?
     };
+    undo_checkpoint(sandbox, force, cp, || {
+        log()
+            .lock()
+            .map_err(|_| "checkpoint log poisoned".to_string())?
+            .pop();
+        Ok(())
+    })
+}
+
+pub fn undo_in(store: &CheckpointStore, sandbox: &Sandbox, force: bool) -> Result<String, String> {
+    let cp = store
+        .latest()
+        .map_err(|error| error.to_string())?
+        .map(|record| Checkpoint {
+            rel: record.relative_path,
+            backup: record.backup,
+            tool: record.tool,
+            post_hash: record.post_hash,
+        })
+        .ok_or_else(|| "nothing to undo".to_string())?;
+    undo_checkpoint(sandbox, force, cp, || {
+        store
+            .pop_latest()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn undo_checkpoint(
+    sandbox: &Sandbox,
+    force: bool,
+    cp: Checkpoint,
+    pop: impl FnOnce() -> Result<(), String>,
+) -> Result<String, String> {
     let target = sandbox.resolve(&cp.rel, false)?;
     let target = canonical_target(&target).unwrap_or(target);
 
@@ -222,9 +299,7 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
     }
 
     // Only pop once the guard has passed.
-    if let Ok(mut g) = log().lock() {
-        g.pop();
-    }
+    pop()?;
     match &cp.backup {
         Some(b) => {
             std::fs::copy(b, &target).map_err(|e| format!("restore failed: {e}"))?;
@@ -240,12 +315,19 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
 
 /// A unified-ish diff of every checkpointed file against what is on disk now.
 pub fn diff(sandbox: &Sandbox) -> String {
-    let cps = all();
+    diff_from(sandbox, &all())
+}
+
+pub fn diff_in(store: &CheckpointStore, sandbox: &Sandbox) -> Result<String, RuntimeStateError> {
+    Ok(diff_from(sandbox, &all_in(store)?))
+}
+
+fn diff_from(sandbox: &Sandbox, cps: &[Checkpoint]) -> String {
     if cps.is_empty() {
         return "no changes this session".to_string();
     }
     let mut out = String::new();
-    for cp in &cps {
+    for cp in cps {
         let now = sandbox
             .resolve(&cp.rel, false)
             .ok()
@@ -339,7 +421,14 @@ pub fn line_diff(before: &str, after: &str) -> String {
 
 /// `3 change(s): src/a.rs, src/b.rs`
 pub fn summary() -> String {
-    let cps = all();
+    summary_from(&all())
+}
+
+pub fn summary_in(store: &CheckpointStore) -> Result<String, RuntimeStateError> {
+    Ok(summary_from(&all_in(store)?))
+}
+
+fn summary_from(cps: &[Checkpoint]) -> String {
     if cps.is_empty() {
         return "no checkpoints this session".to_string();
     }
@@ -386,6 +475,31 @@ pub(crate) mod tests {
             "undo must restore byte-identical content"
         );
         clear();
+    }
+
+    #[test]
+    fn runtime_checkpoint_store_commits_inspects_and_undoes_in_isolation() {
+        let first = CheckpointStore::default();
+        let second = CheckpointStore::default();
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = sb(dir.path());
+        let file = dir.path().join("runtime.txt");
+        std::fs::write(&file, "before\n").unwrap();
+
+        let pending = prepare(&sandbox, &file, "edit_file");
+        std::fs::write(&file, "after\n").unwrap();
+        finish_in(&first, pending, true).unwrap();
+
+        assert_eq!(all_in(&first).unwrap().len(), 1);
+        assert!(all_in(&second).unwrap().is_empty());
+        assert!(diff_in(&first, &sandbox).unwrap().contains("+ after"));
+        assert_eq!(summary_in(&first).unwrap(), "1 change(s): runtime.txt");
+        assert_eq!(
+            undo_in(&first, &sandbox, false).unwrap(),
+            "restored runtime.txt"
+        );
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before\n");
+        assert!(all_in(&first).unwrap().is_empty());
     }
 
     #[test]

@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://camelid.invalid/schema/remote/v1/approval-record.schema.json",
+  "type": "object",
+  "required": ["schema", "tool", "risk", "action"],
+  "properties": {
+    "schema": { "const": "camelid.approval-record/v1" },
+    "tool": { "enum": ["write_file", "edit_file", "run_shell", "http_fetch", "web_search"] },
+    "risk": { "enum": ["write", "exec", "network"] },
+    "action": { "$ref": "#/$defs/action" }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "tool": { "const": "write_file" },
+            "risk": { "const": "write" },
+            "action": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "write_file" } }
+            }
+          }
+        },
+        {
+          "properties": {
+            "tool": { "const": "edit_file" },
+            "risk": { "const": "write" },
+            "action": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "edit_file" } }
+            }
+          }
+        },
+        {
+          "properties": {
+            "tool": { "const": "run_shell" },
+            "risk": { "const": "exec" },
+            "action": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "run_shell" } }
+            }
+          }
+        },
+        {
+          "properties": {
+            "tool": { "const": "http_fetch" },
+            "risk": { "const": "network" },
+            "action": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "http_fetch" } }
+            }
+          }
+        },
+        {
+          "properties": {
+            "tool": { "const": "web_search" },
+            "risk": { "const": "network" },
+            "action": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": { "kind": { "const": "web_search" } }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "$defs": {
+    "target": {
+      "type": "object",
+      "required": ["canonical_native", "workspace_display"],
+      "properties": {
+        "canonical_native": { "type": "string", "maxLength": 8192 },
+        "workspace_display": { "type": "string", "maxLength": 8192 }
+      },
+      "additionalProperties": false
+    },
+    "enforcement": {
+      "type": "object",
+      "required": ["platform", "mode", "enforced_layers", "note"],
+      "properties": {
+        "platform": { "type": "string", "pattern": "^[a-z0-9_.-]{1,64}$" },
+        "mode": { "enum": ["sandboxed", "unrestricted"] },
+        "enforced_layers": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "type": "string", "pattern": "^[a-z0-9_.-]{1,64}$" }
+        },
+        "note": { "oneOf": [{ "type": "string", "maxLength": 1024 }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "target", "content"],
+          "properties": {
+            "kind": { "const": "write_file" },
+            "target": { "$ref": "#/$defs/target" },
+            "content": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target", "old", "new"],
+          "properties": {
+            "kind": { "const": "edit_file" },
+            "target": { "$ref": "#/$defs/target" },
+            "old": { "type": "string" },
+            "new": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "command", "workdir", "timeout_ms", "enforcement"],
+          "properties": {
+            "kind": { "const": "run_shell" },
+            "command": { "type": "string", "minLength": 1 },
+            "workdir": { "$ref": "#/$defs/target" },
+            "timeout_ms": { "type": "integer", "minimum": 1 },
+            "enforcement": { "$ref": "#/$defs/enforcement" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "method", "url"],
+          "properties": {
+            "kind": { "const": "http_fetch" },
+            "method": { "type": "string", "pattern": "^[A-Z]{1,32}$" },
+            "url": { "type": "string", "format": "uri", "pattern": "^https?://" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "query"],
+          "properties": {
+            "kind": { "const": "web_search" },
+            "query": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "$comment": "Authoritative encoders reject canonical approval records above 1048576 UTF-8 bytes."
+}

@@ -1,0 +1,12 @@
+[bindings.kotlin]
+package_name = "ai.camelid.remote.crypto"
+cdylib_name = "camelid_remote_crypto_ffi"
+android = true
+generate_immutable_records = true
+
+[bindings.swift]
+module_name = "CamelidRemoteCrypto"
+ffi_module_name = "CamelidRemoteCryptoFFI"
+ffi_module_filename = "CamelidRemoteCryptoFFI"
+cdylib_name = "camelid_remote_crypto_ffi"
+generate_immutable_records = true

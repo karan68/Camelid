@@ -1,0 +1,28 @@
+{
+  "schema": "camelid.remote-native-artifacts/v1",
+  "min_sdk": 24,
+  "rust_toolchain": "1.95.0",
+  "ndk": "27.1.12297006",
+  "kotlin_binding": {
+    "library": "src/main/java/ai/camelid/remote/crypto/camelid_remote_crypto_ffi.kt",
+    "sha256": "88855faf6cfc0890ea831ca308783100c1bbde18fd025ed0a760d1687019c728"
+  },
+  "artifacts": [
+    {
+      "target": "aarch64-linux-android",
+      "abi": "arm64-v8a",
+      "purpose": "device-development-build",
+      "library": "src/main/jniLibs/arm64-v8a/libcamelid_remote_crypto_ffi.so",
+      "source_sha256": "3b6938e46168217f0683da472bd0cba29128600436baae6639a03dc6ee3a7cd3",
+      "apk_stripped_sha256": "bf8950b65c4767cbe418b66f0e6adb9254e25fa23edd24a37c5748a788c00df4",
+      "strip": "ndk-27.1.12297006 llvm-strip --strip-unneeded"
+    },
+    {
+      "target": "x86_64-linux-android",
+      "abi": "x86_64",
+      "purpose": "emulator-instrumentation-only",
+      "library": "src/main/jniLibs/x86_64/libcamelid_remote_crypto_ffi.so",
+      "source_sha256": "74ace1bfbedcb254cd7267e02e5dcf15e2e380898ad8b594325c82c353b86a02"
+    }
+  ]
+}

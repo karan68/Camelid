@@ -1,0 +1,11 @@
+[package]
+name = "camelid-remote-crypto-bindgen"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+description = "Pinned UniFFI generator for Camelid remote cryptography"
+
+[dependencies]
+uniffi = { version = "=0.32.0", default-features = false, features = ["cli"] }

@@ -149,6 +149,14 @@ jobs:
       - name: Check ledger drift (ledger == code contract; surfaces consistent)
         run: node scripts/check-ledger-drift.mjs
 
+      - name: Install remote protocol fixture validator
+        working-directory: tools/remote-protocol-fixtures
+        run: npm ci
+
+      - name: Validate remote protocol schemas and fixtures
+        working-directory: tools/remote-protocol-fixtures
+        run: npm test
+
       - name: Check CUDA batched-prefill parity gate wiring
         run: node scripts/check-cuda-prefill-parity-gate.mjs
 
@@ -205,6 +213,26 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+
+      - name: Remote crypto crates clippy
+        run: >-
+          cargo clippy
+          -p camelid-agent-runtime
+          -p camelid-agent-events
+          -p camelid-remote-protocol
+          -p camelid-remote-crypto
+          -p camelid-remote-crypto-ffi
+          -p camelid-remote-crypto-bindgen
+          --all-targets -- -D warnings
+
+      - name: Remote crypto crates tests
+        run: >-
+          cargo test
+          -p camelid-agent-runtime
+          -p camelid-agent-events
+          -p camelid-remote-protocol
+          -p camelid-remote-crypto
+          -p camelid-remote-crypto-ffi
 
       # CAMELID_REQUIRE_METAL_TESTS=1 makes the macOS Metal lane fail-closed: the
       # device-gated skips (56 in src/metal.rs, plus the draft-rollback regression guard
@@ -355,6 +383,71 @@ jobs:
       - name: Frontend UI regression smoke
         run: npm run smoke:ui
 
+  remote-crypto-kotlin:
+    runs-on: ubuntu-latest
+    needs: public-scrub
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install pinned Kotlin and compile dependencies
+        env:
+          DEPS: ${{ runner.temp }}/remote-crypto-deps
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEPS"
+          curl -fsSL -o "$DEPS/kotlin.zip" https://github.com/JetBrains/kotlin/releases/download/v2.4.10/kotlin-compiler-2.4.10.zip
+          echo '473dd66c7a3ef4b182065b3da670466c1bf2773a9dbb0ed8b33a39fe9d4f876d  '"$DEPS/kotlin.zip" | sha256sum -c -
+          unzip -q "$DEPS/kotlin.zip" -d "$DEPS/kotlin"
+          curl -fsSL -o "$DEPS/jna.jar" https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.19.1/jna-5.19.1.jar
+          echo '4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae  '"$DEPS/jna.jar" | sha256sum -c -
+          curl -fsSL -o "$DEPS/android.jar" https://repo1.maven.org/maven2/org/robolectric/android-all/17-robolectric-15733970/android-all-17-robolectric-15733970.jar
+          echo 'f6a41ad548bb45cccd3b1d4774cb50d57826dd319b6e5accd6b6269876e12d71  '"$DEPS/android.jar" | sha256sum -c -
+          curl -fsSL -o "$DEPS/annotation.jar" https://dl.google.com/dl/android/maven2/androidx/annotation/annotation-jvm/1.10.0/annotation-jvm-1.10.0.jar
+          echo 'ddd072ddbb553178e205517ce777b2f05aa9e412982d9ecb4eedc74f1212f697  '"$DEPS/annotation.jar" | sha256sum -c -
+
+      - name: Kotlin binding interoperability
+        env:
+          KOTLINC: ${{ runner.temp }}/remote-crypto-deps/kotlin/kotlinc/bin/kotlinc
+          JNA_JAR: ${{ runner.temp }}/remote-crypto-deps/jna.jar
+        run: bash qa/remote-crypto-bindings/run-kotlin-interop.sh
+
+      - name: Android-optimized Kotlin binding compilation
+        env:
+          KOTLINC: ${{ runner.temp }}/remote-crypto-deps/kotlin/kotlinc/bin/kotlinc
+          JNA_JAR: ${{ runner.temp }}/remote-crypto-deps/jna.jar
+          ANDROID_JAR: ${{ runner.temp }}/remote-crypto-deps/android.jar
+          ANNOTATION_JAR: ${{ runner.temp }}/remote-crypto-deps/annotation.jar
+        run: bash qa/remote-crypto-bindings/run-android-compile.sh
+
+  remote-crypto-swift:
+    runs-on: macos-latest
+    needs: public-scrub
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Swift binding interoperability
+        run: bash qa/remote-crypto-bindings/run-swift-interop.sh
+
   # ---------------------------------------------------------------------------
   # Single aggregate gate. Make THIS the only required status check in branch
   # protection (see the note in the PR/commit). It runs on every event and
@@ -366,7 +459,7 @@ jobs:
   # gives one stable context whatever the selected OS set.
   # ---------------------------------------------------------------------------
   ci-gate:
-    needs: [setup, public-scrub, rust, desktop, validation-scripts, frontend]
+    needs: [setup, public-scrub, rust, desktop, validation-scripts, frontend, remote-crypto-kotlin, remote-crypto-swift]
     if: always()
     runs-on: ubuntu-latest
     steps:

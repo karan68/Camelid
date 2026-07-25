@@ -1,0 +1,19 @@
+[package]
+name = "camelid-remote-protocol"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+description = "Versioned protocol types and bounds for Camelid remote control"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+url = "2"
+uuid = { version = "1", features = ["serde"] }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -28,9 +28,10 @@ const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
+const RemoteView = lazy(() => import('./views/RemoteView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'workspace', 'remote', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -300,6 +301,8 @@ function App() {
               setTab={navigateTab}
             />
           )}
+
+          {tab === 'remote' && <RemoteView showNotice={showNotice} />}
 
           {tab === 'analytics' && (
             <AnalyticsView conversations={conversations} models={models} runtime={runtime} capabilities={dashboard?.capabilities} />

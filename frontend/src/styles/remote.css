@@ -1,0 +1,233 @@
+.remote-view__stats {
+  margin-bottom: 16px;
+}
+
+.remote-view__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.remote-view__copy {
+  margin: 0 0 16px;
+  color: var(--cx-text-muted);
+  line-height: 1.55;
+}
+
+.remote-view__pairing,
+.remote-view__capabilities {
+  margin-bottom: 16px;
+}
+
+.remote-view__offer {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 24px;
+  align-items: center;
+}
+
+.remote-view__qr,
+.remote-view__qr-missing {
+  width: 280px;
+  aspect-ratio: 1;
+  border: 1px solid var(--cx-border);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.remote-view__qr-missing {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #374151;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.remote-view__offer-copy {
+  display: grid;
+  justify-items: start;
+  gap: 12px;
+}
+
+.remote-view__offer-copy p {
+  max-width: 52ch;
+  margin: 0;
+  color: var(--cx-text-muted);
+  line-height: 1.55;
+}
+
+.remote-view__confirmation {
+  display: grid;
+  gap: 16px;
+  max-width: 720px;
+}
+
+.remote-view__confirmation > div:not(.remote-view__confirmation-actions) {
+  display: grid;
+  gap: 5px;
+}
+
+.remote-view__confirmation-label {
+  color: var(--cx-text-muted);
+  font-size: 12px;
+}
+
+.remote-view__confirmation code {
+  width: fit-content;
+  padding: 7px 9px;
+  border: 1px solid var(--cx-border);
+  border-radius: 4px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.remote-view__confirmation p {
+  margin: 0;
+  color: var(--cx-text-muted);
+  line-height: 1.55;
+}
+
+.remote-view__confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.remote-view__details {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+}
+
+.remote-view__details div {
+  display: grid;
+  gap: 3px;
+}
+
+.remote-view__details dt,
+.remote-view__table span,
+.remote-view__table small {
+  color: var(--cx-text-muted);
+  font-size: 12px;
+}
+
+.remote-view__details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.remote-view__capability-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 20px;
+  margin: 0;
+}
+
+.remote-view__capability-grid div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.remote-view__capability-grid dt,
+.remote-view__tools > span {
+  color: var(--cx-text-muted);
+  font-size: 12px;
+}
+
+.remote-view__capability-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-view__shell-note {
+  margin: 14px 0 0;
+  color: var(--cx-text-muted);
+  line-height: 1.5;
+}
+
+.remote-view__tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+  margin-top: 16px;
+}
+
+.remote-view__tools code {
+  padding: 3px 6px;
+  border: 1px solid var(--cx-border);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.remote-view__table {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--cx-border);
+  border-radius: 6px;
+  background: var(--cx-border);
+}
+
+.remote-view__row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.6fr) minmax(110px, .7fr) minmax(145px, .9fr) auto;
+  gap: 16px;
+  align-items: center;
+  min-height: 66px;
+  padding: 12px 14px;
+  background: var(--cx-surface);
+}
+
+.remote-view__row > div {
+  min-width: 0;
+}
+
+.remote-view__row > div:first-child,
+.remote-view__row > div:nth-child(3) {
+  display: grid;
+  gap: 3px;
+}
+
+.remote-view__row small {
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+}
+
+@media (max-width: 760px) {
+  .remote-view__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .remote-view__capability-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .remote-view__offer {
+    grid-template-columns: 1fr;
+  }
+
+  .remote-view__qr,
+  .remote-view__qr-missing {
+    width: min(280px, 100%);
+  }
+
+  .remote-view__row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px 16px;
+  }
+
+  .remote-view__row > div:nth-child(3) {
+    grid-column: 1;
+  }
+
+  .remote-view__row > div:nth-child(4) {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+}
