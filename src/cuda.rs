@@ -149,6 +149,11 @@ pub fn set_gpu_accel_enabled(enabled: bool) {
 /// intercept it — the only reliable defense is to never make the call. Skipping
 /// CUDA here is also exactly what the operator asked for, so this is honest on
 /// every platform rather than a WSL-specific workaround.
+// Only the CUDA implementation calls this, and the module compiles on hosts with
+// CUDA off (macOS, aarch64 Linux), where it is legitimately unused rather than a
+// mistake. Kept ungated so the parse below stays covered by the test on every
+// platform, since the value's meaning does not vary by target.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn devices_masked_by_env() -> bool {
     devices_masked(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())
 }
@@ -157,6 +162,7 @@ fn devices_masked_by_env() -> bool {
 /// without mutating process env (same split as `fit_check_skipped`). Only an
 /// explicit "no devices" value masks; an unset var, or any real device list,
 /// leaves CUDA alone.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn devices_masked(raw: Option<&str>) -> bool {
     raw.map(str::trim)
         .is_some_and(|v| v.is_empty() || v == "-1")
