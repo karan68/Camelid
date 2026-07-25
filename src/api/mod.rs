@@ -2036,12 +2036,20 @@ pub(crate) async fn serve_remote_host(
     shutdown: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let state = AppState::default()
+    let state = remote_host_state(addr, models_dir, remote_management);
+    serve_with_state(addr, listener, state, false, Some(shutdown), None).await
+}
+
+fn remote_host_state(
+    addr: SocketAddr,
+    models_dir: PathBuf,
+    remote_management: crate::chat::remote_control::RemoteManagementHandle,
+) -> AppState {
+    AppState::default()
         .with_local_model_delete(addr.ip().is_loopback())
         .with_models_dir(Some(models_dir))
         .with_remote_management(remote_management)
-        .with_serve_addr(addr);
-    serve_with_state(addr, listener, state, false, Some(shutdown), None).await
+        .with_serve_addr(addr)
 }
 
 async fn serve_with_state(
@@ -13941,6 +13949,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn remote_host_state_never_enables_workspace_cli_authority() {
+        let (remote_management, _commands) = crate::chat::remote_control::channel();
+        let state = remote_host_state(
+            "127.0.0.1:8186".parse().unwrap(),
+            PathBuf::from("models"),
+            remote_management,
+        );
+
+        assert!(state.remote_management.is_some());
+        assert!(state.workspace_cli_token.is_none());
+    }
 
     #[test]
     fn health_backend_reports_the_effective_serving_lane() {
