@@ -430,8 +430,19 @@ extern "C" __global__ void q8_0_block_linear_row(
             vram_free / (1024 * 1024),
             vram_total / (1024 * 1024),
         );
-        let ptx: Ptx = cudarc::nvrtc::compile_ptx_with_opts(Q8_KERNEL_SRC, compile_options())
-            .map_err(|e| format!("nvrtc compile failed: {e}"))?;
+        // Same failure class as the driver load above, and the same remedy: cudarc
+        // panics from inside its lazy NVRTC loader when libnvrtc cannot be dlopen'd,
+        // so the `.map_err` below never gets to run. This matters now that CUDA is
+        // compiled into the DEFAULT x86_64 Linux build: installing the NVIDIA driver
+        // does NOT install NVRTC (that ships with the CUDA toolkit), so the common
+        // driver-only Linux host would abort the process at startup — including
+        // under `--gpu off`, because capability detection reaches this path
+        // regardless of the GPU switch. Degrade to the CPU path instead.
+        let ptx: Ptx = std::panic::catch_unwind(|| {
+            cudarc::nvrtc::compile_ptx_with_opts(Q8_KERNEL_SRC, compile_options())
+        })
+        .map_err(|_| "CUDA NVRTC library not available".to_string())?
+        .map_err(|e| format!("nvrtc compile failed: {e}"))?;
         let module = ctx
             .load_module(ptx)
             .map_err(|e| format!("load_module failed: {e}"))?;

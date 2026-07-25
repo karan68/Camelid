@@ -1243,7 +1243,12 @@ fn build_engine() -> Result<Engine, String> {
         arch: Some("compute_61"),
         ..Default::default()
     };
-    let ptx = compile_ptx_with_opts(KERNEL, opts).map_err(|e| format!("nvrtc: {e}"))?;
+    // Guarded like the other NVRTC entry points: cudarc panics from its lazy loader
+    // when libnvrtc is missing, so `.map_err` never runs and the process would abort
+    // instead of falling back. (NVRTC ships with the CUDA toolkit, not the driver.)
+    let ptx = std::panic::catch_unwind(|| compile_ptx_with_opts(KERNEL, opts))
+        .map_err(|_| "CUDA NVRTC library not available".to_string())?
+        .map_err(|e| format!("nvrtc: {e}"))?;
     let m = ctx
         .load_module(ptx)
         .map_err(|e| format!("load_module: {e}"))?;
