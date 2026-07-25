@@ -16,7 +16,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { fonts, palette } from '@/constants/remote-theme';
 import type { ApprovalProjection, CapabilityProjection } from '@/remote/reducer';
@@ -519,6 +519,7 @@ function ApprovalModal({
   onClose(): void;
   onDecision(approval: ApprovalProjection, decision: 'allow_once' | 'deny' | 'abort_turn'): Promise<void>;
 }) {
+  const insets = useSafeAreaInsets();
   const record = approval === null ? null : asRecord(approval.record);
   const action = asRecord(record?.action);
   const actionable = approval?.status === 'pending' && connected && !pendingAction;
@@ -549,7 +550,7 @@ function ApprovalModal({
             <Text selectable style={styles.exactActionText}>{formatAction(action)}</Text>
           </View>
         </ScrollView>
-        <View style={styles.modalActions}>
+        <View style={[styles.modalActions, { paddingBottom: Math.max(insets.bottom, 14) }]}>
           <Pressable
             disabled={!actionable}
             onPress={() => approval !== null && void onDecision(approval, 'allow_once')}
