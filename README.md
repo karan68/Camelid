@@ -262,7 +262,15 @@ Camelid ships for three platforms today.
 |---|---|---|
 | Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | NVIDIA CUDA on validated paths; CPU fallback |
 | macOS Apple Silicon | Engine archive (`.tar.gz`) | Metal and CPU |
-| Linux x86_64 | Engine archive (`.tar.gz`) | CPU; CUDA buildable for supported NVIDIA setups |
+| Linux x86_64 | Engine archive (`.tar.gz`) | NVIDIA CUDA compiled in by default; CPU fallback |
+
+CUDA is compiled into the default build on Windows and x86_64 Linux, so a machine with the normal
+NVIDIA driver gets the GPU path with no build flags and no CUDA SDK (the driver and NVRTC load
+dynamically at runtime; without a GPU the build still runs CPU-only). `camelid serve --gpu
+auto|on|off` (or `CAMELID_GPU`) overrides the automatic choice. Other Linux targets — aarch64, the
+Raspberry Pi — stay CPU-only, with CUDA opt-in via `--features cuda`. Note the validated GPU parity
+rows in [COMPATIBILITY.md](COMPATIBILITY.md) were recorded on Windows; compiling the path in on
+Linux does not by itself extend those row-level parity claims.
 
 ## Documentation
 

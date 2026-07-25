@@ -96,9 +96,24 @@ cudarc = { version = "0.19", default-features = false, features = [
     "fallback-dynamic-loading",
 ] }
 
-# Linux (non-macOS unix): CUDA is OPT-IN via `--features cuda` (CI uses
-# `--all-features`). macOS has no cudarc — its GPU lane is Metal.
-[target.'cfg(all(not(target_os = "macos"), not(windows)))'.dependencies]
+# MESA: x86_64 Linux gets CUDA in the DEFAULT build, mirroring Windows. cudarc is
+# NON-optional here so `build.rs`'s `cuda` cfg injection has the crate in the graph;
+# the driver/NVRTC load dynamically at runtime (no CUDA SDK to build; no-ops without a
+# GPU). Keeps the primary x86_64 Linux dev/CI host on the GPU path out of the box.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cuda-12090",
+    "fallback-dynamic-loading",
+] }
+
+# Other non-macOS / non-Windows targets (aarch64 Linux / Pi / NanoCamelid, BSD, …):
+# CUDA stays OPT-IN via `--features cuda` (CI uses `--all-features`). cudarc stays
+# `optional` here so `cuda = ["dep:cudarc"]` still resolves and the Pi keeps building
+# CPU-only by default. macOS has no cudarc — its GPU lane is Metal.
+[target.'cfg(all(not(target_os = "macos"), not(windows), not(all(target_os = "linux", target_arch = "x86_64"))))'.dependencies]
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",
@@ -108,10 +123,12 @@ cudarc = { version = "0.19", default-features = false, features = [
 ], optional = true }
 
 [features]
-# CUDA builds by DEFAULT on Windows only: `build.rs` enables the `cuda` cfg there and
-# the Windows cudarc above is always linked, so no `--features` flag is needed. On
-# Linux it is opt-in via `--features cuda` (or `--all-features`); macOS never has it.
-# The CPU path remains the parity reference everywhere.
+# CUDA builds by DEFAULT on Windows AND x86_64 Linux: `build.rs` enables the `cuda` cfg
+# on those targets and the matching non-optional cudarc above is always linked, so no
+# `--features` flag is needed. Other Linux (aarch64 / Pi) and BSD keep it opt-in via
+# `--features cuda` (or `--all-features`); macOS never has it (Metal is its GPU lane).
+# `cuda = ["dep:cudarc"]` still resolves because cudarc stays `optional` on those
+# opt-in targets. The CPU path remains the parity reference everywhere.
 default = []
 cuda = ["dep:cudarc"]
 # Decode zero-alloc gate (Lane B step 6): installs a counting global allocator

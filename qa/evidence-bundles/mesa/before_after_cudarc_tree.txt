@@ -1,0 +1,37 @@
+MESA — cudarc dependency-graph before/after (resolved from Windows host via --target)
+=====================================================================================
+Host: x86_64-pc-windows-msvc   Repo: main b9f9a403 -> branch feat/mesa-linux-gpu-default
+Mechanism: `cargo tree --target <triple> -i cudarc` (dependency RESOLUTION only; no
+compile). cross-target resolution evaluates cfg() for the named triple, so the Linux
+graph is provable from Windows.
+
+## G0 — BEFORE (opt-in on Linux) ####################################################
+
+$ cargo tree --target x86_64-unknown-linux-gnu -i cudarc
+warning: nothing to print.        <-- cudarc ABSENT from default x86_64-linux graph
+
+$ cargo tree --target x86_64-unknown-linux-gnu --features cuda -i cudarc
+cudarc v0.19.7
+└── camelid v0.3.1                 <-- present only under --features cuda
+
+$ cargo tree --target aarch64-unknown-linux-gnu -i cudarc
+warning: nothing to print.        <-- cudarc ABSENT (Pi / NanoCamelid CPU-only)
+
+## G1 — AFTER (default-on for x86_64 Linux; aarch64 unchanged) ######################
+(filled in after the Cargo.toml edit — see below)
+
+$ cargo tree --target x86_64-unknown-linux-gnu -i cudarc
+cudarc v0.19.7
+└── camelid v0.3.1                 <-- NOW PRESENT in default x86_64-linux graph (MESA)
+
+$ cargo tree --target aarch64-unknown-linux-gnu -i cudarc
+warning: nothing to print.        <-- STILL ABSENT: aarch64 (Pi) stays CPU-only by default
+
+$ cargo tree --target aarch64-unknown-linux-gnu --features cuda -i cudarc
+cudarc v0.19.7
+└── camelid v0.3.1                 <-- opt-in `--features cuda` still resolves on aarch64
+
+$ cargo metadata --format-version 1   ->  manifest resolves OK
+  (`cuda = ["dep:cudarc"]` still valid: cudarc stays `optional` on the aarch64/BSD block)
+
+RESULT: MESA inverts x86_64-Linux from opt-in to default-on, aarch64 unchanged. PASS.

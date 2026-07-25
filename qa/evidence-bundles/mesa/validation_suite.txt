@@ -1,0 +1,34 @@
+MESA — G5: validation suite (host x86_64-pc-windows-msvc, branch feat/mesa-linux-gpu-default)
+============================================================================================
+
+$ cargo fmt --all -- --check
+  -> clean (no diffs)
+
+$ cargo clippy --all-targets --all-features -- -D warnings
+   Compiling camelid v0.3.1 (.../Camelid)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 33.11s
+  -> clean under -D warnings (compiles all MESA code incl. the --gpu path with cuda on)
+
+$ cargo test --all-targets --all-features
+  lib:  test result: ok. 858 passed; 0 failed; 60 ignored; finished in 150.87s
+  bin:  858 lib OK, then the `--bin camelid` harness hit STATUS_STACK_OVERFLOW in
+        `basalt_forced_decode_tests::gemma4_generate_parses_forced_decode_flags`.
+        DIAGNOSIS: pre-existing Windows-debug artifact, NOT a MESA regression. The
+        /STACK:8388608 link arg in build.rs applies to the `camelid` BIN, not to the
+        separate test-harness exe, so its test threads get the default stack. The
+        overflowing test is a BASALT forced-decode CLI-parse test untouched by MESA.
+        Re-run with an adequate thread stack:
+
+$ RUST_MIN_STACK=16777216 cargo test --all-features --bin camelid
+  -> test result: ok. 121 passed; 0 failed; 0 ignored; finished in 3.71s
+     (includes gemma4_generate_parses_forced_decode_flags — passes with room on the stack)
+  Linux CI (the campaign's real gate) does not hit this Windows-only artifact.
+
+$ cargo doc --no-deps --all-features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.83s
+  -> Finished. (33 pre-existing lib-doc warnings + 1 pre-existing repack-ghost `<model>`
+     HTML-tag warning; none introduced by MESA. `cargo doc` without -Dwarnings passes.)
+
+RESULT: fmt clean, clippy -D warnings clean, 858 lib + 121 bin tests pass, doc builds.
+        The only red is the documented Windows-debug thread-stack artifact, which clears
+        with RUST_MIN_STACK and is unrelated to MESA.

@@ -3145,8 +3145,15 @@ impl CudaResidentKernels {
             arch: Some("compute_61"),
             ..Default::default()
         };
-        let ptx: Ptx = cudarc::nvrtc::compile_ptx_with_opts(KERNELS, opts)
-            .map_err(|e| format!("nvrtc: {e}"))?;
+        // cudarc panics from inside its lazy NVRTC loader when libnvrtc is absent,
+        // so `.map_err` never runs — catch it and report a normal Err so the caller
+        // falls back to CPU instead of the process aborting. See the same guard in
+        // `cuda::init_backend`; a driver-only Linux host (NVRTC ships with the CUDA
+        // toolkit, not the driver) reaches this path once CUDA is in the default build.
+        let ptx: Ptx =
+            std::panic::catch_unwind(|| cudarc::nvrtc::compile_ptx_with_opts(KERNELS, opts))
+                .map_err(|_| "CUDA NVRTC library not available".to_string())?
+                .map_err(|e| format!("nvrtc: {e}"))?;
         let m = ctx
             .load_module(ptx)
             .map_err(|e| format!("load_module: {e}"))?;

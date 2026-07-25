@@ -26,6 +26,17 @@ compile_error!(
      declare cudarc as a non-optional Windows dependency."
 );
 
+// MESA: the same default-on guarantee on x86_64 Linux. `build.rs` injects the `cuda`
+// cfg and Cargo.toml declares cudarc non-optional for this target, so a bare `cargo
+// build` can never silently drop to the CPU-only path here either. (aarch64 Linux / Pi
+// and BSD keep CUDA opt-in and are intentionally not guarded.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "cuda")))]
+compile_error!(
+    "CUDA must be enabled by default on x86_64 Linux (MESA): build.rs should emit \
+     `cargo:rustc-cfg=feature=\"cuda\"` for this target and Cargo.toml should declare \
+     cudarc as a non-optional x86_64-linux dependency."
+);
+
 /// Result of probing for a usable CUDA device at startup.
 #[derive(Debug, Clone, Default)]
 pub struct CudaDeviceInfo {
@@ -125,6 +136,36 @@ pub fn set_gpu_accel_enabled(enabled: bool) {
         if enabled { 2 } else { 1 },
         std::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// Whether the operator has masked every CUDA device via `CUDA_VISIBLE_DEVICES`.
+///
+/// `-1` (or an empty value) is the standard "expose no devices" setting, and this
+/// repo relies on it for CPU-pinned runs — the decode receipts and `alloc_gate`
+/// both document `CUDA_VISIBLE_DEVICES=-1`. Nothing in the CUDA path used to read
+/// it, so the driver was initialized anyway; on the WSL2 GPU-PV stack doing that
+/// with every device masked aborts the process inside glibc ("free(): double free
+/// detected"). That is a SIGABRT, NOT a Rust panic, so `catch_unwind` cannot
+/// intercept it — the only reliable defense is to never make the call. Skipping
+/// CUDA here is also exactly what the operator asked for, so this is honest on
+/// every platform rather than a WSL-specific workaround.
+// Only the CUDA implementation calls this, and the module compiles on hosts with
+// CUDA off (macOS, aarch64 Linux), where it is legitimately unused rather than a
+// mistake. Kept ungated so the parse below stays covered by the test on every
+// platform, since the value's meaning does not vary by target.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn devices_masked_by_env() -> bool {
+    devices_masked(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())
+}
+
+/// Pure half of [`devices_masked_by_env`], split out so the parse is unit-testable
+/// without mutating process env (same split as `fit_check_skipped`). Only an
+/// explicit "no devices" value masks; an unset var, or any real device list,
+/// leaves CUDA alone.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn devices_masked(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|v| v.is_empty() || v == "-1")
 }
 
 /// Whether a usable CUDA device is actually present (feature built + device + a
@@ -388,6 +429,12 @@ extern "C" __global__ void q8_0_block_linear_row(
     }
 
     fn init_backend() -> Result<CudaBackend, String> {
+        // Honor an explicit device mask before touching the driver: see
+        // `devices_masked_by_env`. Initializing CUDA with every device masked can
+        // abort the process, and an abort is not catchable below.
+        if super::devices_masked_by_env() {
+            return Err("CUDA devices masked by CUDA_VISIBLE_DEVICES".to_string());
+        }
         let ordinal = super::selected_device_ordinal();
         // cudarc panics (rather than returning Err) when the CUDA driver
         // library cannot be loaded — e.g. on a CI runner or any host with no
@@ -419,8 +466,19 @@ extern "C" __global__ void q8_0_block_linear_row(
             vram_free / (1024 * 1024),
             vram_total / (1024 * 1024),
         );
-        let ptx: Ptx = cudarc::nvrtc::compile_ptx_with_opts(Q8_KERNEL_SRC, compile_options())
-            .map_err(|e| format!("nvrtc compile failed: {e}"))?;
+        // Same failure class as the driver load above, and the same remedy: cudarc
+        // panics from inside its lazy NVRTC loader when libnvrtc cannot be dlopen'd,
+        // so the `.map_err` below never gets to run. This matters now that CUDA is
+        // compiled into the DEFAULT x86_64 Linux build: installing the NVIDIA driver
+        // does NOT install NVRTC (that ships with the CUDA toolkit), so the common
+        // driver-only Linux host would abort the process at startup — including
+        // under `--gpu off`, because capability detection reaches this path
+        // regardless of the GPU switch. Degrade to the CPU path instead.
+        let ptx: Ptx = std::panic::catch_unwind(|| {
+            cudarc::nvrtc::compile_ptx_with_opts(Q8_KERNEL_SRC, compile_options())
+        })
+        .map_err(|_| "CUDA NVRTC library not available".to_string())?
+        .map_err(|e| format!("nvrtc compile failed: {e}"))?;
         let module = ctx
             .load_module(ptx)
             .map_err(|e| format!("load_module failed: {e}"))?;
@@ -445,6 +503,12 @@ extern "C" __global__ void q8_0_block_linear_row(
     /// kernels (so it is cheap and side-effect-free relative to full init). Returns
     /// `None` on any machine without a usable CUDA device.
     pub fn probe_capability() -> Option<super::CudaCapability> {
+        // See `devices_masked_by_env`: never initialize the driver when the
+        // operator has masked every device. This probe runs during the startup
+        // hardware profile, so an abort here kills the process before it serves.
+        if super::devices_masked_by_env() {
+            return None;
+        }
         let ordinal = super::selected_device_ordinal();
         // See init_backend: a missing CUDA driver library makes cudarc panic
         // rather than return Err, so guard the first call against it.
@@ -483,6 +547,11 @@ extern "C" __global__ void q8_0_block_linear_row(
     /// wrongly falls back to the CPU decode path. Best-effort: any error (or a host
     /// without CUDA) is ignored — the caller only loses the reclaim, never correctness.
     pub fn release_async_pool() {
+        // Nothing to reclaim when every device is masked, and initializing the
+        // driver to find that out can abort — see `devices_masked_by_env`.
+        if super::devices_masked_by_env() {
+            return;
+        }
         let ordinal = super::selected_device_ordinal();
         // Retain the primary context so the driver is initialized and the device
         // handle is valid; held until after the trim. Guard the first call against a
@@ -1058,5 +1127,27 @@ extern "C" __global__ void q8_0_block_linear_row(
                 "block-kernel worst relative error {worst} exceeds 1e-4 vs CPU reference"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod device_mask_tests {
+    use super::devices_masked;
+
+    #[test]
+    fn only_an_explicit_no_devices_value_masks_cuda() {
+        // The documented CPU-pinning setting, and the empty-list spelling.
+        assert!(devices_masked(Some("-1")));
+        assert!(devices_masked(Some("  -1  ")));
+        assert!(devices_masked(Some("")));
+        // Unset must never mask: that is every ordinary GPU host.
+        assert!(!devices_masked(None));
+        // A real device selection must never mask — masking here would silently
+        // drop the GPU path for anyone pinning to a specific card.
+        assert!(!devices_masked(Some("0")));
+        assert!(!devices_masked(Some("1")));
+        assert!(!devices_masked(Some("0,1")));
+        // Not a mask value, and must not be parsed as one.
+        assert!(!devices_masked(Some("-1,0")));
     }
 }

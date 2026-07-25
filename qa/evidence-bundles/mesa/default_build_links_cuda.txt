@@ -1,0 +1,42 @@
+MESA — G2: default build compiles the CUDA backend on x86_64 Linux
+==================================================================
+Host: x86_64-pc-windows-msvc. A Windows host cannot LINK a Linux binary, but
+`cargo check --target x86_64-unknown-linux-gnu` runs build.rs with the Linux
+target cfgs and compiles cudarc + the CUDA module as metadata — the strongest
+proxy available here. The final link + GPU runtime close on CI ubuntu and on the
+RTX Linux box (§6 hardware gate).
+
+## Windows DEFAULT build (the shipped host) — real, full compile ####################
+
+$ cargo build --bin camelid            # NO --features
+   Compiling camelid v0.3.1 (.../Camelid)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 52.51s
+-> Windows default build is CUDA-on and unaffected (G6). The binary then ran the
+   G3 runtime test on the RTX 3060 (see serve_gpu_help_and_states.json).
+
+## x86_64 LINUX DEFAULT check (cross-target metadata) ###############################
+
+$ cargo check --target x86_64-unknown-linux-gnu --bin camelid   # NO --features
+    ... Checking axum v0.7.9
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.78s   -> CLEAN
+
+$ ls target/x86_64-unknown-linux-gnu/debug/deps/ | grep cudarc
+libcudarc-d8bc1c98f5aac7d5.rmeta        <-- cudarc compiled for linux target, DEFAULT build
+
+AIRTIGHT LOGICAL PROOF (G2 + G4 together):
+  The new guard in src/cuda.rs is
+      #[cfg(all(target_os="linux", target_arch="x86_64", not(feature="cuda")))]
+      compile_error!("CUDA must be enabled by default on x86_64 Linux (MESA) ...");
+  If build.rs had NOT injected `feature="cuda"` for the linux target, this
+  compile_error! would have HARD-FAILED the check above. The check finished clean,
+  so the `cuda` cfg IS injected by default on x86_64 Linux and the whole GPU
+  backend compiled with no `--features` flag. PASS.
+
+## aarch64 LINUX DEFAULT check (Pi / NanoCamelid — must stay CPU-only) ##############
+
+$ cargo check --target aarch64-unknown-linux-gnu --bin camelid  # NO --features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.29s   -> CLEAN
+
+$ ls target/aarch64-unknown-linux-gnu/debug/deps/ | grep cudarc
+  (none)                                <-- cudarc ABSENT: aarch64 opt-in preserved,
+                                            no MESA guard on aarch64 (correctly), CPU-only.
