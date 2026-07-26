@@ -91,6 +91,9 @@ const JUNK_PATTERNS = [
 
 const COMMON_DOCS = ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md']
 
+/** Depth bound for symlink resolution; real payloads use one hop. */
+const MAX_SYMLINK_HOPS = 8
+
 const ARTIFACT_SPECS = {
   'macos-arm64': {
     archive: 'camelid-macos-arm64.tar.gz',
@@ -242,6 +245,68 @@ export function resolvePayloadRoot(topLevelNames, spec) {
 }
 
 /**
+ * Follow a symlink chain to the regular file it ultimately names.
+ *
+ * dlopen resolves links, so verifying only that a link's immediate target
+ * exists is not enough: `libnvrtc.so.12 -> libnvrtc-builtins.so.12.9` points
+ * at a real staged file and still cannot serve as the compiler soname. Cycles
+ * must terminate too, or a self-referential link looks like a valid target of
+ * itself.
+ *
+ * @param {Map<string, object>} byPath payload entries keyed by POSIX path
+ * @param {string} startPath entry to resolve
+ * @returns {{kind: 'resolved'|'dangling'|'escape'|'cycle'|'too-deep', path: string,
+ *   entry?: object, target?: string}}
+ */
+export function resolveSymlinkChain(byPath, startPath, maxHops = MAX_SYMLINK_HOPS) {
+  const seen = new Set()
+  let current = startPath
+  for (let hop = 0; hop <= maxHops; hop += 1) {
+    if (seen.has(current)) return { kind: 'cycle', path: current }
+    seen.add(current)
+    const entry = byPath.get(current)
+    if (!entry) return { kind: 'dangling', path: current }
+    if (entry.kind !== 'symlink') return { kind: 'resolved', path: current, entry }
+    const target = entry.linkTarget ?? ''
+    if (target.startsWith('/')) return { kind: 'escape', path: current, target }
+    const next = posix.normalize(posix.join(posix.dirname(current), target))
+    if (next === '..' || next.startsWith('../')) return { kind: 'escape', path: current, target }
+    current = next
+  }
+  return { kind: 'too-deep', path: startPath }
+}
+
+/**
+ * Require at least one entry named like `role` to RESOLVE to a regular file
+ * that is also named like `role`.
+ *
+ * @returns {string[]} failure messages
+ */
+function checkNvrtcRole(candidates, byPath, pattern, role, consequence) {
+  if (!candidates.length) {
+    return [`no NVRTC ${role} library matching ${pattern} — ${consequence}`]
+  }
+  const diagnostics = []
+  for (const candidate of candidates) {
+    const resolution = resolveSymlinkChain(byPath, candidate.path)
+    if (resolution.kind !== 'resolved') {
+      diagnostics.push(`${candidate.path} does not resolve (${resolution.kind}${resolution.target ? ` -> ${resolution.target}` : ''})`)
+      continue
+    }
+    if (resolution.entry.kind !== 'file') {
+      diagnostics.push(`${candidate.path} resolves to a ${resolution.entry.kind} (${resolution.path})`)
+      continue
+    }
+    if (!pattern.test(basename(resolution.path))) {
+      diagnostics.push(`${candidate.path} resolves to ${resolution.path}, which is not an NVRTC ${role} library`)
+      continue
+    }
+    return []
+  }
+  return [`no usable NVRTC ${role} library — ${consequence}. Checked: ${diagnostics.join('; ')}`]
+}
+
+/**
  * The whole manifest contract, as a pure function of a normalized entry list.
  *
  * @param {Array<{path: string, kind: 'file'|'dir'|'symlink', size: number,
@@ -256,7 +321,6 @@ export function checkManifest(entries, spec, options = {}) {
   const failures = []
   const files = entries.filter((e) => e.kind === 'file')
   const byPath = new Map(entries.map((e) => [e.path, e]))
-  const topLevelFileNames = files.filter((e) => !e.path.includes('/')).map((e) => e.path)
 
   // --- required payload -----------------------------------------------------
   for (const required of spec.required) {
@@ -284,23 +348,32 @@ export function checkManifest(entries, spec, options = {}) {
 
   // --- NVRTC redistributables ----------------------------------------------
   if (spec.nvrtc) {
-    const family = topLevelFileNames.concat(
-      entries.filter((e) => e.kind === 'symlink' && !e.path.includes('/')).map((e) => e.path),
-    )
+    const topLevel = entries.filter((e) => !e.path.includes('/') && (e.kind === 'file' || e.kind === 'symlink'))
     if (requireNvrtc) {
-      if (!family.some((n) => spec.nvrtc.compiler.test(n))) {
-        failures.push(
-          `no NVRTC compiler library matching ${spec.nvrtc.compiler} — the GPU path ` +
-            'would silently fall back to CPU on a driver-only host',
-        )
-      }
-      if (!family.some((n) => spec.nvrtc.builtins.test(n))) {
-        failures.push(`no NVRTC builtins library matching ${spec.nvrtc.builtins} — the NVRTC pair is incomplete`)
-      }
+      // A NAME is not enough. cudarc dlopen's the soname, and dlopen follows
+      // links, so the chain has to end at a real library of the right family.
+      failures.push(
+        ...checkNvrtcRole(
+          topLevel.filter((e) => spec.nvrtc.compiler.test(basename(e.path))),
+          byPath,
+          spec.nvrtc.compiler,
+          'compiler',
+          'the GPU path would silently fall back to CPU on a driver-only host',
+        ),
+      )
+      failures.push(
+        ...checkNvrtcRole(
+          topLevel.filter((e) => spec.nvrtc.builtins.test(basename(e.path))),
+          byPath,
+          spec.nvrtc.builtins,
+          'builtins',
+          'the NVRTC pair is incomplete',
+        ),
+      )
     }
-    for (const name of family) {
-      if (spec.nvrtc.forbidden.test(name)) {
-        failures.push(`${name} is the alternate JIT backend cudarc never loads and must not be shipped`)
+    for (const entry of topLevel) {
+      if (spec.nvrtc.forbidden.test(entry.path)) {
+        failures.push(`${entry.path} is the alternate JIT backend cudarc never loads and must not be shipped`)
       }
     }
   }
@@ -334,18 +407,23 @@ export function checkManifest(entries, spec, options = {}) {
     )
   }
 
-  // --- dangling symlinks ----------------------------------------------------
+  // --- symlink integrity ----------------------------------------------------
   // A link that resolves nowhere is worse than no link: dlopen fails and the
-  // GPU silently never engages.
+  // GPU silently never engages. A link that never terminates is worse still,
+  // because a naive one-hop check reads a cycle as a satisfied target.
   for (const entry of entries) {
     if (entry.kind !== 'symlink') continue
+    const resolution = resolveSymlinkChain(byPath, entry.path)
     const target = entry.linkTarget ?? ''
-    if (target.startsWith('/') || target.includes('..')) {
-      failures.push(`symlink ${entry.path} -> ${target} escapes the payload`)
-      continue
+    if (resolution.kind === 'escape') {
+      failures.push(`symlink ${entry.path} -> ${resolution.target ?? target} escapes the payload`)
+    } else if (resolution.kind === 'dangling') {
+      failures.push(`symlink ${entry.path} -> ${target} is dangling inside the archive (no entry at ${resolution.path})`)
+    } else if (resolution.kind === 'cycle') {
+      failures.push(`symlink ${entry.path} -> ${target} never terminates (cycle at ${resolution.path})`)
+    } else if (resolution.kind === 'too-deep') {
+      failures.push(`symlink ${entry.path} -> ${target} exceeds ${MAX_SYMLINK_HOPS} hops`)
     }
-    const resolved = posix.normalize(posix.join(posix.dirname(entry.path), target))
-    if (!byPath.has(resolved)) failures.push(`symlink ${entry.path} -> ${target} is dangling inside the archive`)
   }
 
   // --- junk and label-specific forbidden entries ---------------------------

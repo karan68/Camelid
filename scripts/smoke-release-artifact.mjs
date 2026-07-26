@@ -52,6 +52,12 @@ export const HEALTH_POLL_INTERVAL_MS = 350
 /** Version probe budget. `--version` parses the clap tree and exits. */
 export const VERSION_TIMEOUT_MS = 30_000
 
+/** How long a terminated engine gets to close its stdio before SIGKILL. */
+export const TERMINATE_TIMEOUT_MS = 10_000
+
+/** Grace period after SIGKILL for the stdio pipes to drain. */
+export const SIGKILL_GRACE_MS = 5_000
+
 // ---------------------------------------------------------------------------
 // Pure assertions (unit-tested directly)
 // ---------------------------------------------------------------------------
@@ -230,23 +236,101 @@ export async function probeServer(port, get = httpGet) {
   return { failures, health: health.body }
 }
 
-/** Terminate a child and its tree, then wait for the exit to be observed. */
-async function terminate(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  if (process.platform === 'win32') {
-    // A bare kill() leaves the process tree behind on Windows and the runner
-    // then hangs waiting on inherited pipes.
-    await new Promise((done) => {
-      const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-      killer.on('exit', done)
-      killer.on('error', done)
-    })
-  } else {
-    child.kill('SIGTERM')
+/**
+ * Terminate a child and its whole tree, then wait for its stdio to CLOSE.
+ *
+ * `close` rather than `exit`: exit fires when the process goes away, but the
+ * piped stdio streams can still be draining, so reading stderr after exit can
+ * miss the very tail — which is exactly where a panic or abort message lands.
+ * The caller passes a `closed` promise created at spawn time so the event
+ * cannot be missed if the child had already gone.
+ */
+async function terminate(child, closed) {
+  if (child.exitCode === null && child.signalCode === null) {
+    if (process.platform === 'win32') {
+      // A bare kill() leaves the process tree behind on Windows and the runner
+      // then hangs waiting on inherited pipes.
+      await new Promise((done) => {
+        const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+        killer.on('exit', done)
+        killer.on('error', done)
+      })
+    } else {
+      child.kill('SIGTERM')
+    }
   }
-  const exited = new Promise((done) => child.once('exit', done))
-  const timedOut = await Promise.race([exited.then(() => false), sleep(10_000).then(() => true)])
-  if (timedOut) child.kill('SIGKILL')
+  const timedOut = await Promise.race([closed.then(() => false), sleep(TERMINATE_TIMEOUT_MS).then(() => true)])
+  if (!timedOut) return
+  child.kill('SIGKILL')
+  // Still wait after escalating: SIGKILL is not instantaneous, and returning
+  // here would hand the caller a half-drained stderr buffer.
+  await Promise.race([closed, sleep(SIGKILL_GRACE_MS)])
+}
+
+/**
+ * Boot a candidate engine, probe it, and shut it down.
+ *
+ * Split out of main() so the self-test can drive it against a fixture process
+ * that misbehaves in ways a healthy release binary never would.
+ *
+ * @returns {Promise<{failures: string[], healthBody: string|null, stdout: string, stderr: string}>}
+ */
+export async function bootAndProbe({ command, args, cwd, port, timeoutMs = HEALTH_TIMEOUT_MS, get = httpGet }) {
+  const failures = []
+  const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+  // Created before anything can kill the child, so a fast exit cannot race us
+  // into awaiting an event that already fired. Deliberately NOT events.once():
+  // that rejects on the 'error' event a failed spawn emits, turning an
+  // unspawnable binary into an unhandled rejection instead of a clean failure.
+  const closed = new Promise((markClosed) => child.once('close', markClosed))
+  let stdout = ''
+  let stderr = ''
+  let spawnError = null
+  child.stdout.on('data', (d) => { stdout += d })
+  child.stderr.on('data', (d) => { stderr += d })
+  child.on('error', (error) => { spawnError = error })
+  const isAlive = () => spawnError === null && child.exitCode === null && child.signalCode === null
+
+  let healthBody = null
+  try {
+    const health = await waitForHealth({ port, timeoutMs, isAlive, get })
+    if (!health.ok) {
+      failures.push(health.reason)
+      if (spawnError) failures.push(`spawn failed: ${spawnError.message}`)
+    } else {
+      const probe = await probeServer(port, get)
+      failures.push(...probe.failures)
+      healthBody = probe.health
+      // Answering the probes and then falling over is not "serving". Without
+      // this the teardown below sees an already-dead child, returns happily,
+      // and the smoke reports success for a binary that cannot stay up. The
+      // transport re-check is the reliable half: a closed listener refuses
+      // immediately, whereas the process may take a moment to disappear.
+      try {
+        const after = await get(port, '/v1/health')
+        if (after.status !== 200) {
+          failures.push(`the engine stopped serving after the probes (/v1/health returned ${after.status})`)
+        }
+      } catch (error) {
+        failures.push(`the engine stopped serving after the probes (/v1/health: ${error.code || error.message})`)
+      }
+      if (!isAlive()) {
+        failures.push(
+          `the engine exited on its own after answering the probes ` +
+            `(exit code ${child.exitCode}, signal ${child.signalCode}) — a release binary must keep serving`,
+        )
+      }
+    }
+  } catch (error) {
+    // A transport error mid-probe means the engine died under us; report it as
+    // a failure rather than letting it escape as an unhandled rejection.
+    failures.push(`probing the engine failed: ${error.message}`)
+    if (!isAlive()) failures.push('the engine exited while it was being probed')
+  } finally {
+    await terminate(child, closed)
+  }
+
+  return { failures, healthBody, stdout, stderr }
 }
 
 /** Run `<binary> --version` and compare it to the expected tag. */
@@ -343,44 +427,31 @@ async function main() {
   // 2. boot, serve, shut down ---------------------------------------------
   const emptyModelsDir = await mkdtemp(join(tmpdir(), 'camelid-smoke-models-'))
   const port = await pickFreePort()
-  let stderr = ''
-  let stdout = ''
-  let child = null
-  let healthBody = null
+  let boot
   try {
-    child = spawn(binaryPath, buildServeArgs({ port, modelsDir: emptyModelsDir }), {
+    boot = await bootAndProbe({
+      command: binaryPath,
+      args: buildServeArgs({ port, modelsDir: emptyModelsDir }),
       cwd: args.dir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    child.stdout.on('data', (d) => { stdout += d })
-    child.stderr.on('data', (d) => { stderr += d })
-    let spawnError = null
-    child.on('error', (error) => { spawnError = error })
-
-    const health = await waitForHealth({
       port,
       timeoutMs,
-      isAlive: () => spawnError === null && child.exitCode === null && child.signalCode === null,
     })
-    if (!health.ok) {
-      failures.push(health.reason)
-      if (spawnError) failures.push(`spawn failed: ${spawnError.message}`)
-    } else {
-      console.log(`  /v1/health answered on 127.0.0.1:${port}`)
-      const probe = await probeServer(port)
-      failures.push(...probe.failures)
-      healthBody = probe.health
-      if (!probe.failures.length) console.log('  /v1/health, /api/capabilities and the embedded web UI all served')
-    }
   } finally {
-    if (child) await terminate(child)
     await rm(emptyModelsDir, { recursive: true, force: true })
+  }
+  failures.push(...boot.failures)
+  const healthBody = boot.healthBody
+  if (!boot.failures.length) {
+    console.log(`  /v1/health answered on 127.0.0.1:${port}`)
+    console.log('  /v1/health, /api/capabilities and the embedded web UI all served')
   }
 
   // 3. crash markers -------------------------------------------------------
+  // Read only after bootAndProbe has awaited the child's stdio CLOSE, so this
+  // sees the complete buffer including anything written on the way down.
   // A driverless runner is exactly the missing-NVRTC environment, so a clean
   // stderr here is the standing guard for "fall back to CPU, do not abort".
-  failures.push(...assertNoCrashMarkers(stderr))
+  failures.push(...assertNoCrashMarkers(boot.stderr))
 
   if (args.out) {
     const receipt = {
@@ -402,8 +473,8 @@ async function main() {
   if (failures.length) {
     console.error(`\nsmoke-release-artifact FAILED (${failures.length}):`)
     for (const failure of failures) console.error(`  FAIL: ${failure}`)
-    if (stderr.trim()) console.error(`\n--- engine stderr ---\n${stderr.trim()}`)
-    if (stdout.trim()) console.error(`\n--- engine stdout ---\n${stdout.trim()}`)
+    if (boot.stderr.trim()) console.error(`\n--- engine stderr ---\n${boot.stderr.trim()}`)
+    if (boot.stdout.trim()) console.error(`\n--- engine stdout ---\n${boot.stdout.trim()}`)
     process.exit(1)
   }
   console.log(`\nsmoke-release-artifact passed: ${args.label} boots and serves`)

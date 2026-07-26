@@ -20,6 +20,7 @@ import {
   parseVersionOutput,
   readTree,
   resolvePayloadRoot,
+  resolveSymlinkChain,
 } from './check-release-artifact.mjs'
 
 const workspace = await mkdtemp(join(tmpdir(), 'camelid-artifact-test-'))
@@ -325,6 +326,110 @@ assert.deepEqual(
   }),
   [],
   'the mode check must stay off where the filesystem has no mode bits to lose',
+)
+
+// ---------------------------------------------------------------------------
+// resolveSymlinkChain
+// ---------------------------------------------------------------------------
+{
+  const map = (...es) => new Map(es.map((e) => [e.path, e]))
+  const real = entry('libnvrtc.so.12.9.86')
+
+  assert.equal(resolveSymlinkChain(map(real), 'libnvrtc.so.12.9.86').kind, 'resolved', 'a regular file resolves to itself')
+  assert.equal(
+    resolveSymlinkChain(map(real, link('libnvrtc.so.12', 'libnvrtc.so.12.9.86')), 'libnvrtc.so.12').path,
+    'libnvrtc.so.12.9.86',
+    'a one-hop link resolves to its target',
+  )
+  assert.equal(
+    resolveSymlinkChain(map(real, link('a', 'b'), link('b', 'libnvrtc.so.12.9.86')), 'a').path,
+    'libnvrtc.so.12.9.86',
+    'a multi-hop chain resolves to the terminal file',
+  )
+  assert.equal(resolveSymlinkChain(map(link('a', 'missing')), 'a').kind, 'dangling')
+  assert.equal(resolveSymlinkChain(map(link('a', 'a')), 'a').kind, 'cycle', 'a self-referential link is a cycle, not a satisfied target')
+  assert.equal(resolveSymlinkChain(map(link('a', 'b'), link('b', 'a')), 'a').kind, 'cycle')
+  assert.equal(resolveSymlinkChain(map(link('a', '/usr/lib/x')), 'a').kind, 'escape')
+  assert.equal(resolveSymlinkChain(map(link('a', '../../etc/passwd')), 'a').kind, 'escape')
+  {
+    // A chain longer than the hop bound must terminate rather than spin.
+    const long = []
+    for (let i = 0; i < 12; i += 1) long.push(link(`l${i}`, `l${i + 1}`))
+    assert.equal(resolveSymlinkChain(map(...long), 'l0').kind, 'too-deep')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NVRTC sonames must RESOLVE to the right library, not merely be named like one
+//
+// cudarc dlopen's the soname and dlopen follows links, so a link whose name
+// matches while its target is the wrong library reproduces exactly the
+// silent CPU-fallback packaging failure this gate exists to catch. The
+// driverless boot smoke cannot catch it either, because it deliberately
+// exercises the CPU path.
+// ---------------------------------------------------------------------------
+const withoutCompiler = [
+  entry('camelid'),
+  entry('README.md'),
+  entry('LICENSE'),
+  entry('THIRD_PARTY_NOTICES.md'),
+  entry('libnvrtc-builtins.so.12.9'),
+]
+
+assert.deepEqual(
+  checkManifest([...withoutCompiler, entry('libnvrtc.so.12.9.86'), link('libnvrtc.so.12', 'libnvrtc.so.12.9.86')], LINUX, { requireNvrtc: true }),
+  [],
+  'the real packaging shape (soname symlink -> versioned real file) must still pass',
+)
+assert.ok(
+  has(checkManifest([...withoutCompiler, link('libnvrtc.so.12', 'libnvrtc-builtins.so.12.9')], LINUX, { requireNvrtc: true }), /not an NVRTC compiler library/),
+  'a compiler soname pointing at the BUILTINS library must fail',
+)
+assert.ok(
+  has(checkManifest([...withoutCompiler, link('libnvrtc.so.12', 'LICENSE')], LINUX, { requireNvrtc: true }), /not an NVRTC compiler library/),
+  'a compiler soname pointing at an unrelated file must fail',
+)
+assert.ok(
+  has(checkManifest([...withoutCompiler, link('libnvrtc.so.12', 'libnvrtc.so.12')], LINUX, { requireNvrtc: true }), /no usable NVRTC compiler/),
+  'a self-referential compiler soname must fail',
+)
+assert.ok(
+  has(
+    checkManifest([...withoutCompiler, link('libnvrtc.so.12', 'libnvrtc.so.13'), link('libnvrtc.so.13', 'libnvrtc.so.12')], LINUX, {
+      requireNvrtc: true,
+    }),
+    /no usable NVRTC compiler/,
+  ),
+  'a cyclic compiler soname must fail',
+)
+assert.ok(
+  has(
+    checkManifest(
+      [entry('camelid'), entry('README.md'), entry('LICENSE'), entry('THIRD_PARTY_NOTICES.md'), entry('libnvrtc.so.12.9.86'), link('libnvrtc-builtins.so.12.9', 'libnvrtc.so.12.9.86')],
+      LINUX,
+      { requireNvrtc: true },
+    ),
+    /not an NVRTC builtins library/,
+  ),
+  'a builtins soname pointing at the compiler must fail',
+)
+assert.ok(
+  has(
+    checkManifest(
+      [
+        entry('camelid.exe'),
+        entry('README.md'),
+        entry('LICENSE'),
+        entry('THIRD_PARTY_NOTICES.md'),
+        entry('nvrtc-builtins64_129.dll'),
+        link('nvrtc64_120_0.dll', 'nvrtc-builtins64_129.dll'),
+      ],
+      WINDOWS,
+      { requireNvrtc: true },
+    ),
+    /not an NVRTC compiler library/,
+  ),
+  'the same wrong-family check must apply on Windows',
 )
 
 // ---------------------------------------------------------------------------

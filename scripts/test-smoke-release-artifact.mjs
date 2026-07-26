@@ -14,7 +14,10 @@
 // What is deliberately NOT covered here: spawning camelid itself. That is what
 // the release workflow does with the actual artifact.
 import assert from 'node:assert/strict'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   HEALTH_POLL_INTERVAL_MS,
@@ -23,6 +26,7 @@ import {
   assertHealthPayload,
   assertNoCrashMarkers,
   assertWebUi,
+  bootAndProbe,
   buildServeArgs,
   httpGet,
   pickFreePort,
@@ -237,5 +241,91 @@ await assert.rejects(
   const another = await pickFreePort()
   assert.ok(Number.isInteger(another), 'pickFreePort must be repeatable')
 }
+
+// ---------------------------------------------------------------------------
+// bootAndProbe, against a real child process
+//
+// The release binary is not available in the validation-scripts job, so these
+// drive a fixture process that behaves like the engine and then misbehaves in
+// ways a healthy binary never would.
+// ---------------------------------------------------------------------------
+const fixtureDir = await mkdtemp(join(tmpdir(), 'camelid-smoke-fixture-'))
+const fixturePath = join(fixtureDir, 'engine-fixture.mjs')
+await writeFile(
+  fixturePath,
+  `import { createServer } from 'node:http'
+import { writeSync } from 'node:fs'
+
+const port = Number(process.argv[2])
+const mode = process.argv[3] ?? 'stay'
+const health = ${JSON.stringify(healthyBody)}
+const html = ${JSON.stringify(goodHtml)}
+
+const server = createServer((req, res) => {
+  if (req.url === '/v1/health') res.writeHead(200, { 'content-type': 'application/json' }).end(health)
+  else if (req.url === '/api/capabilities') res.writeHead(200, { 'content-type': 'application/json' }).end('{}')
+  else if (req.url === '/') res.writeHead(200, { 'content-type': 'text/html' }).end(html)
+  else res.writeHead(404).end('nope')
+
+  // '/' is the last probe probeServer issues. Dying right after flushing it is
+  // the "served everything, then fell over" case.
+  if (mode === 'die-after-probes' && req.url === '/') {
+    res.on('finish', () => {
+      // writeSync, not process.stderr.write: an async pipe write can be
+      // truncated by process.exit, and this message existing at all is the
+      // point of the test.
+      writeSync(2, "thread 'main' panicked at fixture: dying right after the last probe\\n")
+      server.close()
+      process.exit(0)
+    })
+  }
+})
+server.listen(port, '127.0.0.1')
+`,
+  'utf8',
+)
+
+{
+  const port = await pickFreePort()
+  const boot = await bootAndProbe({ command: process.execPath, args: [fixturePath, String(port), 'stay'], port, timeoutMs: 10_000 })
+  assert.deepEqual(boot.failures, [], 'a fixture that boots, serves and stays up must pass')
+}
+
+{
+  const port = await pickFreePort()
+  const boot = await bootAndProbe({
+    command: process.execPath,
+    args: [fixturePath, String(port), 'die-after-probes'],
+    port,
+    timeoutMs: 10_000,
+  })
+  assert.ok(
+    has(boot.failures, /stopped serving after the probes|exited on its own after answering the probes/),
+    `an engine that serves every probe and then exits must NOT pass; got ${JSON.stringify(boot.failures)}`,
+  )
+  // Proves the teardown waits for stdio 'close' rather than 'exit': this line
+  // is written while the process is on its way down, and would be missed by a
+  // buffer read at exit time.
+  assert.match(boot.stderr, /panicked at fixture/, 'stderr written on the way down must still be captured')
+  assert.ok(has(assertNoCrashMarkers(boot.stderr), /rust panic/), 'the captured tail must reach the crash-marker check')
+}
+
+{
+  const port = await pickFreePort()
+  const boot = await bootAndProbe({ command: process.execPath, args: ['--eval', 'process.exit(3)'], port, timeoutMs: 3000 })
+  assert.ok(has(boot.failures, /exited before \/v1\/health answered/), 'a process that never listens must fail, not hang')
+}
+
+{
+  const boot = await bootAndProbe({
+    command: join(fixtureDir, 'does-not-exist-anywhere'),
+    args: [],
+    port: await pickFreePort(),
+    timeoutMs: 3000,
+  })
+  assert.ok(boot.failures.length > 0, 'a binary that cannot be spawned must fail')
+}
+
+await rm(fixtureDir, { recursive: true, force: true })
 
 console.log('test-smoke-release-artifact: all checks passed')

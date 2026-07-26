@@ -529,11 +529,48 @@ jobs:
     needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Download build artifacts
+      # Download BY NAME, one step per artifact this job is responsible for.
+      # `download-artifact` with neither `name` nor `pattern` fetches every
+      # artifact in the run, and `merge-multiple: true` flattens them all into
+      # one directory -- so a bare download would sweep the diagnostic
+      # verification receipts (and whatever the independent desktop job had
+      # finished uploading) into `dist`, and `files: dist/*` below would attach
+      # them to the public release. Naming each artifact keeps the published
+      # set exact and fails closed if one is missing.
+      - name: Download the macOS artifact
         uses: actions/download-artifact@v4
         with:
+          name: camelid-macos-arm64
           path: dist
-          merge-multiple: true
+
+      - name: Download the Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: camelid-linux-x86_64
+          path: dist
+
+      - name: Download the Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: camelid-windows-x64
+          path: dist
+
+      # Nothing but the three server archives and their sidecars may reach the
+      # release. This is a cheap standing assertion that the downloads above
+      # stayed scoped.
+      - name: Confirm only publishable files are staged
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          unexpected=$(find . -maxdepth 1 -type f \
+            ! -name '*.tar.gz' ! -name '*.tar.gz.sha256' \
+            ! -name '*.zip' ! -name '*.zip.sha256' -print)
+          if [ -n "$unexpected" ]; then
+            echo "refusing to publish unexpected files:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+          ls -1
 
       # Each .sha256 was computed on its own build runner. The bytes then made
       # two more hops (upload-artifact, download-artifact) before this job
