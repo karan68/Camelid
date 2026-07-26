@@ -2689,30 +2689,28 @@ impl LlamaInferenceSession {
     }
 
     /// Temperature-sampling analog of the greedy resident fast lane: when the
-    /// sampler is plain temperature (no top-k / top-p / penalties / logit-bias),
-    /// draw the next token on the GPU via Gumbel-max ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no 128K-logit host copy and
-    /// no CPU sort, which the profiler showed cost ~7 ms/token (more than the whole
-    /// forward). Returns `Ok(None)` when the config isn't GPU-eligible or CUDA
-    /// resident decode is off, so the caller uses the CPU logits path unchanged.
+    /// sampler is plain temperature (no filtering, penalties, or logit bias),
+    /// draw the next token on the GPU via Gumbel-max — no full-vocabulary host
+    /// copy and no CPU sort. Metal is enabled by default with an explicit escape
+    /// hatch; CUDA retains its opt-in gate until its older streaming-state issue
+    /// is separately resolved.
     pub fn generate_next_token_sampled_resident(
         &mut self,
         token_id: u32,
         config: &SamplingConfig,
     ) -> Result<Option<(u32, u128)>> {
-        // The resident GPU Gumbel-max temperature-sampling fast lane produces
-        // corrupted output in the streaming decode path (garbled, off-topic
-        // tokens for any temperature > 0; greedy/argmax and the CPU temperature
-        // sampler are unaffected). Disabled by default until the GPU
-        // sampling-state interaction is root-caused; opt back in with
-        // CAMELID_GPU_TEMP_SAMPLING. Declining here routes temperature sampling
-        // through the correct CPU sampler (one logits copy per token).
-        if !resident_gpu_temperature_sampling_enabled()
-            || !resident_decode_cuda_enabled()
+        let metal_sampling =
+            resident_decode_metal_enabled() && resident_metal_temperature_sampling_enabled();
+        let cuda_sampling =
+            resident_decode_cuda_enabled() && resident_gpu_temperature_sampling_enabled();
+        if (!metal_sampling && !cuda_sampling)
             || config.temperature <= 0.0
             || config.top_k.is_some()
             || config.top_p.is_some_and(|p| p < 1.0)
+            || config.min_p.is_some_and(|p| p > 0.0)
             || config.presence_penalty != 0.0
             || config.frequency_penalty != 0.0
+            || config.repeat_penalty != 1.0
             || !config.logit_bias.is_empty()
         {
             return Ok(None);
@@ -2729,16 +2727,15 @@ impl LlamaInferenceSession {
             .token_embedding
             .embedding_lookup(&[token_id], "token_embedding")?;
         let inv_temp = 1.0 / config.temperature;
-        // Per-token seed so the Gumbel draw differs each step (the CPU sampler's
-        // fixed seed=0 draw is replaced; temperature sampling is random regardless).
         let base = config.seed.unwrap_or(0);
-        let seed = base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
-        match self.try_resident_decode_forward_cuda(
-            &embedding,
-            true,
-            None,
-            Some((inv_temp, seed)),
-        )? {
+        let forward = if metal_sampling {
+            self.try_resident_decode_forward_metal_sample(&embedding, token_id, inv_temp, base)?
+        } else {
+            let seed =
+                base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
+            self.try_resident_decode_forward_cuda(&embedding, true, None, Some((inv_temp, seed)))?
+        };
+        match forward {
             Some(ResidentForward::Sampled(id)) => {
                 self.kv_cache.position += 1;
                 Ok(Some((id, started.elapsed().as_micros())))
@@ -6001,12 +5998,21 @@ fn sample_with_config(
     }
 
     let mut candidates: Vec<(usize, f32)> = adjusted.data.iter().copied().enumerate().collect();
+    if let Some(top_k) = config.top_k {
+        // Partition around K before ordering the survivors. The comparator is a
+        // total order (token id breaks equal-logit ties), so sorting the selected
+        // prefix below produces exactly the same candidates and deterministic
+        // sampling order as a full-vocabulary sort.
+        if top_k < candidates.len() {
+            candidates.select_nth_unstable_by(top_k, |(left_idx, left), (right_idx, right)| {
+                right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
+            });
+            candidates.truncate(top_k);
+        }
+    }
     candidates.sort_by(|(left_idx, left), (right_idx, right)| {
         right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
     });
-    if let Some(top_k) = config.top_k {
-        candidates.truncate(top_k.min(candidates.len()));
-    }
 
     let max_logit = candidates
         .iter()
@@ -6045,9 +6051,10 @@ fn sample_with_config(
     }
 
     if let Some(top_p) = config.top_p.filter(|top_p| *top_p < 1.0) {
-        weighted.sort_by(|(left_idx, left), (right_idx, right)| {
-            right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
-        });
+        // `weighted` still has the descending-logit order established above:
+        // exp/logit scaling and normalization are monotonic, and min-p retains
+        // elements without reordering them. Sorting by probability again was a
+        // redundant O(n log n) pass over the vocabulary.
         let mut cumulative = 0.0;
         let mut keep = 0usize;
         for (_, probability) in &weighted {
@@ -10477,8 +10484,7 @@ fn expert_matrix_view(
             TensorShape {
                 dims: vec![output_width, input_width],
             },
-            Q8_0FileBacking::new(
-                backing.path.clone(),
+            backing.clone_with_offset_and_blocks(
                 backing.absolute_offset + (block_offset * Q8BlockReader::BLOCK_SIZE_BYTES) as u64,
                 block_count,
             ),
@@ -11672,11 +11678,25 @@ fn build_resident_cuda_engine(
     Some(engine)
 }
 
-/// Opt-in gate for the resident GPU Gumbel-max temperature-sampling fast lane.
-/// Default OFF: the fast lane corrupts output in the streaming decode path, so
-/// temperature sampling falls back to the (correct) CPU sampler. Set
-/// `CAMELID_GPU_TEMP_SAMPLING=1/true/on/yes` to re-enable for debugging once the
-/// GPU sampling-state interaction is fixed.
+/// Metal's resident Gumbel-max sampling lane. Default ON after its device-level
+/// distribution/reproducibility gate; `CAMELID_METAL_TEMP_SAMPLING=0` keeps an
+/// escape hatch for driver diagnosis.
+fn resident_metal_temperature_sampling_enabled() -> bool {
+    match std::env::var_os("CAMELID_METAL_TEMP_SAMPLING") {
+        Some(value) => {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            !(value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no"))
+        }
+        None => true,
+    }
+}
+
+/// Opt-in gate for the CUDA Gumbel-max temperature-sampling lane. Its prior
+/// streaming-state corruption remains isolated behind this default-OFF switch.
 fn resident_gpu_temperature_sampling_enabled() -> bool {
     match std::env::var_os("CAMELID_GPU_TEMP_SAMPLING") {
         Some(value) => {

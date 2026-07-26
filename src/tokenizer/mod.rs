@@ -285,11 +285,11 @@ impl Tokenizer {
             // Llama SPM — tokens, scores, and the bos/eos/unk ids are all read from
             // the GGUF below. (Gemma sets tokenizer.ggml.add_space_prefix=0; exact
             // leading-space parity is a follow-up, construction works on the SPM path.)
-            "llama" | "gemma4" => TokenizerModel::LlamaSpm,
+            "llama" | "gemma2" | "gemma3" | "gemma4" => TokenizerModel::LlamaSpm,
             "gpt2" => TokenizerModel::Gpt2Bpe,
             other => {
                 return Err(BackendError::UnsupportedTokenizer(format!(
-                    "unsupported tokenizer model {other:?}; currently supported: llama/SPM, gemma4/SPM, and GPT-2/BPE llama-bpe"
+                    "unsupported tokenizer model {other:?}; currently supported: llama/SPM, gemma2/SPM, gemma3/SPM, gemma4/SPM, and GPT-2/BPE llama-bpe"
                 )))
             }
         };
@@ -444,7 +444,7 @@ impl Tokenizer {
                 // (without this, the BOS is dropped and the whole forward
                 // diverges). E-series/12B already ship true, so this is a no-op
                 // for them.
-                add_bos: if model_name == "gemma4" {
+                add_bos: if model_name.starts_with("gemma") {
                     true
                 } else {
                     file.metadata_bool("tokenizer.ggml.add_bos_token")

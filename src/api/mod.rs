@@ -4920,6 +4920,7 @@ mod gemma4_template_tests {
         // reject them (falling through would reach the optimized engine, which
         // mis-binds gemma3), and must NOT touch the optimized-lane archs.
         assert!(completions_unsupported_for_arch("qwen35"));
+        assert!(completions_unsupported_for_arch("gemma2"));
         assert!(completions_unsupported_for_arch("gemma3"));
         assert!(!completions_unsupported_for_arch("llama"));
         assert!(!completions_unsupported_for_arch("qwen3"));
@@ -5707,7 +5708,7 @@ fn runnable_serve_enabled() -> bool {
 /// its chat requests get a typed 503 instead of falling through to the mis-bound
 /// optimized engine — fail-closed by design.
 fn is_runnable_serve_arch(arch: &str) -> bool {
-    matches!(arch, "qwen35" | "gemma3")
+    matches!(arch, "qwen35" | "gemma2" | "gemma3")
 }
 
 /// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
@@ -6097,12 +6098,12 @@ async fn runnable_chat_nonstreaming(
         .into_iter()
         .map(|t| t.get("function").cloned().unwrap_or(t))
         .collect();
-    let prompt_text = if runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_tools",
-                "the gemma3 runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
+                "the gemma runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
                 None,
             );
         }
@@ -6114,7 +6115,7 @@ async fn runnable_chat_nonstreaming(
     };
     // gemma3 renders carry no BOS string (oracle /apply-template parity) — BOS is
     // added at token level (add_special=true), matching llama-server's chat path.
-    let add_special = runtime.architecture == "gemma3";
+    let add_special = runtime.architecture == "gemma2" || runtime.architecture == "gemma3";
     let prompt_ids = match runtime.tokenizer.encode(&prompt_text, add_special, true) {
         Ok(ids) => ids,
         Err(e) => {
@@ -6209,12 +6210,12 @@ async fn runnable_chat_streaming(
         .into_iter()
         .map(|t| t.get("function").cloned().unwrap_or(t))
         .collect();
-    let prompt_text = if runtime.architecture == "gemma3" {
+    let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_tools",
-                "the gemma3 runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
+                "the gemma runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
                 None,
             );
         }
@@ -6226,7 +6227,7 @@ async fn runnable_chat_streaming(
     };
     // gemma3 renders carry no BOS string (oracle /apply-template parity) — BOS is
     // added at token level (add_special=true), matching llama-server's chat path.
-    let add_special = runtime.architecture == "gemma3";
+    let add_special = runtime.architecture == "gemma2" || runtime.architecture == "gemma3";
     let prompt_ids = match runtime.tokenizer.encode(&prompt_text, add_special, true) {
         Ok(ids) => ids,
         Err(e) => {
