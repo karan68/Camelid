@@ -91,6 +91,20 @@ const JUNK_PATTERNS = [
 
 const COMMON_DOCS = ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md']
 
+/**
+ * Allowlist patterns shared by every artifact. Anchored on purpose: the payload
+ * is a CLOSED set, so anything not named here fails rather than riding along.
+ */
+const DOC_PATTERNS = [/^README\.md$/, /^LICENSE$/, /^THIRD_PARTY_NOTICES\.md$/]
+
+/**
+ * Constrained NVRTC filename shapes. `libnvrtc.so.12`, `libnvrtc.so.12.9.86`
+ * and `libnvrtc-builtins.so.12.9` match; `libnvrtc.alt.so.12` and anything
+ * merely containing "nvrtc" do not.
+ */
+const NVRTC_UNIX_PATTERNS = [/^libnvrtc\.so(\.\d+)+$/, /^libnvrtc-builtins\.so(\.\d+)+$/]
+const NVRTC_WINDOWS_PATTERNS = [/^nvrtc64_\d+_\d+\.dll$/i, /^nvrtc-builtins64_\d+\.dll$/i]
+
 /** Depth bound for symlink resolution; real payloads use one hop. */
 const MAX_SYMLINK_HOPS = 8
 
@@ -102,6 +116,7 @@ const ARTIFACT_SPECS = {
     binary: 'camelid',
     executable: true,
     required: ['camelid', ...COMMON_DOCS],
+    allowed: [/^camelid$/, ...DOC_PATTERNS],
     nvrtc: null,
     forbidden: [],
   },
@@ -112,6 +127,7 @@ const ARTIFACT_SPECS = {
     binary: 'camelid',
     executable: true,
     required: ['camelid', ...COMMON_DOCS],
+    allowed: [/^camelid$/, ...DOC_PATTERNS, ...NVRTC_UNIX_PATTERNS],
     nvrtc: NVRTC.unix,
     forbidden: [],
   },
@@ -122,6 +138,7 @@ const ARTIFACT_SPECS = {
     binary: 'camelid.exe',
     executable: false,
     required: ['camelid.exe', ...COMMON_DOCS],
+    allowed: [/^camelid\.exe$/, ...DOC_PATTERNS, ...NVRTC_WINDOWS_PATTERNS],
     nvrtc: NVRTC.windows,
     forbidden: [],
   },
@@ -134,6 +151,7 @@ const ARTIFACT_SPECS = {
     // The portable layout is desktop exe + sidecar + NVRTC beside each other,
     // which is what `beside-exe` sidecar resolution depends on.
     required: ['camelid-desktop.exe', 'camelid.exe', 'DESKTOP_README.md', ...COMMON_DOCS],
+    allowed: [/^camelid-desktop\.exe$/, /^camelid\.exe$/, /^DESKTOP_README\.md$/, ...DOC_PATTERNS, ...NVRTC_WINDOWS_PATTERNS],
     nvrtc: NVRTC.windows,
     // The NSIS installer is `Move-Item`d OUT of the portable folder before it is
     // zipped, because it is published as its own artifact. If that move ever
@@ -159,14 +177,22 @@ const LABELS = Object.keys(ARTIFACT_SPECS)
  * coreutils emits in binary mode, CRLF, and a UTF-8 BOM so a future packaging
  * tweak does not fail for a cosmetic reason.
  *
+ * EXACTLY ONE record is required. A sidecar carrying a valid first line
+ * followed by anything else is rejected: `shasum -c` would consume every
+ * record, so accepting only the first would verify something different from
+ * what a user's own check does.
+ *
  * @returns {{hash: string, name: string}}
  */
 export function parseChecksumFile(text) {
   if (typeof text !== 'string') throw new TypeError('checksum content must be a string')
-  const line = text.replace(/^\uFEFF/, '').split(/\r?\n/).find((l) => l.trim().length > 0)
-  if (!line) throw new Error('checksum file is empty')
-  const match = /^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$/.exec(line.trim())
-  if (!match) throw new Error(`checksum line is not "<64-hex>  <name>": ${JSON.stringify(line.trim())}`)
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter((l) => l.trim().length > 0)
+  if (!lines.length) throw new Error('checksum file is empty')
+  if (lines.length > 1) {
+    throw new Error(`checksum file must contain exactly one record, found ${lines.length}`)
+  }
+  const match = /^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$/.exec(lines[0].trim())
+  if (!match) throw new Error(`checksum line is not "<64-hex>  <name>": ${JSON.stringify(lines[0].trim())}`)
   return { hash: match[1].toLowerCase(), name: match[2] }
 }
 
@@ -424,6 +450,17 @@ export function checkManifest(entries, spec, options = {}) {
     } else if (resolution.kind === 'too-deep') {
       failures.push(`symlink ${entry.path} -> ${target} exceeds ${MAX_SYMLINK_HOPS} hops`)
     }
+  }
+
+  // --- closed payload contract ---------------------------------------------
+  // Required-plus-junk-patterns is an OPEN set: it accepts anything nobody
+  // thought to forbid. The shipped payloads are small and fully enumerable, so
+  // the allowlist is the honest shape: an accidental future glob, a staged
+  // credential, or a stray build output fails here instead of reaching a
+  // public download.
+  for (const entry of entries) {
+    if (spec.allowed.some((re) => re.test(entry.path))) continue
+    failures.push(`unexpected entry in the artifact: ${entry.path} (${entry.kind}) is not part of the ${spec.archive} payload`)
   }
 
   // --- junk and label-specific forbidden entries ---------------------------

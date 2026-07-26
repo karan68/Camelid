@@ -20,6 +20,11 @@ permissions:
   contents: write
 
 env:
+  # The single release identity for this run. A tag push resolves to the pushed
+  # tag; a workflow_dispatch resolves to the tag the operator asked to publish.
+  # Every job checks THIS out and asserts the binary reports it, so a dispatch
+  # cannot build one ref and attach those bytes to a different tag.
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
   # Any CUDA 12.x works: the NVRTC soname (nvrtc64_120_0.dll) is stable across the
   # 12.x series and cudarc is pinned to the 12.x ABI (`cuda-12090`). The matching
   # nvrtc-builtins ship in the same component, so the pair is always self-consistent.
@@ -37,8 +42,13 @@ jobs:
             label: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
+      # Pinned to RELEASE_TAG, not the triggering ref: a workflow_dispatch must
+      # build the tag it is going to publish under, or the attached bytes are
+      # not the tag's bytes.
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       # The web UI is embedded into the binary at compile time, so it must be
       # built before cargo build.
@@ -125,20 +135,14 @@ jobs:
             $nvrtc_flag \
             --out "$dist-check-receipt.json"
 
-          # Only a tag push guarantees the checked-out commit IS the released
-          # commit. workflow_dispatch builds whatever ref it was started from,
-          # so pinning the binary to the input tag there would fail by design.
-          version_flag=""
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            version_flag="--expect-version ${{ github.ref_name }}"
-          else
-            echo "note: not a tag push; skipping the binary/tag version assertion"
-          fi
-
+          # Asserted unconditionally. The checkout above pinned this job to
+          # RELEASE_TAG, so the binary must report it whether this run came
+          # from a tag push or a manual dispatch -- the release is published
+          # under that same tag either way.
           node scripts/smoke-release-artifact.mjs \
             --dir "verify/$dist" \
             --label "${{ matrix.label }}" \
-            $version_flag \
+            --expect-version "${{ env.RELEASE_TAG }}" \
             --out "$dist-smoke-receipt.json"
 
       - name: Upload artifacts
@@ -178,6 +182,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -277,11 +283,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "check-release-artifact failed ($LASTEXITCODE)" }
 
           # Compress-Archive packs the CONTENTS, so the payload is at the root.
-          $versionArgs = @()
-          if ('${{ github.ref_type }}' -eq 'tag') { $versionArgs = @('--expect-version', '${{ github.ref_name }}') }
-          else { Write-Host 'note: not a tag push; skipping the binary/tag version assertion' }
-
-          node scripts/smoke-release-artifact.mjs --dir verify --label windows-x64 @versionArgs --out "$dist-smoke-receipt.json"
+          node scripts/smoke-release-artifact.mjs --dir verify --label windows-x64 --expect-version '${{ env.RELEASE_TAG }}' --out "$dist-smoke-receipt.json"
           if ($LASTEXITCODE -ne 0) { throw "smoke-release-artifact failed ($LASTEXITCODE)" }
 
       - name: Upload artifacts
@@ -331,6 +333,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -480,11 +484,7 @@ jobs:
             --out "$dist-check-receipt.json"
           if ($LASTEXITCODE -ne 0) { throw "check-release-artifact failed ($LASTEXITCODE)" }
 
-          $versionArgs = @()
-          if ('${{ github.ref_type }}' -eq 'tag') { $versionArgs = @('--expect-version', '${{ github.ref_name }}') }
-          else { Write-Host 'note: not a tag push; skipping the binary/tag version assertion' }
-
-          node scripts/smoke-release-artifact.mjs --dir verify-desktop --label desktop-windows-x64 @versionArgs --out "$dist-smoke-receipt.json"
+          node scripts/smoke-release-artifact.mjs --dir verify-desktop --label desktop-windows-x64 --expect-version '${{ env.RELEASE_TAG }}' --out "$dist-smoke-receipt.json"
           if ($LASTEXITCODE -ne 0) { throw "smoke-release-artifact failed ($LASTEXITCODE)" }
 
           # The installer is published separately and must exist as its own file.
@@ -518,7 +518,7 @@ jobs:
       - name: Publish signed desktop artifacts to the release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             camelid-desktop-windows-x64.zip
             camelid-desktop-windows-x64.zip.sha256
@@ -556,66 +556,31 @@ jobs:
           path: dist
 
       # Nothing but the three server archives and their sidecars may reach the
-      # release. This is a cheap standing assertion that the downloads above
-      # stayed scoped.
-      - name: Confirm only publishable files are staged
-        working-directory: dist
-        run: |
-          set -euo pipefail
-          unexpected=$(find . -maxdepth 1 -type f \
-            ! -name '*.tar.gz' ! -name '*.tar.gz.sha256' \
-            ! -name '*.zip' ! -name '*.zip.sha256' -print)
-          if [ -n "$unexpected" ]; then
-            echo "refusing to publish unexpected files:" >&2
-            echo "$unexpected" >&2
-            exit 1
-          fi
-          ls -1
+      # release, and every sidecar must be one record naming its own archive.
+      # This reuses the same parser the build-time check uses, so the two gates
+      # cannot drift and a `shasum -c` run by a user verifies what CI verified.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
-      # Each .sha256 was computed on its own build runner. The bytes then made
-      # two more hops (upload-artifact, download-artifact) before this job
-      # publishes them, and nothing re-checked them afterwards. Re-hashing here
-      # means the checksum published beside a file provably describes the file
-      # actually published.
-      - name: Re-verify checksums after the artifact round-trip
-        working-directory: dist
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Verify checksums after the artifact round-trip
         run: |
-          set -euo pipefail
-          shopt -s nullglob
-          sidecars=(*.sha256)
-          if [ ${#sidecars[@]} -eq 0 ]; then
-            echo "no .sha256 sidecars found in dist/ — refusing to publish unverifiable artifacts" >&2
-            exit 1
-          fi
-          for sidecar in "${sidecars[@]}"; do
-            archive="${sidecar%.sha256}"
-            if [ ! -f "$archive" ]; then
-              echo "$sidecar has no matching archive $archive" >&2
-              exit 1
-            fi
-            # awk (not read) so a sidecar written without a trailing newline —
-            # which is exactly what the PowerShell packaging steps produce —
-            # still yields its hash.
-            expected=$(awk '{print $1; exit}' "$sidecar")
-            actual=$(shasum -a 256 "$archive" | awk '{print $1}')
-            if [ "$expected" != "$actual" ]; then
-              echo "checksum mismatch for $archive: sidecar $expected, actual $actual" >&2
-              exit 1
-            fi
-            echo "  verified $archive"
-          done
-          # Every publishable archive must carry a sidecar, not just the reverse.
-          for archive in *.tar.gz *.zip; do
-            if [ ! -f "$archive.sha256" ]; then
-              echo "$archive has no .sha256 sidecar" >&2
-              exit 1
-            fi
-          done
+          node scripts/verify-release-checksums.mjs \
+            --dir dist \
+            --expect camelid-macos-arm64.tar.gz \
+            --expect camelid-linux-x86_64.tar.gz \
+            --expect camelid-windows-x64.zip
 
       - name: Publish to the GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true

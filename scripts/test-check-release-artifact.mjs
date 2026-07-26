@@ -112,6 +112,18 @@ assert.equal(parseChecksumFile(`${'A'.repeat(64)}  a.zip`).hash, HASH, 'hashes m
 assert.throws(() => parseChecksumFile(''), /empty/, 'an empty sidecar must throw')
 assert.throws(() => parseChecksumFile('not-a-hash  a.zip'), /64-hex/, 'a malformed sidecar must throw')
 assert.throws(() => parseChecksumFile(`${'a'.repeat(63)}  a.zip`), /64-hex/, 'a short hash must throw')
+// `shasum -c` consumes every record, so honouring only the first would verify
+// something different from what a user's own check does.
+assert.throws(
+  () => parseChecksumFile(`${HASH}  a.zip\ngarbage garbage`),
+  /exactly one record/,
+  'a valid first record followed by garbage must throw',
+)
+assert.throws(
+  () => parseChecksumFile(`${HASH}  a.zip\n${'b'.repeat(64)}  b.zip`),
+  /exactly one record/,
+  'a multi-record sidecar must throw',
+)
 
 // ---------------------------------------------------------------------------
 // version comparison
@@ -490,6 +502,57 @@ assert.deepEqual(
   ),
   [],
   'the installer rule is desktop-specific and must not leak onto other labels',
+)
+
+// ---------------------------------------------------------------------------
+// closed payload contract
+//
+// Required-files-plus-junk-patterns is an OPEN set: it accepts anything nobody
+// thought to forbid. These assert the allowlist actually closes it, so an
+// accidental future glob or a staged credential cannot ride along into a
+// public download.
+// ---------------------------------------------------------------------------
+assert.ok(
+  has(await failuresFor('windows-credentials', { ...goodWindows, 'credentials.json': '{}' }, WINDOWS, { requireNvrtc: true }), /unexpected entry/),
+  'a staged credential file must fail even though it matches no junk pattern',
+)
+assert.ok(
+  has(await failuresFor('windows-extra-exe', { ...goodWindows, 'totally-unexpected.exe': 'PE' }, WINDOWS, { requireNvrtc: true }), /unexpected entry/),
+  'an unexpected executable must fail',
+)
+assert.ok(
+  has(await failuresFor('windows-nested-dir', { ...goodWindows, 'extra/inner.txt': 'x' }, WINDOWS, { requireNvrtc: true }), /unexpected entry/),
+  'an arbitrary nested directory must fail',
+)
+assert.ok(
+  has(await failuresFor('linux-extra-doc', { ...goodLinux, 'NOTES.md': 'notes' }, LINUX, { requireNvrtc: true }), /unexpected entry/),
+  'even an innocuous extra document must fail: the payload is a closed set',
+)
+// NVRTC names are constrained, not merely "contains nvrtc".
+assert.ok(
+  has(await failuresFor('windows-odd-nvrtc', { ...goodWindows, 'nvrtc64_evil.dll': 'x' }, WINDOWS, { requireNvrtc: true }), /unexpected entry/),
+  'an nvrtc-shaped name that does not match the versioned pattern must fail',
+)
+assert.ok(
+  has(await failuresFor('linux-odd-nvrtc', { ...goodLinux, 'libnvrtc.so': 'x' }, LINUX, { requireNvrtc: true }), /unexpected entry/),
+  'an unversioned libnvrtc.so must fail the constrained pattern',
+)
+assert.deepEqual(
+  checkManifest(
+    [
+      entry('camelid'),
+      entry('README.md'),
+      entry('LICENSE'),
+      entry('THIRD_PARTY_NOTICES.md'),
+      entry('libnvrtc.so.12.9.86'),
+      entry('libnvrtc-builtins.so.12.9'),
+      link('libnvrtc.so.12', 'libnvrtc.so.12.9.86'),
+    ],
+    LINUX,
+    { requireNvrtc: true },
+  ),
+  [],
+  'the real staged NVRTC filenames must all satisfy the allowlist',
 )
 
 // ---------------------------------------------------------------------------

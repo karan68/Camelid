@@ -125,6 +125,19 @@ export function assertCapabilitiesPayload(status, bodyText) {
 }
 
 /**
+ * Pull the first hashed module URL out of the app shell.
+ *
+ * Matching the markup only proves the HTML mentions a bundle; the URL has to be
+ * fetched before the UI can be called embedded (see assertUiAsset).
+ *
+ * @returns {string|null}
+ */
+export function extractUiAssetUrl(bodyText) {
+  const match = /<script[^>]+src="(\/assets\/[^"]+\.js)"/i.exec(String(bodyText ?? ''))
+  return match ? match[1] : null
+}
+
+/**
  * `GET /` must serve the EMBEDDED web UI, not merely 200.
  *
  * Requiring both the app title and a hashed module asset means an empty or
@@ -137,9 +150,30 @@ export function assertWebUi(status, headers, bodyText) {
   if (!contentType.includes('text/html')) failures.push(`GET /: expected an HTML content-type, got ${JSON.stringify(contentType)}`)
   const body = String(bodyText ?? '')
   if (!/<title>\s*Camelid\s*<\/title>/i.test(body)) failures.push('GET /: embedded UI is missing the Camelid app shell title')
-  if (!/src="\/assets\/[^"]+\.js"/.test(body)) {
+  if (!extractUiAssetUrl(body)) {
     failures.push('GET /: embedded UI references no hashed /assets/*.js bundle — the web UI build did not make it into the binary')
   }
+  return failures
+}
+
+/**
+ * The referenced bundle must actually be served.
+ *
+ * An app shell that names `/assets/index-abc.js` while the binary embeds
+ * nothing at that path is a blank page for every browser client, and a
+ * markup-only assertion cannot tell the two apart.
+ */
+export function assertUiAsset(url, status, headers, bodyText) {
+  const failures = []
+  if (status !== 200) {
+    failures.push(`GET ${url}: expected 200, got ${status} — the app shell references a bundle the binary does not serve`)
+    return failures
+  }
+  const contentType = String(headers?.['content-type'] ?? '')
+  if (!/javascript|ecmascript/i.test(contentType)) {
+    failures.push(`GET ${url}: expected a JavaScript content-type, got ${JSON.stringify(contentType)}`)
+  }
+  if (String(bodyText ?? '').length === 0) failures.push(`GET ${url}: bundle is empty`)
   return failures
 }
 
@@ -233,6 +267,18 @@ export async function probeServer(port, get = httpGet) {
   failures.push(...assertCapabilitiesPayload(capabilities.status, capabilities.body))
   const index = await get(port, '/')
   failures.push(...assertWebUi(index.status, index.headers, index.body))
+
+  // Follow the reference. A shell that names a bundle the binary never embeds
+  // renders a blank app, and every markup-level assertion above still passes.
+  const assetUrl = extractUiAssetUrl(index.body)
+  if (assetUrl) {
+    try {
+      const asset = await get(port, assetUrl)
+      failures.push(...assertUiAsset(assetUrl, asset.status, asset.headers, asset.body))
+    } catch (error) {
+      failures.push(`GET ${assetUrl}: request failed — ${error.code || error.message}`)
+    }
+  }
   return { failures, health: health.body }
 }
 

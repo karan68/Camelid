@@ -25,9 +25,11 @@ import {
   assertCapabilitiesPayload,
   assertHealthPayload,
   assertNoCrashMarkers,
+  assertUiAsset,
   assertWebUi,
   bootAndProbe,
   buildServeArgs,
+  extractUiAssetUrl,
   httpGet,
   pickFreePort,
   probeServer,
@@ -97,6 +99,8 @@ assert.ok(has(assertCapabilitiesPayload(200, '[]'), /expected a JSON object/), '
 // GET / — the embedded web UI must actually be embedded
 // ---------------------------------------------------------------------------
 const goodHtml = '<!doctype html><html><head><title>Camelid</title><script type="module" src="/assets/index-BwWMwyQo.js"></script></head><body></body></html>'
+const UI_ASSET_URL = '/assets/index-BwWMwyQo.js'
+const UI_ASSET_BODY = 'export const app = 1;\n'
 const htmlHeaders = { 'content-type': 'text/html' }
 assert.deepEqual(assertWebUi(200, htmlHeaders, goodHtml), [], 'the real app shell must pass')
 assert.ok(has(assertWebUi(404, htmlHeaders, goodHtml), /expected 200, got 404/), 'a missing root route must fail')
@@ -106,6 +110,37 @@ assert.ok(
   has(assertWebUi(200, htmlHeaders, '<html><head><title>Camelid</title></head><body>placeholder</body></html>'), /no hashed \/assets/),
   'a shell with no bundle means the web UI build never reached the binary',
 )
+
+// ---------------------------------------------------------------------------
+// The referenced bundle must be fetched, not just mentioned
+// ---------------------------------------------------------------------------
+assert.equal(extractUiAssetUrl(goodHtml), UI_ASSET_URL, 'the hashed module URL must be extracted from the shell')
+assert.equal(
+  extractUiAssetUrl('<script type="module" crossorigin src="/assets/index-Cz-PZZB3.js"></script>'),
+  '/assets/index-Cz-PZZB3.js',
+  'vite emits extra attributes before src; extraction must still work',
+)
+assert.equal(extractUiAssetUrl('<html><body>nothing</body></html>'), null, 'a shell with no bundle yields no URL')
+
+assert.deepEqual(
+  assertUiAsset(UI_ASSET_URL, 200, { 'content-type': 'text/javascript' }, UI_ASSET_BODY),
+  [],
+  'a served bundle must pass',
+)
+assert.deepEqual(
+  assertUiAsset(UI_ASSET_URL, 200, { 'content-type': 'application/javascript; charset=utf-8' }, UI_ASSET_BODY),
+  [],
+  'the other common JavaScript content-type must also pass',
+)
+assert.ok(
+  has(assertUiAsset(UI_ASSET_URL, 404, {}, ''), /does not serve/),
+  'a referenced-but-missing bundle is a blank app and must fail',
+)
+assert.ok(
+  has(assertUiAsset(UI_ASSET_URL, 200, { 'content-type': 'text/html' }, '<html>'), /expected a JavaScript content-type/),
+  'an HTML fallback served at an asset path must fail',
+)
+assert.ok(has(assertUiAsset(UI_ASSET_URL, 200, { 'content-type': 'text/javascript' }, ''), /bundle is empty/), 'an empty bundle must fail')
 
 // ---------------------------------------------------------------------------
 // crash markers
@@ -193,6 +228,7 @@ const engineLike = (overrides = {}) => (req, res) => {
     '/v1/health': () => res.writeHead(200, { 'content-type': 'application/json' }).end(healthyBody),
     '/api/capabilities': () => res.writeHead(200, { 'content-type': 'application/json' }).end('{"capabilities":[]}'),
     '/': () => res.writeHead(200, { 'content-type': 'text/html' }).end(goodHtml),
+    [UI_ASSET_URL]: () => res.writeHead(200, { 'content-type': 'text/javascript' }).end(UI_ASSET_BODY),
     ...overrides,
   }
   const route = routes[req.url]
@@ -223,6 +259,23 @@ await withServer(
 await withServer(engineLike({ '/api/capabilities': (res) => res.writeHead(500).end('boom') }), async (port) => {
   const probe = await probeServer(port)
   assert.ok(has(probe.failures, /expected 200, got 500/), 'a broken capabilities route must be caught end to end')
+})
+
+// The reviewer's case: a syntactically valid shell whose bundle 404s. Every
+// markup-level assertion passes; only fetching the URL catches it.
+await withServer(engineLike({ [UI_ASSET_URL]: (res) => res.writeHead(404).end('missing') }), async (port) => {
+  const probe = await probeServer(port)
+  assert.deepEqual(
+    assertWebUi(200, htmlHeaders, goodHtml),
+    [],
+    'the markup assertions alone must still pass — that is why the fetch is required',
+  )
+  assert.ok(has(probe.failures, /does not serve/), 'a referenced-but-missing bundle must be caught end to end')
+})
+
+await withServer(engineLike({ [UI_ASSET_URL]: (res) => res.writeHead(200, { 'content-type': 'text/html' }).end('<html>') }), async (port) => {
+  const probe = await probeServer(port)
+  assert.ok(has(probe.failures, /expected a JavaScript content-type/), 'an HTML body served at the bundle URL must be caught')
 })
 
 const closedPort = await pickFreePort()
@@ -260,16 +313,19 @@ const port = Number(process.argv[2])
 const mode = process.argv[3] ?? 'stay'
 const health = ${JSON.stringify(healthyBody)}
 const html = ${JSON.stringify(goodHtml)}
+const assetUrl = ${JSON.stringify(UI_ASSET_URL)}
+const assetBody = ${JSON.stringify(UI_ASSET_BODY)}
 
 const server = createServer((req, res) => {
   if (req.url === '/v1/health') res.writeHead(200, { 'content-type': 'application/json' }).end(health)
   else if (req.url === '/api/capabilities') res.writeHead(200, { 'content-type': 'application/json' }).end('{}')
   else if (req.url === '/') res.writeHead(200, { 'content-type': 'text/html' }).end(html)
+  else if (req.url === assetUrl) res.writeHead(200, { 'content-type': 'text/javascript' }).end(assetBody)
   else res.writeHead(404).end('nope')
 
-  // '/' is the last probe probeServer issues. Dying right after flushing it is
-  // the "served everything, then fell over" case.
-  if (mode === 'die-after-probes' && req.url === '/') {
+  // The bundle is the last probe probeServer issues. Dying right after
+  // flushing it is the "served everything, then fell over" case.
+  if (mode === 'die-after-probes' && req.url === assetUrl) {
     res.on('finish', () => {
       // writeSync, not process.stderr.write: an async pipe write can be
       // truncated by process.exit, and this message existing at all is the
