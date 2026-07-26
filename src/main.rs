@@ -2573,11 +2573,13 @@ async fn main() -> anyhow::Result<()> {
             warmup,
             threads,
             json: _,
-            // `apply_deterministic_mode` already set CAMELID_DETERMINISTIC + forced the
-            // Metal stack off before this match, so generation rides the CPU path; the
-            // engine reads the env directly.
-            deterministic: _,
+            deterministic,
         } => {
+            // Match `serve`'s fast-load plan so benchmark startup/RSS measures
+            // the production Metal path rather than eagerly materializing Q8.
+            if !deterministic {
+                apply_serve_nocopy_default();
+            }
             run_bench_generate(
                 model,
                 prompt_file,
@@ -5596,12 +5598,14 @@ fn apply_deterministic_mode() {
     );
 }
 
-/// Default the single-node `serve` path to fast-load (CAMELID_METAL_NOCOPY): Q8_0
+/// Default the single-node serve/benchmark path to fast-load
+/// (CAMELID_METAL_NOCOPY): Q8_0
 /// weights map straight into page-aligned wire pages the GPU reads in place — same
 /// decode speed, ~36% lower peak RSS, and warm reloads in seconds instead of the
 /// full disk pass. Gated to exactly the configuration that can consume wire pages:
 /// macOS, the resident decode path active, and the wire kernel stack on. This is
-/// why it lives in the serve arm and not `apply_default_fast_stack` — speculative
+/// why callers apply it after command-specific mode selection instead of from
+/// `apply_default_fast_stack` — speculative
 /// decoding disables resident decode (its CPU repack plan needs the materialized
 /// blocks), any wire-off override falls back to the block path, and the
 /// distributed nodes (whose CPU forward needs `q8_0_blocks`) never run this arm.

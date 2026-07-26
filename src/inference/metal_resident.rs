@@ -9,6 +9,40 @@ use crate::metal;
 
 pub(super) type ResidentDecodeState = metal::ResidentDecodeState;
 
+#[derive(Clone, Copy)]
+enum MetalSampleRequest {
+    Greedy {
+        input_token: u32,
+    },
+    Temperature {
+        input_token: u32,
+        inv_temperature: f32,
+        base_seed: u64,
+    },
+}
+
+impl MetalSampleRequest {
+    fn input_token(self) -> u32 {
+        match self {
+            Self::Greedy { input_token } | Self::Temperature { input_token, .. } => input_token,
+        }
+    }
+
+    fn mode(self) -> metal::SampleMode {
+        match self {
+            Self::Greedy { .. } => metal::SampleMode::Greedy,
+            Self::Temperature {
+                inv_temperature,
+                base_seed,
+                ..
+            } => metal::SampleMode::Temperature {
+                inv_temperature,
+                base_seed,
+            },
+        }
+    }
+}
+
 /// Maximum speculative-verify window (`[last_token, drafts...]`), mirroring the CUDA host's
 /// `MAX_VERIFY_K`. `k = drafts.len() + 1 <= MAX_VERIFY_K`.
 // Used only by the non-cuda Metal verify seam (verify_drafts_metal / verify_tree_metal), whose
@@ -272,6 +306,37 @@ impl super::LlamaInferenceSession {
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
+        self.try_resident_decode_forward_metal_inner(
+            embedding,
+            compute_logits,
+            gpu_sample_token.map(|input_token| MetalSampleRequest::Greedy { input_token }),
+        )
+    }
+
+    pub(super) fn try_resident_decode_forward_metal_sample(
+        &mut self,
+        embedding: &CpuTensor,
+        input_token: u32,
+        inv_temperature: f32,
+        base_seed: u64,
+    ) -> Result<Option<ResidentForward>> {
+        self.try_resident_decode_forward_metal_inner(
+            embedding,
+            true,
+            Some(MetalSampleRequest::Temperature {
+                input_token,
+                inv_temperature,
+                base_seed,
+            }),
+        )
+    }
+
+    fn try_resident_decode_forward_metal_inner(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+        gpu_sample: Option<MetalSampleRequest>,
+    ) -> Result<Option<ResidentForward>> {
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
         }
@@ -414,7 +479,7 @@ impl super::LlamaInferenceSession {
 
         // GPU-side greedy sampling stage: only when the caller asked for it, logits run on
         // the GPU, and the token embedding table is plain Q8_0 (the gather reads its rows).
-        let sample_stage = match gpu_sample_token {
+        let sample_stage = match gpu_sample {
             Some(_)
                 if compute_logits
                     && weights.token_embedding.source_type == Some(GgufTensorType::Q8_0)
@@ -422,11 +487,23 @@ impl super::LlamaInferenceSession {
                         || weights.token_embedding.q8_0_wire_pages.is_some()) =>
             {
                 let embedding_blocks = resident_weight_bytes(&weights.token_embedding);
-                (embedding_blocks.block_count() == vocab * (hidden / 32))
-                    .then_some(metal::SampleStage { embedding_blocks })
+                (embedding_blocks.block_count() == vocab * (hidden / 32)).then_some(
+                    metal::SampleStage {
+                        embedding_blocks,
+                        mode: gpu_sample.expect("sample request matched above").mode(),
+                    },
+                )
             }
             _ => None,
         };
+        // Temperature sampling must fail before advancing resident KV when the
+        // device-side tail cannot be built. Returning logits here would already
+        // have executed the position and make a caller fallback run it twice.
+        if matches!(gpu_sample, Some(MetalSampleRequest::Temperature { .. }))
+            && sample_stage.is_none()
+        {
+            return Ok(None);
+        }
 
         // Rope tables for position+1 feed the encode-ahead pipeline: the session encodes
         // the NEXT token's command buffer while this token executes on the GPU.
@@ -449,7 +526,9 @@ impl super::LlamaInferenceSession {
             scale,
             logits_stage,
             sample_stage,
-            gpu_sample_token.unwrap_or(u32::MAX),
+            gpu_sample
+                .map(MetalSampleRequest::input_token)
+                .unwrap_or(u32::MAX),
             next_tables
                 .as_ref()
                 .map(|t| (t.cos.as_slice(), t.sin.as_slice())),

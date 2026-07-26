@@ -886,6 +886,15 @@ impl Q8_0FileBacking {
         }
     }
 
+    pub fn clone_with_offset_and_blocks(&self, absolute_offset: u64, num_blocks: usize) -> Self {
+        Self {
+            path: self.path.clone(),
+            absolute_offset,
+            num_blocks,
+            file_handle: self.file_handle.clone(),
+        }
+    }
+
     pub fn file(&self) -> Result<Arc<File>> {
         if let Some(file) = self.file_handle.get() {
             return Ok(file.clone());
@@ -6459,6 +6468,35 @@ mod tests {
         assert_eq!(stats.cache_capacity_bytes, 0);
         let _ = std::fs::remove_file(path);
         std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn q8_file_backing_subviews_share_one_cached_file_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-shared-backing-handle-{}",
+            std::process::id()
+        ));
+        let mut bytes = vec![0_u8; 3 * Q8_0_BLOCK_BYTES];
+        bytes[Q8_0_BLOCK_BYTES..2 * Q8_0_BLOCK_BYTES].fill(0x5a);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let parent = Q8_0FileBacking::new(path.clone(), 0, 3);
+        let subview = parent.clone_with_offset_and_blocks(Q8_0_BLOCK_BYTES as u64, 1);
+        assert!(!parent.file_handle_cached());
+        assert!(!subview.file_handle_cached());
+
+        let subview_file = subview.file().unwrap();
+        assert!(parent.file_handle_cached());
+        let parent_file = parent.file().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&parent_file, &subview_file));
+
+        let mut out = [0_u8; Q8_0_BLOCK_BYTES];
+        subview
+            .read_exact_at_cached(&mut out, Q8_0_BLOCK_BYTES as u64)
+            .unwrap();
+        assert_eq!(out, [0x5a; Q8_0_BLOCK_BYTES]);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

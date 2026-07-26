@@ -82,6 +82,7 @@ struct MetalLinearKernel {
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     argmax_f32_greedy_pipeline: ComputePipelineState,
+    sample_gumbel_f32_pipeline: ComputePipelineState,
     attention_decode_splitk_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_pipeline: ComputePipelineState,
@@ -3991,6 +3992,60 @@ kernel void argmax_f32_greedy(
     }
 }
 
+// Temperature sampling via Gumbel-max. A categorical draw from
+// softmax(logits / temperature) is argmax(logit / temperature + Gumbel(0, 1)),
+// so one linear GPU pass replaces the full-logit host copy, softmax, and sort.
+// The stateless SplitMix64 hash makes the result reproducible for a given seed.
+inline float splitmix_uniform(ulong seed, uint idx) {
+    ulong z = seed + 0x9E3779B97F4A7C15ul * ulong(idx + 1u);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ul;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBul;
+    z ^= z >> 31;
+    uint mantissa = uint(z >> 40);
+    return (float(mantissa) + 0.5f) / 16777216.0f;
+}
+
+kernel void sample_gumbel_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* out_id [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    constant float& inv_temperature [[buffer(3)]],
+    constant ulong& seed [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float sh_val[1024];
+    threadgroup uint sh_idx[1024];
+    float best = -INFINITY;
+    uint best_i = 0xffffffffu;
+    for (uint i = tid; i < count; i += tg_size) {
+        float u = splitmix_uniform(seed, i);
+        float gumbel = -log(-log(u));
+        float value = logits[i] * inv_temperature + gumbel;
+        if (value > best) {
+            best = value;
+            best_i = i;
+        }
+    }
+    sh_val[tid] = best;
+    sh_idx[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other = sh_val[tid + stride];
+            uint other_i = sh_idx[tid + stride];
+            if (other > sh_val[tid] || (other == sh_val[tid] && other_i < sh_idx[tid])) {
+                sh_val[tid] = other;
+                sh_idx[tid] = other_i;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out_id[0] = sh_idx[0];
+    }
+}
+
 // Dequantize the sampled token's Q8_0 embedding row (wire 34-byte blocks) into the
 // f32 input buffer the next pre-encoded token graph reads. Same dequant math as the
 // CPU embedding_lookup (f16 scale -> f32, times the i8 quant), so the values are
@@ -4653,6 +4708,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let argmax_f32_greedy_pipeline = device
                 .new_compute_pipeline_state_with_function(&argmax_f32_greedy_function)
                 .ok()?;
+            let sample_gumbel_f32_function = elementwise_library
+                .get_function("sample_gumbel_f32", None)
+                .ok()?;
+            let sample_gumbel_f32_pipeline = device
+                .new_compute_pipeline_state_with_function(&sample_gumbel_f32_function)
+                .ok()?;
             let embed_row_gather_q8_wire_function = elementwise_library
                 .get_function("embed_row_gather_q8_wire", None)
                 .ok()?;
@@ -4823,6 +4884,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 argmax_f32_greedy_pipeline,
+                sample_gumbel_f32_pipeline,
                 attention_decode_splitk_pipeline,
                 attention_decode_splitk_kv16_pipeline,
                 attention_decode_splitk_kv16_direct_pipeline,
@@ -10763,13 +10825,50 @@ pub struct LogitsStage<'a> {
     pub vocab_size: usize,
 }
 
-/// GPU-side greedy sampling stage for the resident decode fast path: the token graph's
-/// tail argmaxes the logits and gathers the sampled token's embedding row into the next
-/// graph's input buffer, so the CPU never sits between two tokens on the critical path.
+/// GPU-side sampling operation attached to a resident token graph.
+#[derive(Clone, Copy)]
+pub enum SampleMode {
+    Greedy,
+    Temperature {
+        inv_temperature: f32,
+        base_seed: u64,
+    },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleSignature {
+    Greedy,
+    Temperature {
+        inv_temperature_bits: u32,
+        token_seed: u64,
+    },
+}
+
+impl SampleMode {
+    #[cfg(target_os = "macos")]
+    fn signature(self, position: usize) -> SampleSignature {
+        match self {
+            Self::Greedy => SampleSignature::Greedy,
+            Self::Temperature {
+                inv_temperature,
+                base_seed,
+            } => SampleSignature::Temperature {
+                inv_temperature_bits: inv_temperature.to_bits(),
+                token_seed: base_seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(position as u64 + 1),
+            },
+        }
+    }
+}
+
+/// GPU-side sampling stage for the resident decode fast path: the token graph's
+/// tail samples the logits and gathers the selected token's embedding row into
+/// the next graph's input buffer, so the CPU never sits between two tokens.
 pub struct SampleStage<'a> {
     /// Token-embedding Q8_0 bytes (36-byte CPU blocks wire-converted in the buffer
     /// cache, or page-aligned wire pages wrapped in place).
     pub embedding_blocks: ResidentWeightBytes<'a>,
+    pub mode: SampleMode,
 }
 
 /// What a resident forward_token call produced: the raw logits/hidden vector (CPU
@@ -10849,6 +10948,7 @@ struct PreparedToken {
     position: usize,
     has_logits: bool,
     has_sample: bool,
+    sample_signature: Option<SampleSignature>,
     event_value: u64,
     cb: metal::CommandBuffer,
     logits_buf: Option<Buffer>,
@@ -11181,6 +11281,9 @@ impl ResidentDecodeState {
             None
         };
         let want_sample = sample_stage.is_some() && logits_stage.is_some();
+        let requested_sample_signature = sample_stage
+            .as_ref()
+            .map(|stage| stage.mode.signature(position));
         let pending = self.pending.take();
         let pending_signaled = std::mem::take(&mut self.pending_signaled);
         let usable = matches!(
@@ -11188,6 +11291,7 @@ impl ResidentDecodeState {
             Some(p) if p.position == position
                 && p.has_logits == logits_stage.is_some()
                 && p.has_sample == want_sample
+                && p.sample_signature == requested_sample_signature
         );
         // Fast path: the pending graph was already signaled last call (its input embedding
         // comes from the previous graph's GPU-side gather). It only matches the caller's
@@ -11497,11 +11601,11 @@ impl ResidentDecodeState {
         } else {
             None
         };
-        // Greedy sampling tail: argmax the logits into a 4-byte id buffer, then gather the
-        // sampled token's embedding row into buf_a — the input the NEXT pre-encoded graph
-        // reads. Both are hazard-ordered after the logits matmul by Metal's tracking.
-        let sampled_buf = match (&logits_buf, &emb_buf, logits_stage) {
-            (Some(lb), Some(eb), Some(s)) => {
+        // Sampling tail: select an id from the logits, then gather that token's
+        // embedding row into buf_a — the input the NEXT pre-encoded graph reads.
+        // Both operations are hazard-ordered after the logits matmul by Metal.
+        let sampled_buf = match (&logits_buf, &emb_buf, logits_stage, sample_stage) {
+            (Some(lb), Some(eb), Some(s), Some(sample)) => {
                 let nb = |bytes: u64| pool_get(k, bytes);
                 let id_buf = nb(4);
                 let am_scalar = nb(4);
@@ -11510,10 +11614,34 @@ impl ResidentDecodeState {
                     *(am_scalar.contents() as *mut u32) = s.vocab_size as u32;
                     *(eg_scalar.contents() as *mut u32) = bpr_hidden as u32;
                 }
-                e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
-                e.set_buffer(0, Some(lb), 0);
-                e.set_buffer(1, Some(&id_buf), 0);
-                e.set_buffer(2, Some(&am_scalar), 0);
+                match sample.mode {
+                    SampleMode::Greedy => {
+                        e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+                        e.set_buffer(0, Some(lb), 0);
+                        e.set_buffer(1, Some(&id_buf), 0);
+                        e.set_buffer(2, Some(&am_scalar), 0);
+                    }
+                    SampleMode::Temperature {
+                        inv_temperature,
+                        base_seed,
+                    } => {
+                        let temperature_scalar = nb(4);
+                        let seed_scalar = nb(8);
+                        let token_seed =
+                            base_seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(position as u64 + 1);
+                        unsafe {
+                            *(temperature_scalar.contents() as *mut f32) = inv_temperature;
+                            *(seed_scalar.contents() as *mut u64) = token_seed;
+                        }
+                        e.set_compute_pipeline_state(&k.sample_gumbel_f32_pipeline);
+                        e.set_buffer(0, Some(lb), 0);
+                        e.set_buffer(1, Some(&id_buf), 0);
+                        e.set_buffer(2, Some(&am_scalar), 0);
+                        e.set_buffer(3, Some(&temperature_scalar), 0);
+                        e.set_buffer(4, Some(&seed_scalar), 0);
+                        keep.extend([temperature_scalar, seed_scalar]);
+                    }
+                }
                 e.dispatch_thread_groups(
                     metal::MTLSize {
                         width: 1,
@@ -11549,6 +11677,7 @@ impl ResidentDecodeState {
             position,
             has_logits: logits_stage.is_some(),
             has_sample: sampled_buf.is_some(),
+            sample_signature: sample_stage.map(|stage| stage.mode.signature(position)),
             event_value,
             cb: cb.to_owned(),
             logits_buf,
@@ -19987,6 +20116,98 @@ mod tests {
             let got = unsafe { *(ib.contents() as *const u32) };
             assert_eq!(got as usize, best_idx, "len {}", logits.len());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gumbel_sampler_matches_stateless_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let logits = vec![0.0_f32; 4096];
+
+        let reference = |seed: u64| {
+            let mut best_uniform = f32::NEG_INFINITY;
+            let mut best_idx = 0_u32;
+            for idx in 0..logits.len() {
+                let mut z =
+                    seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                // Gumbel is monotonic in the uniform draw. Comparing the
+                // exact 24-bit uniforms avoids any CPU/GPU log approximation
+                // becoming part of this stateless-RNG and reduction test.
+                let uniform = ((z >> 40) as u32) as f32;
+                if uniform > best_uniform {
+                    best_uniform = uniform;
+                    best_idx = idx as u32;
+                }
+            }
+            best_idx
+        };
+
+        let logits_buf = k.device.new_buffer_with_data(
+            logits.as_ptr() as *const _,
+            (logits.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = k
+            .device
+            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let count_buf = k
+            .device
+            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let temperature_buf = k
+            .device
+            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let seed_buf = k
+            .device
+            .new_buffer(8, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            *(count_buf.contents() as *mut u32) = logits.len() as u32;
+            *(temperature_buf.contents() as *mut f32) = 1.0;
+        }
+
+        let mut sampled = Vec::new();
+        for seed in [0_u64, 1, 7, 42, u32::MAX as u64, u64::MAX] {
+            unsafe {
+                *(seed_buf.contents() as *mut u64) = seed;
+            }
+            let cb = k.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&k.sample_gumbel_f32_pipeline);
+            e.set_buffer(0, Some(&logits_buf), 0);
+            e.set_buffer(1, Some(&out_buf), 0);
+            e.set_buffer(2, Some(&count_buf), 0);
+            e.set_buffer(3, Some(&temperature_buf), 0);
+            e.set_buffer(4, Some(&seed_buf), 0);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let got = unsafe { *(out_buf.contents() as *const u32) };
+            assert_eq!(got, reference(seed), "seed {seed}");
+            sampled.push(got);
+        }
+        sampled.sort_unstable();
+        sampled.dedup();
+        assert!(
+            sampled.len() > 1,
+            "different seeds should not collapse to one sampled token"
+        );
     }
 
     #[cfg(target_os = "macos")]
