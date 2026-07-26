@@ -46,6 +46,26 @@ camelid-desktop.exe ──spawns──▶ camelid.exe serve --addr 127.0.0.1:<ep
 On window close the sidecar is terminated cleanly; a Windows **job object** with
 `KILL_ON_JOB_CLOSE` is the backstop so a desktop crash cannot orphan a `camelid` process.
 
+## Startup failures
+
+The splash is fail-closed: it stays visible until the sidecar returns `200` from
+`/v1/health`. It polls every 350 ms for up to 40 seconds. Native startup state is retained and
+replayed after the splash listener registers, so a fast failure cannot be lost before the page
+loads. A failure shows an actionable title and next step first, followed by the engine's actual
+error and captured stderr under **Technical details**; it never navigates to a fake-ready UI.
+
+| Splash error | Meaning | Next step |
+| --- | --- | --- |
+| **Camelid engine is missing** | `camelid.exe` was not found beside the desktop executable, in the bundled sidecar resources, or on `PATH`. | Reinstall Camelid Desktop or restore `camelid.exe` beside `camelid-desktop.exe`, then retry. |
+| **Sidecar port unavailable** | The engine reported that it could not bind Camelid's selected ephemeral loopback port. This is not a fixed `8181` port conflict. | Close the conflicting local process and retry. |
+| **Engine startup timed out** | The sidecar did not pass the 40-second `/v1/health` gate. | Retry, then use the visible technical details to diagnose a persistent failure. |
+| **Engine startup failed** | The sidecar exited before it became healthy for another reason. | Review the visible technical details and retry. |
+
+Model readiness is separate from sidecar startup. Once `/v1/health` passes, Desktop navigates to
+the engine's existing UI; if no eligible model is loaded, that UI remains the authority and shows
+its normal model-required state. Desktop does not claim a ready model or manufacture a model error
+on the splash.
+
 ## Requirements
 
 - Windows 10/11 with the **WebView2 runtime** (preinstalled on current Windows 10/11; the

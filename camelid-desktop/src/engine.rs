@@ -31,27 +31,71 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(40);
 /// Backoff between health polls (model load can dominate; keep polls cheap and patient).
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(350);
 
+/// Stable startup-failure classes rendered by the bundled splash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineErrorKind {
+    MissingBinary,
+    PortUnavailable,
+    StartupTimeout,
+    StartupFailed,
+}
+
 /// A fatal error during sidecar startup, carrying any captured engine stderr so the splash
 /// can surface the *real* failure rather than a fake "ready" state.
 #[derive(Debug)]
 pub struct EngineError {
+    kind: EngineErrorKind,
     pub message: String,
     pub stderr: Option<String>,
 }
 
 impl EngineError {
-    fn new(message: impl Into<String>) -> Self {
+    fn new(kind: EngineErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
             stderr: None,
         }
     }
-    fn with_stderr(message: impl Into<String>, stderr: Option<String>) -> Self {
+    fn with_stderr(
+        kind: EngineErrorKind,
+        message: impl Into<String>,
+        stderr: Option<String>,
+    ) -> Self {
         Self {
+            kind,
             message: message.into(),
             stderr,
         }
     }
+    /// Stable summary rendered prominently on the splash after sidecar startup fails.
+    pub fn splash_title(&self) -> &'static str {
+        match self.kind {
+            EngineErrorKind::MissingBinary => "Camelid engine is missing",
+            EngineErrorKind::PortUnavailable => "Sidecar port unavailable",
+            EngineErrorKind::StartupTimeout => "Engine startup timed out",
+            EngineErrorKind::StartupFailed => "Engine startup failed",
+        }
+    }
+
+    /// Actionable next step paired with [`Self::splash_title`] on the splash.
+    pub fn splash_guidance(&self) -> &'static str {
+        match self.kind {
+            EngineErrorKind::MissingBinary => {
+                "Reinstall Camelid Desktop or place camelid.exe beside camelid-desktop.exe, then retry."
+            }
+            EngineErrorKind::PortUnavailable => {
+                "Another local process claimed Camelid's selected loopback port. Close it and retry."
+            }
+            EngineErrorKind::StartupTimeout => {
+                "The engine did not pass its 40-second health check. Retry, then review the technical details if it persists."
+            }
+            EngineErrorKind::StartupFailed => {
+                "The engine stopped before it became healthy. Review the technical details, then retry."
+            }
+        }
+    }
+
     /// Human-readable detail block for the splash error pane.
     pub fn detail(&self) -> String {
         match &self.stderr {
@@ -154,11 +198,20 @@ fn simplify_extended_path(p: PathBuf) -> PathBuf {
 /// release and the sidecar re-binding; this is the standard trade-off and is handled by the
 /// health gate failing loudly (never silently) if the bind races.
 pub fn pick_ephemeral_port() -> Result<u16, EngineError> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| EngineError::new(format!("could not reserve a loopback port: {e}")))?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| {
+        EngineError::new(
+            EngineErrorKind::PortUnavailable,
+            format!("could not reserve a loopback port: {e}"),
+        )
+    })?;
     let port = listener
         .local_addr()
-        .map_err(|e| EngineError::new(format!("could not read reserved port: {e}")))?
+        .map_err(|e| {
+            EngineError::new(
+                EngineErrorKind::PortUnavailable,
+                format!("could not read reserved port: {e}"),
+            )
+        })?
         .port();
     drop(listener);
     Ok(port)
@@ -167,8 +220,12 @@ pub fn pick_ephemeral_port() -> Result<u16, EngineError> {
 /// Spawn `camelid serve --addr 127.0.0.1:<port> --no-open --models-dir <abs>`, bound to
 /// loopback only, and health-gate it. Returns a running [`Engine`] or an [`EngineError`]
 /// carrying engine stderr.
-pub fn spawn(engine_path: &PathBuf) -> Result<Engine, EngineError> {
+pub fn spawn(engine_path: &Path) -> Result<Engine, EngineError> {
     let port = pick_ephemeral_port()?;
+    spawn_on_port(engine_path, port)
+}
+
+fn spawn_on_port(engine_path: &Path, port: u16) -> Result<Engine, EngineError> {
     let addr = format!("127.0.0.1:{port}");
 
     let mut command = Command::new(engine_path);
@@ -193,10 +250,18 @@ pub fn spawn(engine_path: &PathBuf) -> Result<Engine, EngineError> {
     no_console_window(&mut command);
 
     let mut child = command.spawn().map_err(|e| {
-        EngineError::new(format!(
-            "failed to launch the camelid engine at {}: {e}",
-            engine_path.display()
-        ))
+        let kind = if e.kind() == std::io::ErrorKind::NotFound {
+            EngineErrorKind::MissingBinary
+        } else {
+            EngineErrorKind::StartupFailed
+        };
+        EngineError::new(
+            kind,
+            format!(
+                "failed to launch the camelid engine at {}: {e}",
+                engine_path.display()
+            ),
+        )
     })?;
 
     // Tie the child's lifetime to ours: if the desktop process dies (even crashes), the OS
@@ -211,13 +276,7 @@ pub fn spawn(engine_path: &PathBuf) -> Result<Engine, EngineError> {
             #[cfg(windows)]
             _job: job,
         }),
-        Err(err) => {
-            // Capture whatever the engine printed before failing, then ensure it's dead.
-            let stderr = drain_stderr(&mut child);
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(EngineError::with_stderr(err.message, stderr.or(err.stderr)))
-        }
+        Err(err) => Err(finish_startup_failure(&mut child, err)),
     }
 }
 
@@ -240,25 +299,54 @@ fn sidecar_models_dir(engine_path: &Path) -> Option<PathBuf> {
 
 /// Poll `/v1/health` until it returns 200, the engine exits, or the budget elapses.
 fn wait_for_health(port: u16, child: &mut Child) -> Result<(), EngineError> {
-    let deadline = Instant::now() + HEALTH_TIMEOUT;
+    wait_for_health_with_timeout(port, child, HEALTH_TIMEOUT, HEALTH_POLL_INTERVAL)
+}
+
+fn wait_for_health_with_timeout(
+    port: u16,
+    child: &mut Child,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), EngineError> {
+    let deadline = Instant::now() + timeout;
     loop {
         // If the engine already exited, fail immediately with its status (stderr added later).
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(EngineError::new(format!(
-                "the camelid engine exited before becoming healthy (status: {status})"
-            )));
+            return Err(EngineError::new(
+                EngineErrorKind::StartupFailed,
+                format!("the camelid engine exited before becoming healthy (status: {status})"),
+            ));
         }
         if http_health_ok(port) {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(EngineError::new(format!(
-                "the camelid engine did not report healthy on 127.0.0.1:{port} within {}s",
-                HEALTH_TIMEOUT.as_secs()
-            )));
+            return Err(EngineError::new(
+                EngineErrorKind::StartupTimeout,
+                format!(
+                    "the camelid engine did not report healthy on 127.0.0.1:{port} within {}s",
+                    HEALTH_TIMEOUT.as_secs()
+                ),
+            ));
         }
-        std::thread::sleep(HEALTH_POLL_INTERVAL);
+        std::thread::sleep(poll_interval);
     }
+}
+
+/// Recognize only explicit OS bind diagnostics captured from the sidecar.
+///
+/// The ephemeral reservation must be released before the sidecar binds. A listener observed
+/// *after* a generic sidecar exit is not proof that it caused the exit, so it must not control
+/// the user-facing diagnosis. The engine's own bind failure is the authority instead.
+fn stderr_is_bind_failure(stderr: Option<&str>) -> bool {
+    let Some(stderr) = stderr else {
+        return false;
+    };
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("address already in use")
+        || stderr.contains("only one usage of each socket address")
+        || stderr.contains("os error 98")
+        || stderr.contains("os error 10048")
 }
 
 /// Dependency-free loopback HTTP/1.1 GET of `/v1/health`; true iff the status line is 200.
@@ -287,17 +375,38 @@ fn http_health_ok(port: u16) -> bool {
     }
 }
 
-/// Best-effort read of any buffered engine stderr (used to enrich a startup failure).
+/// Best-effort read of engine stderr after the child has been reaped.
 fn drain_stderr(child: &mut Child) -> Option<String> {
     let mut stderr = child.stderr.take()?;
     let mut buf = String::new();
-    // The child has been (or is about to be) killed; this read returns what was buffered.
     let _ = stderr.read_to_string(&mut buf);
     if buf.trim().is_empty() {
         None
     } else {
         Some(buf)
     }
+}
+
+fn terminate_and_collect_stderr(child: &mut Child) -> Option<String> {
+    let _ = child.kill();
+    let _ = child.wait();
+    drain_stderr(child)
+}
+
+fn finish_startup_failure(child: &mut Child, error: EngineError) -> EngineError {
+    // A timed-out child still owns the stderr pipe. Reap it before a blocking read so the
+    // startup worker cannot get stuck and leave the splash spinner visible indefinitely.
+    let stderr = terminate_and_collect_stderr(child);
+    let EngineError {
+        mut kind,
+        message,
+        stderr: prior_stderr,
+    } = error;
+    let stderr = stderr.or(prior_stderr);
+    if kind == EngineErrorKind::StartupFailed && stderr_is_bind_failure(stderr.as_deref()) {
+        kind = EngineErrorKind::PortUnavailable;
+    }
+    EngineError::with_stderr(kind, message, stderr)
 }
 
 /// Suppress the spawned engine's console window on Windows (CREATE_NO_WINDOW).
@@ -375,8 +484,157 @@ impl Drop for JobObject {
 
 #[cfg(test)]
 mod tests {
-    use super::sidecar_models_dir;
+    use super::{
+        finish_startup_failure, sidecar_models_dir, spawn, stderr_is_bind_failure,
+        terminate_and_collect_stderr, wait_for_health_with_timeout, EngineError, EngineErrorKind,
+    };
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn splash_failure_contract_is_actionable() {
+        let cases = [
+            (
+                EngineErrorKind::MissingBinary,
+                "Camelid engine is missing",
+                "place camelid.exe beside camelid-desktop.exe",
+            ),
+            (
+                EngineErrorKind::PortUnavailable,
+                "Sidecar port unavailable",
+                "selected loopback port",
+            ),
+            (
+                EngineErrorKind::StartupTimeout,
+                "Engine startup timed out",
+                "40-second health check",
+            ),
+            (
+                EngineErrorKind::StartupFailed,
+                "Engine startup failed",
+                "stopped before it became healthy",
+            ),
+        ];
+
+        for (kind, title, guidance_fragment) in cases {
+            let error = EngineError::new(kind, "technical detail");
+            assert_eq!(error.splash_title(), title);
+            assert!(error.splash_guidance().contains(guidance_fragment));
+        }
+    }
+
+    #[test]
+    fn missing_sidecar_is_classified_at_spawn() {
+        let missing = std::env::temp_dir().join(format!(
+            "camelid-desktop-missing-sidecar-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+
+        let error = match spawn(&missing) {
+            Ok(_) => panic!("a missing sidecar unexpectedly launched"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind, EngineErrorKind::MissingBinary);
+        assert_eq!(error.splash_title(), "Camelid engine is missing");
+    }
+
+    #[test]
+    fn captured_bind_diagnostic_is_required_for_port_classification() {
+        assert!(stderr_is_bind_failure(Some(
+            "failed to bind 127.0.0.1:1234: Address already in use (os error 98)"
+        )));
+        assert!(stderr_is_bind_failure(Some(
+            "Only one usage of each socket address is normally permitted. (os error 10048)"
+        )));
+        assert!(!stderr_is_bind_failure(Some(
+            "model metadata is invalid; sidecar stopped before binding"
+        )));
+        assert!(!stderr_is_bind_failure(None));
+    }
+
+    #[test]
+    fn unhealthy_live_child_is_reaped_before_stderr_is_drained() {
+        let mut command = long_lived_stderr_command("sidecar remains alive");
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = command.spawn().expect("start test sidecar");
+        assert!(child.try_wait().expect("query child state").is_none());
+
+        let started = Instant::now();
+        let error = wait_for_health_with_timeout(
+            unused_loopback_port(),
+            &mut child,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        )
+        .expect_err("live child without health endpoint must time out");
+        assert_eq!(error.kind, EngineErrorKind::StartupTimeout);
+
+        let stderr = terminate_and_collect_stderr(&mut child).expect("captured test stderr");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(stderr.contains("sidecar remains alive"));
+        assert!(child.try_wait().expect("query reaped child").is_some());
+    }
+
+    #[test]
+    fn only_captured_bind_diagnostics_change_the_final_error_kind() {
+        let mut bind_command = long_lived_stderr_command("address already in use");
+        bind_command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut bind_child = bind_command.spawn().expect("start bind-failure test child");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let bind_error = finish_startup_failure(
+            &mut bind_child,
+            EngineError::new(EngineErrorKind::StartupFailed, "sidecar exited"),
+        );
+        assert_eq!(
+            bind_error.kind,
+            EngineErrorKind::PortUnavailable,
+            "unexpected captured stderr: {:?}",
+            bind_error.stderr
+        );
+
+        let mut generic_command = long_lived_stderr_command("model metadata is invalid");
+        generic_command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut generic_child = generic_command
+            .spawn()
+            .expect("start generic-failure test child");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let generic_error = finish_startup_failure(
+            &mut generic_child,
+            EngineError::new(EngineErrorKind::StartupFailed, "sidecar exited"),
+        );
+        assert_eq!(generic_error.kind, EngineErrorKind::StartupFailed);
+    }
+
+    fn unused_loopback_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+        let port = listener.local_addr().expect("read reserved port").port();
+        drop(listener);
+        port
+    }
+
+    #[cfg(windows)]
+    fn long_lived_stderr_command(message: &str) -> Command {
+        let mut command = Command::new("cmd.exe");
+        let script = format!("echo {message} 1>&2 & ping -n 3 127.0.0.1 >nul 2>nul");
+        command.args(["/D", "/C", script.as_str()]);
+        command
+    }
+
+    #[cfg(not(windows))]
+    fn long_lived_stderr_command(message: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("printf '%s\\n' '{message}' >&2; exec sleep 30"),
+        ]);
+        command
+    }
 
     #[test]
     fn models_dir_sits_beside_an_absolute_engine_path() {
