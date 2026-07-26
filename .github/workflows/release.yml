@@ -101,6 +101,46 @@ jobs:
           tar -czf "$dist.tar.gz" "$dist"
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
 
+      # Open the box that actually ships. Everything above this point verifies
+      # the STAGING directory (scripts/package-linux-cuda.sh) or the source tree
+      # (ci.yml); nothing has ever inspected or executed the archive itself.
+      # Extracting with the same tar a user runs also proves the archive is
+      # readable and that symlinks survived packaging.
+      - name: Verify the packaged artifact
+        run: |
+          set -euo pipefail
+          dist="camelid-${{ matrix.label }}"
+          rm -rf verify && mkdir -p verify
+          tar -xzf "$dist.tar.gz" -C verify
+
+          # NVRTC is staged into the Linux tarball only; macOS has no CUDA lane.
+          nvrtc_flag=""
+          if [ "${{ matrix.label }}" = "linux-x86_64" ]; then nvrtc_flag="--require-nvrtc"; fi
+
+          node scripts/check-release-artifact.mjs \
+            --dir verify \
+            --label "${{ matrix.label }}" \
+            --archive "$dist.tar.gz" \
+            --checksum "$dist.tar.gz.sha256" \
+            $nvrtc_flag \
+            --out "$dist-check-receipt.json"
+
+          # Only a tag push guarantees the checked-out commit IS the released
+          # commit. workflow_dispatch builds whatever ref it was started from,
+          # so pinning the binary to the input tag there would fail by design.
+          version_flag=""
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version_flag="--expect-version ${{ github.ref_name }}"
+          else
+            echo "note: not a tag push; skipping the binary/tag version assertion"
+          fi
+
+          node scripts/smoke-release-artifact.mjs \
+            --dir "verify/$dist" \
+            --label "${{ matrix.label }}" \
+            $version_flag \
+            --out "$dist-smoke-receipt.json"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +148,17 @@ jobs:
           path: |
             camelid-${{ matrix.label }}.tar.gz
             camelid-${{ matrix.label }}.tar.gz.sha256
+
+      # Receipts are diagnostic only: they are attached to the CI run, never to
+      # the release and never committed (qa/evidence-bundles is a scrubbed,
+      # checksum-audited tree and this is not one of its bundles).
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-${{ matrix.label }}
+          path: camelid-${{ matrix.label }}-*-receipt.json
+          if-no-files-found: ignore
 
   # Windows is built separately: its packaging differs from the unix matrix above
   # because a self-contained Windows download must ship the NVRTC redistributable
@@ -206,6 +257,33 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 "$dist.zip").Hash.ToLower()
           "$hash  $dist.zip" | Out-File -Encoding ascii -NoNewline "$dist.zip.sha256"
 
+      # Verify the SIGNED, zipped artifact — after signing on purpose, so the
+      # smoke proves the exe users actually receive still boots.
+      - name: Verify the packaged artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'camelid-windows-x64'
+          Remove-Item -Recurse -Force verify -ErrorAction SilentlyContinue
+          Expand-Archive -Path "$dist.zip" -DestinationPath verify -Force
+
+          node scripts/check-release-artifact.mjs `
+            --dir verify `
+            --label windows-x64 `
+            --archive "$dist.zip" `
+            --checksum "$dist.zip.sha256" `
+            --require-nvrtc `
+            --out "$dist-check-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "check-release-artifact failed ($LASTEXITCODE)" }
+
+          # Compress-Archive packs the CONTENTS, so the payload is at the root.
+          $versionArgs = @()
+          if ('${{ github.ref_type }}' -eq 'tag') { $versionArgs = @('--expect-version', '${{ github.ref_name }}') }
+          else { Write-Host 'note: not a tag push; skipping the binary/tag version assertion' }
+
+          node scripts/smoke-release-artifact.mjs --dir verify --label windows-x64 @versionArgs --out "$dist-smoke-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "smoke-release-artifact failed ($LASTEXITCODE)" }
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -213,6 +291,14 @@ jobs:
           path: |
             camelid-windows-x64.zip
             camelid-windows-x64.zip.sha256
+
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-windows-x64
+          path: camelid-windows-x64-*-receipt.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------------
   # ADDITIVE: native Windows desktop app (camelid-desktop). Fully independent of the
@@ -370,6 +456,43 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 "$dist.zip").Hash.ToLower()
           "$hash  $dist.zip" | Out-File -Encoding ascii -NoNewline "$dist.zip.sha256"
 
+      # The portable layout depends on beside-exe resolution, so the contract
+      # check also proves the sidecar and its NVRTC pair travelled with the
+      # desktop exe, and that the NSIS installer was moved OUT before zipping.
+      # The boot smoke drives the SIDECAR: launching a Tauri GUI headless on a
+      # runner proves nothing, whereas the engine it bundles is the thing that
+      # must serve. A failure here still cannot block the server release — this
+      # job is in no other job's `needs`.
+      - name: Verify the packaged desktop artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'camelid-desktop-windows-x64'
+          Remove-Item -Recurse -Force verify-desktop -ErrorAction SilentlyContinue
+          Expand-Archive -Path "$dist.zip" -DestinationPath verify-desktop -Force
+
+          node scripts/check-release-artifact.mjs `
+            --dir verify-desktop `
+            --label desktop-windows-x64 `
+            --archive "$dist.zip" `
+            --checksum "$dist.zip.sha256" `
+            --require-nvrtc `
+            --out "$dist-check-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "check-release-artifact failed ($LASTEXITCODE)" }
+
+          $versionArgs = @()
+          if ('${{ github.ref_type }}' -eq 'tag') { $versionArgs = @('--expect-version', '${{ github.ref_name }}') }
+          else { Write-Host 'note: not a tag push; skipping the binary/tag version assertion' }
+
+          node scripts/smoke-release-artifact.mjs --dir verify-desktop --label desktop-windows-x64 @versionArgs --out "$dist-smoke-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "smoke-release-artifact failed ($LASTEXITCODE)" }
+
+          # The installer is published separately and must exist as its own file.
+          $setup = Get-ChildItem -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'no NSIS installer was produced' }
+          if ($setup.Length -le 0) { throw "installer $($setup.Name) is zero bytes" }
+          Write-Host "installer: $($setup.Name) ($([math]::Round($setup.Length / 1MB, 1)) MB)"
+
       - name: Upload desktop artifacts (CI)
         uses: actions/upload-artifact@v4
         with:
@@ -378,6 +501,14 @@ jobs:
             camelid-desktop-windows-x64.zip
             camelid-desktop-windows-x64.zip.sha256
             *-setup.exe
+
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-desktop-windows-x64
+          path: camelid-desktop-windows-x64-*-receipt.json
+          if-no-files-found: ignore
 
       # Publish the SIGNED desktop artifacts to the SAME GitHub release, independently of the
       # server `release` job (which is left untouched and is in no way gated by this job).
@@ -403,6 +534,46 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # Each .sha256 was computed on its own build runner. The bytes then made
+      # two more hops (upload-artifact, download-artifact) before this job
+      # publishes them, and nothing re-checked them afterwards. Re-hashing here
+      # means the checksum published beside a file provably describes the file
+      # actually published.
+      - name: Re-verify checksums after the artifact round-trip
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sidecars=(*.sha256)
+          if [ ${#sidecars[@]} -eq 0 ]; then
+            echo "no .sha256 sidecars found in dist/ — refusing to publish unverifiable artifacts" >&2
+            exit 1
+          fi
+          for sidecar in "${sidecars[@]}"; do
+            archive="${sidecar%.sha256}"
+            if [ ! -f "$archive" ]; then
+              echo "$sidecar has no matching archive $archive" >&2
+              exit 1
+            fi
+            # awk (not read) so a sidecar written without a trailing newline —
+            # which is exactly what the PowerShell packaging steps produce —
+            # still yields its hash.
+            expected=$(awk '{print $1; exit}' "$sidecar")
+            actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+            if [ "$expected" != "$actual" ]; then
+              echo "checksum mismatch for $archive: sidecar $expected, actual $actual" >&2
+              exit 1
+            fi
+            echo "  verified $archive"
+          done
+          # Every publishable archive must carry a sidecar, not just the reverse.
+          for archive in *.tar.gz *.zip; do
+            if [ ! -f "$archive.sha256" ]; then
+              echo "$archive has no .sha256 sidecar" >&2
+              exit 1
+            fi
+          done
 
       - name: Publish to the GitHub release
         uses: softprops/action-gh-release@v2
