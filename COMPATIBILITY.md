@@ -147,6 +147,10 @@ The Windows port is implementation-level only and behind `#[cfg(...)]` guards: f
 - Direct Windows-vs-llama.cpp parity artifacts for the Llama 3.2 1B/3B and other exact rows. TinyLlama and the four Qwen3 dense Q8_0 rows (0.6B/1.7B/4B/8B) carry Windows parity bundles today; the Llama 3.2 1B/3B Windows CPU lanes generate correctly and agree with the GPU lane, but their Windows parity bundles are still follow-up.
 - Performance, throughput, or packaging on Windows. (The Qwen3 rows run on the AVX2 x86_q8 path, but no Windows throughput number is claimed.)
 
+**Windows CUDA status.** Windows CUDA is experimental. Any evidence is limited to the named exact
+rows and the recorded GPU, driver, and CUDA version; it does not establish general Windows-CUDA
+token parity or a throughput claim.
+
 **Windows CUDA — dense Qwen3 Q8_0 rows validated (GPU-specific); experimental beyond the recorded GPU.** The CUDA backend is compiled into the DEFAULT build on Windows and x86_64 Linux (other targets keep it opt-in via `cargo build --features cuda`; macOS uses Metal). Compiling the path in is a build-wiring fact, not a support claim: every validated row below was recorded on the Windows GPU named with it, and running the same path on Linux does not extend those parity claims to that host. It runs the whole decode forward on an NVIDIA GPU via from-scratch NVRTC kernels (no vendored llama.cpp): a GPU-resident decode engine that uploads weights once and caches them across requests, single-shot GPU prefill, on-device greedy/temperature sampling, and a lossless n-gram speculative-decode path. The per-kernel GPU tests are bit-identical to the CPU dot, and the resident prefill / batched-verify / full-forward paths carry GPU device tests.
 
 - **TinyLlama** on an RTX 3060: token-identical to the CPU/llama.cpp reference (direct parity audit, prompt + generated text + 50-token stream match, `first_divergent_token_index=-1`), including when dense per-token diagnostics force the decode onto the CPU path — the GPU prefill mirrors its KV cache back to host so the CPU and GPU KV histories stay in lockstep.

@@ -33,7 +33,7 @@ ready to use.
 - **Local by default.** Models and inference stay on your machine unless you choose to expose the server.
 - **One engine, several interfaces.** Desktop app, browser chat, terminal chat, or HTTP API — all the same runtime.
 - **Nothing else to install.** The engine and web UI ship together as one binary.
-- **Hardware acceleration.** Native Metal on Apple Silicon and CUDA on validated NVIDIA paths, with a CPU fallback everywhere.
+- **Hardware acceleration.** Native Metal on Apple Silicon and experimental Windows CUDA for exact, recorded NVIDIA paths, with a CPU fallback everywhere.
 - **Evidence-backed compatibility.** Support is tied to an exact GGUF row and published validation artifacts, never a broad claim.
 
 ## Quick start
@@ -48,8 +48,11 @@ ready to use.
    - `Camelid.Desktop_<version>_x64-setup.exe` — signed installer; installs per-user, no admin rights.
    - `camelid-desktop-windows-x64.zip` — portable desktop app, no installation required.
 2. Run it. The app installs per-user under `%LOCALAPPDATA%\Camelid Desktop`.
-3. It bundles the CUDA runtime, so GPU acceleration works with just the normal NVIDIA driver (CPU
-   otherwise), and it embeds the same engine as everything below.
+3. It bundles the CUDA runtime, so no separate CUDA Toolkit is required. Its experimental Windows
+  CUDA path still requires a compatible NVIDIA driver (CPU otherwise), and it embeds the same
+  engine as everything below. Windows CUDA evidence is limited to the exact rows and recorded GPU,
+  driver, and CUDA versions in [COMPATIBILITY.md](COMPATIBILITY.md); it makes no general
+  token-parity or throughput claim.
 
 ### Option B — Prebuilt engine (Windows, macOS, or Linux)
 
@@ -260,17 +263,19 @@ Camelid ships for three platforms today.
 
 | Platform | Distribution | Acceleration |
 |---|---|---|
-| Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | NVIDIA CUDA on validated paths; CPU fallback |
+| Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | Experimental CUDA on named exact rows and recorded NVIDIA configurations; CPU fallback |
 | macOS Apple Silicon | Engine archive (`.tar.gz`) | Metal and CPU |
 | Linux x86_64 | Engine archive (`.tar.gz`) | NVIDIA CUDA compiled in by default; CPU fallback |
 
-CUDA is compiled into the default build on Windows and x86_64 Linux, so a machine with the normal
-NVIDIA driver gets the GPU path with no build flags and no CUDA SDK (the driver and NVRTC load
-dynamically at runtime; without a GPU the build still runs CPU-only). `camelid serve --gpu
-auto|on|off` (or `CAMELID_GPU`) overrides the automatic choice. Other Linux targets — aarch64, the
-Raspberry Pi — stay CPU-only, with CUDA opt-in via `--features cuda`. Note the validated GPU parity
-rows in [COMPATIBILITY.md](COMPATIBILITY.md) were recorded on Windows; compiling the path in on
-Linux does not by itself extend those row-level parity claims.
+CUDA is compiled into the default build on Windows and x86_64 Linux. On Windows, the GPU path is
+experimental: it needs a compatible NVIDIA driver, but no separate CUDA Toolkit or build flag. Its
+evidence is limited to the named exact rows and recorded GPU, driver, and CUDA configuration in
+[COMPATIBILITY.md](COMPATIBILITY.md); other configurations are not covered by those parity or
+throughput claims. The driver and NVRTC load dynamically at runtime; without a usable GPU the build
+still runs CPU-only. `camelid serve --gpu auto|on|off` (or `CAMELID_GPU`) overrides the automatic
+choice. Other Linux targets — aarch64, the Raspberry Pi — stay CPU-only, with CUDA opt-in via
+`--features cuda`. Compiling the path in on Linux does not by itself extend the Windows row-level
+parity claims.
 
 ## Documentation
 
