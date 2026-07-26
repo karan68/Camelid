@@ -12,7 +12,13 @@ pub struct LlamaKvCachePlan {
     pub max_sequence_length: usize,
     pub layer_count: usize,
     pub kv_head_count: usize,
+    /// Backward-compatible alias for the standard attention head width.
+    ///
+    /// For MLA plans this is the compressed key width; callers that need
+    /// asymmetric key/value widths must use `k_head_dim` and `v_head_dim`.
     pub head_dim: usize,
+    pub k_head_dim: usize,
+    pub v_head_dim: usize,
     pub key_shape: Vec<usize>,
     pub value_shape: Vec<usize>,
 }
@@ -21,19 +27,44 @@ impl LlamaKvCachePlan {
     pub fn from_config(config: &LlamaModelConfig) -> Result<Self> {
         let dims = DenseLlamaDims::from_config(config)?;
         let max_sequence_length = config.context_length as usize;
-        let shape = vec![
-            dims.block_count,
-            max_sequence_length,
-            dims.attention_head_count_kv,
-            dims.head_dim,
-        ];
+        let (kv_head_count, k_head_dim, v_head_dim, key_shape, value_shape) =
+            if let Some(mla) = &config.mla {
+                // For DeepSeek MLA, we store the compressed latent c_KV + k_pe in the keys buffer.
+                // We treat it as a single "KV head" of width (kv_lora_rank + rope_head_dim).
+                // The values buffer is left empty (width 0), but the logical output v_head_dim is kv_lora_rank.
+                let k_head_dim = (mla.kv_lora_rank + mla.rope_head_dim) as usize;
+                let v_head_dim = mla.kv_lora_rank as usize;
+                let key_shape = vec![dims.block_count, max_sequence_length, 1, k_head_dim];
+                let value_shape = vec![dims.block_count, max_sequence_length, 1, 0];
+                (1, k_head_dim, v_head_dim, key_shape, value_shape)
+            } else {
+                let k_head_dim = dims.head_dim;
+                let v_head_dim = dims.head_dim;
+                let key_shape = vec![
+                    dims.block_count,
+                    max_sequence_length,
+                    dims.attention_head_count_kv,
+                    k_head_dim,
+                ];
+                let value_shape = key_shape.clone();
+                (
+                    dims.attention_head_count_kv,
+                    k_head_dim,
+                    v_head_dim,
+                    key_shape,
+                    value_shape,
+                )
+            };
+
         Ok(Self {
             max_sequence_length,
             layer_count: dims.block_count,
-            kv_head_count: dims.attention_head_count_kv,
-            head_dim: dims.head_dim,
-            key_shape: shape.clone(),
-            value_shape: shape,
+            kv_head_count,
+            head_dim: k_head_dim,
+            k_head_dim,
+            v_head_dim,
+            key_shape,
+            value_shape,
         })
     }
 }
@@ -297,47 +328,65 @@ impl LlamaKvCache {
                 budget_bytes: self.kv_budget_bytes,
             });
         }
-        let values = target_sequence_length
+        let k_elements = target_sequence_length
             .checked_mul(self.plan.layer_count)
             .and_then(|value| value.checked_mul(self.plan.kv_head_count))
-            .and_then(|value| value.checked_mul(self.plan.head_dim))
+            .and_then(|value| value.checked_mul(self.plan.key_shape[3]))
             .ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch("KV cache element count overflow".to_string())
             })?;
+        let v_elements = target_sequence_length
+            .checked_mul(self.plan.layer_count)
+            .and_then(|value| value.checked_mul(self.plan.kv_head_count))
+            .and_then(|value| value.checked_mul(self.plan.value_shape[3]))
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch("KV cache element count overflow".to_string())
+            })?;
+
         #[allow(clippy::too_many_arguments)]
         fn grow_buffers<T: Copy + Default>(
             keys: &mut Vec<T>,
             vals: &mut Vec<T>,
             layout: KvLayout,
-            elements: usize,
+            k_elements: usize,
+            v_elements: usize,
             old_alloc: usize,
             new_alloc: usize,
-            head_dim: usize,
+            k_head_dim: usize,
+            v_head_dim: usize,
             streams: usize,
         ) {
             match layout {
                 KvLayout::PositionMajor => {
                     // Positions are outermost, so growth is a pure append.
-                    keys.resize(elements, T::default());
-                    vals.resize(elements, T::default());
+                    keys.resize(k_elements, T::default());
+                    vals.resize(v_elements, T::default());
                 }
                 KvLayout::HeadMajor => {
                     // Each head's stream stride is the allocated capacity, so
                     // growth re-lays the buffer: copy every (layer, head)
                     // block to its new base. Pure permutation of identical
                     // bits — bitwise-neutral — amortized over the chunking.
-                    let old_len = old_alloc * head_dim;
-                    let new_len = new_alloc * head_dim;
-                    let mut new_keys = vec![T::default(); elements];
-                    let mut new_vals = vec![T::default(); elements];
-                    if old_len > 0 {
-                        for stream in 0..streams {
-                            let old_base = stream * old_len;
-                            let new_base = stream * new_len;
-                            new_keys[new_base..new_base + old_len]
-                                .copy_from_slice(&keys[old_base..old_base + old_len]);
-                            new_vals[new_base..new_base + old_len]
-                                .copy_from_slice(&vals[old_base..old_base + old_len]);
+                    let k_old_len = old_alloc * k_head_dim;
+                    let k_new_len = new_alloc * k_head_dim;
+                    let v_old_len = old_alloc * v_head_dim;
+                    let v_new_len = new_alloc * v_head_dim;
+
+                    let mut new_keys = vec![T::default(); k_elements];
+                    let mut new_vals = vec![T::default(); v_elements];
+
+                    for stream in 0..streams {
+                        if k_old_len > 0 {
+                            let old_base = stream * k_old_len;
+                            let new_base = stream * k_new_len;
+                            new_keys[new_base..new_base + k_old_len]
+                                .copy_from_slice(&keys[old_base..old_base + k_old_len]);
+                        }
+                        if v_old_len > 0 {
+                            let old_base = stream * v_old_len;
+                            let new_base = stream * v_new_len;
+                            new_vals[new_base..new_base + v_old_len]
+                                .copy_from_slice(&vals[old_base..old_base + v_old_len]);
                         }
                     }
                     *keys = new_keys;
@@ -345,27 +394,33 @@ impl LlamaKvCache {
                 }
             }
         }
-        let head_dim = self.plan.head_dim;
+
+        let k_head_dim = self.plan.key_shape[3];
+        let v_head_dim = self.plan.value_shape[3];
         let streams = self.plan.layer_count * self.plan.kv_head_count;
         match self.dtype {
             KvDtype::F32 => grow_buffers(
                 &mut self.keys,
                 &mut self.values,
                 self.layout,
-                values,
+                k_elements,
+                v_elements,
                 self.allocated_sequence_length,
                 target_sequence_length,
-                head_dim,
+                k_head_dim,
+                v_head_dim,
                 streams,
             ),
             KvDtype::F16 => grow_buffers(
                 &mut self.keys_f16,
                 &mut self.values_f16,
                 self.layout,
-                values,
+                k_elements,
+                v_elements,
                 self.allocated_sequence_length,
                 target_sequence_length,
-                head_dim,
+                k_head_dim,
+                v_head_dim,
                 streams,
             ),
         }
@@ -429,8 +484,8 @@ impl LlamaKvCache {
         {
             return false;
         }
-        let end =
-            self.offset(last_layer, position - 1, self.plan.kv_head_count - 1) + self.plan.head_dim;
+        let end = self.offset(last_layer, position - 1, self.plan.kv_head_count - 1)
+            + self.plan.k_head_dim;
         self.keys.len() >= end && self.values.len() >= end
     }
 
@@ -485,20 +540,30 @@ impl LlamaKvCache {
         keys: &[f32],
         values: &[f32],
     ) -> Result<()> {
-        let head_dim = self.plan.head_dim;
+        let k_head_dim = self.plan.k_head_dim;
+        let v_head_dim = self.plan.v_head_dim;
         let n_kv = self.plan.kv_head_count;
-        let expected = n_kv
+        let expected_k = n_kv
             .checked_mul(position_count)
-            .and_then(|v| v.checked_mul(head_dim))
+            .and_then(|v| v.checked_mul(k_head_dim))
             .ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch(
-                    "resident KV readback element count overflow".to_string(),
+                    "resident KV readback element count overflow for keys".to_string(),
                 )
             })?;
-        if keys.len() != expected || values.len() != expected {
+        let expected_v = n_kv
+            .checked_mul(position_count)
+            .and_then(|v| v.checked_mul(v_head_dim))
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "resident KV readback element count overflow for values".to_string(),
+                )
+            })?;
+        // If v_head_dim is 0, backend might still return an empty slice, which is expected_v = 0
+        if keys.len() != expected_k || values.len() != expected_v {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "resident KV readback for layer {layer_idx} returned {} key / {} value elements, \
-                 expected {expected} ({n_kv} kv heads x {position_count} positions x {head_dim})",
+                 expected {expected_k} keys / {expected_v} values ({n_kv} kv heads x {position_count} positions x {k_head_dim}/{v_head_dim})",
                 keys.len(),
                 values.len()
             )));
@@ -506,13 +571,19 @@ impl LlamaKvCache {
         self.ensure_position_capacity(position_count)?;
         for p in 0..position_count {
             for h in 0..n_kv {
-                let src = (h * position_count + p) * head_dim;
+                let k_src = (h * position_count + p) * k_head_dim;
+                let v_src = (h * position_count + p) * v_head_dim;
+                let value_slice = if v_head_dim > 0 {
+                    &values[v_src..v_src + v_head_dim]
+                } else {
+                    &[]
+                };
                 self.store_kv_head_row(
                     layer_idx,
                     p,
                     h,
-                    &keys[src..src + head_dim],
-                    &values[src..src + head_dim],
+                    &keys[k_src..k_src + k_head_dim],
+                    value_slice,
                 );
             }
         }
@@ -524,12 +595,12 @@ impl LlamaKvCache {
             KvLayout::PositionMajor => {
                 (((position * self.plan.layer_count) + layer_idx) * self.plan.kv_head_count
                     + kv_head)
-                    * self.plan.head_dim
+                    * self.plan.k_head_dim
             }
             KvLayout::HeadMajor => {
                 (((layer_idx * self.plan.kv_head_count) + kv_head) * self.allocated_sequence_length
                     + position)
-                    * self.plan.head_dim
+                    * self.plan.k_head_dim
             }
         }
     }
@@ -544,7 +615,7 @@ impl LlamaKvCache {
     pub(super) fn head_position_stride(&self) -> usize {
         match self.layout {
             KvLayout::PositionMajor => self.position_stride(),
-            KvLayout::HeadMajor => self.plan.head_dim,
+            KvLayout::HeadMajor => self.plan.k_head_dim,
         }
     }
 
@@ -552,15 +623,18 @@ impl LlamaKvCache {
     /// layout-independent count used for capacity and budget math, NOT an
     /// address stride (use [`Self::head_position_stride`] for walks).
     pub(super) fn position_stride(&self) -> usize {
-        self.plan.layer_count * self.plan.kv_head_count * self.plan.head_dim
+        self.plan.layer_count * self.plan.kv_head_count * self.plan.key_shape[3]
+    }
+
+    pub(super) fn value_position_stride(&self) -> usize {
+        self.plan.layer_count * self.plan.kv_head_count * self.plan.value_shape[3]
     }
 
     /// Bytes one token's KV occupies across all layers/heads at the active
     /// dtype, counting both the K and V buffers — the per-token cost the
     /// predict-and-abort guard projects.
     fn kv_bytes_per_token(&self) -> u64 {
-        (self.position_stride() as u64)
-            .saturating_mul(2) // K + V
+        ((self.position_stride() + self.value_position_stride()) as u64)
             .saturating_mul(self.element_bytes())
     }
 
@@ -578,32 +652,41 @@ impl LlamaKvCache {
         key_row: &[f32],
         value_row: &[f32],
     ) {
-        let head_dim = self.plan.head_dim;
-        debug_assert_eq!(key_row.len(), head_dim);
-        debug_assert_eq!(value_row.len(), head_dim);
+        let k_head_dim = self.plan.k_head_dim;
+        let v_dim = value_row.len();
+        debug_assert_eq!(key_row.len(), k_head_dim);
         // Every writer routes through here, so this is THE place the materialized-through
         // watermark advances — including the GPU→host mirror, which therefore needs no
         // special-casing to be trusted afterwards.
         self.materialized_through = self.materialized_through.max(position + 1);
         let dst = self.offset(layer_idx, position, kv_head);
+
         match self.dtype {
             KvDtype::F32 => {
-                for (slot, &value) in self.keys[dst..dst + head_dim].iter_mut().zip(key_row) {
+                for (slot, &value) in self.keys[dst..dst + k_head_dim].iter_mut().zip(key_row) {
                     *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
                 }
-                for (slot, &value) in self.values[dst..dst + head_dim].iter_mut().zip(value_row) {
-                    *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                if v_dim > 0 {
+                    let v_dst = dst / k_head_dim * v_dim; // Adjust offset for value buffer if dims differ
+                    for (slot, &value) in
+                        self.values[v_dst..v_dst + v_dim].iter_mut().zip(value_row)
+                    {
+                        *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                    }
                 }
             }
             KvDtype::F16 => {
                 super::kv_f16::convert_f32_slice_to_f16(
                     key_row,
-                    &mut self.keys_f16[dst..dst + head_dim],
+                    &mut self.keys_f16[dst..dst + k_head_dim],
                 );
-                super::kv_f16::convert_f32_slice_to_f16(
-                    value_row,
-                    &mut self.values_f16[dst..dst + head_dim],
-                );
+                if v_dim > 0 {
+                    let v_dst = dst / k_head_dim * v_dim;
+                    super::kv_f16::convert_f32_slice_to_f16(
+                        value_row,
+                        &mut self.values_f16[v_dst..v_dst + v_dim],
+                    );
+                }
             }
         }
     }
@@ -618,13 +701,13 @@ impl LlamaKvCache {
         kv_head: usize,
         out: &mut [f32],
     ) {
-        let head_dim = self.plan.head_dim;
-        debug_assert_eq!(out.len(), head_dim);
+        let k_head_dim = self.plan.k_head_dim;
+        debug_assert_eq!(out.len(), k_head_dim);
         let src = self.offset(layer_idx, position, kv_head);
         match self.dtype {
-            KvDtype::F32 => out.copy_from_slice(&self.keys[src..src + head_dim]),
+            KvDtype::F32 => out.copy_from_slice(&self.keys[src..src + k_head_dim]),
             KvDtype::F16 => {
-                for (slot, &bits) in out.iter_mut().zip(&self.keys_f16[src..src + head_dim]) {
+                for (slot, &bits) in out.iter_mut().zip(&self.keys_f16[src..src + k_head_dim]) {
                     *slot = super::kv_f16::f16_to_f32_kv(bits);
                 }
             }
@@ -639,13 +722,29 @@ impl LlamaKvCache {
         kv_head: usize,
         out: &mut [f32],
     ) {
-        let head_dim = self.plan.head_dim;
-        debug_assert_eq!(out.len(), head_dim);
-        let src = self.offset(layer_idx, position, kv_head);
+        let v_head_dim = self.plan.v_head_dim;
+        let k_head_dim = self.plan.k_head_dim;
+        debug_assert_eq!(out.len(), v_head_dim);
+        let key_src = self.offset(layer_idx, position, kv_head);
+        let is_mla = self.plan.value_shape[3] == 0;
         match self.dtype {
-            KvDtype::F32 => out.copy_from_slice(&self.values[src..src + head_dim]),
+            KvDtype::F32 => {
+                let src_slice = if is_mla {
+                    &self.keys[key_src..key_src + v_head_dim]
+                } else {
+                    let v_src = key_src / k_head_dim * v_head_dim;
+                    &self.values[v_src..v_src + v_head_dim]
+                };
+                out.copy_from_slice(src_slice);
+            }
             KvDtype::F16 => {
-                for (slot, &bits) in out.iter_mut().zip(&self.values_f16[src..src + head_dim]) {
+                let src_slice = if is_mla {
+                    &self.keys_f16[key_src..key_src + v_head_dim]
+                } else {
+                    let v_src = key_src / k_head_dim * v_head_dim;
+                    &self.values_f16[v_src..v_src + v_head_dim]
+                };
+                for (slot, &bits) in out.iter_mut().zip(src_slice) {
                     *slot = super::kv_f16::f16_to_f32_kv(bits);
                 }
             }
@@ -728,6 +827,8 @@ mod tests {
             layer_count: layers,
             kv_head_count: kv_heads,
             head_dim,
+            k_head_dim: head_dim,
+            v_head_dim: head_dim,
             key_shape: shape.clone(),
             value_shape: shape,
         }

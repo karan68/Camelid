@@ -4317,6 +4317,8 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         moe: None,
         gemma4: None,
         qwen35: None,
+        logit_scale: None,
+        mla: None,
     })
 }
 

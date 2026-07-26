@@ -59,7 +59,7 @@ impl RopePositionMode {
 /// `rope_neox_pairing = true` (split-half / NEOX) because its GGUF weights are
 /// not permuted; LLaMA-family rows keep adjacent even/odd because llama.cpp
 /// permutes their weights at conversion.
-pub(super) fn rope_pairing_for_config(config: &LlamaModelConfig) -> Result<RopePairing> {
+pub(crate) fn rope_pairing_for_config(config: &LlamaModelConfig) -> Result<RopePairing> {
     if env::var_os("CAMELID_ROPE_PAIRING").is_some() {
         return diagnostic_rope_pairing();
     }
@@ -151,6 +151,7 @@ pub(super) fn apply_rope(
     head_count: usize,
     config: &LlamaModelConfig,
     rope_freqs: Option<&CpuTensor>,
+    rope_offset: usize,
     name: &str,
 ) -> Result<CpuTensor> {
     if head_count == 0 {
@@ -201,6 +202,7 @@ pub(super) fn apply_rope(
             position_mode: diagnostic_rope_position_mode()?,
             scaling,
             rope_freqs,
+            rope_offset,
         },
         name,
     )
@@ -212,6 +214,7 @@ pub(super) fn apply_rope_batch(
     head_count: usize,
     config: &LlamaModelConfig,
     rope_freqs: Option<&CpuTensor>,
+    rope_offset: usize,
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
     if head_count == 0 {
@@ -249,6 +252,11 @@ pub(super) fn apply_rope_batch(
     let rope_freqs = rope_freqs
         .map(|freqs| validate_rope_frequency_tensor(freqs, rope_dim))
         .transpose()?;
+
+    let mut data = tensor.data.clone();
+    use crate::tensor::should_parallelize_linear_output;
+    use rayon::prelude::*;
+
     let params = RopeParams {
         position: base_position,
         head_count,
@@ -260,11 +268,8 @@ pub(super) fn apply_rope_batch(
         position_mode: diagnostic_rope_position_mode()?,
         scaling,
         rope_freqs,
+        rope_offset,
     };
-
-    let mut data = tensor.data.clone();
-    use crate::tensor::should_parallelize_linear_output;
-    use rayon::prelude::*;
 
     if should_parallelize_linear_output(rows * width) {
         data.par_chunks_mut(width)
@@ -470,6 +475,7 @@ pub(super) struct RopeParams<'a> {
     pub(super) position_mode: RopePositionMode,
     pub(super) scaling: RopeScaling,
     pub(super) rope_freqs: Option<&'a [f32]>,
+    pub(super) rope_offset: usize,
 }
 
 pub(super) fn apply_rope_with_pairing(
@@ -497,7 +503,7 @@ fn apply_rope_to_row(data: &mut [f32], position: usize, mut params: RopeParams<'
         sin *= mscale;
         cos *= mscale;
         for head in 0..params.head_count {
-            let head_start = head * params.head_dim;
+            let head_start = head * params.head_dim + params.rope_offset;
             let (dim0, dim1) = match params.pairing {
                 RopePairing::AdjacentEvenOdd => {
                     let dim0 = head_start + (pair_idx * 2);
@@ -603,6 +609,7 @@ pub(super) fn resident_decode_rope_tables(
         position_mode,
         scaling,
         rope_freqs,
+        rope_offset: 0,
     };
     let half = rope_dim / 2;
     let eff = position_mode.effective_position(position) as f32;
@@ -659,6 +666,7 @@ pub(super) fn resident_prefill_rope_tables(
         position_mode,
         scaling,
         rope_freqs: validated_freqs,
+        rope_offset: 0,
     };
     let freqs: Vec<f32> = (0..half)
         .map(|pair| rope_pair_frequency(pair, &params))

@@ -881,7 +881,7 @@ fn select_kquant_plan(
         )
     } else if crate::inference::q4_k_cpu_block_dot_enabled() {
         reasons.push(
-            "CPU K-quant block-dot decode (Q4_K AVX2 + Q6_K 8-lane scalar) reads wire-only blocks; no f32 materialization"
+            "CPU K-quant block-dot decode reads Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS wire blocks; no f32 materialization"
                 .into(),
         );
         (

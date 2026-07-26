@@ -78,6 +78,7 @@ pub use q8_telemetry::{
     LlamaQ8OutputProjectionLayerRouteTelemetry, LlamaQ8OutputProjectionRouteTelemetry,
     LlamaQ8ProjectionRouteDenialTelemetry, LlamaQ8ScheduleRoleTelemetry, LlamaQ8ScheduleTelemetry,
 };
+pub(crate) use rope::rope_pairing_for_config;
 use rope::{
     apply_rope, apply_rope_batch, apply_rope_with_pairing, rope_scaling_from_config,
     validate_rope_frequency_tensor, RopeParams,
@@ -92,8 +93,8 @@ use rope::{RopeScaling, RopeScalingKind};
 use crate::{
     gguf::GgufTensorType,
     model::{
-        DenseLlamaDims, LlamaFfnTensors, LlamaModelConfig, LlamaMoeExpertTensors,
-        LlamaTensorBinding,
+        DenseLlamaDims, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig,
+        LlamaMoeExpertTensors, LlamaTensorBinding,
     },
     tensor::{
         dot_product, parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
@@ -264,6 +265,13 @@ pub struct DecodeLinearBindings {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct LlamaAttentionBiasWeights {
+    pub q: CpuTensor,
+    pub k: CpuTensor,
+    pub v: CpuTensor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LlamaLayerWeights {
     pub attention_norm: CpuTensor,
     pub attention_q: CpuTensor,
@@ -277,11 +285,26 @@ pub struct LlamaLayerWeights {
     /// Per-head RMSNorm weight for the K projection; bound in lockstep with
     /// [`Self::attention_q_norm`].
     pub attention_k_norm: Option<CpuTensor>,
+    /// Qwen2/Qwen2.5 projection biases, applied before RoPE.
+    pub attention_biases: Option<LlamaAttentionBiasWeights>,
     pub ffn_norm: CpuTensor,
     pub ffn_gate: CpuTensor,
     pub ffn_up: CpuTensor,
     pub ffn_down: CpuTensor,
     pub moe_router: Option<CpuTensor>,
+
+    // MLA Tensors
+    pub mla_q_a_proj: Option<CpuTensor>,
+    pub mla_q_a_layernorm: Option<CpuTensor>,
+    pub mla_q_b_proj: Option<CpuTensor>,
+    pub mla_kv_a_proj_with_mqa: Option<CpuTensor>,
+    pub mla_kv_a_layernorm: Option<CpuTensor>,
+    pub mla_kv_b_proj: Option<CpuTensor>,
+
+    // DeepSeekMoE Shared Experts
+    pub moe_shared_gate: Option<CpuTensor>,
+    pub moe_shared_up: Option<CpuTensor>,
+    pub moe_shared_down: Option<CpuTensor>,
     /// Steady-state decode kernel bindings; see [`DecodeBindingCell`].
     pub decode_bindings: DecodeLinearBindings,
 }
@@ -584,11 +607,22 @@ impl LlamaLoadedWeights {
         for (layer_idx, layer) in binding.layers.iter().enumerate() {
             let is_owned = layer_range.as_ref().is_none_or(|r| r.contains(&layer_idx));
             if is_owned {
-                let (ffn_gate, ffn_up, ffn_down, moe_router) = match &layer.ffn {
+                let (
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    moe_router,
+                    moe_shared_gate,
+                    moe_shared_up,
+                    moe_shared_down,
+                ) = match &layer.ffn {
                     LlamaFfnTensors::Dense { gate, up, down } => (
                         load_linear(&gate.name)?,
                         load_linear(&up.name)?,
                         load_linear(&down.name)?,
+                        None,
+                        None,
+                        None,
                         None,
                     ),
                     LlamaFfnTensors::MoE {
@@ -601,106 +635,391 @@ impl LlamaLoadedWeights {
                         load_moe_experts(up_experts)?,
                         load_moe_experts(down_experts)?,
                         Some(store.load_cpu_f32(&router.name)?),
+                        None,
+                        None,
+                        None,
+                    ),
+                    LlamaFfnTensors::DeepSeekMoE {
+                        shared_gate,
+                        shared_up,
+                        shared_down,
+                        router,
+                        gate_experts,
+                        up_experts,
+                        down_experts,
+                    } => (
+                        load_moe_experts(gate_experts)?,
+                        load_moe_experts(up_experts)?,
+                        load_moe_experts(down_experts)?,
+                        Some(store.load_cpu_f32(&router.name)?),
+                        Some(load_linear(&shared_gate.name)?),
+                        Some(load_linear(&shared_up.name)?),
+                        Some(load_linear(&shared_down.name)?),
                     ),
                 };
-                // DEBUG ONLY: CAMELID_DEBUG_DISABLE_QK_NORM=1 skips loading the
-                // QK-norm weights so a Qwen3 forward runs as if it had none ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â used
-                // to bisect whether QK-norm is the source of a parity gap. Never
-                // set in production.
+
                 let debug_disable_qk_norm =
                     std::env::var_os("CAMELID_DEBUG_DISABLE_QK_NORM").is_some();
-                let attention_q_norm = if debug_disable_qk_norm {
-                    None
-                } else {
-                    layer
-                        .attention_q_norm
-                        .as_ref()
-                        .map(|desc| store.load_cpu_f32(&desc.name))
-                        .transpose()?
-                };
-                let attention_k_norm = if debug_disable_qk_norm {
-                    None
-                } else {
-                    layer
-                        .attention_k_norm
-                        .as_ref()
-                        .map(|desc| store.load_cpu_f32(&desc.name))
-                        .transpose()?
-                };
-                layers.push(LlamaLayerWeights {
-                    attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
-                    attention_q: load_linear(&layer.attention_q.name)?,
-                    attention_k: load_linear(&layer.attention_k.name)?,
-                    attention_v: load_linear(&layer.attention_v.name)?,
-                    attention_output: load_linear(&layer.attention_output.name)?,
+
+                let (
+                    attention_q,
+                    attention_k,
+                    attention_v,
                     attention_q_norm,
                     attention_k_norm,
+                    attention_biases,
+                    mla_q_a_proj,
+                    mla_q_a_layernorm,
+                    mla_q_b_proj,
+                    mla_kv_a_proj_with_mqa,
+                    mla_kv_a_layernorm,
+                    mla_kv_b_proj,
+                ) = match &layer.attention {
+                    LlamaAttentionTensors::Standard {
+                        q,
+                        k,
+                        v,
+                        q_norm,
+                        k_norm,
+                        biases,
+                    } => {
+                        let attention_q_norm = if debug_disable_qk_norm {
+                            None
+                        } else {
+                            q_norm
+                                .as_ref()
+                                .map(|desc| store.load_cpu_f32(&desc.name))
+                                .transpose()?
+                        };
+                        let attention_k_norm = if debug_disable_qk_norm {
+                            None
+                        } else {
+                            k_norm
+                                .as_ref()
+                                .map(|desc| store.load_cpu_f32(&desc.name))
+                                .transpose()?
+                        };
+                        let attention_biases = biases
+                            .as_ref()
+                            .map(|biases| -> Result<LlamaAttentionBiasWeights> {
+                                Ok(LlamaAttentionBiasWeights {
+                                    q: store.load_cpu_f32(&biases.q.name)?,
+                                    k: store.load_cpu_f32(&biases.k.name)?,
+                                    v: store.load_cpu_f32(&biases.v.name)?,
+                                })
+                            })
+                            .transpose()?;
+                        (
+                            load_linear(&q.name)?,
+                            load_linear(&k.name)?,
+                            load_linear(&v.name)?,
+                            attention_q_norm,
+                            attention_k_norm,
+                            attention_biases,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                    LlamaAttentionTensors::Mla {
+                        q_a_proj,
+                        q_a_layernorm,
+                        q_b_proj,
+                        kv_a_proj_with_mqa,
+                        kv_a_layernorm,
+                        kv_b_proj,
+                    } => {
+                        let loaded_q_a_proj = load_linear(&q_a_proj.name)?;
+                        let loaded_q_a_norm = store.load_cpu_f32(&q_a_layernorm.name)?;
+                        let loaded_q_b_proj = load_linear(&q_b_proj.name)?;
+                        let loaded_kv_a_proj = load_linear(&kv_a_proj_with_mqa.name)?;
+                        let loaded_kv_a_norm = store.load_cpu_f32(&kv_a_layernorm.name)?;
+                        let loaded_kv_b_proj = load_linear(&kv_b_proj.name)?;
+
+                        // We will absorb kv_b_proj into q_b_proj and attention_output in a separate pass
+                        // after loading layer.attention_output.
+                        (
+                            CpuTensor::from_f32(&q_a_proj.name, vec![0], vec![])?, // Empty standard Q
+                            CpuTensor::from_f32(&q_a_proj.name, vec![0], vec![])?, // Empty standard K
+                            CpuTensor::from_f32(&q_a_proj.name, vec![0], vec![])?, // Empty standard V
+                            None,
+                            None,
+                            None,
+                            Some(loaded_q_a_proj),
+                            Some(loaded_q_a_norm),
+                            Some(loaded_q_b_proj),
+                            Some(loaded_kv_a_proj),
+                            Some(loaded_kv_a_norm),
+                            Some(loaded_kv_b_proj),
+                        )
+                    }
+                };
+
+                let mut attention_output = load_linear(&layer.attention_output.name)?;
+
+                // --- MLA WEIGHT ABSORPTION ---
+                let mut mla_q_b_proj = mla_q_b_proj;
+                let mut mla_kv_b_proj_opt = mla_kv_b_proj;
+                if let (Some(mla), Some(q_b_linear), Some(kv_b_linear)) =
+                    (&binding.mla_metadata, &mla_q_b_proj, &mla_kv_b_proj_opt)
+                {
+                    let num_heads = binding.attention_head_count;
+                    let nope_dim = mla.nope_head_dim as usize;
+                    let rope_dim = mla.rope_head_dim as usize;
+                    let v_dim = nope_dim; // In DeepSeek V2/V3, v_head_dim == nope_head_dim
+                    let q_lora = mla.q_lora_rank as usize;
+                    let kv_lora = mla.kv_lora_rank as usize;
+                    let d_model = binding.hidden_size;
+
+                    let q_b = store.load_cpu_f32(&q_b_linear.name)?;
+                    let kv_b = store.load_cpu_f32(&kv_b_linear.name)?;
+                    let o = store.load_cpu_f32(&attention_output.name)?;
+
+                    // q_b: [num_heads * (nope_dim + rope_dim), q_lora]
+                    // kv_b: [num_heads * (nope_dim + v_dim), kv_lora]
+                    // attention_output: [d_model, num_heads * v_dim]
+
+                    // 1. Absorb kv_b_k into q_b_nope
+                    let mut absorbed_q_b = vec![0.0f32; num_heads * (kv_lora + rope_dim) * q_lora];
+
+                    for h in 0..num_heads {
+                        let q_head_start = h * (nope_dim + rope_dim);
+                        let kv_head_start = h * (nope_dim + v_dim);
+
+                        for out_k in 0..kv_lora {
+                            for in_q in 0..q_lora {
+                                let mut sum = 0.0;
+                                for d in 0..nope_dim {
+                                    let kv_val = kv_b.data[(kv_head_start + d) * kv_lora + out_k];
+                                    let q_val = q_b.data[(q_head_start + d) * q_lora + in_q];
+                                    sum += kv_val * q_val;
+                                }
+                                let absorbed_idx =
+                                    (h * (kv_lora + rope_dim) + out_k) * q_lora + in_q;
+                                absorbed_q_b[absorbed_idx] = sum;
+                            }
+                        }
+
+                        // Copy W_UQ_rope exactly as it is
+                        for d in 0..rope_dim {
+                            for in_q in 0..q_lora {
+                                let q_val = q_b.data[(q_head_start + nope_dim + d) * q_lora + in_q];
+                                let absorbed_idx =
+                                    (h * (kv_lora + rope_dim) + kv_lora + d) * q_lora + in_q;
+                                absorbed_q_b[absorbed_idx] = q_val;
+                            }
+                        }
+                    }
+
+                    mla_q_b_proj = Some(CpuTensor::from_f32(
+                        &q_b.name,
+                        vec![num_heads * (kv_lora + rope_dim), q_lora],
+                        absorbed_q_b,
+                    )?);
+
+                    // 2. Absorb kv_b_v into attention_output
+                    let mut absorbed_o = vec![0.0f32; d_model * (num_heads * kv_lora)];
+                    for out_m in 0..d_model {
+                        for h in 0..num_heads {
+                            let kv_head_start = h * (nope_dim + v_dim);
+                            for in_k in 0..kv_lora {
+                                let mut sum = 0.0;
+                                for d in 0..v_dim {
+                                    let kv_val =
+                                        kv_b.data[(kv_head_start + nope_dim + d) * kv_lora + in_k];
+                                    let o_val =
+                                        o.data[out_m * (num_heads * v_dim) + (h * v_dim + d)];
+                                    sum += kv_val * o_val;
+                                }
+                                absorbed_o[out_m * (num_heads * kv_lora) + (h * kv_lora + in_k)] =
+                                    sum;
+                            }
+                        }
+                    }
+
+                    attention_output = CpuTensor::from_f32(
+                        &attention_output.name,
+                        vec![d_model, num_heads * kv_lora],
+                        absorbed_o,
+                    )?;
+
+                    // We don't need kv_b_proj at runtime anymore!
+                    mla_kv_b_proj_opt = None;
+                }
+
+                layers.push(LlamaLayerWeights {
+                    attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
+                    attention_q,
+                    attention_k,
+                    attention_v,
+                    attention_output,
+                    attention_q_norm,
+                    attention_k_norm,
+                    attention_biases,
+                    mla_q_a_proj,
+                    mla_q_a_layernorm,
+                    mla_q_b_proj,
+                    mla_kv_a_proj_with_mqa,
+                    mla_kv_a_layernorm,
+                    mla_kv_b_proj: mla_kv_b_proj_opt,
                     ffn_norm: store.load_cpu_f32(&layer.ffn_norm.name)?,
                     ffn_gate,
                     ffn_up,
                     ffn_down,
                     moe_router,
+                    moe_shared_gate,
+                    moe_shared_up,
+                    moe_shared_down,
                     decode_bindings: DecodeLinearBindings::default(),
                 });
             } else {
+                let (
+                    ffn_gate_name,
+                    ffn_up_name,
+                    ffn_down_name,
+                    moe_router_name,
+                    moe_shared_gate_name,
+                    moe_shared_up_name,
+                    moe_shared_down_name,
+                ) = match &layer.ffn {
+                    LlamaFfnTensors::Dense { gate, up, down } => {
+                        (&gate.name, &up.name, &down.name, None, None, None, None)
+                    }
+                    LlamaFfnTensors::MoE {
+                        router,
+                        gate_experts,
+                        up_experts,
+                        down_experts,
+                    } => (
+                        match gate_experts {
+                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        },
+                        match up_experts {
+                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        },
+                        match down_experts {
+                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        },
+                        Some(&router.name),
+                        None,
+                        None,
+                        None,
+                    ),
+                    LlamaFfnTensors::DeepSeekMoE {
+                        shared_gate,
+                        shared_up,
+                        shared_down,
+                        router,
+                        gate_experts,
+                        up_experts,
+                        down_experts,
+                    } => (
+                        match gate_experts {
+                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        },
+                        match up_experts {
+                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        },
+                        match down_experts {
+                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        },
+                        Some(&router.name),
+                        Some(&shared_gate.name),
+                        Some(&shared_up.name),
+                        Some(&shared_down.name),
+                    ),
+                };
+
+                let (
+                    attention_q,
+                    attention_k,
+                    attention_v,
+                    mla_q_a_proj,
+                    mla_q_a_layernorm,
+                    mla_q_b_proj,
+                    mla_kv_a_proj_with_mqa,
+                    mla_kv_a_layernorm,
+                    mla_kv_b_proj,
+                ) = match &layer.attention {
+                    LlamaAttentionTensors::Standard { q, k, v, .. } => (
+                        CpuTensor::from_f32(&q.name, vec![0], vec![])?,
+                        CpuTensor::from_f32(&k.name, vec![0], vec![])?,
+                        CpuTensor::from_f32(&v.name, vec![0], vec![])?,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    LlamaAttentionTensors::Mla {
+                        q_a_proj,
+                        q_a_layernorm,
+                        q_b_proj,
+                        kv_a_proj_with_mqa,
+                        kv_a_layernorm,
+                        kv_b_proj,
+                    } => (
+                        CpuTensor::from_f32(&q_a_proj.name, vec![0], vec![])?,
+                        CpuTensor::from_f32(&q_a_proj.name, vec![0], vec![])?,
+                        CpuTensor::from_f32(&q_a_proj.name, vec![0], vec![])?,
+                        Some(CpuTensor::from_f32(&q_a_proj.name, vec![0], vec![])?),
+                        Some(CpuTensor::from_f32(&q_a_layernorm.name, vec![0], vec![])?),
+                        Some(CpuTensor::from_f32(&q_b_proj.name, vec![0], vec![])?),
+                        Some(CpuTensor::from_f32(
+                            &kv_a_proj_with_mqa.name,
+                            vec![0],
+                            vec![],
+                        )?),
+                        Some(CpuTensor::from_f32(&kv_a_layernorm.name, vec![0], vec![])?),
+                        Some(CpuTensor::from_f32(&kv_b_proj.name, vec![0], vec![])?),
+                    ),
+                };
+
                 layers.push(LlamaLayerWeights {
                     attention_norm: CpuTensor::from_f32(
                         &layer.attention_norm.name,
                         vec![0],
                         vec![],
                     )?,
-                    attention_q: CpuTensor::from_f32(&layer.attention_q.name, vec![0], vec![])?,
-                    attention_k: CpuTensor::from_f32(&layer.attention_k.name, vec![0], vec![])?,
-                    attention_v: CpuTensor::from_f32(&layer.attention_v.name, vec![0], vec![])?,
+                    attention_q,
+                    attention_k,
+                    attention_v,
                     attention_output: CpuTensor::from_f32(
                         &layer.attention_output.name,
                         vec![0],
                         vec![],
                     )?,
-                    // Unowned pipeline layers carry empty placeholders; QK-norm is
-                    // applied by the owning node, so leave these None here.
                     attention_q_norm: None,
                     attention_k_norm: None,
+                    attention_biases: None,
+                    mla_q_a_proj,
+                    mla_q_a_layernorm,
+                    mla_q_b_proj,
+                    mla_kv_a_proj_with_mqa,
+                    mla_kv_a_layernorm,
+                    mla_kv_b_proj,
                     ffn_norm: CpuTensor::from_f32(&layer.ffn_norm.name, vec![0], vec![])?,
-                    ffn_gate: CpuTensor::from_f32(
-                        match &layer.ffn {
-                            LlamaFfnTensors::Dense { gate, .. } => &gate.name,
-                            LlamaFfnTensors::MoE { gate_experts, .. } => match gate_experts {
-                                LlamaMoeExpertTensors::Merged(desc) => &desc.name,
-                                LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
-                            },
-                        },
-                        vec![0],
-                        vec![],
-                    )?,
-                    ffn_up: CpuTensor::from_f32(
-                        match &layer.ffn {
-                            LlamaFfnTensors::Dense { up, .. } => &up.name,
-                            LlamaFfnTensors::MoE { up_experts, .. } => match up_experts {
-                                LlamaMoeExpertTensors::Merged(desc) => &desc.name,
-                                LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
-                            },
-                        },
-                        vec![0],
-                        vec![],
-                    )?,
-                    ffn_down: CpuTensor::from_f32(
-                        match &layer.ffn {
-                            LlamaFfnTensors::Dense { down, .. } => &down.name,
-                            LlamaFfnTensors::MoE { down_experts, .. } => match down_experts {
-                                LlamaMoeExpertTensors::Merged(desc) => &desc.name,
-                                LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
-                            },
-                        },
-                        vec![0],
-                        vec![],
-                    )?,
-                    moe_router: match &layer.ffn {
-                        LlamaFfnTensors::Dense { .. } => None,
-                        LlamaFfnTensors::MoE { router, .. } => {
-                            Some(CpuTensor::from_f32(&router.name, vec![0], vec![])?)
-                        }
-                    },
+                    ffn_gate: CpuTensor::from_f32(ffn_gate_name, vec![0], vec![])?,
+                    ffn_up: CpuTensor::from_f32(ffn_up_name, vec![0], vec![])?,
+                    ffn_down: CpuTensor::from_f32(ffn_down_name, vec![0], vec![])?,
+                    moe_router: moe_router_name
+                        .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
+                    moe_shared_gate: moe_shared_gate_name
+                        .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
+                    moe_shared_up: moe_shared_up_name
+                        .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
+                    moe_shared_down: moe_shared_down_name
+                        .map(|n| CpuTensor::from_f32(n, vec![0], vec![]).unwrap()),
                     decode_bindings: DecodeLinearBindings::default(),
                 });
             }
@@ -2148,6 +2467,9 @@ impl LlamaInferenceSession {
         if self.config.moe.is_some() {
             bail!("moe config");
         }
+        if want_logits && self.config.logit_scale.is_some() {
+            bail!("logit_scale is not supported in the GPU logit kernel yet");
+        }
         // QK-norm (Qwen3) is applied in the resident path (decode:
         // encode_attention_block, prefill: prefill_tokens) via the per-head
         // RMSNorm kernel, so it no longer disqualifies the resident path.
@@ -2160,10 +2482,7 @@ impl LlamaInferenceSession {
         // Wire-page (fast-load) weights satisfy residency too, but only when the wire
         // kernels are active ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â their bytes exist solely in the 34-byte wire layout.
         let wire_ok = metal_seam::wire_mode_active();
-        let is_q8 = |t: &CpuTensor| {
-            t.source_type == Some(GgufTensorType::Q8_0)
-                && (t.q8_0_blocks.is_some() || (wire_ok && t.q8_0_wire_pages.is_some()))
-        };
+        let is_q8 = |t: &CpuTensor| metal_resident_weight_eligible(t, wire_ok);
         // Q4_K_M residency: the tensor is Q4_K with its 144-byte super-block wire
         // bytes materialized, and its contraction dimension is a whole number of
         // 256-value super-blocks (the q4k_gemv kernel processes one super-block at a
@@ -2230,10 +2549,20 @@ impl LlamaInferenceSession {
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
-        // A projection is resident-eligible if it is plain Q8_0 OR a K-quant lane
-        // (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K / IQ4_XS). Q8_0 behavior is byte-identical to before.
+        // CUDA supports Q8_0 plus the K-quant/IQ4_XS wire formats. Metal's
+        // resident byte view and kernels currently consume Q8_0 only.
+        // Distinguishing them here prevents a Metal request from reaching
+        // `resident_weight_bytes` with no Q8 backing and panicking.
+        let metal_only = resident_decode_metal_enabled() && !resident_decode_cuda_enabled();
         let is_resident_quant = |t: &CpuTensor| {
-            is_q8(t) || is_q4k(t) || is_q5k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t) || is_iq4xs(t)
+            is_q8(t)
+                || (!metal_only
+                    && (is_q4k(t)
+                        || is_q5k(t)
+                        || is_q6k(t)
+                        || is_q2k(t)
+                        || is_q3k(t)
+                        || is_iq4xs(t)))
         };
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
@@ -2245,7 +2574,8 @@ impl LlamaInferenceSession {
             bail!("layer range invalid/empty");
         }
         for (idx, layer) in self.weights.layers[range].iter().enumerate() {
-            if layer.moe_router.is_some()
+            if layer.attention_biases.is_some()
+                || layer.moe_router.is_some()
                 || !is_resident_quant(&layer.attention_q)
                 || !is_resident_quant(&layer.attention_k)
                 || !is_resident_quant(&layer.attention_v)
@@ -2255,7 +2585,8 @@ impl LlamaInferenceSession {
                 || !is_resident_quant(&layer.ffn_down)
             {
                 bail!(format!(
-                    "layer {idx} not resident-eligible Q8_0/Q4_K (q8 blocks/pages present: q={}/{} k={}/{} v={}/{} o={}/{} gate={}/{} up={}/{} down={}/{})",
+                    "layer {idx} not resident-eligible (attention_biases={}, q8 blocks/pages present: q={}/{} k={}/{} v={}/{} o={}/{} gate={}/{} up={}/{} down={}/{})",
+                    layer.attention_biases.is_some(),
                     layer.attention_q.q8_0_blocks.is_some(),
                     layer.attention_q.q8_0_wire_pages.is_some(),
                     layer.attention_k.q8_0_blocks.is_some(),
@@ -3637,13 +3968,19 @@ impl LlamaInferenceSession {
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let norm =
             out_hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?;
-        let logits = output_projection_runtime_with_plan(
+        let mut logits = output_projection_runtime_with_plan(
             &norm,
             self.weights.output_projection(),
             "logits",
             &runtime_plan,
             false,
         )?;
+
+        if let Some(scale) = self.config.logit_scale {
+            for l in logits.data.iter_mut() {
+                *l *= scale;
+            }
+        }
         Ok(logits)
     }
 
@@ -4524,7 +4861,7 @@ impl LlamaInferenceSession {
                 (self.kv_cache.position
                     * self.kv_cache.plan.layer_count
                     * self.kv_cache.plan.kv_head_count
-                    * self.kv_cache.plan.head_dim
+                    * self.kv_cache.plan.k_head_dim
                     * 2
                     * std::mem::size_of::<f32>()) as u64,
             ),
@@ -6300,7 +6637,93 @@ fn forward_layer_timed(
         )?
     };
 
-    let (q, k, v, shared_qkv_elapsed) = if let Some((q, k, v)) = shared_qkv {
+    let (q, k, v, shared_qkv_elapsed) = if let (
+        Some(q_a_proj),
+        Some(q_a_layernorm),
+        Some(q_b_proj),
+        Some(kv_a_proj),
+        Some(kv_a_layernorm),
+        Some(_kv_b_proj),
+    ) = (
+        &layer.mla_q_a_proj,
+        &layer.mla_q_a_layernorm,
+        &layer.mla_q_b_proj,
+        &layer.mla_kv_a_proj_with_mqa,
+        &layer.mla_kv_a_layernorm,
+        &layer.mla_kv_b_proj,
+    ) {
+        let total_started = timings_on.then(Instant::now);
+
+        // Q path
+        let q_a = linear_for_role_runtime(&attn_norm, q_a_proj, "mla_q_a", "linear", false)?;
+        let q_a_norm = pooled_rms_norm(
+            &q_a,
+            q_a_layernorm,
+            params.config.rms_norm_epsilon,
+            "mla_q_a_norm",
+        )?;
+        let q = linear_for_role_runtime(&q_a_norm, q_b_proj, "mla_q_b", "linear", false)?;
+
+        // KV path
+        let kv_a = linear_for_role_runtime(&attn_norm, kv_a_proj, "mla_kv_a", "linear", false)?;
+
+        // Split c_KV and k_pe from kv_a
+        // kv_a shape is [1, kv_lora_rank + rope_head_dim]
+        let mla = params.config.mla.as_ref().unwrap();
+        let c_kv_len = mla.kv_lora_rank as usize;
+        let k_pe_len = mla.rope_head_dim as usize;
+
+        let c_kv = CpuTensor::from_f32(
+            "mla_c_kv",
+            vec![1, c_kv_len],
+            kv_a.data[..c_kv_len].to_vec(),
+        )?;
+        let k_pe = CpuTensor::from_f32(
+            "mla_k_pe",
+            vec![1, k_pe_len],
+            kv_a.data[c_kv_len..].to_vec(),
+        )?;
+
+        // For MLA, we DO NOT expand K and V here! We store the compressed latents in the KV cache
+        // to save memory, and the attention kernel (causal_attention_context) will expand them on the fly.
+        // We only expand Q here since Q is not cached.
+
+        // Apply RoPE to k_pe manually here since its layout doesn't match the standard global RoPE
+        let k_pe_roped = apply_rope(
+            &k_pe,
+            kv_cache.position,
+            1, // single head
+            params.config,
+            params.rope_freqs,
+            0,
+            "mla_k_pe_rope",
+        )?;
+
+        let c_kv_norm = pooled_rms_norm(
+            &c_kv,
+            kv_a_layernorm,
+            params.config.rms_norm_epsilon,
+            "mla_c_kv_norm",
+        )?;
+
+        // Assemble final K for cache: c_KV + k_pe_roped
+        let mut k_data = Vec::with_capacity(c_kv_len + k_pe_len);
+        k_data.extend_from_slice(&c_kv_norm.data);
+        k_data.extend_from_slice(&k_pe_roped.data);
+        let k = CpuTensor::from_f32("attention_k", vec![1, k_data.len()], k_data)?;
+
+        // V is empty for MLA cache (it's generated on the fly from c_KV)
+        let v = CpuTensor::from_f32("attention_v", vec![1, 0], vec![])?;
+
+        let elapsed = total_started.map(|s| s.elapsed().as_micros());
+        if let Some(total) = elapsed {
+            let base = total / 3;
+            timings.attention_q = base;
+            timings.attention_k = base;
+            timings.attention_v = total - (base * 2);
+        }
+        (q, k, v, None)
+    } else if let Some((q, k, v)) = shared_qkv {
         let elapsed = timing_elapsed_us(&qkv_started);
         (q, k, v, Some(elapsed))
     } else {
@@ -6347,11 +6770,27 @@ fn forward_layer_timed(
         timings.attention_k = base;
         timings.attention_v = total_elapsed - (base * 2);
     }
+    let (q, k, v) = match &layer.attention_biases {
+        Some(biases) => (
+            add_projection_bias(q, &biases.q, "attention q")?,
+            add_projection_bias(k, &biases.k, "attention k")?,
+            add_projection_bias(v, &biases.v, "attention v")?,
+        ),
+        None => (q, k, v),
+    };
     let attention_q_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&q))
         .transpose()?;
     let attention_q_diagnostic = collect_diagnostics
-        .then(|| linear_projection_diagnostics(&attn_norm, &layer.attention_q, &q, "linear"))
+        .then(|| {
+            linear_projection_diagnostics_with_bias(
+                &attn_norm,
+                &layer.attention_q,
+                layer.attention_biases.as_ref().map(|biases| &biases.q),
+                &q,
+                "linear",
+            )
+        })
         .transpose()?;
     if let Some(memory) = &mut memory {
         memory.record_after_attention_q(capture_memory_sample(kv_cache));
@@ -6362,7 +6801,15 @@ fn forward_layer_timed(
         .then(|| LlamaTensorStats::from_tensor(&k))
         .transpose()?;
     let attention_k_diagnostic = collect_diagnostics
-        .then(|| linear_projection_diagnostics(&attn_norm, &layer.attention_k, &k, "attention_k"))
+        .then(|| {
+            linear_projection_diagnostics_with_bias(
+                &attn_norm,
+                &layer.attention_k,
+                layer.attention_biases.as_ref().map(|biases| &biases.k),
+                &k,
+                "attention_k",
+            )
+        })
         .transpose()?;
     if let Some(memory) = &mut memory {
         memory.record_after_attention_k(capture_memory_sample(kv_cache));
@@ -6399,16 +6846,26 @@ fn forward_layer_timed(
         config.attention_head_count as usize,
         config,
         rope_freqs,
+        config
+            .mla
+            .as_ref()
+            .map_or(0, |mla| mla.nope_head_dim as usize),
         &cached_layer_label!(layer_idx, "attention_q_rope"),
     )?;
-    let k = apply_rope(
-        &k_before_rope,
-        kv_cache.position,
-        config.attention_head_count_kv as usize,
-        config,
-        rope_freqs,
-        &cached_layer_label!(layer_idx, "attention_k_rope"),
-    )?;
+    let k = if config.mla.is_some() {
+        // k is already RoPE'd and in the exact cached layout (1 head of [c_kv, k_pe])
+        k_before_rope.clone()
+    } else {
+        apply_rope(
+            &k_before_rope,
+            kv_cache.position,
+            config.attention_head_count_kv as usize,
+            config,
+            rope_freqs,
+            0,
+            &cached_layer_label!(layer_idx, "attention_k_rope"),
+        )?
+    };
     let attention_q_rope_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&q))
         .transpose()?;
@@ -6451,7 +6908,15 @@ fn forward_layer_timed(
         .then(|| LlamaTensorStats::from_tensor(&v))
         .transpose()?;
     let attention_v_diagnostic = collect_diagnostics
-        .then(|| linear_projection_diagnostics(&attn_norm, &layer.attention_v, &v, "attention_v"))
+        .then(|| {
+            linear_projection_diagnostics_with_bias(
+                &attn_norm,
+                &layer.attention_v,
+                layer.attention_biases.as_ref().map(|biases| &biases.v),
+                &v,
+                "attention_v",
+            )
+        })
         .transpose()?;
     if let Some(memory) = &mut memory {
         memory.record_after_attention_v(capture_memory_sample(kv_cache));
@@ -6574,25 +7039,56 @@ fn forward_layer_timed(
         mixtral_moe_trace,
         ffn_out_already_residual,
     ) = if let (Some(moe), Some(router)) = (&params.config.moe, &layer.moe_router) {
-        let (ffn_out, gate, up, activation, down, trace) = mixtral_moe_ffn(
-            &ffn_norm,
-            router,
-            &layer.ffn_gate,
-            &layer.ffn_up,
-            &layer.ffn_down,
-            moe.expert_used_count as usize,
-            MixtralMoeFfnOptions::new(
-                cached_layer_label!(layer_idx, "mixtral_moe_ffn"),
-                collect_diagnostics,
-            ),
-        )?;
-        timings.ffn_gate = gate;
-        timings.ffn_up = up;
-        timings.ffn_activation = activation;
-        timings.ffn_down = down;
-        (
-            ffn_out, None, None, None, None, None, None, None, None, trace, false,
-        )
+        if let (Some(shared_gate), Some(shared_up), Some(shared_down)) = (
+            &layer.moe_shared_gate,
+            &layer.moe_shared_up,
+            &layer.moe_shared_down,
+        ) {
+            let (ffn_out, gate, up, activation, down, trace) = deepseek_moe_ffn(
+                &ffn_norm,
+                DeepSeekMoeWeights {
+                    router,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                    gate_experts: &layer.ffn_gate,
+                    up_experts: &layer.ffn_up,
+                    down_experts: &layer.ffn_down,
+                },
+                moe,
+                MixtralMoeFfnOptions::new(
+                    cached_layer_label!(layer_idx, "deepseek_moe_ffn"),
+                    collect_diagnostics,
+                ),
+            )?;
+            timings.ffn_gate = gate;
+            timings.ffn_up = up;
+            timings.ffn_activation = activation;
+            timings.ffn_down = down;
+            (
+                ffn_out, None, None, None, None, None, None, None, None, trace, false,
+            )
+        } else {
+            let (ffn_out, gate, up, activation, down, trace) = mixtral_moe_ffn(
+                &ffn_norm,
+                router,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &layer.ffn_down,
+                moe.expert_used_count as usize,
+                MixtralMoeFfnOptions::new(
+                    cached_layer_label!(layer_idx, "mixtral_moe_ffn"),
+                    collect_diagnostics,
+                ),
+            )?;
+            timings.ffn_gate = gate;
+            timings.ffn_up = up;
+            timings.ffn_activation = activation;
+            timings.ffn_down = down;
+            (
+                ffn_out, None, None, None, None, None, None, None, None, trace, false,
+            )
+        }
     } else {
         let activated_name = cached_layer_label!(layer_idx, "ffn_activated");
         let down_name = cached_layer_label!(layer_idx, "ffn_down");
@@ -6915,6 +7411,14 @@ fn forward_prefill_layer_chunk_timed(
         timings.attention_k = base;
         timings.attention_v = total_elapsed - (base * 2);
     }
+    let (q, k, v) = match &layer.attention_biases {
+        Some(biases) => (
+            add_projection_bias(q, &biases.q, "prefill attention q")?,
+            add_projection_bias(k, &biases.k, "prefill attention k")?,
+            add_projection_bias(v, &biases.v, "prefill attention v")?,
+        ),
+        None => (q, k, v),
+    };
     if let Some(memory) = &mut memory {
         memory.record_after_attention_q(capture_memory_sample(kv_cache));
     }
@@ -6951,6 +7455,7 @@ fn forward_prefill_layer_chunk_timed(
         config.attention_head_count as usize,
         config,
         params.rope_freqs,
+        0,
         cached_layer_label!(layer_idx, "prefill_attention_q_rope"),
     )?;
     let k = apply_rope_batch(
@@ -6959,6 +7464,7 @@ fn forward_prefill_layer_chunk_timed(
         config.attention_head_count_kv as usize,
         config,
         params.rope_freqs,
+        0,
         cached_layer_label!(layer_idx, "prefill_attention_k_rope"),
     )?;
     timings.attention_rope = started.elapsed().as_micros();
@@ -7035,23 +7541,52 @@ fn forward_prefill_layer_chunk_timed(
     trace_chunk_memory("ffn_norm_done");
 
     let ffn_out = if let (Some(moe), Some(router)) = (&params.config.moe, &layer.moe_router) {
-        let (ffn_out, gate, up, activation, down, _) = mixtral_moe_ffn(
-            &ffn_norm,
-            router,
-            &layer.ffn_gate,
-            &layer.ffn_up,
-            &layer.ffn_down,
-            moe.expert_used_count as usize,
-            MixtralMoeFfnOptions::new(
-                cached_layer_label!(layer_idx, "prefill_mixtral_moe_ffn"),
-                false,
-            ),
-        )?;
-        timings.ffn_gate = gate;
-        timings.ffn_up = up;
-        timings.ffn_activation = activation;
-        timings.ffn_down = down;
-        ffn_out
+        if let (Some(shared_gate), Some(shared_up), Some(shared_down)) = (
+            &layer.moe_shared_gate,
+            &layer.moe_shared_up,
+            &layer.moe_shared_down,
+        ) {
+            let (ffn_out, gate, up, activation, down, _) = deepseek_moe_ffn(
+                &ffn_norm,
+                DeepSeekMoeWeights {
+                    router,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                    gate_experts: &layer.ffn_gate,
+                    up_experts: &layer.ffn_up,
+                    down_experts: &layer.ffn_down,
+                },
+                moe,
+                MixtralMoeFfnOptions::new(
+                    cached_layer_label!(layer_idx, "prefill_deepseek_moe_ffn"),
+                    false,
+                ),
+            )?;
+            timings.ffn_gate = gate;
+            timings.ffn_up = up;
+            timings.ffn_activation = activation;
+            timings.ffn_down = down;
+            ffn_out
+        } else {
+            let (ffn_out, gate, up, activation, down, _) = mixtral_moe_ffn(
+                &ffn_norm,
+                router,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &layer.ffn_down,
+                moe.expert_used_count as usize,
+                MixtralMoeFfnOptions::new(
+                    cached_layer_label!(layer_idx, "prefill_mixtral_moe_ffn"),
+                    false,
+                ),
+            )?;
+            timings.ffn_gate = gate;
+            timings.ffn_up = up;
+            timings.ffn_activation = activation;
+            timings.ffn_down = down;
+            ffn_out
+        }
     } else {
         let activated = gated_ffn_activation_batch(
             &ffn_norm,
@@ -7846,6 +8381,16 @@ fn linear_projection_diagnostics(
     reported: &CpuTensor,
     rectangular_role: &str,
 ) -> Result<LlamaLinearProjectionDiagnostic> {
+    linear_projection_diagnostics_with_bias(input, weight, None, reported, rectangular_role)
+}
+
+fn linear_projection_diagnostics_with_bias(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    reported: &CpuTensor,
+    rectangular_role: &str,
+) -> Result<LlamaLinearProjectionDiagnostic> {
     if input.rank() != 2 || input.dim(0)? != 1 {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "linear projection diagnostics expected one input row, got {:?}",
@@ -7883,6 +8428,10 @@ fn linear_projection_diagnostics(
                 "linear_projection_diagnostic",
             )?
         }
+    };
+    let reconstructed = match bias {
+        Some(bias) => add_projection_bias(reconstructed, bias, "linear projection diagnostic")?,
+        None => reconstructed,
     };
     require_tensor_shape(
         &reconstructed,
@@ -8096,6 +8645,12 @@ fn linear_with_diagnostic_layouts_with_plan(
         return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name);
     }
     if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+        if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q2_k_block_dot(input, weight, name);
+        }
+        if weight.source_type == Some(GgufTensorType::Q3K) && weight.q3_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q3_k_block_dot(input, weight, name);
+        }
         if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
         }
@@ -8226,6 +8781,8 @@ struct BorrowedLinearWeight<'a> {
     q8_0_file_backing: Option<&'a Q8_0FileBacking>,
     tq2_0_wire_bytes: Option<&'a [u8]>,
     iq4_xs_wire_bytes: Option<&'a [u8]>,
+    q2_k_wire_bytes: Option<&'a [u8]>,
+    q3_k_wire_bytes: Option<&'a [u8]>,
     q4_k_wire_bytes: Option<&'a [u8]>,
     q5_k_wire_bytes: Option<&'a [u8]>,
     q6_k_wire_bytes: Option<&'a [u8]>,
@@ -8251,6 +8808,8 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_file_backing: weight.q8_0_file_backing.as_ref(),
             tq2_0_wire_bytes: weight.tq2_0_wire_bytes.as_deref().map(|v| v.as_slice()),
             iq4_xs_wire_bytes: weight.iq4_xs_wire_bytes.as_deref().map(|v| v.as_slice()),
+            q2_k_wire_bytes: weight.q2_k_wire_bytes.as_deref().map(|v| v.as_slice()),
+            q3_k_wire_bytes: weight.q3_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q4_k_wire_bytes: weight.q4_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q5_k_wire_bytes: weight.q5_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q6_k_wire_bytes: weight.q6_k_wire_bytes.as_deref().map(|v| v.as_slice()),
@@ -8344,6 +8903,32 @@ fn add_tensor_in_place(
     Ok(())
 }
 
+fn add_projection_bias(
+    mut projection: CpuTensor,
+    bias: &CpuTensor,
+    context: &str,
+) -> Result<CpuTensor> {
+    if projection.rank() != 2 || bias.rank() != 1 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "{context} expects rank-2 projection and rank-1 bias, got {:?} and {:?}",
+            projection.shape.dims, bias.shape.dims
+        )));
+    }
+    let width = projection.dim(1)?;
+    if bias.dim(0)? != width || bias.data.len() != width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "{context} bias width {} does not match projection width {width}",
+            bias.data.len()
+        )));
+    }
+    for row in projection.data.chunks_exact_mut(width) {
+        for (value, bias) in row.iter_mut().zip(&bias.data) {
+            *value += *bias;
+        }
+    }
+    Ok(projection)
+}
+
 #[allow(dead_code)]
 fn output_projection_runtime(
     input: &CpuTensor,
@@ -8428,6 +9013,12 @@ fn output_projection_with_layout_with_plan(
                 && weight.iq4_xs_wire_bytes.is_some()
             {
                 return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name.as_str());
+            }
+            if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
+                return matmul_rhs_transposed_q2_k_block_dot(input, weight, name.as_str());
+            }
+            if weight.source_type == Some(GgufTensorType::Q3K) && weight.q3_k_wire_bytes.is_some() {
+                return matmul_rhs_transposed_q3_k_block_dot(input, weight, name.as_str());
             }
             // Tied Q5_K embed/lm_head: stream the Q5_K wire blocks (the wire-only load
             // leaves no f32 to matmul over), mirroring the Q6_K tied path below.
@@ -8523,6 +9114,12 @@ fn matmul_rhs_transposed_with_precision_with_plan(
     // without an in-place CPU dot they have no CPU consumer. Dispatch them to the
     // bit-exact block-dot kernels (gated; a Q4_K_M model mixes both quants).
     if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+        if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q2_k_block_dot(input, weight, name);
+        }
+        if weight.source_type == Some(GgufTensorType::Q3K) && weight.q3_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q3_k_block_dot(input, weight, name);
+        }
         if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
         }
@@ -8595,6 +9192,16 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
         }
     }
     if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+        if weight.source_type == Some(GgufTensorType::Q2K) {
+            if let Some(wire) = weight.q2_k_wire_bytes {
+                return q2_k_block_dot_core(input, wire, output_width, input_width, name);
+            }
+        }
+        if weight.source_type == Some(GgufTensorType::Q3K) {
+            if let Some(wire) = weight.q3_k_wire_bytes {
+                return q3_k_block_dot_core(input, wire, output_width, input_width, name);
+            }
+        }
         if weight.source_type == Some(GgufTensorType::Q4K) {
             if let Some(wire) = weight.q4_k_wire_bytes {
                 return q4_k_block_dot_core(input, wire, output_width, input_width, name);
@@ -10616,6 +11223,192 @@ fn mixtral_moe_ffn(
     ))
 }
 
+struct DeepSeekMoeWeights<'a> {
+    router: &'a CpuTensor,
+    shared_gate: &'a CpuTensor,
+    shared_up: &'a CpuTensor,
+    shared_down: &'a CpuTensor,
+    gate_experts: &'a CpuTensor,
+    up_experts: &'a CpuTensor,
+    down_experts: &'a CpuTensor,
+}
+
+fn deepseek_moe_ffn(
+    input: &CpuTensor,
+    weights: DeepSeekMoeWeights<'_>,
+    moe: &crate::model::MixtralMoeMetadata,
+    options: MixtralMoeFfnOptions,
+) -> Result<(
+    CpuTensor,
+    u128,
+    u128,
+    u128,
+    u128,
+    Option<LlamaMixtralMoeTrace>,
+)> {
+    let DeepSeekMoeWeights {
+        router,
+        shared_gate,
+        shared_up,
+        shared_down,
+        gate_experts,
+        up_experts,
+        down_experts,
+    } = weights;
+    if input.rank() != 2 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "DeepSeek MoE FFN expects rank-2 input, got {:?}",
+            input.shape.dims
+        )));
+    }
+    let rows = input.dim(0)?;
+    let hidden = input.dim(1)?;
+    let ff = gate_experts.dim(1)?;
+    let router_started = Instant::now();
+    let logits = linear_for_role_runtime(input, router, "moe_router", "linear", false)?;
+    let router_elapsed = router_started.elapsed().as_micros();
+    let expert_count = logits.dim(1)?;
+    let mut output = vec![0.0_f32; rows * hidden];
+    let mut gate_elapsed = 0;
+    let mut up_elapsed = 0;
+    let mut activation_elapsed = 0;
+    let mut down_elapsed = 0;
+
+    // 1. Shared Expert Pass
+    let shared_activated = gated_ffn_activation(
+        input,
+        shared_gate,
+        shared_up,
+        "shared_expert_activated",
+        false,
+    )?;
+    gate_elapsed += shared_activated.gate;
+    up_elapsed += shared_activated.up;
+    activation_elapsed += shared_activated.activation;
+    let shared_out_started = Instant::now();
+    let shared_expert_out = linear_for_role_runtime(
+        &shared_activated.tensor,
+        shared_down,
+        "shared_expert_down",
+        "ffn_down",
+        false,
+    )?;
+    down_elapsed += shared_out_started.elapsed().as_micros();
+
+    let mut trace = options.collect_trace.then(|| LlamaMixtralMoeTrace {
+        expert_used_count: moe.expert_used_count as usize,
+        rows: Vec::with_capacity(rows),
+    });
+
+    for row in 0..rows {
+        // Add shared expert output directly to the sum
+        for col in 0..hidden {
+            output[row * hidden + col] += shared_expert_out.data[row * hidden + col];
+        }
+
+        let row_input = CpuTensor::from_f32(
+            "moe_row",
+            vec![1, hidden],
+            input.data[row * hidden..(row + 1) * hidden].to_vec(),
+        )?;
+
+        let mut weights_and_indices = match moe.expert_gating_func {
+            2 => {
+                // SIGMOID
+                let mut scored = Vec::with_capacity(expert_count);
+                for col in 0..expert_count {
+                    let logit = logits.data[row * expert_count + col];
+                    let sigmoid = 1.0 / (1.0 + (-logit).exp());
+                    scored.push((col, sigmoid));
+                }
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+                scored.truncate(moe.expert_used_count as usize);
+                scored
+            }
+            _ => {
+                // SOFTMAX (DeepSeek V2 uses softmax, but not renormalized like Mixtral)
+                let mut scored = Vec::with_capacity(expert_count);
+                let mut max_logit = f32::NEG_INFINITY;
+                for col in 0..expert_count {
+                    let logit = logits.data[row * expert_count + col];
+                    if logit > max_logit {
+                        max_logit = logit;
+                    }
+                }
+                let mut sum = 0.0;
+                for col in 0..expert_count {
+                    let logit = logits.data[row * expert_count + col];
+                    let exp = (logit - max_logit).exp();
+                    scored.push((col, exp));
+                    sum += exp;
+                }
+                for (_, w) in &mut scored {
+                    *w /= sum;
+                }
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+                scored.truncate(moe.expert_used_count as usize);
+                scored
+            }
+        };
+
+        if moe.expert_weights_norm {
+            let mut topk_sum = 0.0;
+            for (_, w) in &weights_and_indices {
+                topk_sum += *w;
+            }
+            if topk_sum > 0.0 {
+                for (_, w) in &mut weights_and_indices {
+                    *w /= topk_sum;
+                }
+            }
+        }
+        if moe.expert_weights_scale != 1.0 && moe.expert_weights_scale != 0.0 {
+            for (_, w) in &mut weights_and_indices {
+                *w *= moe.expert_weights_scale;
+            }
+        }
+        let top = weights_and_indices;
+        if let Some(trace) = &mut trace {
+            trace.rows.push(LlamaMixtralMoeRowTrace {
+                row_index: row,
+                router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
+                selected_experts: top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
+                selected_weights: top.iter().map(|(_, weight)| *weight).collect(),
+            });
+        }
+        for (expert_idx, weight) in top {
+            let gate = expert_matrix_view(gate_experts, expert_idx, hidden, ff, "moe_gate_expert")?;
+            let up = expert_matrix_view(up_experts, expert_idx, hidden, ff, "moe_up_expert")?;
+            let down = expert_matrix_view(down_experts, expert_idx, ff, hidden, "moe_down_expert")?;
+            let activated =
+                gated_ffn_activation(&row_input, &gate, &up, "moe_expert_activated", false)?;
+            gate_elapsed += activated.gate;
+            up_elapsed += activated.up;
+            activation_elapsed += activated.activation;
+            let started = Instant::now();
+            let expert_out = linear_for_role_runtime(
+                &activated.tensor,
+                &down,
+                "moe_expert_down",
+                "ffn_down",
+                false,
+            )?;
+            down_elapsed += started.elapsed().as_micros();
+            for col in 0..hidden {
+                output[row * hidden + col] += expert_out.data[col] * weight;
+            }
+        }
+    }
+    Ok((
+        CpuTensor::from_f32(options.name, vec![rows, hidden], output)?,
+        gate_elapsed + router_elapsed,
+        up_elapsed,
+        activation_elapsed,
+        down_elapsed,
+        trace,
+    ))
+}
+
 fn ffn_activation_diagnostics(
     gate: &CpuTensor,
     up: &CpuTensor,
@@ -10909,6 +11702,11 @@ fn q8_0_metal_enabled() -> bool {
 fn resident_decode_metal_enabled() -> bool {
     !deterministic_mode_enabled()
         && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+}
+
+fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) -> bool {
+    tensor.source_type == Some(GgufTensorType::Q8_0)
+        && (tensor.q8_0_blocks.is_some() || (wire_mode_active && tensor.q8_0_wire_pages.is_some()))
 }
 
 /// Process-global resident CUDA engine, keyed by the model's weight identity.
@@ -17825,6 +18623,26 @@ fn accumulate_transposed_linear_row_q4_k(input_row: &[f32], wire: &[u8], output:
     });
 }
 
+fn accumulate_transposed_linear_row_q2_k(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
+    use rayon::prelude::*;
+    let row_bytes = (input_row.len() / Q6_K_VALUES_PER_BLOCK) * crate::tensor::Q2_K_BLOCK_BYTES;
+    let q8 = quantize_q8_k_blocks(input_row);
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = q2_k_wire_row_dot(w_row, &q8);
+    });
+}
+
+fn accumulate_transposed_linear_row_q3_k(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
+    use rayon::prelude::*;
+    let row_bytes = (input_row.len() / Q6_K_VALUES_PER_BLOCK) * crate::tensor::Q3_K_BLOCK_BYTES;
+    let q8 = quantize_q8_k_blocks(input_row);
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = q3_k_wire_row_dot(w_row, &q8);
+    });
+}
+
 /// Per-input-row Q5_K accumulate (176 B/super-block, `q5_k_wire_row_dot`).
 fn accumulate_transposed_linear_row_q5_k(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
     use rayon::prelude::*;
@@ -18967,6 +19785,139 @@ fn q6_k_owner_prefill_tiled(
         });
     }
     CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+#[derive(Clone, Copy)]
+struct ScalarKQuantSpec {
+    wire_bytes_per_block: usize,
+    format_name: &'static str,
+    row_dot: fn(&[u8], &[Q8KBlock]) -> f32,
+}
+
+fn scalar_kquant_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    spec: ScalarKQuantSpec,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    if !in_dim.is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "{} block-dot requires in_dim multiple of 256, got {in_dim}",
+            spec.format_name
+        )));
+    }
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * spec.wire_bytes_per_block;
+    if row_bytes == 0 || wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{} wire length {} != out_dim {out_dim} * row_bytes {row_bytes}",
+            spec.format_name,
+            wire.len(),
+        )));
+    }
+    let n_rows = input.dim(0)?;
+    let quantized_inputs: Vec<Vec<Q8KBlock>> = (0..n_rows)
+        .map(|row| quantize_q8_k_blocks(&input.data[row * in_dim..(row + 1) * in_dim]))
+        .collect();
+    let columns: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|output| {
+            let weight_row = &wire[output * row_bytes..(output + 1) * row_bytes];
+            quantized_inputs
+                .iter()
+                .map(|input| (spec.row_dot)(weight_row, input))
+                .collect()
+        })
+        .collect();
+    let mut output = vec![0.0_f32; n_rows * out_dim];
+    for (column, values) in columns.iter().enumerate() {
+        for (row, value) in values.iter().enumerate() {
+            output[row * out_dim + column] = *value;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], output)
+}
+
+fn q2_k_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    scalar_kquant_block_dot_core(
+        input,
+        wire,
+        out_dim,
+        in_dim,
+        ScalarKQuantSpec {
+            wire_bytes_per_block: crate::tensor::Q2_K_BLOCK_BYTES,
+            format_name: "Q2_K",
+            row_dot: q2_k_wire_row_dot,
+        },
+        name,
+    )
+}
+
+fn q3_k_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    scalar_kquant_block_dot_core(
+        input,
+        wire,
+        out_dim,
+        in_dim,
+        ScalarKQuantSpec {
+            wire_bytes_per_block: crate::tensor::Q3_K_BLOCK_BYTES,
+            format_name: "Q3_K",
+            row_dot: q3_k_wire_row_dot,
+        },
+        name,
+    )
+}
+
+fn matmul_rhs_transposed_q2_k_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let in_dim = input.dim(1)?;
+    let wire = weight.q2_k_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Q2_K weight missing wire bytes".to_string())
+    })?;
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * crate::tensor::Q2_K_BLOCK_BYTES;
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q2_K weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    q2_k_block_dot_core(input, wire, wire.len() / row_bytes, in_dim, name)
+}
+
+fn matmul_rhs_transposed_q3_k_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let in_dim = input.dim(1)?;
+    let wire = weight.q3_k_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Q3_K weight missing wire bytes".to_string())
+    })?;
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * crate::tensor::Q3_K_BLOCK_BYTES;
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q3_K weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    q3_k_block_dot_core(input, wire, wire.len() / row_bytes, in_dim, name)
 }
 
 /// Q5_K analogue of [`q4_k_block_dot_core`] (176 B/super-block, `q5_k_wire_row_dot`).
@@ -21508,6 +22459,18 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
     // retained wire blocks in place. This is the universal funnel for the
     // accumulate-based (descriptor/borrowed) matmul layouts.
     if q4_k_cpu_block_dot_enabled() && input_row.len().is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
+        if weight.source_type == Some(GgufTensorType::Q2K) {
+            if let Some(wire) = weight.q2_k_wire_bytes {
+                accumulate_transposed_linear_row_q2_k(input_row, wire, output);
+                return;
+            }
+        }
+        if weight.source_type == Some(GgufTensorType::Q3K) {
+            if let Some(wire) = weight.q3_k_wire_bytes {
+                accumulate_transposed_linear_row_q3_k(input_row, wire, output);
+                return;
+            }
+        }
         if weight.source_type == Some(GgufTensorType::Q4K) {
             if let Some(wire) = weight.q4_k_wire_bytes {
                 accumulate_transposed_linear_row_q4_k(input_row, wire, output);
@@ -23174,6 +24137,7 @@ fn rope_diagnostics(
             position_mode,
             scaling,
             rope_freqs,
+            rope_offset: 0,
         },
         &format!("{role}_rope_diagnostic"),
     )?;
@@ -23267,10 +24231,13 @@ fn write_kv_cache(
     key: &CpuTensor,
     value: &CpuTensor,
 ) -> Result<()> {
-    let expected_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
-    if key.shape.dims != [1, expected_width] || value.shape.dims != [1, expected_width] {
+    let k_head_dim = kv_cache.plan.key_shape[3];
+    let v_head_dim = kv_cache.plan.value_shape[3];
+    let expected_k_width = kv_cache.plan.kv_head_count * k_head_dim;
+    let expected_v_width = kv_cache.plan.kv_head_count * v_head_dim;
+    if key.shape.dims != [1, expected_k_width] || value.shape.dims != [1, expected_v_width] {
         return Err(BackendError::RuntimeShapeMismatch(format!(
-            "KV projection shapes must be [1, {expected_width}], got key {:?}, value {:?}",
+            "KV projection shapes mismatch, expected key [1, {expected_k_width}], value [1, {expected_v_width}], got key {:?}, value {:?}",
             key.shape.dims, value.shape.dims
         )));
     }
@@ -23281,20 +24248,15 @@ fn write_kv_cache(
         )));
     }
     kv_cache.ensure_position_capacity(kv_cache.position + 1)?;
-    // Per-head stores: identical element order and per-element math as the
-    // historical whole-row copy in position-major (heads are contiguous
-    // there), and the only correct shape in head-major, where one token's
-    // heads live in separate streams. `store_kv_head_row` is the canonical
-    // f16-rounding store for both dtypes.
-    let head_dim = kv_cache.plan.head_dim;
     for kv_head in 0..kv_cache.plan.kv_head_count {
-        let src = kv_head * head_dim;
+        let k_src = kv_head * k_head_dim;
+        let v_src = kv_head * v_head_dim;
         kv_cache.store_kv_head_row(
             layer_idx,
             kv_cache.position,
             kv_head,
-            &key.data[src..src + head_dim],
-            &value.data[src..src + head_dim],
+            &key.data[k_src..k_src + k_head_dim],
+            &value.data[v_src..v_src + v_head_dim],
         );
     }
     Ok(())
@@ -23307,15 +24269,18 @@ fn write_kv_cache_batch(
     key: &CpuTensor,
     value: &CpuTensor,
 ) -> Result<()> {
-    let expected_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
+    let k_head_dim = kv_cache.plan.key_shape[3];
+    let v_head_dim = kv_cache.plan.value_shape[3];
+    let expected_k_width = kv_cache.plan.kv_head_count * k_head_dim;
+    let expected_v_width = kv_cache.plan.kv_head_count * v_head_dim;
     if key.rank() != 2
         || value.rank() != 2
-        || key.dim(1)? != expected_width
-        || value.dim(1)? != expected_width
+        || key.dim(1)? != expected_k_width
+        || value.dim(1)? != expected_v_width
         || key.dim(0)? != value.dim(0)?
     {
         return Err(BackendError::RuntimeShapeMismatch(format!(
-            "KV batch projection shapes must be [rows, {expected_width}], got key {:?}, value {:?}",
+            "KV batch projection shapes mismatch, expected key [rows, {expected_k_width}], value [rows, {expected_v_width}], got key {:?}, value {:?}",
             key.shape.dims, value.shape.dims
         )));
     }
@@ -23327,19 +24292,19 @@ fn write_kv_cache_batch(
     }
     let rows = key.dim(0)?;
     kv_cache.ensure_position_capacity(base_position + rows)?;
-    // Per-head stores; see `write_kv_cache` for the order argument.
-    let head_dim = kv_cache.plan.head_dim;
     for row in 0..rows {
         let position = base_position + row;
-        let row_start = row * expected_width;
+        let k_row_start = row * expected_k_width;
+        let v_row_start = row * expected_v_width;
         for kv_head in 0..kv_cache.plan.kv_head_count {
-            let src = row_start + kv_head * head_dim;
+            let k_src = k_row_start + kv_head * k_head_dim;
+            let v_src = v_row_start + kv_head * v_head_dim;
             kv_cache.store_kv_head_row(
                 layer_idx,
                 position,
                 kv_head,
-                &key.data[src..src + head_dim],
-                &value.data[src..src + head_dim],
+                &key.data[k_src..k_src + k_head_dim],
+                &value.data[v_src..v_src + v_head_dim],
             );
         }
     }
@@ -23369,10 +24334,13 @@ fn kv_cache_trace(
         ));
     }
 
-    let key_value_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
-    if key_value_width == 0 {
+    let k_head_dim = kv_cache.plan.k_head_dim;
+    let v_head_dim = kv_cache.plan.v_head_dim;
+    let k_width = kv_cache.plan.kv_head_count * k_head_dim;
+    let v_width = kv_cache.plan.kv_head_count * v_head_dim;
+    if k_width == 0 {
         return Err(BackendError::RuntimeShapeMismatch(
-            "KV trace requires non-empty key/value rows".to_string(),
+            "KV trace requires non-empty key rows".to_string(),
         ));
     }
     let mut key_sum_square = 0.0_f64;
@@ -23386,37 +24354,41 @@ fn kv_cache_trace(
     let mut value_max_abs_position = 0;
     let mut value_max_abs_index = 0;
 
-    // Walk per (position, kv_head) with the LOGICAL in-token index so the
-    // checksum/ordinal stream is identical in both KV layouts and dtypes (in
-    // position-major/f32 this reads the exact same values in the exact same
-    // order as the historical whole-row walk; f16 expansion is exact).
-    let head_dim = kv_cache.plan.head_dim;
-    let mut key_row = vec![0.0f32; head_dim];
-    let mut value_row = vec![0.0f32; head_dim];
+    let mut key_row = vec![0.0f32; k_head_dim];
+    let mut value_row = vec![0.0f32; v_head_dim];
     for position in 0..position_count {
         for kv_head in 0..kv_cache.plan.kv_head_count {
             kv_cache.copy_key_row_into(layer_idx, position, kv_head, &mut key_row);
             kv_cache.copy_value_row_into(layer_idx, position, kv_head, &mut value_row);
-            for (dim, (&key, &value)) in key_row.iter().zip(value_row.iter()).enumerate() {
-                let idx = kv_head * head_dim + dim;
-                if !key.is_finite() || !value.is_finite() {
+            for (dim, &key) in key_row.iter().enumerate() {
+                let idx = kv_head * k_head_dim + dim;
+                if !key.is_finite() {
                     return Err(BackendError::RuntimeShapeMismatch(format!(
                         "KV trace found non-finite value at layer {layer_idx} position {position} index {idx}"
                     )));
                 }
-                let ordinal = ((position * key_value_width) + idx + 1) as f64;
+                let ordinal = ((position * k_width) + idx + 1) as f64;
                 let key64 = key as f64;
-                let value64 = value as f64;
                 key_sum_square += key64 * key64;
-                value_sum_square += value64 * value64;
                 key_checksum += ordinal * key64;
-                value_checksum += ordinal * value64;
                 let key_abs = key.abs();
                 if key_abs > key_max_abs {
                     key_max_abs = key_abs;
                     key_max_abs_position = position;
                     key_max_abs_index = idx;
                 }
+            }
+            for (dim, &value) in value_row.iter().enumerate() {
+                let idx = kv_head * v_head_dim + dim;
+                if !value.is_finite() {
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "KV trace found non-finite value at layer {layer_idx} position {position} index {idx}"
+                    )));
+                }
+                let ordinal = ((position * v_width) + idx + 1) as f64;
+                let value64 = value as f64;
+                value_sum_square += value64 * value64;
+                value_checksum += ordinal * value64;
                 let value_abs = value.abs();
                 if value_abs > value_max_abs {
                     value_max_abs = value_abs;
@@ -23427,22 +24399,24 @@ fn kv_cache_trace(
         }
     }
 
-    let value_count = (position_count * key_value_width) as f64;
+    let k_count = (position_count * k_width) as f64;
+    let v_count = (position_count * v_width) as f64;
+    let v_count = if v_count == 0.0 { 1.0 } else { v_count }; // Avoid NaNs
     let sampled_positions = sampled_attention_trace_positions(position_count)
         .into_iter()
-        .map(|position| kv_cache_position_trace(kv_cache, layer_idx, position, key_value_width))
+        .map(|position| kv_cache_position_trace(kv_cache, layer_idx, position, k_width, v_width))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LlamaKvCacheTrace {
         layer_index: layer_idx,
         position_count,
         kv_head_count: kv_cache.plan.kv_head_count,
-        head_dim: kv_cache.plan.head_dim,
-        key_value_width,
+        head_dim: kv_cache.plan.k_head_dim, // We just use k_head_dim for tracing reporting
+        key_value_width: k_width,
         key_checksum,
         value_checksum,
-        key_rms: (key_sum_square / value_count).sqrt() as f32,
-        value_rms: (value_sum_square / value_count).sqrt() as f32,
+        key_rms: (key_sum_square / k_count).sqrt() as f32,
+        value_rms: (value_sum_square / v_count).sqrt() as f32,
         key_max_abs,
         key_max_abs_position,
         key_max_abs_index,
@@ -23457,29 +24431,30 @@ fn kv_cache_position_trace(
     kv_cache: &LlamaKvCache,
     layer_idx: usize,
     position: usize,
-    key_value_width: usize,
+    k_width: usize,
+    v_width: usize,
 ) -> Result<LlamaKvCachePositionTrace> {
-    // Materialize the token's logical row (kv_head-major element order, the
-    // historical contiguous order) so checksums, ordinals, and sampled
-    // values are identical in both KV layouts and dtypes. Diagnostics-only
-    // path; the copy is TENSOR-trace sized, not hot.
-    let head_dim = kv_cache.plan.head_dim;
-    let mut key_row = vec![0.0f32; key_value_width];
-    let mut value_row = vec![0.0f32; key_value_width];
+    let k_head_dim = kv_cache.plan.k_head_dim;
+    let v_head_dim = kv_cache.plan.v_head_dim;
+    let mut key_row = vec![0.0f32; k_width];
+    let mut value_row = vec![0.0f32; v_width];
     for kv_head in 0..kv_cache.plan.kv_head_count {
-        let out_start = kv_head * head_dim;
+        let k_out_start = kv_head * k_head_dim;
         kv_cache.copy_key_row_into(
             layer_idx,
             position,
             kv_head,
-            &mut key_row[out_start..out_start + head_dim],
+            &mut key_row[k_out_start..k_out_start + k_head_dim],
         );
-        kv_cache.copy_value_row_into(
-            layer_idx,
-            position,
-            kv_head,
-            &mut value_row[out_start..out_start + head_dim],
-        );
+        let v_out_start = kv_head * v_head_dim;
+        if v_head_dim > 0 {
+            kv_cache.copy_value_row_into(
+                layer_idx,
+                position,
+                kv_head,
+                &mut value_row[v_out_start..v_out_start + v_head_dim],
+            );
+        }
     }
     let key_slice = key_row.as_slice();
     let value_slice = value_row.as_slice();
@@ -23489,29 +24464,39 @@ fn kv_cache_position_trace(
     let mut value_checksum = 0.0_f64;
     let mut key_max_abs = 0.0_f32;
     let mut value_max_abs = 0.0_f32;
-    for (idx, (&key, &value)) in key_slice.iter().zip(value_slice.iter()).enumerate() {
-        if !key.is_finite() || !value.is_finite() {
+    for (idx, &key) in key_slice.iter().enumerate() {
+        if !key.is_finite() {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "KV position trace found non-finite value at layer {layer_idx} position {position} index {idx}"
             )));
         }
         let ordinal = (idx + 1) as f64;
         let key64 = key as f64;
-        let value64 = value as f64;
         key_sum_square += key64 * key64;
-        value_sum_square += value64 * value64;
         key_checksum += ordinal * key64;
-        value_checksum += ordinal * value64;
         key_max_abs = key_max_abs.max(key.abs());
+    }
+    for (idx, &value) in value_slice.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "KV position trace found non-finite value at layer {layer_idx} position {position} index {idx}"
+            )));
+        }
+        let ordinal = (idx + 1) as f64;
+        let value64 = value as f64;
+        value_sum_square += value64 * value64;
+        value_checksum += ordinal * value64;
         value_max_abs = value_max_abs.max(value.abs());
     }
-    let width = key_value_width as f64;
+    let k_width_f = k_width as f64;
+    let v_width_f = v_width as f64;
+    let v_width_f = if v_width_f == 0.0 { 1.0 } else { v_width_f };
     Ok(LlamaKvCachePositionTrace {
         position,
         key_checksum,
         value_checksum,
-        key_rms: (key_sum_square / width).sqrt() as f32,
-        value_rms: (value_sum_square / width).sqrt() as f32,
+        key_rms: (key_sum_square / k_width_f).sqrt() as f32,
+        value_rms: (value_sum_square / v_width_f).sqrt() as f32,
         key_max_abs,
         value_max_abs,
         key_first_values: key_slice
@@ -23553,11 +24538,13 @@ fn causal_attention_context(
             "attention head count {attention_heads} must be a multiple of kv head count {kv_heads}"
         )));
     }
-    let head_dim = kv_cache.plan.head_dim;
-    let expected_width = attention_heads * head_dim;
-    if query.shape.dims != [1, expected_width] {
+    let k_head_dim = kv_cache.plan.k_head_dim;
+    let v_head_dim = kv_cache.plan.v_head_dim;
+    let expected_width = attention_heads * v_head_dim;
+    let q_expected_width = attention_heads * k_head_dim;
+    if query.shape.dims != [1, q_expected_width] {
         return Err(BackendError::RuntimeShapeMismatch(format!(
-            "attention query shape {:?} does not match expected [1, {expected_width}]",
+            "attention query shape {:?} does not match expected [1, {q_expected_width}]",
             query.shape.dims
         )));
     }
@@ -23578,7 +24565,7 @@ fn causal_attention_context(
     let repeats = attention_heads / kv_heads;
     let head_mapping = diagnostic_gqa_head_mapping()?;
     let score_scale = diagnostic_attention_score_scale()?;
-    let scale = attention_score_scale_value(head_dim, score_scale);
+    let scale = attention_score_scale_value(k_head_dim, score_scale);
     // Pooled buffer: bit-identical to `vec![0.0; expected_width]` (zeroed to
     // length); recycled by the layer forward when the context tensor dies.
     let mut out = decode_scratch::take(expected_width);
@@ -23587,12 +24574,12 @@ fn causal_attention_context(
         for attention_head in 0..attention_heads {
             let kv_head =
                 map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
-            let out_start = attention_head * head_dim;
+            let out_start = attention_head * v_head_dim;
             kv_cache.copy_value_row_into(
                 layer_idx,
                 0,
                 kv_head,
-                &mut out[out_start..out_start + head_dim],
+                &mut out[out_start..out_start + v_head_dim],
             );
         }
     } else {
@@ -23646,11 +24633,13 @@ fn causal_attention_context_batch(
             "attention head count {attention_heads} must be a multiple of kv head count {kv_heads}"
         )));
     }
-    let head_dim = kv_cache.plan.head_dim;
-    let expected_width = attention_heads * head_dim;
-    if query.rank() != 2 || query.dim(1)? != expected_width {
+    let k_head_dim = kv_cache.plan.k_head_dim;
+    let v_head_dim = kv_cache.plan.v_head_dim;
+    let expected_width = attention_heads * v_head_dim;
+    let q_expected_width = attention_heads * k_head_dim;
+    if query.rank() != 2 || query.dim(1)? != q_expected_width {
         return Err(BackendError::RuntimeShapeMismatch(format!(
-            "attention query shape {:?} does not match expected [rows, {expected_width}]",
+            "attention query shape {:?} does not match expected [rows, {q_expected_width}]",
             query.shape.dims
         )));
     }
@@ -23682,7 +24671,7 @@ fn causal_attention_context_batch(
     let repeats = attention_heads / kv_heads;
     let head_mapping = diagnostic_gqa_head_mapping()?;
     let score_scale = diagnostic_attention_score_scale()?;
-    let scale = attention_score_scale_value(head_dim, score_scale);
+    let scale = attention_score_scale_value(k_head_dim, score_scale);
     let mut out = vec![0.0; rows * expected_width];
 
     let fill_row = |row: usize, out_row: &mut [f32], scores: &mut Vec<f32>| -> Result<()> {
@@ -23692,21 +24681,21 @@ fn causal_attention_context_batch(
             for attention_head in 0..attention_heads {
                 let kv_head =
                     map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
-                let out_start = attention_head * head_dim;
+                let out_start = attention_head * v_head_dim;
                 kv_cache.copy_value_row_into(
                     layer_idx,
                     0,
                     kv_head,
-                    &mut out_row[out_start..out_start + head_dim],
+                    &mut out_row[out_start..out_start + v_head_dim],
                 );
             }
         } else {
             for attention_head in 0..attention_heads {
                 let kv_head =
                     map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
-                let query_start = query_row_start + attention_head * head_dim;
-                let query_slice = &query.data[query_start..query_start + head_dim];
-                let out_start = attention_head * head_dim;
+                let query_start = query_row_start + attention_head * k_head_dim;
+                let query_slice = &query.data[query_start..query_start + k_head_dim];
+                let out_start = attention_head * v_head_dim;
                 attention_context_for_head_into(
                     AttentionContextHeadParams {
                         kv_cache,
@@ -23716,7 +24705,7 @@ fn causal_attention_context_batch(
                         position_count,
                         scale,
                     },
-                    &mut out_row[out_start..out_start + head_dim],
+                    &mut out_row[out_start..out_start + v_head_dim],
                     scores,
                 )?;
             }
@@ -23873,8 +24862,9 @@ fn decode_attention_all_heads_into_with_mode(
     out: &mut [f32],
     parallel: bool,
 ) -> Result<()> {
-    let head_dim = params.kv_cache.plan.head_dim;
-    debug_assert_eq!(out.len(), params.attention_heads * head_dim);
+    let k_head_dim = params.kv_cache.plan.k_head_dim;
+    let v_head_dim = params.kv_cache.plan.v_head_dim;
+    debug_assert_eq!(out.len(), params.attention_heads * v_head_dim);
     if parallel {
         // Per-WORKER persistent scratch: thread-local so parallel regions
         // never contend on the decode pool, alive across tokens so
@@ -23884,22 +24874,24 @@ fn decode_attention_all_heads_into_with_mode(
             static ATTN_WORKER_SCORES: std::cell::RefCell<Vec<f32>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
-        return out.par_chunks_exact_mut(head_dim).enumerate().try_for_each(
-            |(attention_head, out_slice)| {
+        return out
+            .par_chunks_exact_mut(v_head_dim)
+            .enumerate()
+            .try_for_each(|(attention_head, out_slice)| {
                 let kv_head = map_attention_head_to_kv_head(
                     attention_head,
                     params.repeats,
                     params.kv_heads,
                     params.head_mapping,
                 );
-                let query_start = attention_head * head_dim;
+                let query_start = attention_head * k_head_dim;
                 ATTN_WORKER_SCORES.with(|cell| {
                     attention_context_for_head_into(
                         AttentionContextHeadParams {
                             kv_cache: params.kv_cache,
                             layer_idx: params.layer_idx,
                             kv_head,
-                            query_slice: &params.query_data[query_start..query_start + head_dim],
+                            query_slice: &params.query_data[query_start..query_start + k_head_dim],
                             position_count: params.position_count,
                             scale: params.scale,
                         },
@@ -23907,8 +24899,7 @@ fn decode_attention_all_heads_into_with_mode(
                         &mut cell.borrow_mut(),
                     )
                 })
-            },
-        );
+            });
     }
 
     // Pooled serial scratch, recycled on every exit path.
@@ -23921,18 +24912,18 @@ fn decode_attention_all_heads_into_with_mode(
             params.kv_heads,
             params.head_mapping,
         );
-        let query_start = attention_head * head_dim;
-        let out_start = attention_head * head_dim;
+        let query_start = attention_head * k_head_dim;
+        let out_start = attention_head * v_head_dim;
         let head_result = attention_context_for_head_into(
             AttentionContextHeadParams {
                 kv_cache: params.kv_cache,
                 layer_idx: params.layer_idx,
                 kv_head,
-                query_slice: &params.query_data[query_start..query_start + head_dim],
+                query_slice: &params.query_data[query_start..query_start + k_head_dim],
                 position_count: params.position_count,
                 scale: params.scale,
             },
-            &mut out[out_start..out_start + head_dim],
+            &mut out[out_start..out_start + v_head_dim],
             &mut scores,
         );
         if let Err(error) = head_result {
@@ -23968,9 +24959,10 @@ fn attention_context_for_head_into_with_kernels(
     scores: &mut Vec<f32>,
     use_blocked_kernels: bool,
 ) -> Result<()> {
-    let head_dim = params.kv_cache.plan.head_dim;
-    debug_assert_eq!(params.query_slice.len(), head_dim);
-    debug_assert_eq!(out_slice.len(), head_dim);
+    let k_head_dim = params.kv_cache.plan.k_head_dim;
+    let v_head_dim = params.kv_cache.plan.v_head_dim;
+    debug_assert_eq!(params.query_slice.len(), k_head_dim);
+    debug_assert_eq!(out_slice.len(), v_head_dim);
     scores.clear();
     scores.reserve(params.position_count);
     let head_base = params
@@ -23982,7 +24974,7 @@ fn attention_context_for_head_into_with_kernels(
     for position in 0..params.position_count {
         let score = match params.kv_cache.dtype {
             KvDtype::F32 => {
-                let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
+                let key_slice = &params.kv_cache.keys[key_start..key_start + k_head_dim];
                 if use_blocked_kernels {
                     attn_f32_dot::dot_blocked(params.query_slice, key_slice) * params.scale
                 } else {
@@ -23994,7 +24986,7 @@ fn attention_context_for_head_into_with_kernels(
                 // construction; fail-closed to F32 otherwise). The fused
                 // kernel expands each element exactly and then runs the
                 // identical canonical blocked order.
-                let key_slice = &params.kv_cache.keys_f16[key_start..key_start + head_dim];
+                let key_slice = &params.kv_cache.keys_f16[key_start..key_start + k_head_dim];
                 attn_f32_dot::dot_blocked_f16(params.query_slice, key_slice) * params.scale
             }
         };
@@ -24018,11 +25010,16 @@ fn attention_context_for_head_into_with_kernels(
 
     let inv_score_sum = 1.0 / score_sum;
     let mut value_start = head_base;
+    let is_mla = params.kv_cache.plan.value_shape[3] == 0;
     for (position, score) in scores.iter().copied().enumerate() {
         let probability = score * inv_score_sum;
         match params.kv_cache.dtype {
             KvDtype::F32 => {
-                let value_slice = &params.kv_cache.values[value_start..value_start + head_dim];
+                let value_slice = if is_mla {
+                    &params.kv_cache.keys[value_start..value_start + v_head_dim]
+                } else {
+                    &params.kv_cache.values[value_start..value_start + v_head_dim]
+                };
                 if use_blocked_kernels {
                     attn_f32_dot::axpy_blocked(out_slice, probability, value_slice);
                 } else {
@@ -24032,7 +25029,11 @@ fn attention_context_for_head_into_with_kernels(
                 }
             }
             KvDtype::F16 => {
-                let value_slice = &params.kv_cache.values_f16[value_start..value_start + head_dim];
+                let value_slice = if is_mla {
+                    &params.kv_cache.keys_f16[value_start..value_start + v_head_dim]
+                } else {
+                    &params.kv_cache.values_f16[value_start..value_start + v_head_dim]
+                };
                 attn_f32_dot::axpy_blocked_f16(out_slice, probability, value_slice);
             }
         }
@@ -24065,7 +25066,7 @@ struct AttentionTraceParams<'a> {
 }
 
 fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<LlamaAttentionTrace> {
-    let head_dim = params.kv_cache.plan.head_dim;
+    let k_head_dim = params.kv_cache.plan.k_head_dim;
     let sampled_heads = sampled_attention_trace_heads(
         params.attention_heads,
         params.repeats,
@@ -24080,9 +25081,9 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
             params.kv_heads,
             params.head_mapping,
         );
-        let query_start = attention_head * head_dim;
-        let query_slice = &params.query.data[query_start..query_start + head_dim];
-        let context_slice = &params.context.data[query_start..query_start + head_dim];
+        let query_start = attention_head * k_head_dim;
+        let query_slice = &params.query.data[query_start..query_start + k_head_dim];
+        let context_slice = &params.context.data[query_start..query_start + k_head_dim];
         let scores = attention_scores_for_head(
             params.kv_cache,
             params.layer_idx,
@@ -24118,7 +25119,7 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
             params.kv_cache,
             params.layer_idx,
             kv_head,
-            head_dim,
+            k_head_dim,
             &scores,
             &probabilities,
         );
@@ -24126,7 +25127,7 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
             params.kv_cache,
             params.layer_idx,
             kv_head,
-            head_dim,
+            k_head_dim,
             &probabilities,
         );
         let mut context_reconstruction_max_abs_delta_index = 0;
@@ -24145,8 +25146,8 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
         let sampled_positions = sampled_attention_trace_positions(params.position_count);
         let mut positions = Vec::with_capacity(sampled_positions.len());
         for position in sampled_positions {
-            let mut key_row = vec![0.0f32; head_dim];
-            let mut value_row = vec![0.0f32; head_dim];
+            let mut key_row = vec![0.0f32; k_head_dim];
+            let mut value_row = vec![0.0f32; params.kv_cache.plan.v_head_dim];
             params
                 .kv_cache
                 .copy_key_row_into(params.layer_idx, position, kv_head, &mut key_row);
@@ -24205,7 +25206,7 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
     Ok(LlamaAttentionTrace {
         scale: params.scale,
         position_count: params.position_count,
-        head_dim,
+        head_dim: k_head_dim,
         heads,
     })
 }
@@ -24218,12 +25219,12 @@ fn attention_scores_for_head(
     position_count: usize,
     scale: f32,
 ) -> Vec<f32> {
-    let head_dim = kv_cache.plan.head_dim;
+    let k_head_dim = kv_cache.plan.k_head_dim;
     let mut scores = Vec::with_capacity(position_count);
     // Diagnostics-only reconstruction: materialize each key row (exact for
     // both dtypes; a plain copy for f32) and keep the historical legacy-dot
     // scoring this trace has always used.
-    let mut key_row = vec![0.0f32; head_dim];
+    let mut key_row = vec![0.0f32; k_head_dim];
     for position in 0..position_count {
         kv_cache.copy_key_row_into(layer_idx, position, kv_head, &mut key_row);
         let score = dot_product(query_slice, &key_row) * scale;
