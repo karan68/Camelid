@@ -10835,6 +10835,7 @@ pub enum SampleMode {
     },
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SampleSignature {
     Greedy,
@@ -10845,6 +10846,7 @@ enum SampleSignature {
 }
 
 impl SampleMode {
+    #[cfg(target_os = "macos")]
     fn signature(self, position: usize) -> SampleSignature {
         match self {
             Self::Greedy => SampleSignature::Greedy,
