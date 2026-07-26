@@ -234,13 +234,28 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # Windows uses its default feature set here: build.rs enables CUDA for
+          # this target, matching the empty matrix.features value on this leg.
           cargo build --bin camelid
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build --bin camelid exited with $LASTEXITCODE"
+          }
+
+          # These were the historical overflowing entrypoints. Each constructs
+          # the full Clap command tree before producing its respective output.
           $version = & .\target\debug\camelid.exe --version
           if ($LASTEXITCODE -ne 0) {
             throw "debug camelid --version exited with $LASTEXITCODE"
           }
           if ($version -notmatch '^camelid\s+\S+') {
             throw "unexpected debug version output: $version"
+          }
+          foreach ($arguments in @(@("--help"), @("serve", "--help"))) {
+            $display = $arguments -join " "
+            & .\target\debug\camelid.exe @arguments > $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "debug camelid $display exited with $LASTEXITCODE"
+            }
           }
 
       # Report, in the log, whether this runner can actually execute the macOS Metal test
