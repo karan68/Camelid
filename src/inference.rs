@@ -2785,23 +2785,17 @@ impl LlamaInferenceSession {
         if n > slot.engine.max_pos() {
             return Ok(false);
         }
-        // Default to the batched prefill (each weight read once per MAX_VERIFY_K-token
-        // chunk instead of once per token). `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0`
-        // forces the serial per-token loop ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â an A/B switch for parity bisection. Both
-        // write bit-identical KV (the batched stack reuses the same per-block dot and
-        // block-ordered sum), so decode after either is token-identical.
+        // Default to batched prefill on the benchmark-promoted Q8 lane. The
+        // parity-correct Q4_K/Q6_K tiles remain explicit opt-ins because they
+        // regress sustained WDDM throughput on the RTX 3060 Laptop reference.
+        // `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0/1` remains the A/B override.
         let serial_prefill = std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED")
             .map(|v| {
                 let v = v.to_string_lossy();
                 let v = v.trim();
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
-            // K-quant (Q4_K/Q6_K) models MUST use the serial per-token prefill: the
-            // batched prefill GEMM (`q8_gemm_batched`) is Q8_0-only, while the serial
-            // `prefill` shares the per-token `forward_pass`, which dispatches the K-quant
-            // kernels. (Decode after either is token-identical for Q8_0; for K-quant only
-            // the serial path exists.)
-            .unwrap_or_else(|| slot.engine.uses_kquant());
+            .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
         let prefill_result = if serial_prefill {
             slot.engine
                 .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
@@ -3022,9 +3016,8 @@ impl LlamaInferenceSession {
     /// Temperature-sampling analog of the greedy resident fast lane: when the
     /// sampler is plain temperature (no filtering, penalties, or logit bias),
     /// draw the next token on the GPU via Gumbel-max — no full-vocabulary host
-    /// copy and no CPU sort. Metal is enabled by default with an explicit escape
-    /// hatch; CUDA retains its opt-in gate until its older streaming-state issue
-    /// is separately resolved.
+    /// copy and no CPU sort. Metal and CUDA are enabled by default after their
+    /// device/reference and seeded-streaming gates, with explicit escape hatches.
     pub fn generate_next_token_sampled_resident(
         &mut self,
         token_id: u32,
@@ -3175,7 +3168,7 @@ impl LlamaInferenceSession {
             slot.key == key
                 && slot.engine.weights_ready()
                 && slot.engine.filled() == position
-                && !slot.engine.is_offloaded()
+                && slot.engine.supports_batched_verify()
         });
         if !ready {
             return Ok(None);
@@ -3278,7 +3271,7 @@ impl LlamaInferenceSession {
             slot.key == key
                 && slot.engine.weights_ready()
                 && slot.engine.filled() == position
-                && !slot.engine.is_offloaded()
+                && slot.engine.supports_tree_verify()
         });
         if !ready {
             return Ok(None);
@@ -12063,7 +12056,7 @@ fn build_resident_cuda_engine(
     is_drafter: bool,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     use crate::cuda_resident::ProjQuant;
-    // The resident upload byte source for a projection: Q8_0 36-byte blocks, or the
+    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks, or the
     // raw K-quant super-block wire bytes (144 B for Q4_K, 210 B for Q6_K). These are
     // the bytes `set_layer_located`/`set_output` repack per lane.
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
@@ -12493,19 +12486,21 @@ fn resident_metal_temperature_sampling_enabled() -> bool {
     }
 }
 
-/// Opt-in gate for the CUDA Gumbel-max temperature-sampling lane. Its prior
-/// streaming-state corruption remains isolated behind this default-OFF switch.
+/// CUDA's resident Gumbel-max sampling lane. Default ON after the streaming
+/// prompt-cache bypass, sampler-eligibility hardening, device-level stateless-RNG
+/// parity test, and repeated seeded streaming validation. Keep an explicit
+/// default-safe escape hatch for driver or model-specific diagnosis.
 fn resident_gpu_temperature_sampling_enabled() -> bool {
     match std::env::var_os("CAMELID_GPU_TEMP_SAMPLING") {
         Some(value) => {
             let value = value.to_string_lossy();
             let value = value.trim();
-            value.eq_ignore_ascii_case("1")
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("on")
-                || value.eq_ignore_ascii_case("yes")
+            !(value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no"))
         }
-        None => false,
+        None => true,
     }
 }
 
