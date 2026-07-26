@@ -38,6 +38,8 @@ pub struct LlamaModelConfig {
     /// against llama.cpp); `false` for llama/mistral/etc. The env override
     /// `CAMELID_ROPE_PAIRING` still takes precedence for diagnostics.
     pub rope_neox_pairing: bool,
+    /// Logit scale — applied before softmax, commonly in Command R models.
+    pub logit_scale: Option<f32>,
     pub moe: Option<MixtralMoeMetadata>,
     /// Gemma 4 (`general.architecture = "gemma4"`) specific metadata. `None` for
     /// every other architecture. Holds the per-layer-type attention dims, dual
@@ -49,6 +51,8 @@ pub struct LlamaModelConfig {
     /// the per-layer recurrent/full-attention schedule that a dense Llama config
     /// cannot express. See [`Qwen35Metadata`].
     pub qwen35: Option<Qwen35Metadata>,
+    /// Multi-Head Latent Attention (MLA) metadata for DeepSeek models.
+    pub mla: Option<MlaMetadata>,
 }
 
 /// Whether `architecture` is one of the dense-decoder families Camelid actually
@@ -215,25 +219,64 @@ impl LlamaModelConfig {
             // known 92029b7e limitation), while a CAMELID_ROPE_PAIRING=split_half
             // probe on the exact Phi-3-mini-4k Q8_0 row produces coherent
             // long-form output — the runnable lane independently asserts NEOX for
-            // phi3. Other unpermuted archs (qwen2/gemma3/…) very likely need this
-            // too but stay out of scope and unverified until their own rows prove
-            // it (gemma3 serves via the runnable lane, which handles it there).
+            // phi3. Qwen2/Qwen2.5 uses the same unpermuted split-half layout;
+            // this is exercised by the real Qwen2.5 Q3_K_M mini2 smoke lane.
+            // Other unpermuted archs (gemma3/…) stay out of this path until their
+            // own rows prove it (gemma3 serves via the runnable lane).
             // qwen35 full-attention layers are also unpermuted (NEOX split-half),
             // with partial RoPE over the first `rope.dimension_count` (64) of the
             // 256-wide head — handled in the runnable qwen35 path.
             rope_neox_pairing: arch_uses_neox_rope_pairing(architecture),
+            logit_scale: gguf.metadata_f32(&architecture_key(architecture, "logit_scale")),
             moe,
             gemma4,
             qwen35,
+            mla: MlaMetadata::from_gguf(gguf, architecture),
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MlaMetadata {
+    pub q_lora_rank: u32,
+    pub kv_lora_rank: u32,
+    pub nope_head_dim: u32,
+    pub rope_head_dim: u32,
+}
+
+impl MlaMetadata {
+    pub fn from_gguf(gguf: &GgufFile, architecture: &str) -> Option<Self> {
+        if architecture != "deepseek2" && architecture != "deepseek3" {
+            return None;
+        }
+        Some(Self {
+            q_lora_rank: gguf
+                .metadata_u32(&architecture_key(architecture, "attention.q_lora_rank"))
+                .unwrap_or(1536),
+            kv_lora_rank: gguf
+                .metadata_u32(&architecture_key(architecture, "attention.kv_lora_rank"))
+                .unwrap_or(512),
+            nope_head_dim: gguf
+                .metadata_u32(&architecture_key(architecture, "attention.key_length"))
+                .unwrap_or(128),
+            rope_head_dim: gguf
+                .metadata_u32(&architecture_key(
+                    architecture,
+                    "attention.rope_dimension_count",
+                ))
+                .unwrap_or(64),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MixtralMoeMetadata {
     pub family_label: &'static str,
     pub expert_count: u32,
     pub expert_used_count: u32,
+    pub expert_weights_scale: f32,
+    pub expert_weights_norm: bool,
+    pub expert_gating_func: u32,
 }
 
 impl MixtralMoeMetadata {
@@ -252,10 +295,23 @@ impl MixtralMoeMetadata {
             "MoE"
         };
 
+        let expert_weights_scale = gguf
+            .metadata_f32(&architecture_key(architecture, "expert_weights_scale"))
+            .unwrap_or(1.0);
+        let expert_weights_norm = gguf
+            .metadata_bool(&architecture_key(architecture, "expert_weights_norm"))
+            .unwrap_or(false);
+        let expert_gating_func = gguf
+            .metadata_u32(&architecture_key(architecture, "expert_gating_func"))
+            .unwrap_or(0);
+
         Some(Self {
             family_label,
             expert_count,
             expert_used_count,
+            expert_weights_scale,
+            expert_weights_norm,
+            expert_gating_func,
         })
     }
 }
@@ -681,14 +737,14 @@ impl Qwen35Metadata {
     }
 }
 
-/// NEOX split-half RoPE pairing per architecture: qwen3/qwen35 (verified
-/// token-identical vs the pinned reference) and phi3 (unpermuted weights;
+/// NEOX split-half RoPE pairing per architecture: qwen2/qwen3/qwen35 and phi3
+/// (unpermuted weights;
 /// proven during MUSTER M-A2 — adjacent even/odd degenerates long generation,
 /// split-half restores coherence; the runnable lane independently asserts NEOX
 /// for phi3). Everything else keeps adjacent even/odd (LLaMA-style permuted
 /// conversions). Pure so the gate is unit-testable.
 fn arch_uses_neox_rope_pairing(architecture: &str) -> bool {
-    matches!(architecture, "qwen3" | "qwen35" | "phi3")
+    matches!(architecture, "qwen2" | "qwen3" | "qwen35" | "phi3")
 }
 
 fn architecture_key(architecture: &str, suffix: &str) -> String {
@@ -707,24 +763,91 @@ fn llama_attention_head_count_kv(
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LlamaLayerTensors {
     pub attention_norm: GgufTensorDescriptor,
-    pub attention_q: GgufTensorDescriptor,
-    pub attention_k: GgufTensorDescriptor,
-    pub attention_v: GgufTensorDescriptor,
+    pub attention: LlamaAttentionTensors,
     pub attention_output: GgufTensorDescriptor,
-    /// Per-head RMSNorm applied to the Q projection *after* reshape-to-heads and
-    /// *before* RoPE. `Some` only for architectures that use QK-norm (Qwen3);
-    /// `None` for plain Llama-family rows (llama/mistral/qwen2/…). When `Some`
-    /// the descriptor shape is `[head_dim]`. See [`LlamaTensorBinding::bind`] for
-    /// the per-architecture presence invariant.
-    pub attention_q_norm: Option<GgufTensorDescriptor>,
-    /// Per-head RMSNorm applied to the K projection, mirroring
-    /// [`Self::attention_q_norm`]. Bound in lockstep with it (both `Some` or both
-    /// `None`).
-    pub attention_k_norm: Option<GgufTensorDescriptor>,
     pub ffn_norm: GgufTensorDescriptor,
     pub ffn: LlamaFfnTensors,
 }
 
+impl LlamaLayerTensors {
+    pub fn attention_q(&self) -> Option<&GgufTensorDescriptor> {
+        match &self.attention {
+            LlamaAttentionTensors::Standard { q, .. } => Some(q),
+            LlamaAttentionTensors::Mla { .. } => None,
+        }
+    }
+
+    pub fn attention_k(&self) -> Option<&GgufTensorDescriptor> {
+        match &self.attention {
+            LlamaAttentionTensors::Standard { k, .. } => Some(k),
+            LlamaAttentionTensors::Mla { .. } => None,
+        }
+    }
+
+    pub fn attention_v(&self) -> Option<&GgufTensorDescriptor> {
+        match &self.attention {
+            LlamaAttentionTensors::Standard { v, .. } => Some(v),
+            LlamaAttentionTensors::Mla { .. } => None,
+        }
+    }
+
+    pub fn attention_q_norm(&self) -> Option<&GgufTensorDescriptor> {
+        match &self.attention {
+            LlamaAttentionTensors::Standard { q_norm, .. } => q_norm.as_ref(),
+            LlamaAttentionTensors::Mla { .. } => None,
+        }
+    }
+
+    pub fn attention_k_norm(&self) -> Option<&GgufTensorDescriptor> {
+        match &self.attention {
+            LlamaAttentionTensors::Standard { k_norm, .. } => k_norm.as_ref(),
+            LlamaAttentionTensors::Mla { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LlamaAttentionBiasTensors {
+    pub q: GgufTensorDescriptor,
+    pub k: GgufTensorDescriptor,
+    pub v: GgufTensorDescriptor,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum LlamaAttentionTensors {
+    Standard {
+        q: GgufTensorDescriptor,
+        k: GgufTensorDescriptor,
+        v: GgufTensorDescriptor,
+        /// Per-head RMSNorm applied to the Q projection *after* reshape-to-heads and
+        /// *before* RoPE. `Some` only for architectures that use QK-norm (Qwen3);
+        /// `None` for plain Llama-family rows (llama/mistral/qwen2/…). When `Some`
+        /// the descriptor shape is `[head_dim]`. See [`LlamaTensorBinding::bind`] for
+        /// the per-architecture presence invariant.
+        q_norm: Option<GgufTensorDescriptor>,
+        /// Per-head RMSNorm applied to the K projection, mirroring
+        /// [`Self::attention_q_norm`]. Bound in lockstep with it (both `Some` or both
+        /// `None`).
+        k_norm: Option<GgufTensorDescriptor>,
+        /// Optional Q/K/V projection biases. Qwen2/Qwen2.5 requires all three;
+        /// most Llama-shaped architectures carry none.
+        biases: Option<LlamaAttentionBiasTensors>,
+    },
+    Mla {
+        q_a_proj: GgufTensorDescriptor,
+        q_a_layernorm: GgufTensorDescriptor,
+        q_b_proj: GgufTensorDescriptor,
+        kv_a_proj_with_mqa: GgufTensorDescriptor,
+        kv_a_layernorm: GgufTensorDescriptor,
+        kv_b_proj: GgufTensorDescriptor,
+    },
+}
+
+// The descriptor tree is built once at model-bind time and its direct, named fields keep
+// architecture validation auditable. Boxing a single DeepSeek-only field merely to shave the
+// enum discriminant size would complicate every binding consumer without affecting inference
+// memory, which is dominated by the model tensors themselves.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum LlamaFfnTensors {
     Dense {
@@ -733,6 +856,15 @@ pub enum LlamaFfnTensors {
         down: GgufTensorDescriptor,
     },
     MoE {
+        router: GgufTensorDescriptor,
+        gate_experts: LlamaMoeExpertTensors,
+        up_experts: LlamaMoeExpertTensors,
+        down_experts: LlamaMoeExpertTensors,
+    },
+    DeepSeekMoE {
+        shared_gate: GgufTensorDescriptor,
+        shared_up: GgufTensorDescriptor,
+        shared_down: GgufTensorDescriptor,
         router: GgufTensorDescriptor,
         gate_experts: LlamaMoeExpertTensors,
         up_experts: LlamaMoeExpertTensors,
@@ -762,6 +894,9 @@ pub struct LlamaTensorBinding {
     pub output: GgufTensorDescriptor,
     pub output_is_tied_embedding: bool,
     pub rope_freqs: Option<GgufTensorDescriptor>,
+    pub mla_metadata: Option<MlaMetadata>,
+    pub attention_head_count: usize,
+    pub hidden_size: usize,
     pub layers: Vec<LlamaLayerTensors>,
 }
 
@@ -783,7 +918,7 @@ impl LlamaTensorBinding {
         // direction (carrying QK-norm weights that the forward path would drop,
         // or fabricating them where none exist).
         let architecture = gguf.architecture().unwrap_or_default();
-        let expects_qk_norm = architecture == "qwen3";
+        let expects_qk_norm = architecture == "qwen3" || architecture == "command-r";
         let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
 
         // Qwen3 sets the per-head dim explicitly via `attention.key_length` /
@@ -817,9 +952,9 @@ impl LlamaTensorBinding {
                 let k = find_tensor(gguf, &k_norm_name).cloned();
                 if q.is_none() || k.is_none() {
                     return Err(BackendError::UnsupportedModelArchitecture(format!(
-                        "qwen3 layer {layer_idx} is missing QK-norm tensors \
-                         (attn_q_norm present: {}, attn_k_norm present: {}); Qwen3 applies \
-                         per-head RMSNorm to Q and K and cannot be run correctly without them",
+                        "qwen3/command-r layer {layer_idx} is missing QK-norm tensors \
+                         (attn_q_norm present: {}, attn_k_norm present: {}); this architecture applies \
+                         per-head norm to Q and K and cannot be run correctly without them",
                         q.is_some(),
                         k.is_some()
                     )));
@@ -842,16 +977,71 @@ impl LlamaTensorBinding {
                 }
                 (None, None)
             };
+            let q_bias = find_tensor(gguf, &format!("blk.{layer_idx}.attn_q.bias")).cloned();
+            let k_bias = find_tensor(gguf, &format!("blk.{layer_idx}.attn_k.bias")).cloned();
+            let v_bias = find_tensor(gguf, &format!("blk.{layer_idx}.attn_v.bias")).cloned();
+            let attention_biases = match (q_bias, k_bias, v_bias) {
+                (Some(q), Some(k), Some(v)) => Some(LlamaAttentionBiasTensors { q, k, v }),
+                (None, None, None) if architecture == "qwen2" => {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "qwen2 layer {layer_idx} is missing required attn_q/attn_k/attn_v bias tensors"
+                    )))
+                }
+                (None, None, None) => None,
+                (q, k, v) => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "layer {layer_idx} has an incomplete attention bias set \
+                         (q={}, k={}, v={}); Q/K/V projection biases must be present together",
+                        q.is_some(),
+                        k.is_some(),
+                        v.is_some()
+                    )))
+                }
+            };
+            let attention = if architecture == "deepseek2" || architecture == "deepseek3" {
+                LlamaAttentionTensors::Mla {
+                    q_a_proj: required_tensor(
+                        gguf,
+                        &format!("blk.{layer_idx}.attn_q_a_proj.weight"),
+                    )?,
+                    q_a_layernorm: required_tensor(
+                        gguf,
+                        &format!("blk.{layer_idx}.attn_q_a_layernorm.weight"),
+                    )?,
+                    q_b_proj: required_tensor(
+                        gguf,
+                        &format!("blk.{layer_idx}.attn_q_b_proj.weight"),
+                    )?,
+                    kv_a_proj_with_mqa: required_tensor(
+                        gguf,
+                        &format!("blk.{layer_idx}.attn_kv_a_proj_with_mqa.weight"),
+                    )?,
+                    kv_a_layernorm: required_tensor(
+                        gguf,
+                        &format!("blk.{layer_idx}.attn_kv_a_layernorm.weight"),
+                    )?,
+                    kv_b_proj: required_tensor(
+                        gguf,
+                        &format!("blk.{layer_idx}.attn_kv_b_proj.weight"),
+                    )?,
+                }
+            } else {
+                LlamaAttentionTensors::Standard {
+                    q: required_tensor(gguf, &format!("blk.{layer_idx}.attn_q.weight"))?,
+                    k: required_tensor(gguf, &format!("blk.{layer_idx}.attn_k.weight"))?,
+                    v: required_tensor(gguf, &format!("blk.{layer_idx}.attn_v.weight"))?,
+                    q_norm: attention_q_norm,
+                    k_norm: attention_k_norm,
+                    biases: attention_biases,
+                }
+            };
+
             layers.push(LlamaLayerTensors {
-                attention_q_norm,
-                attention_k_norm,
                 attention_norm: required_tensor(
                     gguf,
                     &format!("blk.{layer_idx}.attn_norm.weight"),
                 )?,
-                attention_q: required_tensor(gguf, &format!("blk.{layer_idx}.attn_q.weight"))?,
-                attention_k: required_tensor(gguf, &format!("blk.{layer_idx}.attn_k.weight"))?,
-                attention_v: required_tensor(gguf, &format!("blk.{layer_idx}.attn_v.weight"))?,
+                attention,
                 attention_output: required_tensor(
                     gguf,
                     &format!("blk.{layer_idx}.attn_output.weight"),
@@ -898,6 +1088,9 @@ impl LlamaTensorBinding {
             output,
             output_is_tied_embedding,
             rope_freqs,
+            mla_metadata: config.mla.clone(),
+            attention_head_count: config.attention_head_count as usize,
+            hidden_size: config.embedding_length as usize,
             layers,
         };
         binding.validate_dense_shapes(config)?;
@@ -968,54 +1161,82 @@ impl LlamaTensorBinding {
             };
             let q_width = config.attention_head_count as usize * head_dim;
             let kv_width = config.attention_head_count_kv as usize * head_dim;
-            require_descriptor_matrix_shape(
-                &layer.attention_q,
-                dims.embedding_length,
-                q_width,
-                &format!("layer {idx} attention q"),
-            )?;
-            require_descriptor_matrix_shape(
-                &layer.attention_k,
-                dims.embedding_length,
-                kv_width,
-                &format!("layer {idx} attention k"),
-            )?;
-            require_descriptor_matrix_shape(
-                &layer.attention_v,
-                dims.embedding_length,
-                kv_width,
-                &format!("layer {idx} attention v"),
-            )?;
+            match &layer.attention {
+                LlamaAttentionTensors::Standard {
+                    q,
+                    k,
+                    v,
+                    q_norm,
+                    k_norm,
+                    biases,
+                } => {
+                    require_descriptor_matrix_shape(
+                        q,
+                        dims.embedding_length,
+                        q_width,
+                        &format!("layer {idx} attention q"),
+                    )?;
+                    require_descriptor_matrix_shape(
+                        k,
+                        dims.embedding_length,
+                        kv_width,
+                        &format!("layer {idx} attention k"),
+                    )?;
+                    require_descriptor_matrix_shape(
+                        v,
+                        dims.embedding_length,
+                        kv_width,
+                        &format!("layer {idx} attention v"),
+                    )?;
+                    match (q_norm, k_norm) {
+                        (Some(qn), Some(kn)) => {
+                            require_descriptor_shape(
+                                qn,
+                                &[head_dim],
+                                &format!("layer {idx} attention q_norm"),
+                            )?;
+                            require_descriptor_shape(
+                                kn,
+                                &[head_dim],
+                                &format!("layer {idx} attention k_norm"),
+                            )?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(BackendError::InvalidModelMetadata(format!(
+                                "layer {idx} has exactly one of attn_q_norm/attn_k_norm bound; QK-norm \
+                                 weights must be present as a pair"
+                            )));
+                        }
+                    }
+                    if let Some(biases) = biases {
+                        require_descriptor_shape(
+                            &biases.q,
+                            &[q_width],
+                            &format!("layer {idx} attention q bias"),
+                        )?;
+                        require_descriptor_shape(
+                            &biases.k,
+                            &[kv_width],
+                            &format!("layer {idx} attention k bias"),
+                        )?;
+                        require_descriptor_shape(
+                            &biases.v,
+                            &[kv_width],
+                            &format!("layer {idx} attention v bias"),
+                        )?;
+                    }
+                }
+                LlamaAttentionTensors::Mla { .. } => {
+                    // DeepSeek MLA shape validation not yet implemented
+                }
+            }
             require_descriptor_matrix_shape(
                 &layer.attention_output,
                 q_width,
                 dims.embedding_length,
                 &format!("layer {idx} attention output"),
             )?;
-            // QK-norm (Qwen3) — per-head RMSNorm weights over the head dim. Only
-            // populated for architectures that use them; validate shape `[head_dim]`
-            // and require they appear together.
-            match (&layer.attention_q_norm, &layer.attention_k_norm) {
-                (Some(q_norm), Some(k_norm)) => {
-                    require_descriptor_shape(
-                        q_norm,
-                        &[head_dim],
-                        &format!("layer {idx} attention q_norm"),
-                    )?;
-                    require_descriptor_shape(
-                        k_norm,
-                        &[head_dim],
-                        &format!("layer {idx} attention k_norm"),
-                    )?;
-                }
-                (None, None) => {}
-                _ => {
-                    return Err(BackendError::InvalidModelMetadata(format!(
-                        "layer {idx} has exactly one of attn_q_norm/attn_k_norm bound; QK-norm \
-                         weights must be present as a pair"
-                    )));
-                }
-            }
             require_descriptor_shape(
                 &layer.ffn_norm,
                 &[dims.embedding_length],
@@ -1041,6 +1262,9 @@ impl LlamaTensorBinding {
                         dims.embedding_length,
                         &format!("layer {idx} ffn down"),
                     )?;
+                }
+                LlamaFfnTensors::DeepSeekMoE { .. } => {
+                    // DeepSeekMoE shape validation not yet implemented
                 }
                 LlamaFfnTensors::MoE {
                     router,
@@ -1799,7 +2023,7 @@ mod tests {
 
     #[test]
     fn neox_rope_pairing_covers_exactly_the_proven_archs() {
-        // qwen3/qwen35 verified vs the pinned reference; phi3 proven during
+        // qwen2/qwen3/qwen35 verified vs real rows; phi3 proven during
         // MUSTER M-A2 (adjacent even/odd degenerates long generation on the
         // exact Phi-3-mini-4k row, split-half restores coherence). Everything
         // else — including the other unpermuted-but-unproven archs — must stay
@@ -1807,9 +2031,9 @@ mod tests {
         assert!(super::arch_uses_neox_rope_pairing("qwen3"));
         assert!(super::arch_uses_neox_rope_pairing("qwen35"));
         assert!(super::arch_uses_neox_rope_pairing("phi3"));
+        assert!(super::arch_uses_neox_rope_pairing("qwen2"));
         assert!(!super::arch_uses_neox_rope_pairing("llama"));
         assert!(!super::arch_uses_neox_rope_pairing("mistral"));
-        assert!(!super::arch_uses_neox_rope_pairing("qwen2"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma3"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma4"));
     }

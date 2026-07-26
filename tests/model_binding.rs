@@ -3,7 +3,10 @@ use std::{fs, path::Path};
 use camelid::{
     gguf::read_metadata,
     inference::LlamaKvCachePlan,
-    model::{LlamaFfnTensors, LlamaModelConfig, LlamaMoeExpertTensors, LlamaTensorBinding},
+    model::{
+        LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig, LlamaMoeExpertTensors,
+        LlamaTensorBinding,
+    },
 };
 
 #[test]
@@ -43,8 +46,14 @@ fn defaults_missing_kv_heads_to_attention_heads_for_tinyllama_style_metadata() {
     assert_eq!(config.attention_head_count_kv, config.attention_head_count);
     assert_eq!(config.rope_dimension_count, Some(4));
     assert_eq!(config.rope_freq_base, Some(10_000.0));
-    assert_eq!(binding.layers[0].attention_k.dimensions, vec![8, 8]);
-    assert_eq!(binding.layers[0].attention_v.dimensions, vec![8, 8]);
+    assert_eq!(
+        binding.layers[0].attention_k().unwrap().dimensions,
+        vec![8, 8]
+    );
+    assert_eq!(
+        binding.layers[0].attention_v().unwrap().dimensions,
+        vec![8, 8]
+    );
     assert_eq!(cache_plan.kv_head_count, 2);
     assert_eq!(cache_plan.head_dim, 4);
     assert_eq!(cache_plan.key_shape, vec![1, 128, 2, 4]);
@@ -69,8 +78,14 @@ fn accepts_mistral_metadata_on_llama_dense_runtime() {
     assert_eq!(config.rope_dimension_count, Some(4));
     assert_eq!(config.rope_freq_base, Some(10_000.0));
     assert_eq!(config.rms_norm_epsilon, 1e-6);
-    assert_eq!(binding.layers[0].attention_q.name, "blk.0.attn_q.weight");
-    assert_eq!(binding.layers[0].attention_k.dimensions, vec![8, 4]);
+    assert_eq!(
+        binding.layers[0].attention_q().unwrap().name,
+        "blk.0.attn_q.weight"
+    );
+    assert_eq!(
+        binding.layers[0].attention_k().unwrap().dimensions,
+        vec![8, 4]
+    );
     assert_eq!(cache_plan.kv_head_count, 1);
     assert_eq!(cache_plan.head_dim, 4);
 }
@@ -107,7 +122,9 @@ fn binds_mixtral_moe_metadata_and_expert_tensors() {
                 matches!(down_experts, LlamaMoeExpertTensors::Merged(desc) if desc.name == "blk.0.ffn_down_exps.weight")
             );
         }
-        LlamaFfnTensors::Dense { .. } => panic!("expected Mixtral MoE FFN tensors"),
+        LlamaFfnTensors::Dense { .. } | LlamaFfnTensors::DeepSeekMoE { .. } => {
+            panic!("expected Mixtral MoE FFN tensors")
+        }
     }
 }
 
@@ -138,9 +155,18 @@ fn accepts_llama3_style_gqa_metadata_and_rope_theta() {
         "rope_freqs.weight"
     );
     assert_eq!(binding.rope_freqs.as_ref().unwrap().dimensions, vec![2]);
-    assert_eq!(binding.layers[0].attention_q.dimensions, vec![32, 32]);
-    assert_eq!(binding.layers[0].attention_k.dimensions, vec![32, 8]);
-    assert_eq!(binding.layers[0].attention_v.dimensions, vec![32, 8]);
+    assert_eq!(
+        binding.layers[0].attention_q().unwrap().dimensions,
+        vec![32, 32]
+    );
+    assert_eq!(
+        binding.layers[0].attention_k().unwrap().dimensions,
+        vec![32, 8]
+    );
+    assert_eq!(
+        binding.layers[0].attention_v().unwrap().dimensions,
+        vec![32, 8]
+    );
     assert_eq!(cache_plan.kv_head_count, 2);
     assert_eq!(cache_plan.head_dim, 4);
     assert_eq!(cache_plan.key_shape, vec![1, 8192, 2, 4]);
@@ -175,10 +201,15 @@ fn binds_required_llama_tensors() {
     assert_eq!(binding.output.name, "output.weight");
     assert!(!binding.output_is_tied_embedding);
     assert_eq!(binding.layers.len(), 1);
-    assert_eq!(binding.layers[0].attention_q.name, "blk.0.attn_q.weight");
+    assert_eq!(
+        binding.layers[0].attention_q().unwrap().name,
+        "blk.0.attn_q.weight"
+    );
     match &binding.layers[0].ffn {
         LlamaFfnTensors::Dense { down, .. } => assert_eq!(down.name, "blk.0.ffn_down.weight"),
-        LlamaFfnTensors::MoE { .. } => panic!("expected dense FFN tensors"),
+        LlamaFfnTensors::MoE { .. } | LlamaFfnTensors::DeepSeekMoE { .. } => {
+            panic!("expected dense FFN tensors")
+        }
     }
 }
 
@@ -706,10 +737,15 @@ fn push_i64(b: &mut Vec<u8>, value: i64) {
 /// `attn_q_norm`/`attn_k_norm` tensors. head_dim is 8 so the F32 norm tensors
 /// (32 bytes) honor the GGUF 32-byte data alignment.
 fn write_qwen3_gguf(path: &Path, include_qk_norm: bool) {
-    write_qk_norm_gguf(path, "qwen3", include_qk_norm);
+    write_attention_fixture_gguf(path, "qwen3", include_qk_norm, false);
 }
 
-fn write_qk_norm_gguf(path: &Path, architecture: &str, include_qk_norm: bool) {
+fn write_attention_fixture_gguf(
+    path: &Path,
+    architecture: &str,
+    include_qk_norm: bool,
+    include_qkv_biases: bool,
+) {
     let mut tensors: Vec<(&str, Vec<i64>)> = vec![
         ("token_embd.weight", vec![4, 16]),
         ("output_norm.weight", vec![16]),
@@ -727,6 +763,11 @@ fn write_qk_norm_gguf(path: &Path, architecture: &str, include_qk_norm: bool) {
         // head_dim = embedding_length / head_count = 16 / 2 = 8.
         tensors.push(("blk.0.attn_q_norm.weight", vec![8]));
         tensors.push(("blk.0.attn_k_norm.weight", vec![8]));
+    }
+    if include_qkv_biases {
+        tensors.push(("blk.0.attn_q.bias", vec![16]));
+        tensors.push(("blk.0.attn_k.bias", vec![8]));
+        tensors.push(("blk.0.attn_v.bias", vec![8]));
     }
 
     let mut b = Vec::new();
@@ -793,12 +834,10 @@ fn qwen3_binds_per_head_qk_norm_tensors() {
 
     let layer = &binding.layers[0];
     let q_norm = layer
-        .attention_q_norm
-        .as_ref()
+        .attention_q_norm()
         .expect("qwen3 must bind attn_q_norm");
     let k_norm = layer
-        .attention_k_norm
-        .as_ref()
+        .attention_k_norm()
         .expect("qwen3 must bind attn_k_norm");
     // Shape is [head_dim] = [8].
     assert_eq!(q_norm.dimensions, vec![8]);
@@ -828,7 +867,7 @@ fn llama_family_with_unexpected_qk_norm_fails_closed() {
     let path = dir.path().join("llama-with-qknorm.gguf");
     // A plain llama row that unexpectedly carries QK-norm tensors must not be
     // silently accepted (the Llama forward path would drop them).
-    write_qk_norm_gguf(&path, "llama", true);
+    write_attention_fixture_gguf(&path, "llama", true, false);
 
     let gguf = read_metadata(&path).unwrap();
     let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
@@ -837,6 +876,45 @@ fn llama_family_with_unexpected_qk_norm_fails_closed() {
     assert!(
         format!("{err}").contains("QK-norm"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn qwen2_binds_required_qkv_projection_biases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("qwen2-with-biases.gguf");
+    write_attention_fixture_gguf(&path, "qwen2", false, true);
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
+
+    let LlamaAttentionTensors::Standard {
+        biases: Some(biases),
+        ..
+    } = &binding.layers[0].attention
+    else {
+        panic!("qwen2 must bind its Q/K/V projection biases");
+    };
+    assert_eq!(biases.q.dimensions, vec![16]);
+    assert_eq!(biases.k.dimensions, vec![8]);
+    assert_eq!(biases.v.dimensions, vec![8]);
+}
+
+#[test]
+fn qwen2_without_qkv_projection_biases_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("qwen2-without-biases.gguf");
+    write_attention_fixture_gguf(&path, "qwen2", false, false);
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let err = LlamaTensorBinding::bind(&gguf, &config)
+        .expect_err("qwen2 missing Q/K/V projection biases must fail closed");
+    let message = format!("{err}");
+    assert!(
+        message.contains("qwen2") && message.contains("bias"),
+        "unexpected error: {message}"
     );
 }
 
@@ -919,7 +997,10 @@ fn qwen3_explicit_head_dim_binds_wide_q_projection() {
     // Binder accepts the wide q projection [16, 32] (q_width 32 > embedding 16)
     // and the matching output [32, 16] — fails closed without explicit-head_dim plumbing.
     let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
-    assert_eq!(binding.layers[0].attention_q.dimensions, vec![16, 32]);
+    assert_eq!(
+        binding.layers[0].attention_q().unwrap().dimensions,
+        vec![16, 32]
+    );
     assert_eq!(binding.layers[0].attention_output.dimensions, vec![32, 16]);
-    assert!(binding.layers[0].attention_q_norm.is_some());
+    assert!(binding.layers[0].attention_q_norm().is_some());
 }

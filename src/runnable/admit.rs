@@ -227,6 +227,7 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::Q6K
             | GgufTensorType::Q5K
             | GgufTensorType::Q4K
+            | GgufTensorType::Q2K
             | GgufTensorType::Q3K
             | GgufTensorType::Q4_0
             | GgufTensorType::IQ4XS
@@ -267,7 +268,7 @@ fn check_quants(
                 tensor: Some(tensor.name.clone()),
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
-                     F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16",
+                     F32, F16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16",
                     tensor.tensor_type, tensor.name
                 ),
             });
@@ -712,25 +713,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_quant_naming_tensor() {
+    fn accepts_q2_k_quant() {
         let mut file = base_fixture();
-        // Q2_K has no runnable-lane dequant (resident-GPU-engine only) — the
-        // runnable admission must reject it. (Q3_K, formerly the example here,
-        // was covered by the Ornith constrained-VRAM conductor's Q3_K_M lane.)
         file.tensors
             .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q2K));
-        let reject = admit(&file).expect_err("Q2_K must reject");
+        let admitted = admit(&file).expect("Q2_K has runnable dequant and wire-dot coverage");
+        assert!(admitted.quants.contains(&GgufTensorType::Q2K));
+    }
+
+    #[test]
+    fn rejects_unknown_quant_naming_tensor() {
+        let mut file = base_fixture();
+        file.tensors
+            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q4_1));
+        let reject = admit(&file).expect_err("Q4_1 must reject");
         assert_eq!(reject.axis, AdmissionAxis::Quant);
-        assert_eq!(reject.offending_value, "Q2K");
+        assert_eq!(reject.offending_value, "Q4_1");
         assert_eq!(reject.tensor.as_deref(), Some("blk.12.ffn_down.weight"));
-        assert!(reject.message.contains("blk.12.ffn_down.weight"));
-        // BASALT D-B6: the SHA_E `ends_with("IQ4_XS")` pin (generic covered-set
-        // message byte-identical to pre-BASALT main) is deliberately retired — the
-        // covered set now lists BF16, a sanctioned covered-set widening (IQ4_XS
-        // precedent). The generic message must now name BF16 as the covered-set tail.
         assert!(
             reject.message.ends_with("IQ4_XS, BF16"),
-            "generic covered-set message must now list BF16 (D-B6): {}",
+            "generic covered-set message must name its complete supported tail: {}",
             reject.message
         );
     }
@@ -781,11 +783,11 @@ mod tests {
     fn reject_serializes_to_machine_readable_json() {
         let mut file = base_fixture();
         file.tensors
-            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q2K));
-        let reject = admit(&file).expect_err("Q2_K must reject");
+            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::IQ4NL));
+        let reject = admit(&file).expect_err("IQ4_NL must reject");
         let json = serde_json::to_value(&reject).expect("reject serializes");
         assert_eq!(json["axis"], "quant");
-        assert_eq!(json["offending_value"], "Q2K");
+        assert_eq!(json["offending_value"], "IQ4NL");
         assert_eq!(json["tensor"], "blk.12.ffn_down.weight");
     }
 

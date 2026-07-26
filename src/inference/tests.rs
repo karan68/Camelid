@@ -10,6 +10,32 @@ fn assert_close(actual: f32, expected: f32) {
 }
 
 #[test]
+fn projection_bias_broadcasts_across_every_token_row() {
+    let projection =
+        CpuTensor::from_f32("q", vec![2, 3], vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0]).unwrap();
+    let bias = CpuTensor::from_f32("q.bias", vec![3], vec![0.5, -1.0, 2.0]).unwrap();
+
+    let biased = add_projection_bias(projection, &bias, "test q projection").unwrap();
+
+    assert_eq!(biased.shape.dims, vec![2, 3]);
+    assert_eq!(biased.data, vec![1.5, 1.0, 5.0, -0.5, -3.0, -1.0]);
+}
+
+#[test]
+fn projection_bias_rejects_a_mismatched_width() {
+    let projection = CpuTensor::from_f32("q", vec![2, 3], vec![0.0; 6]).unwrap();
+    let bias = CpuTensor::from_f32("q.bias", vec![2], vec![0.0; 2]).unwrap();
+
+    let err = add_projection_bias(projection, &bias, "test q projection").unwrap_err();
+
+    assert!(
+        matches!(err, BackendError::RuntimeShapeMismatch(_)),
+        "unexpected error: {err}"
+    );
+    assert!(format!("{err}").contains("does not match projection width 3"));
+}
+
+#[test]
 fn resident_parity_forbids_reflects_the_cached_verdict() {
     // A key unlikely to collide with other parallel tests sharing the process-global map.
     let key = 0x5A5A_A5A5_1234_5678_u64;
@@ -41,6 +67,108 @@ fn resident_parity_forbids_reflects_the_cached_verdict() {
         .lock()
         .unwrap()
         .remove(&panic_key);
+}
+
+#[test]
+fn metal_resident_weight_gate_rejects_kquant_wire_storage() {
+    let q8 = CpuTensor::from_q8_0_blocks(
+        "q8.weight",
+        TensorShape { dims: vec![1, 32] },
+        vec![Q8_0Block {
+            scale: 0.25,
+            quants: [1; 32],
+        }],
+    )
+    .unwrap();
+    assert!(metal_resident_weight_eligible(&q8, false));
+
+    let mut q4 = CpuTensor::from_f32("q4.weight", vec![1, 256], vec![0.0; 256]).unwrap();
+    q4.source_type = Some(GgufTensorType::Q4K);
+    q4.q4_k_wire_bytes = Some(Arc::new(vec![0; crate::tensor::Q4_K_BLOCK_BYTES]));
+    q4.data.clear();
+
+    assert!(
+        !metal_resident_weight_eligible(&q4, false),
+        "the Metal resident engine currently only implements Q8_0 weights"
+    );
+}
+
+#[test]
+fn q3_k_wire_linear_routes_through_cpu_block_dot_without_dense_data() {
+    let _env_guard = env_lock();
+    std::env::set_var("CAMELID_X86_Q4K_DECODE", "1");
+
+    let input_values = (0..Q6_K_VALUES_PER_BLOCK)
+        .map(|index| (index as f32 - 127.0) / 64.0)
+        .collect::<Vec<_>>();
+    let input = CpuTensor::from_f32("input", vec![1, Q6_K_VALUES_PER_BLOCK], input_values).unwrap();
+    let output_width = 2;
+    let mut wire = vec![0_u8; output_width * crate::tensor::Q3_K_BLOCK_BYTES];
+    for (row, block) in wire
+        .chunks_exact_mut(crate::tensor::Q3_K_BLOCK_BYTES)
+        .enumerate()
+    {
+        for (index, byte) in block[..108].iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(17).wrapping_add(row as u8 * 29);
+        }
+        block[108..110].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    }
+    let mut weight = CpuTensor::from_f32(
+        "blk.0.attn_q.weight",
+        vec![Q6_K_VALUES_PER_BLOCK, output_width],
+        vec![0.0; Q6_K_VALUES_PER_BLOCK * output_width],
+    )
+    .unwrap();
+    weight.source_type = Some(GgufTensorType::Q3K);
+    weight.q3_k_wire_bytes = Some(Arc::new(wire.clone()));
+    weight.data.clear();
+
+    let actual =
+        linear_for_role_runtime(&input, &weight, "attention_q", "attention q", false).unwrap();
+    let quantized_input = quantize_q8_k_blocks(&input.data);
+    let expected = wire
+        .chunks_exact(crate::tensor::Q3_K_BLOCK_BYTES)
+        .map(|row| q3_k_wire_row_dot(row, &quantized_input))
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual.shape.dims, vec![1, output_width]);
+    assert_eq!(actual.data, expected);
+
+    std::env::remove_var("CAMELID_X86_Q4K_DECODE");
+}
+
+#[test]
+fn q3_k_wire_dot_matches_dequantized_reference() {
+    let input = (0..Q6_K_VALUES_PER_BLOCK)
+        .map(|index| ((index * 37 % 211) as f32 - 105.0) / 31.0)
+        .collect::<Vec<_>>();
+    let quantized = quantize_q8_k_blocks(&input);
+    let mut wire = [0_u8; crate::tensor::Q3_K_BLOCK_BYTES];
+    for (index, byte) in wire[..108].iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(17).wrapping_add(23);
+    }
+    wire[108..110].copy_from_slice(&0x3c00_u16.to_le_bytes());
+
+    let block = crate::tensor::Q3KBlock::from_bytes(&wire);
+    let mut weights = [0.0_f32; Q6_K_VALUES_PER_BLOCK];
+    block.dequantize(&mut weights);
+    let dequantized_input = quantized[0]
+        .qs
+        .iter()
+        .map(|quant| quantized[0].d * f32::from(*quant))
+        .collect::<Vec<_>>();
+    let expected = weights
+        .iter()
+        .zip(dequantized_input)
+        .map(|(weight, input)| weight * input)
+        .sum::<f32>();
+    let actual = q3_k_wire_row_dot(&wire, &quantized);
+    let tolerance = expected.abs().max(1.0) * 1e-5;
+
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "Q3_K wire dot {actual} diverged from dequantized reference {expected}"
+    );
 }
 
 #[test]
@@ -847,9 +975,19 @@ fn tiny_prefill_schedule_weights(attention_q: CpuTensor) -> LlamaLoadedWeights {
             ffn_up: CpuTensor::from_f32("blk.0.ffn_up.weight", vec![2, 2], vec![1.0; 4]).unwrap(),
             ffn_down: CpuTensor::from_f32("blk.0.ffn_down.weight", vec![2, 2], vec![1.0; 4])
                 .unwrap(),
+            attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            mla_q_a_proj: None,
+            mla_q_a_layernorm: None,
+            mla_q_b_proj: None,
+            mla_kv_a_proj_with_mqa: None,
+            mla_kv_a_layernorm: None,
+            mla_kv_b_proj: None,
+            moe_shared_gate: None,
+            moe_shared_up: None,
+            moe_shared_down: None,
             decode_bindings: DecodeLinearBindings::default(),
         }],
     }
@@ -1232,9 +1370,11 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let dense_vector = |name: &str| CpuTensor::from_f32(name, vec![32], vec![1.0; 32]).unwrap();
     let dense_matrix =
@@ -1262,6 +1402,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
             attention_k: dense_matrix("blk.0.attn_k.weight"),
             attention_v: dense_matrix("blk.0.attn_v.weight"),
             attention_output: dense_matrix("blk.0.attn_output.weight"),
+            attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
             ffn_norm: dense_vector("blk.0.ffn_norm.weight"),
@@ -1269,6 +1410,15 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
             ffn_up: dense_matrix("blk.0.ffn_up.weight"),
             ffn_down: dense_matrix("blk.0.ffn_down.weight"),
             moe_router: None,
+            mla_q_a_proj: None,
+            mla_q_a_layernorm: None,
+            mla_q_b_proj: None,
+            mla_kv_a_proj_with_mqa: None,
+            mla_kv_a_layernorm: None,
+            mla_kv_b_proj: None,
+            moe_shared_gate: None,
+            moe_shared_up: None,
+            moe_shared_down: None,
             decode_bindings: DecodeLinearBindings::default(),
         }],
     };
@@ -1329,9 +1479,11 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let dense_vector = |name: &str| CpuTensor::from_f32(name, vec![32], vec![1.0; 32]).unwrap();
     let dense_matrix =
@@ -1359,6 +1511,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
             attention_k: dense_matrix("blk.0.attn_k.weight"),
             attention_v: dense_matrix("blk.0.attn_v.weight"),
             attention_output: dense_matrix("blk.0.attn_output.weight"),
+            attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
             ffn_norm: dense_vector("blk.0.ffn_norm.weight"),
@@ -1366,6 +1519,15 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
             ffn_up: dense_matrix("blk.0.ffn_up.weight"),
             ffn_down: dense_matrix("blk.0.ffn_down.weight"),
             moe_router: None,
+            mla_q_a_proj: None,
+            mla_q_a_layernorm: None,
+            mla_q_b_proj: None,
+            mla_kv_a_proj_with_mqa: None,
+            mla_kv_a_layernorm: None,
+            mla_kv_b_proj: None,
+            moe_shared_gate: None,
+            moe_shared_up: None,
+            moe_shared_down: None,
             decode_bindings: DecodeLinearBindings::default(),
         }],
     };
@@ -7288,6 +7450,12 @@ fn q8_0_runtime_packed_prefill_gate_up_sched_matches_unfused_path() {
 
 #[test]
 fn q8_0_file_reader_quantized_input_buffer_reuses_capacity() {
+    // The retained-scratch limit is process-global environment state. Serialize
+    // against the bounded-retention test so its 128-byte cap cannot clear this
+    // thread-local allocation between the two capacity observations.
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
     let first = CpuTensor::from_f32(
         "first",
         vec![2, Q8_0_BLOCK_VALUES],
@@ -8377,13 +8545,15 @@ fn applies_rope_to_each_attention_head() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
 
-    let rotated = apply_rope(&tensor, 1, 2, &config, None, "query_rope").unwrap();
+    let rotated = apply_rope(&tensor, 1, 2, &config, None, 0, "query_rope").unwrap();
 
     let (sin, cos) = 1.0_f32.sin_cos();
     assert_eq!(rotated.shape.dims, vec![1, 4]);
@@ -8417,13 +8587,15 @@ fn apply_rope_uses_configured_frequency_base() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
 
-    let rotated = apply_rope(&tensor, 1, 1, &config, None, "query_rope").unwrap();
+    let rotated = apply_rope(&tensor, 1, 1, &config, None, 0, "query_rope").unwrap();
     let diagnostic =
         rope_diagnostics(&tensor, &rotated, 1, 1, &config, None, "attention_q").unwrap();
 
@@ -8467,13 +8639,15 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
 
-    let rotated = apply_rope(&tensor, 8, 1, &config, None, "query_rope").unwrap();
+    let rotated = apply_rope(&tensor, 8, 1, &config, None, 0, "query_rope").unwrap();
     let diagnostic =
         rope_diagnostics(&tensor, &rotated, 8, 1, &config, None, "attention_q").unwrap();
 
@@ -8521,14 +8695,16 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
     let rope_freqs = CpuTensor::from_f32("rope_freqs.weight", vec![2], vec![1.0, 4.0]).unwrap();
 
-    let rotated = apply_rope(&tensor, 8, 1, &config, Some(&rope_freqs), "query_rope").unwrap();
+    let rotated = apply_rope(&tensor, 8, 1, &config, Some(&rope_freqs), 0, "query_rope").unwrap();
     let diagnostic = rope_diagnostics(
         &tensor,
         &rotated,
@@ -8582,12 +8758,14 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
-    let reported = apply_rope(&tensor, 1, 2, &config, None, "query_rope").unwrap();
+    let reported = apply_rope(&tensor, 1, 2, &config, None, 0, "query_rope").unwrap();
 
     let diagnostic =
         rope_diagnostics(&tensor, &reported, 1, 2, &config, None, "attention_q").unwrap();
@@ -8648,9 +8826,11 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 0.0]).unwrap();
     let head_dim = 4;
@@ -8670,6 +8850,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
             position_mode: RopePositionMode::ZeroBased,
             scaling: no_rope_scaling(),
             rope_freqs: None,
+            rope_offset: 0,
         },
         "adjacent",
     )
@@ -8687,6 +8868,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
             position_mode: RopePositionMode::ZeroBased,
             scaling: no_rope_scaling(),
             rope_freqs: None,
+            rope_offset: 0,
         },
         "split",
     )
@@ -8726,9 +8908,11 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 2], vec![1.0, 0.0]).unwrap();
     let head_dim = 2;
@@ -8748,6 +8932,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
             position_mode: RopePositionMode::ZeroBased,
             scaling: no_rope_scaling(),
             rope_freqs: None,
+            rope_offset: 0,
         },
         "forward",
     )
@@ -8765,6 +8950,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
             position_mode: RopePositionMode::ZeroBased,
             scaling: no_rope_scaling(),
             rope_freqs: None,
+            rope_offset: 0,
         },
         "inverse",
     )
@@ -8803,13 +8989,15 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 2], vec![1.0, 0.0]).unwrap();
 
-    let rotated = apply_rope(&tensor, 0, 1, &config, None, "query_rope").unwrap();
+    let rotated = apply_rope(&tensor, 0, 1, &config, None, 0, "query_rope").unwrap();
     let diagnostic =
         rope_diagnostics(&tensor, &rotated, 0, 1, &config, None, "attention_q").unwrap();
 
@@ -10418,9 +10606,11 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
         token_embedding: CpuTensor::from_f32(
@@ -10493,9 +10683,19 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
                 vec![1.0, 0.0, 0.0, 1.0],
             )
             .unwrap(),
+            attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            mla_q_a_proj: None,
+            mla_q_a_layernorm: None,
+            mla_q_b_proj: None,
+            mla_kv_a_proj_with_mqa: None,
+            mla_kv_a_layernorm: None,
+            mla_kv_b_proj: None,
+            moe_shared_gate: None,
+            moe_shared_up: None,
+            moe_shared_down: None,
             decode_bindings: DecodeLinearBindings::default(),
         }],
         layer_range: None,
@@ -10695,9 +10895,11 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
         token_embedding: CpuTensor::from_f32(
@@ -10763,9 +10965,19 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
                 vec![0.7, -0.2, 0.4, 0.3],
             )
             .unwrap(),
+            attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            mla_q_a_proj: None,
+            mla_q_a_layernorm: None,
+            mla_q_b_proj: None,
+            mla_kv_a_proj_with_mqa: None,
+            mla_kv_a_layernorm: None,
+            mla_kv_b_proj: None,
+            moe_shared_gate: None,
+            moe_shared_up: None,
+            moe_shared_down: None,
             decode_bindings: DecodeLinearBindings::default(),
         }],
         layer_range: None,
@@ -10912,9 +11124,11 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let layer = LlamaLayerWeights {
         attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0, 1.0])
@@ -10958,9 +11172,19 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
             vec![1.0, 0.0, 0.0, 1.0],
         )
         .unwrap(),
+        attention_biases: None,
         attention_q_norm: None,
         attention_k_norm: None,
         moe_router: None,
+        mla_q_a_proj: None,
+        mla_q_a_layernorm: None,
+        mla_q_b_proj: None,
+        mla_kv_a_proj_with_mqa: None,
+        mla_kv_a_layernorm: None,
+        mla_kv_b_proj: None,
+        moe_shared_gate: None,
+        moe_shared_up: None,
+        moe_shared_down: None,
         decode_bindings: DecodeLinearBindings::default(),
     };
     let hidden = CpuTensor::from_f32("hidden", vec![2, 2], vec![0.1, 0.2, 0.3, 0.4]).unwrap();
@@ -11013,9 +11237,11 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let kv_cache = LlamaKvCache::new(LlamaKvCachePlan::from_config(&config).unwrap()).unwrap();
     let query = CpuTensor::from_f32("query", vec![1, 2], vec![0.1, 0.2]).unwrap();
@@ -11043,6 +11269,8 @@ fn batch_attention_parallel_context_matches_serial() {
         layer_count: 1,
         kv_head_count: kv_heads,
         head_dim,
+        k_head_dim: head_dim,
+        v_head_dim: head_dim,
         key_shape: vec![1, rows, kv_heads, head_dim],
         value_shape: vec![1, rows, kv_heads, head_dim],
     };
@@ -11156,9 +11384,11 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
         token_embedding: CpuTensor::from_f32(
@@ -11224,9 +11454,19 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
                 vec![0.7, -0.2, 0.4, 0.3],
             )
             .unwrap(),
+            attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            mla_q_a_proj: None,
+            mla_q_a_layernorm: None,
+            mla_q_b_proj: None,
+            mla_kv_a_proj_with_mqa: None,
+            mla_kv_a_layernorm: None,
+            mla_kv_b_proj: None,
+            moe_shared_gate: None,
+            moe_shared_up: None,
+            moe_shared_down: None,
             decode_bindings: DecodeLinearBindings::default(),
         }],
         layer_range: None,
@@ -11258,6 +11498,8 @@ fn kv_cache_allocates_positions_lazily_without_losing_prior_layers() {
         layer_count: 2,
         kv_head_count: 1,
         head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
         key_shape: vec![2, 10, 1, 2],
         value_shape: vec![2, 10, 1, 2],
     };
@@ -11305,6 +11547,8 @@ fn kv_cache_uses_paged_growth_for_model_sized_contexts() {
         layer_count: 2,
         kv_head_count: 1,
         head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
         key_shape: vec![2, 1024, 1, 2],
         value_shape: vec![2, 1024, 1, 2],
     };
@@ -11326,6 +11570,8 @@ fn kv_cache_storage_matches_llama_cpp_f16_rounding() {
         layer_count: 1,
         kv_head_count: 1,
         head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
         key_shape: vec![1, 1, 1, 2],
         value_shape: vec![1, 1, 1, 2],
     };
@@ -11367,6 +11613,8 @@ fn causal_attention_context_attends_over_prior_and_current_positions() {
         layer_count: 1,
         kv_head_count: 1,
         head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
         key_shape: vec![1, 3, 1, 2],
         value_shape: vec![1, 3, 1, 2],
     };
@@ -11463,6 +11711,8 @@ fn causal_attention_context_repeats_grouped_kv_heads_for_single_position() {
         layer_count: 1,
         kv_head_count: 2,
         head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
         key_shape: vec![1, 1, 2, 2],
         value_shape: vec![1, 1, 2, 2],
     };
@@ -11521,6 +11771,8 @@ fn causal_attention_context_repeats_grouped_kv_heads_across_positions() {
         layer_count: 1,
         kv_head_count: 2,
         head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
         key_shape: vec![1, 2, 2, 2],
         value_shape: vec![1, 2, 2, 2],
     };
@@ -11603,6 +11855,8 @@ fn attention_trace_reports_top_probability_positions_outside_edge_samples() {
         layer_count: 1,
         kv_head_count: 1,
         head_dim: 2,
+        k_head_dim: 2,
+        v_head_dim: 2,
         key_shape: vec![1, 10, 1, 2],
         value_shape: vec![1, 10, 1, 2],
     };
@@ -11920,9 +12174,11 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         file_type: None,
         rope_neox_pairing: false,
         attention_key_length: None,
+        logit_scale: None,
         moe: None,
         gemma4: None,
         qwen35: None,
+        mla: None,
     };
     let n = 7;
     let head_dim = 8;
@@ -12664,6 +12920,7 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
             attention_k: t("blk.0.attn_k.weight", vec![2, 2], 4),
             attention_v: t("blk.0.attn_v.weight", vec![2, 2], 4),
             attention_output: t("blk.0.attn_output.weight", vec![2, 2], 4),
+            attention_biases: None,
             attention_q_norm: q_norm,
             attention_k_norm: k_norm,
             ffn_norm: t("blk.0.ffn_norm.weight", vec![2], 2),
@@ -12671,6 +12928,15 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
             ffn_up: t("blk.0.ffn_up.weight", vec![2, 2], 4),
             ffn_down: t("blk.0.ffn_down.weight", vec![2, 2], 4),
             moe_router: None,
+            mla_q_a_proj: None,
+            mla_q_a_layernorm: None,
+            mla_q_b_proj: None,
+            mla_kv_a_proj_with_mqa: None,
+            mla_kv_a_layernorm: None,
+            mla_kv_b_proj: None,
+            moe_shared_gate: None,
+            moe_shared_up: None,
+            moe_shared_down: None,
             decode_bindings: DecodeLinearBindings::default(),
         }],
     }
@@ -12773,6 +13039,8 @@ fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
                     layer_count: 1,
                     kv_head_count: kv_heads,
                     head_dim,
+                    k_head_dim: head_dim,
+                    v_head_dim: head_dim,
                     key_shape: vec![1, position_count, kv_heads, head_dim],
                     value_shape: vec![1, position_count, kv_heads, head_dim],
                 };
@@ -12968,6 +13236,8 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
                     layer_count: 2,
                     kv_head_count: kv_heads,
                     head_dim,
+                    k_head_dim: head_dim,
+                    v_head_dim: head_dim,
                     key_shape: vec![2, position_count.max(512), kv_heads, head_dim],
                     value_shape: vec![2, position_count.max(512), kv_heads, head_dim],
                 };

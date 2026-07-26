@@ -28,12 +28,14 @@
       "type": "string",
       "$comment": "Code-derived from `status:` literals in src/api/mod.rs. check-ledger-schema.mjs asserts this list is a SUPERSET of the live code values (drift guard). Polymorphic by item type: model rows use the supported_*/active_validation_*/planned_* subset; SupportItem lists (quant/family/api_features) add ok/partial/future/downloading/error.",
       "enum": [
+        "active_validation_blocked_parity",
         "active_validation_partial_runtime",
         "blocked_later_generation_divergence",
         "blocked_pending_normalized_full_support",
         "current_gate_refresh_under_stricter_bar",
         "downloading",
         "error",
+        "experimental_scaffolding",
         "future",
         "not_applicable_until_certified_row",
         "not_applicable_until_runtime_support",
@@ -64,6 +66,7 @@
         "exact_row_gpu_resident_raw_decode_parity_smoke_only",
         "exact_row_single_node_cpu_smoke_only",
         "exact_row_smoke_only",
+        "exact_row_validation_only",
         "future_exact_row_planning_only"
       ]
     },
@@ -73,6 +76,7 @@
       "enum": [
         "blocked_later_generation_divergence",
         "blocked_pending_normalized_full_support",
+        "blocked_prompt_and_generation_parity",
         "current_gate_refresh_under_stricter_bar",
         "not_applicable_until_certified_row",
         "not_applicable_until_runtime_support"
@@ -81,7 +85,13 @@
     "latestCheckedResultVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `latest_checked_result:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["blocked_later_generation_divergence", "not_started", "pass", "planning_only"]
+      "enum": [
+        "blocked_later_generation_divergence",
+        "blocked_prompt_and_generation_parity",
+        "not_started",
+        "pass",
+        "planning_only"
+      ]
     },
     "supportItem": {
       "type": "object",

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
 use crate::inference::{DecodeLinearBindings, LlamaLayerWeights};
-use crate::model::{LlamaFfnTensors, LlamaTensorBinding};
+use crate::model::{LlamaAttentionTensors, LlamaFfnTensors, LlamaTensorBinding};
 use crate::tensor::{cpu_tensor_from_gguf_bytes, CpuTensor, TensorStore};
 
 pub const CGHOST_MAGIC: &[u8; 8] = b"CGHOST1\0";
@@ -137,17 +137,38 @@ pub fn write_cghost(
         }
         let (gate, up, down) = match &layer.ffn {
             LlamaFfnTensors::Dense { gate, up, down } => (gate, up, down),
-            LlamaFfnTensors::MoE { .. } => {
+            _ => {
                 return Err(invalid(format!(
                     "layer {layer_idx} is MoE; ghost v1 supports dense models only"
                 )))
             }
         };
+        let (q, k, v) = match &layer.attention {
+            LlamaAttentionTensors::Standard {
+                q,
+                k,
+                v,
+                biases: None,
+                ..
+            } => (q, k, v),
+            LlamaAttentionTensors::Standard {
+                biases: Some(_), ..
+            } => {
+                return Err(invalid(format!(
+                "layer {layer_idx} has attention projection biases; ghost v1 cannot preserve them"
+            )))
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "layer {layer_idx} is MLA; ghost v1 supports standard attention only"
+                )))
+            }
+        };
         let tensors = vec![
             ("attn_norm".to_string(), layer.attention_norm.name.clone()),
-            ("attn_q".to_string(), layer.attention_q.name.clone()),
-            ("attn_k".to_string(), layer.attention_k.name.clone()),
-            ("attn_v".to_string(), layer.attention_v.name.clone()),
+            ("attn_q".to_string(), q.name.clone()),
+            ("attn_k".to_string(), k.name.clone()),
+            ("attn_v".to_string(), v.name.clone()),
             (
                 "attn_output".to_string(),
                 layer.attention_output.name.clone(),
@@ -411,17 +432,27 @@ impl GhostFile {
                 attention_k: take("attn_k")?,
                 attention_v: take("attn_v")?,
                 attention_output: take("attn_output")?,
+                attention_biases: None,
                 // The ghost (.cghost layer-streaming) format predates QK-norm and
                 // carries no attn_q_norm/attn_k_norm roles, so ghost mode does not
                 // support Qwen3-style models. Left None here; a Qwen3 ghost run is
                 // not a supported configuration.
                 attention_q_norm: None,
                 attention_k_norm: None,
+                mla_q_a_proj: None,
+                mla_q_a_layernorm: None,
+                mla_q_b_proj: None,
+                mla_kv_a_proj_with_mqa: None,
+                mla_kv_a_layernorm: None,
+                mla_kv_b_proj: None,
                 ffn_norm: take("ffn_norm")?,
                 ffn_gate: take("ffn_gate")?,
                 ffn_up: take("ffn_up")?,
                 ffn_down: take("ffn_down")?,
-                moe_router: None,
+                moe_router: None, // ghost v1 only supports dense models
+                moe_shared_gate: None,
+                moe_shared_up: None,
+                moe_shared_down: None,
                 decode_bindings: DecodeLinearBindings::default(),
             },
             span_len,

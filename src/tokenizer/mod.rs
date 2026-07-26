@@ -30,6 +30,8 @@ pub enum BpePreTokenizer {
     /// up to three (`\p{N}{1,3}`).
     #[default]
     Llama3,
+    /// command-r pre-tokenizer, standard byte-fallback tiktoken behavior.
+    CommandR,
     /// llama.cpp `qwen2` (Qwen2/Qwen3): each digit is its own piece (`\p{N}`).
     /// Byte-for-byte identical to `llama-bpe` in every other branch — verified
     /// against `llama-vocab.cpp` LLAMA_VOCAB_PRE_TYPE_LLAMA3 vs _QWEN2.
@@ -49,7 +51,7 @@ impl BpePreTokenizer {
     /// Maximum number of consecutive digits the pre-tokenizer keeps in one piece.
     fn digit_group_max(self) -> usize {
         match self {
-            Self::Llama3 => 3,
+            Self::Llama3 | Self::CommandR => 3,
             Self::Qwen2 | Self::Qwen35 => 1,
         }
     }
@@ -266,11 +268,12 @@ fn resolve_gpt2_pre_tokenizer(
 ) -> Result<BpePreTokenizer> {
     match pre {
         Some("llama-bpe") => Ok(BpePreTokenizer::Llama3),
+        Some("command-r") => Ok(BpePreTokenizer::CommandR),
         Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
         Some("qwen35") => Ok(BpePreTokenizer::Qwen35),
         None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
         other => Err(BackendError::UnsupportedTokenizer(format!(
-            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2, qwen35"
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35"
         ))),
     }
 }

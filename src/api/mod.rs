@@ -35,10 +35,10 @@ use crate::{
         diagnostic_attention_score_scale, diagnostic_ffn_gate_up_order,
         diagnostic_gqa_head_mapping, diagnostic_linear_accumulation_precision,
         diagnostic_output_projection_layout, diagnostic_rectangular_linear_layout,
-        diagnostic_rms_norm_epsilon, diagnostic_rope_direction, diagnostic_rope_pairing,
-        diagnostic_rope_position_mode, diagnostic_square_linear_layout,
-        diagnostic_zero_delta_selector, output_projection_diagnostics,
-        q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry, snapshot_q8_schedule_telemetry,
+        diagnostic_rms_norm_epsilon, diagnostic_rope_direction, diagnostic_rope_position_mode,
+        diagnostic_square_linear_layout, diagnostic_zero_delta_selector,
+        output_projection_diagnostics, q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry,
+        rope_pairing_for_config, snapshot_q8_schedule_telemetry,
         speculative::{
             accepted_draft_prefix, ModelDrafter, NGramDrafter, SpeculativeDrafter,
             DEFAULT_MODEL_DRAFT_TOKENS, DEFAULT_NGRAM_DRAFT_TOKENS,
@@ -47,7 +47,10 @@ use crate::{
         LlamaInferenceSession, LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
         LlamaOutputProjectionDiagnostic, LlamaQ8ScheduleTelemetry, LlamaSampler, SamplingConfig,
     },
-    model::{DenseLlamaDims, LlamaFfnTensors, LlamaModelConfig, LlamaTensorBinding},
+    model::{
+        DenseLlamaDims, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig,
+        LlamaTensorBinding,
+    },
     model_source::{inspect_model_source, ModelSourceInspection, ModelSourceKind},
     receipt::{
         self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
@@ -3004,6 +3007,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "public readiness: Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token exact-row MoE runtime evidence only. Top-k expert routing runs with lazy/file-backed rank-3 Q8 experts, but later Gate 9A 50-token evidence diverged at generated token index 9 and a longer-continuation backend call hung, so API/WebUI/frontend readiness and broad Mixtral support remain unsupported.",
             },
             SupportItem {
+                id: "command_r",
+                status: "experimental_scaffolding",
+                notes: "Command-R tensor, normalization, tokenizer, and logit-scale scaffolding exists, but the runnable parser/admission path still rejects command-r and no exact-row load, generation, parity, or frontend evidence exists.",
+            },
+            SupportItem {
                 id: "qwen25",
                 status: "planned_exact_row_candidate",
                 notes: "public readiness: planned first Qwen row only for Qwen2.5-7B-Instruct-Q8_0.gguf; not supported yet. Architecture mapping, tokenizer/template references, bounded load, prompt-token parity, API/WebUI, RSS, and bundle evidence are missing",
@@ -4240,6 +4248,258 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "capture acquisition path, model SHA and license/access notes, then add tokenizer/chat-template fixtures and independent prompt-token references before any runtime-support wording",
             },
             ModelCompatibilityTarget {
+                id: "phi3_mini_4k_instruct_q8_0",
+                tool_capable: false,
+                family: "phi3",
+                quantization: "Q8_0",
+                status: "active_validation_blocked_parity",
+                support_scope: "exact_row_validation_only",
+                full_support_status: "blocked_prompt_and_generation_parity",
+                full_support_blockers: "committed prompt-token and raw-generation parity receipts fail; API/WebUI readiness, context, performance, and portability evidence are also missing",
+                metadata_parses: "observed",
+                tokenizer_works: "blocked_prompt_token_parity",
+                tensors_load: "observed",
+                generation_runs: "observed_but_not_parity_certified",
+                parity_audited: "failed",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_blocked_parity",
+                frontend_readiness_gate: "fail-closed until prompt-token and generation parity pass for this exact artifact",
+                tested_context: "short_prompt_failed_parity_probe",
+                chat_template_renderer: "phi3_metadata_template_under_validation",
+                chat_template_shape_pack: "failed_reference_parity",
+                chat_template_shape_pack_id: "phi3-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "phi3-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "phi3-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "phi3-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack_id: "phi3-context-4096-smoke-v1",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "phi3_hold_evidence",
+                latest_checked_result: "blocked_prompt_and_generation_parity",
+                latest_checked_output: "qa/muster/phi3-hold-evidence/README.md",
+                evidence: "exact-row work exists, but qa/muster/phi3-hold-evidence records all_match=false for prompt-token parity and all_pass=false for raw/chat generation parity; this row is intentionally not advertised as supported",
+                next_step: "fix Phi-3 tokenizer/template and generation parity, then capture exact-row API/WebUI and bounded-context evidence before promotion",
+            },
+            ModelCompatibilityTarget {
+                id: "deepseek_r1_distill_qwen_7b_q8_0",
+                tool_capable: false,
+                family: "qwen25",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                support_scope: "future_exact_row_planning_only",
+                full_support_status: "not_applicable_until_runtime_support",
+                full_support_blockers: "the exact artifact has no committed load, tokenizer/template, generation parity, API/WebUI, context, performance, or portability evidence",
+                metadata_parses: "not_started",
+                tokenizer_works: "not_started",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                frontend_readiness_gate: "fail-closed until exact-artifact runtime and parity evidence exists",
+                tested_context: "not_started",
+                chat_template_renderer: "qwen25_instruct_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen25-instruct-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "qwen25-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "qwen25-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "qwen25-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack_id: "qwen25-context-4096-smoke-v1",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "planning only: a Qwen2-family base architecture does not certify this DeepSeek-distilled exact artifact",
+                next_step: "acquire and SHA-anchor the exact artifact, then run prompt-token, generation, API/WebUI, memory, and bounded-context gates",
+            },
+            ModelCompatibilityTarget {
+                id: "c4ai_command_r_v01_q8_0",
+                tool_capable: false,
+                family: "command_r",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                support_scope: "future_exact_row_planning_only",
+                full_support_status: "not_applicable_until_runtime_support",
+                full_support_blockers: "command-r is still rejected by runnable architecture admission; the new tensor/tokenizer scaffolding is unreachable and has no exact-row load or parity evidence",
+                metadata_parses: "header_only_not_runnable",
+                tokenizer_works: "scaffolding_unvalidated",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                frontend_readiness_gate: "fail-closed while command-r runtime admission rejects the architecture",
+                tested_context: "not_started",
+                chat_template_renderer: "command_r_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "command-r-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "command-r-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "command-r-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "command-r-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack_id: "command-r-context-4096-smoke-v1",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "planning only: logit-scale, normalization, and tokenizer scaffolding do not make command-r runnable or supported",
+                next_step: "implement and validate command-r admission/binding, then run exact-artifact tokenizer, generation, parity, API/WebUI, memory, and context gates",
+            },
+            ModelCompatibilityTarget {
+                id: "deepseek_r1_distill_llama_8b_q8_0",
+                tool_capable: false,
+                family: "llama",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                support_scope: "future_exact_row_planning_only",
+                full_support_status: "not_applicable_until_runtime_support",
+                full_support_blockers: "the exact artifact has no committed load, tokenizer/template, generation parity, API/WebUI, context, performance, or portability evidence",
+                metadata_parses: "not_started",
+                tokenizer_works: "not_started",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                frontend_readiness_gate: "fail-closed until exact-artifact runtime and parity evidence exists",
+                tested_context: "not_started",
+                chat_template_renderer: "llama3_distill_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "llama3-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack_id: "llama3-context-4096-smoke-v1",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "planning only: support for other Llama exact rows does not certify this DeepSeek-distilled artifact",
+                next_step: "acquire and SHA-anchor the exact artifact, then run prompt-token, generation, API/WebUI, memory, and bounded-context gates",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen25_coder_7b_q8_0",
+                tool_capable: false,
+                family: "qwen25",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                support_scope: "future_exact_row_planning_only",
+                full_support_status: "not_applicable_until_runtime_support",
+                full_support_blockers: "the exact artifact has no committed load, tokenizer/template, generation parity, API/WebUI, context, performance, or portability evidence",
+                metadata_parses: "not_started",
+                tokenizer_works: "not_started",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                frontend_readiness_gate: "fail-closed until exact-artifact runtime and parity evidence exists",
+                tested_context: "not_started",
+                chat_template_renderer: "qwen25_coder_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen25-instruct-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "qwen25-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "qwen25-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "qwen25-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack_id: "qwen25-context-4096-smoke-v1",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "planning only: Qwen2-family runtime work does not certify this coder-tuned exact artifact",
+                next_step: "acquire and SHA-anchor the exact artifact, then run prompt-token, generation, API/WebUI, memory, and bounded-context gates",
+            },
+            ModelCompatibilityTarget {
+                id: "llama31_8b_instruct_q8_0",
+                tool_capable: false,
+                family: "llama",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                support_scope: "future_exact_row_planning_only",
+                full_support_status: "not_applicable_until_runtime_support",
+                full_support_blockers: "the exact artifact has no committed load, tokenizer/template, generation parity, API/WebUI, context, performance, or portability evidence",
+                metadata_parses: "not_started",
+                tokenizer_works: "not_started",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                frontend_readiness_gate: "fail-closed until exact-artifact runtime and parity evidence exists",
+                tested_context: "not_started",
+                chat_template_renderer: "llama31_instruct_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "llama3-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack_id: "llama3-context-4096-smoke-v1",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "planning only: support for other Llama exact rows does not certify this 3.1 8B artifact",
+                next_step: "acquire and SHA-anchor the exact artifact, then run prompt-token, generation, API/WebUI, memory, and bounded-context gates",
+            },
+            ModelCompatibilityTarget {
                 id: "gemma2_9b_it_q8_0",
                 tool_capable: false,
                 family: "gemma2_decoder",
@@ -4829,6 +5089,28 @@ mod gemma4_template_tests {
             "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
+    }
+
+    #[test]
+    fn qwen2_chatml_prompt_matches_default_system_template_shape() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "Reply with exactly: hello".to_string(),
+        }];
+
+        assert_eq!(
+            render_qwen2_chatml_prompt(&messages),
+            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n\
+             <|im_start|>user\nReply with exactly: hello<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        let qwen2_template = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. \
+                              You are a helpful assistant.<|im_end|>";
+        assert!(is_qwen2_chatml_template(qwen2_template));
+        assert!(!is_qwen2_chatml_template(
+            "<|im_start|>user\n{{ content }}<|im_end|>"
+        ));
     }
 
     #[test]
@@ -9487,14 +9769,35 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
             })?;
     }
     for layer in &binding.layers {
-        for desc in [
-            &layer.attention_norm,
-            &layer.attention_q,
-            &layer.attention_k,
-            &layer.attention_v,
-            &layer.attention_output,
-            &layer.ffn_norm,
-        ] {
+        let mut attention_tensors = vec![&layer.attention_norm, &layer.attention_output];
+        match &layer.attention {
+            LlamaAttentionTensors::Standard {
+                q, k, v, biases, ..
+            } => {
+                attention_tensors.extend([q, k, v]);
+                if let Some(biases) = biases {
+                    attention_tensors.extend([&biases.q, &biases.k, &biases.v]);
+                }
+            }
+            LlamaAttentionTensors::Mla {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+                kv_a_proj_with_mqa,
+                kv_a_layernorm,
+                kv_b_proj,
+            } => {
+                attention_tensors.extend([
+                    q_a_proj,
+                    q_a_layernorm,
+                    q_b_proj,
+                    kv_a_proj_with_mqa,
+                    kv_a_layernorm,
+                    kv_b_proj,
+                ]);
+            }
+        }
+        for desc in attention_tensors {
             total = total
                 .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
                 .ok_or_else(|| {
@@ -9503,6 +9806,17 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                     )
                 })?;
         }
+        total = total
+            .checked_add(tensor_estimate(
+                &layer.ffn_norm,
+                retain_q8_blocks,
+                lazy_q8_linear,
+            )?)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(
+                    "CPU materialization byte estimate overflow".to_string(),
+                )
+            })?;
         match &layer.ffn {
             LlamaFfnTensors::Dense { gate, up, down } => {
                 for desc in [gate, up, down] {
@@ -9522,6 +9836,30 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 down_experts,
             } => {
                 for desc in std::iter::once(router)
+                    .chain(gate_experts.descriptors())
+                    .chain(up_experts.descriptors())
+                    .chain(down_experts.descriptors())
+                {
+                    total = total
+                        .checked_add(tensor_estimate(desc, retain_q8_blocks, lazy_q8_linear)?)
+                        .ok_or_else(|| {
+                            BackendError::InvalidTensorData(
+                                "CPU materialization byte estimate overflow".to_string(),
+                            )
+                        })?;
+                }
+            }
+            LlamaFfnTensors::DeepSeekMoE {
+                shared_gate,
+                shared_up,
+                shared_down,
+                router,
+                gate_experts,
+                up_experts,
+                down_experts,
+            } => {
+                for desc in [shared_gate, shared_up, shared_down, router]
+                    .into_iter()
                     .chain(gate_experts.descriptors())
                     .chain(up_experts.descriptors())
                     .chain(down_experts.descriptors())
@@ -9572,13 +9910,20 @@ fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
             }
             // MoE is not resident-eligible; its experts take the eager-f32 CPU path,
             // which the guard must keep protecting.
-            LlamaFfnTensors::MoE { .. } => false,
+            LlamaFfnTensors::MoE { .. } | LlamaFfnTensors::DeepSeekMoE { .. } => false,
         };
-        dense
-            && is_resident_quant(&layer.attention_q)
-            && is_resident_quant(&layer.attention_k)
-            && is_resident_quant(&layer.attention_v)
-            && is_resident_quant(&layer.attention_output)
+        let attention_resident = match &layer.attention {
+            LlamaAttentionTensors::Standard {
+                q, k, v, biases, ..
+            } => {
+                biases.is_none()
+                    && is_resident_quant(q)
+                    && is_resident_quant(k)
+                    && is_resident_quant(v)
+            }
+            LlamaAttentionTensors::Mla { .. } => false, // MLA not resident eligible
+        };
+        dense && attention_resident && is_resident_quant(&layer.attention_output)
     })
 }
 
@@ -10244,7 +10589,7 @@ fn dense_diagnostic_metadata(
         rope_scaling_original_context_length: config.rope_scaling_original_context_length,
         rope_scaling_low_freq_factor: config.rope_scaling_low_freq_factor,
         rope_scaling_high_freq_factor: config.rope_scaling_high_freq_factor,
-        rope_pairing: diagnostic_rope_pairing()
+        rope_pairing: rope_pairing_for_config(config)
             .map(|pairing| pairing.label())
             .unwrap_or("invalid_env"),
         rope_direction: diagnostic_rope_direction()
@@ -13001,6 +13346,12 @@ fn render_chat_prompt_for_tokenization_with_tools(
                 parse_special: true,
             });
         }
+        if is_qwen2_chatml_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "Qwen2/Qwen2.5 tool-call template rendering is not validated; failing closed",
+            ));
+        }
         // Qwen3's full Jinja template uses constructs minijinja can't evaluate;
         // render tools via the dedicated ChatML+tools path instead.
         if is_qwen3_chatml_template(template) {
@@ -13088,6 +13439,13 @@ fn render_chat_prompt_for_tokenization_fallback(
                 parse_special: true,
             };
         }
+        if is_qwen2_chatml_template(template) {
+            return RenderedPrompt {
+                text: render_qwen2_chatml_prompt(messages),
+                add_special: false,
+                parse_special: true,
+            };
+        }
         if is_qwen3_chatml_template(template) {
             return RenderedPrompt {
                 text: render_qwen3_chatml_prompt(messages, enable_thinking),
@@ -13105,6 +13463,42 @@ fn render_chat_prompt_for_tokenization_fallback(
         add_special: true,
         parse_special: tokenizer.chat_prompt_parse_special(),
     }
+}
+
+/// Render the no-tools Qwen2/Qwen2.5 ChatML template shipped in the model GGUF.
+/// Unlike Qwen3, this template injects Qwen's default system preamble when the
+/// caller did not supply one and opens a plain assistant turn (no thinking tags).
+fn render_qwen2_chatml_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    let first_is_system = messages
+        .first()
+        .is_some_and(|message| message.role.trim() == "system");
+
+    prompt.push_str("<|im_start|>system\n");
+    if first_is_system {
+        prompt.push_str(&messages[0].content);
+    } else {
+        prompt.push_str("You are Qwen, created by Alibaba Cloud. You are a helpful assistant.");
+    }
+    prompt.push_str("<|im_end|>\n");
+
+    let mut append_generation_prompt = true;
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.role.trim();
+        if index == 0 && first_is_system {
+            continue;
+        }
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n");
+    }
+    prompt
 }
 
 /// Render a Qwen3 ChatML prompt. Mirrors the GGUF jinja template for the standard
@@ -13237,7 +13631,15 @@ fn is_mistral_instruct_template(template: &str) -> bool {
         && (template.contains("bos_token") || template.contains("</s>"))
 }
 
-/// Qwen3 (and Qwen2) ChatML template detector: `<|im_start|>` / `<|im_end|>`
+fn is_qwen2_chatml_template(template: &str) -> bool {
+    template.contains("<|im_start|>")
+        && template.contains("<|im_end|>")
+        && template.contains("You are Qwen, created by Alibaba Cloud")
+}
+
+/// Generic Qwen3 ChatML template detector: `<|im_start|>` / `<|im_end|>`.
+/// Qwen2/Qwen2.5's distinct default-system template is detected first by
+/// [`is_qwen2_chatml_template`].
 /// turn markers. camelid's minijinja cannot render the full Qwen3 jinja template
 /// (it uses constructs that evaluate to undefined), so the dense ChatML path is
 /// rendered by [`render_qwen3_chatml_prompt`] instead.
@@ -15383,9 +15785,13 @@ mod tests {
         );
 
         for id in [
-            "mixtral_8x7b_instruct_v0_1_q8_0",
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
+            "deepseek_r1_distill_qwen_7b_q8_0",
+            "c4ai_command_r_v01_q8_0",
+            "deepseek_r1_distill_llama_8b_q8_0",
+            "qwen25_coder_7b_q8_0",
+            "llama31_8b_instruct_q8_0",
         ] {
             let target = response
                 .model_compatibility
@@ -15414,6 +15820,7 @@ mod tests {
     #[test]
     fn capabilities_report_next_family_rows_stay_planned_and_fail_closed() {
         let response = capabilities_response();
+
         let mixtral = response
             .model_compatibility
             .iter()
@@ -15440,7 +15847,15 @@ mod tests {
             .contains("Gate 9A 50-token evidence diverged at generated token index 9"));
         assert!(mixtral.evidence.contains("No broad Mixtral"));
 
-        let planned_rows = ["qwen25_7b_instruct_q8_0", "gemma2_9b_it_q8_0"];
+        let planned_rows = [
+            "qwen25_7b_instruct_q8_0",
+            "gemma2_9b_it_q8_0",
+            "deepseek_r1_distill_qwen_7b_q8_0",
+            "c4ai_command_r_v01_q8_0",
+            "deepseek_r1_distill_llama_8b_q8_0",
+            "qwen25_coder_7b_q8_0",
+            "llama31_8b_instruct_q8_0",
+        ];
 
         for id in planned_rows {
             let target = response
@@ -15466,6 +15881,21 @@ mod tests {
             assert!(target.frontend_readiness_gate.contains("fail-closed"));
             assert!(target.evidence.contains("planning only"));
         }
+
+        let phi3 = response
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "phi3_mini_4k_instruct_q8_0")
+            .expect("Phi-3 exact-row validation lane should stay visible");
+        assert_eq!(phi3.status, "active_validation_blocked_parity");
+        assert_eq!(phi3.parity_audited, "failed");
+        assert_eq!(
+            phi3.latest_checked_result,
+            "blocked_prompt_and_generation_parity"
+        );
+        assert!(phi3.frontend_readiness_gate.contains("fail-closed"));
+        assert!(phi3.evidence.contains("all_match=false"));
+        assert!(phi3.evidence.contains("all_pass=false"));
     }
 
     #[test]
@@ -15935,6 +16365,27 @@ mod tests {
                 "{ty:?} binding must not bypass the CPU materialization guard"
             );
         }
+    }
+
+    #[test]
+    fn binding_all_resident_quant_linears_rejects_attention_biases() {
+        let mut binding = materialization_binding(false, GgufTensorType::Q8_0, vec![256, 256]);
+        let bias =
+            |name: &str, width: u64| materialization_desc(name, GgufTensorType::F32, vec![width]);
+        let LlamaAttentionTensors::Standard { biases, .. } = &mut binding.layers[0].attention
+        else {
+            unreachable!("materialization fixture uses standard attention");
+        };
+        *biases = Some(crate::model::LlamaAttentionBiasTensors {
+            q: bias("blk.0.attn_q.bias", 256),
+            k: bias("blk.0.attn_k.bias", 256),
+            v: bias("blk.0.attn_v.bias", 256),
+        });
+
+        assert!(
+            !binding_all_resident_quant_linears(&binding),
+            "resident engines must not run a layer whose projection biases they cannot apply"
+        );
     }
 
     #[test]
@@ -17515,14 +17966,20 @@ mod tests {
             output: desc("output.weight"),
             output_is_tied_embedding: tied_output,
             rope_freqs: None,
+            mla_metadata: None,
+            attention_head_count: 1,
+            hidden_size: dimensions.first().copied().unwrap_or(1) as usize,
             layers: vec![crate::model::LlamaLayerTensors {
                 attention_norm: desc("blk.0.attn_norm.weight"),
-                attention_q: desc("blk.0.attn_q.weight"),
-                attention_k: desc("blk.0.attn_k.weight"),
-                attention_v: desc("blk.0.attn_v.weight"),
+                attention: LlamaAttentionTensors::Standard {
+                    q: desc("blk.0.attn_q.weight"),
+                    k: desc("blk.0.attn_k.weight"),
+                    v: desc("blk.0.attn_v.weight"),
+                    biases: None,
+                    q_norm: None,
+                    k_norm: None,
+                },
                 attention_output: desc("blk.0.attn_output.weight"),
-                attention_q_norm: None,
-                attention_k_norm: None,
                 ffn_norm: desc("blk.0.ffn_norm.weight"),
                 ffn: LlamaFfnTensors::Dense {
                     gate: desc("blk.0.ffn_gate.weight"),
@@ -17810,9 +18267,11 @@ mod tests {
             file_type: Some(0),
             rope_neox_pairing: false,
             attention_key_length: None,
+            logit_scale: None,
             moe: None,
             gemma4: None,
             qwen35: None,
+            mla: None,
         }
     }
 
@@ -17843,6 +18302,7 @@ mod tests {
                     hidden,
                     &[0, 1, 2, 3],
                 ),
+                attention_biases: None,
                 ffn_norm: ones("blk.0.ffn_norm.weight", hidden),
                 ffn_gate: select_rows("blk.0.ffn_gate.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
                 ffn_up: select_rows("blk.0.ffn_up.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
@@ -17850,6 +18310,15 @@ mod tests {
                 attention_q_norm: None,
                 attention_k_norm: None,
                 moe_router: None,
+                mla_q_a_proj: None,
+                mla_q_a_layernorm: None,
+                mla_q_b_proj: None,
+                mla_kv_a_proj_with_mqa: None,
+                mla_kv_a_layernorm: None,
+                mla_kv_b_proj: None,
+                moe_shared_gate: None,
+                moe_shared_up: None,
+                moe_shared_down: None,
                 decode_bindings: DecodeLinearBindings::default(),
             }],
             layer_range: None,
@@ -18283,6 +18752,71 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             architecture: "phi3",
             license: "mit",
             task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "deepseek_r1_distill_qwen_7b_q8_0",
+            name: "DeepSeek R1 Distill Qwen 7B Q8_0",
+            repo_id: "unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF",
+            filename: "DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf",
+            size_bytes: 8098524896,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "qwen25",
+            license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "c4ai_command_r_v01_q8_0",
+            name: "Cohere Command R v01 Q8_0",
+            repo_id: "second-state/C4AI-Command-R-v01-GGUF",
+            filename: "c4ai-command-r-v01-Q8_0.gguf",
+            size_bytes: 37179013760,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "command-r",
+            license: "cc-by-nc-4.0",
+            task_tags: &["general"],
+        },
+        CatalogItem {
+            catalog_id: "deepseek_r1_distill_llama_8b_q8_0",
+            name: "DeepSeek R1 Distill Llama 8B Q8_0",
+            repo_id: "unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF",
+            filename: "DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf",
+            size_bytes: 8540773088,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "llama",
+            license: "llama3.1",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "qwen25_coder_7b_q8_0",
+            name: "Qwen2.5 Coder 7B Q8_0",
+            repo_id: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            filename: "qwen2.5-coder-7b-instruct-q8_0.gguf",
+            size_bytes: 8098525184,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "qwen25",
+            license: "apache-2.0",
+            task_tags: &["coding"],
+        },
+        CatalogItem {
+            catalog_id: "llama31_8b_instruct_q8_0",
+            name: "Llama 3.1 8B Instruct Q8_0",
+            repo_id: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            filename: "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+            size_bytes: 8540775840,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "llama",
+            license: "llama3.1",
+            task_tags: &["general"],
         },
     ]
 }

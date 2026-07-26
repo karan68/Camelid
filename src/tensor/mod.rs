@@ -2259,6 +2259,60 @@ impl CpuTensor {
                 },
             );
         }
+        if let Some(wire) = self.q2_k_wire_bytes.as_deref() {
+            return self.embedding_lookup_kquant_wire(
+                token_ids,
+                name,
+                vocab,
+                width,
+                wire,
+                Q2_K_BLOCK_BYTES,
+                |b, out| {
+                    let blk: &[u8; Q2_K_BLOCK_BYTES] = b.try_into().unwrap();
+                    Q2KBlock::from_bytes(blk).dequantize(out);
+                },
+            );
+        }
+        if let Some(wire) = self.q3_k_wire_bytes.as_deref() {
+            return self.embedding_lookup_kquant_wire(
+                token_ids,
+                name,
+                vocab,
+                width,
+                wire,
+                Q3_K_BLOCK_BYTES,
+                |b, out| {
+                    let blk: &[u8; Q3_K_BLOCK_BYTES] = b.try_into().unwrap();
+                    Q3KBlock::from_bytes(blk).dequantize(out);
+                },
+            );
+        }
+        if let Some(wire) = self.iq4_xs_wire_bytes.as_deref() {
+            return self.embedding_lookup_kquant_wire(
+                token_ids,
+                name,
+                vocab,
+                width,
+                wire,
+                IQ4_XS_BLOCK_BYTES,
+                |b, out| {
+                    let blk: &[u8; IQ4_XS_BLOCK_BYTES] = b.try_into().unwrap();
+                    IQ4XSBlock::from_bytes(blk).dequantize(out);
+                },
+            );
+        }
+        let expected_dense_len = vocab.checked_mul(width).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("embedding dense element count overflow".to_string())
+        })?;
+        if self.data.len() != expected_dense_len {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "embedding tensor {} has no readable backing: dense elements {}, expected {}; source type {:?}",
+                self.name,
+                self.data.len(),
+                expected_dense_len,
+                self.source_type
+            )));
+        }
         let output_len = token_ids.len().checked_mul(width).ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(
                 "embedding lookup output element count overflow".to_string(),
@@ -5328,7 +5382,11 @@ fn decode_q5_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
     Ok(out)
 }
 
-fn decode_q2_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_q2_k_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
     let blocks = decode_q2_k_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
@@ -6405,9 +6463,12 @@ mod tests {
         f16_bits_to_f32, parse_byte_count, q8_0_file_read_stats, q8_file_cache_get,
         q8_file_cache_insert, q8_repack_tensor_enabled_for_flags, q8_repack_x86_tensor_enabled,
         with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
-        Q8_0PackedRows4, Q8_0PackedRows4Interleave, TensorShape, Q8_0_BLOCK_BYTES,
+        Q8_0PackedRows4, Q8_0PackedRows4Interleave, TensorShape, Q3_K_BLOCK_BYTES,
+        Q8_0_BLOCK_BYTES,
     };
+    use crate::gguf::GgufTensorType;
     use crate::test_support::env_lock;
+    use std::sync::Arc;
 
     #[test]
     fn q8_file_cache_disabled_path_does_not_store_or_hit() {
@@ -6539,6 +6600,35 @@ mod tests {
         assert_eq!(embedding.shape.dims, vec![2, 32]);
         assert_eq!(&embedding.data[..32], &[-1.0; 32]);
         assert_eq!(&embedding.data[32..], &[1.0; 32]);
+    }
+
+    #[test]
+    fn q3_k_wire_backed_embedding_dequantizes_without_dense_data() {
+        let mut tensor =
+            CpuTensor::from_f32("token_embd.weight", vec![2, 256], vec![0.0; 512]).unwrap();
+        tensor.source_type = Some(GgufTensorType::Q3K);
+        tensor.data.clear();
+        tensor.q3_k_wire_bytes = Some(Arc::new(vec![0; 2 * Q3_K_BLOCK_BYTES]));
+
+        let embedding = tensor.embedding_lookup(&[1], "embedding").unwrap();
+
+        assert_eq!(embedding.shape.dims, vec![1, 256]);
+        assert!(embedding.data.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn embedding_lookup_without_any_backing_returns_typed_error() {
+        let mut tensor =
+            CpuTensor::from_f32("token_embd.weight", vec![1, 256], vec![0.0; 256]).unwrap();
+        tensor.source_type = Some(GgufTensorType::Q3K);
+        tensor.data.clear();
+
+        let error = tensor.embedding_lookup(&[0], "embedding").unwrap_err();
+
+        assert!(
+            error.to_string().contains("has no readable backing"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

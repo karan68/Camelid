@@ -348,6 +348,8 @@ pub struct RunnableModel {
     /// gemma2 logit soft-caps; gemma3 has neither. `cap * tanh(x / cap)`.
     final_logit_softcap: Option<f32>,
     attn_logit_softcap: Option<f32>,
+    /// Logit scale — applied before softmax, commonly in Command R models.
+    logit_scale: Option<f32>,
     token_embd: RawMat, // [in=d_model, out=vocab]; row = token embedding
     output: RawMat,     // logits projection; tied models reuse token_embd
     output_norm: Vec<f32>,
@@ -525,6 +527,7 @@ impl RunnableModel {
                 ffn_gelu: false,
                 final_logit_softcap: None,
                 attn_logit_softcap: None,
+                logit_scale: None,
                 token_embd,
                 output,
                 output_norm,
@@ -597,9 +600,10 @@ impl RunnableModel {
         }
 
         let is_gemma = arch.starts_with("gemma");
-        // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3 (unpermuted weights);
-        // adjacent even/odd for llama-family (llama.cpp permutes those weights).
-        let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3";
+        let is_command_r = arch == "command-r";
+        // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3/command-r (unpermuted weights);
+        // LLAMA (interleaved) for standard variants.
+        let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3" || is_command_r;
         // gemma3 dual RoPE: every Nth layer (sliding_window_pattern, default 6) is a
         // GLOBAL-attention layer using the GGUF freq_base (1e6); the rest are local
         // sliding-window layers using the gemma3 default local base (10000). The
@@ -623,6 +627,7 @@ impl RunnableModel {
 
         let final_logit_softcap = gguf.metadata_f32(&format!("{arch}.final_logit_softcapping"));
         let attn_logit_softcap = gguf.metadata_f32(&format!("{arch}.attn_logit_softcapping"));
+        let logit_scale = gguf.metadata_f32(&format!("{arch}.logit_scale"));
 
         Ok(Self {
             architecture: arch,
@@ -645,6 +650,7 @@ impl RunnableModel {
             ffn_gelu: is_gemma,
             final_logit_softcap,
             attn_logit_softcap,
+            logit_scale,
             token_embd,
             output,
             output_norm,
@@ -653,6 +659,22 @@ impl RunnableModel {
             #[cfg(feature = "cuda")]
             cuda: std::sync::Mutex::new(None),
         })
+    }
+
+    fn apply_norm(&self, x: &[f32], weight: &[f32]) -> Vec<f32> {
+        if self.architecture == "command-r" {
+            layer_norm(x, weight, self.eps)
+        } else {
+            rms_norm(x, weight, self.eps)
+        }
+    }
+
+    fn apply_norm_heads(&self, vec: &mut [f32], n_heads: usize, head_dim: usize, weight: &[f32]) {
+        if self.architecture == "command-r" {
+            layer_norm_heads(vec, n_heads, head_dim, weight, self.eps)
+        } else {
+            norm_heads(vec, n_heads, head_dim, weight, self.eps)
+        }
     }
 
     /// Forward the whole token sequence; return logits for the **last** position.
@@ -696,7 +718,7 @@ impl RunnableModel {
 
         // Final norm on the last position, then logits (one dequantized row per vocab).
         let last = &hidden[(seq - 1) * dm..seq * dm];
-        let normed = rms_norm(last, &self.output_norm, self.eps);
+        let normed = self.apply_norm(last, &self.output_norm);
         let mut logits = vec![0.0f32; self.vocab];
         for (t, lt) in logits.iter_mut().enumerate() {
             let row = self.output.dequant_row(t, "output")?;
@@ -706,6 +728,11 @@ impl RunnableModel {
         if let Some(cap) = self.final_logit_softcap {
             for l in logits.iter_mut() {
                 *l = cap * (*l / cap).tanh();
+            }
+        }
+        if let Some(scale) = self.logit_scale {
+            for l in logits.iter_mut() {
+                *l *= scale;
             }
         }
         Ok(logits)
@@ -769,7 +796,7 @@ impl RunnableModel {
 
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention (single query position over cached K/V) ---
-            let xn = rms_norm(&hidden, &layer.attn_norm, self.eps);
+            let xn = self.apply_norm(&hidden, &layer.attn_norm);
             let wq = layer.wq.dequant_all(&name(li, "attn_q"))?;
             let wk = layer.wk.dequant_all(&name(li, "attn_k"))?;
             let wv = layer.wv.dequant_all(&name(li, "attn_v"))?;
@@ -778,10 +805,10 @@ impl RunnableModel {
             let mut kp = wk.matvec(&xn);
             let vp = wv.matvec(&xn);
             if let Some(qn) = &layer.q_norm {
-                norm_heads(&mut qp, self.n_heads, hd, qn, self.eps);
+                self.apply_norm_heads(&mut qp, self.n_heads, hd, qn);
             }
             if let Some(kn) = &layer.k_norm {
-                norm_heads(&mut kp, self.n_kv_heads, hd, kn, self.eps);
+                self.apply_norm_heads(&mut kp, self.n_kv_heads, hd, kn);
             }
             let rb = self.layer_rope_base[li];
             self.apply_rope(&mut qp, self.n_heads, pos, rb);
@@ -825,14 +852,14 @@ impl RunnableModel {
             }
             let mut proj = wo.matvec(&attn_out);
             if let Some(pn) = &layer.post_attn_norm {
-                proj = rms_norm(&proj, pn, self.eps);
+                proj = self.apply_norm(&proj, pn);
             }
             for (h, p) in hidden.iter_mut().zip(proj.iter()) {
                 *h += *p;
             }
 
             // --- FFN ---
-            let xn2 = rms_norm(&hidden, &layer.ffn_norm, self.eps);
+            let xn2 = self.apply_norm(&hidden, &layer.ffn_norm);
             let gate = layer.gate.dequant_all(&name(li, "ffn_gate"))?;
             let up = layer.up.dequant_all(&name(li, "ffn_up"))?;
             let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
@@ -849,14 +876,14 @@ impl RunnableModel {
             }
             let mut d = down.matvec(&act);
             if let Some(pn) = &layer.post_ffn_norm {
-                d = rms_norm(&d, pn, self.eps);
+                d = self.apply_norm(&d, pn);
             }
             for (h, dv) in hidden.iter_mut().zip(d.iter()) {
                 *h += *dv;
             }
         }
 
-        let normed = rms_norm(&hidden, &self.output_norm, self.eps);
+        let normed = self.apply_norm(&hidden, &self.output_norm);
         let mut logits = vec![0.0f32; self.vocab];
         for (tk, lt) in logits.iter_mut().enumerate() {
             let row = self.output.dequant_row(tk, "output")?;
@@ -865,6 +892,11 @@ impl RunnableModel {
         if let Some(cap) = self.final_logit_softcap {
             for l in logits.iter_mut() {
                 *l = cap * (*l / cap).tanh();
+            }
+        }
+        if let Some(scale) = self.logit_scale {
+            for l in logits.iter_mut() {
+                *l *= scale;
             }
         }
         Ok(logits)
@@ -895,16 +927,16 @@ impl RunnableModel {
         let mut v = vec![0.0f32; seq * kv_dim];
         for pos in 0..seq {
             let x = &hidden[pos * dm..(pos + 1) * dm];
-            let xn = rms_norm(x, &layer.attn_norm, self.eps);
+            let xn = self.apply_norm(x, &layer.attn_norm);
             let mut qp = wq.matvec(&xn);
             let mut kp = wk.matvec(&xn);
             let vp = wv.matvec(&xn);
             // QK-norm (qwen3, gemma3): per-head RMSNorm before RoPE.
             if let Some(qn) = &layer.q_norm {
-                norm_heads(&mut qp, self.n_heads, hd, qn, self.eps);
+                self.apply_norm_heads(&mut qp, self.n_heads, hd, qn);
             }
             if let Some(kn) = &layer.k_norm {
-                norm_heads(&mut kp, self.n_kv_heads, hd, kn, self.eps);
+                self.apply_norm_heads(&mut kp, self.n_kv_heads, hd, kn);
             }
             let rope_base = self.layer_rope_base[li];
             self.apply_rope(&mut qp, self.n_heads, pos, rope_base);
@@ -950,7 +982,7 @@ impl RunnableModel {
             let mut proj = wo.matvec(&attn_out);
             // gemma: post-attention RMSNorm before the residual add.
             if let Some(pn) = &layer.post_attn_norm {
-                proj = rms_norm(&proj, pn, self.eps);
+                proj = self.apply_norm(&proj, pn);
             }
             let dst = &mut hidden[pos * dm..(pos + 1) * dm];
             for (h, p) in dst.iter_mut().zip(proj.iter()) {
@@ -967,7 +999,7 @@ impl RunnableModel {
         let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
         for pos in 0..seq {
             let x = &hidden[pos * dm..(pos + 1) * dm];
-            let xn = rms_norm(x, &layer.ffn_norm, self.eps);
+            let xn = self.apply_norm(x, &layer.ffn_norm);
             let g = gate.matvec(&xn);
             let u = up.matvec(&xn);
             // Gated FFN: gemma uses GeGLU (gelu-tanh), llama uses SwiGLU (silu).
@@ -983,7 +1015,7 @@ impl RunnableModel {
             let mut d = down.matvec(&act);
             // gemma: post-FFN RMSNorm before the residual add.
             if let Some(pn) = &layer.post_ffn_norm {
-                d = rms_norm(&d, pn, self.eps);
+                d = self.apply_norm(&d, pn);
             }
             let dst = &mut hidden[pos * dm..(pos + 1) * dm];
             for (hv, dv) in dst.iter_mut().zip(d.iter()) {
@@ -1237,7 +1269,7 @@ impl RunnableModel {
         for (li, layer) in rt.layers.iter().enumerate() {
             let xn: Vec<Vec<f32>> = hidden
                 .iter()
-                .map(|h| rms_norm(h, &layer.attn_norm, self.eps))
+                .map(|h| self.apply_norm(h, &layer.attn_norm))
                 .collect();
             let mix: Vec<Vec<f32>> = match &layer.kind {
                 Qwen35Kind::Full {
@@ -1302,7 +1334,7 @@ impl RunnableModel {
             // FFN (SwiGLU), batched, pre-normed by post_attention_norm.
             let xn2: Vec<Vec<f32>> = hidden
                 .iter()
-                .map(|h| rms_norm(h, &layer.post_attn_norm, self.eps))
+                .map(|h| self.apply_norm(h, &layer.post_attn_norm))
                 .collect();
             let g = layer.ffn_gate.par_matmul(&xn2)?;
             let u = layer.ffn_up.par_matmul(&xn2)?;
@@ -1324,7 +1356,7 @@ impl RunnableModel {
             }
         }
 
-        let normed = rms_norm(&hidden[m - 1], &self.output_norm, self.eps);
+        let normed = self.apply_norm(&hidden[m - 1], &self.output_norm);
         let logits = self.output.par_matvec(&normed, "output")?;
         Ok((cache, logits))
     }
@@ -1628,7 +1660,7 @@ impl RunnableModel {
         let mut hidden = self.token_embd.dequant_row(t, "token_embd")?;
 
         for (li, layer) in rt.layers.iter().enumerate() {
-            let xn = rms_norm(&hidden, &layer.attn_norm, self.eps);
+            let xn = self.apply_norm(&hidden, &layer.attn_norm);
             let mix = match &layer.kind {
                 Qwen35Kind::Full {
                     wq,
@@ -1646,7 +1678,7 @@ impl RunnableModel {
 
             // FFN (SwiGLU), pre-normed by post_attention_norm; residual base is the
             // post-attention hidden state (matches qwen35.cpp ffn_residual).
-            let xn2 = rms_norm(&hidden, &layer.post_attn_norm, self.eps);
+            let xn2 = self.apply_norm(&hidden, &layer.post_attn_norm);
             let g = layer.ffn_gate.par_matvec(&xn2, &name(li, "ffn_gate"))?;
             let u = layer.ffn_up.par_matvec(&xn2, &name(li, "ffn_up"))?;
             let mut act = vec![0.0f32; g.len()];
@@ -1665,7 +1697,7 @@ impl RunnableModel {
         }
         // Final norm + LM head (fused row-parallel; bit-identical to the sequential
         // loop). The 248k-row output projection is the single biggest decode cost.
-        let normed = rms_norm(&hidden, &self.output_norm, self.eps);
+        let normed = self.apply_norm(&hidden, &self.output_norm);
         self.output.par_matvec(&normed, "output")
     }
 
@@ -1724,10 +1756,10 @@ impl RunnableModel {
             q[h * hd..(h + 1) * hd].copy_from_slice(&qg[b..b + hd]);
             gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[b + hd..b + 2 * hd]);
         }
-        norm_heads(&mut q, n_head, hd, q_norm, self.eps);
+        self.apply_norm_heads(&mut q, n_head, hd, q_norm);
 
         let mut k = k_in.to_vec();
-        norm_heads(&mut k, n_kv, hd, k_norm, self.eps);
+        self.apply_norm_heads(&mut k, n_kv, hd, k_norm);
 
         // Partial NEOX RoPE: rotates the first rope_dim (64) of each 256-wide head.
         self.apply_rope(&mut q, n_head, pos, self.rope_base);
@@ -1985,10 +2017,21 @@ fn norm_heads(vec: &mut [f32], n_heads: usize, head_dim: usize, weight: &[f32], 
     }
 }
 
-/// RMSNorm: `x * rsqrt(mean(x^2) + eps) * weight`. The GGUF weight is applied
-/// directly for every architecture — gemma's `(1 + weight)` convention is already
-/// baked into the GGUF (llama.cpp's gemma conversion adds 1 at convert time, so the
-/// weights read as ~5 not ~0), so no special-casing is needed here.
+/// Per-head LayerNorm in place: normalize each of `n_heads` contiguous `head_dim`
+/// slices with the shared `weight` (length `head_dim`). Centers the mean before variance.
+fn layer_norm_heads(vec: &mut [f32], n_heads: usize, head_dim: usize, weight: &[f32], eps: f32) {
+    for h in 0..n_heads {
+        let slice = &mut vec[h * head_dim..(h + 1) * head_dim];
+        let mean = slice.iter().sum::<f32>() / head_dim as f32;
+        let var = slice.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / head_dim as f32;
+        let inv = 1.0 / (var + eps).sqrt();
+        for (x, w) in slice.iter_mut().zip(weight.iter()) {
+            *x = (*x - mean) * inv * *w;
+        }
+    }
+}
+
+/// RMSNorm: `x * rsqrt(mean(x^2) + eps) * weight`.
 fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len() as f32;
     let ss: f32 = x.iter().map(|v| v * v).sum();
@@ -1996,6 +2039,16 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     x.iter()
         .zip(weight.iter())
         .map(|(v, w)| v * inv * w)
+        .collect()
+}
+
+fn layer_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let mean = x.iter().sum::<f32>() / x.len() as f32;
+    let var = x.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / x.len() as f32;
+    let inv = 1.0 / (var + eps).sqrt();
+    x.iter()
+        .zip(weight.iter())
+        .map(|(v, w)| (v - mean) * inv * w)
         .collect()
 }
 
