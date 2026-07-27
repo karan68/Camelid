@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "e78dc0a",
+    "source_head": "26c6fe6",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -1636,7 +1636,7 @@
         "status": "active_validation_blocked_parity",
         "support_scope": "exact_row_validation_only",
         "full_support_status": "blocked_generation_parity",
-        "full_support_blockers": "the committed raw-generation parity receipt fails: the forward pass diverges from the reference (and disagrees with itself between fresh prefill and incremental decode); API/WebUI readiness, context, performance, and portability evidence are also missing. Prompt-token parity no longer blocks",
+        "full_support_blockers": "the engine is NON-DETERMINISTIC on this architecture at temperature 0, so generation parity cannot be certified; API/WebUI readiness, context, performance, and portability evidence are also missing. Prompt-token parity no longer blocks",
         "metadata_parses": "observed",
         "tokenizer_works": "validated_raw_8_of_8_and_chat_3_of_3_prompt_token_parity",
         "tensors_load": "observed",
@@ -1645,7 +1645,7 @@
         "performance_measured": "not_started",
         "frontend_load_path_verified": "fail_closed_blocked_parity",
         "frontend_readiness_gate": "fail-closed until generation parity passes for this exact artifact",
-        "tested_context": "prompt_token_parity_to_2180_tokens_generation_diverges_by_the_4th_token",
+        "tested_context": "prompt_token_parity_to_2180_tokens_generation_nondeterministic_at_temperature_zero",
         "chat_template_renderer": "phi3_metadata_template_prompt_tokens_reference_matched",
         "chat_template_shape_pack": "failed_reference_parity",
         "chat_template_shape_pack_id": "phi3-chat-template-pack-v1",
@@ -1667,8 +1667,8 @@
         "latest_checked_bucket": "phi3_hold_evidence",
         "latest_checked_result": "blocked_generation_parity",
         "latest_checked_output": "qa/muster/phi3-hold-evidence/README.md",
-        "evidence": "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. Generation parity still FAILS and blocks the row: on the 9-token prefix 'The capital of France is Paris.\\\\n' the reference is ~99.1% confident of <|assistant|> (logprob -0.0091) while camelid ranks it -4.944 and emits '===', and camelid disagrees with itself between fresh prefill and incremental decode at that position — qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json rules out the tokenizer, RoPE pairing, the padded vocab, sampling policy and detokenization. This row is intentionally not advertised as supported",
-        "next_step": "localize the forward-pass divergence by layer-level activation tracing against the reference (prefill and decode disagree, so the attention/KV-cache path is the open suspect), then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion"
+        "evidence": "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. Generation parity still blocks the row, but the cause is NON-DETERMINISM, not a fixed forward-pass error: six identical temperature-0 requests on the 9-token prefix 'The capital of France is Paris.\\\\n' returned two different tokens, flipping between the reference <|assistant|> (32001) and \\\\n (13), with the reference token winning a majority of runs — qa/muster/phi3-hold-evidence/nondeterminism-q8-20260727.json. That receipt scopes it to phi3 (Llama-3.2-3B on metal_resident and Mistral-7B on the SAME cpu_reference path are both bit-identical across runs) and rules out a parallel-reduction race (--threads 1) and lazy Q8 materialization (CAMELID_LAZY_Q8_0_LINEAR=0); phi3-only head_dim=96 and the fused attn_qkv/ffn_up sub-row expansion are the open suspects. It SUPERSEDES generation-divergence-q8-20260727.json, whose prefill-vs-decode reading was drawn from two samples of a noisy process and is wrong. This row is intentionally not advertised as supported",
+        "next_step": "make phi3 decode REPEATABLE first — identical temperature-0 requests must return identical logits. It survives --threads 1 and eager Q8, so hunt an uninitialized/stale read on the phi3-only paths: head_dim=96 tails (every other local row is 128) and the fused attn_qkv/ffn_up sub-row descriptor expansion in src/model.rs. Only then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion"
       }
     },
     {
