@@ -5145,6 +5145,36 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn phi4_compact_prompt_preserves_roles_without_marker_adjacent_newlines() {
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "Be concise.".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Capital of France?".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "assistant".to_string(),
+                content: "Paris.".to_string(),
+            },
+        ];
+        assert_eq!(
+            render_phi4_compact_prompt(&messages),
+            "<|system|>Be concise.<|end|><|user|>Capital of France?<|end|>\
+             <|assistant|>Paris.<|end|><|assistant|>"
+        );
+
+        let phi4_template = "{% for message in messages %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}";
+        assert!(is_phi4_compact_template(phi4_template));
+        assert!(!is_phi3_template(phi4_template));
+    }
+
+    #[test]
     fn qwen3_chatml_prompt_renders_thinking_enabled_generation_prompt() {
         let messages = [ChatMessage {
             unsupported_content_parts: Vec::new(),
@@ -13402,6 +13432,13 @@ fn render_chat_prompt_for_tokenization_fallback(
         // marker spellings but separates turns with <|end|> (not </s>) and stops on
         // <|end|>. Routing it through the tinyllama renderer used the wrong separator
         // and stop token, so generation rambled.
+        if is_phi4_compact_template(template) {
+            return RenderedPrompt {
+                text: render_phi4_compact_prompt(messages),
+                add_special: true,
+                parse_special: true,
+            };
+        }
         if is_phi3_template(template) {
             return RenderedPrompt {
                 text: render_phi3_prompt(messages),
@@ -13645,6 +13682,16 @@ fn is_qwen2_chatml_template(template: &str) -> bool {
 /// rendered by [`render_qwen3_chatml_prompt`] instead.
 fn is_qwen3_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>") && template.contains("<|im_end|>")
+}
+
+/// Phi-4's compact marker template keeps every role marker adjacent to content:
+/// `<|role|>content<|end|>`, followed by a bare `<|assistant|>` generation prompt.
+/// Check it before Phi-3 because both families use the same marker vocabulary.
+fn is_phi4_compact_template(template: &str) -> bool {
+    template.contains("'<|' + message['role'] + '|>'")
+        && template.contains("message['content'] + '<|end|>'")
+        && template.contains("add_generation_prompt")
+        && template.contains("'<|assistant|>'")
 }
 
 /// Phi-3 chat template detector: `<|user|>`/`<|assistant|>` turns separated by the
@@ -14089,6 +14136,20 @@ fn render_phi3_prompt(messages: &[ChatMessage]) -> String {
             prompt.push_str("<|end|>\n<|assistant|>\n");
         }
     }
+    prompt
+}
+
+/// Render Phi-4's compact marker template from its exact GGUF metadata shape.
+fn render_phi4_compact_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str("<|");
+        prompt.push_str(message.role.trim());
+        prompt.push_str("|>");
+        prompt.push_str(&message.content);
+        prompt.push_str("<|end|>");
+    }
+    prompt.push_str("<|assistant|>");
     prompt
 }
 
@@ -18834,6 +18895,21 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             license: "llama3.1",
             task_tags: &["general"],
         },
+        CatalogItem {
+            // Exact artifact pinned against Hugging Face's LFS SHA-256 on 2026-07-27.
+            // It remains experimental until an exact-row support contract is earned.
+            catalog_id: "phi4_mini_instruct_q4_k_m",
+            name: "Phi-4-mini-instruct Q4_K_M",
+            repo_id: "unsloth/Phi-4-mini-instruct-GGUF",
+            filename: "Phi-4-mini-instruct-Q4_K_M.gguf",
+            size_bytes: 2491874272,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
+            architecture: "phi3",
+            license: "mit",
+            task_tags: &["general", "coding"],
+        },
     ]
 }
 
@@ -20698,7 +20774,9 @@ mod non_windows_model_delete_tests {
 
 #[cfg(test)]
 mod catalog_fit_tests {
-    use super::{curated_catalog, CatalogItem, CatalogItemView};
+    use super::{
+        classify_model_lane, curated_catalog, CatalogItem, CatalogItemView, ModelLaneClass,
+    };
     use crate::capability::{HardwareProfile, SimdCaps};
     use crate::fit::FitVerdict;
 
@@ -20745,6 +20823,20 @@ mod catalog_fit_tests {
         let item = row("llama3_8b_instruct_q8_0");
         let view = CatalogItemView::from_curated(&item, &hw);
         assert_eq!(view.fit, FitVerdict::WontFit);
+    }
+
+    #[test]
+    fn phi4_mini_q4km_is_discoverable_but_not_a_supported_row() {
+        let item = row("phi4_mini_instruct_q4_k_m");
+        assert_eq!(item.repo_id, "unsloth/Phi-4-mini-instruct-GGUF");
+        assert_eq!(item.filename, "Phi-4-mini-instruct-Q4_K_M.gguf");
+        assert_eq!(item.size_bytes, 2_491_874_272);
+        assert_eq!(item.architecture, "phi3");
+        assert_eq!(item.quant, "Q4_K_M");
+        assert_eq!(
+            classify_model_lane(Some(item.architecture), item.filename),
+            ModelLaneClass::ExperimentalImplemented
+        );
     }
 
     #[test]

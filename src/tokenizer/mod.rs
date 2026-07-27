@@ -45,13 +45,16 @@ pub enum BpePreTokenizer {
     /// the ITEM1 tokenizer gate (qa/ornith/constrained-vram), which covers NFD,
     /// Devanagari (incl. virama clusters), Arabic harakat, and zalgo inputs.
     Qwen35,
+    /// llama.cpp `gpt-4o` (Phi-4-mini): case-aware word runs with a trailing
+    /// contraction, three-digit number groups, and combining-mark folding.
+    Gpt4o,
 }
 
 impl BpePreTokenizer {
     /// Maximum number of consecutive digits the pre-tokenizer keeps in one piece.
     fn digit_group_max(self) -> usize {
         match self {
-            Self::Llama3 | Self::CommandR => 3,
+            Self::Llama3 | Self::CommandR | Self::Gpt4o => 3,
             Self::Qwen2 | Self::Qwen35 => 1,
         }
     }
@@ -271,9 +274,10 @@ fn resolve_gpt2_pre_tokenizer(
         Some("command-r") => Ok(BpePreTokenizer::CommandR),
         Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
         Some("qwen35") => Ok(BpePreTokenizer::Qwen35),
+        Some("gpt-4o") => Ok(BpePreTokenizer::Gpt4o),
         None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
         other => Err(BackendError::UnsupportedTokenizer(format!(
-            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35"
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35, gpt-4o"
         ))),
     }
 }
@@ -596,11 +600,15 @@ impl Tokenizer {
                 .next_control_token_start(text, byte_start, parse_special)
                 .unwrap_or(text.len());
 
-            for segment in bpe_pretokenize_with(
-                &text[byte_start..byte_end],
-                self.bpe_pre_tokenizer.digit_group_max(),
-                self.bpe_pre_tokenizer.fold_marks(),
-            ) {
+            let segments = match self.bpe_pre_tokenizer {
+                BpePreTokenizer::Gpt4o => bpe_pretokenize_gpt4o(&text[byte_start..byte_end]),
+                pre_tokenizer => bpe_pretokenize_with(
+                    &text[byte_start..byte_end],
+                    pre_tokenizer.digit_group_max(),
+                    pre_tokenizer.fold_marks(),
+                ),
+            };
+            for segment in segments {
                 self.encode_bpe_segment(segment, &mut out)?;
             }
             byte_start = byte_end;
@@ -1209,6 +1217,103 @@ fn bpe_pretokenize(text: &str) -> Vec<&str> {
     bpe_pretokenize_with(text, 3, false)
 }
 
+/// GPT4O's case-aware pre-tokenizer, ported from pinned llama.cpp's
+/// `LLAMA_VOCAB_PRE_TYPE_GPT4O` expression. Its contractions stay attached to
+/// the preceding word, unlike the Llama-3/Qwen2 dialects.
+fn bpe_pretokenize_gpt4o(text: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut byte_start = 0;
+
+    while byte_start < text.len() {
+        let byte_end = next_gpt4o_segment_end(text, byte_start);
+        segments.push(&text[byte_start..byte_end]);
+        byte_start = byte_end;
+    }
+
+    segments
+}
+
+fn next_gpt4o_segment_end(text: &str, byte_start: usize) -> usize {
+    if let Some(end) = consume_gpt4o_word(text, byte_start) {
+        return end;
+    }
+
+    let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
+    if is_number(ch) {
+        return consume_digits(text, byte_start, 3);
+    }
+    if let Some(end) = consume_optional_space_punctuation(text, byte_start, false) {
+        return end;
+    }
+    if let Some(end) = consume_whitespace_with_newline(text, byte_start) {
+        return end;
+    }
+    if is_whitespace(ch) {
+        return consume_whitespace_before_nonspace(text, byte_start);
+    }
+
+    byte_start + ch.len_utf8()
+}
+
+fn consume_gpt4o_word(text: &str, byte_start: usize) -> Option<usize> {
+    let first = next_char(text, byte_start)?;
+    let word_start = if is_letter(first) {
+        byte_start
+    } else if first != '\r' && first != '\n' && !is_number(first) {
+        let next_start = byte_start + first.len_utf8();
+        let next = (next_start < text.len()).then(|| next_char(text, next_start))??;
+        is_letter(next).then_some(next_start)?
+    } else {
+        return None;
+    };
+
+    let mut upper_end = word_start;
+    let mut last_lower_like = None;
+    while upper_end < text.len() {
+        let ch = next_char(text, upper_end).expect("upper_end is in-bounds");
+        if !is_gpt4o_upper_like(ch) {
+            break;
+        }
+        if is_gpt4o_lower_like(ch) {
+            last_lower_like = Some(upper_end);
+        }
+        upper_end += ch.len_utf8();
+    }
+
+    let word_end = if upper_end < text.len()
+        && is_gpt4o_lower_like(next_char(text, upper_end).expect("upper_end is in-bounds"))
+    {
+        consume_gpt4o_lower_run(text, upper_end)
+    } else if upper_end == word_start {
+        consume_gpt4o_lower_run(text, word_start)
+    } else if let Some(lower_start) = last_lower_like {
+        consume_gpt4o_lower_run(text, lower_start)
+    } else {
+        upper_end
+    };
+
+    Some(consume_contraction(text, word_end).unwrap_or(word_end))
+}
+
+fn consume_gpt4o_lower_run(text: &str, mut byte_start: usize) -> usize {
+    while byte_start < text.len() {
+        let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
+        if !is_gpt4o_lower_like(ch) {
+            break;
+        }
+        byte_start += ch.len_utf8();
+    }
+    byte_start
+}
+
+fn is_gpt4o_upper_like(ch: char) -> bool {
+    (is_letter(ch) && !ch.is_lowercase()) || is_mark(ch)
+}
+
+fn is_gpt4o_lower_like(ch: char) -> bool {
+    (is_letter(ch) && !ch.is_uppercase()) || is_mark(ch)
+}
+
 fn bpe_pretokenize_with(text: &str, digit_group_max: usize, fold_marks: bool) -> Vec<&str> {
     // GPT-2/BPE pre-tokenizer, mirroring llama.cpp's tiktoken-style regex without
     // pulling in a regex dependency:
@@ -1515,8 +1620,8 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bpe_pretokenize, bpe_pretokenize_with, is_chat_control_marker, is_mark, BpeRegistry, Token,
-        TokenKind,
+        bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_with, is_chat_control_marker,
+        is_mark, BpeRegistry, Token, TokenKind,
     };
 
     fn tok(text: &str, kind: TokenKind) -> Token {
@@ -1576,6 +1681,10 @@ mod tests {
         assert!(matches!(
             resolve_gpt2_pre_tokenizer(Some("qwen35"), &no_sig),
             Ok(BpePreTokenizer::Qwen35)
+        ));
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("gpt-4o"), &no_sig),
+            Ok(BpePreTokenizer::Gpt4o)
         ));
 
         // Missing pre + Llama-3 signature => recovered as Llama3 (the fix).
@@ -1753,6 +1862,65 @@ mod tests {
 
         for (input, expected) in cases {
             assert_eq!(bpe_pretokenize(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn gpt4o_pretokenizer_matches_llama_cpp_case_and_contraction_rules() {
+        let cases = [
+            ("it's NASA's turn", vec!["it's", " NASA's", " turn"]),
+            ("camelCase HTTPServer", vec!["camel", "Case", " HTTPServer"]),
+            ("1234", vec!["123", "4"]),
+            ("!Hello\r\nnext", vec!["!Hello", "\r\n", "next"]),
+            ("cafe\u{301} bar", vec!["cafe\u{301}", " bar"]),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(bpe_pretokenize_gpt4o(input), expected, "input {input:?}");
+        }
+    }
+
+    // Pinned llama.cpp `acd79d603` (build 9632) oracle vectors for the exact
+    // Phi-4-mini Q4_K_M GGUF. Opt-in because the artifact is multi-gigabyte.
+    #[test]
+    #[ignore = "set CAMELID_PHI4_MINI_GGUF to the pinned Phi-4-mini Q4_K_M GGUF"]
+    fn phi4_mini_gpt4o_tokenizer_matches_pinned_oracle() {
+        use super::Tokenizer;
+
+        let path = std::env::var("CAMELID_PHI4_MINI_GGUF")
+            .expect("set CAMELID_PHI4_MINI_GGUF to the pinned Phi-4-mini Q4_K_M GGUF");
+        let gguf = crate::gguf::read_metadata(&path).expect("read Phi-4-mini GGUF metadata");
+        assert_eq!(gguf.architecture(), Some("phi3"));
+        assert_eq!(gguf.metadata_string("tokenizer.ggml.pre"), Some("gpt-4o"));
+        let tokenizer = Tokenizer::from_gguf(&gguf).expect("load Phi-4-mini tokenizer");
+
+        let cases = [
+            ("it's NASA's turn", vec![64_190, 42_606, 885, 3_716]),
+            ("camelCase HTTPServer", vec![178_067, 6_187, 21_929, 6_444]),
+            ("1234", vec![7_633, 19]),
+            ("!Hello\r\nnext", vec![0, 13_225, 370, 7_311]),
+            ("cafe\u{301} bar", vec![66, 6_903, 13_430, 3_608]),
+            (
+                "  spaces and\t tabs🙂",
+                vec![220, 18_608, 326, 197, 38_191, 37_459],
+            ),
+            (
+                "<|user|>\nWhat is the capital of France?<|end|>\n<|assistant|>\n",
+                vec![
+                    200_021, 198, 4_827, 382, 290, 9_029, 328, 10_128, 30, 200_020, 198, 200_019,
+                    198,
+                ],
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                tokenizer
+                    .encode(input, true, true)
+                    .expect("encode Phi-4-mini input"),
+                expected,
+                "pinned oracle token mismatch for {input:?}"
+            );
         }
     }
 

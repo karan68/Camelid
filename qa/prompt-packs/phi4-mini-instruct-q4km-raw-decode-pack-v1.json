@@ -1,0 +1,17 @@
+{
+  "schema": "camelid.raw_decode_prompt_pack/v1",
+  "pack_id": "phi4-mini-instruct-q4km-raw-decode-pack-v1",
+  "purpose": "Raw-decode parity gate for the exact Phi-4-mini-instruct-Q4_K_M.gguf artifact (SHA-256 88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a). The pack is frozen before pinned llama.cpp oracle capture. It exercises the GPT4O tokenizer's case, contraction, Unicode, whitespace, code, structured-data, and longer-context shapes without depending on a chat template.",
+  "comparator": "llama.cpp acd79d603 (build 9632)",
+  "stop_token_ids": [199999, 200020],
+  "prompts": [
+    "The capital of France is",
+    "2 + 2 =",
+    "Complete this Python function. Output only code:\n\ndef fibonacci(number):\n",
+    "Convert this record to compact JSON with keys name, age, and city. Output only JSON:\n\nAda Lovelace, 36, London\n\nJSON:",
+    "Explain the difference between a process and a thread in two concise sentences.",
+    "camelCase HTTPServer NASA's launch sequence is",
+    "Whitespace check:  two spaces, a tab\tand a newline follow.\nNext:",
+    "Entry 1: The lighthouse keeper recorded the tide and the north-east wind over the grey harbor.\nEntry 2: The lighthouse keeper recorded the tide and the north-east wind over the grey harbor.\nEntry 3: The lighthouse keeper recorded the tide and the north-east wind over the grey harbor.\nEntry 4: The lighthouse keeper recorded the tide and the north-east wind over the grey harbor.\nSummary:"
+  ]
+}
