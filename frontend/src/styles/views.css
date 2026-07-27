@@ -1311,6 +1311,50 @@
 .catalog-start-steps li.is-done { color: var(--color-text-muted); }
 .catalog-start-steps li.is-done span { border-color: var(--color-ready); color: var(--color-ready); }
 .catalog-start-failure { margin-top: var(--space-2); padding: var(--space-2) var(--space-3); border-left: 3px solid var(--color-warning); background: var(--color-surface-strong); }
+
+/* Fit advisory: three tones for three remedies. `--bad` (error) means the machine
+   is too small; `--warn` means it is merely busy, which is a different sentence and
+   must not borrow the error colour; `--unknown` is the absence of a claim and is
+   deliberately quiet so it never competes with a real verdict. */
+.catalog-fit-chip--warn { color: var(--color-warning); background: color-mix(in srgb, var(--color-warning) 12%, transparent); border-color: color-mix(in srgb, var(--color-warning) 40%, transparent); }
+.catalog-fit-chip--unknown { color: var(--color-text-muted); background: var(--color-surface-strong); border-color: var(--color-border-soft); font-weight: 600; }
+.catalog-fit-detail { font-size: var(--text-xs); color: var(--color-text-faint); flex: 1 1 100%; }
+.catalog-fit-check { padding: 2px 10px; border-radius: 999px; border: 1px solid var(--color-border-soft); background: var(--color-bg-elevated); color: var(--color-text); font-size: var(--text-xs); font-weight: 700; }
+.catalog-fit-check:hover:not(:disabled) { background: var(--color-surface-hover); }
+.catalog-fit-check:disabled { color: var(--color-text-faint); }
+
+/* One Hugging Face repo = one card. The nested row keeps the download machinery
+   but drops its own head, so the card owns the identity and the row owns the act. */
+.hf-model-card { border: 1px solid var(--color-border-soft); border-radius: var(--radius-md); padding: var(--space-3); background: var(--color-surface); }
+.hf-model-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); }
+.hf-model-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.hf-model-title { margin: 0; font-size: var(--text-sm); font-weight: 700; overflow-wrap: anywhere; }
+.hf-model-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin: 0; font-size: var(--text-xs); color: var(--color-text-muted); }
+.hf-model-owner { font-family: var(--font-mono); }
+.hf-model-arch { border-bottom: 1px dotted var(--color-border-soft); cursor: help; }
+.hf-model-unsupported { color: var(--color-warning); }
+.hf-quant-picker { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-2); }
+.hf-quant-label { font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--color-text-faint); }
+.hf-quant-select { flex: 1 1 260px; min-width: 0; max-width: 100%; padding: var(--space-1) var(--space-2); border-radius: var(--radius-sm); border: 1px solid var(--color-border-soft); background: var(--color-bg-elevated); color: var(--color-text); font-size: var(--text-xs); font-family: var(--font-mono); }
+/* Nested inside a card: no second border or background box. */
+.catalog-row--compact { border: 0; border-radius: 0; padding: 0; background: transparent; }
+.catalog-row--compact.catalog-row--advisory { border-left: 0; }
+
+/* Search feedback. A live Hub search is several network round-trips; leaving the
+   previous results frozen with no indicator is what made it read as a hang. */
+.catalog-skeleton { display: flex; flex-direction: column; gap: var(--space-2); }
+.catalog-skeleton-row { border: 1px solid var(--color-border-soft); border-radius: var(--radius-md); padding: var(--space-3); background: var(--color-surface); display: flex; flex-direction: column; gap: var(--space-2); }
+.catalog-skeleton-bar { height: 10px; border-radius: 999px; background: linear-gradient(90deg, var(--color-surface-strong) 25%, var(--color-surface-hover) 37%, var(--color-surface-strong) 63%); background-size: 400% 100%; animation: catalogSkeleton 1.4s ease-in-out infinite; }
+.catalog-skeleton-bar--title { width: 42%; }
+.catalog-skeleton-bar--meta { width: 68%; height: 8px; }
+@keyframes catalogSkeleton { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+@media (prefers-reduced-motion: reduce) { .catalog-skeleton-bar { animation: none; } }
+
+/* Dead ends stay reachable but stop competing for the first screen. */
+.catalog-collapsed { margin-top: var(--space-3); border: 1px solid var(--color-border-soft); border-radius: var(--radius-md); background: var(--color-surface); }
+.catalog-collapsed > summary { padding: var(--space-2) var(--space-3); font-size: var(--text-xs); font-weight: 600; color: var(--color-text-muted); cursor: pointer; }
+.catalog-collapsed > summary:hover { color: var(--color-text); }
+.catalog-collapsed > .catalog-list, .catalog-collapsed > .catalog-row-faint { padding: 0 var(--space-3) var(--space-3); }
 /* Download button doubles as the progress bar: a fill grows left→right with the
    percentage (smooth transition); before the first byte lands it shows an
    indeterminate shimmer so the click feels acknowledged immediately. */
