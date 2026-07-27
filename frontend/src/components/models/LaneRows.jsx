@@ -107,7 +107,7 @@ export function SupportedRow({ entry, active, busy, deleteBusy, blockedReason, o
   )
 }
 
-export function CompatibleRow({ entry, receipt, deleteBusy, blockedReason, onDelete }) {
+export function CompatibleRow({ entry, receipt, busy, deleteBusy, blockedReason, onUse, onDelete }) {
   return (
     <article className="lane-row lane-row--runnable" aria-label={`Compatible model ${entry.filename}`}>
       <div className="lane-row-head">
@@ -124,12 +124,16 @@ export function CompatibleRow({ entry, receipt, deleteBusy, blockedReason, onDel
         <p className="lane-row-faint">Loading runnable receipt…</p>
       )}
       <p className="lane-row-faint">
-        Runnable execution is the generic f32 lane — run it with the CLI
-        (<code>camelid runnable-smoke</code>). No HTTP serve endpoint yet, so there is no
-        in-app “Use for chat” for the runnable lane.
+        The receipt above attests one deterministic CLI run on the generic f32 lane
+        (<code>camelid runnable-smoke</code>) — it is not a parity contract. Loading it for
+        chat serves it the same way any implemented-but-unanchored model is served, so its
+        chat output carries no parity claim and is not cross-validated against the reference.
       </p>
       <div className="lane-row-actions">
-        <DeleteModelButton entry={entry} busy={deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
+        <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
+          {busy ? 'Loading…' : 'Use for chat (experimental)'}
+        </button>
+        <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
       </div>
     </article>
   )

@@ -437,8 +437,10 @@ export default function ModelsView({
                 key={m.filename}
                 entry={m}
                 receipt={receipts[m.filename]}
+                busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
                 blockedReason={deleteBlockedReason}
+                onUse={() => loadModelForChat(m.filename)}
                 onDelete={requestDeleteModel}
               />
             ))}
