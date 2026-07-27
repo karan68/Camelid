@@ -20001,13 +20001,31 @@ async fn check_catalog_fit(Json(req): Json<CatalogFitRequest>) -> Response {
         );
     }
 
-    let hw = crate::capability::HardwareProfile::cached();
+    // LIVE probe, deliberately not `HardwareProfile::cached()`.
+    //
+    // `cached()` is a `OnceLock` — memory is read once at startup and frozen for the
+    // process. The catalog LIST endpoint accepts that (re-probing per GET would
+    // re-init CUDA on every request, for every row). This endpoint is the opposite
+    // case: one explicit, user-initiated question about one model, which already
+    // costs a network header fetch.
+    //
+    // It is also a correctness requirement. The refusal this powers tells the user
+    // to free memory and check again; against a frozen snapshot that instruction
+    // would be a lie, because freeing memory could never change the answer. Probing
+    // live also makes a "fits" here agree with the authoritative load guard, which
+    // probes live too.
+    let hw = match tokio::task::spawn_blocking(crate::capability::HardwareProfile::detect).await {
+        Ok(profile) => profile,
+        // A panicking probe must not fail the request; fall back to the startup
+        // snapshot, which is still a real measurement of this machine.
+        Err(_) => crate::capability::HardwareProfile::cached().clone(),
+    };
     let resolution = crate::fit_dims::global()
         .resolve_now(req.repo_id.clone(), req.filename.clone(), req.size_bytes)
         .await;
     let (fit, fit_confidence) = match resolution.dims() {
         Some(dims) => (
-            crate::fit::assess(hw, &exact_footprint_for(req.size_bytes, dims, hw)),
+            crate::fit::assess(&hw, &exact_footprint_for(req.size_bytes, dims, &hw)),
             "exact",
         ),
         None => (crate::fit::FitVerdict::Unknown, "unknown"),

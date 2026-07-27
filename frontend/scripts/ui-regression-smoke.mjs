@@ -292,8 +292,12 @@ assert.match(catalogBrowseSource, /Download and start/, 'curated catalog rows sh
 assert.match(catalogBrowseSource, /settlementInFlightRef\.current/, 'catalog settlement must be single-flight across polling ticks')
 assert.match(catalogBrowseSource, /canceledCatalogIds\.has\(item\.catalog_id\)/, 'catalog cancellation must be keyed by catalog identity, not filename')
 assert.match(catalogBrowseSource, /aria-label="Search model catalog"/, 'catalog search must have an explicit accessible name')
-assert.match(catalogBrowseSource, /downloadAndStart = lane === 'supported' && item\.fit !== 'wont_fit'/, 'automatic start must be limited to supported rows that are not known to exceed this host')
-assert.match(catalogBrowseSource, /item\.fit !== 'wont_fit'[\s\S]*item\.oracle_qualified/, 'known-wont-fit rows must not automatically run generic smoke admission')
+assert.match(catalogBrowseSource, /downloadAndStart = lane === 'supported' && !refusedByFit/, 'automatic start must be limited to supported rows that are not known to exceed this host')
+assert.match(catalogBrowseSource, /refusedByFit[\s\S]*item\.oracle_qualified/, 'rows this host cannot load must not automatically run generic smoke admission')
+// The refusal set must stay the FULL one. Testing `fit !== 'wont_fit'` alone was a
+// real defect: an `insufficient_free_memory` row would chain into a load that the
+// 422 preload guard refuses, since that guard blocks on both negative verdicts.
+assert.match(catalogBrowseSource, /const refusedByFit = isRefusingFit\(item\.fit\)/, 'auto-start must gate on every load-refusing verdict, not just wont_fit')
 assert.match(modelsViewSource, /if \(!inspectRes\.ok\)[\s\S]*return \{ ok: false, stage: 'checking', message \}/, 'automatic activation must fail closed on an HTTP-level inspect failure')
 assert.match(modelsViewSource, /refreshCurrent\(\)[\s\S]*current\?\.path[\s\S]*active model/, 'automatic navigation must wait for current-model confirmation')
 assert.match(modelsViewSource, /v1\/health[\s\S]*health\.loaded_now[\s\S]*health\.generation_ready[\s\S]*health\.active_model_id !== filename/, 'automatic navigation must wait for live generation readiness and active-model identity')
@@ -534,5 +538,15 @@ assert.match(chatCss, /\.message-live-generation-badge\s*\{/, 'streaming assista
 assert.match(chatCss, /\.message-live-dot\s*\{[^}]*animation:\s*cxPulse/s, 'live generation badges should visibly pulse only while the badge is rendered')
 assert.match(uiCss, /@keyframes cxPulse/, 'the live pulse keyframes must exist')
 assert.match(tokensCss, /@keyframes camelidDotBounce/, 'the streaming dot bounce keyframes must exist')
+
+/* ---- Catalog browse logic ----
+   Runs the unit smoke for src/lib/catalogBrowse.js (quantization ordering and
+   advice, repo grouping, default-quantization rules, the architecture partition,
+   and the unchecked/settled/retryable split) inside this job.
+
+   Imported here rather than added to the workflow because that is the frontend
+   suite CI already gates; a behavioural module with no gate is a regression
+   waiting to happen. The module asserts at import time and throws on failure. */
+await import('./catalog-browse-smoke.mjs')
 
 console.log('UI regression smoke passed (re-baselined Phase 2 pre-work)')

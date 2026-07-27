@@ -4,6 +4,7 @@ import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcqui
 import {
   defaultFileIndex,
   fitDetail,
+  fitIsRecheckable,
   fitIsSettled,
   fitLabel,
   groupHfFilesByRepo,
@@ -161,6 +162,21 @@ function FitAdvisory({ item, onCheckFit, checking }) {
         {item.fit_confidence === 'approx' ? '~ ' : ''}
         {label}
       </span>
+      {/* Memory pressure is the one refusal a user can act on, and acting on it
+          needs a live re-probe: the listing's verdicts come from a startup
+          snapshot, so reloading the page cannot pick up freed memory. */}
+      {transient && onCheckFit ? (
+        <button
+          type="button"
+          className="catalog-fit-check"
+          onClick={onCheckFit}
+          disabled={checking}
+          aria-busy={checking || undefined}
+          title="Re-read this machine's free memory and this model's size, right now"
+        >
+          {checking ? 'Re-checking…' : 'Re-check'}
+        </button>
+      ) : null}
       {Array.isArray(item.task_tags) && item.task_tags.length ? (
         <span className="catalog-fit-tags">
           <span className="catalog-fit-tags-label">best for</span>
@@ -797,13 +813,19 @@ export function CatalogLaneBrowse({
       onStartModel={onStartModel}
       onModelStarted={onModelStarted}
       onOperationBusy={onOperationBusy}
+      // Curated rows get the re-check path too, and it matters more for them:
+      // the landing view now FOLDS AWAY rows the catalog thinks cannot load, so a
+      // stale "not enough memory" would hide a model that has since become
+      // runnable, with no way to bring it back.
+      onCheckFit={fitIsRecheckable(item.fit) ? () => checkFit(item) : undefined}
+      checkingFit={isCheckingFit(item)}
       {...extra}
     />
   ), [
-    base, canceledCatalogIds, capabilities, downloads, installAvailable, installBlockedReason,
-    localFilenames, onAcquired, onDownloadAcknowledged, onDownloadRetry, onInstallStarted,
-    onModelStarted, onOperationBusy, onStartModel, pendingCatalogId, reserveAcquisition,
-    settleAcquisition,
+    base, canceledCatalogIds, capabilities, checkFit, downloads, installAvailable,
+    installBlockedReason, isCheckingFit, localFilenames, onAcquired, onDownloadAcknowledged,
+    onDownloadRetry, onInstallStarted, onModelStarted, onOperationBusy, onStartModel,
+    pendingCatalogId, reserveAcquisition, settleAcquisition,
   ])
 
   // A row whose acquisition is in flight must keep rendering even if a newer
@@ -884,7 +906,7 @@ export function CatalogLaneBrowse({
             title="Curated — runs on this machine"
             marker={null}
             count={curatedRunnable.length}
-            emptyText="No curated model fits the memory free right now. Close some applications and reload, or search Hugging Face for a smaller one."
+            emptyText="No curated model fits the memory free right now. Close some applications, then use Re-check on one of the rows below."
           >
             {curatedRunnable.map((item) => renderRow(item))}
           </CatalogGroup>

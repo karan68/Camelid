@@ -9,6 +9,7 @@ import {
   compareByQuality,
   defaultFileIndex,
   fitDetail,
+  fitIsRecheckable,
   fitIsSettled,
   fitLabel,
   groupHfFilesByRepo,
@@ -61,6 +62,20 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
   assert.equal(fitDetail('cpu_only_ok'), null)
   // A busy machine must never be described as an undersized one.
   assert.doesNotMatch(fitDetail('insufficient_free_memory'), /too big|smaller model/i)
+
+  // The remedy must name the action that actually works. The catalog listing is
+  // built from a startup memory snapshot, so "reload the page" would be false
+  // advice: only the live re-check can observe freed memory.
+  assert.match(fitDetail('insufficient_free_memory'), /Re-check/)
+  assert.doesNotMatch(fitDetail('insufficient_free_memory'), /reload|refresh/i)
+
+  // Only a transient shortage is worth re-checking. A model bigger than the whole
+  // machine stays too big however much is freed.
+  assert.equal(fitIsRecheckable('insufficient_free_memory'), true)
+  assert.equal(fitIsRecheckable('wont_fit'), false)
+  assert.equal(fitIsRecheckable('cpu_only_ok'), false)
+  assert.equal(fitIsRecheckable('unknown'), false)
+  assert.equal(fitIsRecheckable(undefined), false)
 }
 
 /* --- unchecked vs. settled ------------------------------------------------ */

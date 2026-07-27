@@ -70,16 +70,30 @@ export function fitIsSettled(item) {
 }
 
 /* Why the row is refused or unresolved, and what the user can actually do about
-   it. A machine that is merely busy must never be described as too small. */
+   it. A machine that is merely busy must never be described as too small.
+
+   The wording is tied to a real mechanism: a refusal caused by memory pressure is
+   re-checkable, because the check endpoint probes memory live. Telling the user to
+   free memory would be empty advice otherwise — the catalog listing reads a
+   startup snapshot, so a page reload alone changes nothing. */
 export function fitDetail(fit) {
   switch (fit) {
     case 'insufficient_free_memory':
-      return 'This machine is big enough — the memory is in use. Close some applications and check again.'
+      return 'This machine is big enough — the memory is in use. Close some applications, then use Re-check.'
     case 'wont_fit':
       return 'Freeing memory will not help; pick a smaller model or a smaller quantization.'
     default:
       return null
   }
+}
+
+/* Whether re-checking this row could ever change its answer.
+
+   Only memory pressure is transient. A model larger than the whole machine stays
+   too large however much is freed, so offering a re-check there would be busywork
+   dressed as a remedy. */
+export function fitIsRecheckable(fit) {
+  return fit === 'insufficient_free_memory'
 }
 
 /* --- quantization --------------------------------------------------------- */
