@@ -333,10 +333,24 @@ impl Tokenizer {
             )));
         }
 
-        let bpe_registry = BpeRegistry::from_merges(
+        // `tokenizer.ggml.model = "llama"` is SPM proper: the reference segments it
+        // by token SCORE and ignores any merge list the converter happened to embed.
+        // Some Llama-family GGUFs ship merges anyway (TinyLlama carries 61k), and
+        // honouring them silently switched that model to rank-based BPE, segmenting
+        // ordinary words differently from the reference (`thunderstorm` -> `st|orm`
+        // instead of `stor|m`). Drop merges for this model only.
+        //
+        // Scoped to the raw metadata string, NOT `TokenizerModel::LlamaSpm`: gemma2/
+        // gemma3/gemma4 also map onto that enum but genuinely are merge-driven here
+        // (the DiffusionGemma tokenizer-parity gate pins gemma4's merge behaviour),
+        // and they declare their own tokenizer model names.
+        let spm_ignores_merges = model_name == "llama";
+        let bpe_registry = BpeRegistry::from_merges(if spm_ignores_merges {
+            Vec::new()
+        } else {
             file.metadata_array_strings_optional("tokenizer.ggml.merges")?
-                .unwrap_or_default(),
-        );
+                .unwrap_or_default()
+        });
         let bpe_ranks = bpe_registry.ranks().clone();
 
         let mut tokens = Vec::with_capacity(token_texts.len());
@@ -729,6 +743,17 @@ impl Tokenizer {
         normalized
     }
 
+    /// True when `token_text` is a `<|…|>` chat-control marker whose trailing
+    /// whitespace the reference strips. Deliberately narrow: SPM models whose turn
+    /// scaffolding is `[INST]`/`<s>` (TinyLlama, Llama 2, Mistral) do not match the
+    /// `<|…|>` shape, and BPE families (Qwen3, Llama 3) never reach this SPM path,
+    /// so their committed tokenizations are untouched.
+    fn chat_control_marker_rstrips(&self, token_text: &str) -> bool {
+        self.tokens
+            .iter()
+            .any(|token| token.text == token_text && is_chat_control_marker(token))
+    }
+
     fn should_insert_dummy_after_control(
         &self,
         token_text: &str,
@@ -792,12 +817,21 @@ impl Tokenizer {
     }
 
     fn encode_piece(&self, piece: &str, parse_special: bool) -> Result<Vec<TokenId>> {
-        if self.bpe_ranks.is_empty() && !parse_special {
-            return self.encode_piece_greedy(piece);
-        }
+        // SPM used to short-circuit to `encode_piece_greedy` here whenever specials
+        // were not being parsed. That encoder is longest-match-first, which is a
+        // different algorithm from the reference's score-ordered bigram merge and
+        // segments ordinary words differently (`thunderstorm` -> `stor|m` instead of
+        // `st|orm`). Fall through so every SPM segment reaches the ported session.
 
         let mut out = Vec::new();
         let mut byte_start = 0;
+        // Set when a control token asked for the SPM dummy prefix. It is applied by
+        // PREPENDING `▁` to the next raw segment, never by pushing the bare `▁` id:
+        // the reference merges the prefix into the following word (`▁What` = one
+        // token), whereas emitting the standalone id splits it into `▁` + `What` and
+        // diverges on every fragment that follows a special. `normalize_spm_text`'s
+        // non-special path already prepends the character; this keeps both in step.
+        let mut pending_dummy_prefix = false;
         while byte_start < piece.len() {
             if parse_special {
                 if let Some((token_text, token_len)) =
@@ -806,6 +840,18 @@ impl Tokenizer {
                     if let Some(id) = self.token_to_id.get(token_text) {
                         out.push(*id);
                         byte_start += token_len;
+                        // `<|...|>` chat-control markers carry rstrip semantics: the
+                        // reference drops the whitespace run that follows the marker
+                        // (Phi-3 renders `<|user|>\n…`, and the reference tokenizes
+                        // that as `<|user|>` + `▁What`, with no `<0x0A>`). Consume it
+                        // before deciding on the dummy prefix, so the prefix attaches
+                        // to the first real character of the fragment.
+                        if self.chat_control_marker_rstrips(token_text) {
+                            let trimmed = piece[byte_start..].trim_start_matches(|c: char| {
+                                c == SPM_SPACE || c.is_ascii_whitespace()
+                            });
+                            byte_start = piece.len() - trimmed.len();
+                        }
                         let rest = &piece[byte_start..];
                         let next_is_control = self
                             .longest_control_token_at(piece, byte_start, true)
@@ -817,10 +863,7 @@ impl Tokenizer {
                                 next_is_control,
                             )
                         {
-                            if let Some(dummy_prefix) = self.token_to_id.get(&SPM_SPACE.to_string())
-                            {
-                                out.push(*dummy_prefix);
-                            }
+                            pending_dummy_prefix = true;
                         }
                         continue;
                     }
@@ -833,15 +876,16 @@ impl Tokenizer {
             } else {
                 piece.len()
             };
-            if self.bpe_ranks.is_empty() {
-                if parse_special {
-                    self.encode_spm_segment(&piece[byte_start..byte_end], &mut out)?;
-                } else {
-                    out.extend(self.encode_piece_greedy(&piece[byte_start..byte_end])?);
-                }
+            let segment = &piece[byte_start..byte_end];
+            let prefixed;
+            let segment = if pending_dummy_prefix {
+                pending_dummy_prefix = false;
+                prefixed = format!("{SPM_SPACE}{segment}");
+                prefixed.as_str()
             } else {
-                self.encode_spm_segment(&piece[byte_start..byte_end], &mut out)?;
-            }
+                segment
+            };
+            self.encode_spm_segment(segment, &mut out)?;
             byte_start = byte_end;
         }
         Ok(out)
@@ -867,12 +911,15 @@ impl Tokenizer {
             return Ok(());
         }
 
-        let symbols = if self.bpe_ranks.is_empty() {
-            self.merge_spm_symbols_by_score(segment)
-        } else {
-            self.bpe_registry
-                .merge_symbols(segment.chars().map(|ch| ch.to_string()).collect())
-        };
+        // SPM (no merge ranks) follows the reference session verbatim; only the
+        // rank-based BPE families (gemma4 et al) use the symbol-merge path below.
+        if self.bpe_ranks.is_empty() {
+            return self.encode_spm_segment_reference(segment, out);
+        }
+
+        let symbols = self
+            .bpe_registry
+            .merge_symbols(segment.chars().map(|ch| ch.to_string()).collect());
 
         let mut unresolved = String::new();
         for symbol in symbols {
@@ -903,33 +950,177 @@ impl Tokenizer {
         Ok(())
     }
 
-    fn merge_spm_symbols_by_score(&self, segment: &str) -> Vec<String> {
-        let mut symbols: Vec<String> = segment.chars().map(|ch| ch.to_string()).collect();
-
-        loop {
-            let mut best: Option<(f32, usize)> = None;
-            for idx in 0..symbols.len().saturating_sub(1) {
-                let candidate = format!("{}{}", symbols[idx], symbols[idx + 1]);
-                if candidate.contains("▁▁") {
-                    continue;
-                }
-                let Some(id) = self.token_to_id.get(&candidate).copied() else {
-                    continue;
-                };
-                let score = self.tokens[id as usize].score;
-                match best {
-                    Some((best_score, best_idx))
-                        if score < best_score || (score == best_score && idx >= best_idx) => {}
-                    _ => best = Some((score, idx)),
-                }
-            }
-
-            let Some((_, idx)) = best else { break };
-            symbols[idx] = format!("{}{}", symbols[idx], symbols[idx + 1]);
-            symbols.remove(idx + 1);
+    /// SPM segmentation, ported from the reference `llm_tokenizer_spm_session`.
+    ///
+    /// A global "merge the best-scoring adjacent pair, recompute everything" loop is
+    /// NOT equivalent to the reference and diverges on ordinary words (`thunderstorm`
+    /// segmented `stor|m` instead of `st|orm`, `LRUCache` as `LR|UC|ache` instead of
+    /// `L|RU|Cache`). Four properties have to hold together:
+    ///
+    /// 1. Symbols are a doubly-linked list merged IN PLACE (`left.n += right.n`,
+    ///    `right.n = 0`), so indices stay stable and `rev_merge` can address them.
+    /// 2. The queue is seeded ONCE with every adjacent pair; after a merge only
+    ///    `(prev, left)` and `(left, next)` are offered. Re-deriving all pairs each
+    ///    pass invents merges the reference never queued.
+    /// 3. Popped entries are validated against the CURRENT symbol widths
+    ///    (`left.n + right.n != size` -> stale, skip), so a pair whose operands were
+    ///    already consumed cannot fire late.
+    /// 4. Output goes through `resegment`: a merged span that is not itself a vocab
+    ///    token is split back into the two operands that formed it via `rev_merge`,
+    ///    recursively, and only a span with no recorded merge falls back to bytes.
+    ///
+    /// Tie-break matches the reference comparator: highest score wins; on equal
+    /// scores the smaller left index wins.
+    fn encode_spm_segment_reference(&self, segment: &str, out: &mut Vec<TokenId>) -> Result<()> {
+        #[derive(Clone, Copy)]
+        struct Symbol {
+            start: usize,
+            n: usize,
+            prev: i64,
+            next: i64,
         }
 
-        symbols
+        #[derive(Clone, Copy)]
+        struct Bigram {
+            left: usize,
+            right: usize,
+            score: f32,
+            size: usize,
+        }
+        impl PartialEq for Bigram {
+            fn eq(&self, other: &Self) -> bool {
+                self.score == other.score && self.left == other.left
+            }
+        }
+        impl Eq for Bigram {}
+        impl Ord for Bigram {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                // Max-heap: greatest score pops first; equal scores favour the
+                // SMALLER left index, so reverse that half of the comparison.
+                self.score
+                    .partial_cmp(&other.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| other.left.cmp(&self.left))
+            }
+        }
+        impl PartialOrd for Bigram {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut symbols: Vec<Symbol> = Vec::new();
+        for (offset, ch) in segment.char_indices() {
+            let index = symbols.len() as i64;
+            let n = ch.len_utf8();
+            symbols.push(Symbol {
+                start: offset,
+                n,
+                prev: index - 1,
+                next: if offset + n == segment.len() {
+                    -1
+                } else {
+                    index + 1
+                },
+            });
+        }
+        if symbols.is_empty() {
+            return Ok(());
+        }
+
+        let mut rev_merge: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut work: BinaryHeap<Bigram> = BinaryHeap::new();
+
+        let try_add_bigram = |symbols: &Vec<Symbol>,
+                              work: &mut BinaryHeap<Bigram>,
+                              rev_merge: &mut HashMap<String, (usize, usize)>,
+                              left: i64,
+                              right: i64| {
+            if left == -1 || right == -1 {
+                return;
+            }
+            let (left, right) = (left as usize, right as usize);
+            let start = symbols[left].start;
+            let end = start + symbols[left].n + symbols[right].n;
+            let Some(text) = segment.get(start..end) else {
+                return;
+            };
+            let Some(id) = self.token_to_id.get(text).copied() else {
+                return;
+            };
+            let Some(token) = self.tokens.get(id as usize) else {
+                return;
+            };
+            work.push(Bigram {
+                left,
+                right,
+                score: token.score,
+                size: text.len(),
+            });
+            rev_merge.insert(text.to_string(), (left, right));
+        };
+
+        for i in 1..symbols.len() {
+            try_add_bigram(&symbols, &mut work, &mut rev_merge, i as i64 - 1, i as i64);
+        }
+
+        while let Some(bigram) = work.pop() {
+            let (left, right) = (bigram.left, bigram.right);
+            // Stale: an operand was already absorbed, or the pair no longer spans
+            // the width this entry was queued for.
+            if symbols[left].n == 0
+                || symbols[right].n == 0
+                || symbols[left].n + symbols[right].n != bigram.size
+            {
+                continue;
+            }
+
+            symbols[left].n += symbols[right].n;
+            symbols[right].n = 0;
+            symbols[left].next = symbols[right].next;
+            if symbols[right].next >= 0 {
+                let next = symbols[right].next as usize;
+                symbols[next].prev = left as i64;
+            }
+
+            let (prev, next) = (symbols[left].prev, symbols[left].next);
+            try_add_bigram(&symbols, &mut work, &mut rev_merge, prev, left as i64);
+            try_add_bigram(&symbols, &mut work, &mut rev_merge, left as i64, next);
+        }
+
+        // Walk the surviving chain, resegmenting each span. Iterative rather than
+        // recursive (the reference recurses) so a pathological merge tree cannot
+        // overflow the stack; the explicit stack reproduces the same left-then-right
+        // pre-order.
+        let mut index = 0_i64;
+        while index != -1 {
+            let symbol = symbols[index as usize];
+            let mut pending = vec![(symbol.start, symbol.n)];
+            while let Some((start, n)) = pending.pop() {
+                let Some(text) = segment.get(start..start + n) else {
+                    continue;
+                };
+                if let Some(id) = self.token_to_id.get(text).copied() {
+                    out.push(id);
+                    continue;
+                }
+                match rev_merge.get(text) {
+                    // A recorded merge whose left operand still spans the whole
+                    // parent would re-expand to itself forever. Unreachable for a
+                    // well-formed vocab (a merge is only queued when the joined text
+                    // IS a token, so the branch above already took it), but fail to
+                    // bytes rather than hang if a vocab ever violates that.
+                    Some(&(left, right)) if symbols[left].n < n => {
+                        // Push right first so left is popped (emitted) first.
+                        pending.push((symbols[right].start, symbols[right].n));
+                        pending.push((symbols[left].start, symbols[left].n));
+                    }
+                    _ => self.encode_unknown_symbol_bytes(text, out)?,
+                }
+            }
+            index = symbol.next;
+        }
+        Ok(())
     }
 
     fn encode_unknown_symbol_bytes(&self, symbol: &str, out: &mut Vec<TokenId>) -> Result<()> {

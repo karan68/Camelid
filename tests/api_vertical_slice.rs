@@ -2365,7 +2365,7 @@ async fn load_model_reports_tokenizer_summary() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["tokenizer"]["status"], "available");
     assert_eq!(body["tokenizer"]["model"], "llama_spm");
-    assert_eq!(body["tokenizer"]["token_count"], 7);
+    assert_eq!(body["tokenizer"]["token_count"], 14);
     assert_eq!(body["tokenizer"]["byte_token_count"], 1);
     assert_eq!(body["tokenizer"]["special"]["bos"], 1);
     assert_eq!(body["tokenizer"]["special"]["eos"], 2);
@@ -2628,7 +2628,7 @@ async fn tokenizer_endpoint_returns_current_model_tokenizer_summary() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["model"], "llama_spm");
-    assert_eq!(body["token_count"], 7);
+    assert_eq!(body["token_count"], 14);
     assert_eq!(
         body["special"]["eog"].as_array().unwrap(),
         &[serde_json::json!(2)]
@@ -2791,13 +2791,16 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     // `add_space_prefix=true` unconditionally prepends a space, so the already
-    // space-led " hello!" tokenizes with a leading double-space (id 6 twice).
+    // space-led " hello!" normalizes to `▁▁hello!`. `▁▁` is not in this vocab, so
+    // the first `▁` stands alone (6) and the second merges into `▁hello` (3) —
+    // the reference merges the dummy prefix into the following word rather than
+    // leaving it as a bare piece. The previous `6,6,4,5` came from the old
+    // longest-match encoder plus its `▁▁` deferral, not from the reference.
     assert_eq!(
         body["tokens"].as_array().unwrap(),
         &[
             serde_json::json!(6),
-            serde_json::json!(6),
-            serde_json::json!(4),
+            serde_json::json!(3),
             serde_json::json!(5)
         ]
     );
@@ -2820,9 +2823,9 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
     assert_eq!(
         body["tokens"].as_array().unwrap(),
         &[
+            // Same `▁▁hello!` segmentation as the id-only assertion above.
             serde_json::json!({"id":6,"piece":" "}),
-            serde_json::json!({"id":6,"piece":" "}),
-            serde_json::json!({"id":4,"piece":"hello"}),
+            serde_json::json!({"id":3,"piece":" hello"}),
             serde_json::json!({"id":5,"piece":"!"})
         ]
     );
@@ -4088,7 +4091,14 @@ async fn streaming_completion_accepts_advanced_sampling_controls() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(content_type.starts_with("text/event-stream"));
     assert!(body.contains("\"object\":\"text_completion\""));
-    assert!(body.contains("\"text\":\"<unk>\""));
+    // What this test is for is that presence_penalty / frequency_penalty /
+    // logit_bias are ACCEPTED and still stream a well-formed completion. The
+    // emitted token is incidental and fixture-specific: this vocab cannot build
+    // `▁hello` by pairwise merge, so the prompt is a run of byte-fallback <unk>s,
+    // and penalising that repeat (plus the logit_bias) makes the sampler pick EOS
+    // immediately — hence an empty delta and finish_reason=stop. The sibling
+    // `streaming_completion_*` test covers the unpenalised <unk> emission.
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
     assert!(body.contains("data: [DONE]"));
 }
 
@@ -4156,7 +4166,13 @@ async fn completion_clamps_over_limit_max_tokens_to_context() {
     write_generation_gguf_with_options(
         &path,
         GenerationFixtureOptions {
-            context_length: 8,
+            // 16, not 8: this fixture's 4-token vocab holds `▁hello` but none of the
+            // single-step pieces SPM needs to build it, so `"hello"` byte-falls-back
+            // (and `▁` is 3 UTF-8 bytes) to a 9-token prompt. A longest-match encoder
+            // could jump straight to `▁hello`; the reference algorithm cannot. The
+            // clamp path under test needs a context with room left over, which is
+            // what this widens — the assertion below is unchanged.
+            context_length: 16,
             include_tokenizer: true,
             truncate_payload: false,
         },
@@ -4203,10 +4219,11 @@ async fn completion_clamps_over_limit_max_tokens_to_context() {
         StatusCode::OK,
         "an over-limit max_tokens must clamp and generate, not reject: {body}"
     );
+    // 9-token prompt in a 16-token context leaves room for 7.
     let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or(0);
     assert!(
-        (1..=6).contains(&completion_tokens),
-        "generation must be clamped to the room left in the context (<=6), got {completion_tokens}: {body}"
+        (1..=7).contains(&completion_tokens),
+        "generation must be clamped to the room left in the context (<=7), got {completion_tokens}: {body}"
     );
 }
 
@@ -4440,9 +4457,18 @@ fn write_tokenizer_gguf_with_optional_chat_template(
     add_space_prefix: bool,
     chat_template: Option<&str>,
 ) {
-    let tokens = ["<unk>", "<s>", "</s>", "▁hello", "hello", "<0x21>", "▁"];
-    let scores = [0.0, 0.0, 0.0, 10.0, 2.0, 0.0, 1.0];
-    let token_types = [2, 3, 3, 1, 1, 6, 1];
+    // SPM reaches a token only through successive pairwise merges whose every
+    // intermediate is itself in the vocab, so the single-step pieces are required
+    // for `▁hello`/`hello` to be reachable at all. Appended (never reordered) so
+    // the ids these tests assert stay put. Mirrors tests/tokenizer.rs.
+    let tokens = [
+        "<unk>", "<s>", "</s>", "▁hello", "hello", "<0x21>", "▁", "▁h", "▁he", "▁hel", "▁hell",
+        "he", "hel", "hell",
+    ];
+    let scores = [
+        0.0, 0.0, 0.0, 10.0, 2.0, 0.0, 1.0, 3.0, 4.0, 5.0, 6.0, 2.5, 2.6, 2.7,
+    ];
+    let token_types = [2, 3, 3, 1, 1, 6, 1, 1, 1, 1, 1, 1, 1, 1];
 
     let mut b = Vec::new();
     b.extend_from_slice(b"GGUF");
