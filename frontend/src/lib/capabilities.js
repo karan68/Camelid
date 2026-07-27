@@ -180,6 +180,32 @@ function quantAwareCompatibilityHint(target, quantKey, confidence, { exact = fal
   return { kind: 'quant_mismatch', target, observedQuant: quantKey, confidence: `${confidence} with different quant`, exact }
 }
 
+/* Parameter-count token ("4b", "0.6b", "9b") normalized to a bare number string.
+   Underscores and dots are equivalent so a row id (`qwen3_0_6b_instruct_q8_0`) and a
+   filename ("Qwen3-0.6B-Q8_0.gguf") reduce to the same key. */
+function modelSizeKey(text) {
+  const match = String(text || '')
+    .toLowerCase()
+    .match(/(?:^|[^a-z0-9])(\d+(?:[._]\d+)?)\s*b(?:[^a-z0-9]|$)/)
+  return match ? match[1].replace(/[._]/g, '.') : null
+}
+
+/* The generic family fallbacks below scan for the FIRST row whose id merely contains
+   the family name. With several sizes certified under one family that returns an
+   arbitrary neighbour — a 4B file inherited the 0.6B row's id, status and evidence
+   copy purely from array order. A family hint is advisory and never unlocks chat, but
+   it must not name a row of a different size. When the subject states a size, keep only
+   rows of that size; if none match, decline the row-specific hint so the caller falls
+   through to the planned-family entry (or to "no matching compatibility row"), which is
+   honest rather than confidently wrong. Subjects with no size token are unchanged. */
+function findFamilyRowOfMatchingSize(rows, subject, predicate) {
+  const candidates = rows.filter(predicate)
+  if (!candidates.length) return null
+  const subjectSize = modelSizeKey(subject)
+  if (!subjectSize) return candidates[0]
+  return candidates.find((row) => modelSizeKey(row.id) === subjectSize) || null
+}
+
 function futureExactRowHint(rows, subject, quantKey) {
   const matchers = [
     {
@@ -672,7 +698,7 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   if (subject.includes('mistral')) {
     const hint = futureExactRowHint(rows, subject, quantKey)
     if (hint) return hint
-    const target = findRow((row) => row.family === 'mistral' || row.id.includes('mistral'))
+    const target = findFamilyRowOfMatchingSize(rows, subject, (row) => row.family === 'mistral' || row.id.includes('mistral'))
     if (target) return { kind: 'family', target, confidence: 'Mistral family name match without exact row match' }
     const family = findFamily((item) => item.id.includes('mistral'))
     if (family) return { kind: 'family', target: family, confidence: 'family name match' }
@@ -681,7 +707,7 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   if (subject.includes('mixtral')) {
     const hint = futureExactRowHint(rows, subject, quantKey)
     if (hint) return hint
-    const target = findRow((row) => row.family === 'mixtral_moe' || row.family === 'mixtral' || row.id.includes('mixtral'))
+    const target = findFamilyRowOfMatchingSize(rows, subject, (row) => row.family === 'mixtral_moe' || row.family === 'mixtral' || row.id.includes('mixtral'))
     if (target) return { kind: 'family', target, confidence: 'Mixtral family name match without exact row match' }
     const family = findFamily((item) => item.id.includes('mixtral'))
     if (family) return { kind: 'family', target: family, confidence: 'family name match' }
@@ -690,7 +716,7 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   if (subject.includes('qwen')) {
     const hint = futureExactRowHint(rows, subject, quantKey)
     if (hint) return hint
-    const target = findRow((row) => row.family === 'qwen_decoder' || row.family === 'qwen2' || row.id.includes('qwen'))
+    const target = findFamilyRowOfMatchingSize(rows, subject, (row) => row.family === 'qwen_decoder' || row.family === 'qwen2' || row.id.includes('qwen'))
     if (target) return { kind: 'family', target, confidence: 'Qwen family name match without exact row match' }
     const family = findFamily((item) => item.id.includes('qwen'))
     if (family) return { kind: 'family', target: family, confidence: 'family name match' }
@@ -699,7 +725,7 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   if (subject.includes('gemma')) {
     const hint = futureExactRowHint(rows, subject, quantKey)
     if (hint) return hint
-    const target = findRow((row) => row.family === 'gemma2_decoder' || row.family === 'gemma2' || row.id.includes('gemma'))
+    const target = findFamilyRowOfMatchingSize(rows, subject, (row) => row.family === 'gemma2_decoder' || row.family === 'gemma2' || row.id.includes('gemma'))
     if (target) return { kind: 'family', target, confidence: 'Gemma family name match without exact row match' }
     const family = findFamily((item) => item.id.includes('gemma'))
     if (family) return { kind: 'family', target: family, confidence: 'family name match' }
