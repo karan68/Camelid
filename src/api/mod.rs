@@ -4254,18 +4254,18 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 quantization: "Q8_0",
                 status: "active_validation_blocked_parity",
                 support_scope: "exact_row_validation_only",
-                full_support_status: "blocked_prompt_and_generation_parity",
-                full_support_blockers: "committed prompt-token and raw-generation parity receipts fail; API/WebUI readiness, context, performance, and portability evidence are also missing",
+                full_support_status: "blocked_generation_parity",
+                full_support_blockers: "the committed raw-generation parity receipt fails: the forward pass diverges from the reference (and disagrees with itself between fresh prefill and incremental decode); API/WebUI readiness, context, performance, and portability evidence are also missing. Prompt-token parity no longer blocks",
                 metadata_parses: "observed",
-                tokenizer_works: "blocked_prompt_token_parity",
+                tokenizer_works: "validated_raw_8_of_8_and_chat_3_of_3_prompt_token_parity",
                 tensors_load: "observed",
                 generation_runs: "observed_but_not_parity_certified",
                 parity_audited: "failed",
                 performance_measured: "not_started",
                 frontend_load_path_verified: "fail_closed_blocked_parity",
-                frontend_readiness_gate: "fail-closed until prompt-token and generation parity pass for this exact artifact",
-                tested_context: "short_prompt_failed_parity_probe",
-                chat_template_renderer: "phi3_metadata_template_under_validation",
+                frontend_readiness_gate: "fail-closed until generation parity passes for this exact artifact",
+                tested_context: "prompt_token_parity_to_2180_tokens_generation_diverges_by_the_4th_token",
+                chat_template_renderer: "phi3_metadata_template_prompt_tokens_reference_matched",
                 chat_template_shape_pack: "failed_reference_parity",
                 chat_template_shape_pack_id: "phi3-chat-template-pack-v1",
                 bounded_context_512_pack: "not_started",
@@ -4284,10 +4284,10 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
                 latest_checked_bucket: "phi3_hold_evidence",
-                latest_checked_result: "blocked_prompt_and_generation_parity",
+                latest_checked_result: "blocked_generation_parity",
                 latest_checked_output: "qa/muster/phi3-hold-evidence/README.md",
-                evidence: "exact-row work exists, but qa/muster/phi3-hold-evidence records all_match=false for prompt-token parity and all_pass=false for raw/chat generation parity; this row is intentionally not advertised as supported",
-                next_step: "fix Phi-3 tokenizer/template and generation parity, then capture exact-row API/WebUI and bounded-context evidence before promotion",
+                evidence: "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. Generation parity still FAILS and blocks the row: on the 9-token prefix 'The capital of France is Paris.\\n' the reference is ~99.1% confident of <|assistant|> (logprob -0.0091) while camelid ranks it -4.944 and emits '===', and camelid disagrees with itself between fresh prefill and incremental decode at that position — qa/muster/phi3-hold-evidence/generation-divergence-q8-20260727.json rules out the tokenizer, RoPE pairing, the padded vocab, sampling policy and detokenization. This row is intentionally not advertised as supported",
+                next_step: "localize the forward-pass divergence by layer-level activation tracing against the reference (prefill and decode disagree, so the attention/KV-cache path is the open suspect), then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion",
             },
             ModelCompatibilityTarget {
                 id: "deepseek_r1_distill_qwen_7b_q8_0",
@@ -15887,15 +15887,22 @@ mod tests {
             .iter()
             .find(|target| target.id == "phi3_mini_4k_instruct_q8_0")
             .expect("Phi-3 exact-row validation lane should stay visible");
+        // The row stays blocked and fail-closed: prompt-token parity was cleared
+        // 2026-07-27, but the forward pass still diverges from the reference, so
+        // nothing about the support claim moves.
         assert_eq!(phi3.status, "active_validation_blocked_parity");
         assert_eq!(phi3.parity_audited, "failed");
-        assert_eq!(
-            phi3.latest_checked_result,
-            "blocked_prompt_and_generation_parity"
-        );
+        assert_eq!(phi3.latest_checked_result, "blocked_generation_parity");
         assert!(phi3.frontend_readiness_gate.contains("fail-closed"));
-        assert!(phi3.evidence.contains("all_match=false"));
-        assert!(phi3.evidence.contains("all_pass=false"));
+        // Prompt-token parity now passes and must be stated as passing...
+        assert!(phi3.evidence.contains("prompt-token parity PASSES"));
+        assert!(phi3.evidence.contains("all_match=true"));
+        assert!(!phi3.tokenizer_works.starts_with("blocked"));
+        // ...while generation parity must still be stated as blocking.
+        assert!(phi3.evidence.contains("Generation parity still FAILS"));
+        assert!(phi3
+            .full_support_status
+            .contains("blocked_generation_parity"));
     }
 
     #[test]
