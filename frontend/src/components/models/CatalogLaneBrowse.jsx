@@ -542,11 +542,15 @@ function CatalogRow({
    weights. Selecting a variant swaps which exact file the row below will download —
    the confirmation still names that file, so grouping never blurs what is fetched. */
 function HfModelCard({ group, renderRow, onCheckFit, isCheckingFit }) {
-  const [selected, setSelected] = useState(() => Math.max(0, defaultFileIndex(group.files)))
-  // "Load more" can replace this repo's file list; clamp instead of indexing off
-  // the end.
-  const index = Math.min(selected, group.files.length - 1)
-  const file = group.files[index]
+  /* The selection is the chosen FILE, not its position. "Load more" can append
+     quantizations to a repo already on screen, and the list is re-sorted by
+     quality on every render — holding an index would silently slide the user's
+     choice onto a different file (and a different download) underneath them.
+     `null` means "never chosen", which is what lets the default track incoming
+     fit verdicts instead of freezing at first paint. */
+  const [selectedId, setSelectedId] = useState(null)
+  const fallback = group.files[Math.max(0, defaultFileIndex(group.files))]
+  const file = group.files.find((candidate) => candidate.catalog_id === selectedId) || fallback
 
   if (!file) return null
 
@@ -580,11 +584,11 @@ function HfModelCard({ group, renderRow, onCheckFit, isCheckingFit }) {
         <select
           id={`quant-${group.repoId}`}
           className="hf-quant-select"
-          value={index}
-          onChange={(event) => setSelected(Number(event.target.value))}
+          value={file.catalog_id}
+          onChange={(event) => setSelectedId(event.target.value)}
         >
-          {group.files.map((candidate, candidateIndex) => (
-            <option key={candidate.catalog_id} value={candidateIndex}>
+          {group.files.map((candidate) => (
+            <option key={candidate.catalog_id} value={candidate.catalog_id}>
               {candidate.quant || 'unlabelled'} · {prettySize(candidate.size_bytes)}
               {quantAdvice(candidate.quant).note ? ` · ${quantAdvice(candidate.quant).note}` : ''}
             </option>
@@ -724,7 +728,8 @@ export function CatalogLaneBrowse({
   }, [])
 
   // Append the next page of experimental (Hugging Face) results.
-  const loadMore = useCallback(async () => {    if (!nextCursor || !debouncedQuery) return
+  const loadMore = useCallback(async () => {
+    if (!nextCursor || !debouncedQuery) return
     const sequence = requestSequenceRef.current
     setLoadingMore(true)
     try {

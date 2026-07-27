@@ -84,7 +84,7 @@ pub async fn search_gguf(
     limit: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<HfSearchPage> {
-    let key = cache_key(query, cursor);
+    let key = cache_key(query, limit, cursor);
     if let Some(hit) = search_cache().get(&key, Instant::now()) {
         return Ok(hit);
     }
@@ -99,10 +99,12 @@ pub async fn search_gguf(
     Ok(page)
 }
 
-/// Cache identity for a page. The NUL separator cannot appear in a URL-safe cursor
-/// or a user query, so `("a", Some("b"))` can never collide with `("a\0b", None)`.
-fn cache_key(query: &str, cursor: Option<&str>) -> String {
-    format!("{query}\u{0}{}", cursor.unwrap_or_default())
+/// Cache identity for a page. `limit` is part of it because it bounds how many
+/// repos the page inspects: serving a 5-repo page to a caller that asked for 15
+/// would silently truncate results. The NUL separators cannot appear in a URL-safe
+/// cursor or a user query, so no two distinct triples can collide.
+fn cache_key(query: &str, limit: usize, cursor: Option<&str>) -> String {
+    format!("{query}\u{0}{limit}\u{0}{}", cursor.unwrap_or_default())
 }
 
 /// Bounded, TTL'd page cache. Insertion-ordered `Vec` rather than a `HashMap` +
@@ -540,10 +542,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_separates_query_from_cursor() {
-        // Without a separator, ("a\0b", None) and ("a", Some("b")) would collide.
-        assert_ne!(cache_key("a\u{0}b", None), cache_key("a", Some("b")));
-        assert_eq!(cache_key("phi", None), cache_key("phi", Some("")));
+    fn cache_key_separates_query_limit_and_cursor() {
+        // Without separators, ("a\0b", None) and ("a", Some("b")) would collide.
+        assert_ne!(
+            cache_key("a\u{0}b", 15, None),
+            cache_key("a", 15, Some("b"))
+        );
+        assert_eq!(cache_key("phi", 15, None), cache_key("phi", 15, Some("")));
+        // A page sized for 15 repos must not be served to a caller asking for 5.
+        assert_ne!(cache_key("phi", 15, None), cache_key("phi", 5, None));
     }
 
     #[test]

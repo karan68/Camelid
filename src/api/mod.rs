@@ -18470,10 +18470,27 @@ pub struct CatalogItemView {
     pub arch_support: &'static str,
 }
 
+/// The `general.architecture` a GGUF guessed as `token` will actually declare.
+///
+/// The browse guesser names model *families*; the loader allowlist names GGUF
+/// architectures, and those are not the same vocabulary — the same mismatch that
+/// made curated labels unusable for this axis. Mixtral is the case that bites:
+/// its GGUFs declare `llama` (the MoE tensors ride the llama architecture, which
+/// is why [`crate::model::MixtralMoeMetadata`] reads `llama.expert_count`), and
+/// Camelid ships an evidence-backed `mixtral_8x7b_instruct_v0_1_q8_0` row. Testing
+/// the family token directly stamped every Mixtral repo `not_implemented`, which
+/// folded a family we vouch for into the "cannot run this" drawer.
+fn loader_architecture_for_guess(token: &str) -> &str {
+    match token {
+        "mixtral" => "llama",
+        other => other,
+    }
+}
+
 /// Advisory architecture-support label for a **filename-guessed** architecture.
 /// An empty or unrecognized architecture is `"unknown"`, never `"not_implemented"`.
 fn guessed_arch_support(architecture: &str) -> &'static str {
-    if crate::model::is_implemented_architecture(architecture) {
+    if crate::model::is_implemented_architecture(loader_architecture_for_guess(architecture)) {
         "implemented"
     } else if architecture.is_empty() {
         "unknown"
@@ -18508,6 +18525,16 @@ fn exact_footprint_for(
         crate::fit::ADVISORY_CONTEXT_TOKENS,
         kv_dtype_for(hw),
     )
+}
+
+/// Whether `(repo_id, filename)` names a pinned curated row rather than an
+/// arbitrary Hugging Face file. Curated rows are the ones we vouch for and the
+/// only ones the coarse size pad is authorized for, so the on-demand fit check
+/// asks this before deciding whether an unmeasurable model still gets a verdict.
+fn is_curated_artifact(repo_id: &str, filename: &str) -> bool {
+    curated_catalog()
+        .iter()
+        .any(|item| item.repo_id == repo_id && item.filename == filename)
 }
 
 /// Footprint + confidence for a curated row: an **exact** footprint (weights + KV
@@ -20028,6 +20055,18 @@ async fn check_catalog_fit(Json(req): Json<CatalogFitRequest>) -> Response {
             crate::fit::assess(&hw, &exact_footprint_for(req.size_bytes, dims, &hw)),
             "exact",
         ),
+        // A curated row whose dimensions cannot be read is *listed* with the coarse
+        // size pad (see `curated_footprint`), so answering `Unknown` here would make
+        // "Re-check" erase a verdict the page already shows — on exactly the rows
+        // that need it, since "close some applications, then Re-check" is the remedy
+        // we print for them. Same rule as the listing, so the two cannot disagree.
+        None if is_curated_artifact(&req.repo_id, &req.filename) => (
+            crate::fit::assess(&hw, &crate::fit::advisory_footprint(req.size_bytes)),
+            "approx",
+        ),
+        // A live Hugging Face row gets no such pad: it is shown as `unknown` when
+        // unmeasured, and a size-based guess dressed as the result of an explicit
+        // check would be worse than the silence it replaced.
         None => (crate::fit::FitVerdict::Unknown, "unknown"),
     };
     Json(CatalogFitResponse {
@@ -21151,32 +21190,57 @@ mod catalog_fit_tests {
     #[test]
     fn arch_support_is_only_claimed_where_the_vocabulary_matches() {
         // Experimental rows: the architecture comes from `hf_browse::guess_architecture`,
-        // whose tokens are the same ones the loader allowlist tests, so both answers
-        // are usable.
+        // whose tokens are mapped onto the loader's vocabulary before the allowlist
+        // is consulted, so both answers are usable.
         assert_eq!(super::guessed_arch_support("qwen3"), "implemented");
         assert_eq!(super::guessed_arch_support("llama"), "implemented");
-        assert_eq!(super::guessed_arch_support("mixtral"), "not_implemented");
+        // REGRESSION: the guesser names a model FAMILY, the allowlist names a GGUF
+        // architecture. Mixtral GGUFs declare `llama`, and Camelid ships an
+        // evidence-backed `mixtral_8x7b_instruct_v0_1_q8_0` row — testing the family
+        // token directly folded every Mixtral repo into the "cannot run this" drawer.
+        assert_eq!(super::guessed_arch_support("mixtral"), "implemented");
+        assert_eq!(super::loader_architecture_for_guess("mixtral"), "llama");
+        // A family Camelid genuinely does not implement still reads as a negative.
+        assert_eq!(super::guessed_arch_support("mamba"), "not_implemented");
         // A guess that matched nothing is an absence of evidence and must NOT read
         // as a negative, or a UI filtering on it would hide models that load fine.
         assert_eq!(super::guessed_arch_support(""), "unknown");
     }
 
     #[test]
-    fn every_guessable_architecture_token_maps_to_a_definite_answer() {
-        // The helper is only sound while the browse guesser and the loader allowlist
-        // share a vocabulary. Pin that: every token `guess_architecture` can emit
-        // must resolve definitely, never to "unknown" (which would silently hide the
-        // row behind an "we could not tell" that is really "we did tell").
+    fn every_guessable_architecture_token_is_reported_loadable() {
+        // The helper is only sound while every token the browse guesser can emit maps
+        // onto something the loader recognizes. Pin that: a token that drifts out of
+        // the loader's vocabulary would silently hide its whole family behind a label
+        // claiming Camelid cannot run it.
         for token in [
             "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "lfm2",
             "mixtral",
         ] {
-            assert_ne!(
+            assert_eq!(
                 super::guessed_arch_support(token),
-                "unknown",
-                "browse can emit {token}, so it must resolve definitely"
+                "implemented",
+                "browse can emit {token}, and Camelid loads that family"
             );
         }
+    }
+
+    #[test]
+    fn only_curated_artifacts_are_recognized_for_the_size_pad() {
+        // The on-demand fit check falls back to the coarse pad for curated rows only,
+        // so this predicate decides whether an unmeasurable model keeps a verdict.
+        let curated = curated_catalog();
+        let row = curated.first().expect("catalog is non-empty");
+        assert!(super::is_curated_artifact(row.repo_id, row.filename));
+        // Right file, wrong repo (and vice versa) is not a curated row.
+        assert!(!super::is_curated_artifact(
+            "someone/elses-GGUF",
+            row.filename
+        ));
+        assert!(!super::is_curated_artifact(
+            row.repo_id,
+            "not-a-curated-file.gguf"
+        ));
     }
 
     #[test]
