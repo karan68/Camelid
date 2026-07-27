@@ -1,5 +1,10 @@
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::{
+    collections::{BTreeSet, BinaryHeap, HashMap},
+    fs::File,
+    io::Read,
+};
 
+use sha2::Digest;
 use unicode_general_category::{get_general_category, GeneralCategory};
 
 use crate::{gguf::GgufFile, BackendError, Result};
@@ -289,11 +294,29 @@ fn resolve_gpt2_pre_tokenizer(
     }
 }
 
+const PHI4_MINI_Q4KM_SHA256: &str =
+    "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a";
+
 fn is_exact_phi4_mini_q4km(file: &GgufFile) -> bool {
-    file.architecture() == Some("phi3")
+    let named_phi4 = file.architecture() == Some("phi3")
         && file.model_name() == Some("Phi 4 Mini Instruct")
         && file.path.file_name().and_then(|name| name.to_str())
-            == Some("Phi-4-mini-instruct-Q4_K_M.gguf")
+            == Some("Phi-4-mini-instruct-Q4_K_M.gguf");
+    named_phi4 && sha256_file(&file.path).is_some_and(|sha256| sha256 == PHI4_MINI_Q4KM_SHA256)
+}
+
+fn sha256_file(path: &std::path::Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", digest.finalize()))
 }
 
 impl Tokenizer {
@@ -1297,13 +1320,15 @@ fn consume_gpt4o_word(text: &str, byte_start: usize) -> Option<usize> {
 
 fn consume_gpt4o_first_word_alternative(text: &str, byte_start: usize) -> Option<usize> {
     let mut upper_end = byte_start;
-    let mut last_upper_start = None;
+    let mut last_lower_like = None;
     while upper_end < text.len() {
         let ch = next_char(text, upper_end)?;
         if !is_gpt4o_upper_like(ch) {
             break;
         }
-        last_upper_start = Some(upper_end);
+        if is_gpt4o_lower_like(ch) {
+            last_lower_like = Some(upper_end);
+        }
         upper_end += ch.len_utf8();
     }
 
@@ -1312,7 +1337,7 @@ fn consume_gpt4o_first_word_alternative(text: &str, byte_start: usize) -> Option
     let lower_start = if next_char(text, upper_end).is_some_and(is_gpt4o_lower_like) {
         upper_end
     } else {
-        last_upper_start.filter(|last| next_char(text, *last).is_some_and(is_gpt4o_lower_like))?
+        last_lower_like?
     };
 
     let mut end = lower_start;
@@ -1716,7 +1741,7 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 mod tests {
     use super::{
         bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_with, is_chat_control_marker,
-        is_mark, BpePreTokenizer, BpeRegistry, Token, TokenKind,
+        is_exact_phi4_mini_q4km, is_mark, BpePreTokenizer, BpeRegistry, Token, TokenKind,
     };
 
     fn tok(text: &str, kind: TokenKind) -> Token {
@@ -1817,7 +1842,7 @@ mod tests {
             ]),
             tensors: Vec::new(),
         };
-        assert!(is_exact_phi4_mini_q4km(&exact));
+        assert!(!is_exact_phi4_mini_q4km(&exact));
         let mut renamed = exact.clone();
         renamed.path = PathBuf::from("renamed.gguf");
         assert!(!is_exact_phi4_mini_q4km(&renamed));
@@ -2042,6 +2067,7 @@ mod tests {
         assert_eq!(gguf.architecture(), Some("phi3"));
         assert_eq!(gguf.model_name(), Some("Phi 4 Mini Instruct"));
         assert_eq!(gguf.metadata_string("tokenizer.ggml.pre"), Some("gpt-4o"));
+        assert!(is_exact_phi4_mini_q4km(&gguf));
         let tokenizer = Tokenizer::from_gguf(&gguf).expect("load Phi-4-mini tokenizer");
         assert!(
             tokenizer.special.eog.contains(&200_020),

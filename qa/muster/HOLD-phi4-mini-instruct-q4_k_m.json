@@ -14,7 +14,7 @@
   "observed_engine_facts_not_support": [
     "The exact artifact uses tokenizer.ggml.pre=gpt-4o and a compact metadata chat template. GPT4O tokenization is gated to this exact filename, model name, and phi3 architecture until broader artifact coverage is independently earned.",
     "The GPT4O pre-tokenizer is pinned to llama.cpp acd79d603's executed collapsed-regex path, with raw llama-tokenize --ids --no-bos captures committed in qa/prompt-packs/phi4-mini-gpt4o-tokenizer-oracle-v1.json.",
-    "The ordinary-message compact chat template is locked against the full upstream Phi-4 tokenizer_config.json template in qa/prompt-packs/phi4-mini-chat-template-shapes-v1.json."
+    "The ordinary-message compact chat template is locked against the exact GGUF metadata template in qa/prompt-packs/phi4-mini-chat-template-shapes-v1.json; tool-bearing requests fail closed until independently validated."
   ],
   "named_blockers": [
     {

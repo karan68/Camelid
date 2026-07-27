@@ -5102,6 +5102,30 @@ pub(crate) const GEMMA4_THINK: &str = "<|think|>";
 #[cfg(test)]
 mod gemma4_template_tests {
     use super::*;
+    use crate::tokenizer::{
+        BpePreTokenizer, BpeRegistry, SpecialTokens, TokenizerConfig, TokenizerModel,
+    };
+
+    fn phi4_template_test_tokenizer(template: &str) -> Tokenizer {
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: false,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(template.to_string()),
+        }
+    }
 
     #[test]
     fn chat_prompt_uses_gemma4_turn_markers() {
@@ -5220,7 +5244,7 @@ mod gemma4_template_tests {
         assert_eq!(pack.pack_id, "phi4-mini-chat-template-shapes-v1");
         assert_eq!(
             pack.oracle.revision,
-            "cfbefacb99257ffa30c83adab238a50856ac3083"
+            "78eb92a46fc37e6b524df991ed9aca9bc6aa7b80"
         );
         assert!(is_phi4_compact_template(&pack.oracle.template));
         assert!(!is_phi3_template(&pack.oracle.template));
@@ -5245,7 +5269,36 @@ mod gemma4_template_tests {
                 "shape {} diverges from the real Phi-4 ordinary-message template",
                 shape.id
             );
+
+            let tokenizer = phi4_template_test_tokenizer(&pack.oracle.template);
+            let routed = render_chat_prompt_for_tokenization(&messages, &tokenizer);
+            assert_eq!(routed.text, shape.expected_prompt);
+            assert!(routed.add_special);
+            assert!(routed.parse_special);
         }
+    }
+
+    #[test]
+    fn phi4_tool_requests_fail_closed_instead_of_dropping_tools() {
+        let template = "{% for message in messages %}{% if message['role'] == 'system' and 'tools' in message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}";
+        let tokenizer = phi4_template_test_tokenizer(template);
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "Read notes.txt".to_string(),
+        }];
+        let tools = [serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {}}
+        })];
+
+        let err = render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, &tools)
+            .expect_err("Phi-4 tools must not silently fall through to the ordinary renderer");
+        assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+        assert!(err
+            .to_string()
+            .contains("Phi-4 tool-call template rendering is not validated"));
     }
 
     #[test]
@@ -13440,6 +13493,12 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        if is_phi4_compact_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "Phi-4 tool-call template rendering is not validated; failing closed",
+            ));
+        }
         // Mistral Instruct templates (v0.3 GGUF) don't reference the `tools`
         // Jinja variable â€” the generic Jinja render silently drops them. Use
         // the dedicated renderer that produces [AVAILABLE_TOOLS] natively.
@@ -13769,7 +13828,6 @@ fn is_phi4_compact_template(template: &str) -> bool {
         && template.contains("<|/tool|>")
         && template.contains("add_generation_prompt")
         && template.contains("'<|assistant|>'")
-        && template.contains("{{ eos_token }}")
 }
 
 /// Phi-3 chat template detector: `<|user|>`/`<|assistant|>` turns separated by the
@@ -14218,7 +14276,7 @@ fn render_phi3_prompt(messages: &[ChatMessage]) -> String {
 }
 
 /// Render the ordinary-message branch of Phi-4's compact metadata template.
-/// Tool-bearing requests bypass this fallback and use metadata Jinja rendering.
+/// Tool-bearing requests fail closed until that template path is independently validated.
 fn render_phi4_compact_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for message in messages {

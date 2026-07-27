@@ -1,11 +1,11 @@
 {
   "schema": "camelid.chat_template_shape_pack/v1",
   "pack_id": "phi4-mini-chat-template-shapes-v1",
-  "purpose": "Locks the ordinary-message branch of the exact Phi-4-mini-instruct GGUF chat template. Tool-bearing system messages use the generic metadata-Jinja renderer; this pack covers the dedicated compact fallback used when no tools are supplied.",
+  "purpose": "Locks the ordinary-message branch of the exact Phi-4-mini-instruct GGUF chat template. Tool-bearing requests fail closed until their metadata-Jinja path is independently validated.",
   "oracle": {
-    "source": "microsoft/Phi-4-mini-instruct tokenizer_config.json",
-    "revision": "cfbefacb99257ffa30c83adab238a50856ac3083",
-    "template": "{% for message in messages %}{% if message['role'] == 'system' and 'tools' in message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% else %}{{ eos_token }}{% endif %}"
+    "source": "unsloth/Phi-4-mini-instruct-GGUF exact GGUF metadata",
+    "revision": "78eb92a46fc37e6b524df991ed9aca9bc6aa7b80",
+    "template": "{% for message in messages %}{% if message['role'] == 'system' and 'tools' in message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}"
   },
   "shapes": [
     {

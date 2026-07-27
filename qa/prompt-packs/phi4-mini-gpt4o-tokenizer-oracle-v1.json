@@ -28,6 +28,13 @@
     {"id":"newline_slash","input":"a.\n/b","input_utf8_hex":"612e0a2f62","expected_segments":["a",".\n/","b"],"expected_token_ids":[64,118550,65]},
     {"id":"precomposed","input":"café naïve","input_utf8_hex":"636166c3a9206e61c3af7665","expected_segments":["café"," naïve"],"expected_token_ids":[66,103112,153475,737]},
     {"id":"indic_marks","input":"नमस्ते world","input_utf8_hex":"e0a4a8e0a4aee0a4b8e0a58de0a4a4e0a58720776f726c64","expected_segments":["नमस","्त","े"," world"],"expected_token_ids":[998,1637,1496,4385,628,2375]},
-    {"id":"whitespace_symbol","input":" spaces and\ttabs🙂","input_utf8_hex":"2073706163657320616e640974616273f09f9982","expected_segments":[" spaces"," and","\ttabs","🙂"],"expected_token_ids":[18608,326,6264,6071,37459]}
+    {"id":"whitespace_symbol","input":" spaces and\ttabs🙂","input_utf8_hex":"2073706163657320616e640974616273f09f9982","expected_segments":[" spaces"," and","\ttabs","🙂"],"expected_token_ids":[18608,326,6264,6071,37459]},
+    {"id":"uber","input":"ÜBER","input_utf8_hex":"c39c424552","expected_segments":["Ü","BER"],"expected_token_ids":[8858,16712]},
+    {"id":"uber_x","input":"ÜBER x","input_utf8_hex":"c39c4245522078","expected_segments":["Ü","BER"," x"],"expected_token_ids":[8858,16712,1215]},
+    {"id":"a_e_acute_b","input":"AÉB","input_utf8_hex":"41c38942","expected_segments":["AÉ","B"],"expected_token_ids":[32,5859,33]},
+    {"id":"etat","input":"ÉTAT français","input_utf8_hex":"c389544154206672616ec3a7616973","expected_segments":["É","TAT"," français"],"expected_token_ids":[5859,51,1228,30450]},
+    {"id":"uber_contraction","input":"ÜBER's","input_utf8_hex":"c39c4245522773","expected_segments":["Ü","BER's"],"expected_token_ids":[8858,16712,885]},
+    {"id":"angstrom","input":"ÅNGSTROM unit","input_utf8_hex":"c3854e475354524f4d20756e6974","expected_segments":["Å","NGSTROM"," unit"],"expected_token_ids":[13631,19236,1117,6443,7670]},
+    {"id":"x_e_y_z_e","input":"XÉYZÉ","input_utf8_hex":"58c389595ac389","expected_segments":["XÉYZÉ"],"expected_token_ids":[55,5859,118480,5859]}
   ]
 }
