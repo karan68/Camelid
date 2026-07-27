@@ -12,7 +12,7 @@ Desktop app, browser chat, terminal UI, and an OpenAI-style API — all backed b
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-64748b.svg)](#platform-support)
 
-[Download][latest-release] · [Quick start](#quick-start) · [Model compatibility](COMPATIBILITY.md) · [Documentation](DOCS.md) · [Contributing](CONTRIBUTING.md)
+[Download][latest-release] · [Quick start](#quick-start) · [Supported models](#supported-models) · [Model compatibility](COMPATIBILITY.md) · [Documentation](DOCS.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -84,19 +84,84 @@ Prefer the terminal? Run `camelid chat` instead for a full-screen chat UI over t
 > `camelid serve --addr 0.0.0.0:8181` makes the API and UI reachable by every device that can
 > reach the host. Only bind `0.0.0.0` on a trusted network, behind your own access controls.
 
-## Choose a model
+## Supported models
 
-Not sure where to start? Pick **Llama 3.2 3B** — it's a good balance of quality and size. Catalog
-ids resolve by unique substring, so the short id below is all `camelid pull` needs.
+> [!IMPORTANT]
+> **Camelid's model policy: exact rows, not families.** Support is granted to a specific *model file
+> at a specific quantization*, validated token-for-token against a pinned llama.cpp reference and
+> backed by a committed parity receipt. A neighboring size, a different quant, another upload of
+> the "same" model, or a wider template does **not** inherit that support — it fails closed with a
+> typed error rather than quietly producing unverified output. The boundary for each row, and what
+> is explicitly *not* claimed, is pinned in [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md) and
+> [COMPATIBILITY.md](COMPATIBILITY.md).
+
+### Start here
+
+Not sure where to begin? Pick **Llama 3.2 3B** — the best balance of quality and size.
 
 | Goal | Model | Pull id |
 |---|---|---|
 | Smallest end-to-end test (~1.2 GB) | TinyLlama 1.1B Chat Q8_0 | `tinyllama` |
-| Recommended first model | Llama 3.2 3B Instruct Q8_0 | `llama32_3b` |
-| Larger, fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
+| **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `llama32_3b` |
+| Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
+| Reasoning + coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
 
-All three are `Q8_0` quantizations. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full set of
-supported rows.
+### Catalog models — `camelid pull`
+
+Twenty-one curated rows ship in the `camelid pull` catalog. Run `camelid pull` with no argument to
+print the list, or `camelid pull <id>` to download into `./models`. Ids resolve by **unique
+substring**, so the short ids below are all you need — `camelid pull llama32_3b` works exactly like
+the full `llama32_3b_instruct_q8_0`.
+
+| Model | Quant | Arch | Size | Pull id | GGUF file |
+|---|---|---|---:|---|---|
+| **TinyLlama 1.1B Chat** | `Q8_0` | `llama` | 1.2 GB | `tinyllama` | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` |
+| **Llama 3.2 1B Instruct** | `Q8_0` | `llama` | 1.3 GB | `llama32_1b` | `Llama-3.2-1B-Instruct-Q8_0.gguf` |
+| **Llama 3.2 3B Instruct** | `Q8_0` | `llama` | 3.4 GB | `llama32_3b` | `Llama-3.2-3B-Instruct-Q8_0.gguf` |
+| **Llama 3 8B Instruct** | `Q8_0` | `llama` | 8.5 GB | `llama3_8b` | `Meta-Llama-3-8B-Instruct.Q8_0.gguf` |
+| **Llama 3.1 8B Instruct** | `Q8_0` | `llama` | 8.5 GB | `llama31_8b` | `Meta-Llama-3.1-8B-Instruct-Q8_0.gguf` |
+| **Gemma 3 1B-It** | `Q8_0` | `gemma3` | 1.1 GB | `gemma3_1b` | `gemma-3-1b-it-Q8_0.gguf` |
+| **Gemma 4 E2B-It** | `Q8_0` | `gemma4` | 5.0 GB | `gemma4_e2b` | `gemma-4-E2B-it-Q8_0.gguf` |
+| **Gemma 4 E4B-It** | `Q8_0` | `gemma4` | 8.2 GB | `gemma4_e4b` | `gemma-4-E4B-it-Q8_0.gguf` |
+| **Gemma 4 12B-It** — two-Mac distributed | `Q8_0` | `gemma4` | 12.7 GB | `gemma4_12b` | `gemma-4-12b-it-Q8_0.gguf` |
+| **Gemma 4 26B-A4B-It QAT** — two-Mac distributed MoE | `Q4_0` | `gemma4` | 14.4 GB | `gemma4_26b` | `gemma-4-26B_q4_0-it.gguf` |
+| **Qwen3 0.6B** | `Q8_0` | `qwen3` | 0.6 GB | `qwen3_0_6b` | `Qwen3-0.6B-Q8_0.gguf` |
+| **Qwen3 1.7B** | `Q8_0` | `qwen3` | 1.8 GB | `qwen3_1_7b` | `Qwen3-1.7B-Q8_0.gguf` |
+| **Qwen3 4B** | `Q8_0` | `qwen3` | 4.3 GB | `qwen3_4b_q8` | `Qwen3-4B-Q8_0.gguf` |
+| **Qwen3 4B** | `Q4_K_M` | `qwen3` | 2.5 GB | `qwen3_4b_q4` | `Qwen3-4B-Q4_K_M.gguf` |
+| **Qwen3 8B** | `Q8_0` | `qwen3` | 8.7 GB | `qwen3_8b` | `Qwen3-8B-Q8_0.gguf` |
+| **Mistral 7B Instruct v0.3** | `Q8_0` | `llama` | 7.7 GB | `mistral` | `Mistral-7B-Instruct-v0.3-Q8_0.gguf` |
+| **Phi-3-mini-4k-instruct** | `Q8_0` | `phi3` | 4.1 GB | `phi3` | `Phi-3-mini-4k-instruct-Q8_0.gguf` |
+| **DeepSeek R1 Distill Qwen 7B** | `Q8_0` | `qwen25` | 8.1 GB | `distill_qwen` | `DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf` |
+| **DeepSeek R1 Distill Llama 8B** | `Q8_0` | `llama` | 8.5 GB | `distill_llama` | `DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf` |
+| **Qwen2.5 Coder 7B** | `Q8_0` | `qwen25` | 8.1 GB | `qwen25_coder` | `qwen2.5-coder-7b-instruct-q8_0.gguf` |
+| **Cohere Command R v01** | `Q8_0` | `command-r` | 37.2 GB | `command_r` | `c4ai-command-r-v01-Q8_0.gguf` |
+
+The two Gemma 4 rows marked *two-Mac distributed* are validated on the layer-sharded two-host lane —
+they are memory-infeasible on a single 16 GB machine. Command R is listed for completeness; at
+37 GB it needs a workstation-class host.
+
+### Also parity-certified
+
+These exact rows carry committed parity receipts but are **not** in the `camelid pull` catalog —
+point `--model` at the file yourself. Several are local requantizations rather than a single
+canonical upstream upload, which is precisely why they aren't offered as a one-command download.
+
+| Model | Quant | Arch | GGUF file | Lane |
+|---|---|---|---|---|
+| **Llama 3.2 1B Instruct** | `IQ4_XS` | `llama` | `Llama-3.2-1B-Instruct-IQ4_XS.gguf` | First i-quant row — GPU-resident + CPU wire-streamed raw-decode parity smoke |
+| **Llama 3.2 1B Instruct** | `Q4_K_M` | `llama` | `Llama-3.2-1B-Instruct-Q4_K_M.gguf` | GPU-resident K-quant raw greedy decode (16/16 layers VRAM-resident) |
+| **Llama 3.2 3B Instruct** | `Q4_K_M` | `llama` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | GPU-resident K-quant raw greedy decode (28/28 layers VRAM-resident) |
+| **Llama 3.2 3B Instruct** | `Q5_K_M` | `llama` | `Llama-3.2-3B-Instruct-Q5_K_M.gguf` | GPU-resident Q5 certification, token-and-text identical at 1/5/50 |
+| **Ornith 1.0 9B** | `Q8_0` | `qwen35` | `ornith-1.0-9b-Q8_0.gguf` | Hybrid DeltaNet + sparse attention on the runnable serve lane; `tool_capable` |
+| **Ornith 1.0 9B** | `Q4_K_M` | `qwen35` | `ornith-1.0-9b-Q4_K_M.gguf` | Fully GPU-resident CUDA lane (in-house requant); `tool_capable` |
+| **Ornith 1.0 9B** | `Q3_K_M` | `qwen35` | `ornith-1.0-9b-Q3_K_M.gguf` | Fully GPU-resident at 16K context on a 6 GiB card (imatrix requant) |
+| **Ternary Bonsai 4B** | `TQ2_0` | `qwen3` | `Ternary-Bonsai-4B-TQ2_0.gguf` | Ternary 2.06 bpw, single-node CPU completion smoke (~3.1 GB RSS) |
+| **Gemma 4 E4B-It** | `NVFP4` | `gemma4` | `gemma-4-E4B-it-NVFP4-mm.gguf` | BASALT / GABBRO NVFP4 pilot — Windows CUDA + macOS Metal, fails closed elsewhere |
+
+Each row's exact envelope — which surfaces are certified, which contexts were checked, and what is
+explicitly not claimed — lives in [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md).
+[COMPATIBILITY.md](COMPATIBILITY.md) is the complete, authoritative supported-row ledger.
 
 ## Ways to use Camelid
 
@@ -226,11 +291,13 @@ inherit supported status.
 The authoritative records live in the repository:
 
 - [COMPATIBILITY.md](COMPATIBILITY.md) — the supported-row ledger.
+- [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md) — the per-row support boundary and claim limits.
 - [RECEIPTS.md](RECEIPTS.md) — reproducible validation receipts.
 - [docs/benchmarks/BENCHMARKS.md](docs/benchmarks/BENCHMARKS.md) — performance measurements.
 - [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — how the engine is built.
 
-A selection of currently supported exact rows is below; [COMPATIBILITY.md](COMPATIBILITY.md) is the complete, authoritative ledger.
+Every row in [Supported models](#supported-models) is backed by that evidence chain. The serve lane
+and evidence envelope for a selection of those rows:
 
 | Model row | Quant | Serve lane | Evidence |
 |---|---|---|---|
@@ -278,6 +345,7 @@ Deeper references live alongside the code:
 
 - [DOCS.md](DOCS.md) — documentation index.
 - [COMPATIBILITY.md](COMPATIBILITY.md) — supported models and quantizations.
+- [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md) — exact-row support boundary and claim limits.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — configuration reference.
 - [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — engine internals.
 - [docs/benchmarks/BENCHMARKS.md](docs/benchmarks/BENCHMARKS.md) — performance measurements.
