@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "26c6fe6",
+    "source_head": "690dd285",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -1669,6 +1669,56 @@
         "latest_checked_output": "qa/muster/phi3-hold-evidence/README.md",
         "evidence": "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. Generation parity still blocks the row, but the cause is NON-DETERMINISM, not a fixed forward-pass error: six identical temperature-0 requests on the 9-token prefix 'The capital of France is Paris.\\\\n' returned two different tokens, flipping between the reference <|assistant|> (32001) and \\\\n (13), with the reference token winning a majority of runs — qa/muster/phi3-hold-evidence/nondeterminism-q8-20260727.json. That receipt scopes it to phi3 (Llama-3.2-3B on metal_resident and Mistral-7B on the SAME cpu_reference path are both bit-identical across runs) and rules out a parallel-reduction race (--threads 1) and lazy Q8 materialization (CAMELID_LAZY_Q8_0_LINEAR=0); phi3-only head_dim=96 and the fused attn_qkv/ffn_up sub-row expansion are the open suspects. It SUPERSEDES generation-divergence-q8-20260727.json, whose prefill-vs-decode reading was drawn from two samples of a noisy process and is wrong. This row is intentionally not advertised as supported",
         "next_step": "make phi3 decode REPEATABLE first — identical temperature-0 requests must return identical logits. It survives --threads 1 and eager Q8, so hunt an uninitialized/stale read on the phi3-only paths: head_dim=96 tails (every other local row is 128) and the fused attn_qkv/ffn_up sub-row descriptor expansion in src/model.rs. Only then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion"
+      }
+    },
+    {
+      "identity": {
+        "id": "phi4_mini_instruct_q4_k_m",
+        "family": "phi3",
+        "quantization": "Q4_K_M",
+        "sha256": "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a"
+      },
+      "contract": {
+        "id": "phi4_mini_instruct_q4_k_m",
+        "tool_capable": false,
+        "family": "phi3",
+        "quantization": "Q4_K_M",
+        "status": "active_validation_blocked_parity",
+        "support_scope": "exact_row_validation_only",
+        "full_support_status": "blocked_prompt_and_generation_parity",
+        "full_support_blockers": "the exact artifact has a documented Windows CUDA raw-decode divergence; CPU parity is inconclusive; forward-path isolation, API/WebUI, context, performance, and portability evidence are all missing",
+        "metadata_parses": "observed",
+        "tokenizer_works": "observed_exact_artifact_gpt4o_only",
+        "tensors_load": "observed_cuda_resident_only",
+        "generation_runs": "observed_but_not_parity_certified",
+        "parity_audited": "failed",
+        "performance_measured": "not_started",
+        "frontend_load_path_verified": "fail_closed_blocked_parity",
+        "frontend_readiness_gate": "fail-closed until prompt-token and generation parity pass for this exact artifact",
+        "tested_context": "short_raw_prompt_cuda_diverged_cpu_inconclusive",
+        "chat_template_renderer": "phi4_metadata_template_under_validation",
+        "chat_template_shape_pack": "ordinary_message_shape_locked_not_generation_certified",
+        "chat_template_shape_pack_id": "phi4-mini-chat-template-shapes-v1",
+        "bounded_context_512_pack": "not_started",
+        "bounded_context_512_pack_id": "phi4-context-512-smoke-v1",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_started",
+        "bounded_context_1024_pack_id": "phi4-context-1024-smoke-v1",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_started",
+        "bounded_context_2048_pack_id": "phi4-context-2048-smoke-v1",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_started",
+        "bounded_context_4096_pack_id": "phi4-context-4096-smoke-v1",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "phi4_hold_raw_cuda_divergence",
+        "latest_checked_result": "blocked_prompt_and_generation_parity",
+        "latest_checked_output": "qa/muster/HOLD-phi4-mini-instruct-q4_k_m.json",
+        "evidence": "exact artifact SHA-256 88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a is held in qa/muster/HOLD-phi4-mini-instruct-q4_k_m.json after an unattributed Windows CUDA raw-decode divergence and an inconclusive CPU matrix; it is intentionally absent from curated_catalog and not advertised as supported",
+        "next_step": "isolate the first divergent token across the Phi-4 forward path, then rerun complete tokenizer, generation, API/WebUI, determinism, and bounded-context evidence before any catalog or support promotion"
       }
     },
     {

@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
+use unicode_general_category::{get_general_category, GeneralCategory};
+
 use crate::{gguf::GgufFile, BackendError, Result};
 
 pub type TokenId = u32;
@@ -45,8 +47,8 @@ pub enum BpePreTokenizer {
     /// the ITEM1 tokenizer gate (qa/ornith/constrained-vram), which covers NFD,
     /// Devanagari (incl. virama clusters), Arabic harakat, and zalgo inputs.
     Qwen35,
-    /// llama.cpp `gpt-4o` (Phi-4-mini): case-aware word runs with a trailing
-    /// contraction, three-digit number groups, and combining-mark folding.
+    /// llama.cpp `gpt-4o`: its collapsed-regex dialect uses ASCII-only case
+    /// classes over Unicode General Category `L` code points.
     Gpt4o,
 }
 
@@ -268,18 +270,30 @@ fn is_llama3_bpe_signature(token_texts: &[String]) -> bool {
 fn resolve_gpt2_pre_tokenizer(
     pre: Option<&str>,
     token_texts: &[String],
+    allow_gpt4o: bool,
 ) -> Result<BpePreTokenizer> {
     match pre {
         Some("llama-bpe") => Ok(BpePreTokenizer::Llama3),
         Some("command-r") => Ok(BpePreTokenizer::CommandR),
         Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
         Some("qwen35") => Ok(BpePreTokenizer::Qwen35),
-        Some("gpt-4o") => Ok(BpePreTokenizer::Gpt4o),
+        Some("gpt-4o") if allow_gpt4o => Ok(BpePreTokenizer::Gpt4o),
+        Some("gpt-4o") => Err(BackendError::UnsupportedTokenizer(
+            "gpt-4o is admitted only for the exact Phi-4-mini-instruct-Q4_K_M artifact"
+                .to_string(),
+        )),
         None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
         other => Err(BackendError::UnsupportedTokenizer(format!(
-            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35, gpt-4o"
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35"
         ))),
     }
+}
+
+fn is_exact_phi4_mini_q4km(file: &GgufFile) -> bool {
+    file.architecture() == Some("phi3")
+        && file.model_name() == Some("Phi 4 Mini Instruct")
+        && file.path.file_name().and_then(|name| name.to_str())
+            == Some("Phi-4-mini-instruct-Q4_K_M.gguf")
 }
 
 impl Tokenizer {
@@ -310,7 +324,11 @@ impl Tokenizer {
         }
 
         let bpe_pre_tokenizer = if model == TokenizerModel::Gpt2Bpe {
-            resolve_gpt2_pre_tokenizer(file.metadata_string("tokenizer.ggml.pre"), &token_texts)?
+            resolve_gpt2_pre_tokenizer(
+                file.metadata_string("tokenizer.ggml.pre"),
+                &token_texts,
+                is_exact_phi4_mini_q4km(file),
+            )?
         } else {
             BpePreTokenizer::default()
         };
@@ -601,7 +619,10 @@ impl Tokenizer {
                 .unwrap_or(text.len());
 
             let segments = match self.bpe_pre_tokenizer {
-                BpePreTokenizer::Gpt4o => bpe_pretokenize_gpt4o(&text[byte_start..byte_end]),
+                BpePreTokenizer::Gpt4o => bpe_pretokenize_gpt4o(
+                    &text[byte_start..byte_end],
+                    self.bpe_pre_tokenizer.digit_group_max(),
+                ),
                 pre_tokenizer => bpe_pretokenize_with(
                     &text[byte_start..byte_end],
                     pre_tokenizer.digit_group_max(),
@@ -1217,15 +1238,17 @@ fn bpe_pretokenize(text: &str) -> Vec<&str> {
     bpe_pretokenize_with(text, 3, false)
 }
 
-/// GPT4O's case-aware pre-tokenizer, ported from pinned llama.cpp's
-/// `LLAMA_VOCAB_PRE_TYPE_GPT4O` expression. Its contractions stay attached to
-/// the preceding word, unlike the Llama-3/Qwen2 dialects.
-fn bpe_pretokenize_gpt4o(text: &str) -> Vec<&str> {
+/// GPT4O pre-tokenizer ported from pinned llama.cpp
+/// `LLAMA_VOCAB_PRE_TYPE_GPT4O`. llama.cpp executes an ECMAScript regex over
+/// collapsed Unicode categories, not the more readable tokenizer.json regex in
+/// the adjacent source comment. In particular, marks are not letters and only
+/// ASCII `a-z`/`A-Z` affect the two ordered word alternatives.
+fn bpe_pretokenize_gpt4o(text: &str, digit_group_max: usize) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut byte_start = 0;
 
     while byte_start < text.len() {
-        let byte_end = next_gpt4o_segment_end(text, byte_start);
+        let byte_end = next_gpt4o_segment_end(text, byte_start, digit_group_max);
         segments.push(&text[byte_start..byte_end]);
         byte_start = byte_end;
     }
@@ -1233,16 +1256,16 @@ fn bpe_pretokenize_gpt4o(text: &str) -> Vec<&str> {
     segments
 }
 
-fn next_gpt4o_segment_end(text: &str, byte_start: usize) -> usize {
+fn next_gpt4o_segment_end(text: &str, byte_start: usize, digit_group_max: usize) -> usize {
     if let Some(end) = consume_gpt4o_word(text, byte_start) {
         return end;
     }
 
     let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
-    if is_number(ch) {
-        return consume_digits(text, byte_start, 3);
+    if is_gpt4o_number(ch) {
+        return consume_digits(text, byte_start, digit_group_max);
     }
-    if let Some(end) = consume_optional_space_punctuation(text, byte_start, false) {
+    if let Some(end) = consume_gpt4o_punctuation(text, byte_start) {
         return end;
     }
     if let Some(end) = consume_whitespace_with_newline(text, byte_start) {
@@ -1257,61 +1280,137 @@ fn next_gpt4o_segment_end(text: &str, byte_start: usize) -> usize {
 
 fn consume_gpt4o_word(text: &str, byte_start: usize) -> Option<usize> {
     let first = next_char(text, byte_start)?;
-    let word_start = if is_letter(first) {
+    let word_start = if is_gpt4o_letter(first) {
         byte_start
-    } else if first != '\r' && first != '\n' && !is_number(first) {
+    } else if first != '\r' && first != '\n' && !is_gpt4o_number(first) {
         let next_start = byte_start + first.len_utf8();
-        let next = (next_start < text.len()).then(|| next_char(text, next_start))??;
-        is_letter(next).then_some(next_start)?
+        let next = next_char(text, next_start)?;
+        is_gpt4o_letter(next).then_some(next_start)?
     } else {
         return None;
     };
 
-    let mut upper_end = word_start;
-    let mut last_lower_like = None;
-    while upper_end < text.len() {
-        let ch = next_char(text, upper_end).expect("upper_end is in-bounds");
-        if !is_gpt4o_upper_like(ch) {
-            break;
-        }
-        if is_gpt4o_lower_like(ch) {
-            last_lower_like = Some(upper_end);
-        }
-        upper_end += ch.len_utf8();
-    }
-
-    let word_end = if upper_end < text.len()
-        && is_gpt4o_lower_like(next_char(text, upper_end).expect("upper_end is in-bounds"))
-    {
-        consume_gpt4o_lower_run(text, upper_end)
-    } else if upper_end == word_start {
-        consume_gpt4o_lower_run(text, word_start)
-    } else if let Some(lower_start) = last_lower_like {
-        consume_gpt4o_lower_run(text, lower_start)
-    } else {
-        upper_end
-    };
-
+    let word_end = consume_gpt4o_first_word_alternative(text, word_start)
+        .or_else(|| consume_gpt4o_second_word_alternative(text, word_start))?;
     Some(consume_contraction(text, word_end).unwrap_or(word_end))
 }
 
-fn consume_gpt4o_lower_run(text: &str, mut byte_start: usize) -> usize {
-    while byte_start < text.len() {
-        let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
+fn consume_gpt4o_first_word_alternative(text: &str, byte_start: usize) -> Option<usize> {
+    let mut upper_end = byte_start;
+    let mut last_upper_start = None;
+    while upper_end < text.len() {
+        let ch = next_char(text, upper_end)?;
+        if !is_gpt4o_upper_like(ch) {
+            break;
+        }
+        last_upper_start = Some(upper_end);
+        upper_end += ch.len_utf8();
+    }
+
+    // The first regex alternative greedily consumes its upper-like run, then
+    // backtracks only as far as needed to leave one lower-like code point.
+    let lower_start = if next_char(text, upper_end).is_some_and(is_gpt4o_lower_like) {
+        upper_end
+    } else if let Some(last) =
+        last_upper_start.filter(|last| next_char(text, *last).is_some_and(is_gpt4o_lower_like))
+    {
+        last
+    } else {
+        return None;
+    };
+
+    let mut end = lower_start;
+    while end < text.len() {
+        let ch = next_char(text, end)?;
         if !is_gpt4o_lower_like(ch) {
             break;
         }
-        byte_start += ch.len_utf8();
+        end += ch.len_utf8();
     }
-    byte_start
+    (end > lower_start).then_some(end)
+}
+
+fn consume_gpt4o_second_word_alternative(text: &str, byte_start: usize) -> Option<usize> {
+    let mut end = byte_start;
+    while end < text.len() {
+        let ch = next_char(text, end)?;
+        if !is_gpt4o_upper_like(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    if end == byte_start {
+        return None;
+    }
+    while end < text.len() {
+        let ch = next_char(text, end)?;
+        if !is_gpt4o_lower_like(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    Some(end)
 }
 
 fn is_gpt4o_upper_like(ch: char) -> bool {
-    (is_letter(ch) && !ch.is_lowercase()) || is_mark(ch)
+    is_gpt4o_letter(ch) && !ch.is_ascii_lowercase()
 }
 
 fn is_gpt4o_lower_like(ch: char) -> bool {
-    (is_letter(ch) && !ch.is_uppercase()) || is_mark(ch)
+    is_gpt4o_letter(ch) && !ch.is_ascii_uppercase()
+}
+
+fn is_gpt4o_letter(ch: char) -> bool {
+    matches!(
+        get_general_category(ch),
+        GeneralCategory::UppercaseLetter
+            | GeneralCategory::LowercaseLetter
+            | GeneralCategory::TitlecaseLetter
+            | GeneralCategory::ModifierLetter
+            | GeneralCategory::OtherLetter
+    )
+}
+
+fn is_gpt4o_number(ch: char) -> bool {
+    matches!(
+        get_general_category(ch),
+        GeneralCategory::DecimalNumber
+            | GeneralCategory::LetterNumber
+            | GeneralCategory::OtherNumber
+    )
+}
+
+fn consume_gpt4o_punctuation(text: &str, byte_start: usize) -> Option<usize> {
+    let first = next_char(text, byte_start)?;
+    let mut cursor = if first == ' ' {
+        let next_start = byte_start + first.len_utf8();
+        let next = next_char(text, next_start)?;
+        is_gpt4o_punctuation(next).then_some(next_start)?
+    } else if is_gpt4o_punctuation(first) {
+        byte_start
+    } else {
+        return None;
+    };
+
+    while cursor < text.len() {
+        let ch = next_char(text, cursor)?;
+        if !is_gpt4o_punctuation(ch) {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    while cursor < text.len() {
+        let ch = next_char(text, cursor)?;
+        if !matches!(ch, '\r' | '\n' | '/') {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    Some(cursor)
+}
+
+fn is_gpt4o_punctuation(ch: char) -> bool {
+    !is_whitespace(ch) && !is_gpt4o_letter(ch) && !is_gpt4o_number(ch)
 }
 
 fn bpe_pretokenize_with(text: &str, digit_group_max: usize, fold_marks: bool) -> Vec<&str> {
@@ -1621,7 +1720,7 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 mod tests {
     use super::{
         bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_with, is_chat_control_marker,
-        is_mark, BpeRegistry, Token, TokenKind,
+        is_mark, BpePreTokenizer, BpeRegistry, Token, TokenKind,
     };
 
     fn tok(text: &str, kind: TokenKind) -> Token {
@@ -1660,7 +1759,9 @@ mod tests {
 
     #[test]
     fn resolve_gpt2_pre_tokenizer_gates_the_missing_pre_recovery() {
-        use super::{resolve_gpt2_pre_tokenizer, BpePreTokenizer};
+        use super::{is_exact_phi4_mini_q4km, resolve_gpt2_pre_tokenizer, BpePreTokenizer};
+        use crate::gguf::{GgufFile, GgufMetadataValue};
+        use std::{collections::BTreeMap, path::PathBuf};
         let mut sig = vec![String::new(); 128_256];
         sig[128_000] = "<|begin_of_text|>".to_string();
         sig[128_001] = "<|end_of_text|>".to_string();
@@ -1671,34 +1772,59 @@ mod tests {
 
         // Explicit dialects resolve regardless of the vocab.
         assert!(matches!(
-            resolve_gpt2_pre_tokenizer(Some("llama-bpe"), &no_sig),
+            resolve_gpt2_pre_tokenizer(Some("llama-bpe"), &no_sig, false),
             Ok(BpePreTokenizer::Llama3)
         ));
         assert!(matches!(
-            resolve_gpt2_pre_tokenizer(Some("qwen2"), &no_sig),
+            resolve_gpt2_pre_tokenizer(Some("qwen2"), &no_sig, false),
             Ok(BpePreTokenizer::Qwen2)
         ));
         assert!(matches!(
-            resolve_gpt2_pre_tokenizer(Some("qwen35"), &no_sig),
+            resolve_gpt2_pre_tokenizer(Some("qwen35"), &no_sig, false),
             Ok(BpePreTokenizer::Qwen35)
         ));
         assert!(matches!(
-            resolve_gpt2_pre_tokenizer(Some("gpt-4o"), &no_sig),
+            resolve_gpt2_pre_tokenizer(Some("gpt-4o"), &no_sig, true),
             Ok(BpePreTokenizer::Gpt4o)
         ));
+        assert!(resolve_gpt2_pre_tokenizer(Some("gpt-4o"), &no_sig, false).is_err());
 
         // Missing pre + Llama-3 signature => recovered as Llama3 (the fix).
         assert!(matches!(
-            resolve_gpt2_pre_tokenizer(None, &sig),
+            resolve_gpt2_pre_tokenizer(None, &sig, false),
             Ok(BpePreTokenizer::Llama3)
         ));
 
         // Missing pre WITHOUT the signature => still refused (guards a de-labeled Qwen).
-        assert!(resolve_gpt2_pre_tokenizer(None, &no_sig).is_err());
+        assert!(resolve_gpt2_pre_tokenizer(None, &no_sig, false).is_err());
 
         // An explicit-but-unknown pre is refused EVEN WITH the signature — we only
         // rescue an absent key, never override a stated (if unrecognized) dialect.
-        assert!(resolve_gpt2_pre_tokenizer(Some("smaug-bpe"), &sig).is_err());
+        assert!(resolve_gpt2_pre_tokenizer(Some("smaug-bpe"), &sig, false).is_err());
+
+        let exact = GgufFile {
+            path: PathBuf::from("Phi-4-mini-instruct-Q4_K_M.gguf"),
+            version: 3,
+            tensor_count: 0,
+            metadata_count: 2,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: BTreeMap::from([
+                (
+                    "general.architecture".to_string(),
+                    GgufMetadataValue::String("phi3".to_string()),
+                ),
+                (
+                    "general.name".to_string(),
+                    GgufMetadataValue::String("Phi 4 Mini Instruct".to_string()),
+                ),
+            ]),
+            tensors: Vec::new(),
+        };
+        assert!(is_exact_phi4_mini_q4km(&exact));
+        let mut renamed = exact.clone();
+        renamed.path = PathBuf::from("renamed.gguf");
+        assert!(!is_exact_phi4_mini_q4km(&renamed));
     }
 
     // Parity gate for the missing-`pre` Llama-3 rescue: the exact Meta-Llama-3-8B GGUF
@@ -1866,17 +1992,44 @@ mod tests {
     }
 
     #[test]
-    fn gpt4o_pretokenizer_matches_llama_cpp_case_and_contraction_rules() {
-        let cases = [
-            ("it's NASA's turn", vec!["it's", " NASA's", " turn"]),
-            ("camelCase HTTPServer", vec!["camel", "Case", " HTTPServer"]),
-            ("1234", vec!["123", "4"]),
-            ("!Hello\r\nnext", vec!["!Hello", "\r\n", "next"]),
-            ("cafe\u{301} bar", vec!["cafe\u{301}", " bar"]),
-        ];
+    fn gpt4o_pretokenizer_matches_pinned_llama_cpp_collapsed_regex() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            input: String,
+            expected_segments: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Oracle {
+            commit: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            oracle: Oracle,
+            cases: Vec<Case>,
+        }
 
-        for (input, expected) in cases {
-            assert_eq!(bpe_pretokenize_gpt4o(input), expected, "input {input:?}");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/phi4-mini-gpt4o-tokenizer-oracle-v1.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read Phi-4 tokenizer oracle pack");
+        let pack: Pack = serde_json::from_str(&raw).expect("parse Phi-4 tokenizer oracle pack");
+        assert_eq!(pack.pack_id, "phi4-mini-gpt4o-tokenizer-oracle-v1");
+        assert_eq!(
+            pack.oracle.commit,
+            "acd79d603cb2e1c84c0886137b80f1ad649b6857"
+        );
+
+        for case in pack.cases {
+            assert_eq!(
+                bpe_pretokenize_gpt4o(&case.input, BpePreTokenizer::Gpt4o.digit_group_max()),
+                case.expected_segments,
+                "case {} input {:?}",
+                case.id,
+                case.input
+            );
         }
     }
 
@@ -1891,35 +2044,64 @@ mod tests {
             .expect("set CAMELID_PHI4_MINI_GGUF to the pinned Phi-4-mini Q4_K_M GGUF");
         let gguf = crate::gguf::read_metadata(&path).expect("read Phi-4-mini GGUF metadata");
         assert_eq!(gguf.architecture(), Some("phi3"));
+        assert_eq!(gguf.model_name(), Some("Phi 4 Mini Instruct"));
         assert_eq!(gguf.metadata_string("tokenizer.ggml.pre"), Some("gpt-4o"));
         let tokenizer = Tokenizer::from_gguf(&gguf).expect("load Phi-4-mini tokenizer");
+        assert!(
+            tokenizer.special.eog.contains(&200_020),
+            "<|end|> must be an EOG token for Phi-4 chat turns"
+        );
 
-        let cases = [
-            ("it's NASA's turn", vec![64_190, 42_606, 885, 3_716]),
-            ("camelCase HTTPServer", vec![178_067, 6_187, 21_929, 6_444]),
-            ("1234", vec![7_633, 19]),
-            ("!Hello\r\nnext", vec![0, 13_225, 370, 7_311]),
-            ("cafe\u{301} bar", vec![66, 6_903, 13_430, 3_608]),
-            (
-                "  spaces and\t tabs🙂",
-                vec![220, 18_608, 326, 197, 38_191, 37_459],
-            ),
-            (
-                "<|user|>\nWhat is the capital of France?<|end|>\n<|assistant|>\n",
-                vec![
-                    200_021, 198, 4_827, 382, 290, 9_029, 328, 10_128, 30, 200_020, 198, 200_019,
-                    198,
-                ],
-            ),
-        ];
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            input: String,
+            input_utf8_hex: String,
+            expected_token_ids: Vec<u32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Oracle {
+            command: String,
+            commit: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            oracle: Oracle,
+            cases: Vec<Case>,
+        }
 
-        for (input, expected) in cases {
+        let oracle_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/phi4-mini-gpt4o-tokenizer-oracle-v1.json"
+        );
+        let raw = std::fs::read_to_string(oracle_path).expect("read Phi-4 tokenizer oracle pack");
+        let pack: Pack = serde_json::from_str(&raw).expect("parse Phi-4 tokenizer oracle pack");
+        assert_eq!(
+            pack.oracle.commit,
+            "acd79d603cb2e1c84c0886137b80f1ad649b6857"
+        );
+        assert!(pack.oracle.command.contains("llama-tokenize"));
+
+        for case in pack.cases {
+            let captured_hex = case
+                .input
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(
+                captured_hex, case.input_utf8_hex,
+                "case {} UTF-8 bytes",
+                case.id
+            );
             assert_eq!(
                 tokenizer
-                    .encode(input, true, true)
+                    .encode(&case.input, false, true)
                     .expect("encode Phi-4-mini input"),
-                expected,
-                "pinned oracle token mismatch for {input:?}"
+                case.expected_token_ids,
+                "pinned oracle token mismatch for case {} input {:?}",
+                case.id,
+                case.input
             );
         }
     }

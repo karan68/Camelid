@@ -4290,6 +4290,48 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "make phi3 decode REPEATABLE first — identical temperature-0 requests must return identical logits. It survives --threads 1 and eager Q8, so hunt an uninitialized/stale read on the phi3-only paths: head_dim=96 tails (every other local row is 128) and the fused attn_qkv/ffn_up sub-row descriptor expansion in src/model.rs. Only then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion",
             },
             ModelCompatibilityTarget {
+                id: "phi4_mini_instruct_q4_k_m",
+                tool_capable: false,
+                family: "phi3",
+                quantization: "Q4_K_M",
+                status: "active_validation_blocked_parity",
+                support_scope: "exact_row_validation_only",
+                full_support_status: "blocked_prompt_and_generation_parity",
+                full_support_blockers: "the exact artifact has a documented Windows CUDA raw-decode divergence; CPU parity is inconclusive; forward-path isolation, API/WebUI, context, performance, and portability evidence are all missing",
+                metadata_parses: "observed",
+                tokenizer_works: "observed_exact_artifact_gpt4o_only",
+                tensors_load: "observed_cuda_resident_only",
+                generation_runs: "observed_but_not_parity_certified",
+                parity_audited: "failed",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_blocked_parity",
+                frontend_readiness_gate: "fail-closed until prompt-token and generation parity pass for this exact artifact",
+                tested_context: "short_raw_prompt_cuda_diverged_cpu_inconclusive",
+                chat_template_renderer: "phi4_metadata_template_under_validation",
+                chat_template_shape_pack: "ordinary_message_shape_locked_not_generation_certified",
+                chat_template_shape_pack_id: "phi4-mini-chat-template-shapes-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "phi4-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "phi4-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "phi4-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_started",
+                bounded_context_4096_pack_id: "phi4-context-4096-smoke-v1",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "phi4_hold_raw_cuda_divergence",
+                latest_checked_result: "blocked_prompt_and_generation_parity",
+                latest_checked_output: "qa/muster/HOLD-phi4-mini-instruct-q4_k_m.json",
+                evidence: "exact artifact SHA-256 88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a is held in qa/muster/HOLD-phi4-mini-instruct-q4_k_m.json after an unattributed Windows CUDA raw-decode divergence and an inconclusive CPU matrix; it is intentionally absent from curated_catalog and not advertised as supported",
+                next_step: "isolate the first divergent token across the Phi-4 forward path, then rerun complete tokenizer, generation, API/WebUI, determinism, and bounded-context evidence before any catalog or support promotion",
+            },
+            ModelCompatibilityTarget {
                 id: "deepseek_r1_distill_qwen_7b_q8_0",
                 tool_capable: false,
                 family: "qwen25",
@@ -5146,32 +5188,64 @@ mod gemma4_template_tests {
 
     #[test]
     fn phi4_compact_prompt_preserves_roles_without_marker_adjacent_newlines() {
-        let messages = [
-            ChatMessage {
-                unsupported_content_parts: Vec::new(),
-                role: "system".to_string(),
-                content: "Be concise.".to_string(),
-            },
-            ChatMessage {
-                unsupported_content_parts: Vec::new(),
-                role: "user".to_string(),
-                content: "Capital of France?".to_string(),
-            },
-            ChatMessage {
-                unsupported_content_parts: Vec::new(),
-                role: "assistant".to_string(),
-                content: "Paris.".to_string(),
-            },
-        ];
-        assert_eq!(
-            render_phi4_compact_prompt(&messages),
-            "<|system|>Be concise.<|end|><|user|>Capital of France?<|end|>\
-             <|assistant|>Paris.<|end|><|assistant|>"
-        );
+        #[derive(serde::Deserialize)]
+        struct PackMessage {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            messages: Vec<PackMessage>,
+            expected_prompt: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Oracle {
+            revision: String,
+            template: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            oracle: Oracle,
+            shapes: Vec<Shape>,
+        }
 
-        let phi4_template = "{% for message in messages %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}";
-        assert!(is_phi4_compact_template(phi4_template));
-        assert!(!is_phi3_template(phi4_template));
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/phi4-mini-chat-template-shapes-v1.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read Phi-4 template shapes pack");
+        let pack: Pack = serde_json::from_str(&raw).expect("parse Phi-4 template shapes pack");
+        assert_eq!(pack.pack_id, "phi4-mini-chat-template-shapes-v1");
+        assert_eq!(
+            pack.oracle.revision,
+            "cfbefacb99257ffa30c83adab238a50856ac3083"
+        );
+        assert!(is_phi4_compact_template(&pack.oracle.template));
+        assert!(!is_phi3_template(&pack.oracle.template));
+
+        let phi3_template = "<|user|>\n{{content}}<|end|>\n<|assistant|>\n";
+        assert!(is_phi3_template(phi3_template));
+        assert!(!is_phi4_compact_template(phi3_template));
+
+        for shape in pack.shapes {
+            let messages = shape
+                .messages
+                .into_iter()
+                .map(|message| ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: message.role,
+                    content: message.content,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                render_phi4_compact_prompt(&messages),
+                shape.expected_prompt,
+                "shape {} diverges from the real Phi-4 ordinary-message template",
+                shape.id
+            );
+        }
     }
 
     #[test]
@@ -13688,10 +13762,14 @@ fn is_qwen3_chatml_template(template: &str) -> bool {
 /// `<|role|>content<|end|>`, followed by a bare `<|assistant|>` generation prompt.
 /// Check it before Phi-3 because both families use the same marker vocabulary.
 fn is_phi4_compact_template(template: &str) -> bool {
-    template.contains("'<|' + message['role'] + '|>'")
+    template.contains("message['role'] == 'system'")
+        && template.contains("'tools' in message")
         && template.contains("message['content'] + '<|end|>'")
+        && template.contains("<|tool|>")
+        && template.contains("<|/tool|>")
         && template.contains("add_generation_prompt")
         && template.contains("'<|assistant|>'")
+        && template.contains("{{ eos_token }}")
 }
 
 /// Phi-3 chat template detector: `<|user|>`/`<|assistant|>` turns separated by the
@@ -14139,7 +14217,8 @@ fn render_phi3_prompt(messages: &[ChatMessage]) -> String {
     prompt
 }
 
-/// Render Phi-4's compact marker template from its exact GGUF metadata shape.
+/// Render the ordinary-message branch of Phi-4's compact metadata template.
+/// Tool-bearing requests bypass this fallback and use metadata Jinja rendering.
 fn render_phi4_compact_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for message in messages {
@@ -15973,6 +16052,31 @@ mod tests {
         assert!(phi3
             .full_support_status
             .contains("blocked_generation_parity"));
+
+        // The held Phi-4 artifact carries a tokenizer admission gate but no support
+        // claim, so it must never surface as an installable catalog row.
+        assert!(
+            !curated_catalog()
+                .iter()
+                .any(|item| item.filename == "Phi-4-mini-instruct-Q4_K_M.gguf"),
+            "held Phi-4 artifact must not become a user-facing catalog row"
+        );
+
+        let phi4 = response
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "phi4_mini_instruct_q4_k_m")
+            .expect("Phi-4 exact-row HOLD should stay visible");
+        assert_eq!(phi4.status, "active_validation_blocked_parity");
+        assert_eq!(phi4.parity_audited, "failed");
+        assert_eq!(
+            phi4.latest_checked_output,
+            "qa/muster/HOLD-phi4-mini-instruct-q4_k_m.json"
+        );
+        assert!(phi4.frontend_readiness_gate.contains("fail-closed"));
+        assert!(phi4
+            .evidence
+            .contains("intentionally absent from curated_catalog"));
     }
 
     #[test]
@@ -18895,21 +18999,6 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             license: "llama3.1",
             task_tags: &["general"],
         },
-        CatalogItem {
-            // Exact artifact pinned against Hugging Face's LFS SHA-256 on 2026-07-27.
-            // It remains experimental until an exact-row support contract is earned.
-            catalog_id: "phi4_mini_instruct_q4_k_m",
-            name: "Phi-4-mini-instruct Q4_K_M",
-            repo_id: "unsloth/Phi-4-mini-instruct-GGUF",
-            filename: "Phi-4-mini-instruct-Q4_K_M.gguf",
-            size_bytes: 2491874272,
-            downloads: 0,
-            likes: 0,
-            quant: "Q4_K_M",
-            architecture: "phi3",
-            license: "mit",
-            task_tags: &["general", "coding"],
-        },
     ]
 }
 
@@ -20774,9 +20863,7 @@ mod non_windows_model_delete_tests {
 
 #[cfg(test)]
 mod catalog_fit_tests {
-    use super::{
-        classify_model_lane, curated_catalog, CatalogItem, CatalogItemView, ModelLaneClass,
-    };
+    use super::{curated_catalog, CatalogItem, CatalogItemView};
     use crate::capability::{HardwareProfile, SimdCaps};
     use crate::fit::FitVerdict;
 
@@ -20823,20 +20910,6 @@ mod catalog_fit_tests {
         let item = row("llama3_8b_instruct_q8_0");
         let view = CatalogItemView::from_curated(&item, &hw);
         assert_eq!(view.fit, FitVerdict::WontFit);
-    }
-
-    #[test]
-    fn phi4_mini_q4km_is_discoverable_but_not_a_supported_row() {
-        let item = row("phi4_mini_instruct_q4_k_m");
-        assert_eq!(item.repo_id, "unsloth/Phi-4-mini-instruct-GGUF");
-        assert_eq!(item.filename, "Phi-4-mini-instruct-Q4_K_M.gguf");
-        assert_eq!(item.size_bytes, 2_491_874_272);
-        assert_eq!(item.architecture, "phi3");
-        assert_eq!(item.quant, "Q4_K_M");
-        assert_eq!(
-            classify_model_lane(Some(item.architecture), item.filename),
-            ModelLaneClass::ExperimentalImplemented
-        );
     }
 
     #[test]
