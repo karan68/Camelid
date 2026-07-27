@@ -1311,12 +1311,8 @@ fn consume_gpt4o_first_word_alternative(text: &str, byte_start: usize) -> Option
     // backtracks only as far as needed to leave one lower-like code point.
     let lower_start = if next_char(text, upper_end).is_some_and(is_gpt4o_lower_like) {
         upper_end
-    } else if let Some(last) =
-        last_upper_start.filter(|last| next_char(text, *last).is_some_and(is_gpt4o_lower_like))
-    {
-        last
     } else {
-        return None;
+        last_upper_start.filter(|last| next_char(text, *last).is_some_and(is_gpt4o_lower_like))?
     };
 
     let mut end = lower_start;
