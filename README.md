@@ -296,7 +296,17 @@ The authoritative records live in the repository:
 - [docs/benchmarks/BENCHMARKS.md](docs/benchmarks/BENCHMARKS.md) — performance measurements.
 - [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — how the engine is built.
 
-Every row in [Supported models](#supported-models) above is backed by that evidence chain.
+Every row in [Supported models](#supported-models) is backed by that evidence chain. The serve lane
+and evidence envelope for a selection of those rows:
+
+| Model row | Quant | Serve lane | Evidence |
+|---|---|---|---|
+| TinyLlama 1.1B Chat | Q8_0 | single-node | Current verified gate |
+| Llama 3.2 3B Instruct | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 |
+| Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
+| Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
+| Qwen3 4B | Q8_0 | single-node | Exact-row ChatML parity (thinking-disabled) |
+| Gemma 4 E2B-It | Q8_0 | single-node | 5/5 greedy parity (CPU + Metal) |
 
 ## Build from source
 
