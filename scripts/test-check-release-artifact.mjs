@@ -233,7 +233,18 @@ assert.ok(
     await failuresFor('linux-no-compiler', omit(goodLinux, 'libnvrtc.so.12.9.86', 'libnvrtc.so.12'), LINUX, { requireNvrtc: true }),
     /no NVRTC compiler library/,
   ),
-  'a linux tarball without the libnvrtc soname would silently fall back to CPU and must fail',
+  'a linux tarball with no NVRTC compiler library at all would silently fall back to CPU and must fail',
+)
+// The soname is the whole point: cudarc's dlopen candidates are libnvrtc.so and
+// libnvrtc.so.<major>, never the three-component real name. A tarball that kept
+// libnvrtc.so.12.9.86 but lost the libnvrtc.so.12 link is a CPU-only artifact
+// that looks complete, so the compiler role must be searched for by soname.
+assert.ok(
+  has(
+    await failuresFor('linux-soname-only-missing', omit(goodLinux, 'libnvrtc.so.12'), LINUX, { requireNvrtc: true }),
+    /no NVRTC compiler library/,
+  ),
+  'the versioned real file WITHOUT its soname link cannot be dlopen’d and must fail',
 )
 assert.ok(
   has(await failuresFor('linux-no-builtins', omit(goodLinux, 'libnvrtc-builtins.so.12.9'), LINUX, { requireNvrtc: true }), /no NVRTC builtins/),
@@ -292,16 +303,27 @@ assert.deepEqual(
 // readTree's lstat/readlink handling wherever the OS permits it.
 // ---------------------------------------------------------------------------
 const entry = (path, over = {}) => ({ path, kind: 'file', size: 16, mode: 0o755, sha256: `hash-${path}`, ...over })
-const linuxEntries = (...extra) => [
-  entry('camelid'),
-  entry('README.md'),
-  entry('LICENSE'),
-  entry('THIRD_PARTY_NOTICES.md'),
-  entry('libnvrtc.so.12.9.86'),
-  entry('libnvrtc-builtins.so.12.9'),
-  ...extra,
-]
 const link = (path, linkTarget) => ({ path, kind: 'symlink', size: 0, mode: 0o777, linkTarget })
+/**
+ * A VALID linux payload. The `libnvrtc.so.<major>` soname belongs in the base
+ * fixture, not only in the tests that are about symlinks: it is the name cudarc
+ * dlopen's, so a payload without it is a CPU-only artifact rather than a
+ * release. Any `extra` entry REPLACES the base entry with the same path, which
+ * is how the variants below swap in a dangling or escaping link.
+ */
+const linuxEntries = (...extra) => {
+  const base = [
+    entry('camelid'),
+    entry('README.md'),
+    entry('LICENSE'),
+    entry('THIRD_PARTY_NOTICES.md'),
+    entry('libnvrtc.so.12.9.86'),
+    entry('libnvrtc-builtins.so.12.9'),
+    link('libnvrtc.so.12', 'libnvrtc.so.12.9.86'),
+  ]
+  const replaced = new Set(extra.map((e) => e.path))
+  return [...base.filter((e) => !replaced.has(e.path)), ...extra]
+}
 
 assert.deepEqual(
   checkManifest(linuxEntries(link('libnvrtc.so.12', 'libnvrtc.so.12.9.86')), LINUX, { requireNvrtc: true }),
@@ -322,7 +344,7 @@ assert.ok(
 )
 assert.ok(
   has(
-    checkManifest([...linuxEntries(), entry('libnvrtc.so.12', { sha256: 'hash-libnvrtc.so.12.9.86' })], LINUX, { requireNvrtc: true }),
+    checkManifest(linuxEntries(entry('libnvrtc.so.12', { sha256: 'hash-libnvrtc.so.12.9.86' })), LINUX, { requireNvrtc: true }),
     /duplicate payload/,
   ),
   'two byte-identical NVRTC real files mean a symlink was dereferenced',
