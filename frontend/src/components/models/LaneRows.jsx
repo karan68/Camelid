@@ -79,7 +79,39 @@ function DeleteModelButton({ entry, busy, blockedReason, onDelete }) {
   )
 }
 
-export function SupportedRow({ entry, active, busy, deleteBusy, blockedReason, onUse, onDelete }) {
+function DefaultModelControl({ entry, isDefault, busy, onMakeDefault }) {
+  if (isDefault) {
+    return (
+      <span className="lane-row-default" title="Camelid loads this model when the app starts">
+        ★ Starts automatically
+      </span>
+    )
+  }
+  return (
+    <button
+      type="button"
+      className="lane-row-default-action"
+      onClick={() => onMakeDefault(entry.filename)}
+      disabled={busy}
+      title="Load this model automatically the next time Camelid starts"
+    >
+      {busy ? 'Saving…' : 'Make default'}
+    </button>
+  )
+}
+
+export function SupportedRow({
+  entry,
+  active,
+  busy,
+  deleteBusy,
+  defaultBusy,
+  isDefault,
+  blockedReason,
+  onUse,
+  onDelete,
+  onMakeDefault,
+}) {
   return (
     <article
       className={`lane-row lane-row--supported${active ? ' lane-row--active' : ''}`}
@@ -93,21 +125,39 @@ export function SupportedRow({ entry, active, busy, deleteBusy, blockedReason, o
         <EvidenceChip state="supported" asText>Supported</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
-      {active ? (
-        <p className="lane-row-loaded">● Loaded — this is the active chat model.</p>
-      ) : (
-        <div className="lane-row-actions">
+      {active ? <p className="lane-row-loaded">● Loaded — this is the active chat model.</p> : null}
+      <div className="lane-row-actions">
+        {!active ? (
           <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
             {busy ? 'Loading…' : 'Use for chat'}
           </button>
-          <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
-        </div>
-      )}
+        ) : null}
+        <DefaultModelControl
+          entry={entry}
+          isDefault={isDefault}
+          busy={defaultBusy || busy || deleteBusy}
+          onMakeDefault={onMakeDefault}
+        />
+        {!active ? (
+          <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />
+        ) : null}
+      </div>
     </article>
   )
 }
 
-export function CompatibleRow({ entry, receipt, busy, deleteBusy, blockedReason, onUse, onDelete }) {
+export function CompatibleRow({
+  entry,
+  receipt,
+  busy,
+  deleteBusy,
+  defaultBusy,
+  isDefault,
+  blockedReason,
+  onUse,
+  onDelete,
+  onMakeDefault,
+}) {
   return (
     <article className="lane-row lane-row--runnable" aria-label={`Compatible model ${entry.filename}`}>
       <div className="lane-row-head">
@@ -133,7 +183,13 @@ export function CompatibleRow({ entry, receipt, busy, deleteBusy, blockedReason,
         <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
           {busy ? 'Loading…' : 'Use for chat (experimental)'}
         </button>
-        <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
+        <DefaultModelControl
+          entry={entry}
+          isDefault={isDefault}
+          busy={defaultBusy || busy || deleteBusy}
+          onMakeDefault={onMakeDefault}
+        />
+        <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />
       </div>
     </article>
   )
@@ -160,7 +216,17 @@ export function EligibleRow({ entry, busy, deleteBusy, blockedReason, onRun, onD
   )
 }
 
-export function NotAnchoredRow({ entry, busy, deleteBusy, blockedReason, onUse, onDelete }) {
+export function NotAnchoredRow({
+  entry,
+  busy,
+  deleteBusy,
+  defaultBusy,
+  isDefault,
+  blockedReason,
+  onUse,
+  onDelete,
+  onMakeDefault,
+}) {
   return (
     <article className="lane-row lane-row--blocked" aria-label={`Experimental model ${entry.filename}`}>
       <div className="lane-row-head">
@@ -180,7 +246,13 @@ export function NotAnchoredRow({ entry, busy, deleteBusy, blockedReason, onUse, 
         <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
           {busy ? 'Loading…' : 'Use for chat (experimental)'}
         </button>
-        <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
+        <DefaultModelControl
+          entry={entry}
+          isDefault={isDefault}
+          busy={defaultBusy || busy || deleteBusy}
+          onMakeDefault={onMakeDefault}
+        />
+        <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />
       </div>
     </article>
   )

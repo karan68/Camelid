@@ -54,6 +54,7 @@ use crate::{
         DenseLlamaDims, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig,
         LlamaTensorBinding,
     },
+    model_default,
     model_source::{inspect_model_source, ModelSourceInspection, ModelSourceKind},
     receipt::{
         self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
@@ -2036,6 +2037,10 @@ pub fn router_with_state(state: AppState) -> Router {
         )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
+        .route(
+            "/api/models/default",
+            get(default_model).post(set_default_model),
+        )
         .route("/api/models/runnable-receipt", get(runnable_receipt))
         .route("/api/models/runnable-smoke", post(run_runnable_smoke))
         .route("/api/models/catalog", get(get_catalog))
@@ -19773,17 +19778,7 @@ struct LocalModelFileIdentity {
 }
 
 fn validate_local_model_filename(filename: &str) -> bool {
-    let path = std::path::Path::new(filename);
-    filename == filename.trim()
-        && !filename.is_empty()
-        && !filename.contains(['/', '\\', ':'])
-        && matches!(
-            (path.components().next(), path.components().nth(1)),
-            (Some(std::path::Component::Normal(_)), None)
-        )
-        && path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    model_default::valid_local_model_filename(filename)
 }
 
 #[cfg(windows)]
@@ -19933,7 +19928,6 @@ struct DeleteLocalModelResponse {
     bytes_freed: u64,
 }
 
-#[cfg(windows)]
 fn local_management_request_allowed(headers: &HeaderMap) -> bool {
     let authority = headers
         .get("host")
@@ -19968,6 +19962,196 @@ fn local_management_request_allowed(headers: &HeaderMap) -> bool {
             .get("sec-fetch-site")
             .and_then(|value| value.to_str().ok())
             == Some("same-origin")
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetDefaultModelRequest {
+    filename: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DefaultModelResponse {
+    filename: Option<String>,
+    configured: bool,
+}
+
+impl DefaultModelResponse {
+    fn from_models_dir(models_dir: &std::path::Path) -> Self {
+        match model_default::effective_default_model(models_dir) {
+            Some(choice) => Self {
+                filename: Some(choice.filename),
+                configured: choice.configured,
+            },
+            None => Self {
+                filename: None,
+                configured: false,
+            },
+        }
+    }
+}
+
+/// The startup choice is always readable. With no explicit preference the first
+/// local GGUF is returned, matching the zero-configuration startup behavior.
+async fn default_model(State(state): State<AppState>) -> Json<DefaultModelResponse> {
+    Json(DefaultModelResponse::from_models_dir(&state.models_dir))
+}
+
+/// Persist a startup choice beside the local model library. This mutation is
+/// limited to Camelid's same-origin loopback UI even though the server's general
+/// API CORS policy is permissive.
+async fn set_default_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetDefaultModelRequest>,
+) -> Response {
+    if !state.serve_addr.ip().is_loopback() || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "the default model can be changed only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    match model_default::set_default_model(&state.models_dir, &req.filename) {
+        Ok(choice) => (
+            StatusCode::OK,
+            Json(DefaultModelResponse {
+                filename: Some(choice.filename),
+                configured: true,
+            }),
+        )
+            .into_response(),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_default_model",
+            err.to_string(),
+            Some("filename"),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => api_error(
+            StatusCode::NOT_FOUND,
+            "default_model_not_found",
+            err.to_string(),
+            Some("filename"),
+        ),
+        Err(err) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "default_model_write_failed",
+            format!("could not save the default model: {err}"),
+            Some("filename"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod default_model_api_tests {
+    use super::{router_with_state, AppState};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    async fn response_json(app: axum::Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn default_model_endpoint_reports_fallback_and_persists_a_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.gguf"), []).unwrap();
+        std::fs::write(dir.path().join("chosen.gguf"), []).unwrap();
+        let app =
+            router_with_state(AppState::default().with_models_dir(Some(dir.path().to_path_buf())));
+
+        let (status, body) = response_json(
+            app.clone(),
+            Request::builder()
+                .uri("/api/models/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "filename": "alpha.gguf", "configured": false })
+        );
+
+        let (status, body) = response_json(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/default")
+                .header("host", "127.0.0.1:8181")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "filename": "chosen.gguf" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "filename": "chosen.gguf", "configured": true })
+        );
+
+        let (_, body) = response_json(
+            app,
+            Request::builder()
+                .uri("/api/models/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            body,
+            json!({ "filename": "chosen.gguf", "configured": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn default_model_mutation_rejects_cross_origin_and_unsafe_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("safe.gguf"), []).unwrap();
+        let app =
+            router_with_state(AppState::default().with_models_dir(Some(dir.path().to_path_buf())));
+
+        let (status, _) = response_json(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/default")
+                .header("host", "127.0.0.1:8181")
+                .header("origin", "https://attacker.example")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "filename": "safe.gguf" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) = response_json(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/default")
+                .header("host", "127.0.0.1:8181")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "filename": "../outside.gguf" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_default_model");
+    }
 }
 
 #[cfg(windows)]

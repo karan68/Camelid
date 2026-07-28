@@ -26,6 +26,7 @@ pub mod hf_browse;
 pub mod inference;
 pub mod metal;
 pub mod model;
+pub mod model_default;
 pub mod model_source;
 pub mod offload;
 pub mod platform_fs;

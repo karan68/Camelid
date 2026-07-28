@@ -76,8 +76,11 @@ administrator access, macOS asks for your password through `sudo`. To update lat
 
 Downloaded models live in
 `~/Library/Application Support/app.camelid.desktop/models` and are preserved when the app is
-rebuilt or reinstalled. See [Camelid Desktop](camelid-desktop/README.md) for the sidecar design
-and manual packaging details.
+rebuilt or reinstalled. On launch, Desktop loads the model marked **Starts automatically** on the
+Models page; when no choice has been saved yet, the first installed GGUF is selected
+automatically. Use **Make default** beside another installed model to change the next launch.
+See [Camelid Desktop](camelid-desktop/README.md) for the sidecar design and manual packaging
+details.
 
 ### Option B — Prebuilt engine (Windows, macOS, or Linux)
 
