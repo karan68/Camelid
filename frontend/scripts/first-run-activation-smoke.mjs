@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs'
 import { isCompatibilitySupportedForModel } from '../src/lib/capabilities.js'
 import { getChatGateState } from '../src/lib/chatGate.js'
 import {
+  firstRunCancelOutcome,
   firstRunFailureIsRetryable,
+  firstRunRetryAction,
   isFirstRunHost,
   recommendFirstRunModel,
 } from '../src/lib/firstRunActivation.js'
@@ -163,6 +165,70 @@ assert.equal(
   assert.equal(firstRunFailureIsRetryable('unsupported_model_architecture'), false)
   assert.equal(firstRunFailureIsRetryable('host_memory_unavailable'), true, 'memory pressure clears')
   assert.equal(firstRunFailureIsRetryable(''), true, 'an untyped transport failure is worth one more try')
+}
+
+/* --- retry must not re-download a file that already landed ------------------
+   Activation only runs after the artifact is on disk, so an inspect/load/readiness
+   failure leaves a complete GGUF there. Re-installing would refetch 610 MB AND drop
+   the completed download record, and the fresh `curl`'s final rename onto the
+   existing file can fail -- leaving the user with less than they started with. */
+{
+  assert.equal(firstRunRetryAction({ artifactInstalled: true }), 'activate')
+  assert.equal(firstRunRetryAction({ artifactInstalled: false }), 'download')
+  assert.equal(firstRunRetryAction({}), 'download', 'no evidence of a landed file means the download is still owed')
+  assert.equal(firstRunRetryAction(), 'download')
+}
+
+/* --- cancel is a request, not a fact ---------------------------------------
+   The backend answers three ways and only one is a stop: 200 removed a running
+   download; 409 means it finished first and KEPT its file (cancel is not delete);
+   404 means there is no such download, which during `starting` can simply mean the
+   install has not registered yet. Claiming "Nothing was installed" on any of those
+   is how the card ends up lying about a 610 MB file sitting on disk. */
+{
+  // Finished before the cancel took effect: the file is real, so finish the job.
+  assert.equal(
+    firstRunCancelOutcome({ confirmed: false, stillDownloading: false, artifactInstalled: true }).action,
+    'activate',
+    'a completed artifact must be activated, never reported as "nothing was installed"',
+  )
+  assert.equal(
+    firstRunCancelOutcome({ confirmed: true, stillDownloading: false, artifactInstalled: true }).action,
+    'activate',
+    'even a 200 cancel must not discard an artifact that is on disk',
+  )
+
+  // The cancel did not take: keep watching rather than freezing the UI on "failed".
+  const resumed = firstRunCancelOutcome({ confirmed: false, stillDownloading: true, artifactInstalled: false })
+  assert.equal(resumed.action, 'resume')
+  assert.match(resumed.message, /still running/)
+
+  // Unreadable probes must never collapse into "no".
+  for (const observation of [
+    { stillDownloading: null, artifactInstalled: false },
+    { stillDownloading: false, artifactInstalled: null },
+    { stillDownloading: null, artifactInstalled: null },
+  ]) {
+    const outcome = firstRunCancelOutcome({ confirmed: false, ...observation })
+    assert.equal(outcome.action, 'resume', `unverified observation must not claim a result: ${JSON.stringify(observation)}`)
+    assert.match(outcome.message, /could not confirm/)
+  }
+  assert.equal(
+    firstRunCancelOutcome({ confirmed: true, stillDownloading: null, artifactInstalled: null }).action,
+    'resume',
+    'not even a confirmed 200 may report "nothing installed" without looking',
+  )
+
+  // Nothing running and nothing on disk: the only honest "canceled".
+  const canceled = firstRunCancelOutcome({ confirmed: true, stillDownloading: false, artifactInstalled: false })
+  assert.equal(canceled.action, 'canceled')
+  assert.match(canceled.message, /Nothing was installed/)
+  const inferred = firstRunCancelOutcome({ confirmed: false, stillDownloading: false, artifactInstalled: false })
+  assert.equal(inferred.action, 'canceled')
+  assert.match(inferred.message, /no longer running and nothing was installed/)
+  assert.doesNotMatch(inferred.message, /^Download canceled/, 'an unconfirmed stop must not be worded as a confirmed one')
+
+  assert.equal(firstRunCancelOutcome().action, 'resume', 'no observations at all is not a cancellation')
 }
 
 /* --- the model the card installs must not read as unverified ---------------

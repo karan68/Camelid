@@ -324,6 +324,17 @@ assert.match(firstRunCardSource, /recommendFirstRunModel\(catalogItems, capabili
 assert.match(firstRunCardSource, /settlementInFlightRef/, 'first-run settlement must be single-flight across polling ticks')
 assert.match(firstRunCardSource, /catalog\/cancel/, 'a first-run download must stay cancellable')
 assert.match(firstRunCardSource, /warmGenerationPath/, 'the first message after activation must not pay the cold engine build')
+/* A failure AFTER the artifact landed must retry the check/load, never the download:
+   re-installing refetches the whole file and drops the completed record, and the new
+   download's rename onto the existing GGUF can fail. */
+assert.match(firstRunCardSource, /firstRunRetryAction\(\{ artifactInstalled \}\)/, 'the retry target must be decided by whether the artifact landed')
+assert.match(firstRunCardSource, /retryTarget === 'activate' \? retryActivation : startDownload/, 'a landed artifact must retry activation instead of re-downloading')
+/* Cancelling is a request, not a fact: 200 stopped a download, 409 means it finished
+   first and KEPT its file, 404 can mean the install has not registered yet. */
+assert.match(firstRunCardSource, /confirmed = res\.ok/, 'only a successful cancel counts as a confirmed stop')
+assert.match(firstRunCardSource, /observeAfterCancel\(\)/, 'the cancel outcome must be decided by re-reading downloads plus the local scan')
+assert.match(firstRunCardSource, /firstRunCancelOutcome\(\{ confirmed, \.\.\.observed \}\)/, 'and routed through the shared outcome rule')
+assert.doesNotMatch(firstRunCardSource, /finally \{[\s\S]{0,200}fail\('Download canceled/, 'cancellation must never be reported unconditionally from a finally block')
 assert.match(modelsViewSource, /loadInFlightRef\.current[\s\S]*(already loading|finish loading, then retry)/, 'model loading must be single-flight across catalog completions')
 assert.match(modelsViewSource, /deleteLocalModel\(entry\)/, 'local deletion must submit the scanned entry identity rather than filename alone')
 assert.match(modelsViewSource, /Delete model from disk\?/, 'local model deletion must require destructive confirmation')

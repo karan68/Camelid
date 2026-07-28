@@ -5,7 +5,12 @@ import {
   completeCatalogAcquisition,
 } from '../../lib/catalogActivation'
 import { findCompatibilityHint } from '../../lib/capabilities'
-import { firstRunFailureIsRetryable, recommendFirstRunModel } from '../../lib/firstRunActivation'
+import {
+  firstRunCancelOutcome,
+  firstRunFailureIsRetryable,
+  firstRunRetryAction,
+  recommendFirstRunModel,
+} from '../../lib/firstRunActivation'
 import { formatBytes } from '../../lib/formatters'
 import { loadLocalModelForChat, warmGenerationPath } from '../../lib/modelActivation'
 import { EvidenceChip } from '../ui/EvidenceChip'
@@ -63,8 +68,13 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
   const [catalogFailed, setCatalogFailed] = useState(false)
   const [download, setDownload] = useState(null)
   const [failure, setFailure] = useState(null)
+  const [notice, setNotice] = useState('')
   const [canceling, setCanceling] = useState(false)
   const [settlementTick, setSettlementTick] = useState(0)
+  /* Whether the exact artifact is on disk. State, not just a ref, because the retry
+     button branches on it: a failure AFTER the file landed must retry activation,
+     never re-download. */
+  const [artifactInstalled, setArtifactInstalled] = useState(false)
 
   const itemRef = useRef(null)
   const sawDownloadRef = useRef(false)
@@ -73,6 +83,10 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
   const settlementInFlightRef = useRef(false)
   const installedRef = useRef(false)
   const loadResultRef = useRef(null)
+  /* The in-flight install request. Cancelling during `starting` would otherwise race
+     it: the backend has no download to cancel yet, answers 404, and `curl` starts
+     immediately afterwards -- an uncancellable download the card believes it stopped. */
+  const installRequestRef = useRef(null)
 
   /* Fetch the catalog once per backend. Keyed on `base` only: `capabilities` is a
      fresh object on every dashboard refresh, so depending on it here would re-fetch
@@ -135,6 +149,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
       settledAtRef.current = 0
       installedRef.current = false
       settlementInFlightRef.current = false
+      setArtifactInstalled(false)
       setDownload(existing)
       setPhase('downloading')
     })()
@@ -157,6 +172,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
       setDownload(Array.isArray(downloads) ? downloads.find((entry) => entry.id === target?.catalog_id) || null : null)
       if (local?.models) {
         installedRef.current = local.models.some((model) => model.filename === target?.filename)
+        setArtifactInstalled(installedRef.current)
       }
       setSettlementTick((value) => value + 1)
     }
@@ -169,6 +185,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
   }, [base, phase])
 
   const fail = useCallback((message, code = '') => {
+    setNotice('')
     setFailure({ message, code })
     setPhase('failed')
   }, [])
@@ -239,6 +256,16 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
     }
   }, [activate, download, fail, phase, settlementTick])
 
+  /* Retry an activation that failed AFTER the artifact landed. The file is already
+     on disk and valid, so this re-runs check/load only -- it must never re-enter the
+     download path (see `firstRunRetryAction`). */
+  const retryActivation = () => {
+    settlementInFlightRef.current = false
+    setFailure(null)
+    setNotice('')
+    activate()
+  }
+
   const startDownload = async () => {
     if (!item) return
     itemRef.current = item
@@ -247,11 +274,13 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
     settledAtRef.current = 0
     installedRef.current = false
     settlementInFlightRef.current = false
+    setArtifactInstalled(false)
     setFailure(null)
+    setNotice('')
     setDownload(null)
     setPhase('starting')
     try {
-      const res = await fetch(`${base}/api/models/catalog/install`, {
+      const request = fetch(`${base}/api/models/catalog/install`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -262,6 +291,9 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
           continuation_mode: 'start',
         }),
       })
+      // Published before the await so a cancel arriving mid-flight can wait for it.
+      installRequestRef.current = request.catch(() => null)
+      const res = await request
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         // Rejoining a download that is already running is success, not an error.
@@ -275,27 +307,71 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
     }
   }
 
+  /* Re-read reality after a cancel attempt. Tri-state on purpose: a probe that could
+     not be read stays `null` so the outcome never collapses "we did not look" into
+     "there is nothing there". */
+  const observeAfterCancel = async () => {
+    const target = itemRef.current
+    const [downloads, local] = await Promise.all([
+      fetch(`${base}/api/models/catalog/downloads`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch(`${base}/api/models/local`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    ])
+    return {
+      stillDownloading: Array.isArray(downloads)
+        ? downloads.some((entry) => entry.id === target?.catalog_id && entry.status === 'downloading')
+        : null,
+      artifactInstalled: Array.isArray(local?.models)
+        ? local.models.some((model) => model.filename === target?.filename)
+        : null,
+    }
+  }
+
   const cancelDownload = async () => {
     if (!itemRef.current || canceling) return
     setCanceling(true)
     try {
-      await fetch(`${base}/api/models/catalog/cancel`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: itemRef.current.catalog_id }),
-      })
-    } catch {
-      /* Best-effort: the settlement watcher lands on the same clean, retryable
-         state whether or not the cancel request itself was delivered. */
+      /* Wait for the install request to land first. Cancelling before the backend has
+         registered the download gets a 404 for a download that is about to start. */
+      if (installRequestRef.current) await installRequestRef.current
+
+      let confirmed = false
+      try {
+        const res = await fetch(`${base}/api/models/catalog/cancel`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: itemRef.current.catalog_id }),
+        })
+        // 200 = a running download was removed. 404 = nothing to cancel. 409 =
+        // it finished first and KEPT its file. Only the first is a stop.
+        confirmed = res.ok
+      } catch {
+        /* Treated as an unconfirmed cancel: the observation below decides. */
+      }
+
+      const observed = await observeAfterCancel()
+      const outcome = firstRunCancelOutcome({ confirmed, ...observed })
+      if (outcome.action === 'activate') {
+        // It finished before the cancel took. The file is real; do not throw it away.
+        installedRef.current = true
+        setArtifactInstalled(true)
+        setFailure(null)
+        setNotice('')
+        settlementInFlightRef.current = false
+        activate()
+        return
+      }
+      if (outcome.action === 'resume') {
+        setFailure(null)
+        setNotice(outcome.message)
+        setPhase('downloading')
+        return
+      }
+      installedRef.current = false
+      setArtifactInstalled(false)
+      setDownload(null)
+      fail(outcome.message)
     } finally {
       setCanceling(false)
-      /* The file can land while the cancel is in flight. Activation has then already
-         claimed the settlement, and reporting "canceled" over a model that is being
-         loaded would be a lie — leave that path alone. */
-      if (!settlementInFlightRef.current) {
-        setDownload(null)
-        fail('Download canceled. Nothing was installed — you can start again.')
-      }
     }
   }
 
@@ -329,6 +405,14 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
   const percent = percentOf(download)
   const retryable = !failure || firstRunFailureIsRetryable(failure.code)
   const size = formatBytes(item.size_bytes)
+  /* A failure after the file landed retries the CHECK/LOAD, not the download. Same
+     rule the Models page's catalog rows use, and the reason the label differs: a
+     second "Download 610 MB" here would re-fetch a file already sitting on disk. */
+  const retryTarget = firstRunRetryAction({ artifactInstalled })
+  const retryHandler = retryTarget === 'activate' ? retryActivation : startDownload
+  const retryLabel = failure
+    ? (retryTarget === 'activate' ? 'Retry setup' : 'Try again')
+    : `Download ${size} and start`
 
   return (
     <section className="cxfirstrun" aria-labelledby="cxfirstrun-title">
@@ -378,6 +462,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
               ? `Downloading — ${percent}% of ${size}`
               : STAGE_COPY[phase] || 'Working…'}
           </p>
+          {notice ? <p className="cxfirstrun__notice">{notice}</p> : null}
           {CANCELLABLE_PHASES.has(phase) ? (
             <button type="button" className="cxfirstrun__secondary" onClick={cancelDownload} disabled={canceling}>
               {canceling ? 'Canceling…' : 'Cancel download'}
@@ -387,10 +472,16 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
       ) : (
         <>
           {failure ? <p className="cxfirstrun__error" role="alert">{failure.message}</p> : null}
+          {artifactInstalled && failure ? (
+            <p className="cxfirstrun__notice">
+              {item.filename} is already downloaded -- retrying picks up from there, with no
+              second download.
+            </p>
+          ) : null}
           <div className="cxfirstrun__actions">
             {retryable ? (
-              <button type="button" className="cxfirstrun__primary" onClick={startDownload}>
-                {failure ? 'Try again' : `Download ${size} and start`}
+              <button type="button" className="cxfirstrun__primary" onClick={retryHandler}>
+                {retryLabel}
               </button>
             ) : null}
             <button type="button" className="cxfirstrun__secondary" onClick={onOpenModels}>

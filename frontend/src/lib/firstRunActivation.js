@@ -84,3 +84,65 @@ const PERMANENT_REFUSAL_CODES = new Set(['model_too_large_for_host', 'unsupporte
 export function firstRunFailureIsRetryable(code = '') {
   return !PERMANENT_REFUSAL_CODES.has(String(code || ''))
 }
+
+/* What "Try again" must actually DO.
+
+   Activation runs only after the artifact is observed on disk, so a failure in
+   inspect/load/readiness leaves a complete, valid GGUF sitting there. Retrying by
+   re-installing would re-download the whole file for nothing — and worse: the
+   install endpoint drops the completed download record and starts a fresh `curl`,
+   whose final `rename` onto the GGUF that already exists can fail (it is now the
+   loaded/held file), at which point the backend deletes the freshly downloaded
+   `.part` and reports failure. A retry that ends with LESS than it started with.
+
+   So the retry target is decided by whether the artifact landed, not by which
+   phase failed. Mirrors `CatalogLaneBrowse`'s `retryAcquisition`. */
+export function firstRunRetryAction({ artifactInstalled = false } = {}) {
+  return artifactInstalled ? 'activate' : 'download'
+}
+
+/* What a cancel attempt actually achieved.
+
+   Cancelling is a request, not a fact. The backend answers three different ways and
+   only one of them means "stopped": 200 removed a running download; 409
+   `download_already_completed` means it finished first and KEPT its file (cancel is
+   not delete); 404 means no such download — which during `starting` can simply mean
+   the install has not registered yet. Reporting "Nothing was installed" on any of
+   those is how the card ends up lying about a 610 MB file that is sitting on disk.
+
+   So the outcome is decided by re-reading reality, and the observations are
+   deliberately tri-state: `null` means "could not look", which must never collapse
+   into "no". Refusing to claim anything we did not observe is what keeps a failed
+   probe from producing a false all-clear.
+
+     artifactInstalled === true -> `activate`: the file is there; finish the job.
+     stillDownloading  === true -> `resume`:   cancel did not take; keep watching.
+     either observation unknown -> `resume`:   we did not look, so we do not claim.
+     both observed false        -> `canceled`: nothing running, nothing installed. */
+export function firstRunCancelOutcome({
+  confirmed = false,
+  stillDownloading = null,
+  artifactInstalled = null,
+} = {}) {
+  if (artifactInstalled === true) {
+    return { action: 'activate', message: '' }
+  }
+  if (stillDownloading === true) {
+    return {
+      action: 'resume',
+      message: 'The download did not stop — it is still running. Leaving it in progress.',
+    }
+  }
+  if (artifactInstalled === null || stillDownloading === null) {
+    return {
+      action: 'resume',
+      message: 'Camelid could not confirm whether the download stopped, so it is still being watched.',
+    }
+  }
+  return {
+    action: 'canceled',
+    message: confirmed
+      ? 'Download canceled. Nothing was installed — you can start again.'
+      : 'The download is no longer running and nothing was installed — you can start again.',
+  }
+}
