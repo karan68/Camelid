@@ -149,6 +149,14 @@ jobs:
       - name: Check ledger drift (ledger == code contract; surfaces consistent)
         run: node scripts/check-ledger-drift.mjs
 
+      # FitVerdict is serialized onto the catalog endpoints and the Models tab
+      # branches on those exact strings, which it re-declares as JS literals. No
+      # compiler links the two, and a frontend smoke asserting the frontend's own
+      # literals passes either way — so a renamed variant would reach users as a
+      # blank badge. Tie the vocabulary to src/fit.rs.
+      - name: Check fit-verdict vocabulary (WebUI == src/fit.rs)
+        run: node scripts/check-fit-verdict-vocabulary.mjs
+
       - name: Check CUDA batched-prefill parity gate wiring
         run: node scripts/check-cuda-prefill-parity-gate.mjs
 
@@ -326,6 +334,13 @@ jobs:
 
       - name: Frontend catalog activation smoke
         run: npm run smoke:catalog-activation
+
+      # Covers frontend/src/lib/catalogBrowse.js: fit labels/details, the
+      # settled-vs-retryable `unknown` split, grouping and search ranking. The
+      # script shipped with the lane but was never wired here, so none of that
+      # logic was gated.
+      - name: Frontend catalog browse smoke
+        run: npm run smoke:catalog-browse
 
       - name: Frontend model deletion smoke
         run: npm run smoke:model-deletion
