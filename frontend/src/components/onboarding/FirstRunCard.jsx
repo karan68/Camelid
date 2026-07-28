@@ -46,6 +46,12 @@ const STAGE_COPY = {
 
 const STEPS = ['Download', 'Check', 'Load']
 const IN_FLIGHT_PHASES = new Set(['starting', 'downloading', 'checking', 'loading', 'warming'])
+/* Phases whose owner must keep this card mounted. `failed` is in here and NOT in
+   IN_FLIGHT_PHASES on purpose: a failure that happens after the artifact landed is
+   not work in progress, but its Retry button is the only way out of it, and by then
+   the host no longer looks like a fresh install — so the mount condition would drop
+   the card, the error and the button together on the next dashboard refresh. */
+const RETAINED_PHASES = new Set([...IN_FLIGHT_PHASES, 'failed'])
 const CANCELLABLE_PHASES = new Set(['starting', 'downloading'])
 
 function stepIndex(phase) {
@@ -60,7 +66,7 @@ function percentOf(download) {
   return Math.max(0, Math.min(100, value))
 }
 
-export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, onBusyChange, onOpenModels }) {
+export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, onActiveChange, onOpenModels }) {
   const base = String(apiBase || '').replace(/\/$/, '')
   // phase: idle | starting | downloading | checking | loading | warming | failed | done
   const [phase, setPhase] = useState('idle')
@@ -121,14 +127,17 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
   )
   const item = recommendation?.kind === 'recommended' ? recommendation.item : null
 
-  /* Report in-flight work upward so the owner keeps this card mounted even once the
-     downloaded file makes the host stop looking like a fresh install. Dropping the
-     component mid-activation would abandon the download's only watcher. */
-  const busy = IN_FLIGHT_PHASES.has(phase)
+  /* Report upward so the owner keeps this card mounted even once the downloaded file
+     makes the host stop looking like a fresh install. Dropping the component
+     mid-activation would abandon the download's only watcher, and dropping it on a
+     failure would delete the retry path to an artifact that is already on disk.
+     `working` is the narrower question the layout asks: is there progress to show. */
+  const working = IN_FLIGHT_PHASES.has(phase)
+  const retained = RETAINED_PHASES.has(phase)
   useEffect(() => {
-    onBusyChange?.(busy)
-  }, [busy, onBusyChange])
-  useEffect(() => () => onBusyChange?.(false), [onBusyChange])
+    onActiveChange?.(retained)
+  }, [retained, onActiveChange])
+  useEffect(() => () => onActiveChange?.(false), [onActiveChange])
 
   /* Rejoin a download this backend is already running for the recommended row.
      A reload, or a first render that lands after the install request, must not leave
@@ -448,7 +457,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
           </p>
         </div>
 
-        {busy ? null : (
+        {working ? null : (
           <div className="cxfirstrun__actions">
             {retryable ? (
               <button type="button" className="cxfirstrun__primary" onClick={retryHandler}>
@@ -462,7 +471,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
         )}
       </div>
 
-      {busy ? (
+      {working ? (
         <div className="cxfirstrun__progress" role="status" aria-live="polite">
           <ol className="cxfirstrun__steps" aria-label="Setup progress">
             {STEPS.map((label, index) => (

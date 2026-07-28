@@ -317,7 +317,9 @@ assert.match(appSource, /modelsVisited[\s\S]*hidden=\{tab !== 'library'\}/, 'Mod
 /* First-run activation, same rule for the same reason: an in-flight install must keep
    its watcher when the user navigates, and it must not be unmounted the moment the
    landed file stops making the host look like a fresh install. */
-assert.match(appSource, /\(firstRun \|\| firstRunBusy\)[\s\S]*hidden=\{tab !== 'chat'\}/, 'the first-run card must stay mounted across navigation and for the whole activation')
+assert.match(appSource, /firstRunActive = firstRun \|\| firstRunCardActive/, 'the first-run card must survive the host no longer looking fresh, for as long as it still owns the flow')
+assert.match(appSource, /firstRunActive &&[\s\S]*hidden=\{tab !== 'chat'\}/, 'the first-run card must stay mounted across navigation and for the whole activation')
+assert.match(firstRunCardSource, /RETAINED_PHASES = new Set\(\[\.\.\.IN_FLIGHT_PHASES, 'failed'\]\)/, "a failure still owns the flow: its retry is the only route to an artifact that already downloaded")
 assert.match(appSource, /isFirstRunHost\(\{ runtime, models \}\)/, 'first-run state must be derived from live runtime state, never from a stored onboarding flag')
 assert.doesNotMatch(firstRunCardSource, /localStorage/, 'first-run onboarding must not record itself in localStorage')
 assert.match(firstRunCardSource, /recommendFirstRunModel\(catalogItems, capabilities\)/, 'the first-run offer must be derived from the live catalog and the support contract')

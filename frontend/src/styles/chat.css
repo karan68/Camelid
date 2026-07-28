@@ -587,14 +587,6 @@
   flex-wrap: wrap;
 }
 .cxfirstrun__main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 32ch; }
-.cxfirstrun__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-4);
-  flex-wrap: wrap;
-}
-.cxfirstrun__id { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
 .cxfirstrun__kicker {
   display: flex;
   align-items: center;

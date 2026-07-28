@@ -257,6 +257,16 @@ try {
     const loadsBefore = countRequests('/api/models/load')
     assert.equal(installsBefore, 1, 'exactly one install so far')
 
+    /* The retry button has to still BE there to be useful. Once the artifact lands
+       the host stops looking like a fresh install, so the app-level mount condition
+       drops the card unless the card reports that it still owns the flow -- and the
+       dashboard refreshes on a 2.5s cadence, so a test that clicks retry immediately
+       passes whether or not that is true. Dwell past two refreshes and check. */
+    await new Promise((done) => setTimeout(done, 7000))
+    const afterDwell = await page.evaluate(cardText)
+    assert.equal(afterDwell.gone, false, 'the failed card must survive the dashboard refresh that sees the landed file')
+    assert.equal(afterDwell.primary, 'Retry setup', 'and must keep offering the retry, not strand a downloaded artifact')
+
     // The retry succeeds this time.
     stub.loadStatus = 200
     await page.click('.cxfirstrun__primary')

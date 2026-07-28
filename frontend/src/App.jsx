@@ -53,7 +53,7 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
-  const [firstRunBusy, setFirstRunBusy] = useState(false)
+  const [firstRunCardActive, setFirstRunCardActive] = useState(false)
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined
@@ -193,9 +193,12 @@ function App() {
 
   /* First-run activation. Mounted here rather than inside the chat view so an
      in-flight download keeps its watcher when the user navigates away, and kept
-     mounted while it is working: the moment the file lands the host stops looking
-     like a fresh install, and unmounting then would abandon the load. */
+     mounted while the card still owns the flow: the moment the file lands the host
+     stops looking like a fresh install, so `firstRun` alone would drop the card on
+     the next refresh -- abandoning the load, or deleting a failure's Retry button
+     while the downloaded artifact sits there unused. */
   const firstRun = isFirstRunHost({ runtime, models })
+  const firstRunActive = firstRun || firstRunCardActive
   const handleFirstRunActivated = useCallback(async () => {
     await loadDashboard({ silent: true })
     navigateTab('chat')
@@ -270,13 +273,13 @@ function App() {
           <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        {!DEMO_UI && (firstRun || firstRunBusy) && (
+        {!DEMO_UI && firstRunActive && (
           <div className="camelid-firstrun-slot" hidden={tab !== 'chat'}>
             <FirstRunCard
               apiBase={apiBase}
               capabilities={dashboard?.capabilities}
               onActivated={handleFirstRunActivated}
-              onBusyChange={setFirstRunBusy}
+              onActiveChange={setFirstRunCardActive}
               onOpenModels={() => navigateTab('library')}
             />
           </div>
@@ -313,7 +316,7 @@ function App() {
               selectedModelExperimental={selectedModelExperimental}
               setTab={navigateTab}
               showNewChatLanding={startNewChat}
-              firstRunActive={firstRun || firstRunBusy}
+              firstRunActive={firstRunActive}
               demoMode={DEMO_UI}
             />
           )}
