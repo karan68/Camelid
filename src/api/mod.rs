@@ -1928,6 +1928,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/models/runnable-receipt", get(runnable_receipt))
         .route("/api/models/runnable-smoke", post(run_runnable_smoke))
         .route("/api/models/catalog", get(get_catalog))
+        .route("/api/models/catalog/fit", post(check_catalog_fit))
         .route("/api/models/catalog/install", post(install_catalog_model))
         .route("/api/models/catalog/downloads", get(get_catalog_downloads))
         .route("/api/models/catalog/cancel", post(cancel_catalog_download))
@@ -4699,24 +4700,31 @@ impl ResidentReclaim {
     }
 }
 
-/// The refusal for a `WontFit` verdict: a stable error code plus its message.
+/// The refusal for a load-blocking verdict: a stable error code plus its message.
 ///
 /// A host that is out of room *because something else is already loaded* is a
 /// different situation from a host that is too small for the model, and it has a
 /// different remedy (release the other model vs. pick a smaller one). Reporting
 /// both as `model_too_large_for_host` is what made the advisor dead-end: it told
 /// the operator the machine could not hold a model the machine plainly could.
+///
+/// There is a third case with a third remedy: nothing of ours is resident, the
+/// machine is big enough, but *other applications* have the memory right now
+/// (`FitVerdict::InsufficientFreeMemory`). Closing something is the fix, and saying
+/// "larger than this machine can hold" there is simply false.
 fn fit_preload_message(
     hw: &crate::capability::HardwareProfile,
     footprint: &crate::fit::FitInputs,
     size_bytes: u64,
     reclaim: Option<&ResidentReclaim>,
 ) -> Option<(&'static str, String)> {
-    if crate::fit::assess(hw, footprint) != crate::fit::FitVerdict::WontFit {
+    let verdict = crate::fit::assess(hw, footprint);
+    if !verdict.refuses_load() {
         return None;
     }
     let size_gb = size_bytes as f64 / 1e9;
-    // Something else is resident: name it, and point at the remedy that works.
+    // Something else of ours is resident: name it, and point at the remedy that
+    // works. Checked first because it is the most specific and most actionable.
     if let Some(r) = reclaim.filter(|r| !r.is_empty()) {
         let names = r.ids.join(", ");
         let freed = r.bytes as f64 / 1e9;
@@ -4727,6 +4735,20 @@ fn fit_preload_message(
                  Releasing it frees ~{freed:.1} GB, which should be enough. \
                  Retry with \"replace\": true to swap models in one step (the app's \
                  Load button does this), or POST /api/models/unload first."
+            ),
+        ));
+    }
+    // The machine is big enough; it is just busy. Do not send the user shopping
+    // for smaller models — tell them what is actually in the way.
+    if verdict == crate::fit::FitVerdict::InsufficientFreeMemory {
+        let free_gb = hw.host_ram_free_bytes as f64 / 1e9;
+        let total_gb = hw.host_ram_total_bytes as f64 / 1e9;
+        return Some((
+            "host_memory_unavailable",
+            format!(
+                "This model (~{size_gb:.1} GB) fits this machine, but only ~{free_gb:.1} GB \
+                 of ~{total_gb:.1} GB memory is free right now. Close some applications \
+                 and retry, or set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
             ),
         ));
     }
@@ -4748,9 +4770,10 @@ fn fit_preload_message(
 /// memory and computes an **exact** footprint from the GGUF's real dimensions
 /// (weights + KV at a normal-use context + a bounded scratch margin) whenever the
 /// header parses, falling back to the coarse size pad otherwise. Returns a typed
-/// 422 only on a `WontFit` verdict; `None` (proceed unchanged) on the
-/// `CAMELID_SKIP_FIT_CHECK=1` override, a missing/zero-size file, or any
-/// `Fits*`/`Unknown` verdict — a fail-fast convenience, never a new hard gate.
+/// 422 only on a load-refusing verdict ([`crate::fit::FitVerdict::refuses_load`]);
+/// `None` (proceed unchanged) on the `CAMELID_SKIP_FIT_CHECK=1` override, a
+/// missing/zero-size file, or any `Fits*`/`Unknown` verdict — a fail-fast
+/// convenience, never a new hard gate.
 /// Whether the load-time fit preflight is overridden off. `CAMELID_SKIP_FIT_CHECK=1`
 /// restores the pre-advisor behavior: `POST /api/models/load` attempts the load
 /// unconditionally, letting the authoritative `VramShortfall`/`KvCache` guards be
@@ -18656,6 +18679,101 @@ pub struct CatalogItemView {
     /// real GGUF dimensions (KV cache sized precisely), `"approx"` when from the
     /// coarse size-based heuristic.
     pub fit_confidence: &'static str,
+    /// Whether Camelid implements this row's **guessed** architecture:
+    /// `"implemented"`, `"not_implemented"`, or `"unknown"`.
+    ///
+    /// Exists for exactly one job: letting the Models tab fold away live Hugging
+    /// Face results Camelid could never load. It is therefore only derived for
+    /// experimental rows, where `architecture` comes from
+    /// [`crate::hf_browse::guess_architecture`], whose token vocabulary is the same
+    /// one [`crate::model::is_implemented_architecture`] tests.
+    ///
+    /// **Curated rows always report `"unknown"`**, and that is a correctness
+    /// requirement, not laziness. `CatalogItem::architecture` is a curated *label*
+    /// whose vocabulary is not the loader's: the shipped catalog contains
+    /// `qwen25` (the loader knows `qwen2` and `qwen35`, not `qwen25`) and
+    /// `command-r`. Deriving from it stamped three working, pinned rows
+    /// `not_implemented` — a false negative on the rows we vouch for. Curated rows
+    /// are pinned and never filtered by this axis, so the honest answer is to make
+    /// no claim rather than a wrong one.
+    ///
+    /// Tri-state on purpose even for experimental rows: a confident
+    /// `"not_implemented"` is only reported when an architecture token was actually
+    /// recognized and sits outside the implemented set. When nothing matched we
+    /// report `"unknown"`. Collapsing this to a bool would make "we could not tell"
+    /// indistinguishable from "we know it cannot run", and a UI filtering on it
+    /// would silently hide loadable models.
+    ///
+    /// Advisory in every case: the authoritative architecture is read from GGUF
+    /// metadata at load time and is the only thing that gates a load.
+    pub arch_support: &'static str,
+}
+
+/// The `general.architecture` a GGUF guessed as `token` will actually declare.
+///
+/// The browse guesser names model *families*; the loader allowlist names GGUF
+/// architectures, and those are not the same vocabulary — the same mismatch that
+/// made curated labels unusable for this axis. Mixtral is the case that bites:
+/// its GGUFs declare `llama` (the MoE tensors ride the llama architecture, which
+/// is why [`crate::model::MixtralMoeMetadata`] reads `llama.expert_count`), and
+/// Camelid ships an evidence-backed `mixtral_8x7b_instruct_v0_1_q8_0` row. Testing
+/// the family token directly stamped every Mixtral repo `not_implemented`, which
+/// folded a family we vouch for into the "cannot run this" drawer.
+fn loader_architecture_for_guess(token: &str) -> &str {
+    match token {
+        "mixtral" => "llama",
+        other => other,
+    }
+}
+
+/// Advisory architecture-support label for a **filename-guessed** architecture.
+/// An empty or unrecognized architecture is `"unknown"`, never `"not_implemented"`.
+fn guessed_arch_support(architecture: &str) -> &'static str {
+    if crate::model::is_implemented_architecture(loader_architecture_for_guess(architecture)) {
+        "implemented"
+    } else if architecture.is_empty() {
+        "unknown"
+    } else {
+        "not_implemented"
+    }
+}
+
+/// KV dtype the runtime will actually allocate on this host: f16 on the
+/// GPU-resident path, f32 on CPU. Mirrors the engine so the estimate matches what
+/// gets allocated rather than a nominal figure.
+fn kv_dtype_for(hw: &crate::capability::HardwareProfile) -> crate::fit::KvDtype {
+    if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+        crate::fit::KvDtype::F16
+    } else {
+        crate::fit::KvDtype::F32
+    }
+}
+
+/// Exact footprint (weights + KV at the advisory context + bounded scratch) for a
+/// model whose real GGUF dimensions are known. Single definition shared by the
+/// curated badge, the experimental badge, and the on-demand fit check, so the three
+/// surfaces can never drift into disagreeing about the same model.
+fn exact_footprint_for(
+    size_bytes: u64,
+    dims: crate::fit::ModelDims,
+    hw: &crate::capability::HardwareProfile,
+) -> crate::fit::FitInputs {
+    crate::fit::exact_footprint(
+        size_bytes,
+        dims,
+        crate::fit::ADVISORY_CONTEXT_TOKENS,
+        kv_dtype_for(hw),
+    )
+}
+
+/// Whether `(repo_id, filename)` names a pinned curated row rather than an
+/// arbitrary Hugging Face file. Curated rows are the ones we vouch for and the
+/// only ones the coarse size pad is authorized for, so the on-demand fit check
+/// asks this before deciding whether an unmeasurable model still gets a verdict.
+fn is_curated_artifact(repo_id: &str, filename: &str) -> bool {
+    curated_catalog()
+        .iter()
+        .any(|item| item.repo_id == repo_id && item.filename == filename)
 }
 
 /// Footprint + confidence for a curated row: an **exact** footprint (weights + KV
@@ -18668,20 +18786,7 @@ fn curated_footprint(
     hw: &crate::capability::HardwareProfile,
 ) -> (crate::fit::FitInputs, &'static str) {
     match dims {
-        Some(dims) => {
-            let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
-                crate::fit::KvDtype::F16
-            } else {
-                crate::fit::KvDtype::F32
-            };
-            let fp = crate::fit::exact_footprint(
-                size_bytes,
-                dims,
-                crate::fit::ADVISORY_CONTEXT_TOKENS,
-                kv_dtype,
-            );
-            (fp, "exact")
-        }
+        Some(dims) => (exact_footprint_for(size_bytes, dims, hw), "exact"),
         None => (crate::fit::advisory_footprint(size_bytes), "approx"),
     }
 }
@@ -18712,6 +18817,9 @@ impl CatalogItemView {
             fit: crate::fit::assess(hw, &footprint),
             task_tags: item.task_tags.iter().map(|t| t.to_string()).collect(),
             fit_confidence,
+            // Deliberately no claim: see `arch_support`. The curated `architecture`
+            // label uses a different vocabulary from the loader's allowlist.
+            arch_support: "unknown",
         }
     }
 
@@ -18728,20 +18836,10 @@ impl CatalogItemView {
         let catalog_id = format!("hf::{}::{}", file.repo_id, file.filename);
         let (fit, fit_confidence) =
             match crate::fit_dims::global().lookup(&file.repo_id, &file.filename) {
-                Some(dims) => {
-                    let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
-                        crate::fit::KvDtype::F16
-                    } else {
-                        crate::fit::KvDtype::F32
-                    };
-                    let fp = crate::fit::exact_footprint(
-                        file.size_bytes,
-                        dims,
-                        crate::fit::ADVISORY_CONTEXT_TOKENS,
-                        kv_dtype,
-                    );
-                    (crate::fit::assess(hw, &fp), "exact")
-                }
+                Some(dims) => (
+                    crate::fit::assess(hw, &exact_footprint_for(file.size_bytes, dims, hw)),
+                    "exact",
+                ),
                 None => (crate::fit::FitVerdict::Unknown, "unknown"),
             };
         CatalogItemView {
@@ -18753,6 +18851,7 @@ impl CatalogItemView {
             downloads: file.downloads,
             likes: file.likes,
             quant: file.quant,
+            arch_support: guessed_arch_support(&file.architecture),
             architecture: file.architecture,
             license: String::new(),
             oracle_qualified: false,
@@ -19072,6 +19171,37 @@ pub struct CatalogQuery {
     /// Opaque Hugging Face pagination cursor for the experimental group (from a
     /// prior response's `next_cursor`). Ignored when `query` is absent/trivial.
     pub cursor: Option<String>,
+}
+
+/// Body of an on-demand capacity check for one live Hugging Face GGUF.
+#[derive(Debug, serde::Deserialize)]
+pub struct CatalogFitRequest {
+    pub repo_id: String,
+    pub filename: String,
+    /// The file's real size in bytes, from the browse result. Required: the header
+    /// parser validates tensor offsets against the model's true full length.
+    pub size_bytes: u64,
+}
+
+/// Result of an on-demand capacity check. Echoes the identity so a client that
+/// fired several checks can match responses to rows without tracking order.
+#[derive(Debug, serde::Serialize)]
+pub struct CatalogFitResponse {
+    pub repo_id: String,
+    pub filename: String,
+    pub fit: crate::fit::FitVerdict,
+    /// `"exact"` when the model's real GGUF dimensions were read, `"unknown"` when
+    /// they could not be (unreachable, or not a dense LLaMA-family model).
+    pub fit_confidence: &'static str,
+    /// Whether the check **settled**: `true` when there is nothing further to learn
+    /// by asking again (dimensions resolved, or a definitive negative), `false` when
+    /// the attempt failed for a reason a retry could fix.
+    ///
+    /// Without this a client cannot tell "we checked, and the answer is that we
+    /// cannot say" from "we have not checked yet" — both arrive as an `unknown`
+    /// verdict — so a "check this" affordance can never be retired and pressing it
+    /// looks like a no-op.
+    pub checked: bool,
 }
 
 /// One local on-disk GGUF with the facts the Models tab needs to bucket it by lane.
@@ -20091,6 +20221,101 @@ async fn get_catalog(
     }
 
     Json(CatalogResponse { items, next_cursor })
+}
+
+/// On-demand exact capacity check for one live Hugging Face GGUF.
+///
+/// A catalog page can only warm a handful of rows in the background
+/// (`HF_DIMS_WARM_LIMIT`), so most experimental rows render with no fit claim at
+/// all. That cap is invisible to the user, who just sees "unknown" and has no way
+/// to learn more about the one model they actually care about. This endpoint is
+/// that way: it range-fetches the model's GGUF header, derives its exact KV
+/// dimensions, and returns a real verdict for that row.
+///
+/// Never a guess. If the header cannot be fetched, or parses but is not a dense
+/// LLaMA-family model, the answer is `Unknown` with `"unknown"` confidence — the
+/// same thing the row already showed, not a size-based estimate dressed up as a
+/// check. `checked` then says whether that silence is final or worth retrying.
+/// Idempotent and cached: asking twice costs one fetch, and the request shares the
+/// resolver's global concurrency limit, dedup and backoff so it cannot be used to
+/// drive an unbounded fetch storm.
+async fn check_catalog_fit(Json(req): Json<CatalogFitRequest>) -> Response {
+    // Same bare-`.gguf`-name rule the download path enforces: this filename is
+    // interpolated into a Hub resolve URL.
+    if !validate_local_model_filename(&req.filename) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_filename",
+            "filename must be one bare .gguf name".to_string(),
+            Some("filename"),
+        );
+    }
+    if !crate::fit_dims::is_safe_hf_component(&req.repo_id) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_repo_id",
+            "repo_id must be a Hugging Face repository id".to_string(),
+            Some("repo_id"),
+        );
+    }
+    if req.size_bytes == 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_size",
+            "size_bytes must be the file's real size in bytes".to_string(),
+            Some("size_bytes"),
+        );
+    }
+
+    // LIVE probe, deliberately not `HardwareProfile::cached()`.
+    //
+    // `cached()` is a `OnceLock` — memory is read once at startup and frozen for the
+    // process. The catalog LIST endpoint accepts that (re-probing per GET would
+    // re-init CUDA on every request, for every row). This endpoint is the opposite
+    // case: one explicit, user-initiated question about one model, which already
+    // costs a network header fetch.
+    //
+    // It is also a correctness requirement. The refusal this powers tells the user
+    // to free memory and check again; against a frozen snapshot that instruction
+    // would be a lie, because freeing memory could never change the answer. Probing
+    // live also makes a "fits" here agree with the authoritative load guard, which
+    // probes live too.
+    let hw = match tokio::task::spawn_blocking(crate::capability::HardwareProfile::detect).await {
+        Ok(profile) => profile,
+        // A panicking probe must not fail the request; fall back to the startup
+        // snapshot, which is still a real measurement of this machine.
+        Err(_) => crate::capability::HardwareProfile::cached().clone(),
+    };
+    let resolution = crate::fit_dims::global()
+        .resolve_now(req.repo_id.clone(), req.filename.clone(), req.size_bytes)
+        .await;
+    let (fit, fit_confidence) = match resolution.dims() {
+        Some(dims) => (
+            crate::fit::assess(&hw, &exact_footprint_for(req.size_bytes, dims, &hw)),
+            "exact",
+        ),
+        // A curated row whose dimensions cannot be read is *listed* with the coarse
+        // size pad (see `curated_footprint`), so answering `Unknown` here would make
+        // "Re-check" erase a verdict the page already shows — on exactly the rows
+        // that need it, since "close some applications, then Re-check" is the remedy
+        // we print for them. Same rule as the listing, so the two cannot disagree.
+        None if is_curated_artifact(&req.repo_id, &req.filename) => (
+            crate::fit::assess(&hw, &crate::fit::advisory_footprint(req.size_bytes)),
+            "approx",
+        ),
+        // A live Hugging Face row gets no such pad: it is shown as `unknown` when
+        // unmeasured, and a size-based guess dressed as the result of an explicit
+        // check would be worse than the silence it replaced.
+        None => (crate::fit::FitVerdict::Unknown, "unknown"),
+    };
+    Json(CatalogFitResponse {
+        repo_id: req.repo_id,
+        filename: req.filename,
+        fit,
+        fit_confidence,
+        checked: resolution.is_settled(),
+    })
+    .into_response()
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -21199,6 +21424,227 @@ mod catalog_fit_tests {
             crate::fit::KvDtype::F32, // CPU host
         );
         assert_eq!(fp_exact, expected);
+    }
+
+    #[test]
+    fn arch_support_is_only_claimed_where_the_vocabulary_matches() {
+        // Experimental rows: the architecture comes from `hf_browse::guess_architecture`,
+        // whose tokens are mapped onto the loader's vocabulary before the allowlist
+        // is consulted, so both answers are usable.
+        assert_eq!(super::guessed_arch_support("qwen3"), "implemented");
+        assert_eq!(super::guessed_arch_support("llama"), "implemented");
+        // REGRESSION: the guesser names a model FAMILY, the allowlist names a GGUF
+        // architecture. Mixtral GGUFs declare `llama`, and Camelid ships an
+        // evidence-backed `mixtral_8x7b_instruct_v0_1_q8_0` row — testing the family
+        // token directly folded every Mixtral repo into the "cannot run this" drawer.
+        assert_eq!(super::guessed_arch_support("mixtral"), "implemented");
+        assert_eq!(super::loader_architecture_for_guess("mixtral"), "llama");
+        // A family Camelid genuinely does not implement still reads as a negative.
+        assert_eq!(super::guessed_arch_support("mamba"), "not_implemented");
+        // A guess that matched nothing is an absence of evidence and must NOT read
+        // as a negative, or a UI filtering on it would hide models that load fine.
+        assert_eq!(super::guessed_arch_support(""), "unknown");
+    }
+
+    #[test]
+    fn every_guessable_architecture_token_is_reported_loadable() {
+        // The helper is only sound while every token the browse guesser can emit maps
+        // onto something the loader recognizes. Pin that: a token that drifts out of
+        // the loader's vocabulary would silently hide its whole family behind a label
+        // claiming Camelid cannot run it.
+        for token in [
+            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "lfm2",
+            "mixtral",
+        ] {
+            assert_eq!(
+                super::guessed_arch_support(token),
+                "implemented",
+                "browse can emit {token}, and Camelid loads that family"
+            );
+        }
+    }
+
+    #[test]
+    fn only_curated_artifacts_are_recognized_for_the_size_pad() {
+        // The on-demand fit check falls back to the coarse pad for curated rows only,
+        // so this predicate decides whether an unmeasurable model keeps a verdict.
+        let curated = curated_catalog();
+        let row = curated.first().expect("catalog is non-empty");
+        assert!(super::is_curated_artifact(row.repo_id, row.filename));
+        // Right file, wrong repo (and vice versa) is not a curated row.
+        assert!(!super::is_curated_artifact(
+            "someone/elses-GGUF",
+            row.filename
+        ));
+        assert!(!super::is_curated_artifact(
+            row.repo_id,
+            "not-a-curated-file.gguf"
+        ));
+    }
+
+    #[test]
+    fn curated_rows_make_no_architecture_support_claim() {
+        // REGRESSION: deriving this from `CatalogItem::architecture` stamped three
+        // shipped, pinned rows `not_implemented` — the curated field is a display
+        // label (`qwen25`, `command-r`) whose vocabulary is not the loader's
+        // (`qwen2`, `qwen35`). A wrong negative on a row we vouch for is worse than
+        // no claim, and nothing filters curated rows on this axis.
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        for item in curated_catalog() {
+            let view = CatalogItemView::from_curated(&item, &hw);
+            assert_eq!(
+                view.arch_support, "unknown",
+                "curated row {} must not claim architecture support",
+                view.catalog_id
+            );
+        }
+        // The label that caused the false negative is still in the catalog, so this
+        // test keeps its teeth.
+        assert!(
+            curated_catalog()
+                .iter()
+                .any(|item| !crate::model::is_implemented_architecture(item.architecture)),
+            "expected at least one curated label outside the loader allowlist"
+        );
+    }
+
+    #[test]
+    fn a_busy_host_is_refused_without_being_called_too_small() {
+        // 64 GB machine with 2 GB free, asked for a ~4 GB model. It is refused (the
+        // load would be at risk), but telling the operator to buy a smaller model
+        // would be false: the machine is one of the biggest in the catalog's range.
+        let hw = host(false, 0, 64 * GIB, 2 * GIB);
+        let fp = crate::fit::advisory_footprint(4 * GIB);
+        let (code, msg) =
+            super::fit_preload_message(&hw, &fp, 4 * GIB, None).expect("refused -> message");
+        assert_eq!(code, "host_memory_unavailable");
+        assert!(msg.contains("free right now"), "{msg}");
+        assert!(msg.contains("Close some applications"), "{msg}");
+        assert!(!msg.contains("larger than this machine"), "{msg}");
+        // The override is still offered, exactly as for the too-large case.
+        assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"), "{msg}");
+    }
+
+    #[test]
+    fn a_resident_model_still_takes_precedence_over_the_busy_host_wording() {
+        // Same busy host, but something of OURS is loaded. Releasing that is the
+        // specific remedy, so it must win over the generic "close applications".
+        let hw = host(false, 0, 64 * GIB, 2 * GIB);
+        let fp = crate::fit::advisory_footprint(4 * GIB);
+        let reclaim = super::ResidentReclaim {
+            ids: vec!["Qwen3-4B-Q8_0.gguf".to_string()],
+            bytes: 4 * GIB,
+        };
+        let (code, msg) = super::fit_preload_message(&hw, &fp, 4 * GIB, Some(&reclaim))
+            .expect("refused -> message");
+        assert_eq!(code, "model_requires_unload");
+        assert!(msg.contains("Qwen3-4B-Q8_0.gguf"), "{msg}");
+    }
+}
+
+/// HTTP-level checks for the on-demand catalog fit endpoint. These cover the
+/// input validation only: the resolve path needs the network, and a test that
+/// reached the Hub would be neither hermetic nor fast.
+#[cfg(test)]
+mod catalog_fit_endpoint_tests {
+    use super::{router_with_state, AppState};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    async fn post_fit(body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let app = router_with_state(AppState::default());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/models/catalog/fit")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn assert_rejected(body: serde_json::Value, code: &str) {
+        let (status, response) = post_fit(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"]["code"], code);
+    }
+
+    #[tokio::test]
+    async fn the_filename_must_be_one_bare_gguf_name() {
+        // Both fields are interpolated into a Hub resolve URL, so traversal and
+        // nesting are rejected before any fetch is attempted.
+        assert_rejected(
+            serde_json::json!({
+                "repo_id": "unsloth/Phi-4-mini-instruct-GGUF",
+                "filename": "../../etc/passwd",
+                "size_bytes": 1024u64,
+            }),
+            "invalid_filename",
+        )
+        .await;
+        assert_rejected(
+            serde_json::json!({
+                "repo_id": "unsloth/Phi-4-mini-instruct-GGUF",
+                "filename": "nested/model.gguf",
+                "size_bytes": 1024u64,
+            }),
+            "invalid_filename",
+        )
+        .await;
+        assert_rejected(
+            serde_json::json!({
+                "repo_id": "unsloth/Phi-4-mini-instruct-GGUF",
+                "filename": "model.bin",
+                "size_bytes": 1024u64,
+            }),
+            "invalid_filename",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_repo_id_must_be_a_hugging_face_repository_id() {
+        assert_rejected(
+            serde_json::json!({
+                "repo_id": "unsloth/../secrets",
+                "filename": "model.gguf",
+                "size_bytes": 1024u64,
+            }),
+            "invalid_repo_id",
+        )
+        .await;
+        assert_rejected(
+            serde_json::json!({
+                "repo_id": "",
+                "filename": "model.gguf",
+                "size_bytes": 1024u64,
+            }),
+            "invalid_repo_id",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_zero_size_is_rejected_rather_than_fetched() {
+        // The header parser validates tensor offsets against the true full length,
+        // so a zero size could never produce an honest verdict.
+        assert_rejected(
+            serde_json::json!({
+                "repo_id": "unsloth/Phi-4-mini-instruct-GGUF",
+                "filename": "model.gguf",
+                "size_bytes": 0u64,
+            }),
+            "invalid_size",
+        )
+        .await;
     }
 }
 

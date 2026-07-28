@@ -785,7 +785,11 @@ fn workspace_fit_rank(fit: crate::fit::FitVerdict) -> u8 {
         crate::fit::FitVerdict::FitsResident => 0,
         crate::fit::FitVerdict::FitsWithOffload | crate::fit::FitVerdict::CpuOnlyOk => 1,
         crate::fit::FitVerdict::Unknown => 2,
-        crate::fit::FitVerdict::WontFit => 3,
+        // Both refusals sort last. `InsufficientFreeMemory` is transient and could
+        // become runnable by freeing memory, but ranking it above a proven fit
+        // would put a currently-unloadable model ahead of one the user can start
+        // right now.
+        crate::fit::FitVerdict::InsufficientFreeMemory | crate::fit::FitVerdict::WontFit => 3,
     }
 }
 
