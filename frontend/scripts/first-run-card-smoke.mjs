@@ -73,6 +73,7 @@ function resetStub() {
     localModels: [],          // what /models/local returns
     cancelResponse: { status: 200, body: 'Download canceled' },
     onCancelRequest: null,      // fires server-side when /catalog/cancel arrives
+    cancelDelayMs: 0,           // holds the cancel open so other work can interleave
     downloadsStatus: 200,     // force a failed probe
     localStatus: 200,
     loadStatus: 200,
@@ -151,6 +152,7 @@ const server = createServer(async (req, res) => {
     // flight -- the real race, and the only way to click Cancel before the card
     // has already noticed the file and unmounted the button.
     stub.onCancelRequest?.()
+    if (stub.cancelDelayMs) await new Promise((done) => setTimeout(done, stub.cancelDelayMs))
     const { status, body } = stub.cancelResponse
     if (status === 200) stub.downloads = []
     return sendJson(res, status, typeof body === 'string' ? { message: body } : body)
@@ -302,6 +304,29 @@ try {
     assert.ok(state.gone, 'the artifact must be activated, not discarded')
     assert.ok(countRequests('/api/models/load') >= 1, 'the already-downloaded artifact is routed into activation')
     assert.equal(countRequests('/api/models/catalog/install'), 1, 'and it is never re-downloaded')
+  })
+
+  /* ---- 2b. Cancel and settlement racing for the SAME activation ------------
+     The cancel is held open while the file lands, so the settlement poll claims the
+     activation first and the cancel's own reconciliation arrives second. Both want to
+     activate; only one may. Without single-flight this runs two loads and two
+     acknowledgements for one file. */
+  await scenario('a cancel racing settlement activates the artifact exactly once', async (page) => {
+    await page.click('.cxfirstrun__primary')
+    await page.waitForFunction(() => document.querySelector('.cxfirstrun__progress'), { timeout: 15000 })
+
+    stub.cancelResponse = { status: 409, body: { error: { code: 'download_already_completed', message: 'already finished' } } }
+    stub.onCancelRequest = () => landArtifact()   // lands immediately...
+    stub.cancelDelayMs = 2500                      // ...but the cancel answers late
+
+    await page.click('.cxfirstrun__progress .cxfirstrun__secondary')
+    await page.waitForFunction(() => !document.querySelector('.cxfirstrun'), { timeout: 30000, polling: 250 })
+    // Let any second activation that was going to happen actually happen.
+    await new Promise((done) => setTimeout(done, 2000))
+
+    assert.equal(countRequests('/api/models/load'), 1, 'the model must be loaded exactly once')
+    assert.equal(countRequests('/api/models/catalog/ack'), 1, 'and acknowledged exactly once')
+    assert.equal(countRequests('/api/models/catalog/install'), 1, 'and never re-downloaded')
   })
 
   /* ---- 3. Cancel the backend did not honour must keep watching ------------- */

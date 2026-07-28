@@ -356,7 +356,12 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
         setArtifactInstalled(true)
         setFailure(null)
         setNotice('')
-        settlementInFlightRef.current = false
+        /* Do NOT clear `settlementInFlightRef` here. The settlement poll can claim
+           the activation in the same window the cancel is being answered, and forcing
+           the flag would start a SECOND concurrent activation -- two loads and two
+           acknowledgements for one file. `activate()` is single-flight by itself: if
+           settlement already owns it this is a no-op, which is the correct outcome
+           because the activation is happening either way. */
         activate()
         return
       }
@@ -416,31 +421,46 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
 
   return (
     <section className="cxfirstrun" aria-labelledby="cxfirstrun-title">
-      <div className="cxfirstrun__head">
-        <div className="cxfirstrun__id">
-          <p className="cxfirstrun__kicker">Get started</p>
+      {/* Two columns: what this is on the left, what to press on the right. The card
+          sits above the whole chat surface, so it earns its height in one glance --
+          the provenance and the caveats are a disclosure, not a wall of prose. */}
+      <div className="cxfirstrun__row">
+        <div className="cxfirstrun__main">
+          <p className="cxfirstrun__kicker">
+            Get started
+            <EvidenceChip
+              status={hint?.target?.status || ''}
+              state={hint?.target?.status ? null : 'unsupported'}
+              label={`${size} · validated`}
+              source={{
+                rowId: hint?.target?.id,
+                note: 'A validated exact row: Camelid cross-checks this exact file against the reference implementation.',
+              }}
+              size="sm"
+            />
+          </p>
           <h2 className="cxfirstrun__title" id="cxfirstrun-title">
             Download {item.name} and start chatting
           </h2>
+          <p className="cxfirstrun__summary">
+            Camelid answers with a model on your own machine. This is the smallest one it has
+            validated that fits here.
+          </p>
         </div>
-        <EvidenceChip
-          status={hint?.target?.status || ''}
-          state={hint?.target?.status ? null : 'unsupported'}
-          label={`${size} download`}
-          source={{
-            rowId: hint?.target?.id,
-            note: 'A validated exact row: Camelid cross-checks this exact file against the reference implementation.',
-          }}
-          size="sm"
-        />
-      </div>
 
-      <p className="cxfirstrun__summary">
-        Camelid runs models on your own machine, so it needs one on disk first. This is the
-        smallest model Camelid has validated that fits here — one {size} download, then it
-        loads and Chat is ready. Nothing else to choose.
-      </p>
-      <p className="cxfirstrun__meta">{item.filename} · {item.repo_id} · {item.license}</p>
+        {busy ? null : (
+          <div className="cxfirstrun__actions">
+            {retryable ? (
+              <button type="button" className="cxfirstrun__primary" onClick={retryHandler}>
+                {retryLabel}
+              </button>
+            ) : null}
+            <button type="button" className="cxfirstrun__secondary" onClick={onOpenModels}>
+              {retryable ? 'Choose a different model' : 'Open Models'}
+            </button>
+          </div>
+        )}
+      </div>
 
       {busy ? (
         <div className="cxfirstrun__progress" role="status" aria-live="polite">
@@ -474,24 +494,21 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
           {failure ? <p className="cxfirstrun__error" role="alert">{failure.message}</p> : null}
           {artifactInstalled && failure ? (
             <p className="cxfirstrun__notice">
-              {item.filename} is already downloaded -- retrying picks up from there, with no
+              {item.filename} is already downloaded — retrying picks up from there, with no
               second download.
             </p>
           ) : null}
-          <div className="cxfirstrun__actions">
-            {retryable ? (
-              <button type="button" className="cxfirstrun__primary" onClick={retryHandler}>
-                {retryLabel}
-              </button>
-            ) : null}
-            <button type="button" className="cxfirstrun__secondary" onClick={onOpenModels}>
-              {retryable ? 'Choose a different model' : 'Open Models'}
-            </button>
-          </div>
-          <p className="cxfirstrun__fineprint">
-            The download comes from Hugging Face into your local models folder. Nothing is
-            downloaded until you press the button, and you can cancel at any point.
-          </p>
+          {/* Provenance and the download caveats matter, but only to someone who stops
+              to ask. Collapsed by default so the card stays one glance tall. */}
+          <details className="cxfirstrun__more">
+            <summary>What gets downloaded</summary>
+            <p className="cxfirstrun__meta">{item.filename} · {item.repo_id} · {item.license}</p>
+            <p className="cxfirstrun__fineprint">
+              Fetched from Hugging Face into your local models folder. Nothing is downloaded
+              until you press the button, you can cancel at any point, and Camelid loads it
+              locally — no prompt or reply leaves this machine.
+            </p>
+          </details>
         </>
       )}
     </section>
