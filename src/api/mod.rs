@@ -4256,7 +4256,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "active_validation_blocked_parity",
                 support_scope: "exact_row_validation_only",
                 full_support_status: "blocked_generation_parity",
-                full_support_blockers: "the engine is NON-DETERMINISTIC on this architecture at temperature 0, so generation parity cannot be certified; API/WebUI readiness, context, performance, and portability evidence are also missing. Prompt-token parity no longer blocks",
+                full_support_blockers: "generation parity is not certified: prefill and incremental decode disagree from the 3rd generated token (deterministically, since the Metal PV row-tail fix); API/WebUI readiness, context, performance, and portability evidence are also missing. Prompt-token parity and the temperature-0 non-determinism no longer block",
                 metadata_parses: "observed",
                 tokenizer_works: "validated_raw_8_of_8_and_chat_3_of_3_prompt_token_parity",
                 tensors_load: "observed",
@@ -4265,7 +4265,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 performance_measured: "not_started",
                 frontend_load_path_verified: "fail_closed_blocked_parity",
                 frontend_readiness_gate: "fail-closed until generation parity passes for this exact artifact",
-                tested_context: "prompt_token_parity_to_2180_tokens_generation_nondeterministic_at_temperature_zero",
+                tested_context: "prompt_token_parity_to_2180_tokens_single_token_decode_reference_matched_multi_token_diverges_at_index_2",
                 chat_template_renderer: "phi3_metadata_template_prompt_tokens_reference_matched",
                 chat_template_shape_pack: "failed_reference_parity",
                 chat_template_shape_pack_id: "phi3-chat-template-pack-v1",
@@ -4287,8 +4287,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "phi3_hold_evidence",
                 latest_checked_result: "blocked_generation_parity",
                 latest_checked_output: "qa/muster/phi3-hold-evidence/README.md",
-                evidence: "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. Generation parity still blocks the row, but the cause is NON-DETERMINISM, not a fixed forward-pass error: six identical temperature-0 requests on the 9-token prefix 'The capital of France is Paris.\\n' returned two different tokens, flipping between the reference <|assistant|> (32001) and \\n (13), with the reference token winning a majority of runs — qa/muster/phi3-hold-evidence/nondeterminism-q8-20260727.json. That receipt scopes it to phi3 (Llama-3.2-3B on metal_resident and Mistral-7B on the SAME cpu_reference path are both bit-identical across runs) and rules out a parallel-reduction race (--threads 1) and lazy Q8 materialization (CAMELID_LAZY_Q8_0_LINEAR=0); phi3-only head_dim=96 and the fused attn_qkv/ffn_up sub-row expansion are the open suspects. It SUPERSEDES generation-divergence-q8-20260727.json, whose prefill-vs-decode reading was drawn from two samples of a noisy process and is wrong. This row is intentionally not advertised as supported",
-                next_step: "make phi3 decode REPEATABLE first — identical temperature-0 requests must return identical logits. It survives --threads 1 and eager Q8, so hunt an uninitialized/stale read on the phi3-only paths: head_dim=96 tails (every other local row is 128) and the fused attn_qkv/ffn_up sub-row descriptor expansion in src/model.rs. Only then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion",
+                evidence: "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. The temperature-0 NON-DETERMINISM that previously blocked this row is FIXED: half_mm_batched_f16o ignored its `rows` argument, so at head_dim=96 the prefill PV pass's partial 64-row tile read past each head V slab and wrote into the next head's columns, racing it; bounding the three unguarded sites by `rows` makes the default path bit-stable (6/6 identical single-token, 3/3 identical multi-token) and returns the reference token 32001 — qa/muster/phi3-hold-evidence/nondeterminism-fixed-q8-20260728.json, which also records Llama-3.2-3B and Mistral-7B bit-identical pre/post patch. Generation parity STILL blocks the row for a separate and now-DETERMINISTIC reason: on 'The capital of France is' the reference emits [3681,29889,13,32001,3869] while camelid emits [3681,29889,3681,338,2998], diverging at index 2, and a fresh prefill of the 8-token prefix returns the reference 13 where incremental decode returns 3681. This row is intentionally not advertised as supported",
+                next_step: "reconcile phi3 incremental decode with prefill — a fresh prefill of the same prefix matches the reference while decode does not, so compare the decode KV-cache read against the prefill path for head_dim=96 (the same non-multiple-of-64 shape that broke the PV row tile). Then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion",
             },
             ModelCompatibilityTarget {
                 id: "phi4_mini_instruct_q4_k_m",
@@ -16119,17 +16119,23 @@ mod tests {
         assert!(phi3.evidence.contains("prompt-token parity PASSES"));
         assert!(phi3.evidence.contains("all_match=true"));
         assert!(!phi3.tokenizer_works.starts_with("blocked"));
-        // ...while generation parity must still be stated as blocking, and the
-        // stated CAUSE must be the non-determinism the receipts actually record,
-        // never the superseded prefill-vs-decode reading.
+        // ...the temperature-0 non-determinism must be stated as FIXED (the Metal PV
+        // row-tail guard landed)...
         assert!(phi3
             .evidence
-            .contains("Generation parity still blocks the row"));
-        assert!(phi3.evidence.contains("NON-DETERMINISM"));
-        assert!(phi3.evidence.contains("nondeterminism-q8-20260727.json"));
-        assert!(!phi3
+            .contains("NON-DETERMINISM that previously blocked this row is"));
+        assert!(phi3
             .evidence
-            .contains("disagrees with itself between fresh prefill"));
+            .contains("nondeterminism-fixed-q8-20260728.json"));
+        // ...and generation parity must still be stated as blocking, for the separate
+        // DETERMINISTIC prefill-vs-decode divergence. This is the same claim an earlier
+        // receipt made and had to retract -- it was then inferred from two samples of a
+        // non-deterministic engine. It is assertable here only because it is now
+        // repeatable (3/3 identical runs), which is what makes it evidence.
+        assert!(phi3
+            .evidence
+            .contains("Generation parity STILL blocks the row"));
+        assert!(phi3.evidence.contains("diverging at index 2"));
         assert!(phi3
             .full_support_status
             .contains("blocked_generation_parity"));
