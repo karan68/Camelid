@@ -69,6 +69,7 @@ export default function ChatWorkspace({
   selectedModelExperimental = false,
   setTab,
   showNewChatLanding = null,
+  firstRunActive = false,
   demoMode = false,
 }) {
   // Chat is allowed on the supported lane (full gate) OR the weaker experimental
@@ -199,7 +200,11 @@ export default function ChatWorkspace({
         ? 'The runtime is up, but chat still needs an exact supported row before send unlocks.'
         : selectedModel
           ? 'Your draft is ready now. Send unlocks as soon as this model is ready.'
-          : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
+          // The activation card above already names the one thing to do; repeating
+          // "pick a model" here would offer a second, vaguer instruction.
+          : firstRunActive
+            ? 'Camelid answers with a model running on this machine. Set one up above and this becomes a chat.'
+            : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
   const readinessState = selectedModelRunnable ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const runtimeTone = readinessTone({ ready: selectedModelRunnable, offline: apiUnavailable, waiting: Boolean(runtime?.loaded_now || selectedModel) })

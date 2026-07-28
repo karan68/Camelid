@@ -608,6 +608,18 @@ function getModelCapabilityFields(model, catalogItem) {
     catalogItem?.name,
     catalogItem?.repo_id,
     catalogItem?.filename,
+    // A curated row's `catalog_id` IS its compatibility row id — that identity is
+    // the join the SERVER uses for its own supported-row test (see
+    // `filename_is_supported_exact_row` in src/api/mod.rs, which looks up
+    // `catalog_id` in the supported_* set). Without it the frontend had to
+    // reconstruct the id from the display name, and a row id carrying a token the
+    // name does not ("qwen3_0_6b_INSTRUCT_q8_0" vs "Qwen3 0.6B Q8_0") simply never
+    // matched: eight pinned supported rows — every Qwen3 Q8_0 row and all four
+    // Gemma 4 rows — rendered as merely experimental in the catalog while the
+    // server classified the very same artifact as supported. Live Hugging Face rows
+    // are unaffected: their ids are `hf::<repo>::<file>`, which cannot normalize
+    // onto a ledger row id, and they are forced out of the supported lane anyway.
+    catalogItem?.catalog_id,
   ]
   // Exact compatibility row ids concatenate the model name with its quant
   // (e.g. "qwen3_4b_instruct_q8_0"). A model loaded outside the catalog — e.g. via
