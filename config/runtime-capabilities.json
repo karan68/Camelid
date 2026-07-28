@@ -15,6 +15,26 @@
       "safety_contract": "Runtime project status is distinct from exact model support and cannot promote model compatibility rows."
     },
     {
+      "id": "mixtral-moe-completion",
+      "project": 3,
+      "status": "diagnostic_gate_hardened_parity_blocked",
+      "default_enabled": false,
+      "configuration": [
+        "CAMELID_MOE_EXPERT_STORAGE",
+        "CAMELID_MIXTRAL_LONG_GENERATION"
+      ],
+      "dependencies": [
+        "runtime-capability-registry"
+      ],
+      "evidence": [
+        "inference::tests::mixtral_moe_ffn_captures_router_logits_and_selected_experts",
+        "inference::tests::resident_q8_moe_expert_view_slices_blocks_without_f32_materialization",
+        "api::tests::mixtral_multi_token_generation_stays_fail_closed_until_explicitly_enabled",
+        "scripts/diagnose-mixtral-watchdog.ps1"
+      ],
+      "safety_contract": "The validated one-token path is unchanged. Multi-token Mixtral is rejected by default until exact-row token parity passes; resident Q8 experts are explicit opt-in and require live RAM for the expanded resident blocks, peak loader scratch, and the host headroom floor."
+    },
+    {
       "id": "cpu-kquant-prefill-owner",
       "project": 4,
       "status": "parity_gated",
@@ -83,6 +103,37 @@
         "api::engine::tests::slot_snapshot_tracks_real_active_task"
       ],
       "safety_contract": "The production engine remains single-owner by default; multi-slot token stepping is not advertised as production-ready until inference integration and throughput/parity receipts land."
+    },
+    {
+      "id": "production-server-hardening",
+      "project": 8,
+      "status": "implemented",
+      "default_enabled": true,
+      "configuration": [
+        "CAMELID_API_KEY",
+        "CAMELID_API_KEY_FILE",
+        "CAMELID_CORS_ORIGINS",
+        "CAMELID_ALLOW_UNAUTHENTICATED_REMOTE",
+        "CAMELID_TLS_CERT",
+        "CAMELID_TLS_KEY",
+        "CAMELID_MAX_REQUEST_BODY_BYTES",
+        "CAMELID_MAX_PROMPT_TOKENS",
+        "CAMELID_MAX_GENERATION_TOKENS",
+        "CAMELID_MAX_DOWNLOAD_BYTES"
+      ],
+      "dependencies": [
+        "runtime-capability-registry"
+      ],
+      "evidence": [
+        "api::server::tests::remote_listener_requires_auth_or_explicit_override",
+        "api::server::tests::router_authenticates_api_routes_but_keeps_health_public",
+        "api::server::tests::cors_emits_only_explicitly_allowed_origin",
+        "api::server::tests::tls_files_and_resource_limits_fail_closed_when_incomplete",
+        "api::server::tests::request_body_ceiling_returns_payload_too_large",
+        "api::download_cancel_tests::finished_download_above_ceiling_is_never_promoted",
+        "api::metrics::tests::exposition_is_prometheus_text_and_has_no_model_or_secret_labels"
+      ],
+      "safety_contract": "Loopback stays frictionless. Non-loopback binds require authentication unless an explicit unsafe override is set; CORS is exact-origin only, secrets are redacted, TLS inputs are paired, and request/token/download ceilings are enforced."
     }
   ]
 }

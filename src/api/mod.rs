@@ -9,8 +9,9 @@ use std::{
 };
 
 use axum::{
-    extract::{rejection::JsonRejection, Path as AxumPath, Query, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware,
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
@@ -23,12 +24,16 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 
 #[allow(dead_code)]
 mod continuous_batch;
 mod engine;
+mod metrics;
+mod server;
 mod workspace;
+
+pub use server::ServeOptions;
 
 use crate::{
     execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
@@ -161,6 +166,10 @@ pub struct AppState {
     /// paths never touch it, and a relative path that exists against the
     /// process CWD keeps its historical meaning — this only adds a fallback.
     models_dir: PathBuf,
+    /// Immutable request/token/download ceilings resolved at startup.
+    server_limits: server::ServerLimits,
+    /// Lock-free process metrics shared by middleware and decode jobs.
+    metrics: metrics::ServerMetrics,
 }
 
 impl Default for AppState {
@@ -190,6 +199,8 @@ impl Default for AppState {
             configured_threads: None,
             default_enable_thinking: false,
             models_dir: resolve_models_dir(None),
+            server_limits: server::ServerPolicy::loopback_default().limits,
+            metrics: metrics::ServerMetrics::default(),
         }
     }
 }
@@ -233,6 +244,11 @@ impl AppState {
 
     fn with_workspace_cli_token(mut self, token: Option<&str>) -> Self {
         self.workspace_cli_token = token.map(Arc::from);
+        self
+    }
+
+    fn with_server_policy(mut self, policy: &server::ServerPolicy) -> Self {
+        self.server_limits = policy.limits;
         self
     }
 
@@ -458,6 +474,11 @@ pub struct HealthResponse {
     /// finished (queued + running). Bounded by CAMELID_QUEUE_DEPTH; beyond the
     /// bound requests get a typed 503 (`engine_queue_full`).
     pub engine_queue_depth: usize,
+    pub engine_queued_tasks: usize,
+    pub engine_active_task_id: Option<u64>,
+    pub engine_active_generated_tokens: u64,
+    pub engine_active_elapsed_seconds: u64,
+    pub engine_stalled_seconds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1089,6 +1110,9 @@ pub struct LlamaServerSlotCamelid {
     /// finished (queued + running). See `HealthResponse::engine_queue_depth`.
     pub engine_queue_depth: usize,
     pub queued_tasks: usize,
+    pub active_generated_tokens: u64,
+    pub active_elapsed_seconds: u64,
+    pub stalled_seconds: u64,
     pub unsupported: Vec<&'static str>,
 }
 
@@ -1587,6 +1611,8 @@ struct PreparedGeneration {
     dense_metadata: DenseDiagnosticMetadata,
     timings: GenerationTimings,
     cached_prompt_prefix: Arc<Mutex<PromptPrefixCachePool>>,
+    metrics: metrics::ServerMetrics,
+    engine_progress: engine::EngineHandle,
     speculative: Option<PreparedSpeculative>,
     /// Captured request identity for the live telemetry stream; taken by the
     /// generation path that actually runs (streaming or blocking).
@@ -1951,6 +1977,14 @@ pub(crate) fn router_with_workspace_cli_token_for_tests(token: &str) -> Router {
 }
 
 pub fn router_with_state(state: AppState) -> Router {
+    router_with_state_and_policy(state, server::ServerPolicy::loopback_default())
+}
+
+fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -> Router {
+    let auth = policy.auth.clone();
+    let cors = policy.cors_layer();
+    let body_limit = policy.limits.max_request_body_bytes;
+    let metrics = state.metrics.clone();
     Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
@@ -1988,7 +2022,7 @@ pub fn router_with_state(state: AppState) -> Router {
             "/slots",
             get(llama_server_slots).post(unsupported_llama_server_slots),
         )
-        .route("/metrics", get(unsupported_llama_server_metrics))
+        .route("/metrics", get(metrics::prometheus))
         .route("/completion", post(llama_server_completion))
         .route("/infill", post(unsupported_llama_server_infill))
         .route("/embedding", post(unsupported_embeddings))
@@ -2060,7 +2094,13 @@ pub fn router_with_state(state: AppState) -> Router {
         // chat surface and its static assets), with a client-side-route
         // fallback to the app shell. API routes are matched first.
         .fallback(crate::web_ui::handler)
-        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn_with_state(auth, server::authenticate))
+        .layer(middleware::from_fn_with_state(
+            metrics,
+            metrics::observe_http,
+        ))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -2072,13 +2112,17 @@ pub async fn serve(
     open_ui: bool,
     default_enable_thinking: bool,
     models_dir: Option<PathBuf>,
+    options: ServeOptions,
 ) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let policy = server::ServerPolicy::resolve(addr, options)?;
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
     let mut state = AppState::with_configured_threads(configured_threads)
         .with_default_enable_thinking(default_enable_thinking)
         .with_local_model_delete(addr.ip().is_loopback())
         .with_models_dir(models_dir)
-        .with_serve_addr(addr);
+        .with_serve_addr(addr)
+        .with_server_policy(&policy);
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
             tracing::error!(error=%err, "failed to load startup model");
@@ -2108,8 +2152,24 @@ pub async fn serve(
             .as_ref()
             .map(crate::workspace_auth::WorkspaceCliCredential::token),
     );
-    tracing::info!(%addr, "camelid server listening");
-    let url = format!("http://{addr}");
+    tracing::info!(
+        %addr,
+        auth_enabled = policy.auth.enabled(),
+        tls_enabled = policy.tls.is_some(),
+        cors_origin_count = policy.cors_origin_count(),
+        max_request_body_bytes = policy.limits.max_request_body_bytes,
+        max_prompt_tokens = policy.limits.max_prompt_tokens,
+        max_generation_tokens = policy.limits.max_generation_tokens,
+        max_download_bytes = policy.limits.max_download_bytes,
+        remote_unauthenticated_override = policy.remote_unauthenticated_override,
+        "camelid server policy resolved"
+    );
+    let scheme = if policy.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let url = format!("{scheme}://{addr}");
 
     // Warm the model-fit dimension cache in the background: header-only reads
     // (never weights), disk-cached across restarts, de-duplicated, and globally
@@ -2132,7 +2192,28 @@ pub async fn serve(
     // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
     // to the old lazy build and is not fatal.
     let warm_model_id = state.active_model_id.read().await.clone();
-    let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
+    let app = router_with_state_and_policy(state, policy.clone());
+    let tls_enabled = policy.tls.is_some();
+    let server = if let Some(tls) = &policy.tls {
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key)
+            .await
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("could not load TLS certificate/key: {error}"),
+                )
+            })?;
+        let server = axum_server::from_tcp_rustls(std_listener, tls_config)?;
+        tokio::spawn(async move {
+            server
+                .serve(app.into_make_service())
+                .await
+                .map_err(std::io::Error::other)
+        })
+    } else {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        tokio::spawn(async move { axum::serve(listener, app).await })
+    };
     if let Some(model_id) = warm_model_id {
         // Word the banner for the device that will actually serve â€” saying "GPU"
         // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
@@ -2142,7 +2223,11 @@ pub async fn serve(
             "ðŸª Warming up the model (building the engine, one-time)â€¦"
         };
         eprintln!("\n  {warming_msg}");
-        warmup_generation_blocking(addr, model_id).await;
+        if tls_enabled {
+            tracing::info!("skipping HTTP self-warmup because TLS is enabled");
+        } else {
+            warmup_generation_blocking(addr, model_id, policy.auth.bearer_header_line()).await;
+        }
     }
     print_ready_banner(&url);
     if workspace_cli_credential.is_some() {
@@ -2159,14 +2244,21 @@ pub async fn serve(
 /// first prefill run). Runs the blocking `std::net` round-trip on the blocking pool so
 /// the spawned server task can answer it concurrently. Best-effort: any failure (or
 /// the 180s safety timeout) just returns, leaving the old lazy-build behaviour.
-async fn warmup_generation_blocking(addr: SocketAddr, model_id: String) {
-    let _ = tokio::task::spawn_blocking(move || warmup_request(addr, &model_id)).await;
+async fn warmup_generation_blocking(
+    addr: SocketAddr,
+    model_id: String,
+    auth_header: Option<String>,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        warmup_request(addr, &model_id, auth_header.as_deref())
+    })
+    .await;
 }
 
 /// Send the warm-up chat request and read the full response (blocking). Returns once
 /// the forward has completed so the resident engine is built before the caller
 /// proceeds. Errors are swallowed by the caller â€” this only shaves the cold start.
-fn warmup_request(addr: SocketAddr, model_id: &str) {
+fn warmup_request(addr: SocketAddr, model_id: &str, auth_header: Option<&str>) {
     use std::io::{Read, Write};
     // Give the just-spawned listener a moment to start accepting; retry briefly.
     let mut stream = None;
@@ -2192,8 +2284,9 @@ fn warmup_request(addr: SocketAddr, model_id: &str) {
         "stream": false,
     })
     .to_string();
+    let auth_header = auth_header.unwrap_or("");
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body,
     );
@@ -2286,6 +2379,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         .as_ref()
         .and_then(|id| execution_plans.get(id))
         .cloned();
+    let slot = state.engine.slot_snapshot();
     Json(HealthResponse {
         ok: true,
         engine: "camelid",
@@ -2298,6 +2392,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         model_family,
         gemma4_available,
         engine_queue_depth: state.engine.depth(),
+        engine_queued_tasks: slot.queued_tasks,
+        engine_active_task_id: slot.active_task_id,
+        engine_active_generated_tokens: slot.completed_units,
+        engine_active_elapsed_seconds: slot.active_elapsed_seconds,
+        engine_stalled_seconds: slot.stalled_seconds,
     })
 }
 
@@ -2712,6 +2811,9 @@ async fn llama_server_slots(
                 status,
                 engine_queue_depth: state.engine.depth(),
                 queued_tasks: slot.queued_tasks,
+                active_generated_tokens: slot.completed_units,
+                active_elapsed_seconds: slot.active_elapsed_seconds,
+                stalled_seconds: slot.stalled_seconds,
                 unsupported: vec![
                     "post_slots",
                     "slot_cache_save_restore_erase",
@@ -2730,14 +2832,6 @@ async fn unsupported_llama_server_slots() -> Response {
         "unsupported_llama_server_slots",
         "POST /slots and llama-server slot cache actions are not supported yet; Camelid exposes GET /slots as a read-only compatibility snapshot",
         Some("slots"),
-    )
-}
-
-async fn unsupported_llama_server_metrics() -> Response {
-    unsupported_route(
-        "unsupported_llama_server_metrics",
-        "GET /metrics is not supported yet; Camelid has no llama-server metrics compatibility contract, prompt-cache metrics, or continuous batching telemetry surface for this route",
-        Some("metrics"),
     )
 }
 
@@ -4295,7 +4389,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 full_support_blockers: "later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing",
                 metadata_parses: "validated_sparse_header",
                 tokenizer_works: "validated_against_llama_cpp_reference",
-                tensors_load: "validated_lazy_file_backed_rank3_q8_experts",
+                tensors_load: "validated_lazy_file_backed_rank3_q8_experts_resident_q8_path_unit_validated_only",
                 generation_runs: "bounded_one_token_runtime_smoke_observed",
                 parity_audited: "prompt_tokens_and_bounded_one_token_match_only",
                 performance_measured: "not_promoted",
@@ -4323,8 +4417,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511",
                 latest_checked_result: "blocked_later_generation_divergence",
                 latest_checked_output: "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md",
-                evidence: "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with default full-router softmax weights and lazy/file-backed Q8 experts; bounded one-token backend MoE runtime evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9 and qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511 records partial_failure plus a backend HTTP hang. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
-                next_step: "fix later-generation divergence and rerun row-specific parity/API/WebUI/RSS evidence before any Mixtral support/readiness promotion",
+                evidence: "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k routing now exposes per-layer router logits, selected expert IDs/weights, and per-expert gate/up/activation/down/weighted-down checkpoints. The existing lazy/file-backed Q8 path remains the default; an opt-in zero-copy resident-Q8 expert path is live-RAM gated but has only synthetic/unit validation on this checkout. Bounded one-token backend evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9. Multi-token requests now fail closed by default, and scripts/diagnose-mixtral-watchdog.ps1 separates forward progress from a stalled engine during explicit diagnostic runs. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
+                next_step: "acquire the exact GGUF and compatible pinned llama.cpp oracle, then rerun generated-index-9 parity plus continuation/API/WebUI/RSS/throughput gates before any Mixtral support/readiness promotion",
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
@@ -4752,7 +4846,12 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_server_slots",
                 status: "partial",
-                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, cancellation metadata, and continuous batching metrics remain unsupported.",
+                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported.",
+            },
+            SupportItem {
+                id: "production_server_hardening",
+                status: "supported",
+                notes: "Startup-resolved bearer/X-API-Key authentication with key-file support, fail-closed non-loopback binding, explicit CORS origin allowlists, optional rustls TLS, request/prompt/generation/download ceilings, and a Prometheus /metrics surface for HTTP/generation/token/cache/queue/slot/RSS/VRAM telemetry. Anonymous same-origin loopback remains the default.",
             },
             SupportItem {
                 id: "llama_server_apply_template",
@@ -4767,7 +4866,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors.",
+                notes: "Native /infill, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors.",
             },
             SupportItem {
                 id: "multi_choice_generation",
@@ -10298,6 +10397,16 @@ fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crat
     Ok(estimated_bytes)
 }
 
+fn mixtral_long_generation_is_blocked(
+    moe: Option<&crate::model::MixtralMoeMetadata>,
+    max_tokens: u32,
+    explicitly_enabled: bool,
+) -> bool {
+    max_tokens > 1
+        && moe.is_some_and(|metadata| metadata.family_label == "Mixtral")
+        && !explicitly_enabled
+}
+
 async fn prepare_generation(
     state: &AppState,
     req: GenerationSessionRequest,
@@ -10324,7 +10433,6 @@ async fn prepare_generation(
             Some("max_tokens"),
         ));
     }
-
     let input = match (req.prompt, req.messages, req.camelid_prompt_token_ids) {
         (Some(prompt), None, None) if !prompt.is_empty() => PromptInput::Text(prompt),
         (None, Some(messages), None) if !messages.is_empty() => {
@@ -10475,6 +10583,18 @@ async fn prepare_generation(
             Some("prompt"),
         ));
     }
+    if token_ids.len() > state.server_limits.max_prompt_tokens {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            format!(
+                "prompt encoded to {} tokens, above the server ceiling of {}",
+                token_ids.len(),
+                state.server_limits.max_prompt_tokens
+            ),
+            Some("prompt"),
+        ));
+    }
 
     let config = model.llama_config.as_ref().ok_or_else(|| {
         let message = model
@@ -10532,6 +10652,37 @@ async fn prepare_generation(
             .map(|cap| cap.min(available_max_tokens))
             .unwrap_or(available_max_tokens),
     };
+    // Enforce the operator's ceiling against the effective generation budget,
+    // after preserving the existing API contract that max_tokens is clamped to
+    // the model's remaining context. A huge request on a tiny context therefore
+    // remains harmless and compatible, while a request that could actually
+    // consume more than the configured server limit fails closed.
+    if max_tokens > state.server_limits.max_generation_tokens {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "generation_token_limit_exceeded",
+            format!(
+                "effective max_tokens exceeds the server ceiling of {}",
+                state.server_limits.max_generation_tokens
+            ),
+            Some("max_tokens"),
+        ));
+    }
+    if mixtral_long_generation_is_blocked(
+        config.moe.as_ref(),
+        max_tokens,
+        crate::runtime_config::mixtral_long_generation_enabled(),
+    ) {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unvalidated_mixtral_long_generation",
+            format!(
+                "multi-token Mixtral generation is fail-closed pending exact-row parity; request max_tokens=1 or explicitly set {}=1 for a controlled diagnostic run",
+                crate::runtime_config::MIXTRAL_LONG_GENERATION_ENV
+            ),
+            Some("max_tokens"),
+        ));
+    }
     if let Some(index) = req.camelid_dense_diagnostic_generated_index {
         if index >= max_tokens {
             return Err(api_error(
@@ -10724,6 +10875,8 @@ async fn prepare_generation(
         dense_metadata,
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
+        metrics: state.metrics.clone(),
+        engine_progress: state.engine.clone(),
         speculative,
         telemetry: Some(telemetry_start),
         cancel: GenerationCancel::unbounded(),
@@ -11359,7 +11512,11 @@ fn run_decode_job_serialized(
         std::thread::sleep(duration);
     }
     let cancel = prepared.cancel.clone();
+    let metrics = prepared.metrics.clone();
     let result = generate_decoded_tokens(prepared);
+    if result.is_err() {
+        metrics.record_generation_failure();
+    }
     // Â§4 safe-boot: a decode ran to completion under the applied gait without
     // wedging the host, so clear the in-progress marker. Cheap and idempotent.
     // Not marked when the decode was cancelled or timed out — those did not
@@ -11884,6 +12041,9 @@ fn consume_generation_step(
     }
     acc.generated.push(step.next_token_id);
     acc.history.push(step.next_token_id);
+    prepared
+        .engine_progress
+        .record_progress(acc.generated.len());
     if prepared.tokenizer.special.eog.contains(&step.next_token_id) {
         *acc.finish_reason = "stop";
     } else if !prepared.stop_sequences.is_empty() {
@@ -12161,6 +12321,7 @@ fn generate_token_ids(
                     for &token in &emitted {
                         generated.push(token);
                         history.push(token);
+                        prepared.engine_progress.record_progress(generated.len());
                         if prepared.tokenizer.special.eog.contains(&token) {
                             finish_reason = "stop";
                             break;
@@ -12452,6 +12613,11 @@ fn generate_token_ids(
     if collect_q8_schedule {
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
     }
+    prepared.metrics.record_generation(
+        prepared.token_ids.len(),
+        generated.len(),
+        &prepared.timings,
+    );
 
     // Finalize the rollup before any field is moved out of `prepared`.
     let execution_trace = if tracing_armed {
@@ -13297,6 +13463,11 @@ fn run_stream_decode_job(
     if collect_q8_schedule {
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
     }
+    prepared.metrics.record_generation(
+        prepared.token_ids.len(),
+        generated.len(),
+        &prepared.timings,
+    );
     if let Some(guard) = telemetry_guard {
         let ttft_ms = first_content_ms.map(|ms| ms as u64);
         let decode_tps = match (first_content_ms, generated.len()) {
@@ -14547,6 +14718,14 @@ async fn loaded_tokenizer(state: &AppState) -> std::result::Result<Tokenizer, Re
 }
 
 fn malformed_json_error(err: JsonRejection) -> Response {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_limit_exceeded",
+            err.to_string(),
+            None,
+        );
+    }
     api_error(
         StatusCode::BAD_REQUEST,
         "malformed_json",
@@ -15636,8 +15815,8 @@ mod tests {
             .iter()
             .map(|item| (item.project, item))
             .collect();
-        assert_eq!(projects.len(), 5);
-        for project in [2u32, 4, 5, 6, 7] {
+        assert_eq!(projects.len(), 7);
+        for project in [2u32, 3, 4, 5, 6, 7, 8] {
             let item = projects
                 .get(&project)
                 .unwrap_or_else(|| panic!("project {project} missing"));
@@ -15653,6 +15832,14 @@ mod tests {
         assert!(
             !projects[&7].default_enabled,
             "continuous batching remains default-neutral until integrated"
+        );
+        assert!(
+            !projects[&3].default_enabled,
+            "Mixtral long generation remains exact-row parity gated"
+        );
+        assert!(
+            projects[&8].default_enabled,
+            "production server guardrails are active by default"
         );
     }
 
@@ -16262,6 +16449,40 @@ mod tests {
         assert!(response.support_contract.current_gate.contains(
             "no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied"
         ));
+    }
+
+    #[test]
+    fn mixtral_multi_token_generation_stays_fail_closed_until_explicitly_enabled() {
+        let mixtral = crate::model::MixtralMoeMetadata {
+            family_label: "Mixtral",
+            expert_count: 8,
+            expert_used_count: 2,
+            expert_weights_scale: 1.0,
+            expert_weights_norm: true,
+            expert_gating_func: 0,
+        };
+        let generic_moe = crate::model::MixtralMoeMetadata {
+            family_label: "MoE",
+            ..mixtral.clone()
+        };
+
+        assert!(!mixtral_long_generation_is_blocked(
+            Some(&mixtral),
+            1,
+            false
+        ));
+        assert!(mixtral_long_generation_is_blocked(Some(&mixtral), 2, false));
+        assert!(!mixtral_long_generation_is_blocked(
+            Some(&mixtral),
+            50,
+            true
+        ));
+        assert!(!mixtral_long_generation_is_blocked(
+            Some(&generic_moe),
+            50,
+            false
+        ));
+        assert!(!mixtral_long_generation_is_blocked(None, 50, false));
     }
 
     #[test]
@@ -18753,6 +18974,8 @@ mod tests {
             dense_metadata: dummy_dense_metadata(),
             timings: GenerationTimings::default(),
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(8))),
+            metrics: metrics::ServerMetrics::default(),
+            engine_progress: engine::EngineHandle::spawn(),
             speculative: None,
             telemetry: None,
             cancel: GenerationCancel::unbounded(),
@@ -20881,6 +21104,17 @@ async fn install_catalog_model(
             Some("filename"),
         );
     }
+    if req.size_bytes == 0 || req.size_bytes > state.server_limits.max_download_bytes {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "download_size_limit_exceeded",
+            format!(
+                "declared model size {} bytes is outside the server download ceiling of {} bytes",
+                req.size_bytes, state.server_limits.max_download_bytes
+            ),
+            Some("size_bytes"),
+        );
+    }
     let continuation_mode = match req.continuation_mode.as_deref().unwrap_or("download") {
         mode @ ("download" | "smoke" | "start") => mode.to_string(),
         _ => {
@@ -20950,6 +21184,8 @@ async fn install_catalog_model(
         "https://huggingface.co/{}/resolve/main/{}",
         req.repo_id, req.filename
     );
+    let max_download_bytes_limit = state.server_limits.max_download_bytes;
+    let max_download_bytes = max_download_bytes_limit.to_string();
 
     // `-f` makes curl FAIL on an HTTP error (404/403/â€¦) instead of writing the
     // error page to the output file and exiting 0 â€” which previously looked like an
@@ -20981,6 +21217,8 @@ async fn install_catalog_model(
             "--retry-delay",
             "2",
             "--retry-all-errors",
+            "--max-filesize",
+            &max_download_bytes,
             "-o",
             &part_path,
             &url,
@@ -21022,6 +21260,7 @@ async fn install_catalog_model(
                     still_tracked,
                     &part_path_clone,
                     &dest_path_clone,
+                    max_download_bytes_limit,
                 );
                 if let Some(dl) = map.get_mut(&catalog_id_clone) {
                     dl.status = status;
@@ -21082,8 +21321,16 @@ fn finalize_download_artifact(
     still_tracked: bool,
     part_path: &str,
     dest_path: &str,
+    max_download_bytes: u64,
 ) -> &'static str {
-    let promoted = succeeded && still_tracked && std::fs::rename(part_path, dest_path).is_ok();
+    // Curl's --max-filesize is the first line of defense, but the origin may
+    // omit or lie about Content-Length and curl behavior varies by version.
+    // Recheck the artifact itself before making it loadable so the configured
+    // ceiling remains authoritative even in those cases.
+    let within_limit = std::fs::metadata(part_path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_download_bytes);
+    let promoted =
+        succeeded && still_tracked && within_limit && std::fs::rename(part_path, dest_path).is_ok();
     if !promoted {
         std::fs::remove_file(part_path).ok();
     }
@@ -22204,7 +22451,7 @@ mod download_cancel_tests {
     fn successful_tracked_download_promotes_part_to_dest() {
         let (part, dest) = temp_paths("promote");
         std::fs::write(&part, b"payload").unwrap();
-        let status = finalize_download_artifact(true, true, &part, &dest);
+        let status = finalize_download_artifact(true, true, &part, &dest, u64::MAX);
         assert_eq!(status, "completed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -22220,7 +22467,7 @@ mod download_cancel_tests {
         std::fs::write(&part, b"payload").unwrap();
         // still_tracked=false models a cancel that removed the map entry while
         // curl went on to finish successfully (the Windows kill-less failure mode).
-        let status = finalize_download_artifact(true, false, &part, &dest);
+        let status = finalize_download_artifact(true, false, &part, &dest, u64::MAX);
         assert_eq!(status, "failed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -22236,10 +22483,33 @@ mod download_cancel_tests {
     fn failed_download_removes_partial() {
         let (part, dest) = temp_paths("fail");
         std::fs::write(&part, b"half").unwrap();
-        let status = finalize_download_artifact(false, true, &part, &dest);
+        let status = finalize_download_artifact(false, true, &part, &dest, u64::MAX);
         assert_eq!(status, "failed");
         assert!(!std::path::Path::new(&part).exists());
         assert!(!std::path::Path::new(&dest).exists());
+    }
+
+    #[test]
+    fn finished_download_above_ceiling_is_never_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("model.gguf.part");
+        let dest = dir.path().join("model.gguf");
+        std::fs::write(&part, b"oversized").unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            4,
+        );
+
+        assert_eq!(status, "failed");
+        assert!(!part.exists(), "oversized partial must be removed");
+        assert!(
+            !dest.exists(),
+            "oversized partial must never become loadable"
+        );
     }
 
     #[test]

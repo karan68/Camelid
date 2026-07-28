@@ -12,6 +12,8 @@ pub const NGRAM_INDEX_MAX_ENTRIES_ENV: &str = "CAMELID_NGRAM_INDEX_MAX_ENTRIES";
 pub const KV_POOL_BUDGET_BYTES_ENV: &str = "CAMELID_KV_POOL_BUDGET_BYTES";
 pub const CONTINUOUS_BATCH_SLOTS_ENV: &str = "CAMELID_CONTINUOUS_BATCH_SLOTS";
 pub const KQUANT_PREFILL_OWNER_ENV: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER";
+pub const MOE_EXPERT_STORAGE_ENV: &str = "CAMELID_MOE_EXPERT_STORAGE";
+pub const MIXTRAL_LONG_GENERATION_ENV: &str = "CAMELID_MIXTRAL_LONG_GENERATION";
 
 pub const DEFAULT_ENGINE_QUEUE_DEPTH: usize = 8;
 pub const DEFAULT_NGRAM_INDEX_MAX_ENTRIES: usize = 131_072;
@@ -22,6 +24,17 @@ const MAX_ENGINE_QUEUE_DEPTH: usize = 65_536;
 const MAX_NGRAM_INDEX_ENTRIES: usize = 4_194_304;
 const MAX_CONTINUOUS_BATCH_SLOTS: usize = 256;
 
+/// Storage policy for the very large rank-3 expert tensors used by MoE models.
+///
+/// File-backed experts preserve Camelid's low-memory default. Resident Q8 keeps
+/// the quantized blocks in RAM to remove per-token disk reads, but is admitted
+/// only after the loader's live-memory preflight succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeExpertStorage {
+    FileBacked,
+    ResidentQ8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub engine_queue_depth: usize,
@@ -29,6 +42,8 @@ pub struct RuntimeConfig {
     pub kv_pool_budget_bytes: u64,
     pub continuous_batch_slots: usize,
     pub kquant_prefill_owner: bool,
+    pub moe_expert_storage: MoeExpertStorage,
+    pub mixtral_long_generation: bool,
 }
 
 impl RuntimeConfig {
@@ -59,6 +74,8 @@ impl RuntimeConfig {
                 MAX_CONTINUOUS_BATCH_SLOTS,
             ),
             kquant_prefill_owner: env_flag_default_off(KQUANT_PREFILL_OWNER_ENV),
+            moe_expert_storage: moe_expert_storage_from_env(),
+            mixtral_long_generation: env_flag_default_off(MIXTRAL_LONG_GENERATION_ENV),
         }
     }
 }
@@ -81,6 +98,26 @@ pub fn continuous_batch_slots() -> usize {
 
 pub fn kquant_prefill_owner_enabled() -> bool {
     RuntimeConfig::from_env().kquant_prefill_owner
+}
+
+pub fn moe_expert_storage() -> MoeExpertStorage {
+    RuntimeConfig::from_env().moe_expert_storage
+}
+
+pub fn mixtral_long_generation_enabled() -> bool {
+    RuntimeConfig::from_env().mixtral_long_generation
+}
+
+fn moe_expert_storage_from_env() -> MoeExpertStorage {
+    match env::var(MOE_EXPERT_STORAGE_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("resident") | Some("resident_q8") | Some("wire") => MoeExpertStorage::ResidentQ8,
+        Some("file") | Some("file_backed") | Some("lazy") | None => MoeExpertStorage::FileBacked,
+        Some(_) => MoeExpertStorage::FileBacked,
+    }
 }
 
 fn bounded_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
@@ -125,6 +162,8 @@ mod tests {
             KV_POOL_BUDGET_BYTES_ENV,
             CONTINUOUS_BATCH_SLOTS_ENV,
             KQUANT_PREFILL_OWNER_ENV,
+            MOE_EXPERT_STORAGE_ENV,
+            MIXTRAL_LONG_GENERATION_ENV,
         ] {
             env::remove_var(key);
         }
@@ -133,6 +172,8 @@ mod tests {
         env::set_var(KV_POOL_BUDGET_BYTES_ENV, "0");
         env::set_var(CONTINUOUS_BATCH_SLOTS_ENV, "999");
         env::set_var(KQUANT_PREFILL_OWNER_ENV, "maybe");
+        env::set_var(MOE_EXPERT_STORAGE_ENV, "surprise-me");
+        env::set_var(MIXTRAL_LONG_GENERATION_ENV, "maybe");
 
         assert_eq!(
             RuntimeConfig::from_env(),
@@ -142,6 +183,8 @@ mod tests {
                 kv_pool_budget_bytes: DEFAULT_KV_POOL_BUDGET_BYTES,
                 continuous_batch_slots: DEFAULT_CONTINUOUS_BATCH_SLOTS,
                 kquant_prefill_owner: false,
+                moe_expert_storage: MoeExpertStorage::FileBacked,
+                mixtral_long_generation: false,
             }
         );
 
@@ -151,6 +194,8 @@ mod tests {
             KV_POOL_BUDGET_BYTES_ENV,
             CONTINUOUS_BATCH_SLOTS_ENV,
             KQUANT_PREFILL_OWNER_ENV,
+            MOE_EXPERT_STORAGE_ENV,
+            MIXTRAL_LONG_GENERATION_ENV,
         ] {
             env::remove_var(key);
         }
@@ -164,6 +209,8 @@ mod tests {
         env::set_var(KV_POOL_BUDGET_BYTES_ENV, "4096");
         env::set_var(CONTINUOUS_BATCH_SLOTS_ENV, "4");
         env::set_var(KQUANT_PREFILL_OWNER_ENV, "yes");
+        env::set_var(MOE_EXPERT_STORAGE_ENV, "resident_q8");
+        env::set_var(MIXTRAL_LONG_GENERATION_ENV, "true");
 
         assert_eq!(
             RuntimeConfig::from_env(),
@@ -173,6 +220,8 @@ mod tests {
                 kv_pool_budget_bytes: 4096,
                 continuous_batch_slots: 4,
                 kquant_prefill_owner: true,
+                moe_expert_storage: MoeExpertStorage::ResidentQ8,
+                mixtral_long_generation: true,
             }
         );
 
@@ -182,6 +231,8 @@ mod tests {
             KV_POOL_BUDGET_BYTES_ENV,
             CONTINUOUS_BATCH_SLOTS_ENV,
             KQUANT_PREFILL_OWNER_ENV,
+            MOE_EXPERT_STORAGE_ENV,
+            MIXTRAL_LONG_GENERATION_ENV,
         ] {
             env::remove_var(key);
         }
