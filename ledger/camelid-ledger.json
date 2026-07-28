@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "3348dc4",
+    "source_head": "875cd098",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -176,7 +176,12 @@
       {
         "id": "llama_server_slots",
         "status": "partial",
-        "notes": "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, cancellation metadata, and continuous batching metrics remain unsupported."
+        "notes": "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported."
+      },
+      {
+        "id": "production_server_hardening",
+        "status": "supported",
+        "notes": "Startup-resolved bearer/X-API-Key authentication with key-file support, fail-closed non-loopback binding, explicit CORS origin allowlists, optional rustls TLS, request/prompt/generation/download ceilings, and a Prometheus /metrics surface for HTTP/generation/token/cache/queue/slot/RSS/VRAM telemetry. Anonymous same-origin loopback remains the default."
       },
       {
         "id": "llama_server_apply_template",
@@ -191,7 +196,7 @@
       {
         "id": "fail_closed_native_compatibility_routes",
         "status": "unsupported",
-        "notes": "Native /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors."
+        "notes": "Native /infill, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors."
       },
       {
         "id": "multi_choice_generation",
@@ -1539,7 +1544,7 @@
         "full_support_blockers": "later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing",
         "metadata_parses": "validated_sparse_header",
         "tokenizer_works": "validated_against_llama_cpp_reference",
-        "tensors_load": "validated_lazy_file_backed_rank3_q8_experts",
+        "tensors_load": "validated_lazy_file_backed_rank3_q8_experts_resident_q8_path_unit_validated_only",
         "generation_runs": "bounded_one_token_runtime_smoke_observed",
         "parity_audited": "prompt_tokens_and_bounded_one_token_match_only",
         "performance_measured": "not_promoted",
@@ -1567,8 +1572,8 @@
         "latest_checked_bucket": "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511",
         "latest_checked_result": "blocked_later_generation_divergence",
         "latest_checked_output": "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md",
-        "evidence": "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with default full-router softmax weights and lazy/file-backed Q8 experts; bounded one-token backend MoE runtime evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9 and qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511 records partial_failure plus a backend HTTP hang. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
-        "next_step": "fix later-generation divergence and rerun row-specific parity/API/WebUI/RSS evidence before any Mixtral support/readiness promotion"
+        "evidence": "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k routing now exposes per-layer router logits, selected expert IDs/weights, and per-expert gate/up/activation/down/weighted-down checkpoints. The existing lazy/file-backed Q8 path remains the default; an opt-in zero-copy resident-Q8 expert path is live-RAM gated but has only synthetic/unit validation on this checkout. Bounded one-token backend evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9. Multi-token requests now fail closed by default, and scripts/diagnose-mixtral-watchdog.ps1 separates forward progress from a stalled engine during explicit diagnostic runs. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
+        "next_step": "acquire the exact GGUF and compatible pinned llama.cpp oracle, then rerun generated-index-9 parity plus continuation/API/WebUI/RSS/throughput gates before any Mixtral support/readiness promotion"
       }
     },
     {
