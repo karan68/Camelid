@@ -3,9 +3,14 @@
 // artifact, run BETWEEN packaging and publishing.
 //
 // Why this exists. release.yml already guards the STAGING DIRECTORY:
-// scripts/package-linux-cuda.sh fails on a missing `libnvrtc.so.<major>`
-// soname, a dangling symlink, and a duplicated payload (the v0.4.3 regression).
-// Those guards are good, but three things are still unverified:
+// scripts/package-linux-cuda.sh fails on a dangling symlink and a duplicated
+// payload (the v0.4.3 regression). Those guards are good, but three things are
+// still unverified:
+//
+// (Its soname guard is weaker than it reads: `compgen -G "$dist/libnvrtc.so.*"`
+// at package-linux-cuda.sh:72 also matches the three-component real file, so it
+// passes on a stage that lost the `libnvrtc.so.<major>` link. The compiler-role
+// check below asserts the soname for real, on the extracted archive.)
 //
 //   1. They run before `tar -czf` / `Compress-Archive`. Nothing has ever looked
 //      inside the archive users actually download.
@@ -60,9 +65,20 @@ import { pathToFileURL } from 'node:url'
 /** NVRTC redistributable shapes, per platform family. */
 const NVRTC = {
   unix: {
-    // The soname cudarc actually dlopen's. package-linux-cuda.sh globs
-    // `libnvrtc.so.*`; the staged set is normally the `libnvrtc.so.<major>`
-    // symlink plus its `libnvrtc.so.<major>.<minor>.<patch>` real file.
+    // SELECTOR vs VALIDATOR — these are deliberately different patterns, and
+    // collapsing them into one breaks the check in one direction or the other.
+    //
+    // `compilerSoname` is the name cudarc actually dlopen's: it builds a fixed
+    // candidate list (`libnvrtc.so`, `libnvrtc.so.<major>`, ...) and never asks
+    // for a three-component `libnvrtc.so.<major>.<minor>.<patch>`. So the
+    // ARTIFACT must contain the soname itself; that is what we search for.
+    //
+    // `compiler` is the looser family test applied to what the soname RESOLVES
+    // to, which legitimately IS the three-component real file. Anchoring the
+    // selector and reusing it as the validator would reject every correctly
+    // packaged tarball; leaving the validator loose and reusing it as the
+    // selector passes a tarball that lost the soname entirely.
+    compilerSoname: /^libnvrtc\.so\.\d+$/,
     compiler: /^libnvrtc\.so\.\d+/,
     builtins: /^libnvrtc-builtins\.so/,
     family: /^libnvrtc.*\.so/,
@@ -71,6 +87,11 @@ const NVRTC = {
     forbidden: /\.alt\.so/,
   },
   windows: {
+    // Same split as unix. On Windows the loadable name is already fully
+    // versioned (nvrtc64_120_0.dll) and is a real file rather than a symlink,
+    // so selector and validator coincide in practice — but keeping the shapes
+    // explicit stops `nvrtc64_120_0.alt.dll` from satisfying the role.
+    compilerSoname: /^nvrtc64_\d+_\d+\.dll$/i,
     compiler: /^nvrtc64_.*\.dll$/i,
     builtins: /^nvrtc-builtins64_.*\.dll$/i,
     family: /^nvrtc.*\.dll$/i,
@@ -306,11 +327,15 @@ export function resolveSymlinkChain(byPath, startPath, maxHops = MAX_SYMLINK_HOP
  * Require at least one entry named like `role` to RESOLVE to a regular file
  * that is also named like `role`.
  *
+ * `selector` is what the caller searched for and is reported when nothing
+ * matched; `pattern` validates the far end of the symlink chain. They differ
+ * for the NVRTC compiler — see the NVRTC table.
+ *
  * @returns {string[]} failure messages
  */
-function checkNvrtcRole(candidates, byPath, pattern, role, consequence) {
+function checkNvrtcRole(candidates, byPath, pattern, role, consequence, selector = pattern) {
   if (!candidates.length) {
-    return [`no NVRTC ${role} library matching ${pattern} — ${consequence}`]
+    return [`no NVRTC ${role} library matching ${selector} — ${consequence}`]
   }
   const diagnostics = []
   for (const candidate of candidates) {
@@ -380,11 +405,14 @@ export function checkManifest(entries, spec, options = {}) {
       // links, so the chain has to end at a real library of the right family.
       failures.push(
         ...checkNvrtcRole(
-          topLevel.filter((e) => spec.nvrtc.compiler.test(basename(e.path))),
+          // Search for the SONAME, not the family: a tarball holding only
+          // libnvrtc.so.<major>.<minor>.<patch> cannot be dlopen'd by cudarc.
+          topLevel.filter((e) => spec.nvrtc.compilerSoname.test(basename(e.path))),
           byPath,
           spec.nvrtc.compiler,
           'compiler',
           'the GPU path would silently fall back to CPU on a driver-only host',
+          spec.nvrtc.compilerSoname,
         ),
       )
       failures.push(
