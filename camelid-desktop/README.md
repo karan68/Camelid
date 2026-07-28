@@ -55,24 +55,23 @@ On window close the sidecar is terminated cleanly; a Windows **job object** with
 ## Building (developers)
 
 ```sh
-# From the workspace root. Build the server in RELEASE so a working camelid.exe lands in
-# target/release/ (see the debug caveat below), then build + run the desktop app:
-cargo build --release --locked --bin camelid
+# From the workspace root. Build the debug server sidecar, then build and run
+# the desktop app. Both executables land in target/debug/:
+cargo build --locked --bin camelid
 cargo build -p camelid-desktop
-
-# Run the desktop app, pointing it at the release sidecar that sits beside it. In dev the
-# desktop exe is in target/debug/, so place (or symlink/copy) the release camelid.exe there:
-cp target/release/camelid.exe target/debug/camelid.exe   # one-time, for dev
 cargo run -p camelid-desktop
 ```
 
-> **Debug-server caveat (pre-existing, server-side).** The *debug* `camelid.exe` overflows
-> its main-thread stack on startup (it crashes even on `camelid --version`) — a large stack
-> frame in the server's `main.rs` that release optimization elides. This is unrelated to the
-> desktop app and out of scope here (the brief forbids modifying the server). Always pair the
-> desktop app with a **release** `camelid.exe`; the shipped artifact does exactly that. When
-> the sidecar fails to come up, the desktop surfaces the real error + engine stderr on the
-> splash rather than faking a ready state — which is the intended fail-closed behavior.
+For packaging, build the release sidecar explicitly:
+
+```sh
+cargo build --release --locked --bin camelid
+```
+
+The debug `camelid.exe` is supported for local desktop development. On Windows, the server's
+link configuration reserves sufficient stack for the large CLI parser; CI exercises its
+`--version` startup path directly. When the sidecar fails to come up, the desktop surfaces the
+real error and engine stderr on the splash rather than faking a ready state.
 
 The server build is unaffected by this crate: `cargo build --release --locked --bin camelid`
 does not pull `camelid-desktop` into its graph (workspace `resolver = "2"`,
