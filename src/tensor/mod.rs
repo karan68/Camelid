@@ -112,6 +112,28 @@ pub struct Q8_0Block {
     pub quants: [i8; 32],
 }
 
+/// Cheap view into an immutable resident Q8_0 block allocation.
+///
+/// MoE expert packs are much larger than ordinary linears. Expert selection
+/// uses this range view so each token can borrow one expert without cloning
+/// hundreds of MiB of quantized blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Q8_0SharedBlocks {
+    // Keep the Vec allocation itself behind Arc. `Arc<[T]>::from(Vec<T>)`
+    // allocates and moves into an Arc slice, which briefly doubles multi-GiB
+    // MoE resident storage during promotion. Arc<Vec<T>> retains the loader's
+    // existing allocation and still gives every expert view immutable sharing.
+    pub(crate) blocks: std::sync::Arc<Vec<Q8_0Block>>,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
+
+impl Q8_0SharedBlocks {
+    pub(crate) fn as_slice(&self) -> &[Q8_0Block] {
+        &self.blocks[self.start..self.start + self.len]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Q8_0PackedRows4Interleave {
     I4,
@@ -1151,6 +1173,7 @@ pub struct CpuTensor {
     pub dtype: RuntimeDType,
     pub source_type: Option<GgufTensorType>,
     pub q8_0_blocks: Option<Vec<Q8_0Block>>,
+    pub(crate) q8_0_shared_blocks: Option<Q8_0SharedBlocks>,
     pub q8_0_packed_rows4_4x4: Option<Q8_0PackedRows4>,
     pub q8_0_packed_rows4_4x8: Option<Q8_0PackedRows4>,
     pub q8_0_runtime_storage: Option<Q8_0RuntimeStorage>,
@@ -1343,6 +1366,7 @@ impl Q8_0TensorBlocks {
             dtype: RuntimeDType::F32,
             source_type: None,
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -1426,6 +1450,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: None,
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -1517,6 +1542,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: Some(q8_0_blocks),
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4,
             q8_0_packed_rows4_4x8,
             q8_0_runtime_storage: None,
@@ -1536,6 +1562,60 @@ impl CpuTensor {
         })
     }
 
+    pub(crate) fn from_q8_0_shared_blocks(
+        name: impl Into<String>,
+        shape: TensorShape,
+        blocks: std::sync::Arc<Vec<Q8_0Block>>,
+        start: usize,
+        len: usize,
+    ) -> Result<Self> {
+        let expected_elements = shape.element_count()?;
+        if !expected_elements.is_multiple_of(32) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "shared q8_0 tensor element count {expected_elements} is not block aligned"
+            )));
+        }
+        let expected_blocks = expected_elements / 32;
+        if len != expected_blocks || start.saturating_add(len) > blocks.len() {
+            return Err(BackendError::InvalidTensorData(format!(
+                "shared q8_0 tensor expected {expected_blocks} blocks at {start}, got range length {len} over {} blocks",
+                blocks.len()
+            )));
+        }
+        Ok(Self {
+            name: name.into(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(GgufTensorType::Q8_0),
+            q8_0_blocks: None,
+            q8_0_shared_blocks: Some(Q8_0SharedBlocks { blocks, start, len }),
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
+            q5_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
+            data: Vec::new(),
+        })
+    }
+
+    pub(crate) fn q8_0_block_slice(&self) -> Option<&[Q8_0Block]> {
+        self.q8_0_blocks.as_deref().or_else(|| {
+            self.q8_0_shared_blocks
+                .as_ref()
+                .map(Q8_0SharedBlocks::as_slice)
+        })
+    }
+
     pub fn with_q8_0_file_backing(mut self, backing: Q8_0FileBacking) -> Self {
         self.q8_0_file_backing = Some(backing);
         self
@@ -1552,6 +1632,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -1582,6 +1663,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: Some(Q8_0RuntimeStorage::PackedRows4(packed)),
@@ -1612,6 +1694,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -3656,6 +3739,24 @@ impl TensorStore {
         self.load_q8_0_block_backed_linear_as(name, name)
     }
 
+    /// Load a Q8_0 tensor of any rank into resident quantized blocks.
+    ///
+    /// Unlike `load_q8_0_block_backed_linear`, this never materializes f32 and
+    /// intentionally rejects non-Q8 storage. It exists for rank-3 MoE expert
+    /// packs, where keeping the quantized bytes resident removes repeated disk
+    /// reads without multiplying memory by four.
+    pub fn load_q8_0_block_backed_tensor(&self, name: &str) -> Result<CpuTensor> {
+        let tensor = self.load_q8_0_blocks(name)?;
+        let len = tensor.blocks.len();
+        CpuTensor::from_q8_0_shared_blocks(
+            tensor.name,
+            tensor.shape,
+            std::sync::Arc::new(tensor.blocks),
+            0,
+            len,
+        )
+    }
+
     /// Fast-load: read the tensor's wire-format bytes once into a page-aligned
     /// allocation (page cache enabled, no decode) that the Metal stack wraps with
     /// an offset-0 NoCopy buffer — the only resident copy of the weight. The
@@ -3772,6 +3873,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -3807,6 +3909,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -3842,6 +3945,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -3912,6 +4016,66 @@ impl TensorStore {
         Ok(CpuTensor::q8_0_split_file_backed_tensor(
             name, shape, backings,
         ))
+    }
+
+    /// Join individually named Q8_0 experts into one resident rank-3 tensor.
+    ///
+    /// GGUF split-expert files store each expert contiguously. Appending their
+    /// decoded block records in descriptor order therefore produces the same
+    /// expert-major layout as a merged expert tensor.
+    pub fn load_q8_0_split_block_backed_tensor(
+        &self,
+        name: impl Into<String>,
+        dims: Vec<usize>,
+        experts: &[GgufTensorDescriptor],
+    ) -> Result<CpuTensor> {
+        let name = name.into();
+        let shape = TensorShape { dims };
+        let expected_elements = shape.element_count()?;
+        if expected_elements % Q8_0_BLOCK_VALUES != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "split tensor {name} Q8_0 element count {expected_elements} is not block aligned"
+            )));
+        }
+        let expert_count = experts.len();
+        if expert_count == 0 {
+            return Err(BackendError::InvalidTensorData(
+                "split MoE tensor requires at least one expert".to_string(),
+            ));
+        }
+        if !expected_elements.is_multiple_of(expert_count) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "split tensor {name} element count {expected_elements} is not divisible by {expert_count} experts"
+            )));
+        }
+        let per_expert_elements = expected_elements / expert_count;
+        let mut blocks = Vec::with_capacity(expected_elements / Q8_0_BLOCK_VALUES);
+        for desc in experts {
+            if desc.tensor_type != GgufTensorType::Q8_0 {
+                return Err(BackendError::UnsupportedTensorType(format!(
+                    "split MoE tensor {} has storage type {:?}; resident experts require Q8_0",
+                    desc.name, desc.tensor_type
+                )));
+            }
+            let expert = self.load_q8_0_blocks(&desc.name)?;
+            let actual_elements = expert.shape.element_count()?;
+            if actual_elements != per_expert_elements {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "split MoE tensor {} has {actual_elements} elements, expected {per_expert_elements}",
+                    desc.name
+                )));
+            }
+            blocks.extend(expert.blocks);
+        }
+        if blocks.len() != expected_elements / Q8_0_BLOCK_VALUES {
+            return Err(BackendError::InvalidTensorData(format!(
+                "split tensor {name} decoded {} Q8_0 blocks, expected {}",
+                blocks.len(),
+                expected_elements / Q8_0_BLOCK_VALUES
+            )));
+        }
+        let len = blocks.len();
+        CpuTensor::from_q8_0_shared_blocks(name, shape, std::sync::Arc::new(blocks), 0, len)
     }
 
     pub fn load_q8_0_file_backed_tensor(&self, name: &str) -> Result<CpuTensor> {
@@ -4076,6 +4240,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4,
             q8_0_packed_rows4_4x8,
             q8_0_runtime_storage: None,

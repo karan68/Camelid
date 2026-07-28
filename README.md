@@ -117,8 +117,19 @@ catalog. `camelid serve` starts the engine, the OpenAI-style API, and the web UI
 Prefer the terminal? Run `camelid chat` instead for a full-screen chat UI over the same engine.
 
 > [!WARNING]
-> `camelid serve --addr 0.0.0.0:8181` makes the API and UI reachable by every device that can
-> reach the host. Only bind `0.0.0.0` on a trusted network, behind your own access controls.
+> A non-loopback listener now fails closed unless an API key is configured. Prefer a key file so
+> the secret is not exposed in the process list:
+>
+> ```bash
+> camelid serve --addr 0.0.0.0:8181 --api-key-file ./camelid-api.key
+> ```
+>
+> Add exact browser origins with `--cors-origin https://chat.example`; wildcard CORS is refused.
+> For direct HTTPS, provide both `--tls-cert` and `--tls-key`. The explicit
+> `--allow-unauthenticated-remote` escape hatch is intended only for trusted, externally protected
+> networks. The bundled browser UI does not store or inject the server API key; authenticated remote
+> deployments should use an API client or an authenticating reverse proxy. Anonymous loopback keeps
+> the existing frictionless UI behavior.
 
 ## Supported models
 

@@ -438,12 +438,6 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         ("POST", "/props", "unsupported_llama_server_props", "props"),
         ("POST", "/slots", "unsupported_llama_server_slots", "slots"),
         (
-            "GET",
-            "/metrics",
-            "unsupported_llama_server_metrics",
-            "metrics",
-        ),
-        (
             "POST",
             "/infill",
             "unsupported_llama_server_infill",
@@ -478,6 +472,34 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         assert_eq!(body["error"]["code"], code, "{uri}");
         assert_eq!(body["error"]["param"], param, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn metrics_exposes_prometheus_runtime_counters() {
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("# TYPE camelid_prompt_tokens_total counter"));
+    assert!(body.contains("# TYPE camelid_engine_queue_depth gauge"));
+    assert!(body.contains("# TYPE camelid_process_resident_memory_bytes gauge"));
 }
 
 #[tokio::test]
@@ -732,10 +754,21 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             && item["notes"].as_str().unwrap().contains("stream=true")
     }));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "production_server_hardening"
+            && item["status"] == "supported"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("Prometheus /metrics")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("fail-closed non-loopback")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "fail_closed_native_compatibility_routes"
             && item["status"] == "unsupported"
             && item["notes"].as_str().unwrap().contains("/infill")
-            && item["notes"].as_str().unwrap().contains("/metrics")
             && item["notes"].as_str().unwrap().contains("/v1/embeddings")
             && item["notes"].as_str().unwrap().contains("/v1/responses")
             && item["notes"].as_str().unwrap().contains("/v1/messages")
@@ -1121,7 +1154,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
-        .contains("backend HTTP hang"));
+        .contains("separates forward progress from a stalled engine"));
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
