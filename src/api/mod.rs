@@ -21,7 +21,7 @@ use minijinja::{
     UndefinedBehavior,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
@@ -59,6 +59,7 @@ use crate::{
         DenseLlamaDims, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig,
         LlamaTensorBinding,
     },
+    model_default,
     model_source::{inspect_model_source, ModelSourceInspection, ModelSourceKind},
     receipt::{
         self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
@@ -131,7 +132,7 @@ pub struct AppState {
     model_transition: Arc<tokio::sync::Mutex<()>>,
     /// Per-process nonce makes scan-issued deletion tokens opaque and prevents
     /// clients from constructing authorization from visible file metadata.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     model_delete_nonce: Arc<str>,
     /// Destructive local-file management is available only when the listener
     /// itself is bound to loopback.
@@ -186,7 +187,7 @@ impl Default for AppState {
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::from_env())),
             model_file_lifecycle: Arc::new(RwLock::new(())),
             model_transition: Arc::new(tokio::sync::Mutex::new(())),
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             model_delete_nonce: Arc::from(uuid::Uuid::new_v4().to_string()),
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -2070,6 +2071,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
+        .route(
+            "/api/models/default",
+            get(default_model).post(set_default_model),
+        )
         .route("/api/models/runnable-receipt", get(runnable_receipt))
         .route("/api/models/runnable-smoke", post(run_runnable_smoke))
         .route("/api/models/catalog", get(get_catalog))
@@ -19987,7 +19992,7 @@ pub struct LocalModelsResponse {
     pub models: Vec<LocalModelEntry>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalModelFileIdentity {
     size_bytes: u64,
@@ -19996,20 +20001,10 @@ struct LocalModelFileIdentity {
 }
 
 fn validate_local_model_filename(filename: &str) -> bool {
-    let path = std::path::Path::new(filename);
-    filename == filename.trim()
-        && !filename.is_empty()
-        && !filename.contains(['/', '\\', ':'])
-        && matches!(
-            (path.components().next(), path.components().nth(1)),
-            (Some(std::path::Component::Normal(_)), None)
-        )
-        && path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    model_default::valid_local_model_filename(filename)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn local_model_delete_token(
     nonce: &str,
     filename: &str,
@@ -20141,14 +20136,66 @@ fn local_model_file_identity(
     windows_handle_identity(handle.0, filename, nonce)
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
+fn unix_metadata_identity(
+    metadata: &std::fs::Metadata,
+    filename: &str,
+    nonce: &str,
+) -> Option<LocalModelFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let size_bytes = metadata.size();
+    let modified_nanos = if metadata.mtime() >= 0 {
+        (metadata.mtime() as u128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(metadata.mtime_nsec().max(0) as u128)
+    } else {
+        0
+    };
+    let platform_id = format!(
+        "unix:{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    );
+    let delete_token = (metadata.nlink() == 1).then(|| {
+        local_model_delete_token(nonce, filename, size_bytes, modified_nanos, &platform_id)
+    });
+    Some(LocalModelFileIdentity {
+        size_bytes,
+        modified_nanos,
+        delete_token,
+    })
+}
+
+#[cfg(unix)]
+fn local_model_file_identity(
+    models_dir: &std::path::Path,
+    filename: &str,
+    nonce: &str,
+) -> std::io::Result<Option<LocalModelFileIdentity>> {
+    if !validate_local_model_filename(filename) {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(models_dir.join(filename))?;
+    Ok(unix_metadata_identity(&metadata, filename, nonce))
+}
+
+#[cfg(any(windows, unix))]
 #[derive(Debug, serde::Deserialize)]
 struct DeleteLocalModelRequest {
     filename: String,
     delete_token: String,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[derive(Debug, serde::Serialize)]
 struct DeleteLocalModelResponse {
     deleted: bool,
@@ -20156,7 +20203,6 @@ struct DeleteLocalModelResponse {
     bytes_freed: u64,
 }
 
-#[cfg(windows)]
 fn local_management_request_allowed(headers: &HeaderMap) -> bool {
     let authority = headers
         .get("host")
@@ -20193,10 +20239,201 @@ fn local_management_request_allowed(headers: &HeaderMap) -> bool {
             == Some("same-origin")
 }
 
-#[cfg(windows)]
+#[derive(Debug, serde::Deserialize)]
+struct SetDefaultModelRequest {
+    filename: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DefaultModelResponse {
+    filename: Option<String>,
+    configured: bool,
+}
+
+impl DefaultModelResponse {
+    fn from_models_dir(models_dir: &std::path::Path) -> Self {
+        match model_default::effective_default_model(models_dir) {
+            Some(choice) => Self {
+                filename: Some(choice.filename),
+                configured: choice.configured,
+            },
+            None => Self {
+                filename: None,
+                configured: false,
+            },
+        }
+    }
+}
+
+/// The startup choice is always readable. With no explicit preference the first
+/// local GGUF is returned, matching the zero-configuration startup behavior.
+async fn default_model(State(state): State<AppState>) -> Json<DefaultModelResponse> {
+    Json(DefaultModelResponse::from_models_dir(&state.models_dir))
+}
+
+/// Persist a startup choice beside the local model library. This mutation is
+/// limited to Camelid's same-origin loopback UI even though the server's general
+/// API CORS policy is permissive.
+async fn set_default_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetDefaultModelRequest>,
+) -> Response {
+    if !state.serve_addr.ip().is_loopback() || !local_management_request_allowed(&headers) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "local_management_forbidden",
+            "the default model can be changed only from Camelid's loopback web UI".to_string(),
+            None,
+        );
+    }
+    match model_default::set_default_model(&state.models_dir, &req.filename) {
+        Ok(choice) => (
+            StatusCode::OK,
+            Json(DefaultModelResponse {
+                filename: Some(choice.filename),
+                configured: true,
+            }),
+        )
+            .into_response(),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_default_model",
+            err.to_string(),
+            Some("filename"),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => api_error(
+            StatusCode::NOT_FOUND,
+            "default_model_not_found",
+            err.to_string(),
+            Some("filename"),
+        ),
+        Err(err) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "default_model_write_failed",
+            format!("could not save the default model: {err}"),
+            Some("filename"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod default_model_api_tests {
+    use super::{router_with_state, AppState};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    async fn response_json(app: axum::Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn default_model_endpoint_reports_fallback_and_persists_a_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.gguf"), []).unwrap();
+        std::fs::write(dir.path().join("chosen.gguf"), []).unwrap();
+        let app =
+            router_with_state(AppState::default().with_models_dir(Some(dir.path().to_path_buf())));
+
+        let (status, body) = response_json(
+            app.clone(),
+            Request::builder()
+                .uri("/api/models/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "filename": "alpha.gguf", "configured": false })
+        );
+
+        let (status, body) = response_json(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/default")
+                .header("host", "127.0.0.1:8181")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "filename": "chosen.gguf" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "filename": "chosen.gguf", "configured": true })
+        );
+
+        let (_, body) = response_json(
+            app,
+            Request::builder()
+                .uri("/api/models/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            body,
+            json!({ "filename": "chosen.gguf", "configured": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn default_model_mutation_rejects_cross_origin_and_unsafe_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("safe.gguf"), []).unwrap();
+        let app =
+            router_with_state(AppState::default().with_models_dir(Some(dir.path().to_path_buf())));
+
+        let (status, _) = response_json(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/default")
+                .header("host", "127.0.0.1:8181")
+                .header("origin", "https://attacker.example")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "filename": "safe.gguf" }).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, body) = response_json(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/default")
+                .header("host", "127.0.0.1:8181")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "filename": "../outside.gguf" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_default_model");
+    }
+}
+
+#[cfg(any(windows, unix))]
 #[derive(Debug)]
 enum DeleteLocalModelError {
     Io(std::io::Error),
+    #[cfg(windows)]
     Busy(std::io::Error),
     Changed,
     Unsafe,
@@ -20208,6 +20445,48 @@ fn classify_delete_io(err: std::io::Error) -> DeleteLocalModelError {
         Some(32 | 33) => DeleteLocalModelError::Busy(err),
         _ => DeleteLocalModelError::Io(err),
     }
+}
+
+#[cfg(unix)]
+fn delete_identity_bound_local_model(
+    path: &std::path::Path,
+    filename: &str,
+    nonce: &str,
+    expected_token: &str,
+) -> Result<u64, DeleteLocalModelError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(DeleteLocalModelError::Io)?;
+    let handle_identity = unix_metadata_identity(
+        &handle.metadata().map_err(DeleteLocalModelError::Io)?,
+        filename,
+        nonce,
+    )
+    .ok_or(DeleteLocalModelError::Unsafe)?;
+    if handle_identity.delete_token.as_deref() != Some(expected_token) {
+        return Err(DeleteLocalModelError::Changed);
+    }
+
+    // Re-read the directory entry immediately before unlinking it. The open
+    // handle proves the token still names the same inode, while O_NOFOLLOW and
+    // the path identity check reject symlink or replacement attacks.
+    let path_identity = unix_metadata_identity(
+        &std::fs::symlink_metadata(path).map_err(DeleteLocalModelError::Io)?,
+        filename,
+        nonce,
+    )
+    .ok_or(DeleteLocalModelError::Unsafe)?;
+    if path_identity != handle_identity
+        || path_identity.delete_token.as_deref() != Some(expected_token)
+    {
+        return Err(DeleteLocalModelError::Changed);
+    }
+    std::fs::remove_file(path).map_err(DeleteLocalModelError::Io)?;
+    Ok(handle_identity.size_bytes)
 }
 
 #[cfg(windows)]
@@ -20243,7 +20522,7 @@ fn delete_identity_bound_local_model(
     Ok(identity.size_bytes)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 async fn delete_local_model(
     State(_state): State<AppState>,
     _headers: HeaderMap,
@@ -20257,7 +20536,7 @@ async fn delete_local_model(
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 async fn delete_local_model(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -20384,6 +20663,7 @@ async fn delete_local_model(
                 Some("filename"),
             )
         }
+        #[cfg(windows)]
         Ok(Err(DeleteLocalModelError::Busy(err))) => {
             return api_error(
                 StatusCode::CONFLICT,
@@ -20472,7 +20752,7 @@ async fn local_models(
     _headers: HeaderMap,
 ) -> Json<LocalModelsResponse> {
     let _reader = state.model_file_lifecycle.read().await;
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     let expose_delete_tokens =
         state.allow_local_model_delete && local_management_request_allowed(&_headers);
     let dir = state.models_dir.clone();
@@ -20503,7 +20783,7 @@ async fn local_models(
                     continue;
                 }
             };
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let identity = match local_model_file_identity(
                 &dir,
                 &filename,
@@ -20515,21 +20795,21 @@ async fn local_models(
                     None
                 }
             };
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let delete_token = identity
                 .as_ref()
                 .and_then(|identity| expose_delete_tokens.then(|| identity.delete_token.clone()))
                 .flatten();
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             let delete_token = None;
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let deletable_identity = identity
                 .as_ref()
                 .filter(|identity| identity.delete_token.is_some());
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let size_bytes =
                 deletable_identity.map_or_else(|| metadata.len(), |identity| identity.size_bytes);
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             let size_bytes = metadata.len();
             let metadata_mtime_secs = metadata
                 .modified()
@@ -20537,11 +20817,11 @@ async fn local_models(
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs())
                 .unwrap_or_default();
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let mtime_secs = deletable_identity.map_or(metadata_mtime_secs, |identity| {
                 (identity.modified_nanos / 1_000_000_000) as u64
             });
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             let mtime_secs = metadata_mtime_secs;
 
             // Reuse cached metadata facts when the file is unchanged; only the cheap
@@ -21419,7 +21699,7 @@ async fn acknowledge_catalog_download(
     StatusCode::NO_CONTENT.into_response()
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, unix)))]
 mod local_model_delete_tests {
     use super::{active_downloads_map, router_with_state, ActiveDownload, AppState};
     use axum::{
@@ -21832,7 +22112,7 @@ mod local_model_delete_tests {
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(all(test, not(any(windows, unix))))]
 mod non_windows_model_delete_tests {
     use super::{router_with_state, AppState};
     use axum::{

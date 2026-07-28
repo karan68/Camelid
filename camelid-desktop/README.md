@@ -62,9 +62,11 @@ error and captured stderr under **Technical details**; it never navigates to a f
 | **Engine startup failed** | The sidecar exited before it became healthy for another reason. | Review the visible technical details and retry. |
 
 Model readiness is separate from sidecar startup. Once `/v1/health` passes, Desktop navigates to
-the engine's existing UI; if no eligible model is loaded, that UI remains the authority and shows
-its normal model-required state. Desktop does not claim a ready model or manufacture a model error
-on the splash.
+the engine's existing UI. If local GGUFs exist, the sidecar loads the saved default from the
+configured models directory; without a saved preference, it loads the first local GGUF. The Models
+page labels that row **Starts automatically** and offers **Make default** on other loadable rows.
+If no eligible model exists, the UI remains the authority and shows its normal model-required
+state. Desktop does not claim a ready model or manufacture a model error on the splash.
 
 ## Requirements
 
@@ -86,7 +88,7 @@ From the repository root on an Apple Silicon Mac:
 This builds the frontend, release engine, app bundle, and DMG; closes an existing Camelid Desktop
 instance cleanly; installs the new app at `/Applications/Camelid Desktop.app`; verifies its
 ad-hoc signature; and launches it. The script uses `sudo` only when `/Applications` is not writable.
-The model directory under the user's Application Support folder is not replaced.
+Neither the default Application Support model directory nor a custom model directory is replaced.
 
 Prerequisites are macOS 12 or newer, the Xcode Command Line Tools, Rust, and Node.js 22 with npm.
 The app is not notarized yet, so this path is intended for local testing and developer
@@ -134,7 +136,9 @@ and performs no notarization. macOS may therefore require the user to approve th
 **System Settings → Privacy & Security** after downloading it.
 
 Downloaded models are stored under the app's per-user Application Support directory rather
-than inside the app bundle.
+than inside the app bundle by default. The **Downloaded models** tab can save a different local
+folder for the next launch. Existing GGUFs are never moved automatically, so changing the folder
+does not risk an implicit multi-gigabyte copy or deletion.
 
 ## Scope notes (intentionally deferred)
 
@@ -143,8 +147,6 @@ v1 deliberately keeps the native shell thin and ships the engine's real UI as-is
 - **No fabricated metrics, by construction.** The splash shows only real lifecycle status;
   all chat metrics (e.g. tokens/sec) come from the embedded UI rendering the engine's real
   generation/telemetry events. Nothing in this crate computes or smooths a metric.
-- **Native tray / native GGUF file-picker are deferred.** Both would require granting Tauri
-  IPC to the loopback-origin page, widening the attack surface this design intentionally
-  avoids — and the embedded UI already loads local/catalog models via the existing
-  `/api/models/load` path, so a native picker adds no capability. They can be added later
-  behind a scoped capability if desired.
+- **Native tray / arbitrary GGUF file-picker are deferred.** The loopback-origin page receives
+  only a scoped native folder chooser for configuring model storage; it does not receive broad
+  filesystem access. Local/catalog model loading still goes through the engine's existing API.

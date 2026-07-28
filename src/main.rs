@@ -205,12 +205,16 @@ impl ServerPolicyArgs {
     }
 }
 
-/// Find a GGUF to load when `serve` is started without an explicit `--model`,
-/// so the open-and-use launch lands directly in a usable chat. Looks next to the
-/// executable (the shipped layout: `camelid.exe` beside a `models/` folder) and
-/// in the working directory; returns the first `*.gguf` found.
-fn auto_select_model() -> Option<PathBuf> {
+/// Find the effective default GGUF when `serve` starts without an explicit
+/// `--model`. The configured models directory wins (this is where the desktop
+/// sidecar stores downloads), followed by the historical shipped/CWD layouts.
+/// Within each directory an explicit saved preference wins; otherwise the first
+/// local GGUF is the zero-configuration default.
+fn auto_select_model(configured_models_dir: Option<&std::path::Path>) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = configured_models_dir {
+        dirs.push(dir.to_path_buf());
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             dirs.push(parent.join("models"));
@@ -220,22 +224,29 @@ fn auto_select_model() -> Option<PathBuf> {
     dirs.push(PathBuf::from("models"));
     dirs.push(PathBuf::from("."));
     for dir in dirs {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            let mut ggufs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-                })
-                .collect();
-            ggufs.sort();
-            if let Some(first) = ggufs.into_iter().next() {
-                return Some(first);
-            }
+        if let Some(choice) = camelid::model_default::effective_default_model(&dir) {
+            return Some(choice.path);
         }
     }
     None
+}
+
+#[cfg(test)]
+mod auto_select_model_tests {
+    use super::auto_select_model;
+
+    #[test]
+    fn configured_desktop_models_directory_wins_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("first.gguf"), []).unwrap();
+        std::fs::write(dir.path().join("preferred.gguf"), []).unwrap();
+        camelid::model_default::set_default_model(dir.path(), "preferred.gguf").unwrap();
+
+        assert_eq!(
+            auto_select_model(Some(dir.path())),
+            Some(dir.path().join("preferred.gguf"))
+        );
+    }
 }
 
 /// Windows + CUDA: make the NVIDIA runtime DLLs (NVRTC etc.) loadable without the
@@ -1727,9 +1738,10 @@ async fn main() -> anyhow::Result<()> {
             unsafe {
                 pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
             }
-            // Open-and-use launch: if no model was named, load the first GGUF we
-            // can find (beside the exe or in ./models) so the UI lands in a chat.
-            let model = model.or_else(auto_select_model);
+            // Open-and-use launch: if no model was named, load the user's saved
+            // default from the configured model library. With no saved choice,
+            // the first local GGUF is the zero-configuration default.
+            let model = model.or_else(|| auto_select_model(models_dir.as_deref()));
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
             api::serve(
