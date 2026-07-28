@@ -529,6 +529,23 @@ jobs:
     needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
+      # Checkout FIRST, before anything is downloaded into the workspace.
+      # actions/checkout finds no .git here, so it takes its "Deleting the
+      # contents of ..." path and rmRF's the whole workspace -- which would
+      # remove a `dist` populated by earlier steps, leaving the verify step to
+      # fail on a missing directory and publishing nothing. The scripts this job
+      # runs live in the repo, so the checkout has to happen either way; it just
+      # has to happen before `dist` exists.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
       # Download BY NAME, one step per artifact this job is responsible for.
       # `download-artifact` with neither `name` nor `pattern` fetches every
       # artifact in the run, and `merge-multiple: true` flattens them all into
@@ -559,16 +576,6 @@ jobs:
       # release, and every sidecar must be one record naming its own archive.
       # This reuses the same parser the build-time check uses, so the two gates
       # cannot drift and a `shasum -c` run by a user verifies what CI verified.
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-
       - name: Verify checksums after the artifact round-trip
         run: |
           node scripts/verify-release-checksums.mjs \
