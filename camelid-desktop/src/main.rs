@@ -11,10 +11,14 @@
 
 mod engine;
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 use engine::Engine;
+
+const MODELS_DIRECTORY_PREFERENCE_FILE: &str = "models-directory.json";
 
 /// Managed state holding the running sidecar so it can be torn down on exit.
 #[derive(Default)]
@@ -91,6 +95,130 @@ fn startup_snapshot(state: State<'_, StartupState>) -> StartupSnapshot {
     state.snapshot()
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ModelsDirectoryPreference {
+    path: PathBuf,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ModelsDirectoryChoice {
+    path: Option<String>,
+    restart_required: bool,
+}
+
+fn models_directory_preference_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(MODELS_DIRECTORY_PREFERENCE_FILE)
+}
+
+fn validate_models_directory(path: PathBuf) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("the models directory must be an absolute path".to_string());
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|err| format!("could not access {}: {err}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    path.canonicalize()
+        .map_err(|err| format!("could not resolve {}: {err}", path.display()))
+}
+
+fn read_models_directory_preference(app_data_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let preference_path = models_directory_preference_path(app_data_dir);
+    let bytes = match std::fs::read(&preference_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "could not read {}: {err}",
+                preference_path.display()
+            ))
+        }
+    };
+    let preference: ModelsDirectoryPreference = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("{} is invalid: {err}", preference_path.display()))?;
+    validate_models_directory(preference.path).map(Some)
+}
+
+fn write_models_directory_preference(
+    app_data_dir: &Path,
+    selected: PathBuf,
+) -> Result<PathBuf, String> {
+    let selected = validate_models_directory(selected)?;
+    std::fs::create_dir_all(app_data_dir)
+        .map_err(|err| format!("could not create {}: {err}", app_data_dir.display()))?;
+    let preference_path = models_directory_preference_path(app_data_dir);
+    let bytes = serde_json::to_vec_pretty(&ModelsDirectoryPreference {
+        path: selected.clone(),
+    })
+    .map_err(|err| format!("could not encode the models-directory preference: {err}"))?;
+    std::fs::write(&preference_path, bytes)
+        .map_err(|err| format!("could not save {}: {err}", preference_path.display()))?;
+    Ok(selected)
+}
+
+fn clear_models_directory_preference(app_data_dir: &Path) -> Result<(), String> {
+    let preference_path = models_directory_preference_path(app_data_dir);
+    match std::fs::remove_file(&preference_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "could not remove {}: {err}",
+            preference_path.display()
+        )),
+    }
+}
+
+fn default_models_directory(app_data_dir: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(app_data_dir.join("models"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_data_dir;
+        None
+    }
+}
+
+#[tauri::command]
+fn choose_models_directory(app: tauri::AppHandle) -> Result<Option<ModelsDirectoryChoice>, String> {
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .set_title("Choose Camelid model storage")
+        .blocking_pick_folder()
+    else {
+        return Ok(None);
+    };
+    let selected = selected
+        .into_path()
+        .map_err(|err| format!("the selected folder is not a local filesystem path: {err}"))?;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("could not resolve Camelid application data: {err}"))?;
+    let selected = write_models_directory_preference(&app_data_dir, selected)?;
+    Ok(Some(ModelsDirectoryChoice {
+        path: Some(selected.to_string_lossy().into_owned()),
+        restart_required: true,
+    }))
+}
+
+#[tauri::command]
+fn reset_models_directory(app: tauri::AppHandle) -> Result<ModelsDirectoryChoice, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("could not resolve Camelid application data: {err}"))?;
+    clear_models_directory_preference(&app_data_dir)?;
+    Ok(ModelsDirectoryChoice {
+        path: default_models_directory(&app_data_dir)
+            .map(|path| path.to_string_lossy().into_owned()),
+        restart_required: true,
+    })
+}
+
 /// Report real startup progress to the splash. Never emits a "ready" state that isn't backed
 /// by a passing health check.
 fn emit_status(app: &tauri::AppHandle, message: &str) {
@@ -112,9 +240,14 @@ fn emit_error(app: &tauri::AppHandle, title: &str, guidance: &str, detail: &str)
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(EngineState::default())
         .manage(StartupState::default())
-        .invoke_handler(tauri::generate_handler![startup_snapshot])
+        .invoke_handler(tauri::generate_handler![
+            startup_snapshot,
+            choose_models_directory,
+            reset_models_directory
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
             // Start the sidecar off the UI thread so the splash paints immediately.
@@ -145,25 +278,29 @@ fn start_engine(app: tauri::AppHandle) {
         }
     };
 
-    // A signed macOS app bundle is immutable application code. Keep downloaded GGUFs in
-    // the per-user Application Support directory instead of beside the bundled sidecar
-    // under `Camelid Desktop.app/Contents/Resources`. Windows deliberately retains its
-    // existing per-user installer layout with `models/` beside `camelid.exe`.
-    #[cfg(target_os = "macos")]
+    // A user choice overrides the platform default. The directory is selected
+    // before launch and never changed underneath a running engine.
     let models_dir = match app.path().app_data_dir() {
-        Ok(path) => Some(path.join("models")),
+        Ok(app_data_dir) => match read_models_directory_preference(&app_data_dir) {
+            Ok(Some(path)) => Some(path),
+            Ok(None) => default_models_directory(&app_data_dir),
+            Err(err) => {
+                eprintln!(
+                    "[desktop] custom model storage is unavailable ({err}); using platform default"
+                );
+                default_models_directory(&app_data_dir)
+            }
+        },
         Err(e) => {
             emit_error(
                 &app,
-                "Model storage is unavailable",
-                "Check access to your user Library folder, then retry.",
-                &format!("could not resolve the Application Support directory: {e}"),
+                "Model storage settings are unavailable",
+                "Check access to your user application-data folder, then retry.",
+                &format!("could not resolve the application data directory: {e}"),
             );
             return;
         }
     };
-    #[cfg(not(target_os = "macos"))]
-    let models_dir: Option<std::path::PathBuf> = None;
 
     emit_status(&app, "Starting engine\u{2026}");
     match engine::spawn(&engine_path, models_dir.as_deref()) {
@@ -220,7 +357,12 @@ fn shutdown_engine(app_handle: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupSnapshot, StartupState};
+    use std::path::PathBuf;
+
+    use super::{
+        clear_models_directory_preference, read_models_directory_preference,
+        write_models_directory_preference, StartupSnapshot, StartupState,
+    };
 
     #[test]
     fn startup_error_is_replayable_after_the_listener_would_register() {
@@ -236,5 +378,36 @@ mod tests {
         assert_eq!(error.title, "Camelid engine is missing");
         assert_eq!(error.guidance, "Restore camelid.exe and retry.");
         assert_eq!(error.detail, "failed to launch camelid.exe");
+    }
+
+    #[test]
+    fn models_directory_preference_round_trips_and_resets() {
+        let root = tempfile::tempdir().unwrap();
+        let app_data = root.path().join("app-data");
+        let selected = root.path().join("model-library");
+        std::fs::create_dir(&selected).unwrap();
+
+        let saved =
+            write_models_directory_preference(&app_data, selected.clone()).expect("save choice");
+        assert_eq!(saved, selected.canonicalize().unwrap());
+        assert_eq!(
+            read_models_directory_preference(&app_data).unwrap(),
+            Some(selected.canonicalize().unwrap())
+        );
+
+        clear_models_directory_preference(&app_data).unwrap();
+        assert_eq!(read_models_directory_preference(&app_data).unwrap(), None);
+    }
+
+    #[test]
+    fn models_directory_preference_rejects_files_and_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-folder");
+        std::fs::write(&file, b"fixture").unwrap();
+        assert!(write_models_directory_preference(root.path(), file).is_err());
+        assert!(
+            write_models_directory_preference(root.path(), PathBuf::from("relative/models"))
+                .is_err()
+        );
     }
 }

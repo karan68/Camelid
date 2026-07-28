@@ -20,6 +20,7 @@ const AnalyticsView = lazy(() => import('./views/AnalyticsView'))
 const HistoryView = lazy(() => import('./views/HistoryView'))
 const MemoryView = lazy(() => import('./views/MemoryView'))
 const ModelsView = lazy(() => import('./views/ModelsView'))
+const DownloadedModelsView = lazy(() => import('./views/DownloadedModelsView'))
 const ApiView = lazy(() => import('./views/ApiView'))
 const SystemView = lazy(() => import('./views/SystemView'))
 const SettingsView = lazy(() => import('./views/SettingsView'))
@@ -30,7 +31,7 @@ const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatory
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -344,6 +345,15 @@ function App() {
                 apiBase={apiBase}
               />
             </div>
+          )}
+
+          {tab === 'downloads' && (
+            <DownloadedModelsView
+              runtime={runtime}
+              apiBase={apiBase}
+              unloadCurrentModel={unloadCurrentModel}
+              onOpenModels={() => navigateTab('library')}
+            />
           )}
 
           {tab === 'api' && <ApiView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}

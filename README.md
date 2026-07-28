@@ -75,10 +75,15 @@ administrator access, macOS asks for your password through `sudo`. To update lat
 `git pull` followed by `./scripts/install-macos-desktop.sh` again.
 
 Downloaded models live in
-`~/Library/Application Support/app.camelid.desktop/models` and are preserved when the app is
-rebuilt or reinstalled. On launch, Desktop loads the model marked **Starts automatically** on the
-Models page; when no choice has been saved yet, the first installed GGUF is selected
-automatically. Use **Make default** beside another installed model to change the next launch.
+`~/Library/Application Support/app.camelid.desktop/models` by default and are preserved when the
+app is rebuilt or reinstalled. The **Downloaded models** tab shows the active folder, disk usage,
+and every local GGUF; from there you can change the next-launch storage folder, choose the startup
+default, or permanently delete an unused model after unloading the active model. Changing storage
+folders takes effect after restart and does not move existing files automatically.
+
+On launch, Desktop loads the model marked **Starts automatically**; when no choice has been saved
+yet, the first installed GGUF is selected automatically. Use **Make default** beside another
+installed model to change the next launch.
 See [Camelid Desktop](camelid-desktop/README.md) for the sidecar design and manual packaging
 details.
 
