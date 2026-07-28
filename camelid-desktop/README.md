@@ -62,9 +62,11 @@ error and captured stderr under **Technical details**; it never navigates to a f
 | **Engine startup failed** | The sidecar exited before it became healthy for another reason. | Review the visible technical details and retry. |
 
 Model readiness is separate from sidecar startup. Once `/v1/health` passes, Desktop navigates to
-the engine's existing UI; if no eligible model is loaded, that UI remains the authority and shows
-its normal model-required state. Desktop does not claim a ready model or manufacture a model error
-on the splash.
+the engine's existing UI. If local GGUFs exist, the sidecar loads the saved default from the
+configured models directory; without a saved preference, it loads the first local GGUF. The Models
+page labels that row **Starts automatically** and offers **Make default** on other loadable rows.
+If no eligible model exists, the UI remains the authority and shows its normal model-required
+state. Desktop does not claim a ready model or manufacture a model error on the splash.
 
 ## Requirements
 

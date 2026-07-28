@@ -60,6 +60,7 @@ export default function ModelsView({
   const [importing, setImporting] = useState(false)
   const [pendingDeleteEntry, setPendingDeleteEntry] = useState(null)
   const [deletingFilename, setDeletingFilename] = useState('')
+  const [defaultingFilename, setDefaultingFilename] = useState('')
   const [deleteNotice, setDeleteNotice] = useState('')
   const [catalogOperations, setCatalogOperations] = useState(new Set())
   const loadInFlightRef = useRef('')
@@ -259,6 +260,20 @@ export default function ModelsView({
     setPendingDeleteEntry(entry)
   }
 
+  const makeDefaultModel = async (filename) => {
+    setDefaultingFilename(filename)
+    setLaneError('')
+    setDeleteNotice('')
+    try {
+      await spine.setDefaultModel(filename)
+      setDeleteNotice(`${filename} will load automatically the next time Camelid starts.`)
+    } catch (error) {
+      setLaneError(String(error?.message || error))
+    } finally {
+      setDefaultingFilename('')
+    }
+  }
+
   useEffect(() => {
     if (pendingDeleteEntry && deleteBlockedReason && !deletingFilename) {
       setPendingDeleteEntry(null)
@@ -409,9 +424,12 @@ export default function ModelsView({
               active={m.filename === spine.activeFilename}
               busy={usingFilename === m.filename}
               deleteBusy={deletingFilename === m.filename}
+              defaultBusy={defaultingFilename === m.filename}
+              isDefault={spine.defaultFilename === m.filename}
               blockedReason={deleteBlockedReason}
               onUse={() => loadModelForChat(m.filename)}
               onDelete={requestDeleteModel}
+              onMakeDefault={makeDefaultModel}
             />
           ))
         ) : (
@@ -439,9 +457,12 @@ export default function ModelsView({
                 receipt={receipts[m.filename]}
                 busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
+                defaultBusy={defaultingFilename === m.filename}
+                isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
                 onDelete={requestDeleteModel}
+                onMakeDefault={makeDefaultModel}
               />
             ))}
             {laneBuckets.eligible.map((m) => (
@@ -461,9 +482,12 @@ export default function ModelsView({
                 entry={m}
                 busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
+                defaultBusy={defaultingFilename === m.filename}
+                isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
                 onDelete={requestDeleteModel}
+                onMakeDefault={makeDefaultModel}
               />
             ))}
           </>
@@ -493,7 +517,7 @@ export default function ModelsView({
         }
         onInstallStarted={spine.kickDownloadsPoll}
         onDownloadAcknowledged={spine.refreshDownloads}
-        onAcquired={spine.refreshLocal}
+        onAcquired={spine.refreshLocalAndDefault}
         canceledCatalogIds={canceledCatalogIds}
         onDownloadRetry={clearCanceledDownload}
         onStartModel={loadModelForChat}
