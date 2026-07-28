@@ -83,6 +83,10 @@
           errDetailsEl.open = true;
         }
       }
+      // Requires `app.withGlobalTauri` in tauri.conf.json. This page has no bundler and no
+      // npm dependency, so the API has to arrive as a global; without that flag __TAURI__ is
+      // undefined, this guard is false, and every startup failure -- including a missing
+      // sidecar -- renders as a spinner that turns forever.
       if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.core) {
         window.__TAURI__.event.listen("engine-status", (e) => {
           renderStartupState(e.payload);
