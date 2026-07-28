@@ -460,7 +460,7 @@ mod tests {
         let tls_error = ServerPolicy::resolve(
             addr,
             ServeOptions {
-                tls_cert: Some(PathBuf::from("certificate.pem")),
+                tls_cert: Some(PathBuf::from("certificate-chain")),
                 ..ServeOptions::default()
             },
         )

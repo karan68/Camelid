@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 
-Workspace: `C:\Users\timto\Documents\GitHub\Camelid`
+Workspace: local Camelid checkout
 
 Branch: `codex/mixtral-server-hardening`
 
@@ -58,7 +58,7 @@ Pre-change baseline: `89409ec9cf4b0931396314a8a12e09d987d2916a`
 
 Exact model:
 
-- `C:\Users\timto\models\tinyllama-1.1b-chat-v1.0.Q8_0.gguf`
+- local `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` fixture
 - SHA-256: `A4C9BB1DBAA372F6381A035FA5C02EF087AAA1FF1F843A56A22328114F03FC59`
 - Deterministic CPU, 8 threads, 48 generated tokens, seven alternating before/after pairs.
 

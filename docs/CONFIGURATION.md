@@ -76,8 +76,8 @@ Direct TLS is optional and requires a PEM certificate chain and private key toge
 target/release/camelid serve \
   --addr 0.0.0.0:8443 \
   --api-key-file ./camelid-api.key \
-  --tls-cert ./fullchain.pem \
-  --tls-key ./privkey.pem
+  --tls-cert ./server-cert-chain \
+  --tls-key ./server-private-key
 ```
 
 Resource ceilings are resolved once at startup. Their CLI names and environment aliases are:
