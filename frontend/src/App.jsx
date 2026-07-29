@@ -286,7 +286,10 @@ function App() {
           </div>
         )}
 
-        <div className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        {/* --chat is the full-bleed frame for views that own their own edges and
+           manage their own height (chat, workspace, cluster canvas). Every
+           other view is a .cxv page and needs the padded page frame. */}
+        <div className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
