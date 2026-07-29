@@ -6,12 +6,11 @@ fn main() {
     // command that a capability explicitly grants (capabilities/sidecar.json).
     // Without this manifest those grants have nothing to reference and every
     // invoke from the embedded UI fails with "not allowed by ACL".
-    let attributes = tauri_build::Attributes::new().app_manifest(
-        tauri_build::AppManifest::new().commands(&[
+    let attributes =
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
             "startup_snapshot",
             "choose_models_directory",
             "reset_models_directory",
-        ]),
-    );
+        ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
