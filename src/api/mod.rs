@@ -7572,7 +7572,15 @@ async fn runnable_chat_nonstreaming(
             "completion_tokens": ids.len(),
             "total_tokens": prompt_token_count + ids.len(),
         },
-        "camelid": { "generated_token_ids": ids, "lane": "runnable_qwen35" },
+        // Lane is the neutral "runnable" (the bridge serves qwen35, gemma2, and
+        // gemma3); the actual model architecture is disclosed separately so the
+        // label never misreports one arch as another (matches the parity-artifact
+        // shape in tests/runnable_parity.rs).
+        "camelid": {
+            "generated_token_ids": ids,
+            "lane": "runnable",
+            "architecture": runtime.architecture.as_str(),
+        },
     });
     (StatusCode::OK, Json(body)).into_response()
 }
