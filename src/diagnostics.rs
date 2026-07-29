@@ -315,9 +315,12 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     buffer.push_str(line);
     buffer.push('\n');
     file.write_all(buffer.as_bytes())?;
-    // Flushed per record on purpose: the records that matter most are written
-    // by a process that is about to die, so buffering them would lose exactly
-    // the evidence this module exists to keep.
+    // `File` has no userspace buffer, so this is a no-op today and is kept only
+    // so the code stays correct if the writer type ever changes. What actually
+    // makes a record survive is that `write_all` hands the bytes to the OS
+    // before returning: the page cache outlives the process, which is the
+    // failure this module exists for. It is NOT protection against power loss —
+    // that would need `sync_data`, and an fsync per record is not worth it here.
     file.flush()
 }
 
