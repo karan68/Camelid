@@ -50,7 +50,19 @@ export function responsesBody(modelId) {
     temperature: 0,
     max_output_tokens: 64,
     stream: true,
-    store: false,
+    store: true,
+    metadata: { source: 'camelid-workbench' },
+  }
+}
+
+export function conversationBody() {
+  return {
+    metadata: { source: 'camelid-workbench' },
+    items: [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'Keep this local conversation item.' }],
+    }],
   }
 }
 
@@ -125,7 +137,8 @@ function pythonSdk(apiBase, modelId, kind) {
       '    input="Reply with one short sentence.",',
       '    max_output_tokens=64,',
       '    stream=True,',
-      '    store=False,',
+      '    store=True,',
+      '    metadata={"source": "camelid-workbench"},',
       ')',
       'for event in stream:',
       '    if event.type == "response.output_text.delta":',
@@ -287,12 +300,26 @@ export function workbenchEndpoints({ apiBase, modelId }) {
       gate: 'chat',
       sse: true,
       featureRowId: 'openai_responses',
-      summary: 'Stateless Responses adapter for text, local function tools, structured formats, streaming events, usage, and cancellation. Stateful chaining and hosted tools stay typed unsupported.',
+      summary: 'Responses generation with opt-in local SQLite storage, restart-safe previous_response_id chaining, complete function-tool items, streaming events, usage, and cancellation. Hosted tools remain typed unsupported.',
       body: responsesBody(model),
       examples: {
         curl: curlPost(base, '/v1/responses', responsesBody(model)),
         python: pythonSdk(base, model, 'responses'),
         js: jsFetch(base, '/v1/responses', responsesBody(model), true),
+      },
+    },
+    {
+      id: 'v1_conversations',
+      method: 'POST',
+      path: '/v1/conversations',
+      gate: 'none',
+      featureRowId: 'openai_responses',
+      summary: 'Create a local durable conversation. Conversation and item retrieval/deletion routes are published by the same live conformance row.',
+      body: conversationBody(),
+      examples: {
+        curl: curlPost(base, '/v1/conversations', conversationBody()),
+        python: pythonRequests(base, '/v1/conversations', conversationBody()),
+        js: jsFetch(base, '/v1/conversations', conversationBody()),
       },
     },
     {

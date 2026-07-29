@@ -375,8 +375,8 @@ curl http://127.0.0.1:8181/v1/chat/completions \
   }'
 ```
 
-The same evidence-gated generation core is also available through a stateless
-Responses subset:
+The same evidence-gated generation core is also available through the Responses
+API. Requests remain stateless unless storage is explicitly enabled:
 
 ```bash
 curl http://127.0.0.1:8181/v1/responses \
@@ -386,16 +386,32 @@ curl http://127.0.0.1:8181/v1/responses \
     "input": "Explain why local inference is useful.",
     "max_output_tokens": 128,
     "stream": true,
-    "store": false
+    "store": true,
+    "metadata": {"client": "local-agent"}
   }'
 ```
 
 `/v1/responses` supports text/messages, manual function-call continuations,
 local function tools, structured text formats, streaming events, usage, and
-cancellation. It remains deliberately stateless: `previous_response_id`,
-server-side conversations, `store:true`, background jobs, hosted tools, and
-multimodal input return typed unsupported errors. The exact machine-readable
-boundaries live in `/api/capabilities` under `api_conformance`.
+cancellation. With `store:true`, the terminal response and its canonical input
+and output items are committed to local SQLite before a non-streaming response
+or terminal SSE event is returned. Continue it with
+`"previous_response_id":"resp_..."`, or use `POST /v1/conversations` and pass
+the returned conversation id on later Responses requests. Stored Responses,
+conversations, and ordered conversation items have GET/DELETE routes; repeated
+`store:true` requests can use `Idempotency-Key`.
+
+Storage defaults to `CAMELID_RESPONSES_DB`, then the platform data directory
+(`~/.local/share/camelid/responses.sqlite3` on typical Unix systems). The
+database and parent directory are owner-only on Unix. Reconstruction fails
+closed above 512 items, 1 MiB per item, or 8 MiB total; the loaded model's token
+context gate still applies after reconstruction. Conversation writes and
+idempotency keys are serialized within one Camelid process. `store:false` (the
+default) leaves no Responses record, although supplying a conversation id
+necessarily appends that turn to the conversation. Background jobs, hosted
+tools, multimodal input, remote state, and cross-process request serialization
+remain unsupported. The exact machine-readable boundaries and route inventory
+live in `/api/capabilities` under `api_conformance`.
 
 ## How support is validated
 

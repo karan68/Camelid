@@ -13,7 +13,6 @@ pub(super) enum SupportStatus {
     Supported,
     SupportedCurrentGate,
     SupportedCurrentGateNonStreaming,
-    SupportedCurrentGateStateless,
     SupportedExactModelRow,
     Unsupported,
 }
@@ -25,7 +24,6 @@ impl SupportStatus {
             Self::Supported => "supported",
             Self::SupportedCurrentGate => "supported_current_gate",
             Self::SupportedCurrentGateNonStreaming => "supported_current_gate_nonstreaming",
-            Self::SupportedCurrentGateStateless => "supported_current_gate_stateless",
             Self::SupportedExactModelRow => "supported_exact_model_row",
             Self::Unsupported => "unsupported",
         }
@@ -34,6 +32,7 @@ impl SupportStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HttpMethod {
+    Delete,
     Get,
     Post,
 }
@@ -47,6 +46,13 @@ pub(super) struct RouteContract {
 const fn get(path: &'static str) -> RouteContract {
     RouteContract {
         method: HttpMethod::Get,
+        path,
+    }
+}
+
+const fn delete(path: &'static str) -> RouteContract {
+    RouteContract {
+        method: HttpMethod::Delete,
         path,
     }
 }
@@ -93,21 +99,39 @@ pub(super) const API_CONFORMANCE_CASES: &[ApiConformanceCase] = &[
     },
     ApiConformanceCase {
         id: "openai_responses",
-        status: SupportStatus::SupportedCurrentGateStateless,
-        notes: "POST /v1/responses is a stateless adapter over Camelid's evidence-gated chat generation core. It supports string/message input, instructions, function-call and function-call-output continuation items, local function tools, text/JSON formats, non-streaming responses, SSE response events, usage, and disconnect cancellation. previous_response_id, conversation storage, background mode, hosted built-in tools, multimodal input, and remote OpenAI state are typed unsupported.",
-        routes: &[post("/v1/responses")],
+        status: SupportStatus::SupportedCurrentGate,
+        notes: "POST /v1/responses supports stateless generation by default plus opt-in local SQLite durability through store:true, previous_response_id, and /v1/conversations. Canonical message/function-call/function-call-output items survive restarts; stored Responses and conversation items can be retrieved or deleted; conversation mutation and idempotent requests are serialized. The same evidence-gated generation core supports text/JSON formats, SSE events, usage, and disconnect cancellation. State is local-only and bounded to 512 items/8 MiB; background mode, hosted built-in tools, multimodal input, cross-process request serialization, and remote OpenAI state remain unsupported.",
+        routes: &[
+            post("/v1/responses"),
+            get("/v1/responses/:id"),
+            delete("/v1/responses/:id"),
+            post("/v1/conversations"),
+            get("/v1/conversations/:id"),
+            post("/v1/conversations/:id"),
+            delete("/v1/conversations/:id"),
+            get("/v1/conversations/:id/items"),
+            post("/v1/conversations/:id/items"),
+            get("/v1/conversations/:id/items/:item_id"),
+            delete("/v1/conversations/:id/items/:item_id"),
+        ],
         supported_modes: &[
             "stateless_nonstreaming",
             "stateless_streaming",
+            "durable_nonstreaming",
+            "durable_streaming",
+            "previous_response_id",
+            "conversations",
+            "response_retrieval_and_deletion",
+            "idempotency_key",
             "function_tools",
             "manual_function_call_continuation",
         ],
         unsupported_modes: &[
-            "previous_response_id",
-            "conversation",
             "background",
             "hosted_tools",
             "multimodal_input",
+            "remote_state",
+            "cross_process_request_serialization",
         ],
     },
     ApiConformanceCase {
@@ -286,6 +310,7 @@ pub(super) fn api_conformance_contract() -> Vec<serde_json::Value> {
                 "routes": case.routes.iter().map(|route| {
                     serde_json::json!({
                         "method": match route.method {
+                            HttpMethod::Delete => "DELETE",
                             HttpMethod::Get => "GET",
                             HttpMethod::Post => "POST",
                         },

@@ -1,28 +1,35 @@
-//! Stateless OpenAI Responses API adapter.
+//! OpenAI Responses API adapter with opt-in durable local state.
 //!
 //! The generation implementation remains `/v1/chat/completions`; this module
 //! owns only request normalization and response/event translation. That keeps
 //! model routing, queueing, cancellation, token accounting, tool parsing, and
-//! evidence gates on one execution path.
+//! evidence gates on one execution path. Responses storage preserves canonical
+//! JSON items in a separate SQLite store rather than flattening tool state into
+//! the Workspace text-memory schema.
+
+#![allow(clippy::result_large_err)]
 
 use std::{collections::HashMap, convert::Infallible};
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{rejection::JsonRejection, State},
-    http::StatusCode,
+    extract::{rejection::JsonRejection, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{sse::Event, IntoResponse, Response, Sse},
     Json,
 };
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{
-    api_error, chat_completions, malformed_json_error, ChatCompletionRequest, ChatMessage, StopSpec,
+    api_error, chat_completions, malformed_json_error,
+    responses_store::{ResponseCommit, StoreError},
+    ChatCompletionRequest, ChatMessage, StopSpec,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ResponsesRequest {
     model: Option<String>,
     input: Option<Value>,
@@ -46,37 +53,148 @@ pub(super) struct ResponsesRequest {
 
 pub(super) async fn create(
     State(state): State<super::AppState>,
+    headers: HeaderMap,
     payload: Result<Json<ResponsesRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    if let Err(response) = request.validate_boundary_fields() {
+        return response;
+    }
     let stream = request.stream.unwrap_or(false);
+    let store_response = request.store.unwrap_or(false);
+    let conversation_id = match request.conversation_id() {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let idempotency_key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    if idempotency_key.is_some() && !store_response {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "idempotency_requires_storage",
+            "Idempotency-Key requires store:true so the completed response can be replayed"
+                .to_string(),
+            Some("store"),
+        );
+    }
+    let request_hash = request_fingerprint(&request);
+    let mut lock_keys = Vec::with_capacity(2);
+    if let Some(id) = conversation_id.as_ref() {
+        lock_keys.push(format!("conversation:{id}"));
+    }
+    if let Some(key) = idempotency_key.as_ref() {
+        lock_keys.push(format!("idempotency:{key}"));
+    }
+    lock_keys.sort_unstable();
+    let mut persistence_guards = Vec::with_capacity(lock_keys.len());
+    for key in &lock_keys {
+        persistence_guards.push(state.responses_locks.for_key(key).lock_owned().await);
+    }
+
+    if let Some(key) = idempotency_key.as_deref() {
+        match state.responses_store.get_response_by_idempotency_key(key) {
+            Ok(Some(stored)) if stored.request_hash == request_hash => {
+                return if stream {
+                    replay_stream(stored.response)
+                } else {
+                    Json(stored.response).into_response()
+                };
+            }
+            Ok(Some(_)) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "idempotency_key_conflict",
+                    "Idempotency-Key was already used with a different Responses request"
+                        .to_string(),
+                    None,
+                )
+            }
+            Ok(None) => {}
+            Err(error) => return store_error(error, None),
+        }
+    }
+
+    let current_input = match request.canonical_input_items() {
+        Ok(items) => items,
+        Err(response) => return response,
+    };
+    let mut context = if let Some(previous_id) = request.previous_response_id.as_deref() {
+        match state.responses_store.get_response(previous_id) {
+            Ok(stored) => stored.context,
+            Err(error) => return store_error(error, Some("previous_response_id")),
+        }
+    } else if let Some(conversation_id) = conversation_id.as_deref() {
+        match state.responses_store.get_conversation(conversation_id) {
+            Ok(snapshot) => snapshot.items,
+            Err(error) => return store_error(error, Some("conversation")),
+        }
+    } else {
+        Vec::new()
+    };
+    context.extend(current_input.clone());
+    if let Err(error) = super::responses_store::validate_context(&context) {
+        return store_error(error, Some("input"));
+    }
+
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let created_at = super::unix_secs();
     let model = request
         .model
         .clone()
         .unwrap_or_else(|| "camelid-active".to_string());
-    let chat_request = match request.into_chat_request() {
+    let chat_request = match request.to_chat_request(&Value::Array(context.clone())) {
         Ok(request) => request,
         Err(response) => return response,
     };
+    let properties = ResponseProperties::from_request(&request, conversation_id.clone());
+    let persistence = (store_response || conversation_id.is_some()).then(|| ResponsePersistence {
+        store: state.responses_store.clone(),
+        response_id: response_id.clone(),
+        created_at,
+        previous_response_id: request.previous_response_id.clone(),
+        conversation_id,
+        request_hash,
+        idempotency_key,
+        current_input,
+        context,
+        store_response,
+        _guards: persistence_guards,
+    });
 
     let upstream = chat_completions(State(state), Ok(Json(chat_request))).await;
     if !upstream.status().is_success() {
         return upstream;
     }
     if stream {
-        return translate_stream(upstream, response_id, model, created_at);
+        return translate_stream(
+            upstream,
+            response_id,
+            model,
+            created_at,
+            properties,
+            persistence,
+        );
     }
-    translate_nonstreaming(upstream, response_id, model, created_at).await
+    let response =
+        match translate_nonstreaming(upstream, response_id, model, created_at, &properties).await {
+            Ok(response) => response,
+            Err(response) => return response,
+        };
+    if let Some(persistence) = persistence {
+        if let Err(error) = persistence.commit(&response) {
+            return store_error(error, None);
+        }
+    }
+    Json(response).into_response()
 }
 
 impl ResponsesRequest {
-    fn into_chat_request(self) -> Result<ChatCompletionRequest, Response> {
-        self.validate_boundary_fields()?;
+    fn to_chat_request(&self, input: &Value) -> Result<ChatCompletionRequest, Response> {
         let mut messages = Vec::new();
         if let Some(instructions) = self.instructions.as_ref() {
             let text = value_text(instructions, "instructions")?;
@@ -84,14 +202,6 @@ impl ResponsesRequest {
                 messages.push(text_message("system", text));
             }
         }
-        let input = self.input.as_ref().ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "missing_response_input",
-                "Responses requests require an input string or input-item array".to_string(),
-                Some("input"),
-            )
-        })?;
         messages.extend(input_messages(input)?);
         if messages.is_empty() {
             return Err(api_error(
@@ -105,7 +215,7 @@ impl ResponsesRequest {
         let tools = responses_tools_to_chat(self.tools.as_deref())?;
         let response_format = responses_text_format(self.text.as_ref())?;
         Ok(ChatCompletionRequest {
-            model: self.model,
+            model: self.model.clone(),
             messages: Some(messages),
             stream: self.stream,
             max_tokens: self.max_output_tokens,
@@ -133,7 +243,7 @@ impl ResponsesRequest {
             camelid_receipt: None,
             camelid_enable_thinking: None,
             tools,
-            tool_choice: self.tool_choice,
+            tool_choice: self.tool_choice.clone(),
             parallel_tool_calls: self.parallel_tool_calls,
             response_format,
             json_schema: None,
@@ -147,28 +257,18 @@ impl ResponsesRequest {
     }
 
     fn validate_boundary_fields(&self) -> Result<(), Response> {
-        if self.previous_response_id.is_some() {
-            return Err(unsupported_parameter(
-                "previous_response_id",
-                "Camelid's Responses adapter is stateless; replay prior output items in input instead",
-            ));
-        }
-        if self.conversation.is_some() {
-            return Err(unsupported_parameter(
-                "conversation",
-                "server-side Responses conversations are not implemented; replay prior items in input",
+        if self.previous_response_id.is_some() && self.conversation.is_some() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "mutually_exclusive_parameters",
+                "previous_response_id and conversation cannot be used together".to_string(),
+                Some("conversation"),
             ));
         }
         if self.background.unwrap_or(false) {
             return Err(unsupported_parameter(
                 "background",
                 "background Responses jobs are not implemented by the local runtime",
-            ));
-        }
-        if self.store.unwrap_or(false) {
-            return Err(unsupported_parameter(
-                "store",
-                "Camelid does not store Responses objects; use store:false or omit it",
             ));
         }
         if !self.unsupported_fields.is_empty() {
@@ -186,10 +286,453 @@ impl ResponsesRequest {
                 ),
             ));
         }
-        // Metadata is accepted as caller-owned bookkeeping but never persisted
-        // by the stateless adapter.
-        let _ = &self.metadata;
+        if let Some(metadata) = self.metadata.as_ref() {
+            if !metadata.is_object() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_metadata",
+                    "Responses metadata must be a JSON object".to_string(),
+                    Some("metadata"),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn conversation_id(&self) -> Result<Option<String>, Response> {
+        let Some(conversation) = self.conversation.as_ref() else {
+            return Ok(None);
+        };
+        let id = match conversation {
+            Value::String(id) => Some(id.as_str()),
+            Value::Object(object) => object.get("id").and_then(Value::as_str),
+            _ => None,
+        }
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_conversation",
+                "conversation must be a conversation id or an object containing id".to_string(),
+                Some("conversation"),
+            )
+        })?;
+        Ok(Some(id.to_string()))
+    }
+
+    fn canonical_input_items(&self) -> Result<Vec<Value>, Response> {
+        let input = self.input.as_ref().ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_response_input",
+                "Responses requests require an input string or input-item array".to_string(),
+                Some("input"),
+            )
+        })?;
+        match input {
+            Value::String(text) => Ok(vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            })]),
+            Value::Array(items) => {
+                // Validate through the same conversion used to build the model
+                // prompt before any item is admitted to durable state.
+                let _ = input_messages(input)?;
+                Ok(items.clone())
+            }
+            _ => Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_response_input",
+                "Responses input must be a string or an array of input items".to_string(),
+                Some("input"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResponseProperties {
+    previous_response_id: Option<String>,
+    conversation_id: Option<String>,
+    store: bool,
+    metadata: Value,
+    instructions: Option<Value>,
+    max_output_tokens: Option<u32>,
+    temperature: Option<f32>,
+    text: Value,
+    tool_choice: Value,
+    tools: Vec<Value>,
+    top_p: Option<f32>,
+    parallel_tool_calls: bool,
+}
+
+impl ResponseProperties {
+    fn from_request(request: &ResponsesRequest, conversation_id: Option<String>) -> Self {
+        Self {
+            previous_response_id: request.previous_response_id.clone(),
+            conversation_id,
+            store: request.store.unwrap_or(false),
+            metadata: request.metadata.clone().unwrap_or_else(|| json!({})),
+            instructions: request.instructions.clone(),
+            max_output_tokens: request.max_output_tokens,
+            temperature: request.temperature,
+            text: request
+                .text
+                .clone()
+                .unwrap_or_else(|| json!({"format": {"type": "text"}})),
+            tool_choice: request.tool_choice.clone().unwrap_or_else(|| json!("auto")),
+            tools: request.tools.clone().unwrap_or_default(),
+            top_p: request.top_p,
+            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+        }
+    }
+}
+
+struct ResponsePersistence {
+    store: super::responses_store::ResponsesStore,
+    response_id: String,
+    created_at: u64,
+    previous_response_id: Option<String>,
+    conversation_id: Option<String>,
+    request_hash: String,
+    idempotency_key: Option<String>,
+    current_input: Vec<Value>,
+    context: Vec<Value>,
+    store_response: bool,
+    _guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ResponsePersistence {
+    fn commit(self, response: &Value) -> Result<(), StoreError> {
+        let output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut completed_context = self.context.clone();
+        completed_context.extend(output.clone());
+        self.store.commit_response(ResponseCommit {
+            id: &self.response_id,
+            created_at: self.created_at,
+            conversation_id: self.conversation_id.as_deref(),
+            previous_response_id: self.previous_response_id.as_deref(),
+            request_hash: &self.request_hash,
+            idempotency_key: self.idempotency_key.as_deref(),
+            input: &self.current_input,
+            output: &output,
+            context: &completed_context,
+            response,
+            store_response: self.store_response,
+        })
+    }
+}
+
+fn request_fingerprint(request: &ResponsesRequest) -> String {
+    let bytes = serde_json::to_vec(request).unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, Response> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = value.to_str().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain visible ASCII text".to_string(),
+            None,
+        )
+    })?;
+    if key.is_empty() || key.len() > 255 || key.chars().any(char::is_control) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain 1 to 255 visible characters".to_string(),
+            None,
+        ));
+    }
+    Ok(Some(key.to_string()))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ConversationCreateRequest {
+    metadata: Option<Value>,
+    items: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ConversationUpdateRequest {
+    metadata: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ConversationItemsRequest {
+    items: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ConversationItemsQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+    order: Option<String>,
+}
+
+pub(super) async fn create_conversation(
+    State(state): State<super::AppState>,
+    payload: Result<Json<ConversationCreateRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return malformed_json_error(error),
+    };
+    let id = format!("conv_{}", uuid::Uuid::new_v4().simple());
+    let created_at = super::unix_secs();
+    let metadata = request.metadata.unwrap_or_else(|| json!({}));
+    let items = request.items.unwrap_or_default();
+    if let Err(response) = input_messages(&Value::Array(items.clone())) {
+        return response;
+    }
+    match state
+        .responses_store
+        .create_conversation(&id, created_at, &metadata, &items)
+    {
+        Ok(snapshot) => Json(snapshot.object).into_response(),
+        Err(error) => store_error(error, None),
+    }
+}
+
+pub(super) async fn get_conversation(
+    State(state): State<super::AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.responses_store.get_conversation(&id) {
+        Ok(snapshot) => Json(snapshot.object).into_response(),
+        Err(error) => store_error(error, Some("conversation")),
+    }
+}
+
+pub(super) async fn update_conversation(
+    State(state): State<super::AppState>,
+    Path(id): Path<String>,
+    payload: Result<Json<ConversationUpdateRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return malformed_json_error(error),
+    };
+    let lock = state.responses_locks.for_key(&format!("conversation:{id}"));
+    let _guard = lock.lock().await;
+    match state
+        .responses_store
+        .update_conversation(&id, &request.metadata, super::unix_secs())
+    {
+        Ok(conversation) => Json(conversation).into_response(),
+        Err(error) => store_error(error, Some("conversation")),
+    }
+}
+
+pub(super) async fn delete_conversation(
+    State(state): State<super::AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let lock = state.responses_locks.for_key(&format!("conversation:{id}"));
+    let _guard = lock.lock().await;
+    match state.responses_store.delete_conversation(&id) {
+        Ok(()) => Json(json!({
+            "id": id,
+            "object": "conversation.deleted",
+            "deleted": true,
+        }))
+        .into_response(),
+        Err(error) => store_error(error, Some("conversation")),
+    }
+}
+
+pub(super) async fn add_conversation_items(
+    State(state): State<super::AppState>,
+    Path(id): Path<String>,
+    payload: Result<Json<ConversationItemsRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return malformed_json_error(error),
+    };
+    if let Err(response) = input_messages(&Value::Array(request.items.clone())) {
+        return response;
+    }
+    let lock = state.responses_locks.for_key(&format!("conversation:{id}"));
+    let _guard = lock.lock().await;
+    match state
+        .responses_store
+        .add_conversation_items(&id, super::unix_secs(), &request.items)
+    {
+        Ok(items) => Json(list_object(items, false)).into_response(),
+        Err(error) => store_error(error, Some("items")),
+    }
+}
+
+pub(super) async fn list_conversation_items(
+    State(state): State<super::AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ConversationItemsQuery>,
+) -> Response {
+    let items = match state.responses_store.list_conversation_items(&id) {
+        Ok(items) => items,
+        Err(error) => return store_error(error, Some("conversation")),
+    };
+    let descending = match query.order.as_deref().unwrap_or("desc") {
+        "asc" => false,
+        "desc" => true,
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_order",
+                "order must be asc or desc".to_string(),
+                Some("order"),
+            )
+        }
+    };
+    let limit = query.limit.unwrap_or(20);
+    if limit == 0 || limit > 100 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "limit must be between 1 and 100".to_string(),
+            Some("limit"),
+        );
+    }
+    let mut ordered = items;
+    if descending {
+        ordered.reverse();
+    }
+    if let Some(after) = query.after.as_deref() {
+        let Some(index) = ordered
+            .iter()
+            .position(|item| item.get("id").and_then(Value::as_str) == Some(after))
+        else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_after",
+                "after does not identify an item in this conversation".to_string(),
+                Some("after"),
+            );
+        };
+        ordered.drain(..=index);
+    }
+    let has_more = ordered.len() > limit;
+    ordered.truncate(limit);
+    Json(list_object(ordered, has_more)).into_response()
+}
+
+pub(super) async fn get_conversation_item(
+    State(state): State<super::AppState>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> Response {
+    match state.responses_store.get_conversation_item(&id, &item_id) {
+        Ok(item) => Json(item).into_response(),
+        Err(error) => store_error(error, Some("item_id")),
+    }
+}
+
+pub(super) async fn delete_conversation_item(
+    State(state): State<super::AppState>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> Response {
+    let lock = state.responses_locks.for_key(&format!("conversation:{id}"));
+    let _guard = lock.lock().await;
+    match state
+        .responses_store
+        .delete_conversation_item(&id, &item_id, super::unix_secs())
+    {
+        Ok(()) => Json(json!({
+            "id": item_id,
+            "object": "conversation.item.deleted",
+            "deleted": true,
+        }))
+        .into_response(),
+        Err(error) => store_error(error, Some("item_id")),
+    }
+}
+
+pub(super) async fn get_response(
+    State(state): State<super::AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.responses_store.get_response(&id) {
+        Ok(stored) => Json(stored.response).into_response(),
+        Err(error) => store_error(error, Some("response_id")),
+    }
+}
+
+pub(super) async fn delete_response(
+    State(state): State<super::AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.responses_store.delete_response(&id) {
+        Ok(()) => Json(json!({
+            "id": id,
+            "object": "response.deleted",
+            "deleted": true,
+        }))
+        .into_response(),
+        Err(error) => store_error(error, Some("response_id")),
+    }
+}
+
+fn list_object(items: Vec<Value>, has_more: bool) -> Value {
+    let first_id = items
+        .first()
+        .and_then(|item| item.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_id = items
+        .last()
+        .and_then(|item| item.get("id"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "object": "list",
+        "data": items,
+        "first_id": first_id,
+        "last_id": last_id,
+        "has_more": has_more,
+    })
+}
+
+fn store_error(error: StoreError, param: Option<&'static str>) -> Response {
+    match error {
+        StoreError::NotFound(message) => api_error(
+            StatusCode::NOT_FOUND,
+            "resource_not_found",
+            message.to_string(),
+            param,
+        ),
+        StoreError::Conflict(message) => api_error(
+            StatusCode::CONFLICT,
+            "responses_store_conflict",
+            message.to_string(),
+            param,
+        ),
+        StoreError::Limit(message) => api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "conversation_context_limit_exceeded",
+            message.to_string(),
+            param,
+        ),
+        StoreError::Invalid(message) => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_conversation_item",
+            message.to_string(),
+            param,
+        ),
+        StoreError::Database(message) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "responses_store_failed",
+            message,
+            param,
+        ),
     }
 }
 
@@ -484,22 +1027,23 @@ async fn translate_nonstreaming(
     response_id: String,
     requested_model: String,
     created_at: u64,
-) -> Response {
+    properties: &ResponseProperties,
+) -> Result<Value, Response> {
     let (parts, body) = upstream.into_parts();
     let bytes = match to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            return api_error(
+            return Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "responses_adapter_failed",
                 format!("could not read the chat completion response: {err}"),
                 None,
-            )
+            ))
         }
     };
     let chat: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
-        Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+        Err(_) => return Err(Response::from_parts(parts, Body::from(bytes))),
     };
     let model = chat
         .get("model")
@@ -509,7 +1053,7 @@ async fn translate_nonstreaming(
     let output = response_output_items(message);
     let usage = responses_usage(chat.get("usage"));
     let incomplete = chat["choices"][0]["finish_reason"] == "length";
-    Json(response_object(
+    Ok(response_object(
         &response_id,
         model,
         created_at,
@@ -521,8 +1065,8 @@ async fn translate_nonstreaming(
         output,
         usage,
         incomplete.then_some("max_output_tokens"),
+        properties,
     ))
-    .into_response()
 }
 
 fn response_output_items(message: &Value) -> Vec<Value> {
@@ -589,6 +1133,7 @@ fn responses_usage(chat_usage: Option<&Value>) -> Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn response_object(
     id: &str,
     model: &str,
@@ -597,6 +1142,7 @@ fn response_object(
     output: Vec<Value>,
     usage: Value,
     incomplete_reason: Option<&str>,
+    properties: &ResponseProperties,
 ) -> Value {
     json!({
         "id": id,
@@ -606,21 +1152,22 @@ fn response_object(
         "completed_at": (status == "completed").then_some(super::unix_secs()),
         "error": null,
         "incomplete_details": incomplete_reason.map(|reason| json!({"reason": reason})),
-        "instructions": null,
-        "max_output_tokens": null,
+        "instructions": properties.instructions,
+        "max_output_tokens": properties.max_output_tokens,
         "model": model,
         "output": output,
-        "parallel_tool_calls": true,
-        "previous_response_id": null,
-        "store": false,
-        "temperature": null,
-        "text": {"format": {"type": "text"}},
-        "tool_choice": "auto",
-        "tools": [],
-        "top_p": null,
+        "parallel_tool_calls": properties.parallel_tool_calls,
+        "previous_response_id": properties.previous_response_id,
+        "conversation": properties.conversation_id.as_ref().map(|id| json!({"id": id})),
+        "store": properties.store,
+        "temperature": properties.temperature,
+        "text": properties.text,
+        "tool_choice": properties.tool_choice,
+        "tools": properties.tools,
+        "top_p": properties.top_p,
         "truncation": "disabled",
         "usage": usage,
-        "metadata": {},
+        "metadata": properties.metadata,
     })
 }
 
@@ -629,12 +1176,15 @@ fn translate_stream(
     response_id: String,
     model: String,
     created_at: u64,
+    properties: ResponseProperties,
+    persistence: Option<ResponsePersistence>,
 ) -> Response {
     let (_, body) = upstream.into_parts();
     let mut upstream = body.into_data_stream();
     let events = async_stream::stream! {
         let mut sequence = 0u64;
-        let mut state = ResponsesStreamState::new(response_id, model, created_at);
+        let mut state = ResponsesStreamState::new(response_id, model, created_at, properties);
+        let mut persistence = persistence;
         for event in state.start_events(&mut sequence) {
             yield response_event(event, &mut sequence);
         }
@@ -659,7 +1209,24 @@ fn translate_stream(
                     continue;
                 };
                 if data == "[DONE]" {
-                    for event in state.finish_events(&mut sequence) {
+                    let terminal_events = state.finish_events(&mut sequence);
+                    if let Some(persistence) = persistence.take() {
+                        let response = terminal_events
+                            .last()
+                            .and_then(|event| event.get("response"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        if let Err(error) = persistence.commit(&response) {
+                            yield response_event(json!({
+                                "type": "error",
+                                "code": "responses_store_failed",
+                                "message": error.to_string(),
+                                "param": null,
+                            }), &mut sequence);
+                            return;
+                        }
+                    }
+                    for event in terminal_events {
                         yield response_event(event, &mut sequence);
                     }
                     return;
@@ -681,9 +1248,49 @@ fn translate_stream(
                 }
             }
         }
-        for event in state.finish_events(&mut sequence) {
+        let terminal_events = state.finish_events(&mut sequence);
+        if let Some(persistence) = persistence.take() {
+            let response = terminal_events
+                .last()
+                .and_then(|event| event.get("response"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if let Err(error) = persistence.commit(&response) {
+                yield response_event(json!({
+                    "type": "error",
+                    "code": "responses_store_failed",
+                    "message": error.to_string(),
+                    "param": null,
+                }), &mut sequence);
+                return;
+            }
+        }
+        for event in terminal_events {
             yield response_event(event, &mut sequence);
         }
+    };
+    Sse::new(events).into_response()
+}
+
+fn replay_stream(response: Value) -> Response {
+    let events = async_stream::stream! {
+        let mut sequence = 0u64;
+        let mut created = response.clone();
+        created["status"] = json!("in_progress");
+        created["completed_at"] = Value::Null;
+        yield response_event(
+            json!({"type": "response.created", "response": created}),
+            &mut sequence,
+        );
+        let event_type = if response["status"] == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        yield response_event(
+            json!({"type": event_type, "response": response}),
+            &mut sequence,
+        );
     };
     Sse::new(events).into_response()
 }
@@ -721,10 +1328,16 @@ struct ResponsesStreamState {
     output: Vec<Value>,
     usage: Value,
     finish_reason: Option<String>,
+    properties: ResponseProperties,
 }
 
 impl ResponsesStreamState {
-    fn new(response_id: String, model: String, created_at: u64) -> Self {
+    fn new(
+        response_id: String,
+        model: String,
+        created_at: u64,
+        properties: ResponseProperties,
+    ) -> Self {
         Self {
             response_id,
             model,
@@ -736,6 +1349,7 @@ impl ResponsesStreamState {
             output: Vec::new(),
             usage: responses_usage(None),
             finish_reason: None,
+            properties,
         }
     }
 
@@ -748,6 +1362,7 @@ impl ResponsesStreamState {
             Vec::new(),
             Value::Null,
             None,
+            &self.properties,
         );
         vec![
             json!({"type": "response.created", "response": response}),
@@ -759,6 +1374,7 @@ impl ResponsesStreamState {
                 Vec::new(),
                 Value::Null,
                 None,
+                &self.properties,
             )}),
         ]
     }
@@ -925,6 +1541,7 @@ impl ResponsesStreamState {
                 self.output.clone(),
                 self.usage.clone(),
                 reason,
+                &self.properties,
             ),
         }));
         events
@@ -952,7 +1569,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        let chat = request.into_chat_request().unwrap();
+        let input = request.input.clone().unwrap();
+        let chat = request.to_chat_request(&input).unwrap();
         let messages = chat.messages.unwrap();
         assert_eq!(messages[1].role, "assistant");
         assert!(messages[1].content.contains("\"name\":\"weather\""));
@@ -962,7 +1580,12 @@ mod tests {
 
     #[test]
     fn stream_accumulator_emits_text_and_function_events() {
-        let mut state = ResponsesStreamState::new("resp_test".into(), "local".into(), 1);
+        let properties = ResponseProperties::from_request(
+            &serde_json::from_value(json!({"input":"hello"})).unwrap(),
+            None,
+        );
+        let mut state =
+            ResponsesStreamState::new("resp_test".into(), "local".into(), 1, properties.clone());
         let mut sequence = 0;
         let text_events = state.accept_chat_chunk(
             &json!({"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}),
@@ -972,7 +1595,8 @@ mod tests {
             .iter()
             .any(|event| event["type"] == "response.output_text.delta"));
 
-        let mut tool_state = ResponsesStreamState::new("resp_tool".into(), "local".into(), 1);
+        let mut tool_state =
+            ResponsesStreamState::new("resp_tool".into(), "local".into(), 1, properties);
         let tool_events = tool_state.accept_chat_chunk(
             &json!({"choices":[{"delta":{"tool_calls":[{
                 "index":0,
@@ -989,13 +1613,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stateful_previous_response_id() {
+    fn accepts_stateful_previous_response_id_at_the_request_boundary() {
         let request: ResponsesRequest = serde_json::from_value(json!({
             "input": "hello",
             "previous_response_id": "resp_prior"
         }))
         .unwrap();
-        let response = request.into_chat_request().unwrap_err();
+        assert!(request.validate_boundary_fields().is_ok());
+        assert_eq!(request.previous_response_id.as_deref(), Some("resp_prior"));
+    }
+
+    #[test]
+    fn rejects_previous_response_and_conversation_together() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "input": "hello",
+            "previous_response_id": "resp_prior",
+            "conversation": "conv_test"
+        }))
+        .unwrap();
+        let response = request.validate_boundary_fields().unwrap_err();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

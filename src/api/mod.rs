@@ -32,6 +32,7 @@ mod contract;
 mod engine;
 mod metrics;
 mod responses;
+mod responses_store;
 mod server;
 mod workspace;
 
@@ -149,6 +150,13 @@ pub struct AppState {
     allow_local_model_delete: bool,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
+    /// Durable local state for opt-in Responses objects and Conversations.
+    /// The store opens short-lived SQLite connections so cloned routers share
+    /// on-disk state without tying a connection to an async executor thread.
+    responses_store: responses_store::ResponsesStore,
+    /// Requests that mutate the same durable conversation (or reuse the same
+    /// idempotency key) are serialized through a process-local keyed lock.
+    responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
     /// Browser requests continue to use the independent same-origin predicate.
@@ -204,6 +212,8 @@ impl Default for AppState {
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             verification_reports: Arc::new(RwLock::new(HashMap::new())),
+            responses_store: responses_store::ResponsesStore::default(),
+            responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
             workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
@@ -247,6 +257,17 @@ impl AppState {
     /// here, once, so it stays stable however the process was launched.
     pub fn with_models_dir(mut self, models_dir: Option<PathBuf>) -> Self {
         self.models_dir = resolve_models_dir(models_dir);
+        self
+    }
+
+    /// Override the durable Responses/Conversations SQLite path.
+    ///
+    /// The default is `CAMELID_RESPONSES_DB` or the platform data directory.
+    /// This builder is also useful for embedding Camelid with an isolated
+    /// persistence boundary.
+    pub fn with_responses_store_path(mut self, path: PathBuf) -> Self {
+        self.responses_store = responses_store::ResponsesStore::new(path);
+        self.responses_locks = responses_store::ResponseLockPool::default();
         self
     }
 
@@ -2311,6 +2332,25 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses::create))
+        .route(
+            "/v1/responses/:id",
+            get(responses::get_response).delete(responses::delete_response),
+        )
+        .route("/v1/conversations", post(responses::create_conversation))
+        .route(
+            "/v1/conversations/:id",
+            get(responses::get_conversation)
+                .post(responses::update_conversation)
+                .delete(responses::delete_conversation),
+        )
+        .route(
+            "/v1/conversations/:id/items",
+            get(responses::list_conversation_items).post(responses::add_conversation_items),
+        )
+        .route(
+            "/v1/conversations/:id/items/:item_id",
+            get(responses::get_conversation_item).delete(responses::delete_conversation_item),
+        )
         .route("/v1/messages", post(unsupported_messages))
         .route("/v1/rerank", post(rerank))
         .route("/v1/reranking", post(rerank))
@@ -15769,6 +15809,7 @@ fn api_error(
         });
     }
     let error_type = match status {
+        StatusCode::INTERNAL_SERVER_ERROR => "server_error",
         StatusCode::NOT_IMPLEMENTED => "not_implemented",
         StatusCode::SERVICE_UNAVAILABLE => "runtime_unavailable",
         StatusCode::UNPROCESSABLE_ENTITY => "model_unavailable",
