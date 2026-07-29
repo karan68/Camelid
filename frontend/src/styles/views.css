@@ -355,6 +355,7 @@
 .backend-banner__copy { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .backend-banner__copy strong { font-size: var(--text-sm); }
 .backend-banner__copy span { font-size: var(--text-xs); color: var(--color-text-muted); }
+.backend-banner__copy span code { font-family: var(--font-mono); font-size: 0.92em; padding: 0.1em 0.4em; border-radius: 6px; background: var(--color-code-bg); border: 1px solid var(--color-code-border); color: var(--color-text); overflow-wrap: anywhere; }
 .backend-banner__actions { display: flex; gap: var(--space-2); flex: none; }
 @media (max-width: 640px) {
   .backend-banner { flex-wrap: wrap; }

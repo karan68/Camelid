@@ -271,7 +271,7 @@ function App() {
         )}
 
         {!DEMO_UI && runtime?.status === 'offline' && tab !== 'settings' && (
-          <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
+          <BackendBanner backend={backend} apiBase={apiBase} onOpenSettings={() => navigateTab('settings')} />
         )}
 
         {!DEMO_UI && firstRunActive && (
