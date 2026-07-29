@@ -123,6 +123,7 @@ impl HfLlamaConfigSummary {
             // it MUST be revisited together with tensor orientation before
             // generation is enabled for a SafeTensors source.
             rope_neox_pairing: false,
+            no_rope_layer_step: None,
             logit_scale: None,
             moe: None,
             gemma4: None,

@@ -20054,6 +20054,7 @@ mod tests {
             vocab_size: Some(3),
             file_type: Some(0),
             rope_neox_pairing: false,
+            no_rope_layer_step: None,
             attention_key_length: None,
             logit_scale: None,
             moe: None,

@@ -1424,6 +1424,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         vocab_size: Some(2),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -1534,6 +1535,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         vocab_size: Some(2),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -1589,6 +1591,35 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
     };
     let session = LlamaInferenceSession::new(config, weights).unwrap();
     (session, temp_file)
+}
+
+/// A NoPE model must never reach the resident GPU engines. They build ONE cos/sin
+/// table for the whole forward and rope every layer unconditionally
+/// (`cuda_resident` launch_rope / launch_rope_batched and the Metal equivalents),
+/// so they cannot express the per-layer skip — a smollm3 file on a CUDA build
+/// would silently produce different, wrong tokens from the fixed CPU path.
+///
+/// The gate is checked before the backend-enabled test, so this holds on a
+/// CPU-only host too. Note that on a host where the resident path is not eligible
+/// for some *other* reason this assertion is satisfied but not causal; the
+/// ordering of the check in `resident_decode_eligible` is what makes it load-bearing.
+#[test]
+fn nope_config_disqualifies_the_resident_gpu_path() {
+    let (mut session, _temp) = tiny_kv_budget_session(64);
+
+    session.config.no_rope_layer_step = Some(4);
+    assert!(
+        !session
+            .resident_decode_eligible(false)
+            .expect("eligibility check should not error"),
+        "a NoPE config must be refused by the resident GPU gate"
+    );
+    assert!(
+        !session
+            .resident_decode_eligible(true)
+            .expect("eligibility check should not error"),
+        "a NoPE config must be refused for the want-logits path too"
+    );
 }
 
 /// End-to-end proof that the KV predict-and-abort budget guard fires through the
@@ -8601,6 +8632,7 @@ fn applies_rope_to_each_attention_head() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8644,6 +8676,7 @@ fn apply_rope_uses_configured_frequency_base() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8697,6 +8730,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8754,6 +8788,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8818,6 +8853,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8887,6 +8923,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8970,6 +9007,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -9052,6 +9090,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -10670,6 +10709,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         vocab_size: Some(3),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -10960,6 +11000,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -11190,6 +11231,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -11304,6 +11346,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -11457,6 +11500,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -12342,6 +12386,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,

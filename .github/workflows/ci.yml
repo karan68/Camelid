@@ -282,10 +282,11 @@ jobs:
       - name: Docs
         run: cargo doc --no-deps ${{ matrix.features }}
 
-  # Windows-only build / lint / test of the additive camelid-desktop crate. The `rust`
+  # Windows build / lint / test of the additive camelid-desktop crate. The `rust`
   # job above scopes clippy/test/doc to default-members (the server), so without this the
-  # desktop crate would only be fmt-checked. Tauri/WebView2 is Windows-only and the crate
-  # is Windows-only, so this lives on its own leg rather than in the cross-OS `rust` matrix.
+  # desktop crate would only be fmt-checked. WebView2 is Windows-only, but the crate itself
+  # also builds on macOS (WKWebView), where the release `desktop-macos` job packages it;
+  # this leg covers the Windows build rather than joining the cross-OS `rust` matrix.
   # It needs no frontend build: the desktop app bundles only its static splash; the embedded
   # web UI lives in camelid.exe, which this job does not build. The base tauri.conf.json
   # declares no sidecar resources (those are in the bundle-only overlay), so the crate builds
