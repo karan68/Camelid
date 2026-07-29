@@ -2640,6 +2640,19 @@ impl LlamaInferenceSession {
         if self.resident_paths_disabled {
             bail!("resident paths disabled for this session (CPU-authoritative KV required)");
         }
+        // NoPE architectures (smollm3) must stay on the CPU reference path. The
+        // resident engines build ONE cos/sin table for the whole forward and rope
+        // every layer unconditionally (cuda_resident launch_rope / launch_rope_batched,
+        // and the Metal equivalents), so they cannot express a per-layer skip — a
+        // NoPE model on a resident lane would silently produce different, wrong
+        // tokens from the fixed CPU path. Checked before the backend-enabled gate
+        // because this is a property of the model, not of the available backends.
+        if self.config.no_rope_layer_step.is_some() {
+            bail!(
+                "NoPE architecture (per-layer RoPE skip): the resident GPU engines rope every \
+                 layer from a single cos/sin table and cannot express the skip; CPU reference"
+            );
+        }
         // GPU-runnable tier: an uncurated model is admitted to the resident path only after
         // it passes the one-time parity self-check. A recorded FAIL forbids the resident
         // path here — the single choke point — so no `set_resident_paths_disabled` site can
@@ -7021,20 +7034,34 @@ fn forward_layer_timed(
     };
     let q_before_rope = q;
     let k_before_rope = k;
-    let q = apply_rope(
-        &q_before_rope,
-        kv_cache.position,
-        config.attention_head_count as usize,
-        config,
-        rope_freqs,
-        config
-            .mla
-            .as_ref()
-            .map_or(0, |mla| mla.nope_head_dim as usize),
-        &cached_layer_label!(layer_idx, "attention_q_rope"),
-    )?;
-    let k = if config.mla.is_some() {
-        // k is already RoPE'd and in the exact cached layout (1 head of [c_kv, k_pe])
+    // NoPE layers (smollm3): llama.cpp `models/smollm3.cpp:69` skips ggml_rope_ext
+    // on BOTH Q and K when `(il + 1) % n_no_rope_layer_step == 0`. The un-roped K
+    // is what goes into the cache, exactly as in the reference graph.
+    //
+    // The `.clone()` on the skip branch is required, not incidental: the scratch
+    // pool below recycles `q_before_rope`/`k_before_rope` alongside `q`/`k`, so
+    // the two must be distinct buffers. This is the same shape the MLA branch
+    // already uses.
+    let layer_ropes = config.layer_uses_rope(layer_idx);
+    let q = if layer_ropes {
+        apply_rope(
+            &q_before_rope,
+            kv_cache.position,
+            config.attention_head_count as usize,
+            config,
+            rope_freqs,
+            config
+                .mla
+                .as_ref()
+                .map_or(0, |mla| mla.nope_head_dim as usize),
+            &cached_layer_label!(layer_idx, "attention_q_rope"),
+        )?
+    } else {
+        q_before_rope.clone()
+    };
+    let k = if config.mla.is_some() || !layer_ropes {
+        // MLA: k is already RoPE'd and in the exact cached layout (1 head of
+        // [c_kv, k_pe]). NoPE layer: k is carried through un-roped.
         k_before_rope.clone()
     } else {
         apply_rope(
@@ -7050,12 +7077,19 @@ fn forward_layer_timed(
     let attention_q_rope_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&q))
         .transpose()?;
+    // On a NoPE layer the expected rotation is the IDENTITY, so the reconstruction
+    // is taken at position 0 (angle 0 => cos 1, sin 0). A zero delta then positively
+    // asserts "this layer correctly applied no rotation", instead of reporting a
+    // spurious divergence against a rotation that was deliberately skipped.
+    // The diagnostic is still produced either way: the consumer field is not
+    // optional (see the `.expect` on attention_q_rope_reconstruction).
+    let rope_diagnostic_position = if layer_ropes { kv_cache.position } else { 0 };
     let attention_q_rope_diagnostic = collect_diagnostics
         .then(|| {
             rope_diagnostics(
                 &q_before_rope,
                 &q,
-                kv_cache.position,
+                rope_diagnostic_position,
                 config.attention_head_count as usize,
                 config,
                 rope_freqs,
@@ -7071,7 +7105,7 @@ fn forward_layer_timed(
             rope_diagnostics(
                 &k_before_rope,
                 &k,
-                kv_cache.position,
+                rope_diagnostic_position,
                 config.attention_head_count_kv as usize,
                 config,
                 rope_freqs,
@@ -7630,24 +7664,36 @@ fn forward_prefill_layer_chunk_timed(
         )?,
         None => k,
     };
-    let q = apply_rope_batch(
-        &q,
-        params.base_position,
-        config.attention_head_count as usize,
-        config,
-        params.rope_freqs,
-        0,
-        cached_layer_label!(layer_idx, "prefill_attention_q_rope"),
-    )?;
-    let k = apply_rope_batch(
-        &k,
-        params.base_position,
-        config.attention_head_count_kv as usize,
-        config,
-        params.rope_freqs,
-        0,
-        cached_layer_label!(layer_idx, "prefill_attention_k_rope"),
-    )?;
+    // NoPE layers (smollm3): same predicate as the single-token decode path in
+    // `forward_layer_timed`, applied to the batched prefill. Both paths must agree
+    // or the KV written during prefill would not match what decode expects.
+    let layer_ropes = config.layer_uses_rope(layer_idx);
+    let q = if layer_ropes {
+        apply_rope_batch(
+            &q,
+            params.base_position,
+            config.attention_head_count as usize,
+            config,
+            params.rope_freqs,
+            0,
+            cached_layer_label!(layer_idx, "prefill_attention_q_rope"),
+        )?
+    } else {
+        q
+    };
+    let k = if layer_ropes {
+        apply_rope_batch(
+            &k,
+            params.base_position,
+            config.attention_head_count_kv as usize,
+            config,
+            params.rope_freqs,
+            0,
+            cached_layer_label!(layer_idx, "prefill_attention_k_rope"),
+        )?
+    } else {
+        k
+    };
     timings.attention_rope = started.elapsed().as_micros();
     if let Some(memory) = &mut memory {
         memory.record_after_attention_rope(capture_memory_sample(kv_cache));
