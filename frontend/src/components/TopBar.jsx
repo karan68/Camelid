@@ -11,6 +11,7 @@ const TITLES = {
   chat: 'Chat',
   workspace: 'Workspace',
   library: 'Models',
+  downloads: 'Downloaded models',
   api: 'API',
   compatibility: 'Compatibility ledger',
   analytics: 'Analytics',

@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Last updated: 2026-05-06
+Last updated: 2026-07-28
 
 This guide documents Camelid's current local configuration reality without pretending every workflow is fully automated.
 
@@ -48,6 +48,73 @@ target/release/camelid serve --model /path/to/model.gguf
 ```
 
 That startup path loads the model immediately and applies the default `auto` execution profile for the current host. Use `CAMELID_PROFILE=safe|auto|experimental|debug` when you need to change planner behavior; keep lower-level experiment env vars as developer overrides rather than the primary user workflow.
+
+## Production HTTP policy
+
+Anonymous loopback serving remains the default. A non-loopback address is refused unless you
+configure `--api-key` / `--api-key-file`, or deliberately acknowledge an externally protected
+deployment with `--allow-unauthenticated-remote`. Prefer a key file because a literal command-line
+key can be visible to other local users:
+
+```bash
+target/release/camelid serve \
+  --addr 0.0.0.0:8181 \
+  --api-key-file ./camelid-api.key \
+  --cors-origin https://chat.example
+```
+
+API clients can send either `Authorization: Bearer <key>` or `X-API-Key: <key>`. Health and embedded
+same-origin UI assets remain public; API routes, including `/metrics`, require the key. CORS is
+disabled by default and accepts only explicit `http://` or `https://` origins—wildcard and `null`
+origins are refused. The bundled browser UI does not persist or inject the server API key, so use
+an API client or an authenticating reverse proxy for authenticated remote deployments. The existing
+frictionless browser UI remains the anonymous-loopback experience.
+
+Direct TLS is optional and requires a PEM certificate chain and private key together:
+
+```bash
+target/release/camelid serve \
+  --addr 0.0.0.0:8443 \
+  --api-key-file ./camelid-api.key \
+  --tls-cert ./server-cert-chain \
+  --tls-key ./server-private-key
+```
+
+Resource ceilings are resolved once at startup. Their CLI names and environment aliases are:
+
+| Limit | Default | Environment |
+|---|---:|---|
+| `--max-request-body-bytes` | 16 MiB | `CAMELID_MAX_REQUEST_BODY_BYTES` |
+| `--max-prompt-tokens` | 131,072 | `CAMELID_MAX_PROMPT_TOKENS` |
+| `--max-generation-tokens` | 8,192 | `CAMELID_MAX_GENERATION_TOKENS` |
+| `--max-download-bytes` | 64 GiB | `CAMELID_MAX_DOWNLOAD_BYTES` |
+
+`GET /metrics` exposes bounded-name Prometheus counters and gauges for HTTP/generation latency,
+prompt/decode tokens, prompt and weight cache outcomes, engine queue/slot progress, process RSS,
+and CUDA VRAM. It contains no model-path, prompt, API-key, or per-user labels.
+
+## Mixtral diagnostic gate
+
+The checked Mixtral 8×7B Q8 row has one-token evidence, but its longer continuation parity gate is
+still open. Camelid therefore rejects `max_tokens > 1` for Mixtral by default instead of allowing a
+very slow file-backed request to look hung. Controlled diagnostics must explicitly set
+`CAMELID_MIXTRAL_LONG_GENERATION=1`.
+
+MoE expert storage defaults to `CAMELID_MOE_EXPERT_STORAGE=file_backed`, preserving the existing
+low-RAM path. `resident_q8` keeps the quantized expert blocks in RAM and selects experts through
+zero-copy shared ranges. It is opt-in and fails before allocation unless live available RAM can
+hold all owned expert tensors, peak decode/load scratch for the largest expert descriptor, and
+Camelid's host headroom floor:
+
+```bash
+CAMELID_MIXTRAL_LONG_GENERATION=1 \
+CAMELID_MOE_EXPERT_STORAGE=resident_q8 \
+target/release/camelid serve --model /path/to/Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf
+```
+
+On PowerShell, set the two variables with `$env:NAME = "value"` before starting the server. Use
+`scripts/diagnose-mixtral-watchdog.ps1` to capture health, slot progress, metrics, response, and
+generated-index-9 expert diagnostics under `qa/local-artifacts/`.
 
 ## Frontend API base override
 

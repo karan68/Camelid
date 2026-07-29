@@ -40,14 +40,28 @@ function bySmallestDownload(a, b) {
   return String(a.catalog_id).localeCompare(String(b.catalog_id))
 }
 
+/* First run promises a chat token, so encoder-only rows are not candidates even
+   when they have their own supported exact-row contract. The Nomic sidecar is much
+   smaller than every generative model; without this task-lane guard it would win the
+   size sort, load successfully, leave Chat with no active model, and strand the
+   onboarding flow it was supposed to complete. Architecture is retained as a
+   defensive signal for older catalog payloads that predate task tags. */
+function isGenerativeCatalogItem(item) {
+  const taskTags = Array.isArray(item?.task_tags)
+    ? item.task_tags.map((tag) => String(tag || '').toLowerCase())
+    : []
+  return item?.architecture !== 'nomic-bert' && !taskTags.includes('embeddings')
+}
+
 /* The one model a fresh install is offered.
 
    Rules, in order, and each is a refusal rather than a fallback:
 
-   1. Only `supported_*` contract rows. The first thing a new user runs must be a row
-      Camelid has cross-validated — never an experimental or merely-runnable one. The
-      test suite pins this, because "just take the smallest curated row" would have
-      quietly started offering an unverified model the day one was added.
+   1. Only generative `supported_*` contract rows. The first thing a new user runs
+      must be a row Camelid has cross-validated for Chat — never an encoder sidecar,
+      experimental row, or merely-runnable row. The test suite pins this, because
+      "just take the smallest supported row" would offer the much smaller Nomic
+      embedding model and still leave Chat without a model.
    2. Only rows this host can actually load. A row the load-time fit guard would
       refuse with a 422 must never be offered; that turns one click into a dead end.
    3. Smallest first. The cost of the first token is the download, so the shortest
@@ -62,7 +76,9 @@ function bySmallestDownload(a, b) {
                            backend, or a contract that advertises none). */
 export function recommendFirstRunModel(items = [], capabilities = null) {
   const supported = (items || []).filter(
-    (item) => item?.group === 'curated' && isCompatibilitySupportedForModel(capabilities, null, item),
+    (item) => item?.group === 'curated'
+      && isGenerativeCatalogItem(item)
+      && isCompatibilitySupportedForModel(capabilities, null, item),
   )
   if (!supported.length) return { kind: 'no_supported_row', item: null, smallest: null }
 

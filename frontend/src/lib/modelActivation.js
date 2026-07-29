@@ -1,15 +1,14 @@
-/* The exact HTTP sequence that puts a local GGUF into the chat runtime, defined once.
+/* The exact HTTP sequence that puts a local GGUF into its runtime, defined once.
 
    Two surfaces run it — the Models page's "Use" action and the first-run activation
    card — and they must not drift, because the ORDER is the contract:
 
      1. header-only inspect, so an architecture Camelid cannot run is refused before
         anything reads a multi-GB file;
-     2. the authoritative load (`replace: true` — picking a model is a swap, not a
-        second resident copy, or the fit preflight refuses a model the host could
-        hold alone);
-     3. an identity check (the engine confirmed THIS filename) and a readiness check
-        (`loaded_now` + `generation_ready`), because "HTTP 200" is not "ready".
+     2. the authoritative load (generative models replace the active chat model;
+        the exact Nomic encoder registers as a sidecar without replacing it);
+     3. a lane-specific readiness check: active identity plus generation readiness
+        for chat, or a real bounded embedding for the encoder sidecar.
 
    A second hand-written copy is how one caller quietly loses step 1 or step 3. Every
    dependency is injected, so the whole sequence is testable with no backend. */
@@ -25,11 +24,13 @@ export function modelFilenameFromPath(value) {
 
 /* Load `filename` (a bare name inside the engine's configured models directory).
 
-   Returns `{ ok: true }`, or a typed failure `{ ok: false, stage, message, code,
-   blocker }`. `code` is the backend's stable `error.code` when it sent one — the
-   caller needs it to tell a permanent refusal (`model_too_large_for_host`) from
-   something worth retrying, and to avoid rendering a raw HTTP error. `blocker` is
-   the fail-closed `{ code, message }` shape the Models page renders verbatim.
+   Generative models return `{ ok: true }`; the supported Nomic encoder returns
+   `{ ok: true, embedding: true }` after its sidecar readiness probe. Failures use
+   `{ ok: false, stage, message, code, blocker }`. `code` is the backend's stable
+   `error.code` when it sent one — the caller needs it to tell a permanent refusal
+   (`model_too_large_for_host`) from something worth retrying, and to avoid rendering
+   a raw HTTP error. `blocker` is the fail-closed `{ code, message }` shape the Models
+   page renders verbatim.
 
    `readActiveFilename` exists so a caller that already owns a `/api/models/current`
    poll can answer the identity check from it: that response carries the full model
@@ -71,6 +72,7 @@ export async function loadLocalModelForChat({
         blocker: inspect.blocker,
       }
     }
+    const embeddingModel = inspect?.architecture === 'nomic-bert'
 
     // Only an inspected, implemented model reaches the authoritative load.
     stage = LOADING
@@ -78,7 +80,12 @@ export async function loadLocalModelForChat({
     const loadRes = await fetchImpl(`${base}/api/models/load`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: filename, path, replace: true }),
+      body: JSON.stringify({
+        id: filename,
+        path,
+        replace: !embeddingModel,
+        set_active: !embeddingModel,
+      }),
     })
     if (!loadRes.ok) {
       const body = await loadRes.json().catch(() => ({}))
@@ -93,6 +100,30 @@ export async function loadLocalModelForChat({
         code,
         blocker: code && code !== 'invalid_model' ? { code, message } : null,
       }
+    }
+
+    if (embeddingModel) {
+      const probeRes = await fetchImpl(`${base}/v1/embeddings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: filename,
+          input: 'search_query: Camelid embedding readiness probe',
+          dimensions: 256,
+        }),
+      })
+      const probe = await probeRes.json().catch(() => ({}))
+      if (!probeRes.ok || probe?.data?.[0]?.embedding?.length !== 256) {
+        return {
+          ok: false,
+          stage: LOADING,
+          message: probe?.error?.message
+            || `Camelid registered ${filename}, but its embedding runtime did not pass readiness.`,
+          code: probe?.error?.code || '',
+          blocker: null,
+        }
+      }
+      return { ok: true, embedding: true }
     }
 
     const activeFilename = readActiveFilename

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, mem,
     process::Command,
     sync::{atomic::AtomicU64, Arc},
@@ -342,6 +342,141 @@ pub struct Q8ResidencyReport {
     pub violations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MoeResidentMemoryEstimate {
+    resident_bytes: u64,
+    transient_bytes: u64,
+}
+
+fn q8_0_descriptor_resident_bytes(desc: &crate::gguf::GgufTensorDescriptor) -> Result<u64> {
+    if desc.tensor_type != GgufTensorType::Q8_0 {
+        return Err(BackendError::UnsupportedTensorType(format!(
+            "resident MoE tensor {} has storage type {:?}; resident_q8 requires Q8_0",
+            desc.name, desc.tensor_type
+        )));
+    }
+    let elements = desc.dimensions.iter().try_fold(1u64, |count, dim| {
+        count.checked_mul(*dim).ok_or_else(|| {
+            BackendError::InvalidModelMetadata(format!(
+                "MoE expert tensor {} element count overflowed u64",
+                desc.name
+            ))
+        })
+    })?;
+    if !elements.is_multiple_of(Q8_0_BLOCK_VALUES as u64) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "MoE expert tensor {} has {elements} elements, not Q8_0 block aligned",
+            desc.name
+        )));
+    }
+    (elements / Q8_0_BLOCK_VALUES as u64)
+        .checked_mul(mem::size_of::<Q8_0Block>() as u64)
+        .ok_or_else(|| {
+            BackendError::InvalidModelMetadata(format!(
+                "MoE expert tensor {} resident-byte estimate overflowed u64",
+                desc.name
+            ))
+        })
+}
+
+fn selected_moe_expert_storage_bytes(
+    binding: &LlamaTensorBinding,
+    layer_range: Option<&std::ops::Range<usize>>,
+) -> Result<MoeResidentMemoryEstimate> {
+    let mut names = HashSet::new();
+    let mut estimate = MoeResidentMemoryEstimate::default();
+    for (layer_idx, layer) in binding.layers.iter().enumerate() {
+        if layer_range.is_some_and(|range| !range.contains(&layer_idx)) {
+            continue;
+        }
+        let expert_sets = match &layer.ffn {
+            LlamaFfnTensors::Dense { .. } => continue,
+            LlamaFfnTensors::MoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            }
+            | LlamaFfnTensors::DeepSeekMoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            } => [gate_experts, up_experts, down_experts],
+        };
+        for expert_set in expert_sets {
+            let mut split_transient = 0u64;
+            for desc in expert_set.descriptors() {
+                let resident_bytes = q8_0_descriptor_resident_bytes(desc)?;
+                if names.insert(desc.name.as_str()) {
+                    estimate.resident_bytes = estimate
+                        .resident_bytes
+                        .checked_add(resident_bytes)
+                        .ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "MoE expert resident-byte estimate overflowed u64".to_string(),
+                        )
+                    })?;
+                }
+                let descriptor_transient = match expert_set {
+                    LlamaMoeExpertTensors::Merged(_) => desc.n_bytes,
+                    LlamaMoeExpertTensors::Split(_) => {
+                        desc.n_bytes.checked_add(resident_bytes).ok_or_else(|| {
+                            BackendError::InvalidModelMetadata(
+                                "MoE expert transient-byte estimate overflowed u64".to_string(),
+                            )
+                        })?
+                    }
+                };
+                split_transient = split_transient.max(descriptor_transient);
+            }
+            estimate.transient_bytes = estimate.transient_bytes.max(split_transient);
+        }
+    }
+    Ok(estimate)
+}
+
+fn resident_moe_preflight_error(
+    estimate: MoeResidentMemoryEstimate,
+    ram_status: Option<(u64, u64)>,
+) -> Option<String> {
+    if estimate.resident_bytes == 0 {
+        return None;
+    }
+    let (total, available) = ram_status?;
+    let headroom = crate::gait::ram_headroom_floor(total);
+    let required_available = estimate
+        .resident_bytes
+        .saturating_add(estimate.transient_bytes)
+        .saturating_add(headroom);
+    (available < required_available).then(|| {
+        format!(
+            "resident MoE experts require {:.2} GiB resident plus {:.2} GiB loader scratch and {:.2} GiB host headroom, but only {:.2} GiB is currently available; use {}=file_backed or free RAM",
+            estimate.resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            estimate.transient_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            headroom as f64 / (1024.0 * 1024.0 * 1024.0),
+            available as f64 / (1024.0 * 1024.0 * 1024.0),
+            crate::runtime_config::MOE_EXPERT_STORAGE_ENV,
+        )
+    })
+}
+
+fn preflight_resident_moe_experts(estimate: MoeResidentMemoryEstimate) -> Result<()> {
+    if estimate.resident_bytes == 0 {
+        return Ok(());
+    }
+    let ram_status = crate::gait::host_ram_status().ok_or_else(|| {
+        BackendError::UnsupportedTensorType(format!(
+            "{}=resident_q8 requires a live physical-RAM probe on this platform",
+            crate::runtime_config::MOE_EXPERT_STORAGE_ENV
+        ))
+    })?;
+    if let Some(message) = resident_moe_preflight_error(estimate, Some(ram_status)) {
+        return Err(BackendError::UnsupportedTensorType(message));
+    }
+    Ok(())
+}
+
 impl LlamaLoadedWeights {
     pub fn output_projection(&self) -> &CpuTensor {
         self.output.as_ref().unwrap_or(&self.token_embedding)
@@ -352,8 +487,9 @@ impl LlamaLoadedWeights {
     /// runtime-repacked-without-blocks is reported as a violation so callers (the
     /// distributed CLI nodes) can hard-fail instead of silently streaming weights from disk
     /// per token. Unowned pipeline layers are zero-element placeholders with no
-    /// `source_type` and are skipped naturally. MoE expert tensors are file-backed by
-    /// design and are excluded (the resident decode path rejects MoE models anyway).
+    /// `source_type` and are skipped naturally. MoE expert tensors are excluded because
+    /// the dense resident-decode path rejects MoE models; their residency is governed by
+    /// the separate, live-memory-gated MoE expert storage policy.
     pub fn q8_0_residency_report(&self) -> Q8ResidencyReport {
         let mut report = Q8ResidencyReport::default();
         let mut audit = |tensor: &CpuTensor| {
@@ -510,6 +646,19 @@ impl LlamaLoadedWeights {
                  from disk per token instead of residing in RAM (expect ~100x slower decode)"
             );
         }
+        let moe_expert_storage = crate::runtime_config::moe_expert_storage();
+        if moe_expert_storage == crate::runtime_config::MoeExpertStorage::ResidentQ8 {
+            let estimate = selected_moe_expert_storage_bytes(binding, layer_range.as_ref())?;
+            preflight_resident_moe_experts(estimate)?;
+            if estimate.resident_bytes > 0 {
+                eprintln!(
+                    "[camelid] {}=resident_q8: retaining {:.2} GiB of MoE expert blocks in RAM ({:.2} GiB peak loader scratch)",
+                    crate::runtime_config::MOE_EXPERT_STORAGE_ENV,
+                    estimate.resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    estimate.transient_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
+        }
         let load_linear = |name: &str| {
             // K-quant (Q4_K / Q6_K) 2-D linears: retain only the raw super-block wire
             // bytes (no f32 materialization ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â an 8B model fully decoded to f32 is ~32 GB
@@ -546,7 +695,14 @@ impl LlamaLoadedWeights {
             }
         };
         let load_moe_experts = |experts: &LlamaMoeExpertTensors| match experts {
-            LlamaMoeExpertTensors::Merged(desc) => store.load_q8_0_file_backed_tensor(&desc.name),
+            LlamaMoeExpertTensors::Merged(desc) => match moe_expert_storage {
+                crate::runtime_config::MoeExpertStorage::FileBacked => {
+                    store.load_q8_0_file_backed_tensor(&desc.name)
+                }
+                crate::runtime_config::MoeExpertStorage::ResidentQ8 => {
+                    store.load_q8_0_block_backed_tensor(&desc.name)
+                }
+            },
             LlamaMoeExpertTensors::Split(descs) => {
                 let first = descs.first().ok_or_else(|| {
                     BackendError::InvalidModelMetadata(
@@ -556,11 +712,15 @@ impl LlamaLoadedWeights {
                 let mut dims: Vec<usize> =
                     first.dimensions.iter().map(|dim| *dim as usize).collect();
                 dims.push(descs.len());
-                store.load_q8_0_split_file_backed_tensor(
-                    format!("{}..{} split experts", first.name, descs.len()),
-                    dims,
-                    descs,
-                )
+                let name = format!("{}..{} split experts", first.name, descs.len());
+                match moe_expert_storage {
+                    crate::runtime_config::MoeExpertStorage::FileBacked => {
+                        store.load_q8_0_split_file_backed_tensor(name, dims, descs)
+                    }
+                    crate::runtime_config::MoeExpertStorage::ResidentQ8 => {
+                        store.load_q8_0_split_block_backed_tensor(name, dims, descs)
+                    }
+                }
             }
         };
         let token_embedding = if load_embedding {
@@ -1370,6 +1530,21 @@ pub struct LlamaMixtralMoeRowTrace {
     pub router_logits: Vec<f32>,
     pub selected_experts: Vec<usize>,
     pub selected_weights: Vec<f32>,
+    /// Per-selected-expert checkpoints at the exact diagnostic token. These
+    /// distinguish routing drift from expert projection/combine drift without
+    /// retaining full hidden or FFN vectors.
+    pub experts: Vec<LlamaMixtralMoeExpertTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaMixtralMoeExpertTrace {
+    pub expert_index: usize,
+    pub normalized_weight: f32,
+    pub gate: LlamaTensorStats,
+    pub up: LlamaTensorStats,
+    pub activation: LlamaTensorStats,
+    pub down: LlamaTensorStats,
+    pub weighted_down: LlamaTensorStats,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -8107,7 +8282,7 @@ fn linear_for_role(
     )
 }
 
-fn linear_for_role_runtime(
+pub(crate) fn linear_for_role_runtime(
     input: &CpuTensor,
     weight: &CpuTensor,
     name: impl Into<String>,
@@ -8807,7 +8982,7 @@ impl<'a> BorrowedLinearWeight<'a> {
             cols: weight.dim(1)?,
             data: &weight.data,
             source_type: weight.source_type,
-            q8_0_blocks: weight.q8_0_blocks.as_deref(),
+            q8_0_blocks: weight.q8_0_block_slice(),
             q8_0_packed_rows4_4x4: weight.q8_0_packed_rows4_4x4.as_ref(),
             q8_0_packed_rows4_4x8: weight.q8_0_packed_rows4_4x8.as_ref(),
             q8_0_runtime_storage: weight.q8_0_runtime_storage.as_ref(),
@@ -11061,6 +11236,15 @@ fn expert_matrix_view(
     let expert_elements = input_width.checked_mul(output_width).ok_or_else(|| {
         BackendError::RuntimeShapeMismatch("MoE expert element count overflow".to_string())
     })?;
+    let uses_q8_storage = weight.q8_0_shared_blocks.is_some()
+        || weight.q8_0_blocks.is_some()
+        || weight.q8_0_file_backing.is_some()
+        || weight.q8_0_split_file_backing.is_some();
+    if uses_q8_storage && !expert_elements.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "MoE expert element count {expert_elements} is not Q8_0 block aligned"
+        )));
+    }
     if weight.dim(0)? != input_width || weight.dim(1)? != output_width {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "MoE expert tensor {} expected per-expert dims [{input_width}, {output_width}], got {:?}",
@@ -11102,6 +11286,35 @@ fn expert_matrix_view(
                 block_count,
             ),
         )
+    } else if let Some(shared) = &weight.q8_0_shared_blocks {
+        CpuTensor::from_q8_0_shared_blocks(
+            name,
+            TensorShape {
+                dims: vec![output_width, input_width],
+            },
+            Arc::clone(&shared.blocks),
+            shared.start + block_offset,
+            block_count,
+        )?
+    } else if let Some(blocks) = &weight.q8_0_blocks {
+        let expert_blocks = blocks
+            .get(block_offset..block_offset + block_count)
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(format!(
+                    "MoE expert block slice {}..{} missing from {}",
+                    block_offset,
+                    block_offset + block_count,
+                    weight.name
+                ))
+            })?
+            .to_vec();
+        CpuTensor::from_q8_0_blocks(
+            name,
+            TensorShape {
+                dims: vec![output_width, input_width],
+            },
+            expert_blocks,
+        )?
     } else {
         let start = expert_elements * expert_idx;
         let end = start + expert_elements;
@@ -11118,9 +11331,6 @@ fn expert_matrix_view(
         CpuTensor::from_f32(name, vec![output_width, input_width], data)?
     };
     tensor.source_type = weight.source_type;
-    if let Some(blocks) = &weight.q8_0_blocks {
-        tensor.q8_0_blocks = Some(blocks[block_offset..block_offset + block_count].to_vec());
-    }
     Ok(tensor)
 }
 
@@ -11186,25 +11396,37 @@ fn mixtral_moe_ffn(
             &logits.data[row * expert_count..(row + 1) * expert_count],
             expert_used_count,
         );
-        if let Some(trace) = &mut trace {
-            trace.rows.push(LlamaMixtralMoeRowTrace {
-                row_index: row,
-                router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
-                selected_experts: top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
-                selected_weights: top.iter().map(|(_, weight)| *weight).collect(),
-            });
-        }
+        // Keep diagnostics allocation-free when tracing is disabled. This
+        // function is on every MoE token/layer, so even two tiny Vecs per row
+        // would be a measurable regression on the unchanged default path.
+        let selected = options.collect_trace.then(|| {
+            (
+                top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
+                top.iter().map(|(_, weight)| *weight).collect(),
+            )
+        });
+        let mut expert_traces =
+            Vec::with_capacity(if options.collect_trace { top.len() } else { 0 });
         for (expert_idx, weight) in top {
             let gate =
                 expert_matrix_view(gate_experts, expert_idx, hidden, ff, "mixtral_gate_expert")?;
             let up = expert_matrix_view(up_experts, expert_idx, hidden, ff, "mixtral_up_expert")?;
             let down =
                 expert_matrix_view(down_experts, expert_idx, ff, hidden, "mixtral_down_expert")?;
-            let activated =
-                gated_ffn_activation(&row_input, &gate, &up, "mixtral_expert_activated", false)?;
+            let mut activated = gated_ffn_activation(
+                &row_input,
+                &gate,
+                &up,
+                "mixtral_expert_activated",
+                options.collect_trace,
+            )?;
             gate_elapsed += activated.gate;
             up_elapsed += activated.up;
             activation_elapsed += activated.activation;
+            let activation_stats = options
+                .collect_trace
+                .then(|| LlamaTensorStats::from_tensor(&activated.tensor))
+                .transpose()?;
             let started = Instant::now();
             let expert_out = linear_for_role_runtime(
                 &activated.tensor,
@@ -11214,9 +11436,46 @@ fn mixtral_moe_ffn(
                 false,
             )?;
             down_elapsed += started.elapsed().as_micros();
-            for col in 0..hidden {
-                output[row * hidden + col] += expert_out.data[col] * weight;
+            if options.collect_trace {
+                let contribution = CpuTensor::from_f32(
+                    "mixtral_expert_weighted_down",
+                    vec![1, hidden],
+                    expert_out.data.iter().map(|value| value * weight).collect(),
+                )?;
+                for col in 0..hidden {
+                    output[row * hidden + col] += contribution.data[col];
+                }
+                expert_traces.push(LlamaMixtralMoeExpertTrace {
+                    expert_index: expert_idx,
+                    normalized_weight: weight,
+                    gate: activated
+                        .gate_stats
+                        .take()
+                        .expect("MoE gate statistics requested"),
+                    up: activated
+                        .up_stats
+                        .take()
+                        .expect("MoE up statistics requested"),
+                    activation: activation_stats.expect("MoE activation statistics requested"),
+                    down: LlamaTensorStats::from_tensor(&expert_out)?,
+                    weighted_down: LlamaTensorStats::from_tensor(&contribution)?,
+                });
+            } else {
+                for col in 0..hidden {
+                    output[row * hidden + col] += expert_out.data[col] * weight;
+                }
             }
+        }
+        if let Some(trace) = &mut trace {
+            let (selected_experts, selected_weights) =
+                selected.expect("MoE selection trace requested");
+            trace.rows.push(LlamaMixtralMoeRowTrace {
+                row_index: row,
+                router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
+                selected_experts,
+                selected_weights,
+                experts: expert_traces,
+            });
         }
     }
     Ok((
@@ -11380,6 +11639,7 @@ fn deepseek_moe_ffn(
                 router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
                 selected_experts: top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
                 selected_weights: top.iter().map(|(_, weight)| *weight).collect(),
+                experts: Vec::new(),
             });
         }
         for (expert_idx, weight) in top {
@@ -11643,7 +11903,7 @@ fn should_use_q8_0_block_dot_with_plan(
 ) -> bool {
     runtime_plan.q8.block_dot
         && weight.source_type == Some(GgufTensorType::Q8_0)
-        && (weight.q8_0_blocks.is_some() || q8_0_selected_packed_rows4(weight).is_some())
+        && (weight.q8_0_block_slice().is_some() || q8_0_selected_packed_rows4(weight).is_some())
         && input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
 }
 
@@ -11712,7 +11972,8 @@ fn resident_decode_metal_enabled() -> bool {
 
 fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) -> bool {
     tensor.source_type == Some(GgufTensorType::Q8_0)
-        && (tensor.q8_0_blocks.is_some() || (wire_mode_active && tensor.q8_0_wire_pages.is_some()))
+        && (tensor.q8_0_block_slice().is_some()
+            || (wire_mode_active && tensor.q8_0_wire_pages.is_some()))
 }
 
 /// Process-global resident CUDA engine, keyed by the model's weight identity.
@@ -17338,7 +17599,8 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
     }
     let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
     let expected_blocks = output_width * blocks_per_row;
-    if let Some(weight_blocks) = weight.q8_0_blocks.as_ref() {
+    let retained_blocks = weight.q8_0_block_slice();
+    if let Some(weight_blocks) = retained_blocks {
         if weight_blocks.len() != expected_blocks {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "q8_0 block-dot expected {expected_blocks} blocks for weight {} shape {:?}, got {}",
@@ -17395,10 +17657,7 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
                         return;
                     }
                 }
-                let weight_blocks = weight
-                    .q8_0_blocks
-                    .as_ref()
-                    .expect("q8_0 block-dot precondition checked");
+                let weight_blocks = retained_blocks.expect("q8_0 block-dot precondition checked");
                 for (output_idx, out_value) in output_row.iter_mut().enumerate() {
                     let weight_start = output_idx * blocks_per_row;
                     *out_value = q8_0_dot_rows(
@@ -17425,10 +17684,7 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
                     continue;
                 }
             }
-            let weight_blocks = weight
-                .q8_0_blocks
-                .as_ref()
-                .expect("q8_0 block-dot precondition checked");
+            let weight_blocks = retained_blocks.expect("q8_0 block-dot precondition checked");
             if runtime_plan.q8.metal_retained {
                 let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
                 if with_q8_0_block_scales_and_quants(

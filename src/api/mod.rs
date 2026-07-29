@@ -9,8 +9,9 @@ use std::{
 };
 
 use axum::{
-    extract::{rejection::JsonRejection, Path as AxumPath, Query, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware,
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
@@ -20,17 +21,22 @@ use minijinja::{
     UndefinedBehavior,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 
 #[allow(dead_code)]
 mod continuous_batch;
 mod engine;
+mod metrics;
+mod server;
 mod workspace;
 
+pub use server::ServeOptions;
+
 use crate::{
+    embedding::{cosine_similarity, EncoderConfig, NomicBertRuntime},
     execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
@@ -114,6 +120,12 @@ pub struct AppState {
     /// parallel to the optimized engine (which keeps failing closed for this
     /// arch by design) — see the bridge near `dg_chat_nonstreaming`.
     dg_runtimes: Arc<RwLock<HashMap<String, Arc<DgServeRuntime>>>>,
+    /// Bidirectional encoder runtimes, loaded lazily on the first embeddings or
+    /// reranking request and released with the owning model.
+    embedding_runtimes: Arc<RwLock<HashMap<String, Arc<NomicBertRuntime>>>>,
+    /// Prevent concurrent first-use requests from loading the same encoder
+    /// weights more than once and temporarily doubling resident memory.
+    embedding_runtime_load: Arc<tokio::sync::Mutex<()>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
     active_model_id: Arc<RwLock<Option<String>>>,
@@ -127,7 +139,7 @@ pub struct AppState {
     model_transition: Arc<tokio::sync::Mutex<()>>,
     /// Per-process nonce makes scan-issued deletion tokens opaque and prevents
     /// clients from constructing authorization from visible file metadata.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     model_delete_nonce: Arc<str>,
     /// Destructive local-file management is available only when the listener
     /// itself is bound to loopback.
@@ -162,6 +174,10 @@ pub struct AppState {
     /// paths never touch it, and a relative path that exists against the
     /// process CWD keeps its historical meaning — this only adds a fallback.
     models_dir: PathBuf,
+    /// Immutable request/token/download ceilings resolved at startup.
+    server_limits: server::ServerLimits,
+    /// Lock-free process metrics shared by middleware and decode jobs.
+    metrics: metrics::ServerMetrics,
 }
 
 impl Default for AppState {
@@ -171,6 +187,8 @@ impl Default for AppState {
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
             runnable_runtimes: Arc::new(RwLock::new(HashMap::new())),
             dg_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            embedding_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            embedding_runtime_load: Arc::new(tokio::sync::Mutex::new(())),
             execution_plans: Arc::new(RwLock::new(HashMap::new())),
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
             active_model_id: Arc::new(RwLock::new(None)),
@@ -178,7 +196,7 @@ impl Default for AppState {
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::from_env())),
             model_file_lifecycle: Arc::new(RwLock::new(())),
             model_transition: Arc::new(tokio::sync::Mutex::new(())),
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             model_delete_nonce: Arc::from(uuid::Uuid::new_v4().to_string()),
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -191,6 +209,8 @@ impl Default for AppState {
             configured_threads: None,
             default_enable_thinking: false,
             models_dir: resolve_models_dir(None),
+            server_limits: server::ServerPolicy::loopback_default().limits,
+            metrics: metrics::ServerMetrics::default(),
         }
     }
 }
@@ -234,6 +254,11 @@ impl AppState {
 
     fn with_workspace_cli_token(mut self, token: Option<&str>) -> Self {
         self.workspace_cli_token = token.map(Arc::from);
+        self
+    }
+
+    fn with_server_policy(mut self, policy: &server::ServerPolicy) -> Self {
+        self.server_limits = policy.limits;
         self
     }
 
@@ -436,6 +461,11 @@ pub struct LoadModelRequest {
     /// second resident copy that the fit guard then refuses.
     #[serde(default)]
     pub replace: bool,
+    /// Keep the current generation model active while registering this model.
+    /// Useful for sidecar encoders that Workspace and `/v1/embeddings` address
+    /// explicitly. Omitted preserves the historical activate-on-load behavior.
+    #[serde(default)]
+    pub set_active: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -459,6 +489,11 @@ pub struct HealthResponse {
     /// finished (queued + running). Bounded by CAMELID_QUEUE_DEPTH; beyond the
     /// bound requests get a typed 503 (`engine_queue_full`).
     pub engine_queue_depth: usize,
+    pub engine_queued_tasks: usize,
+    pub engine_active_task_id: Option<u64>,
+    pub engine_active_generated_tokens: u64,
+    pub engine_active_elapsed_seconds: u64,
+    pub engine_stalled_seconds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -636,14 +671,17 @@ pub struct ChatCompletionRequest {
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
     pub parallel_tool_calls: Option<bool>,
-    /// OpenAI `response_format`. `{"type":"json_object"}` turns on JSON-grammar-
-    /// constrained decoding (output guaranteed valid JSON). `{"type":"json_schema",
-    /// "json_schema":{"schema":{...}}}` constrains the output to a supported JSON
-    /// Schema subset -- see `docs/architecture/STRUCTURED_OUTPUTS.md` for the exact
-    /// contract; schemas outside the subset are a typed 400 naming the keyword.
-    /// `{"type":"text"}`/absent is normal decoding; other types are rejected.
-    /// Non-streaming only. Declared here so it is not in `unsupported_fields`.
+    /// OpenAI `response_format`. JSON object and JSON Schema constraints are
+    /// compiled by LLGuidance and enforced token-by-token. Camelid additionally
+    /// accepts `{"type":"grammar","grammar":"..."}` for a Lark/LLGuidance CFG.
+    /// Unsupported schemas/grammars fail closed with a typed 400.
     pub response_format: Option<serde_json::Value>,
+    /// llama.cpp-compatible top-level JSON Schema extension. Mutually exclusive
+    /// with `response_format` and `grammar`.
+    pub json_schema: Option<serde_json::Value>,
+    /// llama.cpp-compatible LLGuidance/Lark grammar extension. Mutually exclusive
+    /// with `response_format` and `json_schema`.
+    pub grammar: Option<String>,
     /// OpenAI `stream_options`. The only honored subfield is `include_usage`
     /// (bool); any other shape or subfield is tolerated silently and ignored,
     /// matching the permissive llama-server oracle. Parsed as a raw value so a
@@ -1090,6 +1128,9 @@ pub struct LlamaServerSlotCamelid {
     /// finished (queued + running). See `HealthResponse::engine_queue_depth`.
     pub engine_queue_depth: usize,
     pub queued_tasks: usize,
+    pub active_generated_tokens: u64,
+    pub active_elapsed_seconds: u64,
+    pub stalled_seconds: u64,
     pub unsupported: Vec<&'static str>,
 }
 
@@ -1588,6 +1629,8 @@ struct PreparedGeneration {
     dense_metadata: DenseDiagnosticMetadata,
     timings: GenerationTimings,
     cached_prompt_prefix: Arc<Mutex<PromptPrefixCachePool>>,
+    metrics: metrics::ServerMetrics,
+    engine_progress: engine::EngineHandle,
     speculative: Option<PreparedSpeculative>,
     /// Captured request identity for the live telemetry stream; taken by the
     /// generation path that actually runs (streaming or blocking).
@@ -1952,6 +1995,14 @@ pub(crate) fn router_with_workspace_cli_token_for_tests(token: &str) -> Router {
 }
 
 pub fn router_with_state(state: AppState) -> Router {
+    router_with_state_and_policy(state, server::ServerPolicy::loopback_default())
+}
+
+fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -> Router {
+    let auth = policy.auth.clone();
+    let cors = policy.cors_layer();
+    let body_limit = policy.limits.max_request_body_bytes;
+    let metrics = state.metrics.clone();
     Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
@@ -1989,13 +2040,13 @@ pub fn router_with_state(state: AppState) -> Router {
             "/slots",
             get(llama_server_slots).post(unsupported_llama_server_slots),
         )
-        .route("/metrics", get(unsupported_llama_server_metrics))
+        .route("/metrics", get(metrics::prometheus))
         .route("/completion", post(llama_server_completion))
         .route("/infill", post(unsupported_llama_server_infill))
-        .route("/embedding", post(unsupported_embeddings))
-        .route("/embeddings", post(unsupported_embeddings))
-        .route("/rerank", post(unsupported_reranking))
-        .route("/reranking", post(unsupported_reranking))
+        .route("/embedding", post(embeddings))
+        .route("/embeddings", post(embeddings))
+        .route("/rerank", post(rerank))
+        .route("/reranking", post(rerank))
         .route(
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
@@ -2056,16 +2107,22 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/models/:model", get(v1_model))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/embeddings", post(unsupported_embeddings))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(unsupported_responses))
         .route("/v1/messages", post(unsupported_messages))
-        .route("/v1/rerank", post(unsupported_reranking))
-        .route("/v1/reranking", post(unsupported_reranking))
+        .route("/v1/rerank", post(rerank))
+        .route("/v1/reranking", post(rerank))
         // Anything not matched above is served from the embedded web UI (the
         // chat surface and its static assets), with a client-side-route
         // fallback to the app shell. API routes are matched first.
         .fallback(crate::web_ui::handler)
-        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn_with_state(auth, server::authenticate))
+        .layer(middleware::from_fn_with_state(
+            metrics,
+            metrics::observe_http,
+        ))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -2077,15 +2134,19 @@ pub async fn serve(
     open_ui: bool,
     default_enable_thinking: bool,
     models_dir: Option<PathBuf>,
+    options: ServeOptions,
 ) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let policy = server::ServerPolicy::resolve(addr, options)?;
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
     let mut state = AppState::with_configured_threads(configured_threads)
         .with_default_enable_thinking(default_enable_thinking)
         .with_local_model_delete(addr.ip().is_loopback())
         .with_models_dir(models_dir)
-        .with_serve_addr(addr);
+        .with_serve_addr(addr)
+        .with_server_policy(&policy);
     if let Some(model_path) = initial_model {
-        if let Err(err) = load_model_from_path(&state, model_path, None).await {
+        if let Err(err) = load_model_from_path(&state, model_path, None, true).await {
             tracing::error!(error=%err, "failed to load startup model");
             eprintln!("\n  Could not load that model: {err}");
             eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
@@ -2113,8 +2174,24 @@ pub async fn serve(
             .as_ref()
             .map(crate::workspace_auth::WorkspaceCliCredential::token),
     );
-    tracing::info!(%addr, "camelid server listening");
-    let url = format!("http://{addr}");
+    tracing::info!(
+        %addr,
+        auth_enabled = policy.auth.enabled(),
+        tls_enabled = policy.tls.is_some(),
+        cors_origin_count = policy.cors_origin_count(),
+        max_request_body_bytes = policy.limits.max_request_body_bytes,
+        max_prompt_tokens = policy.limits.max_prompt_tokens,
+        max_generation_tokens = policy.limits.max_generation_tokens,
+        max_download_bytes = policy.limits.max_download_bytes,
+        remote_unauthenticated_override = policy.remote_unauthenticated_override,
+        "camelid server policy resolved"
+    );
+    let scheme = if policy.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let url = format!("{scheme}://{addr}");
 
     // Warm the model-fit dimension cache in the background: header-only reads
     // (never weights), disk-cached across restarts, de-duplicated, and globally
@@ -2137,7 +2214,28 @@ pub async fn serve(
     // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
     // to the old lazy build and is not fatal.
     let warm_model_id = state.active_model_id.read().await.clone();
-    let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
+    let app = router_with_state_and_policy(state, policy.clone());
+    let tls_enabled = policy.tls.is_some();
+    let server = if let Some(tls) = &policy.tls {
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key)
+            .await
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("could not load TLS certificate/key: {error}"),
+                )
+            })?;
+        let server = axum_server::from_tcp_rustls(std_listener, tls_config)?;
+        tokio::spawn(async move {
+            server
+                .serve(app.into_make_service())
+                .await
+                .map_err(std::io::Error::other)
+        })
+    } else {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        tokio::spawn(async move { axum::serve(listener, app).await })
+    };
     if let Some(model_id) = warm_model_id {
         // Word the banner for the device that will actually serve â€” saying "GPU"
         // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
@@ -2147,7 +2245,11 @@ pub async fn serve(
             "ðŸª Warming up the model (building the engine, one-time)â€¦"
         };
         eprintln!("\n  {warming_msg}");
-        warmup_generation_blocking(addr, model_id).await;
+        if tls_enabled {
+            tracing::info!("skipping HTTP self-warmup because TLS is enabled");
+        } else {
+            warmup_generation_blocking(addr, model_id, policy.auth.bearer_header_line()).await;
+        }
     }
     print_ready_banner(&url);
     if workspace_cli_credential.is_some() {
@@ -2164,14 +2266,21 @@ pub async fn serve(
 /// first prefill run). Runs the blocking `std::net` round-trip on the blocking pool so
 /// the spawned server task can answer it concurrently. Best-effort: any failure (or
 /// the 180s safety timeout) just returns, leaving the old lazy-build behaviour.
-async fn warmup_generation_blocking(addr: SocketAddr, model_id: String) {
-    let _ = tokio::task::spawn_blocking(move || warmup_request(addr, &model_id)).await;
+async fn warmup_generation_blocking(
+    addr: SocketAddr,
+    model_id: String,
+    auth_header: Option<String>,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        warmup_request(addr, &model_id, auth_header.as_deref())
+    })
+    .await;
 }
 
 /// Send the warm-up chat request and read the full response (blocking). Returns once
 /// the forward has completed so the resident engine is built before the caller
 /// proceeds. Errors are swallowed by the caller â€” this only shaves the cold start.
-fn warmup_request(addr: SocketAddr, model_id: &str) {
+fn warmup_request(addr: SocketAddr, model_id: &str, auth_header: Option<&str>) {
     use std::io::{Read, Write};
     // Give the just-spawned listener a moment to start accepting; retry briefly.
     let mut stream = None;
@@ -2197,8 +2306,9 @@ fn warmup_request(addr: SocketAddr, model_id: &str) {
         "stream": false,
     })
     .to_string();
+    let auth_header = auth_header.unwrap_or("");
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body,
     );
@@ -2291,6 +2401,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         .as_ref()
         .and_then(|id| execution_plans.get(id))
         .cloned();
+    let slot = state.engine.slot_snapshot();
     Json(HealthResponse {
         ok: true,
         engine: "camelid",
@@ -2303,6 +2414,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         model_family,
         gemma4_available,
         engine_queue_depth: state.engine.depth(),
+        engine_queued_tasks: slot.queued_tasks,
+        engine_active_task_id: slot.active_task_id,
+        engine_active_generated_tokens: slot.completed_units,
+        engine_active_elapsed_seconds: slot.active_elapsed_seconds,
+        engine_stalled_seconds: slot.stalled_seconds,
     })
 }
 
@@ -2421,7 +2537,7 @@ async fn llama_server_models_load(
         );
     };
 
-    match load_model_from_path(&state, path, req.id).await {
+    match load_model_from_path(&state, path, req.id, true).await {
         Ok(loaded) => {
             let item = LlamaServerModelListItem {
                 id: loaded.id.clone(),
@@ -2717,6 +2833,9 @@ async fn llama_server_slots(
                 status,
                 engine_queue_depth: state.engine.depth(),
                 queued_tasks: slot.queued_tasks,
+                active_generated_tokens: slot.completed_units,
+                active_elapsed_seconds: slot.active_elapsed_seconds,
+                stalled_seconds: slot.stalled_seconds,
                 unsupported: vec![
                     "post_slots",
                     "slot_cache_save_restore_erase",
@@ -2735,14 +2854,6 @@ async fn unsupported_llama_server_slots() -> Response {
         "unsupported_llama_server_slots",
         "POST /slots and llama-server slot cache actions are not supported yet; Camelid exposes GET /slots as a read-only compatibility snapshot",
         Some("slots"),
-    )
-}
-
-async fn unsupported_llama_server_metrics() -> Response {
-    unsupported_route(
-        "unsupported_llama_server_metrics",
-        "GET /metrics is not supported yet; Camelid has no llama-server metrics compatibility contract, prompt-cache metrics, or continuous batching telemetry surface for this route",
-        Some("metrics"),
     )
 }
 
@@ -2909,20 +3020,458 @@ async fn unsupported_llama_server_infill() -> Response {
     )
 }
 
-async fn unsupported_embeddings() -> Response {
-    unsupported_route(
-        "unsupported_embeddings",
-        "embeddings are not supported yet; Camelid has no embeddings runtime or compatibility contract for this route",
-        Some("input"),
-    )
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Text(String),
+    Batch(Vec<String>),
 }
 
-async fn unsupported_reranking() -> Response {
-    unsupported_route(
-        "unsupported_reranking",
-        "reranking is not supported yet; Camelid has no reranking runtime or compatibility contract for this route",
-        Some("input"),
+impl EmbeddingInput {
+    fn into_batch(self) -> Vec<String> {
+        match self {
+            Self::Text(text) => vec![text],
+            Self::Batch(batch) => batch,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingRequest {
+    #[serde(default)]
+    model: Option<String>,
+    input: EmbeddingInput,
+    #[serde(default)]
+    encoding_format: Option<String>,
+    #[serde(default)]
+    dimensions: Option<usize>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingData {
+    object: &'static str,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingUsage {
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: String,
+    usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RerankDocument {
+    Text(String),
+    Object { text: String },
+}
+
+impl RerankDocument {
+    fn text(&self) -> &str {
+        match self {
+            Self::Text(text) | Self::Object { text } => text,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankRequest {
+    #[serde(default)]
+    model: Option<String>,
+    query: String,
+    documents: Vec<RerankDocument>,
+    #[serde(default)]
+    top_n: Option<usize>,
+    #[serde(default)]
+    return_documents: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankResultDocument<'a> {
+    text: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankResult<'a> {
+    index: usize,
+    relevance_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<RerankResultDocument<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankResponse<'a> {
+    id: String,
+    model: String,
+    results: Vec<RerankResult<'a>>,
+    usage: EmbeddingUsage,
+}
+
+async fn resolve_embedding_runtime(
+    state: &AppState,
+    requested_model: Option<&str>,
+) -> std::result::Result<(String, Arc<NomicBertRuntime>), Response> {
+    let model_id = match requested_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(model_id) => model_id.to_string(),
+        None => {
+            let active = state.active_model_id.read().await.clone();
+            let loaded = state.loaded_models.read().await;
+            let active_embedding = active.filter(|id| {
+                loaded
+                    .get(id)
+                    .is_some_and(|model| model.gguf.architecture() == Some("nomic-bert"))
+            });
+            active_embedding
+                .or_else(|| {
+                    let mut candidates = loaded
+                        .values()
+                        .filter(|model| model.gguf.architecture() == Some("nomic-bert"))
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>();
+                    candidates.sort();
+                    candidates.into_iter().next()
+                })
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::NOT_FOUND,
+                        "model_not_loaded",
+                        "load a supported embedding model before requesting embeddings".to_string(),
+                        Some("model"),
+                    )
+                })?
+        }
+    };
+    if let Some(runtime) = state
+        .embedding_runtimes
+        .read()
+        .await
+        .get(&model_id)
+        .cloned()
+    {
+        return Ok((model_id, runtime));
+    }
+    let _load = state.embedding_runtime_load.lock().await;
+    if let Some(runtime) = state
+        .embedding_runtimes
+        .read()
+        .await
+        .get(&model_id)
+        .cloned()
+    {
+        return Ok((model_id, runtime));
+    }
+
+    let model = state
+        .loaded_models
+        .read()
+        .await
+        .get(&model_id)
+        .cloned()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("model {model_id:?} is not loaded"),
+                Some("model"),
+            )
+        })?;
+    if model.gguf.architecture() != Some("nomic-bert") {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model_not_embedding_capable",
+            format!(
+                "model {model_id:?} uses architecture {:?}; the current embedding runtime requires \"nomic-bert\"",
+                model.gguf.architecture().unwrap_or("unknown")
+            ),
+            Some("model"),
+        ));
+    }
+
+    let path = model.path.clone();
+    let _reader = state.model_file_lifecycle.read().await;
+    let loaded = tokio::task::spawn_blocking(move || NomicBertRuntime::load(path)).await;
+    let runtime = match loaded {
+        Ok(Ok(runtime)) => Arc::new(runtime),
+        Ok(Err(error)) => {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                backend_error_code(&error),
+                error.to_string(),
+                Some("model"),
+            ))
+        }
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "embedding_runtime_task_failed",
+                format!("embedding runtime load task failed: {error}"),
+                Some("model"),
+            ))
+        }
+    };
+    let runtime = {
+        let mut runtimes = state.embedding_runtimes.write().await;
+        runtimes
+            .entry(model_id.clone())
+            .or_insert_with(|| runtime.clone())
+            .clone()
+    };
+    Ok((model_id, runtime))
+}
+
+async fn embeddings(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<EmbeddingRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => return malformed_json_error(error),
+    };
+    if let Some(format) = request.encoding_format.as_deref() {
+        if format != "float" {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_embedding_encoding",
+                "encoding_format must be \"float\"; base64 output is not implemented".to_string(),
+                Some("encoding_format"),
+            );
+        }
+    }
+    let _ = request.user;
+    let inputs = request.input.into_batch();
+    if inputs.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_embedding_input",
+            "input must contain at least one string".to_string(),
+            Some("input"),
+        );
+    }
+    let (model_id, runtime) =
+        match resolve_embedding_runtime(&state, request.model.as_deref()).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+    let dimensions = request.dimensions;
+    let result = tokio::task::spawn_blocking(move || {
+        let embeddings = runtime.embed_batch(&inputs, dimensions)?;
+        let prompt_tokens = inputs
+            .iter()
+            .map(|input| {
+                runtime
+                    .tokenizer()
+                    .encode(input, true, false)
+                    .map(|ids| ids.len())
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        Ok::<_, BackendError>((embeddings, prompt_tokens))
+    })
+    .await;
+    let (embeddings, prompt_tokens) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                backend_error_code(&error),
+                error.to_string(),
+                Some("input"),
+            )
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "embedding_task_failed",
+                format!("embedding task failed: {error}"),
+                None,
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(EmbeddingResponse {
+            object: "list",
+            data: embeddings
+                .into_iter()
+                .enumerate()
+                .map(|(index, embedding)| EmbeddingData {
+                    object: "embedding",
+                    embedding,
+                    index,
+                })
+                .collect(),
+            model: model_id,
+            usage: EmbeddingUsage {
+                prompt_tokens,
+                total_tokens: prompt_tokens,
+            },
+        }),
     )
+        .into_response()
+}
+
+fn with_embedding_prefix(text: &str, prefix: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with("search_query:")
+        || trimmed.starts_with("search_document:")
+        || trimmed.starts_with("clustering:")
+        || trimmed.starts_with("classification:")
+    {
+        trimmed.to_string()
+    } else {
+        format!("{prefix}{trimmed}")
+    }
+}
+
+async fn rerank(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<RerankRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => return malformed_json_error(error),
+    };
+    if request.query.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_rerank_query",
+            "query must not be empty".to_string(),
+            Some("query"),
+        );
+    }
+    if request.documents.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_rerank_documents",
+            "documents must contain at least one item".to_string(),
+            Some("documents"),
+        );
+    }
+    let top_n = request.top_n.unwrap_or(request.documents.len());
+    if top_n == 0 || top_n > request.documents.len() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_rerank_top_n",
+            format!(
+                "top_n must be between 1 and the document count ({}), got {top_n}",
+                request.documents.len()
+            ),
+            Some("top_n"),
+        );
+    }
+    let (model_id, runtime) =
+        match resolve_embedding_runtime(&state, request.model.as_deref()).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+
+    let mut inputs = Vec::with_capacity(request.documents.len() + 1);
+    inputs.push(with_embedding_prefix(&request.query, "search_query: "));
+    inputs.extend(
+        request
+            .documents
+            .iter()
+            .map(|document| with_embedding_prefix(document.text(), "search_document: ")),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        let embeddings = runtime.embed_batch(&inputs, None)?;
+        let prompt_tokens = inputs
+            .iter()
+            .map(|input| {
+                runtime
+                    .tokenizer()
+                    .encode(input, true, false)
+                    .map(|ids| ids.len())
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        Ok::<_, BackendError>((embeddings, prompt_tokens))
+    })
+    .await;
+    let (embeddings, prompt_tokens) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                backend_error_code(&error),
+                error.to_string(),
+                Some("documents"),
+            )
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "rerank_task_failed",
+                format!("rerank task failed: {error}"),
+                None,
+            )
+        }
+    };
+    let query = &embeddings[0];
+    let mut ranked = embeddings[1..]
+        .iter()
+        .enumerate()
+        .map(|(index, document)| cosine_similarity(query, document).map(|score| (index, score)))
+        .collect::<crate::Result<Vec<_>>>();
+    let ranked = match ranked.as_mut() {
+        Ok(ranked) => {
+            ranked.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            ranked
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                backend_error_code(error),
+                error.to_string(),
+                None,
+            )
+        }
+    };
+    let results = ranked
+        .iter()
+        .take(top_n)
+        .map(|(index, relevance_score)| RerankResult {
+            index: *index,
+            relevance_score: *relevance_score,
+            document: request.return_documents.then(|| RerankResultDocument {
+                text: request.documents[*index].text(),
+            }),
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(RerankResponse {
+            id: format!("rerank-{}", uuid::Uuid::new_v4()),
+            model: model_id,
+            results,
+            usage: EmbeddingUsage {
+                prompt_tokens,
+                total_tokens: prompt_tokens,
+            },
+        }),
+    )
+        .into_response()
 }
 
 async fn unsupported_responses() -> Response {
@@ -3101,6 +3650,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         ],
         supported_model_families: vec![
             SupportItem {
+                id: "nomic_bert_encoder_exact_v1_5_q8_0",
+                status: "supported_exact_row_embedding_lane",
+                notes: "exact nomic-embed-text-v1.5.Q8_0.gguf only: BERT WordPiece tokenization, bidirectional split-half-RoPE attention, gated-SiLU FFN execution, mean/CLS/last pooling primitives, L2 normalization, Matryoshka truncation, OpenAI embeddings, cosine reranking, and optional Workspace semantic retrieval. Generic BERT, other Nomic files/quants, classifier-head rank pooling, GPU execution, and family-wide support are not implied.",
+            },
+            SupportItem {
                 id: "llama_spm_decoder",
                 status: "supported_current_gate",
                 notes: "LLaMA-style decoder path validated on TinyLlama Q8_0 gate",
@@ -3154,6 +3708,48 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
         ],
         model_compatibility: vec![
+            ModelCompatibilityTarget {
+                id: "nomic_embed_text_v1_5_q8_0",
+                family: "nomic-bert",
+                quantization: "Q8_0",
+                status: "supported_exact_row_embedding",
+                tool_capable: false,
+                support_scope: "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
+                full_support_status: "blocked_pending_broader_encoder_evidence",
+                full_support_blockers: "generic BERT/Nomic variants, other quants, classifier-head rank models, GPU execution, long-context retrieval quality, portability, and a production retrieval benchmark remain unproven",
+                metadata_parses: "validated_exact_nomic_bert_encoder_metadata",
+                tokenizer_works: "validated_bert_wordpiece_three_prompt_token_id_oracle",
+                tensors_load: "validated_61_q8_0_matrices_plus_51_f32_vectors_exact_shapes",
+                generation_runs: "not_applicable_encoder_embeddings_execute",
+                parity_audited: "three_768d_vectors_cosine_above_0_9997_and_max_abs_delta_below_0_003_vs_llama_cpp_b10173",
+                performance_measured: "windows_release_cpu_4_vector_batch_median_265ms_at_8_workers_14_7pct_throughput_uplift_vs_4_workers_peak_rss_flat",
+                frontend_load_path_verified: "real_api_sidecar_load_v1_embeddings_and_v1_rerank_validated_frontend_readiness_probe_wired",
+                frontend_readiness_gate: "green only for the exact catalog artifact nomic-embed-text-v1.5.Q8_0.gguf; embedding readiness is independent of generation_ready",
+                tested_context: "three_short_semantic_oracle_prompts_plus_256d_matryoshka_probe",
+                chat_template_renderer: "not_applicable_encoder_uses_nomic_search_prefixes",
+                chat_template_shape_pack: "not_applicable",
+                chat_template_shape_pack_id: "not_applicable",
+                bounded_context_512_pack: "not_applicable",
+                bounded_context_512_pack_id: "not_applicable",
+                bounded_context_window: 0,
+                bounded_context_1024_pack: "not_applicable",
+                bounded_context_1024_pack_id: "not_applicable",
+                bounded_context_1024_window: 0,
+                bounded_context_2048_pack: "not_applicable",
+                bounded_context_2048_pack_id: "not_applicable",
+                bounded_context_2048_window: 0,
+                bounded_context_4096_pack: "not_applicable",
+                bounded_context_4096_pack_id: "not_applicable",
+                bounded_context_4096_window: 0,
+                bounded_context_8192_pack: "not_applicable",
+                bounded_context_8192_pack_id: "not_applicable",
+                bounded_context_8192_window: 0,
+                latest_checked_bucket: "embedding_semantic_oracle",
+                latest_checked_result: "pass",
+                latest_checked_output: "deterministic_unit_norm_768d_and_256d_embeddings_with_relevant_document_ranked_first",
+                evidence: "exact row nomic-embed-text-v1.5.Q8_0.gguf (146,146,432 bytes; sha256 3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7; Hugging Face revision 18d1044f4866e224159fce8c6fc5c4f3920176e7): 112 tensors (61 Q8_0 matrices retained quantized + 51 F32 vectors), 12 layers, width 768, mean pooling. Exact WordPiece token IDs match llama.cpp b10173 for three fixed query/document prompts. Camelid relevant/irrelevant cosine scores are 0.860397/0.473693 versus llama.cpp 0.859971/0.472697; all three 768d vectors pass cosine >0.9997 and max absolute delta <0.003, are finite/unit-normalized, and repeated input is bit-deterministic. A 256d Matryoshka embedding is re-normalized. Real HTTP sidecar load (`set_active=false`), `/v1/embeddings`, and `/v1/rerank` pass on the exact artifact. On this Windows host, controlled release medians for four short vectors are 304ms at 4 workers and 265ms at 8 workers (13.16 -> 15.09 embeddings/s, +14.7% throughput); observed peak working set stays effectively flat at 162.4 vs 162.8 MiB, while tokenizer/metadata-only baseline is 9.2 MiB. Host-specific measurements, not a portable SLA. This supports only embeddings, embedding-similarity reranking, and bounded in-memory Workspace semantic retrieval for this exact artifact; it is not a generative or cross-encoder-reranker claim.",
+                next_step: "add GPU encoder kernels, separately evidence a classifier-head cross-encoder reranker, and run retrieval recall/long-context/portable-host packs before broadening support",
+            },
             // Ornith-1.0-9B CUDA-resident quant rows (constrained-VRAM lane).
             // ORDER CONTRACT: these quant-suffixed rows MUST stay ahead of the
             // bare-name "Ornith 1.0 9B" Q8_0 row below. The frontend exact-row
@@ -4300,7 +4896,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 full_support_blockers: "later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing",
                 metadata_parses: "validated_sparse_header",
                 tokenizer_works: "validated_against_llama_cpp_reference",
-                tensors_load: "validated_lazy_file_backed_rank3_q8_experts",
+                tensors_load: "validated_lazy_file_backed_rank3_q8_experts_resident_q8_path_unit_validated_only",
                 generation_runs: "bounded_one_token_runtime_smoke_observed",
                 parity_audited: "prompt_tokens_and_bounded_one_token_match_only",
                 performance_measured: "not_promoted",
@@ -4328,8 +4924,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511",
                 latest_checked_result: "blocked_later_generation_divergence",
                 latest_checked_output: "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md",
-                evidence: "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with default full-router softmax weights and lazy/file-backed Q8 experts; bounded one-token backend MoE runtime evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9 and qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511 records partial_failure plus a backend HTTP hang. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
-                next_step: "fix later-generation divergence and rerun row-specific parity/API/WebUI/RSS evidence before any Mixtral support/readiness promotion",
+                evidence: "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k routing now exposes per-layer router logits, selected expert IDs/weights, and per-expert gate/up/activation/down/weighted-down checkpoints. The existing lazy/file-backed Q8 path remains the default; an opt-in zero-copy resident-Q8 expert path is live-RAM gated but has only synthetic/unit validation on this checkout. Bounded one-token backend evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9. Multi-token requests now fail closed by default, and scripts/diagnose-mixtral-watchdog.ps1 separates forward progress from a stalled engine during explicit diagnostic runs. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
+                next_step: "acquire the exact GGUF and compatible pinned llama.cpp oracle, then rerun generated-index-9 parity plus continuation/API/WebUI/RSS/throughput gates before any Mixtral support/readiness promotion",
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
@@ -4725,9 +5321,24 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
             },
             SupportItem {
+                id: "llguidance_structured_outputs",
+                status: "supported_current_gate_nonstreaming",
+                notes: "non-streaming /v1/chat/completions constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and non-chat generation lanes remain typed unsupported.",
+            },
+            SupportItem {
+                id: "openai_embeddings",
+                status: "supported_exact_model_row",
+                notes: "POST /v1/embeddings plus /embedding and /embeddings aliases accept one string or a bounded string batch, return finite unit-normalized float vectors and exact tokenizer usage, and support Nomic Matryoshka dimensions. The current gate is the exact Nomic Embed Text v1.5 Q8_0 catalog row; base64 encoding, token-id input, arbitrary encoder families/quants, and GPU execution are unsupported.",
+            },
+            SupportItem {
+                id: "embedding_similarity_reranking",
+                status: "supported_exact_model_row",
+                notes: "POST /rerank, /reranking, /v1/rerank, and /v1/reranking rank bounded string/object documents by cosine similarity using Nomic search_query/search_document prefixes, stable score ordering, optional top_n, and optional returned documents. This is bi-encoder embedding-similarity reranking, not a classifier-head cross-encoder claim.",
+            },
+            SupportItem {
                 id: "web_workspace",
                 status: "supported_current_gate",
-                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Available only to supported exact rows with tool_capable=true. The historical Qwen3-4B-Q4_K_M bundle validates the underlying tool-call and sandbox path, but its write scenarios no longer describe the current read-only surface. No write, shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim.",
+                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim.",
             },
             SupportItem {
                 id: "stream_options.include_usage",
@@ -4752,12 +5363,17 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_server_props",
                 status: "partial",
-                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, embeddings, or full llama-server WebUI parity.",
+                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, generic embedding-model compatibility, or full llama-server WebUI parity.",
             },
             SupportItem {
                 id: "llama_server_slots",
                 status: "partial",
-                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, cancellation metadata, and continuous batching metrics remain unsupported.",
+                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported.",
+            },
+            SupportItem {
+                id: "production_server_hardening",
+                status: "supported",
+                notes: "Startup-resolved bearer/X-API-Key authentication with key-file support, fail-closed non-loopback binding, explicit CORS origin allowlists, optional rustls TLS, request/prompt/generation/download ceilings, and a Prometheus /metrics surface for HTTP/generation/token/cache/queue/slot/RSS/VRAM telemetry. Anonymous same-origin loopback remains the default.",
             },
             SupportItem {
                 id: "llama_server_apply_template",
@@ -4772,7 +5388,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors.",
+                notes: "Native /infill, /v1/messages, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row.",
             },
             SupportItem {
                 id: "multi_choice_generation",
@@ -5027,7 +5643,7 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             return resp;
         }
     }
-    match load_model_from_path(&state, path, req.id).await {
+    match load_model_from_path(&state, path, req.id, req.set_active.unwrap_or(true)).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
@@ -5052,8 +5668,9 @@ async fn load_model_from_path(
     state: &AppState,
     path: PathBuf,
     id: Option<String>,
+    set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
-    load_model_from_path_with_activation(state, path, id, true).await
+    load_model_from_path_with_activation(state, path, id, set_active).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -5167,7 +5784,12 @@ async fn inspect_model(
 
     // Parse the config header (no tensor bind, no weight load). Ok â‡’ it would load;
     // Err â‡’ it would fail closed with this exact typed reason.
-    let (lane_class, blocker) = match LlamaModelConfig::from_gguf(&gguf) {
+    let config_result = if architecture.as_deref() == Some("nomic-bert") {
+        EncoderConfig::from_gguf(&gguf).map(|_| ())
+    } else {
+        LlamaModelConfig::from_gguf(&gguf).map(|_| ())
+    };
+    let (lane_class, blocker) = match config_result {
         Ok(_) => (
             classify_model_lane(architecture.as_deref(), &filename),
             None,
@@ -5218,6 +5840,7 @@ fn gemma4_cuda_enabled() -> bool {
 fn model_family(gguf: &GgufFile) -> &'static str {
     match gguf.architecture() {
         Some("gemma4") => "gemma4",
+        Some("nomic-bert") => "embedding",
         Some("llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3" | "phi3" | "lfm2") => {
             "llama-family"
         }
@@ -7807,6 +8430,7 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
         state.gemma4_runtimes.write().await.remove(&id);
         state.runnable_runtimes.write().await.remove(&id);
         state.dg_runtimes.write().await.remove(&id);
+        state.embedding_runtimes.write().await.remove(&id);
         state.execution_plans.write().await.remove(&id);
         state.cached_weights.write().await.remove(&id);
         state.model_last_used.write().await.remove(&id);
@@ -7820,6 +8444,7 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
         state.gemma4_runtimes.write().await.clear();
         state.runnable_runtimes.write().await.clear();
         state.dg_runtimes.write().await.clear();
+        state.embedding_runtimes.write().await.clear();
         state.execution_plans.write().await.clear();
         state.cached_weights.write().await.clear();
         state.model_last_used.write().await.clear();
@@ -8104,7 +8729,7 @@ async fn get_or_load_model(
     if let Some(path) = path {
         if path.exists() {
             drop(loaded_models);
-            match load_model_from_path(state, path, Some(target_id.clone())).await {
+            match load_model_from_path(state, path, Some(target_id.clone()), true).await {
                 Ok(loaded) => return Ok(loaded),
                 Err(err) => {
                     return Err(api_error(
@@ -9228,13 +9853,13 @@ async fn chat_completions(
             return response;
         }
     }
-    // response_format -> constrained decoding (json_object / json_schema,
-    // non-streaming). Parsed BEFORE lane dispatch -- it is pure request-shape
-    // validation with no model access -- so a malformed schema 400s uniformly on
-    // every lane, and the env-gated serve lanes below (which do not enforce
-    // constraints) can reject a constrained request instead of silently
-    // returning unconstrained output with a 200.
-    let constraint = match constraint_from_response_format(req.response_format.as_ref()) {
+    // Structured-output constraints are parsed BEFORE lane dispatch so malformed
+    // schemas/CFGs fail uniformly and no lane can silently drop one.
+    let constraint = match constraint_from_request(
+        req.response_format.as_ref(),
+        req.json_schema.as_ref(),
+        req.grammar.as_deref(),
+    ) {
         Ok(constraint) => constraint,
         Err(response) => return *response,
     };
@@ -9242,7 +9867,7 @@ async fn chat_completions(
         api_error(
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
-            "response_format constrained decoding is not supported on this model's serve lane yet"
+            "structured-output constrained decoding is not supported on this model's serve lane yet"
                 .to_string(),
             Some("response_format"),
         )
@@ -9365,7 +9990,7 @@ async fn chat_completions(
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "response_format constrained decoding is not supported with stream:true; request it without streaming".to_string(),
+            "structured-output constrained decoding is not supported with stream:true; request it without streaming".to_string(),
             Some("response_format"),
         );
     }
@@ -9583,8 +10208,26 @@ fn receipt_request_stamp(
         req.top_k,
         req.seed,
         stop_spec_to_vec(req.stop.as_ref()),
-        req.response_format.clone().filter(|v| !v.is_null()),
+        normalized_constraint_receipt(req),
     ))
+}
+
+fn normalized_constraint_receipt(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
+    if let Some(value) = req.response_format.clone().filter(|value| !value.is_null()) {
+        return Some(value);
+    }
+    if let Some(schema) = req.json_schema.clone().filter(|value| !value.is_null()) {
+        return Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"schema": schema}
+        }));
+    }
+    req.grammar.as_ref().map(|grammar| {
+        serde_json::json!({
+            "type": "grammar",
+            "grammar": grammar
+        })
+    })
 }
 
 /// Receipt stamp for the raw `/v1/completions` endpoint. The receipt records the
@@ -9750,7 +10393,7 @@ pub async fn replay_receipt_request(
     request: &receipt::ReceiptRequest,
 ) -> std::result::Result<ReceiptReplay, String> {
     let state = AppState::with_configured_threads(configured_threads);
-    let loaded = load_model_from_path(&state, gguf_path.to_path_buf(), None)
+    let loaded = load_model_from_path(&state, gguf_path.to_path_buf(), None, true)
         .await
         .map_err(|err| format!("model load failed: {err}"))?;
     replay_loaded_receipt_request(&state, &loaded.id, request).await
@@ -10303,6 +10946,16 @@ fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crat
     Ok(estimated_bytes)
 }
 
+fn mixtral_long_generation_is_blocked(
+    moe: Option<&crate::model::MixtralMoeMetadata>,
+    max_tokens: u32,
+    explicitly_enabled: bool,
+) -> bool {
+    max_tokens > 1
+        && moe.is_some_and(|metadata| metadata.family_label == "Mixtral")
+        && !explicitly_enabled
+}
+
 async fn prepare_generation(
     state: &AppState,
     req: GenerationSessionRequest,
@@ -10329,7 +10982,6 @@ async fn prepare_generation(
             Some("max_tokens"),
         ));
     }
-
     let input = match (req.prompt, req.messages, req.camelid_prompt_token_ids) {
         (Some(prompt), None, None) if !prompt.is_empty() => PromptInput::Text(prompt),
         (None, Some(messages), None) if !messages.is_empty() => {
@@ -10480,6 +11132,18 @@ async fn prepare_generation(
             Some("prompt"),
         ));
     }
+    if token_ids.len() > state.server_limits.max_prompt_tokens {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            format!(
+                "prompt encoded to {} tokens, above the server ceiling of {}",
+                token_ids.len(),
+                state.server_limits.max_prompt_tokens
+            ),
+            Some("prompt"),
+        ));
+    }
 
     let config = model.llama_config.as_ref().ok_or_else(|| {
         let message = model
@@ -10537,6 +11201,37 @@ async fn prepare_generation(
             .map(|cap| cap.min(available_max_tokens))
             .unwrap_or(available_max_tokens),
     };
+    // Enforce the operator's ceiling against the effective generation budget,
+    // after preserving the existing API contract that max_tokens is clamped to
+    // the model's remaining context. A huge request on a tiny context therefore
+    // remains harmless and compatible, while a request that could actually
+    // consume more than the configured server limit fails closed.
+    if max_tokens > state.server_limits.max_generation_tokens {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "generation_token_limit_exceeded",
+            format!(
+                "effective max_tokens exceeds the server ceiling of {}",
+                state.server_limits.max_generation_tokens
+            ),
+            Some("max_tokens"),
+        ));
+    }
+    if mixtral_long_generation_is_blocked(
+        config.moe.as_ref(),
+        max_tokens,
+        crate::runtime_config::mixtral_long_generation_enabled(),
+    ) {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unvalidated_mixtral_long_generation",
+            format!(
+                "multi-token Mixtral generation is fail-closed pending exact-row parity; request max_tokens=1 or explicitly set {}=1 for a controlled diagnostic run",
+                crate::runtime_config::MIXTRAL_LONG_GENERATION_ENV
+            ),
+            Some("max_tokens"),
+        ));
+    }
     if let Some(index) = req.camelid_dense_diagnostic_generated_index {
         if index >= max_tokens {
             return Err(api_error(
@@ -10729,6 +11424,8 @@ async fn prepare_generation(
         dense_metadata,
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
+        metrics: state.metrics.clone(),
+        engine_progress: state.engine.clone(),
         speculative,
         telemetry: Some(telemetry_start),
         cancel: GenerationCancel::unbounded(),
@@ -11364,7 +12061,11 @@ fn run_decode_job_serialized(
         std::thread::sleep(duration);
     }
     let cancel = prepared.cancel.clone();
+    let metrics = prepared.metrics.clone();
     let result = generate_decoded_tokens(prepared);
+    if result.is_err() {
+        metrics.record_generation_failure();
+    }
     // Â§4 safe-boot: a decode ran to completion under the applied gait without
     // wedging the host, so clear the in-progress marker. Cheap and idempotent.
     // Not marked when the decode was cancelled or timed out — those did not
@@ -11889,6 +12590,9 @@ fn consume_generation_step(
     }
     acc.generated.push(step.next_token_id);
     acc.history.push(step.next_token_id);
+    prepared
+        .engine_progress
+        .record_progress(acc.generated.len());
     if prepared.tokenizer.special.eog.contains(&step.next_token_id) {
         *acc.finish_reason = "stop";
     } else if !prepared.stop_sequences.is_empty() {
@@ -11924,28 +12628,22 @@ fn generate_token_ids(
     let mut top_logits = Vec::new();
     let mut step_top_logits = Vec::new();
     let mut step_logprobs: Vec<StepLogprob> = Vec::new();
-    // Constrained-decoding setup (response_format json_object / json_schema). Cache
-    // each token's output bytes once; mask the logits to tokens that keep a valid
-    // prefix of the constrained value each step; stop as soon as it completes.
+    // Structured-decoding setup (JSON Schema / LLGuidance Lark). Build the
+    // token trie from exact tokenizer bytes before any forward pass. This retains
+    // byte-fallback fragments that are not standalone UTF-8 strings.
     let constraint_active = prepared.constraint.is_some();
     let grammar_vocab = prepared.tokenizer.tokens.len();
-    let grammar_token_bytes: Vec<Vec<u8>> = if constraint_active {
-        (0..grammar_vocab as u32)
-            .map(|id| {
-                prepared
-                    .tokenizer
-                    .decode(&[id], false)
-                    .unwrap_or_default()
-                    .into_bytes()
-            })
-            .collect()
-    } else {
-        Vec::new()
+    let mut grammar: Option<crate::grammar::ConstraintState> = match prepared.constraint.as_ref() {
+        Some(spec) => Some(spec.build(&prepared.tokenizer).map_err(|err| {
+            Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_parameter",
+                format!("structured-output constraint is not supported by this tokenizer: {err}"),
+                Some("response_format"),
+            ))
+        })?),
+        None => None,
     };
-    let mut grammar: Option<crate::grammar::ConstraintState> = prepared
-        .constraint
-        .as_ref()
-        .map(crate::grammar::ConstraintSpec::build);
     let mut grammar_mask: Vec<bool> =
         vec![false; if constraint_active { grammar_vocab } else { 0 }];
     let collect_step_top_logits = !prepared.logit_diagnostic_token_ids.is_empty();
@@ -12166,6 +12864,7 @@ fn generate_token_ids(
                     for &token in &emitted {
                         generated.push(token);
                         history.push(token);
+                        prepared.engine_progress.record_progress(generated.len());
                         if prepared.tokenizer.special.eog.contains(&token) {
                             finish_reason = "stop";
                             break;
@@ -12196,47 +12895,28 @@ fn generate_token_ids(
                 }
             }
         }
-        // JSON-grammar mask for this step: a token is allowed iff its bytes keep a
-        // valid JSON-object prefix; EOG only once the object is complete.
-        let grammar_allowed: Option<&[bool]> = match grammar.as_ref() {
+        // LLGuidance computes the allowed-token set by walking its token trie.
+        // Converting the compact bitset to the sampler's bool slice is linear,
+        // but grammar evaluation no longer clones an automaton per vocab entry.
+        let grammar_allowed: Option<&[bool]> = match grammar.as_mut() {
             Some(state) => {
-                // `done` gates whether EOG is allowed this step. With the current loop
-                // structure it is always false here (the loop breaks the moment a token
-                // drives the state to done, below); it is kept defensive so the mask
-                // stays correct if that stop/advance ordering ever changes.
-                let done = state.is_done();
-                let mut any_allowed = false;
-                for (id, slot) in grammar_mask.iter_mut().enumerate() {
-                    let bytes = grammar_token_bytes
-                        .get(id)
-                        .map(|v| v.as_slice())
-                        .unwrap_or_default();
-                    *slot = if prepared.tokenizer.special.eog.contains(&(id as u32)) {
-                        done
-                    } else if bytes.is_empty() {
-                        false
-                    } else {
-                        state.accepts(bytes)
-                    };
-                    any_allowed |= *slot;
+                let stopped = state.compute_mask(&mut grammar_mask).map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "constraint_evaluation_failed",
+                        format!("LLGuidance could not compute the next-token mask: {err}"),
+                        Some("response_format"),
+                    ))
+                })?;
+                if stopped {
+                    finish_reason = "stop";
+                    break;
                 }
-                // Fail closed if no token can extend the constrained value and
-                // stopping is not yet allowed. This arises when the next required byte
-                // is only reachable through a multibyte-UTF-8 fragment token:
-                // `grammar_token_bytes` decodes each token in isolation and drops
-                // incomplete UTF-8, so a byte-level-BPE / byte-fallback fragment decodes
-                // to "" and is masked out above (having a byte token is not enough — it
-                // must survive an in-isolation decode). Non-ASCII `enum`/`const` literals,
-                // which would force exactly such a byte, are rejected at schema-compile
-                // time (a request-time 400), so in practice this only guards free-form
-                // values on pathological tokenizers; sampling a fully-masked (all -inf)
-                // distribution would otherwise emit an invalid token or NaN, so we
-                // surface a typed error instead.
-                if !any_allowed {
+                if !grammar_mask.iter().any(|allowed| *allowed) {
                     return Err(Box::new(api_error(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         "constraint_unsatisfiable",
-                        "the response_format constraint cannot be satisfied by this model's tokenizer (no token can produce the next required byte)".to_string(),
+                        "the structured-output constraint cannot be extended by any token in this model's vocabulary".to_string(),
                         Some("response_format"),
                     )));
                 }
@@ -12391,23 +13071,17 @@ fn generate_token_ids(
         }
         generated.push(step.next_token_id);
         history.push(step.next_token_id);
-        // Advance the JSON grammar by the chosen token's bytes; stop the moment the
-        // top-level object closes (the mask guaranteed the bytes are acceptable).
+        // Commit exactly the token LLGuidance allowed. No lossy token
+        // decode/re-encode round trip is involved.
         if let Some(state) = grammar.as_mut() {
-            if let Some(bytes) = grammar_token_bytes.get(step.next_token_id as usize) {
-                for &b in bytes {
-                    // The mask guaranteed every byte of the chosen token is acceptable.
-                    // Advance in all builds (the grammar must consume the emitted bytes)
-                    // and assert acceptance in debug, so a mask/advance divergence fails
-                    // a test instead of silently emitting invalid output.
-                    let accepted = state.advance(b).is_ok();
-                    debug_assert!(
-                        accepted,
-                        "constrained-decode mask allowed a token whose bytes the grammar rejects"
-                    );
-                }
-            }
-            if state.is_done() {
+            if state.commit_token(step.next_token_id).map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "constraint_commit_failed",
+                    format!("LLGuidance rejected the sampled token: {err}"),
+                    Some("response_format"),
+                ))
+            })? {
                 finish_reason = "stop";
                 break;
             }
@@ -12457,6 +13131,11 @@ fn generate_token_ids(
     if collect_q8_schedule {
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
     }
+    prepared.metrics.record_generation(
+        prepared.token_ids.len(),
+        generated.len(),
+        &prepared.timings,
+    );
 
     // Finalize the rollup before any field is moved out of `prepared`.
     let execution_trace = if tracing_armed {
@@ -12620,11 +13299,58 @@ fn build_completion_logprobs(steps: &[StepLogprob]) -> CompletionLogprobs {
     }
 }
 
+/// Resolve the OpenAI response format and llama.cpp-compatible top-level
+/// extensions into one fail-closed constraint. Supplying more than one is
+/// ambiguous and therefore rejected rather than applying precedence.
+fn constraint_from_request(
+    response_format: Option<&serde_json::Value>,
+    json_schema: Option<&serde_json::Value>,
+    grammar: Option<&str>,
+) -> std::result::Result<Option<crate::grammar::ConstraintSpec>, Box<Response>> {
+    let response_format = response_format.filter(|value| !value.is_null());
+    let json_schema = json_schema.filter(|value| !value.is_null());
+    let active = usize::from(response_format.is_some())
+        + usize::from(json_schema.is_some())
+        + usize::from(grammar.is_some());
+    if active > 1 {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "response_format, json_schema, and grammar are mutually exclusive".to_string(),
+            Some("response_format"),
+        )));
+    }
+    if let Some(schema) = json_schema {
+        return crate::grammar::ConstraintSpec::from_schema(schema)
+            .map(Some)
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                    format!("json_schema is not supported by LLGuidance: {err}"),
+                    Some("json_schema"),
+                ))
+            });
+    }
+    if let Some(grammar) = grammar {
+        return crate::grammar::ConstraintSpec::from_lark(grammar)
+            .map(Some)
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                    format!("grammar is not supported by LLGuidance: {err}"),
+                    Some("grammar"),
+                ))
+            });
+    }
+    constraint_from_response_format(response_format)
+}
+
 /// Interpret OpenAI `response_format` into an optional output constraint.
 /// `Ok(None)` = normal decoding (text / absent); `Ok(Some(_))` = constrained
-/// decoding (`json_object`, or `json_schema` whose schema is inside the supported
-/// subset); `Err` = a typed 400 for an unsupported shape or a schema Camelid cannot
-/// enforce byte-for-byte.
+/// decoding (`json_object`, broad `json_schema`, or LLGuidance/Lark `grammar`);
+/// `Err` = a typed 400 for an unsupported shape or constraint.
 fn constraint_from_response_format(
     response_format: Option<&serde_json::Value>,
 ) -> std::result::Result<Option<crate::grammar::ConstraintSpec>, Box<Response>> {
@@ -12641,7 +13367,7 @@ fn constraint_from_response_format(
                     Box::new(api_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
-                        "response_format json_schema requires a `json_schema.schema` object"
+                        "response_format json_schema requires a `json_schema.schema` value"
                             .to_string(),
                         Some("response_format"),
                     ))
@@ -12652,7 +13378,34 @@ fn constraint_from_response_format(
                     Box::new(api_error(
                         StatusCode::BAD_REQUEST,
                         "unsupported_parameter",
-                        format!("response_format json_schema is not supported: {err}"),
+                        format!(
+                            "response_format json_schema is not supported by LLGuidance: {err}"
+                        ),
+                        Some("response_format"),
+                    ))
+                })
+        }
+        Some("grammar") => {
+            let grammar = value
+                .get("grammar")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "response_format grammar requires a string `grammar` field".to_string(),
+                        Some("response_format"),
+                    ))
+                })?;
+            crate::grammar::ConstraintSpec::from_lark(grammar)
+                .map(Some)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_parameter",
+                        format!(
+                            "response_format grammar is not supported by LLGuidance: {err}"
+                        ),
                         Some("response_format"),
                     ))
                 })
@@ -12662,7 +13415,7 @@ fn constraint_from_response_format(
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             format!(
-                "response_format type {other:?} is not supported; only json_object, json_schema, and text are honored"
+                "response_format type {other:?} is not supported; only json_object, json_schema, grammar, and text are honored"
             ),
             Some("response_format"),
         ))),
@@ -13302,6 +14055,11 @@ fn run_stream_decode_job(
     if collect_q8_schedule {
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
     }
+    prepared.metrics.record_generation(
+        prepared.token_ids.len(),
+        generated.len(),
+        &prepared.timings,
+    );
     if let Some(guard) = telemetry_guard {
         let ttft_ms = first_content_ms.map(|ms| ms as u64);
         let decode_tps = match (first_content_ms, generated.len()) {
@@ -14552,6 +15310,14 @@ async fn loaded_tokenizer(state: &AppState) -> std::result::Result<Tokenizer, Re
 }
 
 fn malformed_json_error(err: JsonRejection) -> Response {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_limit_exceeded",
+            err.to_string(),
+            None,
+        );
+    }
     api_error(
         StatusCode::BAD_REQUEST,
         "malformed_json",
@@ -15433,9 +16199,39 @@ mod tests {
         assert!(constraint_from_response_format(Some(&good))
             .unwrap()
             .is_some());
-        // A schema outside the subset is a typed error, not silently ignored.
-        let bad = json!({"type": "json_schema", "json_schema": {"schema": {"type": "string"}}});
+        // Scalar roots and advanced keywords are supported by LLGuidance.
+        let broad = json!({
+            "type": "json_schema",
+            "json_schema": {"schema": {
+                "type": "string", "pattern": "^[a-z]+$", "minLength": 2
+            }}
+        });
+        assert!(constraint_from_response_format(Some(&broad))
+            .unwrap()
+            .is_some());
+        // A schema LLGuidance cannot compile is a typed error, not ignored.
+        let bad = json!({"type": "json_schema", "json_schema": {"schema": {"type": "camel"}}});
         assert!(constraint_from_response_format(Some(&bad)).is_err());
+        // Lark CFGs are accepted through response_format and the llama.cpp-style
+        // top-level field; malformed grammars fail closed.
+        assert!(constraint_from_response_format(Some(
+            &json!({"type": "grammar", "grammar": "start: \"yes\" | \"no\""})
+        ))
+        .unwrap()
+        .is_some());
+        assert!(constraint_from_response_format(Some(
+            &json!({"type": "grammar", "grammar": "start: ("})
+        ))
+        .is_err());
+        assert!(constraint_from_request(None, None, Some("start: \"ok\""))
+            .unwrap()
+            .is_some());
+        assert!(constraint_from_request(
+            Some(&json!({"type": "json_object"})),
+            Some(&json!({"type": "string"})),
+            None,
+        )
+        .is_err());
         // A json_schema without the schema payload is an error.
         assert!(constraint_from_response_format(Some(&json!({"type": "json_schema"}))).is_err());
         // Unknown response_format types remain errors.
@@ -15641,8 +16437,8 @@ mod tests {
             .iter()
             .map(|item| (item.project, item))
             .collect();
-        assert_eq!(projects.len(), 5);
-        for project in [2u32, 4, 5, 6, 7] {
+        assert_eq!(projects.len(), 7);
+        for project in [2u32, 3, 4, 5, 6, 7, 8] {
             let item = projects
                 .get(&project)
                 .unwrap_or_else(|| panic!("project {project} missing"));
@@ -15658,6 +16454,14 @@ mod tests {
         assert!(
             !projects[&7].default_enabled,
             "continuous batching remains default-neutral until integrated"
+        );
+        assert!(
+            !projects[&3].default_enabled,
+            "Mixtral long generation remains exact-row parity gated"
+        );
+        assert!(
+            projects[&8].default_enabled,
+            "production server guardrails are active by default"
         );
     }
 
@@ -15872,7 +16676,54 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_and_catalog_expose_the_exact_nomic_embedding_row() {
+        let capabilities = capabilities_response();
+        let row = capabilities
+            .model_compatibility
+            .iter()
+            .find(|row| row.id == "nomic_embed_text_v1_5_q8_0")
+            .expect("exact Nomic embedding compatibility row");
+        assert_eq!(row.status, "supported_exact_row_embedding");
+        assert_eq!(row.family, "nomic-bert");
+        assert_eq!(row.quantization, "Q8_0");
+        assert!(!row.tool_capable);
+        assert_eq!(row.latest_checked_result, "pass");
+        for feature in [
+            "openai_embeddings",
+            "embedding_similarity_reranking",
+            "llguidance_structured_outputs",
+        ] {
+            assert!(
+                capabilities
+                    .api_features
+                    .iter()
+                    .any(|item| item.id == feature),
+                "missing capability feature {feature}"
+            );
+        }
+        let catalog = curated_catalog();
+        let item = catalog
+            .iter()
+            .find(|item| item.catalog_id == row.id)
+            .expect("exact Nomic catalog row");
+        assert_eq!(item.filename, "nomic-embed-text-v1.5.Q8_0.gguf");
+        assert_eq!(item.size_bytes, 146_146_432);
+        assert!(crate::runnable::oracle_qualified(
+            item.architecture,
+            item.quant
+        ));
+    }
+
+    #[test]
     fn classify_model_lane_separates_supported_experimental_and_unsupported() {
+        assert_eq!(
+            classify_model_lane(Some("nomic-bert"), "nomic-embed-text-v1.5.Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("nomic-bert"), "other-nomic-model.Q8_0.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
         // Exact supported curated artifact â†’ Supported.
         assert_eq!(
             classify_model_lane(Some("llama"), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"),
@@ -16190,6 +17041,9 @@ mod tests {
                 "llama3_2_1b_instruct_iq4_xs",
                 "llama3_8b_instruct_q8_0",
                 "mistral_7b_instruct_v0_3_q8_0",
+                // Nomic v1.5 Q8_0 bidirectional encoder: exact-row embeddings,
+                // embedding-similarity reranking, and Workspace semantic retrieval.
+                "nomic_embed_text_v1_5_q8_0",
                 // Dense Qwen3 Q8_0 ChatML rows (thinking disabled): exact-row
                 // token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on
                 // Windows x86_64 CPU (cpu_reference + x86_q8 AVX2, bit-identical).
@@ -16232,6 +17086,7 @@ mod tests {
                 "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 "llama_spm_decoder",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
+                "nomic_bert_encoder_exact_v1_5_q8_0",
                 "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
             ])
         );
@@ -16267,6 +17122,40 @@ mod tests {
         assert!(response.support_contract.current_gate.contains(
             "no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied"
         ));
+    }
+
+    #[test]
+    fn mixtral_multi_token_generation_stays_fail_closed_until_explicitly_enabled() {
+        let mixtral = crate::model::MixtralMoeMetadata {
+            family_label: "Mixtral",
+            expert_count: 8,
+            expert_used_count: 2,
+            expert_weights_scale: 1.0,
+            expert_weights_norm: true,
+            expert_gating_func: 0,
+        };
+        let generic_moe = crate::model::MixtralMoeMetadata {
+            family_label: "MoE",
+            ..mixtral.clone()
+        };
+
+        assert!(!mixtral_long_generation_is_blocked(
+            Some(&mixtral),
+            1,
+            false
+        ));
+        assert!(mixtral_long_generation_is_blocked(Some(&mixtral), 2, false));
+        assert!(!mixtral_long_generation_is_blocked(
+            Some(&mixtral),
+            50,
+            true
+        ));
+        assert!(!mixtral_long_generation_is_blocked(
+            Some(&generic_moe),
+            50,
+            false
+        ));
+        assert!(!mixtral_long_generation_is_blocked(None, 50, false));
     }
 
     #[test]
@@ -18758,6 +19647,8 @@ mod tests {
             dense_metadata: dummy_dense_metadata(),
             timings: GenerationTimings::default(),
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(8))),
+            metrics: metrics::ServerMetrics::default(),
+            engine_progress: engine::EngineHandle::spawn(),
             speculative: None,
             telemetry: None,
             cancel: GenerationCancel::unbounded(),
@@ -19146,7 +20037,8 @@ pub struct CatalogItem {
     pub architecture: &'static str,
     pub license: &'static str,
     /// Advisory "best for" positioning for the Models tab (curated, not
-    /// benchmarked). Constrained to: `general`, `reasoning`, `coding`, `tools`.
+    /// benchmarked). Constrained to: `general`, `reasoning`, `coding`, `tools`,
+    /// `embeddings`, `retrieval`.
     pub task_tags: &'static [&'static str],
 }
 
@@ -19378,6 +20270,19 @@ impl CatalogItemView {
 
 pub fn curated_catalog() -> Vec<CatalogItem> {
     vec![
+        CatalogItem {
+            catalog_id: "nomic_embed_text_v1_5_q8_0",
+            name: "Nomic Embed Text v1.5 Q8_0",
+            repo_id: "nomic-ai/nomic-embed-text-v1.5-GGUF",
+            filename: "nomic-embed-text-v1.5.Q8_0.gguf",
+            size_bytes: 146146432,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "nomic-bert",
+            license: "apache-2.0",
+            task_tags: &["embeddings", "retrieval"],
+        },
         CatalogItem {
             catalog_id: "llama32_1b_instruct_q8_0",
             name: "Llama 3.2 1B Instruct Q8_0",
@@ -19769,7 +20674,7 @@ pub struct LocalModelsResponse {
     pub models: Vec<LocalModelEntry>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalModelFileIdentity {
     size_bytes: u64,
@@ -19781,7 +20686,7 @@ fn validate_local_model_filename(filename: &str) -> bool {
     model_default::valid_local_model_filename(filename)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn local_model_delete_token(
     nonce: &str,
     filename: &str,
@@ -19913,14 +20818,66 @@ fn local_model_file_identity(
     windows_handle_identity(handle.0, filename, nonce)
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
+fn unix_metadata_identity(
+    metadata: &std::fs::Metadata,
+    filename: &str,
+    nonce: &str,
+) -> Option<LocalModelFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let size_bytes = metadata.size();
+    let modified_nanos = if metadata.mtime() >= 0 {
+        (metadata.mtime() as u128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(metadata.mtime_nsec().max(0) as u128)
+    } else {
+        0
+    };
+    let platform_id = format!(
+        "unix:{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    );
+    let delete_token = (metadata.nlink() == 1).then(|| {
+        local_model_delete_token(nonce, filename, size_bytes, modified_nanos, &platform_id)
+    });
+    Some(LocalModelFileIdentity {
+        size_bytes,
+        modified_nanos,
+        delete_token,
+    })
+}
+
+#[cfg(unix)]
+fn local_model_file_identity(
+    models_dir: &std::path::Path,
+    filename: &str,
+    nonce: &str,
+) -> std::io::Result<Option<LocalModelFileIdentity>> {
+    if !validate_local_model_filename(filename) {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(models_dir.join(filename))?;
+    Ok(unix_metadata_identity(&metadata, filename, nonce))
+}
+
+#[cfg(any(windows, unix))]
 #[derive(Debug, serde::Deserialize)]
 struct DeleteLocalModelRequest {
     filename: String,
     delete_token: String,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[derive(Debug, serde::Serialize)]
 struct DeleteLocalModelResponse {
     deleted: bool,
@@ -20154,10 +21111,11 @@ mod default_model_api_tests {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[derive(Debug)]
 enum DeleteLocalModelError {
     Io(std::io::Error),
+    #[cfg(windows)]
     Busy(std::io::Error),
     Changed,
     Unsafe,
@@ -20169,6 +21127,48 @@ fn classify_delete_io(err: std::io::Error) -> DeleteLocalModelError {
         Some(32 | 33) => DeleteLocalModelError::Busy(err),
         _ => DeleteLocalModelError::Io(err),
     }
+}
+
+#[cfg(unix)]
+fn delete_identity_bound_local_model(
+    path: &std::path::Path,
+    filename: &str,
+    nonce: &str,
+    expected_token: &str,
+) -> Result<u64, DeleteLocalModelError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(DeleteLocalModelError::Io)?;
+    let handle_identity = unix_metadata_identity(
+        &handle.metadata().map_err(DeleteLocalModelError::Io)?,
+        filename,
+        nonce,
+    )
+    .ok_or(DeleteLocalModelError::Unsafe)?;
+    if handle_identity.delete_token.as_deref() != Some(expected_token) {
+        return Err(DeleteLocalModelError::Changed);
+    }
+
+    // Re-read the directory entry immediately before unlinking it. The open
+    // handle proves the token still names the same inode, while O_NOFOLLOW and
+    // the path identity check reject symlink or replacement attacks.
+    let path_identity = unix_metadata_identity(
+        &std::fs::symlink_metadata(path).map_err(DeleteLocalModelError::Io)?,
+        filename,
+        nonce,
+    )
+    .ok_or(DeleteLocalModelError::Unsafe)?;
+    if path_identity != handle_identity
+        || path_identity.delete_token.as_deref() != Some(expected_token)
+    {
+        return Err(DeleteLocalModelError::Changed);
+    }
+    std::fs::remove_file(path).map_err(DeleteLocalModelError::Io)?;
+    Ok(handle_identity.size_bytes)
 }
 
 #[cfg(windows)]
@@ -20204,7 +21204,7 @@ fn delete_identity_bound_local_model(
     Ok(identity.size_bytes)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 async fn delete_local_model(
     State(_state): State<AppState>,
     _headers: HeaderMap,
@@ -20218,7 +21218,7 @@ async fn delete_local_model(
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 async fn delete_local_model(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -20345,6 +21345,7 @@ async fn delete_local_model(
                 Some("filename"),
             )
         }
+        #[cfg(windows)]
         Ok(Err(DeleteLocalModelError::Busy(err))) => {
             return api_error(
                 StatusCode::CONFLICT,
@@ -20433,7 +21434,7 @@ async fn local_models(
     _headers: HeaderMap,
 ) -> Json<LocalModelsResponse> {
     let _reader = state.model_file_lifecycle.read().await;
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     let expose_delete_tokens =
         state.allow_local_model_delete && local_management_request_allowed(&_headers);
     let dir = state.models_dir.clone();
@@ -20464,7 +21465,7 @@ async fn local_models(
                     continue;
                 }
             };
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let identity = match local_model_file_identity(
                 &dir,
                 &filename,
@@ -20476,21 +21477,21 @@ async fn local_models(
                     None
                 }
             };
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let delete_token = identity
                 .as_ref()
                 .and_then(|identity| expose_delete_tokens.then(|| identity.delete_token.clone()))
                 .flatten();
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             let delete_token = None;
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let deletable_identity = identity
                 .as_ref()
                 .filter(|identity| identity.delete_token.is_some());
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let size_bytes =
                 deletable_identity.map_or_else(|| metadata.len(), |identity| identity.size_bytes);
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             let size_bytes = metadata.len();
             let metadata_mtime_secs = metadata
                 .modified()
@@ -20498,11 +21499,11 @@ async fn local_models(
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs())
                 .unwrap_or_default();
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             let mtime_secs = deletable_identity.map_or(metadata_mtime_secs, |identity| {
                 (identity.modified_nanos / 1_000_000_000) as u64
             });
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             let mtime_secs = metadata_mtime_secs;
 
             // Reuse cached metadata facts when the file is unchanged; only the cheap
@@ -20784,7 +21785,7 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
 /// artifact for the supported-row check.
 fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneClass {
     match architecture {
-        Some(arch) if crate::model::is_implemented_architecture(arch) => {
+        Some(arch) if crate::model::is_implemented_architecture(arch) || arch == "nomic-bert" => {
             if filename_is_supported_exact_row(filename) {
                 ModelLaneClass::Supported
             } else {
@@ -21065,6 +22066,17 @@ async fn install_catalog_model(
             Some("filename"),
         );
     }
+    if req.size_bytes == 0 || req.size_bytes > state.server_limits.max_download_bytes {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "download_size_limit_exceeded",
+            format!(
+                "declared model size {} bytes is outside the server download ceiling of {} bytes",
+                req.size_bytes, state.server_limits.max_download_bytes
+            ),
+            Some("size_bytes"),
+        );
+    }
     let continuation_mode = match req.continuation_mode.as_deref().unwrap_or("download") {
         mode @ ("download" | "smoke" | "start") => mode.to_string(),
         _ => {
@@ -21134,6 +22146,8 @@ async fn install_catalog_model(
         "https://huggingface.co/{}/resolve/main/{}",
         req.repo_id, req.filename
     );
+    let max_download_bytes_limit = state.server_limits.max_download_bytes;
+    let max_download_bytes = max_download_bytes_limit.to_string();
 
     // `-f` makes curl FAIL on an HTTP error (404/403/â€¦) instead of writing the
     // error page to the output file and exiting 0 â€” which previously looked like an
@@ -21165,6 +22179,8 @@ async fn install_catalog_model(
             "--retry-delay",
             "2",
             "--retry-all-errors",
+            "--max-filesize",
+            &max_download_bytes,
             "-o",
             &part_path,
             &url,
@@ -21206,6 +22222,7 @@ async fn install_catalog_model(
                     still_tracked,
                     &part_path_clone,
                     &dest_path_clone,
+                    max_download_bytes_limit,
                 );
                 if let Some(dl) = map.get_mut(&catalog_id_clone) {
                     dl.status = status;
@@ -21266,8 +22283,16 @@ fn finalize_download_artifact(
     still_tracked: bool,
     part_path: &str,
     dest_path: &str,
+    max_download_bytes: u64,
 ) -> &'static str {
-    let promoted = succeeded && still_tracked && std::fs::rename(part_path, dest_path).is_ok();
+    // Curl's --max-filesize is the first line of defense, but the origin may
+    // omit or lie about Content-Length and curl behavior varies by version.
+    // Recheck the artifact itself before making it loadable so the configured
+    // ceiling remains authoritative even in those cases.
+    let within_limit = std::fs::metadata(part_path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_download_bytes);
+    let promoted =
+        succeeded && still_tracked && within_limit && std::fs::rename(part_path, dest_path).is_ok();
     if !promoted {
         std::fs::remove_file(part_path).ok();
     }
@@ -21356,7 +22381,7 @@ async fn acknowledge_catalog_download(
     StatusCode::NO_CONTENT.into_response()
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, unix)))]
 mod local_model_delete_tests {
     use super::{active_downloads_map, router_with_state, ActiveDownload, AppState};
     use axum::{
@@ -21769,7 +22794,7 @@ mod local_model_delete_tests {
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(all(test, not(any(windows, unix))))]
 mod non_windows_model_delete_tests {
     use super::{router_with_state, AppState};
     use axum::{
@@ -21957,7 +22982,10 @@ mod catalog_fit_tests {
             );
             for tag in item.task_tags {
                 assert!(
-                    matches!(*tag, "general" | "reasoning" | "coding" | "tools"),
+                    matches!(
+                        *tag,
+                        "general" | "reasoning" | "coding" | "tools" | "embeddings" | "retrieval"
+                    ),
                     "row {} has unexpected task tag {tag}",
                     item.catalog_id
                 );
@@ -22388,7 +23416,7 @@ mod download_cancel_tests {
     fn successful_tracked_download_promotes_part_to_dest() {
         let (part, dest) = temp_paths("promote");
         std::fs::write(&part, b"payload").unwrap();
-        let status = finalize_download_artifact(true, true, &part, &dest);
+        let status = finalize_download_artifact(true, true, &part, &dest, u64::MAX);
         assert_eq!(status, "completed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -22404,7 +23432,7 @@ mod download_cancel_tests {
         std::fs::write(&part, b"payload").unwrap();
         // still_tracked=false models a cancel that removed the map entry while
         // curl went on to finish successfully (the Windows kill-less failure mode).
-        let status = finalize_download_artifact(true, false, &part, &dest);
+        let status = finalize_download_artifact(true, false, &part, &dest, u64::MAX);
         assert_eq!(status, "failed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -22420,10 +23448,33 @@ mod download_cancel_tests {
     fn failed_download_removes_partial() {
         let (part, dest) = temp_paths("fail");
         std::fs::write(&part, b"half").unwrap();
-        let status = finalize_download_artifact(false, true, &part, &dest);
+        let status = finalize_download_artifact(false, true, &part, &dest, u64::MAX);
         assert_eq!(status, "failed");
         assert!(!std::path::Path::new(&part).exists());
         assert!(!std::path::Path::new(&dest).exists());
+    }
+
+    #[test]
+    fn finished_download_above_ceiling_is_never_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("model.gguf.part");
+        let dest = dir.path().join("model.gguf");
+        std::fs::write(&part, b"oversized").unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            4,
+        );
+
+        assert_eq!(status, "failed");
+        assert!(!part.exists(), "oversized partial must be removed");
+        assert!(
+            !dest.exists(),
+            "oversized partial must never become loadable"
+        );
     }
 
     #[test]

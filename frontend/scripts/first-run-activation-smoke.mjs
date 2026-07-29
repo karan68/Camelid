@@ -24,6 +24,7 @@ const capabilities = {
   model_compatibility: [
     { id: 'qwen3_0_6b_instruct_q8_0', family: 'qwen3', quantization: 'Q8_0', status: 'supported_exact_row_smoke', evidence: 'exact row' },
     { id: 'qwen3_1_7b_instruct_q8_0', family: 'qwen3', quantization: 'Q8_0', status: 'supported_exact_row_smoke', evidence: 'exact row' },
+    { id: 'nomic_embed_text_v1_5_q8_0', family: 'nomic-bert', quantization: 'Q8_0', status: 'supported_exact_row_embedding', evidence: 'exact embedding row' },
     { id: 'phi3_mini_4k_instruct_q8_0', family: 'phi3', quantization: 'Q8_0', status: 'active_validation_blocked_parity', evidence: 'not promoted' },
   ],
 }
@@ -37,6 +38,7 @@ const curatedRow = (overrides) => ({
 
 const qwen06b = curatedRow({ catalog_id: 'qwen3_0_6b_instruct_q8_0', name: 'Qwen3 0.6B Q8_0', filename: 'Qwen3-0.6B-Q8_0.gguf', repo_id: 'Qwen/Qwen3-0.6B-GGUF', size_bytes: 639446688 })
 const qwen17b = curatedRow({ catalog_id: 'qwen3_1_7b_instruct_q8_0', name: 'Qwen3 1.7B Q8_0', filename: 'Qwen3-1.7B-Q8_0.gguf', repo_id: 'Qwen/Qwen3-1.7B-GGUF', size_bytes: 1834426016 })
+const nomic = curatedRow({ catalog_id: 'nomic_embed_text_v1_5_q8_0', name: 'Nomic Embed Text v1.5 Q8_0', filename: 'nomic-embed-text-v1.5.Q8_0.gguf', repo_id: 'nomic-ai/nomic-embed-text-v1.5-GGUF', size_bytes: 146146432, architecture: 'nomic-bert', task_tags: ['embeddings', 'retrieval'] })
 const phi3 = curatedRow({ catalog_id: 'phi3_mini_4k_instruct_q8_0', name: 'Phi-3-mini-4k-instruct Q8_0', filename: 'Phi-3-mini-4k-instruct-Q8_0.gguf', repo_id: 'bartowski/Phi-3-mini-4k-instruct-GGUF', size_bytes: 4061221376 })
 
 /* The join that makes the offer possible at all: a curated row's catalog_id IS its
@@ -108,9 +110,13 @@ assert.equal(
 
 /* --- the offer ------------------------------------------------------------ */
 {
-  const offer = recommendFirstRunModel([qwen17b, phi3, qwen06b], capabilities)
+  const offer = recommendFirstRunModel([qwen17b, phi3, nomic, qwen06b], capabilities)
   assert.equal(offer.kind, 'recommended')
-  assert.equal(offer.item.catalog_id, 'qwen3_0_6b_instruct_q8_0', 'the smallest fitting supported row wins')
+  assert.equal(
+    offer.item.catalog_id,
+    'qwen3_0_6b_instruct_q8_0',
+    'the smallest fitting supported generative row wins; a smaller encoder sidecar cannot replace the first Chat model',
+  )
 
   /* The regression this pins: a smaller row that is NOT a supported contract row
      must never be offered, however cheap its download is. */
@@ -326,6 +332,39 @@ assert.equal(modelFilenameFromPath(null), '')
   )
   assert.equal(calls[0].body.path, 'models/Qwen3-0.6B-Q8_0.gguf', 'the load path stays models-relative')
   assert.equal(calls[1].body.replace, true, 'loading a model is a swap, never a second resident copy')
+  assert.equal(calls[1].body.set_active, true, 'a generative model becomes the active Chat model')
+}
+
+{
+  // The supported Nomic encoder is a sidecar: it must not replace the active Chat
+  // model, and readiness is a real embedding rather than generation_ready.
+  const calls = []
+  const result = await loadLocalModelForChat({
+    apiBase: 'http://camelid.test',
+    filename: 'nomic-embed-text-v1.5.Q8_0.gguf',
+    fetchImpl: async (url, options) => {
+      calls.push({ url, body: options?.body ? JSON.parse(options.body) : null })
+      if (url.endsWith('/api/models/inspect')) return response({ body: { architecture: 'nomic-bert' } })
+      if (url.endsWith('/api/models/load')) return response({ body: {} })
+      if (url.endsWith('/v1/embeddings')) {
+        return response({ body: { data: [{ embedding: Array(256).fill(0) }] } })
+      }
+      throw new Error(`unexpected request ${url}`)
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.embedding, true)
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    [
+      'http://camelid.test/api/models/inspect',
+      'http://camelid.test/api/models/load',
+      'http://camelid.test/v1/embeddings',
+    ],
+    'the encoder must stop at sidecar readiness instead of checking Chat readiness',
+  )
+  assert.equal(calls[1].body.replace, false)
+  assert.equal(calls[1].body.set_active, false)
 }
 
 {

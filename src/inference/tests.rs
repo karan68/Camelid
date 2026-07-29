@@ -94,6 +94,60 @@ fn metal_resident_weight_gate_rejects_kquant_wire_storage() {
 }
 
 #[test]
+fn resident_q8_moe_expert_view_slices_blocks_without_f32_materialization() {
+    let blocks: Vec<_> = (0..4)
+        .map(|index| Q8_0Block {
+            scale: index as f32 + 1.0,
+            quants: [index as i8; 32],
+        })
+        .collect();
+    let blocks = Arc::new(blocks);
+    let experts = CpuTensor::from_q8_0_shared_blocks(
+        "experts",
+        TensorShape {
+            dims: vec![32, 2, 2],
+        },
+        Arc::clone(&blocks),
+        0,
+        4,
+    )
+    .unwrap();
+
+    let second = expert_matrix_view(&experts, 1, 32, 2, "expert.1").unwrap();
+
+    assert_eq!(second.shape.dims, vec![2, 32]);
+    assert!(second.data.is_empty());
+    assert!(
+        second.q8_0_blocks.is_none(),
+        "expert selection must not clone"
+    );
+    let shared = second
+        .q8_0_shared_blocks
+        .expect("shared resident Q8 blocks");
+    assert!(Arc::ptr_eq(&shared.blocks, &blocks));
+    assert_eq!(shared.as_slice().len(), 2);
+    assert_eq!(shared.as_slice()[0].scale, 3.0);
+    assert_eq!(shared.as_slice()[1].scale, 4.0);
+}
+
+#[test]
+fn resident_moe_preflight_preserves_host_headroom() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let empty = MoeResidentMemoryEstimate::default();
+    assert!(resident_moe_preflight_error(empty, Some((16 * GIB, 0))).is_none());
+    let estimate = MoeResidentMemoryEstimate {
+        resident_bytes: 2 * GIB,
+        transient_bytes: GIB,
+    };
+    assert!(resident_moe_preflight_error(estimate, Some((16 * GIB, 7 * GIB))).is_none());
+    let error = resident_moe_preflight_error(estimate, Some((16 * GIB, 6 * GIB)))
+        .expect("resident blocks, loader scratch, and headroom should require seven GiB");
+    assert!(error.contains("only 6.00 GiB is currently available"));
+    assert!(error.contains("1.00 GiB loader scratch"));
+    assert!(error.contains(crate::runtime_config::MOE_EXPERT_STORAGE_ENV));
+}
+
+#[test]
 fn q3_k_wire_linear_routes_through_cpu_block_dot_without_dense_data() {
     let _env_guard = env_lock();
     std::env::set_var("CAMELID_X86_Q4K_DECODE", "1");
@@ -12187,7 +12241,7 @@ fn mixtral_moe_ffn_captures_router_logits_and_selected_experts() {
     )
     .unwrap();
 
-    let (_, _, _, _, _, trace) = mixtral_moe_ffn(
+    let (out, _, _, _, _, trace) = mixtral_moe_ffn(
         &input,
         &router,
         &gate_experts,
@@ -12206,6 +12260,20 @@ fn mixtral_moe_ffn_captures_router_logits_and_selected_experts() {
     assert_eq!(trace.rows[0].selected_experts, vec![0, 1]);
     let selected_sum = trace.rows[0].selected_weights.iter().sum::<f32>();
     assert!((selected_sum - 1.0).abs() < 1.0e-6, "{trace:?}");
+    assert_eq!(trace.rows[0].experts.len(), 2);
+    assert_eq!(trace.rows[0].experts[0].expert_index, 0);
+    assert_eq!(trace.rows[0].experts[1].expert_index, 1);
+    for column in 0..out.data.len() {
+        let reconstructed = trace.rows[0]
+            .experts
+            .iter()
+            .map(|expert| expert.weighted_down.checkpoint.first_values[column])
+            .sum::<f32>();
+        assert!(
+            (reconstructed - out.data[column]).abs() < 1.0e-6,
+            "weighted expert checkpoints must reconstruct MoE output column {column}"
+        );
+    }
 }
 
 #[test]
