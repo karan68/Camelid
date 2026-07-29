@@ -1,9 +1,11 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import SidebarRail from './components/layout/SidebarRail'
 import TopBar from './components/TopBar'
 import { BackendBanner } from './components/layout/BackendBanner'
+import { FirstRunCard } from './components/onboarding/FirstRunCard'
 import { Notice } from './components/ui/Notice'
 import { ConfirmDialog } from './components/ui/ConfirmDialog'
+import { isFirstRunHost } from './lib/firstRunActivation'
 import { formatPreview, formatSidebarDate } from './lib/formatters'
 import { useDashboardData } from './hooks/useDashboardData'
 import { useBackendLauncher } from './hooks/useBackendLauncher'
@@ -52,6 +54,7 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
+  const [firstRunCardActive, setFirstRunCardActive] = useState(false)
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined
@@ -189,6 +192,20 @@ function App() {
     setDeleteBusy(false)
   }
 
+  /* First-run activation. Mounted here rather than inside the chat view so an
+     in-flight download keeps its watcher when the user navigates away, and kept
+     mounted while the card still owns the flow: the moment the file lands the host
+     stops looking like a fresh install, so `firstRun` alone would drop the card on
+     the next refresh -- abandoning the load, or deleting a failure's Retry button
+     while the downloaded artifact sits there unused. */
+  const firstRun = isFirstRunHost({ runtime, models })
+  const firstRunActive = firstRun || firstRunCardActive
+  const handleFirstRunActivated = useCallback(async () => {
+    await loadDashboard({ silent: true })
+    navigateTab('chat')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadDashboard])
+
   if (!dashboard) {
     return (
       <div className="loading-shell">
@@ -257,6 +274,18 @@ function App() {
           <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
         )}
 
+        {!DEMO_UI && firstRunActive && (
+          <div className="camelid-firstrun-slot" hidden={tab !== 'chat'}>
+            <FirstRunCard
+              apiBase={apiBase}
+              capabilities={dashboard?.capabilities}
+              onActivated={handleFirstRunActivated}
+              onActiveChange={setFirstRunCardActive}
+              onOpenModels={() => navigateTab('library')}
+            />
+          </div>
+        )}
+
         <div className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
@@ -288,6 +317,7 @@ function App() {
               selectedModelExperimental={selectedModelExperimental}
               setTab={navigateTab}
               showNewChatLanding={startNewChat}
+              firstRunActive={firstRunActive}
               demoMode={DEMO_UI}
             />
           )}

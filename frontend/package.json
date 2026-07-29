@@ -11,6 +11,8 @@
     "smoke:model-state": "node scripts/model-state-smoke.mjs",
     "smoke:model-lanes": "node scripts/model-lanes-smoke.mjs",
     "smoke:catalog-activation": "node scripts/catalog-activation-smoke.mjs",
+    "smoke:first-run": "node scripts/first-run-activation-smoke.mjs",
+    "smoke:first-run-card": "node scripts/first-run-card-smoke.mjs",
     "smoke:catalog-browse": "node scripts/catalog-browse-smoke.mjs",
     "smoke:model-deletion": "node scripts/model-deletion-smoke.mjs",
     "smoke:3b-closure": "node scripts/frontend-3b-closure-smoke.mjs",

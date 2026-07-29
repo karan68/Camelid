@@ -367,6 +367,22 @@ jobs:
       - name: Frontend catalog activation smoke
         run: npm run smoke:catalog-activation
 
+      # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
+      # which model a fresh install is offered (supported_* rows only, fit-filtered,
+      # smallest first) and the inspect -> load -> readiness protocol behind the one
+      # click. Also asserts the shipped ledger row and the shipped catalog id still
+      # join, which is what makes the offer derived rather than hard-coded.
+      - name: Frontend first-run activation smoke
+        run: npm run smoke:first-run
+
+      # Component-level: mounts the real first-run card in a browser against a
+      # scripted backend and drives the two transitions that cannot be proved by
+      # rendering markup -- retrying AFTER the artifact landed (which must not
+      # re-download it) and cancelling when the backend disagrees that anything was
+      # cancelled (404 mid-start, 409 after completion, unreadable probes).
+      - name: Frontend first-run card component smoke
+        run: npm run smoke:first-run-card
+
       # Covers frontend/src/lib/catalogBrowse.js: fit labels/details, the
       # settled-vs-retryable `unknown` split, grouping and search ranking. The
       # script shipped with the lane but was never wired here, so none of that
