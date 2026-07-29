@@ -172,6 +172,10 @@ const readBanner = () => {
     code: code?.textContent?.trim() || null,
     buttons: [...(banner?.querySelectorAll('.backend-banner__actions button') || [])].map((b) => b.textContent.trim()),
     escapesBox,
+    // The failure label is much longer than the idle one; at 390px it is the
+    // most likely thing in this banner to burst its container.
+    buttonOverflow: [...(banner?.querySelectorAll('.backend-banner__actions button') || [])]
+      .some((b) => b.scrollWidth > b.clientWidth + 1),
     documentOverflows: document.documentElement.scrollWidth > window.innerWidth + 1,
   }
 }
@@ -219,9 +223,12 @@ try {
   await page.close()
 
   /* ---- Scenario 1b: no clipboard API (a plain-http LAN address is not a
-     secure context). Claiming "Copied" there would be the same lie. ---- */
+     secure context). Claiming "Copied" there would be the same lie. Run at
+     390px: the failure label is the longest string this banner can show. ---- */
   resetStub()
   page = await openBanner({ clipboard: 'absent' })
+  await page.setViewport({ width: 390, height: 844 })
+  await new Promise((done) => setTimeout(done, 150))
   await clickBannerButton(page, 'Copy')
   await page.waitForFunction(
     () => [...document.querySelectorAll('.backend-banner__actions button')].some((b) => !b.textContent.includes('Copy restart')),
@@ -235,6 +242,10 @@ try {
   })
   check('the command stays readable when it could not be copied', () => {
     assert.equal(banner.code, 'camelid serve')
+  })
+  check('the failure label does not burst its button at 390px', () => {
+    assert.equal(banner.buttonOverflow, false, 'a banner button overflows its box')
+    assert.equal(banner.documentOverflows, false, 'the page scrolls horizontally')
   })
   await page.close()
 
