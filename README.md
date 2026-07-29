@@ -56,23 +56,35 @@ ready to use.
   driver, and CUDA versions in [COMPATIBILITY.md](COMPATIBILITY.md); it makes no general
   token-parity or throughput claim.
 
-#### macOS Apple Silicon — command-line install
+#### macOS Apple Silicon
 
-The macOS desktop app currently uses an ad-hoc signature and is **not notarized**. Until a
-notarized release is available, the simplest honest installation path is to build the current
-source and install it from Terminal. It requires macOS 12 or newer on Apple Silicon, the Xcode
-Command Line Tools, [Rust](https://rustup.rs/), and Node.js 22 with npm.
+Paste one command into Terminal — it downloads the latest release DMG, verifies its checksum,
+installs `Camelid Desktop.app` into `/Applications`, and launches it. No toolchain required;
+it needs macOS 12 or newer on Apple Silicon.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-macos.sh | bash
+```
+
+To update later, run the same command again; models and settings are preserved. If
+`/Applications` requires administrator access, macOS asks for your password through `sudo`.
+
+Prefer to install by hand? Download `camelid-desktop-macos-arm64.dmg` from the
+[latest release][latest-release] and drag **Camelid Desktop** into **Applications**. The app is
+ad-hoc signed and **not notarized**, so macOS quarantines a browser download and blocks the first
+launch: approve it under **System Settings → Privacy & Security → Open Anyway** (on macOS 12:
+**System Preferences → Security & Privacy → General**), or clear the
+quarantine once with `xattr -cr "/Applications/Camelid Desktop.app"`. The install command above
+avoids this entirely, because command-line downloads are not quarantined.
+
+To build and install from source instead — requires the Xcode Command Line Tools,
+[Rust](https://rustup.rs/), and Node.js 22 with npm:
 
 ```bash
 git clone https://github.com/timtoole02/Camelid.git
 cd Camelid
 ./scripts/install-macos-desktop.sh
 ```
-
-The install script builds the web UI and Metal-enabled engine, creates an ad-hoc-signed app,
-installs it as `/Applications/Camelid Desktop.app`, and launches it. If `/Applications` requires
-administrator access, macOS asks for your password through `sudo`. To update later, run
-`git pull` followed by `./scripts/install-macos-desktop.sh` again.
 
 Downloaded models live in
 `~/Library/Application Support/app.camelid.desktop/models` by default and are preserved when the
@@ -216,7 +228,7 @@ Every interface talks to the same local engine — pick whichever fits your work
 
 | Interface | How to start it | Best for |
 |---|---|---|
-| **Desktop app** | Windows installer, or `./scripts/install-macos-desktop.sh` on Apple Silicon | A native app with the engine bundled as a local sidecar |
+| **Desktop app** | Windows installer, or the one-command macOS installer in [Quick start](#quick-start) | A native app with the engine bundled as a local sidecar |
 | **Browser chat** | `camelid serve --model <gguf>` opens the web UI automatically | Everyday chatting in a familiar UI |
 | **Terminal UI** | `camelid chat` — full-screen; `--plain` for a line REPL over SSH | Working entirely in the shell |
 | **HTTP API** | OpenAI-style `/v1/*`, served alongside the UI on the same port | Wiring Camelid into your own apps |
@@ -375,7 +387,7 @@ Camelid ships for three platforms today.
 | Platform | Distribution | Acceleration |
 |---|---|---|
 | Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | Experimental CUDA on named exact rows and recorded NVIDIA configurations; CPU fallback |
-| macOS Apple Silicon | Source-installed desktop app (ad-hoc signed), engine archive (`.tar.gz`) | Metal and CPU |
+| macOS Apple Silicon | Desktop DMG (prebuilt, ad-hoc signed) or source-installed desktop app, engine archive (`.tar.gz`) | Metal and CPU |
 | Linux x86_64 | Engine archive (`.tar.gz`) | NVIDIA CUDA compiled in by default; CPU fallback |
 
 CUDA is compiled into the default build on Windows and x86_64 Linux. On Windows, the GPU path is

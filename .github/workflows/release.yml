@@ -12,7 +12,7 @@ on:
         description: 'Release tag to publish (e.g. v0.1.1)'
         required: true
       skip_desktop:
-        description: 'Skip the additive camelid-desktop (Windows) build'
+        description: 'Skip the additive camelid-desktop (Windows + macOS) builds'
         required: false
         default: 'false'
 
@@ -523,6 +523,140 @@ jobs:
             camelid-desktop-windows-x64.zip
             camelid-desktop-windows-x64.zip.sha256
             *-setup.exe
+          fail_on_unmatched_files: true
+
+  # ---------------------------------------------------------------------------------
+  # ADDITIVE: native macOS desktop app (camelid-desktop on Apple Silicon). Same
+  # independence contract as desktop-windows: it is in NO job's `needs`, so it cannot
+  # change or gate the server artifacts, their checksums, or the server publish step,
+  # and it is skippable via the same `skip_desktop` dispatch input. It reuses
+  # scripts/build-macos-desktop.sh — the exact path a developer runs locally — which
+  # builds the web UI, the release Metal-enabled `camelid` sidecar, the ad-hoc-signed
+  # .app, and a drag-to-Applications DMG. There is no Developer ID identity yet, so
+  # the bundle is ad-hoc signed and NOT notarized; scripts/get-desktop-macos.sh is
+  # the documented quarantine-free install path. See camelid-desktop/README.md.
+  desktop-macos:
+    if: ${{ github.event.inputs.skip_desktop != 'true' }}
+    runs-on: macos-14 # Apple Silicon; build-macos-desktop.sh refuses non-arm64 hosts
+    permissions:
+      contents: write # attach the DMG to the release (no signing secrets involved)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # One build path for CI and developers: the script builds the frontend, the
+      # release sidecar, the Tauri .app, and the DMG (ad-hoc signature). Invoked
+      # through `bash` like every other repo script in CI, so it does not depend
+      # on the executable bit surviving in the index.
+      - name: Build the app bundle and DMG
+        run: bash scripts/build-macos-desktop.sh
+
+      # The DMG is renamed to a STABLE, versionless asset name so
+      # `releases/latest/download/camelid-desktop-macos-arm64.dmg` — the URL
+      # scripts/get-desktop-macos.sh and the README rely on — is the same for
+      # every release. (GitHub also rewrites the space in the Tauri file name
+      # on upload, so the built name could not be published verbatim anyway.)
+      - name: Stage the DMG under its release name
+        run: |
+          set -euo pipefail
+          version="$(node -e 'const fs = require("fs"); process.stdout.write(JSON.parse(fs.readFileSync("camelid-desktop/tauri.conf.json", "utf8")).version)')"
+          src="target/release/bundle/dmg/Camelid Desktop_${version}_aarch64.dmg"
+          if [ ! -f "$src" ]; then
+            echo "expected DMG not found: $src" >&2
+            exit 1
+          fi
+          cp "$src" camelid-desktop-macos-arm64.dmg
+          shasum -a 256 camelid-desktop-macos-arm64.dmg > camelid-desktop-macos-arm64.dmg.sha256
+
+      # Open the box that ships, like the server jobs: mount the DMG a user would
+      # mount, copy the app out the way the installer copies it, verify the ad-hoc
+      # signature survived the round-trip, and boot the BUNDLED sidecar model-less.
+      # The sidecar is the engine that must serve — launching the Tauri GUI
+      # headless on a runner proves nothing (same reasoning as desktop-windows).
+      # The smoke reuses the macos-arm64 spec: the bundled sidecar directory holds
+      # the same single `camelid` binary the server tarball ships.
+      - name: Verify the packaged desktop artifact
+        run: |
+          set -euo pipefail
+          # The published .sha256 must name and match the exact bytes being
+          # uploaded — proven with the SAME parser the other jobs' gates use
+          # (a one-record sidecar the user's own `shasum -c` also consumes),
+          # plus that literal user command itself.
+          shasum -a 256 -c camelid-desktop-macos-arm64.dmg.sha256
+          node --input-type=module -e '
+            import { readFile } from "node:fs/promises"
+            import { parseChecksumFile, sha256File } from "./scripts/check-release-artifact.mjs"
+            const record = parseChecksumFile(await readFile("camelid-desktop-macos-arm64.dmg.sha256", "utf8"))
+            if (record.name !== "camelid-desktop-macos-arm64.dmg") throw new Error(`sidecar names ${record.name}`)
+            const hash = await sha256File("camelid-desktop-macos-arm64.dmg")
+            if (hash !== record.hash) throw new Error(`sidecar hash ${record.hash} != actual ${hash}`)
+            console.log("checksum sidecar round-trip OK")
+          '
+          rm -rf verify-desktop dmg-mount && mkdir -p verify-desktop dmg-mount
+          hdiutil attach camelid-desktop-macos-arm64.dmg -nobrowse -readonly -mountpoint dmg-mount -quiet
+          test -d "dmg-mount/Camelid Desktop.app"
+          test -L "dmg-mount/Applications"
+          ditto --noextattr --noqtn "dmg-mount/Camelid Desktop.app" "verify-desktop/Camelid Desktop.app"
+          # Freshly attached volumes can be transiently busy on runners
+          # (Spotlight/XProtect scan new mounts), so detach with retries and a
+          # -force fallback. Everything below runs on the copied-out bundle,
+          # not the mount.
+          detached=0
+          for attempt in 1 2 3 4 5; do
+            if hdiutil detach dmg-mount -quiet 2>/dev/null; then detached=1; break; fi
+            sleep 2
+          done
+          if [ "$detached" -eq 0 ]; then hdiutil detach dmg-mount -force; fi
+          codesign --verify --deep --strict "verify-desktop/Camelid Desktop.app"
+          # The bundled sidecar payload is a closed set: exactly the engine binary.
+          [ "$(ls -A "verify-desktop/Camelid Desktop.app/Contents/Resources/sidecar")" = "camelid" ]
+          node scripts/smoke-release-artifact.mjs \
+            --dir "verify-desktop/Camelid Desktop.app/Contents/Resources/sidecar" \
+            --label macos-arm64 \
+            --expect-version "${{ env.RELEASE_TAG }}" \
+            --out camelid-desktop-macos-arm64-smoke-receipt.json
+
+      - name: Upload desktop artifacts (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: camelid-desktop-macos-arm64
+          path: |
+            camelid-desktop-macos-arm64.dmg
+            camelid-desktop-macos-arm64.dmg.sha256
+
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-desktop-macos-arm64
+          path: camelid-desktop-macos-arm64-*-receipt.json
+          if-no-files-found: ignore
+
+      # Publish to the SAME GitHub release, independently of the server `release`
+      # job (identical pattern to desktop-windows: softprops is idempotent, and a
+      # desktop failure never blocks the server release — the DMG is just absent).
+      - name: Publish the desktop DMG to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            camelid-desktop-macos-arm64.dmg
+            camelid-desktop-macos-arm64.dmg.sha256
           fail_on_unmatched_files: true
 
   release:
