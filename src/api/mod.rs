@@ -642,6 +642,14 @@ pub struct ChatCompletionRequest {
     /// (llama.cpp `repeat_last_n`). Omit for the whole history — OpenAI's
     /// semantics and this engine's default; `0` disables the penalties.
     pub penalty_last_n: Option<u32>,
+    /// Locally-typical sampling (llama.cpp `typical_p`). Omit or `1.0` disables.
+    pub typical_p: Option<f32>,
+    /// Keep tokens within `n` standard deviations of the max logit
+    /// (llama.cpp `top_n_sigma`). Omit or `<= 0.0` disables.
+    pub top_n_sigma: Option<f32>,
+    /// Floor on how many candidates the truncating filters may leave
+    /// (llama.cpp `min_keep`). Defaults to 1.
+    pub min_keep: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -722,6 +730,14 @@ pub struct CompletionRequest {
     /// clamped to `0` and silently disables penalties instead of meaning
     /// "whole context", so that spelling is deliberately not accepted here.
     pub penalty_last_n: Option<u32>,
+    /// Locally-typical sampling (llama.cpp `typical_p`). Omit or `1.0` disables.
+    pub typical_p: Option<f32>,
+    /// Keep tokens within `n` standard deviations of the max logit
+    /// (llama.cpp `top_n_sigma`). Omit or `<= 0.0` disables.
+    pub top_n_sigma: Option<f32>,
+    /// Floor on how many candidates the truncating filters may leave
+    /// (llama.cpp `min_keep`). Defaults to 1.
+    pub min_keep: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -952,6 +968,14 @@ pub struct LlamaServerCompletionRequest {
     /// clamped to `0` and silently disables penalties instead of meaning
     /// "whole context", so that spelling is deliberately not accepted here.
     pub penalty_last_n: Option<u32>,
+    /// Locally-typical sampling (llama.cpp `typical_p`). Omit or `1.0` disables.
+    pub typical_p: Option<f32>,
+    /// Keep tokens within `n` standard deviations of the max logit
+    /// (llama.cpp `top_n_sigma`). Omit or `<= 0.0` disables.
+    pub top_n_sigma: Option<f32>,
+    /// Floor on how many candidates the truncating filters may leave
+    /// (llama.cpp `min_keep`). Defaults to 1.
+    pub min_keep: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     #[serde(flatten)]
@@ -1179,6 +1203,14 @@ pub struct GenerationSessionRequest {
     /// clamped to `0` and silently disables penalties instead of meaning
     /// "whole context", so that spelling is deliberately not accepted here.
     pub penalty_last_n: Option<u32>,
+    /// Locally-typical sampling (llama.cpp `typical_p`). Omit or `1.0` disables.
+    pub typical_p: Option<f32>,
+    /// Keep tokens within `n` standard deviations of the max logit
+    /// (llama.cpp `top_n_sigma`). Omit or `<= 0.0` disables.
+    pub top_n_sigma: Option<f32>,
+    /// Floor on how many candidates the truncating filters may leave
+    /// (llama.cpp `min_keep`). Defaults to 1.
+    pub min_keep: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -2925,6 +2957,9 @@ async fn llama_server_completion(
         min_p: req.min_p,
         repeat_penalty: req.repeat_penalty,
         penalty_last_n: req.penalty_last_n,
+        typical_p: req.typical_p,
+        top_n_sigma: req.top_n_sigma,
+        min_keep: req.min_keep,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: None,
@@ -9666,6 +9701,9 @@ async fn completions(
         min_p: req.min_p,
         repeat_penalty: req.repeat_penalty,
         penalty_last_n: req.penalty_last_n,
+        typical_p: req.typical_p,
+        top_n_sigma: req.top_n_sigma,
+        min_keep: req.min_keep,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: req.n,
@@ -10061,6 +10099,9 @@ async fn chat_completions(
         min_p: req.min_p,
         repeat_penalty: req.repeat_penalty,
         penalty_last_n: req.penalty_last_n,
+        typical_p: req.typical_p,
+        top_n_sigma: req.top_n_sigma,
+        min_keep: req.min_keep,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: req.n,
@@ -10479,6 +10520,9 @@ async fn replay_loaded_receipt_request(
         min_p: None,
         repeat_penalty: None,
         penalty_last_n: None,
+        typical_p: None,
+        top_n_sigma: None,
+        min_keep: None,
         logit_bias: None,
         stop: if request.stop.is_empty() {
             None
@@ -11865,8 +11909,9 @@ fn validate_unsupported_generation_fields(
             "OpenAI stream_options are not supported yet; Camelid streams plain SSE chunks"
         }
         "echo" | "suffix" => "completion echo/suffix compatibility is not supported yet",
-        "mirostat" | "mirostat_tau" | "mirostat_eta" | "typical_p" | "tfs_z" | "ignore_eos"
-        | "n_keep" => "this llama-server sampler/control field is not supported yet",
+        "mirostat" | "mirostat_tau" | "mirostat_eta" | "tfs_z" | "ignore_eos" | "n_keep" => {
+            "this llama-server sampler/control field is not supported yet"
+        }
         "cache_prompt" | "id_slot" | "id_task" | "slot_id" => {
             "llama-server slot/cache controls are not supported by this compatibility route yet"
         }
@@ -11899,7 +11944,6 @@ fn static_param_name(param: &str) -> &'static str {
         "mirostat" => "mirostat",
         "mirostat_tau" => "mirostat_tau",
         "mirostat_eta" => "mirostat_eta",
-        "typical_p" => "typical_p",
         "tfs_z" => "tfs_z",
         "ignore_eos" => "ignore_eos",
         "n_keep" => "n_keep",
@@ -11975,6 +12019,9 @@ fn sampling_config_from_request(
         top_k: req.top_k.map(|value| value as usize),
         top_p: req.top_p,
         min_p: req.min_p,
+        typical_p: req.typical_p,
+        top_n_sigma: req.top_n_sigma,
+        min_keep: req.min_keep.map(|value| value as usize),
         seed: req.seed,
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
@@ -15820,6 +15867,9 @@ mod tests {
             min_p: None,
             repeat_penalty: None,
             penalty_last_n: None,
+            typical_p: None,
+            top_n_sigma: None,
+            min_keep: None,
             seed: None,
             presence_penalty: None,
             frequency_penalty: None,
