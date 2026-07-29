@@ -73,13 +73,29 @@ state. Desktop does not claim a ready model or manufacture a model error on the 
 - **Windows:** Windows 10/11 with the **WebView2 runtime** (preinstalled on current Windows 10/11; the
   Tauri bundle ships the bootstrapper otherwise).
 - **macOS:** Apple Silicon running macOS 12 or newer. The current macOS desktop bundle is
-  ad-hoc signed for local/developer distribution and is not notarized.
+  ad-hoc signed and not notarized; it ships prebuilt as the release DMG (see
+  [macOS install](#macos-install)).
 - A bundled platform engine. The portable ZIP, Windows installer, and macOS app bundle
   include it automatically.
 
-## macOS command-line install
+## macOS install
 
-From the repository root on an Apple Silicon Mac:
+**Prebuilt (recommended).** On an Apple Silicon Mac, one command downloads the release DMG
+(`camelid-desktop-macos-arm64.dmg`, built by the additive `desktop-macos` release job), verifies
+its published SHA-256, installs `/Applications/Camelid Desktop.app`, and launches it — no
+toolchain required:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-macos.sh | bash
+```
+
+The app is ad-hoc signed and not notarized, so a browser-downloaded DMG is quarantined and
+Gatekeeper blocks the first launch (approve under **System Settings → Privacy & Security** — on
+macOS 12, **System Preferences → Security & Privacy → General** — or
+`xattr -cr` the installed app). The script path avoids that: command-line downloads carry no
+quarantine attribute. Pass a tag to pin a version (`... | bash -s -- v0.4.5`).
+
+**From source.** From the repository root on an Apple Silicon Mac:
 
 ```sh
 ./scripts/install-macos-desktop.sh
@@ -88,11 +104,10 @@ From the repository root on an Apple Silicon Mac:
 This builds the frontend, release engine, app bundle, and DMG; closes an existing Camelid Desktop
 instance cleanly; installs the new app at `/Applications/Camelid Desktop.app`; verifies its
 ad-hoc signature; and launches it. The script uses `sudo` only when `/Applications` is not writable.
-Neither the default Application Support model directory nor a custom model directory is replaced.
-
 Prerequisites are macOS 12 or newer, the Xcode Command Line Tools, Rust, and Node.js 22 with npm.
-The app is not notarized yet, so this path is intended for local testing and developer
-distribution.
+
+Neither path replaces the default Application Support model directory or a custom model
+directory: installed models survive updates and reinstalls.
 
 ## Building (developers)
 
@@ -119,8 +134,8 @@ The server build is unaffected by this crate: `cargo build --release --locked --
 does not pull `camelid-desktop` into its graph (workspace `resolver = "2"`,
 `default-members = ["."]`).
 
-For a bundled installer + portable zip, see the additive `desktop-windows` job in
-`../.github/workflows/release.yml`.
+For the shipped bundles — Windows installer + portable zip, and the macOS DMG — see the
+additive `desktop-windows` and `desktop-macos` jobs in `../.github/workflows/release.yml`.
 
 ### Building the macOS app and DMG
 
@@ -133,7 +148,8 @@ On an Apple Silicon Mac:
 The script builds the real frontend, the release Metal-enabled `camelid` sidecar, and the
 Tauri `.app` and `.dmg`. It uses an ad-hoc signature (`-`), not a Developer ID signature,
 and performs no notarization. macOS may therefore require the user to approve the app in
-**System Settings → Privacy & Security** after downloading it.
+**System Settings → Privacy & Security** (on macOS 12, **System Preferences → Security &
+Privacy → General**) after downloading it.
 
 Downloaded models are stored under the app's per-user Application Support directory rather
 than inside the app bundle by default. The **Downloaded models** tab can save a different local
