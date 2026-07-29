@@ -872,6 +872,7 @@ fn write_q8_0_test_block(
 
 #[test]
 fn q8_file_backed_output_projection_reuses_weight_read_across_batch_rows() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     let _q8_guard = crate::test_support::q8_file_state_lock();
     clear_dense_diagnostic_env();
@@ -932,6 +933,7 @@ fn q8_file_backed_output_projection_reuses_weight_read_across_batch_rows() {
 
 #[test]
 fn q8_file_backed_output_projection_empty_batch_skips_weight_reads() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     let _q8_guard = crate::test_support::q8_file_state_lock();
     clear_dense_diagnostic_env();
@@ -1323,6 +1325,7 @@ fn prefill_layer_major_defaults_only_for_lazy_q8_backing() {
 
 #[test]
 fn prefill_layer_major_q8_cache_uses_scoped_default_only_for_lazy_q8() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
 
@@ -1391,6 +1394,7 @@ fn prefill_layer_major_q8_cache_uses_scoped_default_only_for_lazy_q8() {
 
 #[test]
 fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     let _q8_guard = crate::test_support::q8_file_state_lock();
     clear_dense_diagnostic_env();
