@@ -2223,7 +2223,12 @@ pub struct SamplingConfig {
     pub top_p: Option<f32>,
     /// Minimum-probability filter: keep only tokens whose probability is at
     /// least `min_p * max_probability`. `None`/`0.0` disables it; `1.0` keeps
-    /// only the argmax. Applied after softmax, before `top_p`.
+    /// only the argmax.
+    ///
+    /// Applied *after* `top_p` and *before* temperature, matching the reference
+    /// chain order in llama.cpp `common/common.h`. Because it is a ratio test
+    /// against the peak, it is invariant to renormalization — but not to
+    /// temperature, which is why temperature must stay last.
     pub min_p: Option<f32>,
     pub seed: Option<u64>,
     pub presence_penalty: f32,
@@ -2234,6 +2239,24 @@ pub struct SamplingConfig {
     /// discourage repetition. Applied over the same history as the additive
     /// presence/frequency penalties.
     pub repeat_penalty: f32,
+    /// How many of the most recent history tokens the three penalties above are
+    /// measured over.
+    ///
+    /// `None` (the default) means the **entire** history, which is what OpenAI's
+    /// `presence_penalty`/`frequency_penalty` specify and what this engine has
+    /// always done — so the default is a no-op for existing callers. `Some(0)`
+    /// disables the penalties outright. `Some(n)` measures only the last `n`
+    /// tokens, which is llama.cpp's `--repeat-last-n` (its own default is 64).
+    ///
+    /// Deliberate divergence: llama.cpp windows to 64 by default, but this API is
+    /// OpenAI-shaped and OpenAI counts over the whole context, so adopting 64 as
+    /// the default here would silently change every existing caller's output.
+    /// The capability is offered; the default is not changed.
+    ///
+    /// Note llama.cpp's own `-1` sentinel is a trap worth not copying: on the CLI
+    /// path `std::max(-1, 0)` turns it into `0`, silently *disabling* penalties,
+    /// while only the server maps `-1` to the context length.
+    pub penalty_last_n: Option<usize>,
     pub logit_bias: Vec<(usize, f32)>,
 }
 
@@ -2248,6 +2271,7 @@ impl Default for SamplingConfig {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repeat_penalty: 1.0,
+            penalty_last_n: None,
             logit_bias: Vec::new(),
         }
     }
@@ -6503,6 +6527,34 @@ fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
     Ok(())
 }
 
+/// Numerically-stable softmax over `(token index, logit)` candidates, dividing
+/// each logit by `temperature` first. Returns probabilities positionally aligned
+/// with `candidates`.
+///
+/// `temperature == 1.0` divides by exactly one, which IEEE-754 leaves bit-exact,
+/// so the reordered chain reproduces the previous output token-for-token at unit
+/// temperature.
+fn softmax_candidates(candidates: &[(usize, f32)], temperature: f32) -> Result<Vec<f32>> {
+    let max_logit = candidates
+        .iter()
+        .map(|(_, logit)| *logit / temperature)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut weights: Vec<f32> = candidates
+        .iter()
+        .map(|(_, logit)| ((*logit / temperature) - max_logit).exp())
+        .collect();
+    let sum: f32 = weights.iter().sum();
+    if sum == 0.0 || !sum.is_finite() {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "sampler softmax produced invalid normalization sum".to_string(),
+        ));
+    }
+    for weight in &mut weights {
+        *weight /= sum;
+    }
+    Ok(weights)
+}
+
 fn sample_with_config(
     logits: &CpuTensor,
     config: &SamplingConfig,
@@ -6532,67 +6584,61 @@ fn sample_with_config(
         right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
     });
 
-    let max_logit = candidates
-        .iter()
-        .map(|(_, logit)| *logit / config.temperature)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut weighted: Vec<(usize, f32)> = candidates
-        .into_iter()
-        .map(|(idx, logit)| (idx, ((logit / config.temperature) - max_logit).exp()))
-        .collect();
-    let weight_sum: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
-    if weight_sum == 0.0 || !weight_sum.is_finite() {
-        return Err(BackendError::RuntimeShapeMismatch(
-            "sampler softmax produced invalid normalization sum".to_string(),
-        ));
-    }
-    for (_, weight) in &mut weighted {
-        *weight /= weight_sum;
-    }
+    // Reference chain order — llama.cpp `common/common.h` default `samplers`:
+    // penalties → top_k → typical_p → top_p → min_p → TEMPERATURE → dist. The
+    // reference applies temperature LAST, so every probability-based truncation
+    // measures the *un-tempered* distribution. Dividing by temperature before
+    // top_p/min_p (as this sampler previously did) sharpens or flattens the
+    // distribution those filters measure, so the same (top_p, min_p) keeps a
+    // different candidate set than the reference at any temperature != 1.0.
+    //
+    // top_k is unaffected by the move: temperature scaling is monotonic, so it
+    // cannot reorder logits. At temperature == 1.0 the two orders are bit-exact
+    // (division by one is exact), which is why every existing sampler test —
+    // all of which pin temperature to 0.0 or 1.0 — is untouched by this change.
+    if config.top_p.is_some_and(|top_p| top_p < 1.0)
+        || config.min_p.is_some_and(|min_p| min_p > 0.0)
+    {
+        let mut probabilities = softmax_candidates(&candidates, 1.0)?;
 
-    if let Some(min_p) = config.min_p.filter(|min_p| *min_p > 0.0) {
-        let max_probability = weighted
-            .iter()
-            .map(|(_, weight)| *weight)
-            .fold(0.0_f32, f32::max);
-        let threshold = min_p * max_probability;
-        weighted.retain(|(_, weight)| *weight >= threshold);
-        let renorm: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
-        if weighted.is_empty() || renorm == 0.0 || !renorm.is_finite() {
-            return Err(BackendError::RuntimeShapeMismatch(
-                "min_p filtering removed all sampler candidates".to_string(),
-            ));
-        }
-        for (_, weight) in &mut weighted {
-            *weight /= renorm;
-        }
-    }
-
-    if let Some(top_p) = config.top_p.filter(|top_p| *top_p < 1.0) {
-        // `weighted` still has the descending-logit order established above:
-        // exp/logit scaling and normalization are monotonic, and min-p retains
-        // elements without reordering them. Sorting by probability again was a
-        // redundant O(n log n) pass over the vocabulary.
-        let mut cumulative = 0.0;
-        let mut keep = 0usize;
-        for (_, probability) in &weighted {
-            cumulative += *probability;
-            keep += 1;
-            if cumulative >= top_p {
-                break;
+        if let Some(top_p) = config.top_p.filter(|top_p| *top_p < 1.0) {
+            // `candidates` is in descending-logit order and softmax is monotonic,
+            // so `probabilities` is descending too and the survivors are a prefix.
+            let mut cumulative = 0.0;
+            let mut keep = 0usize;
+            for probability in &probabilities {
+                cumulative += *probability;
+                keep += 1;
+                if cumulative >= top_p {
+                    break;
+                }
             }
+            let keep = keep.max(1);
+            candidates.truncate(keep);
+            probabilities.truncate(keep);
         }
-        weighted.truncate(keep.max(1));
-        let renorm: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
-        if renorm == 0.0 || !renorm.is_finite() {
-            return Err(BackendError::RuntimeShapeMismatch(
-                "top_p filtering removed all sampler candidates".to_string(),
-            ));
-        }
-        for (_, weight) in &mut weighted {
-            *weight /= renorm;
+
+        if let Some(min_p) = config.min_p.filter(|min_p| *min_p > 0.0) {
+            // Ratio test against the peak, so the result is invariant to whether
+            // the survivors were renormalized after top_p — which is why this
+            // stage does not need to renormalize before measuring.
+            let max_probability = probabilities.iter().copied().fold(0.0_f32, f32::max);
+            let threshold = min_p * max_probability;
+            let keep = probabilities
+                .iter()
+                .take_while(|probability| **probability >= threshold)
+                .count()
+                .max(1);
+            candidates.truncate(keep);
         }
     }
+
+    // Temperature last, over the survivors only.
+    let weighted: Vec<(usize, f32)> = candidates
+        .iter()
+        .map(|(idx, _)| *idx)
+        .zip(softmax_candidates(&candidates, config.temperature)?)
+        .collect();
 
     // Advance the RNG per decode step: `token_history.len()` is the deterministic
     // stream position, so each step draws a fresh uniform while a fixed seed still
@@ -6643,8 +6689,17 @@ fn apply_sampling_adjustments<'a>(
         || config.frequency_penalty != 0.0
         || config.repeat_penalty != 1.0
     {
+        // Penalties are measured over the last `penalty_last_n` history tokens.
+        // `None` keeps the whole history, which is both this engine's historical
+        // behaviour and OpenAI's specified semantics — see the field docs on
+        // `SamplingConfig::penalty_last_n` for why the default is not llama.cpp's 64.
+        let window: &[u32] = match config.penalty_last_n {
+            Some(0) => &[],
+            Some(last_n) => &token_history[token_history.len().saturating_sub(last_n)..],
+            None => token_history,
+        };
         let mut counts = std::collections::HashMap::<usize, usize>::new();
-        for token_id in token_history {
+        for token_id in window {
             let token_idx = usize::try_from(*token_id).map_err(|_| {
                 BackendError::RuntimeShapeMismatch(format!(
                     "token id {token_id} does not fit sampler index space"
