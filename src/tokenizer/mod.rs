@@ -40,7 +40,29 @@ pub enum BpePreTokenizer {
     /// up to three (`\p{N}{1,3}`).
     #[default]
     Llama3,
-    /// command-r pre-tokenizer, standard byte-fallback tiktoken behavior.
+    /// **Unreachable scaffolding — does NOT model llama.cpp's `command-r`.**
+    ///
+    /// This variant is parameterised as "llama-bpe with 3-digit grouping", but the
+    /// reference `LLAMA_VOCAB_PRE_TYPE_COMMAND_R` is not in the llama3 family at
+    /// all. llama.cpp groups it with SMOLLM/STARCODER/REFACT and uses a TWO-regex
+    /// list (`src/llama-vocab.cpp`):
+    ///
+    /// ```text
+    /// "\p{N}",
+    /// "'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
+    /// ```
+    ///
+    /// That differs from llama3 on three axes, not one: digits split individually
+    /// (the leading `\p{N}` isolates each, so the later ` ?\p{N}+` can never regroup
+    /// them) rather than in runs of three; the letter branch is ` ?\p{L}+` (space
+    /// prefix only) rather than `[^\r\n\p{L}\p{N}]?\p{L}+` (any non-alphanumeric
+    /// prefix); and the contractions are case-SENSITIVE rather than `'[sS]`-style.
+    ///
+    /// It is scaffolding rather than a live defect: command-r is refused at the
+    /// architecture axis before any tokenizer runs, and `resolve_gpt2_pre_tokenizer`
+    /// now refuses the `command-r` metadata value outright, so this variant cannot
+    /// be reached from a GGUF. Implementing it properly means adding a genuinely
+    /// different splitter, not another `digit_group_max` value.
     CommandR,
     /// llama.cpp `qwen2` (Qwen2/Qwen3): each digit is its own piece (`\p{N}`).
     /// Byte-for-byte identical to `llama-bpe` in every other branch — verified
@@ -282,8 +304,24 @@ fn resolve_gpt2_pre_tokenizer(
 ) -> Result<BpePreTokenizer> {
     match pre {
         Some("llama-bpe") => Ok(BpePreTokenizer::Llama3),
-        Some("command-r") => Ok(BpePreTokenizer::CommandR),
+        // `command-r` is refused rather than mapped: [`BpePreTokenizer::CommandR`]
+        // models it as llama3-with-3-digit-grouping, but the reference dialect is
+        // a different two-regex form entirely (see that variant's docs). Accepting
+        // it here would silently mis-tokenize. The architecture is refused upstream
+        // anyway, so this closes a latent footgun rather than removing a capability.
+        Some("command-r") => Err(BackendError::UnsupportedTokenizer(
+            "command-r's pre-tokenizer is not implemented: the reference dialect is \
+             not in the llama-bpe family (digits split individually, ` ?\\p{L}+` \
+             letter branch, case-sensitive contractions) and Camelid's CommandR \
+             variant does not model it"
+                .to_string(),
+        )),
         Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
+        // `stablelm2` is an EXACT alias of `qwen2`: llama.cpp puts
+        // LLAMA_VOCAB_PRE_TYPE_STABLELM2 and _QWEN2 in the same switch arm with one
+        // shared regex body, so no new splitter is required. Verified
+        // character-for-character against `src/llama-vocab.cpp`.
+        Some("stablelm2") => Ok(BpePreTokenizer::Qwen2),
         Some("qwen35") => Ok(BpePreTokenizer::Qwen35),
         Some("gpt-4o") if allow_gpt4o => Ok(BpePreTokenizer::Gpt4o),
         Some("gpt-4o") => Err(BackendError::UnsupportedTokenizer(
@@ -292,7 +330,7 @@ fn resolve_gpt2_pre_tokenizer(
         )),
         None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
         other => Err(BackendError::UnsupportedTokenizer(format!(
-            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35"
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2, qwen35, stablelm2"
         ))),
     }
 }
@@ -2183,6 +2221,40 @@ mod tests {
             Ok(BpePreTokenizer::Gpt4o)
         ));
         assert!(resolve_gpt2_pre_tokenizer(Some("gpt-4o"), &no_sig, false).is_err());
+
+        // `stablelm2` is an EXACT alias of `qwen2` — llama.cpp puts
+        // LLAMA_VOCAB_PRE_TYPE_STABLELM2 and _QWEN2 in one switch arm sharing a
+        // single regex body, so it needs no new splitter.
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("stablelm2"), &no_sig, false),
+            Ok(BpePreTokenizer::Qwen2)
+        ));
+
+        // `command-r` is REFUSED, not mapped. BpePreTokenizer::CommandR models it
+        // as llama3-with-3-digit-grouping, but the reference dialect is a different
+        // two-regex form (digits split individually, ` ?\p{L}+` letter branch,
+        // case-sensitive contractions). Accepting it would silently mis-tokenize.
+        assert!(resolve_gpt2_pre_tokenizer(Some("command-r"), &no_sig, false).is_err());
+        assert!(resolve_gpt2_pre_tokenizer(Some("command-r"), &sig, false).is_err());
+
+        // Dialects that are NOT aliases of anything implemented stay refused: each
+        // needs a genuinely different splitter, not another digit-grouping value.
+        //   tekken       -> case-run lookahead groups
+        //   smollm       -> two-regex GPT-2 form (same arm as command-r)
+        //   deepseek-llm -> six-regex list with explicit Unicode range classes
+        //   llama4       -> maps to GPT4O upstream, which is sha256-gated here
+        for unsupported in [
+            "tekken",
+            "smollm",
+            "deepseek-llm",
+            "deepseek-coder",
+            "llama4",
+        ] {
+            assert!(
+                resolve_gpt2_pre_tokenizer(Some(unsupported), &no_sig, false).is_err(),
+                "{unsupported} must stay refused until its splitter exists"
+            );
+        }
 
         // Missing pre + Llama-3 signature => recovered as Llama3 (the fix).
         assert!(matches!(
