@@ -46,15 +46,28 @@ ready to use.
 
 #### Windows
 
-1. Download the signed installer from the [latest release][latest-release]:
-   - `Camelid.Desktop_<version>_x64-setup.exe` — signed installer; installs per-user, no admin rights.
-   - `camelid-desktop-windows-x64.zip` — portable desktop app, no installation required.
-2. Run it. The app installs per-user under `%LOCALAPPDATA%\Camelid Desktop`.
-3. It bundles the CUDA runtime, so no separate CUDA Toolkit is required. Its experimental Windows
-  CUDA path still requires a compatible NVIDIA driver (CPU otherwise), and it embeds the same
-  engine as everything below. Windows CUDA evidence is limited to the exact rows and recorded GPU,
-  driver, and CUDA versions in [COMPATIBILITY.md](COMPATIBILITY.md); it makes no general
-  token-parity or throughput claim.
+Paste one command into PowerShell — it downloads the signed installer from the latest release,
+verifies its Authenticode signature, installs the app per-user (no admin rights) under
+`%LOCALAPPDATA%\Camelid Desktop`, and launches it. No toolchain required; it needs 64-bit
+Windows 10 or 11.
+
+```powershell
+irm https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-windows.ps1 | iex
+```
+
+To update later, run the same command again; models and settings are preserved. To pin a
+version, set `CAMELID_DESKTOP_TAG` first (for example `$env:CAMELID_DESKTOP_TAG = 'v0.4.5'`).
+
+Prefer to install by hand? Download either artifact from the [latest release][latest-release]:
+
+- `Camelid.Desktop_<version>_x64-setup.exe` — signed installer; installs per-user, no admin rights.
+- `camelid-desktop-windows-x64.zip` — portable desktop app, no installation required.
+
+Either way, the app bundles the CUDA runtime, so no separate CUDA Toolkit is required. Its
+experimental Windows CUDA path still requires a compatible NVIDIA driver (CPU otherwise), and it
+embeds the same engine as everything below. Windows CUDA evidence is limited to the exact rows and
+recorded GPU, driver, and CUDA versions in [COMPATIBILITY.md](COMPATIBILITY.md); it makes no
+general token-parity or throughput claim.
 
 #### macOS Apple Silicon
 
@@ -228,7 +241,7 @@ Every interface talks to the same local engine — pick whichever fits your work
 
 | Interface | How to start it | Best for |
 |---|---|---|
-| **Desktop app** | Windows installer, or the one-command macOS installer in [Quick start](#quick-start) | A native app with the engine bundled as a local sidecar |
+| **Desktop app** | One-command Windows or macOS installer in [Quick start](#quick-start) | A native app with the engine bundled as a local sidecar |
 | **Browser chat** | `camelid serve --model <gguf>` opens the web UI automatically | Everyday chatting in a familiar UI |
 | **Terminal UI** | `camelid chat` — full-screen; `--plain` for a line REPL over SSH | Working entirely in the shell |
 | **HTTP API** | OpenAI-style `/v1/*`, served alongside the UI on the same port | Wiring Camelid into your own apps |
