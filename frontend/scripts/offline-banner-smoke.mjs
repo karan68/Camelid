@@ -193,12 +193,15 @@ try {
     assert.equal(banner.buttons.some((label) => label.includes('Start Camelid')), false,
       `expected no Start button, got ${JSON.stringify(banner.buttons)}`)
   })
-  check('packaged build offers the restart command instead', () => {
-    assert.ok(banner.buttons.includes('Copy restart command'),
+  check('packaged build offers a real action instead', () => {
+    assert.ok(banner.buttons.includes('Copy terminal command'),
       `expected a copy action, got ${JSON.stringify(banner.buttons)}`)
   })
-  check('packaged build names the command to run', () => {
-    assert.equal(banner.code, 'camelid serve')
+  check('packaged build names the executable, not a PATH-dependent command', () => {
+    // `camelid serve` errors with "'camelid' is not recognized" for anyone who
+    // unzipped a release, so the instruction must name the file to run.
+    assert.equal(banner.code, 'camelid.exe')
+    assert.match(banner.text, /unzipped/i)
   })
   check('packaged build explains why the page cannot restart the engine', () => {
     assert.match(banner.text, /served by the engine/i)
@@ -231,7 +234,7 @@ try {
   await new Promise((done) => setTimeout(done, 150))
   await clickBannerButton(page, 'Copy')
   await page.waitForFunction(
-    () => [...document.querySelectorAll('.backend-banner__actions button')].some((b) => !b.textContent.includes('Copy restart')),
+    () => [...document.querySelectorAll('.backend-banner__actions button')].some((b) => b.textContent.includes('Couldn\u2019t copy')),
     { timeout: 5000 })
   banner = await page.evaluate(readBanner)
   check('an unavailable clipboard is never reported as a successful copy', () => {
@@ -240,8 +243,8 @@ try {
     assert.ok(banner.buttons.some((label) => label.includes('Couldn’t copy')),
       `expected an honest failure label, got ${JSON.stringify(banner.buttons)}`)
   })
-  check('the command stays readable when it could not be copied', () => {
-    assert.equal(banner.code, 'camelid serve')
+  check('the instruction stays readable when the copy failed', () => {
+    assert.equal(banner.code, 'camelid.exe')
   })
   check('the failure label does not burst its button at 390px', () => {
     assert.equal(banner.buttonOverflow, false, 'a banner button overflows its box')
@@ -262,21 +265,22 @@ try {
   })
   await page.close()
 
-  /* ---- Scenario 1d: an overlong saved launch command must wrap, not widen
-     the page. `camelid.launchCommand` survives from a dev session. The token is
-     deliberately unbroken (a deep path, no spaces): a command WITH spaces
-     word-wraps on its own and would make this check pass for free. ---- */
+  /* ---- Scenario 1d: the remote state renders the host name, which is the only
+     variable-length text in this banner and therefore the only overflow risk.
+     The token is deliberately unbroken (no hyphens): hyphens are line-break
+     opportunities and would make this check pass for free. ---- */
   resetStub()
-  page = await openBanner({ storage: { 'camelid.launchCommand': `C:\\camelid\\${'VeryDeeplyNestedDirectory\\'.repeat(6)}camelid.exe` } })
+  const longHost = `${'verylongsubdomainsegment'.repeat(4)}.example`
+  page = await openBanner({ storage: { 'camelid.apiBase': `http://${longHost}:8181` } })
   await page.setViewport({ width: 390, height: 844 })
   await new Promise((done) => setTimeout(done, 200))
   banner = await page.evaluate(readBanner)
-  check('a long unbreakable command wraps instead of breaking the layout at 390px', () => {
+  check('a long unbreakable host wraps instead of breaking the layout at 390px', () => {
     // Prove the scenario is actually exercising the long token before drawing
     // any conclusion from the geometry.
-    assert.ok(banner.code?.includes('VeryDeeplyNestedDirectory'),
-      `the long command never reached the banner: ${JSON.stringify(banner.code)}`)
-    assert.equal(banner.escapesBox, false, 'the command text escapes the banner box')
+    assert.equal(banner.code, longHost,
+      `the long host never reached the banner: ${JSON.stringify(banner.code)}`)
+    assert.equal(banner.escapesBox, false, 'the host text escapes the banner box')
     assert.equal(banner.documentOverflows, false, 'the page scrolls horizontally')
   })
   await page.close()
@@ -288,7 +292,7 @@ try {
   page = await openBanner({ storage: { 'camelid.apiBase': 'http://engine.example:8181' } })
   banner = await page.evaluate(readBanner)
   check('a remote engine is not told to restart locally', () => {
-    assert.equal(banner.buttons.some((label) => label.includes('Copy restart')), false,
+    assert.equal(banner.buttons.some((label) => label.includes('Copy')), false,
       `offered a local restart for a remote engine: ${JSON.stringify(banner.buttons)}`)
     assert.equal(banner.text.includes('served by the engine'), false)
   })

@@ -4,8 +4,14 @@ import { StatusDot } from '../ui/StatusDot'
 import { IconPlay, IconCopy, IconCheck, IconSettings } from '../ui/icons'
 import { copyText } from '../../lib/markdown'
 
-/* Fallback shown on the copy button. Only a hint: the packaged app cannot know
-   which flags the engine was originally launched with. */
+/* Shown on the copy button when nothing better is known.
+
+   NOT presented as "the" restart command. `camelid serve` only runs when the
+   binary is on PATH, which it is NOT for the population that actually hits this
+   banner: someone who unzipped a release and double-clicked camelid.exe. Handing
+   them a command that errors with "'camelid' is not recognized" is the same
+   class of dead end this component exists to remove, so the instruction leads
+   with the executable and the copy action is labelled for what it is. */
 const RESTART_COMMAND = 'camelid serve'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '[::1]', '::1'])
@@ -70,8 +76,8 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
     copyResetRef.current = window.setTimeout(() => setCopyState('idle'), 2400)
   }
 
-  const copyLabel = { copied: 'Copied', failed: 'Couldn’t copy — select it above' }[copyState]
-    || 'Copy restart command'
+  const copyLabel = { copied: 'Copied', failed: 'Couldn’t copy' }[copyState]
+    || 'Copy terminal command'
 
   return (
     <div className="backend-banner" role="status" aria-live="polite">
@@ -81,7 +87,7 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
         <span>
           {canStart && 'Start it to load a model and chat — no setup needed.'}
           {!canStart && isLocalEngine && (
-            <>This page is served by the engine, so it can’t restart it. Run <code>{restartCommand}</code> in a terminal and this clears automatically.</>
+            <>This page is served by the engine, so it can’t restart it. Start <code>camelid.exe</code> again from the folder you unzipped Camelid into — or re-run the command you launched it with.</>
           )}
           {!canStart && !isLocalEngine && (
             <>The engine this UI points at — <code>{host}</code> — isn’t answering. Check that Camelid is running on that machine, or point this UI somewhere else in Settings.</>
