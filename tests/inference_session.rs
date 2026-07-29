@@ -689,6 +689,175 @@ fn rejects_attention_head_configuration_that_cannot_share_kv_heads() {
     assert!(err.contains("kv head count 3"));
 }
 
+#[test]
+fn smollm3_nope_layers_are_every_fourth_zero_based() {
+    // llama.cpp models/smollm3.cpp:69 — use_rope = (il + 1) % 4 != 0, il 0-based.
+    // For the 36-layer SmolLM3-3B (smollm3.cpp:7-10 maps case 36 => LLM_TYPE_3B)
+    // that skips 9 of 36 layers, INCLUDING the final one.
+    let config = LlamaModelConfig {
+        block_count: 36,
+        no_rope_layer_step: Some(4),
+        ..tiny_config()
+    };
+
+    let skipped: Vec<usize> = (0..36).filter(|i| !config.layer_uses_rope(*i)).collect();
+    assert_eq!(skipped, vec![3, 7, 11, 15, 19, 23, 27, 31, 35]);
+    assert_eq!((0..36).filter(|i| config.layer_uses_rope(*i)).count(), 27);
+
+    // Layer 35 is the case an off-by-one silently gets wrong.
+    assert!(!config.layer_uses_rope(35));
+    assert!(config.layer_uses_rope(0));
+}
+
+#[test]
+fn layer_uses_rope_matches_the_reference_formula() {
+    // Proves the predicate is the reference formula across steps, not something
+    // tuned to reproduce step 4.
+    for step in [1u32, 2, 3, 4, 5, 8] {
+        let config = LlamaModelConfig {
+            no_rope_layer_step: Some(step),
+            ..tiny_config()
+        };
+        for il in 0..24usize {
+            assert_eq!(
+                config.layer_uses_rope(il),
+                (il + 1) % (step as usize) != 0,
+                "step {step} layer {il}"
+            );
+        }
+    }
+
+    // None and Some(0) both mean "rope every layer"; Some(0) defensively, so the
+    // modulo stays total (mirrors the `step > 0 &&` guard in llama.cpp
+    // models/afmoe.cpp:137).
+    for step in [None, Some(0)] {
+        let config = LlamaModelConfig {
+            no_rope_layer_step: step,
+            ..tiny_config()
+        };
+        assert!(
+            (0..24).all(|il| config.layer_uses_rope(il)),
+            "step {step:?} must rope every layer"
+        );
+    }
+}
+
+#[test]
+fn nope_layer_is_identity_at_position_zero() {
+    // At position 0 the rotation angle is 0 (cos=1, sin=0), so RoPE is the
+    // identity and skipping it must give bit-identical logits. This proves the
+    // skip branch does not corrupt the tensor, its shape, or the decode scratch
+    // pool recycle that reuses q_before_rope/k_before_rope.
+    let mut roped = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+    let mut nope = LlamaInferenceSession::new(
+        LlamaModelConfig {
+            // (0 + 1) % 1 == 0, so the single layer 0 is NoPE.
+            no_rope_layer_step: Some(1),
+            ..tiny_config()
+        },
+        tiny_weights(),
+    )
+    .unwrap();
+
+    let roped_out = roped.forward_single_token(1).unwrap();
+    let nope_out = nope.forward_single_token(1).unwrap();
+
+    assert_eq!(roped_out.logits.data, nope_out.logits.data);
+}
+
+#[test]
+fn nope_layer_changes_output_at_nonzero_position() {
+    // Companion to the identity test: without this, that test would still pass if
+    // the gate were dead code. At position 1 the rotation is not the identity, so
+    // skipping it must change the logits.
+    let mut roped = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+    let mut nope = LlamaInferenceSession::new(
+        LlamaModelConfig {
+            no_rope_layer_step: Some(1),
+            ..tiny_config()
+        },
+        tiny_weights(),
+    )
+    .unwrap();
+
+    roped.forward_single_token(1).unwrap();
+    nope.forward_single_token(1).unwrap();
+    let roped_out = roped.forward_single_token(2).unwrap();
+    let nope_out = nope.forward_single_token(2).unwrap();
+
+    assert_ne!(
+        roped_out.logits.data, nope_out.logits.data,
+        "the NoPE gate must be live on the decode path"
+    );
+}
+
+#[test]
+fn nope_step_two_ropes_layer_zero() {
+    // Pins the 0-based `(il + 1)` convention numerically. With step 2, layer 0 has
+    // (0 + 1) % 2 == 1 != 0, so it IS roped and must match the baseline exactly.
+    // An `il % step` implementation — the convention llama.cpp uses in
+    // models/smallthinker.cpp:109 — would skip layer 0 here and fail.
+    let mut baseline = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+    let mut stepped = LlamaInferenceSession::new(
+        LlamaModelConfig {
+            no_rope_layer_step: Some(2),
+            ..tiny_config()
+        },
+        tiny_weights(),
+    )
+    .unwrap();
+
+    for token in [1u32, 2] {
+        let baseline_out = baseline.forward_single_token(token).unwrap();
+        let stepped_out = stepped.forward_single_token(token).unwrap();
+        assert_eq!(
+            baseline_out.logits.data, stepped_out.logits.data,
+            "step 2 must rope layer 0"
+        );
+    }
+}
+
+#[test]
+fn nope_gate_is_live_on_the_prompt_path() {
+    // The prompt path has its own rope call site (forward_prefill_layer_chunk_timed);
+    // this proves the skip is wired there too and not only in single-token decode.
+    let prompt = [1u32, 2, 1];
+    let mut roped = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+    let mut nope = LlamaInferenceSession::new(
+        LlamaModelConfig {
+            no_rope_layer_step: Some(1),
+            ..tiny_config()
+        },
+        tiny_weights(),
+    )
+    .unwrap();
+
+    let roped_step = roped
+        .generate_next_token(&prompt, LlamaSampler::Greedy)
+        .unwrap();
+    let nope_step = nope
+        .generate_next_token(&prompt, LlamaSampler::Greedy)
+        .unwrap();
+    assert_ne!(
+        roped_step.logits.data, nope_step.logits.data,
+        "the NoPE gate must be live on the prompt path"
+    );
+
+    // A step that ropes layer 0 must be indistinguishable from the baseline.
+    let mut stepped = LlamaInferenceSession::new(
+        LlamaModelConfig {
+            no_rope_layer_step: Some(2),
+            ..tiny_config()
+        },
+        tiny_weights(),
+    )
+    .unwrap();
+    let stepped_step = stepped
+        .generate_next_token(&prompt, LlamaSampler::Greedy)
+        .unwrap();
+    assert_eq!(roped_step.logits.data, stepped_step.logits.data);
+}
+
 fn tiny_config() -> LlamaModelConfig {
     LlamaModelConfig {
         context_length: 4,
@@ -709,6 +878,7 @@ fn tiny_config() -> LlamaModelConfig {
         vocab_size: Some(3),
         file_type: Some(0),
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,

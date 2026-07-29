@@ -4475,6 +4475,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         file_type: Some(7), // Q8_0
         attention_key_length: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         moe: None,
         gemma4: None,
         qwen35: None,
