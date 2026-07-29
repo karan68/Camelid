@@ -2230,6 +2230,29 @@ pub struct SamplingConfig {
     /// against the peak, it is invariant to renormalization — but not to
     /// temperature, which is why temperature must stay last.
     pub min_p: Option<f32>,
+    /// Locally-typical sampling (llama.cpp `typical_p`): keep the tokens whose
+    /// surprisal `-ln p` is closest to the distribution's entropy, smallest
+    /// difference first, until their mass exceeds `typical_p`. `None`/`1.0`
+    /// disables it. Runs between `top_k` and `top_p`.
+    ///
+    /// Unlike every other filter here it is not a prefix of the logit ordering —
+    /// it can drop the argmax and keep a middling token.
+    pub typical_p: Option<f32>,
+    /// Keep only tokens whose logit is within `n` population standard deviations
+    /// of the maximum logit (llama.cpp `top_n_sigma`). `None`/`<= 0.0` disables it.
+    ///
+    /// Runs FIRST, before `top_k`, because the mean and standard deviation are
+    /// taken over the full candidate set. Operates in logit space, so it is
+    /// unaffected by temperature regardless of chain position.
+    pub top_n_sigma: Option<f32>,
+    /// Floor on how many candidates the truncating filters may leave
+    /// (llama.cpp `min_keep`). Defaults to 1 — never empty the set.
+    ///
+    /// llama.cpp's own default is 0, which its samplers treat as "no floor" via
+    /// explicit `min_keep == 0` guards; 1 is the same behaviour spelled without
+    /// the sentinel, since every one of those samplers already refuses to return
+    /// an empty set.
+    pub min_keep: Option<usize>,
     pub seed: Option<u64>,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
@@ -2267,6 +2290,9 @@ impl Default for SamplingConfig {
             top_k: None,
             top_p: None,
             min_p: None,
+            typical_p: None,
+            top_n_sigma: None,
+            min_keep: None,
             seed: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
@@ -6397,6 +6423,25 @@ impl SamplingConfig {
                 )));
             }
         }
+        if let Some(typical_p) = self.typical_p {
+            if !typical_p.is_finite() || !(0.0..=1.0).contains(&typical_p) {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "typical_p must be finite and in [0, 1], got {typical_p}"
+                )));
+            }
+        }
+        if let Some(top_n_sigma) = self.top_n_sigma {
+            if !top_n_sigma.is_finite() || top_n_sigma < 0.0 {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "top_n_sigma must be finite and non-negative, got {top_n_sigma}"
+                )));
+            }
+        }
+        if matches!(self.min_keep, Some(0)) {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "min_keep must be greater than zero when provided".to_string(),
+            ));
+        }
         if !self.repeat_penalty.is_finite() || self.repeat_penalty <= 0.0 {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "repeat_penalty must be finite and greater than zero, got {}",
@@ -6568,6 +6613,36 @@ fn sample_with_config(
     }
 
     let mut candidates: Vec<(usize, f32)> = adjusted.data.iter().copied().enumerate().collect();
+    let min_keep = config.min_keep.unwrap_or(1).max(1);
+
+    // top_n_sigma runs FIRST in the reference chain (before top_k) and works in
+    // logit space, not probability space: keep every token whose logit is within
+    // `n` population standard deviations of the max. llama.cpp
+    // `llama_sampler_top_n_sigma_apply` masks to -INFINITY; truncating the set is
+    // equivalent here because a masked token can never be drawn.
+    //
+    // The mean and std are taken over the FULL candidate set, which is why this
+    // must run before top_k narrows it.
+    if let Some(n_sigma) = config.top_n_sigma.filter(|n| *n > 0.0) {
+        if candidates.len() > 1 {
+            let valid: Vec<f32> = candidates
+                .iter()
+                .map(|(_, logit)| *logit)
+                .filter(|logit| logit.is_finite())
+                .collect();
+            if !valid.is_empty() {
+                let max = valid.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mean = valid.iter().sum::<f32>() / valid.len() as f32;
+                let variance =
+                    valid.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / valid.len() as f32;
+                let threshold = max - n_sigma * variance.sqrt();
+                // Keep at least the argmax: the max itself always clears the
+                // threshold for any n >= 0, so this cannot empty the set.
+                candidates.retain(|(_, logit)| *logit >= threshold);
+            }
+        }
+    }
+
     if let Some(top_k) = config.top_k {
         // Partition around K before ordering the survivors. The comparator is a
         // total order (token id breaks equal-logit ties), so sorting the selected
@@ -6596,6 +6671,44 @@ fn sample_with_config(
     // cannot reorder logits. At temperature == 1.0 the two orders are bit-exact
     // (division by one is exact), which is why every existing sampler test —
     // all of which pin temperature to 0.0 or 1.0 — is untouched by this change.
+    // typical_p sits between top_k and top_p. It keeps the tokens whose surprisal
+    // is CLOSEST to the distribution's entropy — locally typical sampling — rather
+    // than the most probable ones, so unlike every other filter here its survivors
+    // are not a prefix of the logit ordering.
+    //
+    // llama.cpp `llama_sampler_typical_apply` leaves the array reordered by
+    // shifted score and sets `sorted = false`, letting a later sampler re-sort.
+    // This engine's top_p/min_p stages rely on descending-logit order, so the
+    // survivors are re-sorted here instead. The retained SET is identical.
+    if let Some(typical_p) = config.typical_p.filter(|p| *p < 1.0) {
+        let probabilities = softmax_candidates(&candidates, 1.0)?;
+        let entropy: f32 = probabilities
+            .iter()
+            .map(|p| if *p > 0.0 { -*p * p.ln() } else { 0.0 })
+            .sum();
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        order.sort_by(|a, b| {
+            let score = |i: usize| (-probabilities[i].ln() - entropy).abs();
+            score(*a).total_cmp(&score(*b)).then_with(|| a.cmp(b))
+        });
+
+        let mut cumulative = 0.0f32;
+        let mut keep = order.len();
+        for (rank, idx) in order.iter().enumerate() {
+            cumulative += probabilities[*idx];
+            if cumulative > typical_p && rank + 1 >= min_keep {
+                keep = rank + 1;
+                break;
+            }
+        }
+        let mut survivors: Vec<(usize, f32)> =
+            order.iter().take(keep).map(|i| candidates[*i]).collect();
+        survivors.sort_by(|(left_idx, left), (right_idx, right)| {
+            right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
+        });
+        candidates = survivors;
+    }
+
     if config.top_p.is_some_and(|top_p| top_p < 1.0)
         || config.min_p.is_some_and(|min_p| min_p > 0.0)
     {
@@ -6609,11 +6722,11 @@ fn sample_with_config(
             for probability in &probabilities {
                 cumulative += *probability;
                 keep += 1;
-                if cumulative >= top_p {
+                if cumulative >= top_p && keep >= min_keep {
                     break;
                 }
             }
-            let keep = keep.max(1);
+            let keep = keep.max(min_keep).min(candidates.len());
             candidates.truncate(keep);
             probabilities.truncate(keep);
         }
@@ -6628,7 +6741,8 @@ fn sample_with_config(
                 .iter()
                 .take_while(|probability| **probability >= threshold)
                 .count()
-                .max(1);
+                .max(min_keep)
+                .min(candidates.len());
             candidates.truncate(keep);
         }
     }

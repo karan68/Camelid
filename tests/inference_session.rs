@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use camelid::{
     inference::{
         LlamaInferenceSession, LlamaKvCachePlan, LlamaLayerWeights, LlamaLoadedWeights,
@@ -687,6 +689,137 @@ fn rejects_attention_head_configuration_that_cannot_share_kv_heads() {
 
     assert!(err.contains("attention head count 2"));
     assert!(err.contains("kv head count 3"));
+}
+
+#[test]
+fn top_n_sigma_keeps_only_logits_within_n_standard_deviations() {
+    // logits [10, 9, 1, 0]: mean 5.0, population variance
+    // (25 + 16 + 16 + 25)/4 = 20.5, std 4.5277. With n = 1 the threshold is
+    // 10 - 4.5277 = 5.4723, so only tokens 0 and 1 survive.
+    let logits = tensor("logits", vec![1, 4], vec![10.0, 9.0, 1.0, 0.0]);
+    let mut drawn = std::collections::BTreeSet::new();
+    for seed in 0u64..64 {
+        drawn.insert(
+            LlamaSampler::Sampling(SamplingConfig {
+                temperature: 1.0,
+                top_n_sigma: Some(1.0),
+                seed: Some(seed),
+                ..SamplingConfig::default()
+            })
+            .sample(&logits)
+            .unwrap(),
+        );
+    }
+    assert!(
+        drawn.is_subset(&BTreeSet::from([0, 1])),
+        "tokens beyond one sigma must be cut, drew {drawn:?}"
+    );
+    assert!(drawn.contains(&0) && drawn.contains(&1), "drew {drawn:?}");
+}
+
+#[test]
+fn typical_p_can_drop_the_argmax() {
+    // The property that distinguishes locally-typical sampling from every other
+    // filter here: its survivors are not a prefix of the logit ordering, so the
+    // most probable token can be cut.
+    //
+    // These logits are ln(0.6), ln(0.3), ln(0.1), so the softmax is exactly
+    // [0.6, 0.3, 0.1] and the entropy is 0.89795 nats. Surprisals are 0.51083,
+    // 1.20397, 2.30259, so |surprisal - entropy| is 0.38712, 0.30602, 1.40464 --
+    // token 1, NOT the argmax, is the most "typical". With typical_p = 0.25 the
+    // first candidate alone (0.3) already exceeds it, so token 1 is the only
+    // survivor.
+    // Written as logs of the target probabilities rather than decimal literals:
+    // softmax is shift-invariant, so softmax(ln p) == p exactly for a normalized p.
+    let logits = tensor(
+        "logits",
+        vec![1, 3],
+        vec![0.6f32.ln(), 0.3f32.ln(), 0.1f32.ln()],
+    );
+
+    // Baseline: the argmax is token 0.
+    assert_eq!(LlamaSampler::Greedy.sample(&logits).unwrap(), 0);
+
+    for seed in [0u64, 1, 7, 42, 12345] {
+        let token = LlamaSampler::Sampling(SamplingConfig {
+            temperature: 1.0,
+            typical_p: Some(0.25),
+            seed: Some(seed),
+            ..SamplingConfig::default()
+        })
+        .sample(&logits)
+        .unwrap();
+        assert_eq!(
+            token, 1,
+            "typical_p must keep the most typical token and drop the argmax (seed {seed})"
+        );
+    }
+}
+
+#[test]
+fn min_keep_floors_the_truncating_filters() {
+    // min_p = 1.0 keeps only the argmax; min_keep = 2 raises the floor to two
+    // candidates, so token 1 becomes reachable again.
+    let logits = tensor("logits", vec![1, 3], vec![3.0, 2.0, 1.0]);
+    let draw = |min_keep| {
+        let mut drawn = std::collections::BTreeSet::new();
+        for seed in 0u64..64 {
+            drawn.insert(
+                LlamaSampler::Sampling(SamplingConfig {
+                    temperature: 1.0,
+                    min_p: Some(1.0),
+                    min_keep,
+                    seed: Some(seed),
+                    ..SamplingConfig::default()
+                })
+                .sample(&logits)
+                .unwrap(),
+            );
+        }
+        drawn
+    };
+
+    assert_eq!(
+        draw(None),
+        BTreeSet::from([0]),
+        "min_p=1 keeps only the argmax"
+    );
+    let floored = draw(Some(2));
+    assert!(
+        floored.contains(&1),
+        "min_keep=2 must keep a second candidate, drew {floored:?}"
+    );
+    assert!(
+        !floored.contains(&2),
+        "min_keep=2 must not keep a third, drew {floored:?}"
+    );
+}
+
+#[test]
+fn rejects_out_of_range_typical_p_top_n_sigma_and_min_keep() {
+    let logits = tensor("logits", vec![1, 2], vec![0.0, 1.0]);
+    let err = |config: SamplingConfig| {
+        LlamaSampler::Sampling(config)
+            .sample(&logits)
+            .unwrap_err()
+            .to_string()
+    };
+
+    assert!(err(SamplingConfig {
+        typical_p: Some(1.5),
+        ..SamplingConfig::default()
+    })
+    .contains("typical_p"));
+    assert!(err(SamplingConfig {
+        top_n_sigma: Some(-1.0),
+        ..SamplingConfig::default()
+    })
+    .contains("top_n_sigma"));
+    assert!(err(SamplingConfig {
+        min_keep: Some(0),
+        ..SamplingConfig::default()
+    })
+    .contains("min_keep"));
 }
 
 fn tiny_config() -> LlamaModelConfig {
