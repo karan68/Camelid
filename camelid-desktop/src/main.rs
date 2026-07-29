@@ -181,8 +181,16 @@ fn default_models_directory(app_data_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+// Async on purpose: Tauri runs synchronous commands on the MAIN thread, and
+// `blocking_pick_folder` parks its calling thread until the panel returns while
+// the panel's modal session needs the main thread to pump events — a sync
+// command therefore deadlocks the app (frozen panel, beachball cursor). An
+// async command runs on a worker thread, leaving the main thread free to run
+// the dialog.
 #[tauri::command]
-fn choose_models_directory(app: tauri::AppHandle) -> Result<Option<ModelsDirectoryChoice>, String> {
+async fn choose_models_directory(
+    app: tauri::AppHandle,
+) -> Result<Option<ModelsDirectoryChoice>, String> {
     let Some(selected) = app
         .dialog()
         .file()
@@ -205,8 +213,10 @@ fn choose_models_directory(app: tauri::AppHandle) -> Result<Option<ModelsDirecto
     }))
 }
 
+// Async for the same main-thread reason as choose_models_directory: this only
+// does small preference-file IO, but it has no business on the UI thread.
 #[tauri::command]
-fn reset_models_directory(app: tauri::AppHandle) -> Result<ModelsDirectoryChoice, String> {
+async fn reset_models_directory(app: tauri::AppHandle) -> Result<ModelsDirectoryChoice, String> {
     let app_data_dir = app
         .path()
         .app_data_dir()
