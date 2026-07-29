@@ -638,6 +638,10 @@ pub struct ChatCompletionRequest {
     /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`). `1.0`/`None`
     /// is a no-op; values `> 1.0` discourage repeating recent tokens.
     pub repeat_penalty: Option<f32>,
+    /// How many trailing history tokens the penalties above are measured over
+    /// (llama.cpp `repeat_last_n`). Omit for the whole history — OpenAI's
+    /// semantics and this engine's default; `0` disables the penalties.
+    pub penalty_last_n: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -710,6 +714,14 @@ pub struct CompletionRequest {
     pub min_p: Option<f32>,
     /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`).
     pub repeat_penalty: Option<f32>,
+    /// How many trailing history tokens the penalties above are measured over
+    /// (llama.cpp `repeat_last_n`). Omit for the whole history — OpenAI's
+    /// semantics and this engine's default; `0` disables the penalties.
+    ///
+    /// Unlike llama.cpp there is no `-1` sentinel: on its CLI path `-1` is
+    /// clamped to `0` and silently disables penalties instead of meaning
+    /// "whole context", so that spelling is deliberately not accepted here.
+    pub penalty_last_n: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -932,6 +944,14 @@ pub struct LlamaServerCompletionRequest {
     pub min_p: Option<f32>,
     /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`).
     pub repeat_penalty: Option<f32>,
+    /// How many trailing history tokens the penalties above are measured over
+    /// (llama.cpp `repeat_last_n`). Omit for the whole history — OpenAI's
+    /// semantics and this engine's default; `0` disables the penalties.
+    ///
+    /// Unlike llama.cpp there is no `-1` sentinel: on its CLI path `-1` is
+    /// clamped to `0` and silently disables penalties instead of meaning
+    /// "whole context", so that spelling is deliberately not accepted here.
+    pub penalty_last_n: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     #[serde(flatten)]
@@ -1151,6 +1171,14 @@ pub struct GenerationSessionRequest {
     pub min_p: Option<f32>,
     /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`).
     pub repeat_penalty: Option<f32>,
+    /// How many trailing history tokens the penalties above are measured over
+    /// (llama.cpp `repeat_last_n`). Omit for the whole history — OpenAI's
+    /// semantics and this engine's default; `0` disables the penalties.
+    ///
+    /// Unlike llama.cpp there is no `-1` sentinel: on its CLI path `-1` is
+    /// clamped to `0` and silently disables penalties instead of meaning
+    /// "whole context", so that spelling is deliberately not accepted here.
+    pub penalty_last_n: Option<u32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -2896,6 +2924,7 @@ async fn llama_server_completion(
         frequency_penalty: req.frequency_penalty,
         min_p: req.min_p,
         repeat_penalty: req.repeat_penalty,
+        penalty_last_n: req.penalty_last_n,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: None,
@@ -9636,6 +9665,7 @@ async fn completions(
         frequency_penalty: req.frequency_penalty,
         min_p: req.min_p,
         repeat_penalty: req.repeat_penalty,
+        penalty_last_n: req.penalty_last_n,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: req.n,
@@ -10030,6 +10060,7 @@ async fn chat_completions(
         frequency_penalty: req.frequency_penalty,
         min_p: req.min_p,
         repeat_penalty: req.repeat_penalty,
+        penalty_last_n: req.penalty_last_n,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: req.n,
@@ -10447,6 +10478,7 @@ async fn replay_loaded_receipt_request(
         frequency_penalty: None,
         min_p: None,
         repeat_penalty: None,
+        penalty_last_n: None,
         logit_bias: None,
         stop: if request.stop.is_empty() {
             None
@@ -11947,6 +11979,7 @@ fn sampling_config_from_request(
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
         repeat_penalty: req.repeat_penalty.unwrap_or(1.0),
+        penalty_last_n: req.penalty_last_n.map(|value| value as usize),
         logit_bias: parse_logit_bias(req.logit_bias.as_ref()).map_err(|message| {
             Box::new(api_error(
                 StatusCode::BAD_REQUEST,
@@ -15786,6 +15819,7 @@ mod tests {
             top_p: None,
             min_p: None,
             repeat_penalty: None,
+            penalty_last_n: None,
             seed: None,
             presence_penalty: None,
             frequency_penalty: None,
@@ -16000,6 +16034,45 @@ mod tests {
         }))
         .expect("session request should deserialize");
         assert!(sampling_config_from_request(&bad).is_err());
+    }
+
+    #[test]
+    fn penalty_last_n_is_a_typed_field_that_threads_into_the_sampler() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "penalty_last_n": 64
+        }))
+        .expect("chat request with penalty_last_n should deserialize");
+        assert_eq!(chat.penalty_last_n, Some(64));
+        assert!(!chat.unsupported_fields.contains_key("penalty_last_n"));
+
+        let req: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi",
+            "temperature": 0.8,
+            "penalty_last_n": 64
+        }))
+        .expect("session request should deserialize");
+        assert_eq!(
+            sampling_config_from_request(&req)
+                .expect("valid sampler config")
+                .penalty_last_n,
+            Some(64)
+        );
+
+        // Omitting it keeps the whole-history default, so existing callers are
+        // unaffected by the new field. This is a deliberate divergence from
+        // llama.cpp, whose own default is a 64-token window.
+        let omitted: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi"
+        }))
+        .expect("session request should deserialize");
+        assert_eq!(
+            sampling_config_from_request(&omitted)
+                .expect("valid sampler config")
+                .penalty_last_n,
+            None
+        );
     }
 
     #[test]

@@ -241,6 +241,81 @@ fn penalties_apply_to_seen_tokens_before_sampling() {
 }
 
 #[test]
+fn penalty_last_n_windows_the_history() {
+    // logits [1.0, 0.9, 0.8], history [0, 0, 0, 1], presence 0.5 / frequency 0.25.
+    let logits = tensor("logits", vec![1, 3], vec![1.0, 0.9, 0.8]);
+    let history = [0u32, 0, 0, 1];
+
+    // Default (`penalty_last_n: None`) measures the WHOLE history, so token 0
+    // takes 0.5 + 3*0.25 = -0.25, token 1 takes 0.15, and token 2 (never seen,
+    // 0.8) wins. This is the pre-existing behaviour and must not change.
+    let whole = LlamaSampler::Sampling(SamplingConfig {
+        presence_penalty: 0.5,
+        frequency_penalty: 0.25,
+        ..SamplingConfig::default()
+    })
+    .sample_with_history(&logits, &history)
+    .unwrap();
+    assert_eq!(
+        whole, 2,
+        "unwindowed penalties should demote token 0 hardest"
+    );
+
+    // A one-token window sees only the trailing `1`, so token 0 keeps its 1.0
+    // logit and wins. Long-context/RAG callers want this: without it, every
+    // token in a large prompt is penalized forever.
+    let windowed = LlamaSampler::Sampling(SamplingConfig {
+        presence_penalty: 0.5,
+        frequency_penalty: 0.25,
+        penalty_last_n: Some(1),
+        ..SamplingConfig::default()
+    })
+    .sample_with_history(&logits, &history)
+    .unwrap();
+    assert_eq!(
+        windowed, 0,
+        "penalty_last_n=1 must only penalize the final history token"
+    );
+}
+
+#[test]
+fn penalty_last_n_zero_disables_penalties() {
+    let logits = tensor("logits", vec![1, 3], vec![1.0, 0.9, 0.8]);
+    let token = LlamaSampler::Sampling(SamplingConfig {
+        presence_penalty: 0.5,
+        frequency_penalty: 0.25,
+        penalty_last_n: Some(0),
+        ..SamplingConfig::default()
+    })
+    .sample_with_history(&logits, &[0u32, 0, 0, 1])
+    .unwrap();
+    assert_eq!(token, 0, "penalty_last_n=0 must leave the logits untouched");
+}
+
+#[test]
+fn penalty_last_n_beyond_history_matches_the_whole_history() {
+    // Guards the `saturating_sub` bound: a window longer than the history is the
+    // whole history, not a panic and not an empty window.
+    let logits = tensor("logits", vec![1, 3], vec![1.0, 0.9, 0.8]);
+    let history = [0u32, 0, 0, 1];
+    let config = |penalty_last_n| SamplingConfig {
+        presence_penalty: 0.5,
+        frequency_penalty: 0.25,
+        penalty_last_n,
+        ..SamplingConfig::default()
+    };
+
+    let unbounded = LlamaSampler::Sampling(config(None))
+        .sample_with_history(&logits, &history)
+        .unwrap();
+    let oversized = LlamaSampler::Sampling(config(Some(4096)))
+        .sample_with_history(&logits, &history)
+        .unwrap();
+
+    assert_eq!(unbounded, oversized);
+}
+
+#[test]
 fn rejects_logit_bias_outside_vocabulary() {
     let logits = tensor("logits", vec![1, 2], vec![0.0, 1.0]);
     let err = LlamaSampler::Sampling(SamplingConfig {
@@ -313,6 +388,78 @@ fn min_p_zero_is_a_noop() {
             "min_p=0 changed the draw for seed {seed}"
         );
     }
+}
+
+#[test]
+fn min_p_measures_the_untempered_distribution() {
+    // Parity regression against llama.cpp's default sampler chain
+    // (`common/common.h`: ... top_k -> typical -> top_p -> min_p -> TEMPERATURE
+    // -> dist). Temperature is applied LAST, so min_p measures the raw softmax,
+    // not a temperature-sharpened one.
+    //
+    // logits [3, 2, 1] -> untempered softmax [0.6652, 0.2447, 0.0900].
+    // min_p 0.15 -> threshold 0.15 * 0.6652 = 0.0998, so {0, 1} survive and
+    // token 2 (0.0900) is cut.
+    //
+    // The previous chain divided by temperature *before* min_p: at T=0.5 the
+    // distribution sharpens to [0.8668, 0.1173, 0.0159], the threshold becomes
+    // 0.1300, and only token 0 survived — token 1 was unreachable for every
+    // seed. Reaching token 1 is exactly what the reorder restores.
+    let logits = tensor("logits", vec![1, 3], vec![3.0, 2.0, 1.0]);
+    let mut drawn = std::collections::BTreeSet::new();
+    for seed in 0u64..64 {
+        drawn.insert(
+            LlamaSampler::Sampling(SamplingConfig {
+                temperature: 0.5,
+                min_p: Some(0.15),
+                seed: Some(seed),
+                ..SamplingConfig::default()
+            })
+            .sample(&logits)
+            .unwrap(),
+        );
+    }
+    assert!(
+        drawn.contains(&1),
+        "token 1 must be reachable once min_p measures the untempered distribution, drew {drawn:?}"
+    );
+    assert!(
+        !drawn.contains(&2),
+        "min_p must still cut token 2, drew {drawn:?}"
+    );
+}
+
+#[test]
+fn top_p_measures_the_untempered_distribution() {
+    // Same parity regression, on the top_p stage.
+    //
+    // logits [3, 2, 1] -> untempered softmax [0.6652, 0.2447, 0.0900].
+    // top_p 0.8 accumulates 0.6652 (< 0.8), then 0.9099 (>= 0.8), keeping {0, 1}.
+    //
+    // Dividing by temperature first (T=0.5) gave [0.8668, ...], whose very first
+    // element already clears 0.8, so the old chain kept only token 0.
+    let logits = tensor("logits", vec![1, 3], vec![3.0, 2.0, 1.0]);
+    let mut drawn = std::collections::BTreeSet::new();
+    for seed in 0u64..64 {
+        drawn.insert(
+            LlamaSampler::Sampling(SamplingConfig {
+                temperature: 0.5,
+                top_p: Some(0.8),
+                seed: Some(seed),
+                ..SamplingConfig::default()
+            })
+            .sample(&logits)
+            .unwrap(),
+        );
+    }
+    assert!(
+        drawn.contains(&1),
+        "token 1 must be reachable once top_p measures the untempered distribution, drew {drawn:?}"
+    );
+    assert!(
+        !drawn.contains(&2),
+        "top_p must still cut token 2, drew {drawn:?}"
+    );
 }
 
 #[test]
