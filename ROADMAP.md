@@ -229,9 +229,8 @@ Active rule set:
 
 Near-term candidates include:
 
-- richer logprob support
+- streaming logprobs and multi-choice streaming (the non-streaming single-choice/multi-choice contracts are delivered)
 - broader streaming metadata completeness (OpenAI `stream_options.include_usage` is delivered — a terminal usage chunk on chat-completions streaming, see `COMPATIBILITY.md`; further streaming metadata fields remain pending)
-- multi-choice generation
 - stronger seeded sampling validation
 
 ### llama-server compatibility sequence
@@ -244,7 +243,7 @@ Sequenced plan:
 2. Grow read-only llama-server discovery first: `/props`, `/slots`, `/models`, health/model metadata, and WebUI probes may expose public readiness state, but local paths stay redacted and readiness fails closed unless the loaded exact row is contract-supported and generation-ready. `/models` is limited to currently loaded Camelid models until router-mode cache listing, reload/autoload, native load/unload, and model-source metadata are designed.
 3. Keep tokenizer/control-plane utilities bounded: `/tokenize`, `/detokenize`, and `/apply-template` may work for loaded supported tokenizer/template lanes only; `/tokenize` may expose bounded `with_pieces=true` id/piece objects for supported tokenizers, while arbitrary template kwargs, prompt-cache metadata, and slot lifecycle actions remain unsupported until real semantics exist.
 4. Add native generation compatibility only after request mapping is explicit: `/completion` must translate supported llama-server parameters onto Camelid's generation path without weakening the OpenAI subset, and unsupported sampler, cache, image, infill, and tool fields must remain typed errors.
-5. Defer embeddings, reranking, Responses, Messages, multimodal routes, LoRA, metrics, router-mode model management, and full WebUI parity until backend support, route semantics, tests, capabilities text, docs, and frontend gates all move together.
+5. Keep stateful Responses features, Messages, multimodal routes, LoRA, router-mode model management, and full WebUI parity deferred until backend support, route semantics, tests, capabilities text, docs, and frontend gates all move together. Embeddings/reranking, metrics, and the stateless Responses subset have moved only within their documented exact boundaries.
 
 Current gap sequence as of 2026-06-01:
 
@@ -252,7 +251,7 @@ Current gap sequence as of 2026-06-01:
 2. Tokenizer/template utilities: preserve loaded-model-only `/tokenize`, `/detokenize`, and `/apply-template`; `with_pieces=true` now has a bounded supported-tokenizer test, while template kwargs, richer error mapping, and tokenizer-piece edge cases outside supported lanes still need fixtures and capability text.
 3. Native generation: map a narrow `/completion` request subset to the existing Camelid generation path only after sampler/stop/stream/timing/cancellation behavior is specified and unsupported fields stay typed.
 4. WebUI control plane: add only probes that are read-only and support-contract-aware; keep slot cache actions, prompt-cache metadata, metrics, sleep/idle, router reload/autoload, and native model load/unload unsupported until semantics and tests exist.
-5. Deferred runtime surfaces: embeddings, reranking, infill, multimodal inputs, LoRA adapters, router-mode model management, Responses/Messages, and broad llama-server WebUI parity remain blocked until backend support, docs, capabilities, and frontend gates move together.
+5. Deferred runtime surfaces: stateful Responses chaining/storage, Messages, infill, multimodal inputs, LoRA adapters, router-mode model management, broader encoder/reranker rows, and broad llama-server WebUI parity remain blocked until backend support, docs, capabilities, and frontend gates move together.
 
 ### Performance, packaging, and portability
 

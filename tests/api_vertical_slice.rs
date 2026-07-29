@@ -443,7 +443,6 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
             "unsupported_llama_server_infill",
             "input",
         ),
-        ("POST", "/v1/responses", "unsupported_responses", "input"),
         ("POST", "/v1/messages", "unsupported_messages", "input"),
     ];
 
@@ -465,6 +464,104 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         assert_eq!(body["error"]["code"], code, "{uri}");
         assert_eq!(body["error"]["param"], param, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn responses_route_accepts_stateless_text_and_reaches_the_runtime_gate() {
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"not-loaded","input":"hello","store":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_ne!(body["error"]["code"], "unsupported_responses");
+    assert!(
+        body["error"]["code"] == "model_not_loaded",
+        "stateless Responses input should pass request conversion and stop at the model gate: {body}"
+    );
+}
+
+#[tokio::test]
+async fn responses_route_keeps_stateful_and_hosted_features_typed_unsupported() {
+    let cases = [
+        (
+            r#"{"input":"hello","previous_response_id":"resp_prior"}"#,
+            "previous_response_id",
+        ),
+        (r#"{"input":"hello","background":true}"#, "background"),
+        (
+            r#"{"input":"hello","tools":[{"type":"web_search"}]}"#,
+            "tools",
+        ),
+    ];
+    for (request_body, param) in cases {
+        let response = camelid::api::router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+        assert_eq!(body["error"]["param"], param);
+    }
+}
+
+#[tokio::test]
+async fn chat_route_accepts_assistant_tool_calls_and_tool_results_for_the_next_turn() {
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"not-loaded",
+                        "messages":[
+                            {"role":"user","content":"weather?"},
+                            {"role":"assistant","content":null,"tool_calls":[{
+                                "id":"call_1",
+                                "type":"function",
+                                "function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}
+                            }]},
+                            {"role":"tool","tool_call_id":"call_1","content":"{\"temp\":25}"}
+                        ],
+                        "tools":[{
+                            "type":"function",
+                            "function":{"name":"weather","parameters":{"type":"object"}}
+                        }]
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_ne!(body["error"]["code"], "malformed_json");
+    assert_ne!(body["error"]["code"], "invalid_message_content");
 }
 
 #[tokio::test]
@@ -677,11 +774,69 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             .iter()
             .any(|item| item["id"] == id && item["status"] == "planned_exact_row_candidate"));
     }
-    assert!(body["api_features"]
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "multi_choice_generation"
+            && item["status"] == "supported_current_gate_nonstreaming"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("1..=8 independent")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "rich_logprobs"
+            && item["status"] == "supported_current_gate_nonstreaming"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("OpenAI-shaped logprobs")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "openai_responses"
+            && item["status"] == "supported_current_gate_stateless"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("previous_response_id")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "streaming_tool_calls"
+            && item["status"] == "supported_current_gate"
+            && item["notes"].as_str().unwrap().contains("without leaking")
+    }));
+    let api_feature_ids = body["api_features"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "multi_choice_generation" && item["status"] == "unsupported"));
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    let api_conformance = body["api_conformance"].as_array().unwrap();
+    let conformance_ids = api_conformance
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        api_feature_ids, conformance_ids,
+        "compact feature rows and executable conformance descriptors must be projections of one registry"
+    );
+    let responses_contract = api_conformance
+        .iter()
+        .find(|item| item["id"] == "openai_responses")
+        .unwrap();
+    assert!(responses_contract["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|route| route["method"] == "POST" && route["path"] == "/v1/responses"));
+    assert!(responses_contract["supported_modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|mode| mode == "stateless_streaming"));
+    assert!(responses_contract["unsupported_modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|mode| mode == "previous_response_id"));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "llama_server_tokenizer_aliases"
             && item["status"] == "partial"
@@ -774,7 +929,6 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         item["id"] == "fail_closed_native_compatibility_routes"
             && item["status"] == "unsupported"
             && notes.contains("/infill")
-            && notes.contains("/v1/responses")
             && notes.contains("/v1/messages")
             && notes.contains("Unsupported /models/load router-mode fields")
             && notes.contains("POST /models/unload")
@@ -3808,6 +3962,102 @@ async fn chat_completion_streams_openai_compatible_sse_chunks() {
     assert!(body.contains("\"delta\":{\"content\":\"<unk>\"}"));
     assert!(body.contains("\"finish_reason\":\"length\""));
     assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn responses_adapter_generates_nonstreaming_and_streaming_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-responses.gguf");
+    write_generation_gguf(&path);
+
+    let app = camelid::api::router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path": path, "id": "tiny-responses"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-responses","input":"hello","max_output_tokens":1,"stream":false,"store":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["model"], "tiny-responses");
+    assert_eq!(body["status"], "incomplete");
+    assert_eq!(body["incomplete_details"]["reason"], "max_output_tokens");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(body["output"][0]["content"][0]["text"], "<unk>");
+    assert_eq!(body["usage"]["output_tokens"], 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-responses","input":"hello","max_output_tokens":1,"stream":true,"store":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let stream = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for event_type in [
+        "response.created",
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_item.done",
+        "response.incomplete",
+    ] {
+        assert!(
+            stream.contains(&format!("\"type\":\"{event_type}\"")),
+            "missing {event_type} in stream: {stream}"
+        );
+    }
+    assert!(stream.contains("\"output_tokens\":1"));
 }
 
 #[tokio::test]

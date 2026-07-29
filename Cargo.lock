@@ -469,6 +469,7 @@ dependencies = [
  "axum-server",
  "clap",
  "cudarc",
+ "futures-util",
  "getrandom 0.4.2",
  "libc",
  "llguidance",

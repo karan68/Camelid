@@ -396,6 +396,26 @@ Selected source artifacts recorded by those committed files:
 
 ## Latest promotion-relevant work
 
+### Typed API conformance contract, stateless Responses, and streaming tools
+
+`/api/capabilities` now projects `api_features` and the route/mode-level
+`api_conformance` descriptors from one typed registry. The vertical API slice
+checks that both projections contain the same feature ids and drives the new
+Responses support/unsupported boundaries, eliminating the stale claims that
+multi-choice was unsupported and OpenAI-shaped logprobs were only planned.
+
+`POST /v1/responses` now provides a stateless adapter over the existing
+evidence-gated chat core: string/message input, instructions, manual
+`function_call`/`function_call_output` continuation items, local function
+tools, text/JSON formats, non-streaming output, typed SSE events, usage, and
+disconnect cancellation. Stateful chaining/storage, background mode, hosted
+tools, and multimodal input remain typed unsupported. Chat Completions now
+accepts assistant `tool_calls` plus `tool_call_id` result messages for the next
+turn; generic and Ornith tool streams hold raw model envelopes and emit
+structured tool deltas instead. Focused unit tests and the complete API
+vertical slice cover the contract and adapter shapes without widening any
+model-row support claim.
+
 ### OpenAI `stream_options.include_usage` (streaming usage chunk)
 
 Chat-completions SSE streaming now supports OpenAI `stream_options.include_usage`, closing a user-reported gap where Camelid rejected `stream_options` (which broke usage reporting for OpenAI-compatible agent clients such as OpenCode and OpenClaw). When `include_usage:true`, the stream appends exactly one terminal chunk (`choices: []`) carrying `usage:{prompt_tokens,completion_tokens,total_tokens}` after the finish-reason chunk and before `[DONE]`; the integers are bound to — and verified equal to — the non-streaming endpoint's counts for the same request. Omitting `stream_options` is byte-identical to the prior baseline. Parsing is permissive (any other shape or subfield is tolerated and ignored, no 4xx), matching the pinned llama-server oracle `acd79d6`. This is a protocol-surface change only — no decode/sampler/parity kernel was touched — and adds exactly one `/api/capabilities` `api_features` row. Evidence (oracle + Camelid SSE captures, structural diff, streaming==non-streaming consistency check, and OpenCode + OpenClaw end-to-end proofs): `qa/evidence-bundles/stream-options-include-usage-20260623/`.

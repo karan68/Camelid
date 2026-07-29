@@ -43,6 +43,17 @@ export function embeddingsBody(modelId) {
   }
 }
 
+export function responsesBody(modelId) {
+  return {
+    model: modelId,
+    input: 'Reply with one short sentence.',
+    temperature: 0,
+    max_output_tokens: 64,
+    stream: true,
+    store: false,
+  }
+}
+
 function curlGet(apiBase, path) {
   return `curl ${apiBase}${path}`
 }
@@ -102,6 +113,23 @@ function pythonSdk(apiBase, modelId, kind) {
       '    dimensions=256,',
       ')',
       'print(len(result.data[0].embedding))',
+    ].join('\n')
+  }
+  if (kind === 'responses') {
+    return [
+      'from openai import OpenAI',
+      '',
+      `client = OpenAI(base_url="${apiBase}/v1", api_key="not-needed-locally")`,
+      'stream = client.responses.create(',
+      `    model="${modelId}",`,
+      '    input="Reply with one short sentence.",',
+      '    max_output_tokens=64,',
+      '    stream=True,',
+      '    store=False,',
+      ')',
+      'for event in stream:',
+      '    if event.type == "response.output_text.delta":',
+      '        print(event.delta, end="", flush=True)',
     ].join('\n')
   }
   return null
@@ -256,9 +284,16 @@ export function workbenchEndpoints({ apiBase, modelId }) {
       id: 'v1_responses',
       method: 'POST',
       path: '/v1/responses',
-      gate: 'blocked',
-      featureRowId: 'fail_closed_native_compatibility_routes',
-      summary: 'Fail-closed: the responses surface has no contract; the route returns a typed error instead of pretending.',
+      gate: 'chat',
+      sse: true,
+      featureRowId: 'openai_responses',
+      summary: 'Stateless Responses adapter for text, local function tools, structured formats, streaming events, usage, and cancellation. Stateful chaining and hosted tools stay typed unsupported.',
+      body: responsesBody(model),
+      examples: {
+        curl: curlPost(base, '/v1/responses', responsesBody(model)),
+        python: pythonSdk(base, model, 'responses'),
+        js: jsFetch(base, '/v1/responses', responsesBody(model), true),
+      },
     },
     {
       id: 'v1_messages',

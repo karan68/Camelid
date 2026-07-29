@@ -375,6 +375,28 @@ curl http://127.0.0.1:8181/v1/chat/completions \
   }'
 ```
 
+The same evidence-gated generation core is also available through a stateless
+Responses subset:
+
+```bash
+curl http://127.0.0.1:8181/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Llama 3.2 3B Instruct",
+    "input": "Explain why local inference is useful.",
+    "max_output_tokens": 128,
+    "stream": true,
+    "store": false
+  }'
+```
+
+`/v1/responses` supports text/messages, manual function-call continuations,
+local function tools, structured text formats, streaming events, usage, and
+cancellation. It remains deliberately stateless: `previous_response_id`,
+server-side conversations, `store:true`, background jobs, hosted tools, and
+multimodal input return typed unsupported errors. The exact machine-readable
+boundaries live in `/api/capabilities` under `api_conformance`.
+
 ## How support is validated
 
 Camelid's core commitment is that every supported claim is backed by reproducible evidence.
