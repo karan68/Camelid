@@ -28,9 +28,18 @@
 //! ## Reading the journal
 //!
 //! One JSON object per line. `panic` records are the load-bearing ones: they say
-//! what failed, on which thread, and where. A `session_exit` records a run that
-//! ended by returning from `serve` — today that means a startup or serving
-//! failure, and it carries the reason.
+//! what failed, on which thread, and where.
+//!
+//! A `panic` record does NOT by itself mean the engine died. Panics here are
+//! sometimes caught and handled — `src/cuda.rs` probes the GPU inside
+//! `catch_unwind`, and a decode job wraps its body the same way so a panic
+//! becomes a failed request rather than a dead process. Records carry
+//! `"expected": true` when the panic came from the cudarc loader, which is the
+//! routine "no CUDA runtime on this machine, fall back to the CPU" case; those
+//! are noise. `"expected": false` is the interesting kind.
+//!
+//! A `session_exit` records a run that ended by returning from `serve` — today
+//! that means a startup or serving failure, and it carries the reason.
 //!
 //! A `session_start` with no matching `session_exit` means the process did not
 //! leave through that path. Be precise about what that does and does not say:
@@ -219,12 +228,27 @@ fn record_panic(info: &std::panic::PanicHookInfo<'_>) {
         .unwrap_or("<unnamed>")
         .to_string();
 
+    // A panic hook cannot know whether the unwind will be caught, and several
+    // panics here are ROUTINE: src/cuda.rs probes the GPU with five
+    // `catch_unwind` calls around `CudaContext::new` and PTX compilation, and
+    // the shipped Windows build has CUDA compiled in. On a machine with no CUDA
+    // runtime those fire on every startup, are handled, and the engine goes on to
+    // run happily on the CPU. Unmarked, they would be the MAJORITY of records on
+    // exactly the population this journal exists for, burying the real crash.
+    //
+    // Detected by panic origin, the same test `quiet_cudarc_loader_panics` uses
+    // to keep them off the console.
+    let from_cudarc = info
+        .location()
+        .is_some_and(|loc| loc.file().replace('\\', "/").contains("/cudarc-"));
+
     let mut fields = vec![
         (
             "message".to_string(),
             serde_json::json!(clamp(payload, MAX_MESSAGE_BYTES)),
         ),
         ("thread".to_string(), serde_json::json!(thread)),
+        ("expected".to_string(), serde_json::json!(from_cudarc)),
     ];
     if let Some(location) = location {
         fields.push(("location".to_string(), serde_json::json!(location)));
@@ -562,6 +586,9 @@ mod tests {
         assert!(record["location"]
             .as_str()
             .is_some_and(|loc| loc.contains("diagnostics.rs")));
+        // This panic is ours, not a GPU probe, so it must be the interesting kind.
+        // Getting this backwards would mark every real crash as routine noise.
+        assert_eq!(record["expected"], false);
 
         let _ = std::panic::take_hook();
         let _ = std::fs::remove_file(&path);
