@@ -267,7 +267,7 @@ try {
      deliberately unbroken (a deep path, no spaces): a command WITH spaces
      word-wraps on its own and would make this check pass for free. ---- */
   resetStub()
-  page = await openBanner({ storage: { 'camelid.launchCommand': `C:\\Users\\someone\\${'VeryDeeplyNestedDirectory\\'.repeat(6)}camelid.exe` } })
+  page = await openBanner({ storage: { 'camelid.launchCommand': `C:\\camelid\\${'VeryDeeplyNestedDirectory\\'.repeat(6)}camelid.exe` } })
   await page.setViewport({ width: 390, height: 844 })
   await new Promise((done) => setTimeout(done, 200))
   banner = await page.evaluate(readBanner)
@@ -282,9 +282,10 @@ try {
   await page.close()
 
   /* ---- Scenario 1e: the engine is on another host. `camelid serve` would be
-     advice for the wrong machine. ---- */
+     advice for the wrong machine. The host is an RFC 2606 reserved name, so the
+     fixture is unmistakably synthetic and cannot resolve. ---- */
   resetStub()
-  page = await openBanner({ storage: { 'camelid.apiBase': 'http://192.168.1.50:8181' } })
+  page = await openBanner({ storage: { 'camelid.apiBase': 'http://engine.example:8181' } })
   banner = await page.evaluate(readBanner)
   check('a remote engine is not told to restart locally', () => {
     assert.equal(banner.buttons.some((label) => label.includes('Copy restart')), false,
@@ -292,7 +293,7 @@ try {
     assert.equal(banner.text.includes('served by the engine'), false)
   })
   check('a remote engine names the host that is not answering', () => {
-    assert.equal(banner.code, '192.168.1.50')
+    assert.equal(banner.code, 'engine.example')
     assert.ok(banner.buttons.includes('Settings'))
   })
   await page.close()
