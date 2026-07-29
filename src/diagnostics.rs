@@ -581,9 +581,22 @@ mod tests {
         );
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        let record: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        // Find OUR record rather than parsing the whole file as one value. The
+        // hook is process-global once installed, so any other test that panics
+        // concurrently — `#[should_panic]` cases, the `catch_unwind` probes in
+        // catalog/cuda/diffusion — also appends here, and assuming a
+        // single-line file would make this test flaky under a parallel run.
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let ours: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["message"] == "deliberate diagnostics self-test panic")
+            .collect();
+        assert_eq!(ours.len(), 1, "expected exactly one record for our panic");
+        let record = ours[0];
         assert_eq!(record["event"], "panic");
-        assert_eq!(record["message"], "deliberate diagnostics self-test panic");
         assert_eq!(record["pid"], std::process::id());
         assert!(record["ts"].as_str().is_some_and(|ts| ts.ends_with('Z')));
         assert!(record["location"]
