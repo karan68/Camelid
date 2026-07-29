@@ -472,6 +472,14 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       q8_runtime: health?.q8_runtime || null,
       ...executionRuntimeFields(health),
       status: health?.ok ? 'online' : 'offline',
+      // Absolute path of the running binary, disclosed by loopback servers only.
+      // Captured while the engine is UP so the offline banner can still name a
+      // command that actually runs after it goes down.
+      executable: health?.executable || null,
+      // Address the engine is really bound to. A restart command without this
+      // falls back to the default port, which either collides with whatever
+      // owns it or comes up somewhere this tab is not looking.
+      listen_addr: health?.listen_addr || null,
       api_base: apiBase,
       current_model: currentModel || null,
     },

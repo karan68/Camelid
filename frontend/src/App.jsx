@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import SidebarRail from './components/layout/SidebarRail'
 import TopBar from './components/TopBar'
-import { BackendBanner } from './components/layout/BackendBanner'
+import { BackendBanner, ENGINE_PATH_STORAGE_KEY, ENGINE_ADDR_STORAGE_KEY } from './components/layout/BackendBanner'
 import { FirstRunCard } from './components/onboarding/FirstRunCard'
 import { Notice } from './components/ui/Notice'
 import { ConfirmDialog } from './components/ui/ConfirmDialog'
@@ -107,6 +107,19 @@ function App() {
   useEffect(() => {
     if (apiBase) ensureInferenceTelemetryConnected(apiBase)
   }, [apiBase])
+
+  /* Remember where the engine lives while it is still answering. Once it stops,
+     the offline banner needs this to offer a command that actually runs, and by
+     then there is nobody left to ask. Loopback servers only — a remote engine
+     reports no path, so nothing is stored and the banner stays generic. */
+  useEffect(() => {
+    const executable = runtime?.executable
+    if (!executable || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(ENGINE_PATH_STORAGE_KEY, executable)
+      if (runtime?.listen_addr) window.localStorage.setItem(ENGINE_ADDR_STORAGE_KEY, runtime.listen_addr)
+    } catch { /* private mode */ }
+  }, [runtime?.executable, runtime?.listen_addr])
 
   /* Evidence Chips anywhere in the app deep-link to their ledger row through
      this event — no prop drilling through every chip call site. */

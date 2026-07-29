@@ -285,8 +285,65 @@ try {
   })
   await page.close()
 
-  /* ---- Scenario 1e: the engine is on another host. `camelid serve` would be
-     advice for the wrong machine. The host is an RFC 2606 reserved name, so the
+  /* ---- Scenario 1f: the engine told us where it lives while it was up. The
+     copy button must then produce a command that runs as-is, with no PATH
+     assumption. A path WITHOUT spaces needs no quoting and runs unchanged in
+     both cmd and PowerShell. ---- */
+  resetStub()
+  page = await openBanner({ storage: { 'camelid.enginePath': 'C:\\camelid\\camelid.exe' } })
+  banner = await page.evaluate(readBanner)
+  check('a known engine path becomes a paste-and-run command', () => {
+    assert.equal(banner.code, 'C:\\camelid\\camelid.exe serve')
+  })
+  await clickBannerButton(page, 'Copy')
+  await page.waitForFunction(() => window.__copied.length > 0, { timeout: 5000 })
+  const copiedPath = await page.evaluate(() => window.__copied)
+  check('the clipboard gets the real path, not the PATH-dependent command', () => {
+    assert.deepEqual(copiedPath, ['C:\\camelid\\camelid.exe serve'])
+  })
+  await page.close()
+
+  /* ---- Scenario 1g: a path WITH a space. PowerShell is the default Windows
+     shell and will not execute a quoted string as a command without the `&`
+     call operator, so the naive quoted form fails on the shell most users are
+     actually in. ---- */
+  resetStub()
+  page = await openBanner({ storage: { 'camelid.enginePath': 'C:\\Program Files\\Camelid\\camelid.exe' } })
+  banner = await page.evaluate(readBanner)
+  check('a spaced Windows path is quoted AND call-operated for PowerShell', () => {
+    assert.equal(banner.code, '& "C:\\Program Files\\Camelid\\camelid.exe" serve')
+  })
+  await page.close()
+
+  /* ---- Scenario 1h: a non-default port MUST come back in the command. A bare
+     `serve` re-binds 127.0.0.1:8181, which fails outright when something else
+     owns that port and, even on success, comes up somewhere this tab is not
+     looking — so the banner would never clear. Observed for real. ---- */
+  resetStub()
+  page = await openBanner({ storage: {
+    'camelid.enginePath': 'C:\\camelid\\camelid.exe',
+    'camelid.engineAddr': '127.0.0.1:8188',
+  } })
+  banner = await page.evaluate(readBanner)
+  check('a non-default port is carried into the restart command', () => {
+    assert.equal(banner.code, 'C:\\camelid\\camelid.exe serve --addr 127.0.0.1:8188')
+  })
+  await page.close()
+
+  /* ---- Scenario 1i: the default port stays implicit, so the common case keeps
+     the short command it had. ---- */
+  resetStub()
+  page = await openBanner({ storage: {
+    'camelid.enginePath': 'C:\\camelid\\camelid.exe',
+    'camelid.engineAddr': '127.0.0.1:8181',
+  } })
+  banner = await page.evaluate(readBanner)
+  check('the default port is not spelled out', () => {
+    assert.equal(banner.code, 'C:\\camelid\\camelid.exe serve')
+  })
+  await page.close()
+
+  /* ---- Scenario 1e: the engine is on another host. `camelid serve` would be     advice for the wrong machine. The host is an RFC 2606 reserved name, so the
      fixture is unmistakably synthetic and cannot resolve. ---- */
   resetStub()
   page = await openBanner({ storage: { 'camelid.apiBase': 'http://engine.example:8181' } })

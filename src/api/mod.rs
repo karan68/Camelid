@@ -494,6 +494,27 @@ pub struct HealthResponse {
     pub engine_active_generated_tokens: u64,
     pub engine_active_elapsed_seconds: u64,
     pub engine_stalled_seconds: u64,
+    /// Absolute path of the running `camelid` binary, so the WebUI can tell a
+    /// user exactly how to start the engine again after it stops. `camelid
+    /// serve` is only runnable when the binary is on PATH, which it is NOT for
+    /// someone who unzipped a release — for them the bare command fails with
+    /// "'camelid' is not recognized", which is not a usable instruction.
+    ///
+    /// Loopback deployments ONLY. Off-box this would hand a filesystem path (and
+    /// usually a username) to every caller of an endpoint that is reachable
+    /// before authentication, and the advice would be useless there anyway: the
+    /// reader is not sitting at the machine that needs restarting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// Address this process is actually listening on, so a restart command can
+    /// reproduce it. Without this the UI can only suggest a bare `serve`, which
+    /// silently falls back to the DEFAULT port — it then fails outright if
+    /// something else owns that port, and even when it succeeds the tab showing
+    /// the banner is pointed somewhere else and never reconnects.
+    ///
+    /// Same loopback-only gate as [`HealthResponse::executable`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2419,7 +2440,61 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         engine_active_generated_tokens: slot.completed_units,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
+        executable: loopback_executable_path(state.serve_addr),
+        listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
     })
+}
+
+/// Resolve the running binary's path for [`HealthResponse::executable`].
+///
+/// Returns `None` for any non-loopback listener so a remotely reachable server
+/// never discloses its filesystem layout, and `None` when the path cannot be
+/// determined — the caller treats absence as "fall back to generic advice".
+fn loopback_executable_path(serve_addr: SocketAddr) -> Option<String> {
+    if !serve_addr.ip().is_loopback() {
+        return None;
+    }
+    let path = std::env::current_exe().ok()?;
+    let path = path.to_string_lossy().into_owned();
+    // Strip the Windows verbatim prefix if one is present: `\\?\C:\...` is valid
+    // for the OS but is not something a user can paste into a shell.
+    Some(path.strip_prefix(r"\\?\").unwrap_or(&path).to_string())
+}
+
+#[cfg(test)]
+mod executable_disclosure_tests {
+    use super::loopback_executable_path;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn a_loopback_listener_reports_the_running_binary() {
+        for addr in ["127.0.0.1:8181", "[::1]:8181"] {
+            let resolved = loopback_executable_path(addr.parse::<SocketAddr>().unwrap())
+                .expect("a loopback listener discloses its own path");
+            assert!(
+                !resolved.starts_with(r"\\?\"),
+                "the verbatim prefix is not shell-pasteable: {resolved}"
+            );
+            // The test binary is what is running, so this is the honest answer.
+            assert!(
+                std::path::Path::new(&resolved).exists(),
+                "reported a path that does not exist: {resolved}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reachable_listener_discloses_nothing() {
+        // The path usually contains a username, and the advice would be useless
+        // to a reader who is not sitting at this machine anyway.
+        for addr in ["0.0.0.0:8181", "192.0.2.10:8181"] {
+            assert_eq!(
+                loopback_executable_path(addr.parse::<SocketAddr>().unwrap()),
+                None,
+                "{addr} must not disclose the binary path"
+            );
+        }
+    }
 }
 
 fn health_backend(
