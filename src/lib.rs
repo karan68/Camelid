@@ -31,6 +31,7 @@ pub mod model_default;
 pub mod model_source;
 pub mod offload;
 pub mod platform_fs;
+pub mod quality;
 pub mod receipt;
 pub mod runnable;
 pub mod runtime_config;
