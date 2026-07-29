@@ -1,29 +1,32 @@
 //! Durable crash and lifecycle capture for the shipped engine.
 //!
-//! Slice S1 of `docs/architecture/DIAGNOSTICS_AND_DOCTOR_PLAN.md`. Today a
-//! packaged install that panics leaves **no trace on the machine it happened
-//! on**: the console window is the only sink, and closing it (or losing it with
-//! the process) destroys the evidence. A user who asks "why did it stop?" has
-//! no way to answer that on their own hardware, which is the wrong answer for a
-//! local-first product.
+//! Today a packaged install that panics leaves **no trace on the machine it
+//! happened on**: the console window is the only sink, and closing it (or losing
+//! it with the process) destroys the evidence. A user who asks "why did it
+//! stop?" has no way to answer that on their own hardware, which is the wrong
+//! answer for a local-first product.
 //!
 //! This module writes a small, bounded, append-only journal of *process
-//! lifecycle facts* — nothing else. The contract, per the plan:
+//! lifecycle facts* — nothing else. The contract:
 //!
-//! * **The engine owns the file** (§7.1). Nothing extra is written to stderr for
-//!   the desktop to scrape: `camelid-desktop` retains a piped stderr that it
-//!   drains only on a startup failure, so a chatty stderr would fill the OS pipe
-//!   buffer and block the engine — a hang caused by the diagnostics feature.
-//! * **Fail open** (§7.2). Every path degrades to "no journal", never to a
-//!   failed startup or a failed generation. No `unwrap`/`expect` on any write
-//!   path, and every caller ignores the result.
-//! * **Bounded by construction** (§7.5). One active file with a size cap and a
-//!   single retained predecessor, enforced before every append — not a
-//!   follow-up commit.
-//! * **No prompt or generated text, ever** (§7.3). Records carry process
-//!   lifecycle facts and panic payloads only. Nothing here reads a request.
-//! * **No new dependencies** (§7.7) and **no phone-home** (§7.4). The output is
-//!   a file on the user's disk that they choose to share.
+//! * **The engine owns the file.** Nothing extra is written to stderr for the
+//!   desktop to scrape: `camelid-desktop` retains a piped stderr that it drains
+//!   only on a startup failure, so a chatty stderr would fill the OS pipe buffer
+//!   and block the engine — a hang caused by the diagnostics feature. The one
+//!   deliberate exception is a single line at startup naming this file's path,
+//!   emitted next to the existing ready banner: without it the journal is
+//!   undiscoverable, and one bounded line per run cannot fill a pipe buffer.
+//! * **Fail open.** Every path degrades to "no journal", never to a failed
+//!   startup or a failed generation. No `unwrap`/`expect` on any write path, and
+//!   every caller ignores the result.
+//! * **Bounded by construction.** One active file with a size cap and a single
+//!   retained predecessor, enforced before every append — not a follow-up
+//!   commit. Messages and backtraces are clamped so one pathological record
+//!   cannot consume the budget.
+//! * **No prompt or generated text, ever.** Records carry process lifecycle
+//!   facts and panic payloads only. Nothing here reads a request.
+//! * **No new dependencies** and **no phone-home**. The output is a file on the
+//!   user's disk that they choose to share.
 //!
 //! ## Reading the journal
 //!
@@ -53,7 +56,7 @@
 //! `serve`, and that is deliberately NOT built here: taking ownership of Ctrl-C
 //! would put this diagnostics feature on the critical path of stopping the
 //! server, and a diagnostics feature must never be able to break the thing it
-//! diagnoses (plan §7.2).
+//! diagnoses.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -557,7 +560,12 @@ mod tests {
     /// them.
     #[test]
     fn an_installed_hook_records_a_real_panic_and_still_calls_the_previous_hook() {
-        let dir = std::env::temp_dir().join("camelid-diagnostics-hook-test");
+        // Suffixed with the pid: the sink override is process-global, so a fixed
+        // name would collide if two test processes ever ran on one machine.
+        let dir = std::env::temp_dir().join(format!(
+            "camelid-diagnostics-hook-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(LOG_FILE_NAME);
         let _ = std::fs::remove_file(&path);
