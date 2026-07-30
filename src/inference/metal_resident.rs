@@ -131,6 +131,8 @@ impl super::LlamaInferenceSession {
             .weights
             .token_embedding
             .embedding_lookup(token_ids, "token_embedding_resident_prefill")?;
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights
             .layers
             .iter()
@@ -141,6 +143,7 @@ impl super::LlamaInferenceSession {
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
                 post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -448,6 +451,8 @@ impl super::LlamaInferenceSession {
             self.resident_decode = Some(session);
         }
 
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights.layers[range.clone()]
             .iter()
             .map(|l| metal::ResidentLayerWeights {
@@ -457,6 +462,7 @@ impl super::LlamaInferenceSession {
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
                 post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -627,6 +633,8 @@ impl super::LlamaInferenceSession {
             }
         }
 
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights
             .layers
             .iter()
@@ -637,6 +645,7 @@ impl super::LlamaInferenceSession {
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
                 post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -767,6 +776,8 @@ impl super::LlamaInferenceSession {
         let node_kvslot = tree.node_kvslot(position);
         let (ancestor_bits, words) = tree.ancestor_bitset();
 
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights
             .layers
             .iter()
@@ -777,6 +788,7 @@ impl super::LlamaInferenceSession {
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
                 post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),

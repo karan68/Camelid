@@ -9782,6 +9782,7 @@ fn encode_ffn_block(
     ffn_norm: &[f32],
     eps: f32,
     post_ffw_norm: Option<&[f32]>,
+    geglu: bool,
     gate_w: &Buffer,
     up_w: &Buffer,
     down_w: &Buffer,
@@ -9832,9 +9833,17 @@ fn encode_ffn_block(
         encode_rms_norm_f32(e, k, in_buf, &norm_w_buf, &normf, &rms_scalar);
         encode_q8_matmul_f32y(e, k, &normf, gate_w, &gate_buf, &gateup_scalar, ffn_dim);
         encode_q8_matmul_f32y(e, k, &normf, up_w, &up_buf, &gateup_scalar, ffn_dim);
+        // gemma3 GeGLU: gelu_tanh(gate) * up via the existing gelu_mul_f32
+        // kernel (mirrors the CPU reference exactly; the fused gate+up variant
+        // was previously reverted for register spill — keep separate GEMVs).
+        let act_pipeline = if geglu {
+            &k.gelu_mul_pipeline
+        } else {
+            &k.silu_mul_pipeline
+        };
         encode_binary(
             e,
-            &k.silu_mul_pipeline,
+            act_pipeline,
             &gate_buf,
             &up_buf,
             &siluf,
@@ -9865,9 +9874,32 @@ fn encode_ffn_block(
             &gateup_scalar,
             ffn_dim,
         );
-        encode_silu_mul_quantize(
-            e, k, &gate_buf, &up_buf, &scales2, &quants2, &nblocks2, bpr_ffn,
-        );
+        if geglu {
+            // gemma3 GeGLU on the quantize path: the fused silu_mul_quantize
+            // kernel hardcodes SiLU, so run the existing gelu_mul_f32 kernel
+            // into an f32 buffer and quantize with the standalone quantize
+            // kernel — zero new MSL, same quantize formula.
+            let actf = nb((ffn_dim * 4) as u64);
+            let act_n = nb(4);
+            unsafe {
+                *(act_n.contents() as *mut u32) = ffn_dim as u32;
+            }
+            encode_binary(
+                e,
+                &k.gelu_mul_pipeline,
+                &gate_buf,
+                &up_buf,
+                &actf,
+                &act_n,
+                ffn_dim,
+            );
+            encode_quantize(e, k, &actf, &scales2, &quants2, &nblocks2, bpr_ffn);
+            keep.extend([actf, act_n]);
+        } else {
+            encode_silu_mul_quantize(
+                e, k, &gate_buf, &up_buf, &scales2, &quants2, &nblocks2, bpr_ffn,
+            );
+        }
         encode_q8_matmul(
             e,
             k,
@@ -10406,7 +10438,8 @@ pub fn try_ffn_block_resident(
     let cb = k.queue.new_command_buffer();
     let e = cb.new_compute_command_encoder();
     encode_ffn_block(
-        e, k, &mut keep, &in_buf, &out_buf, ffn_norm, eps, None, &gate_w, &up_w, &down_w, ffn_dim,
+        e, k, &mut keep, &in_buf, &out_buf, ffn_norm, eps, None, false, &gate_w, &up_w, &down_w,
+        ffn_dim,
     );
     e.end_encoding();
     cb.commit();
@@ -10651,7 +10684,8 @@ pub fn try_decode_layer_resident(
         split_half_pairing,
     );
     encode_ffn_block(
-        e, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, None, &gate_w, &up_w, &down_w, ffn_dim,
+        e, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, None, false, &gate_w, &up_w, &down_w,
+        ffn_dim,
     );
     e.end_encoding();
     cb.commit();
@@ -10829,6 +10863,7 @@ pub fn try_decode_forward_resident(
             layer.ffn_norm,
             eps,
             None,
+            false,
             &w[4],
             &w[5],
             &w[6],
@@ -10869,6 +10904,11 @@ pub struct ResidentLayerWeights<'a> {
     /// paths do not apply them and fail closed when they are present.
     pub post_attn_norm: Option<&'a [f32]>,
     pub post_ffw_norm: Option<&'a [f32]>,
+    /// gemma3 FFN activation is GeGLU — `gelu_tanh(gate) * up` — instead of
+    /// the Llama-family SiLU (reference src/runnable/model.rs:865-873). The
+    /// batched prefill and speculative-verify paths encode SiLU only and fail
+    /// closed when this is set.
+    pub ffn_geglu: bool,
     pub q_weight_blocks: ResidentWeightBytes<'a>,
     pub k_weight_blocks: ResidentWeightBytes<'a>,
     pub v_weight_blocks: ResidentWeightBytes<'a>,
@@ -11630,6 +11670,7 @@ impl ResidentDecodeState {
                 layer.ffn_norm,
                 self.eps,
                 layer.post_ffw_norm,
+                layer.ffn_geglu,
                 &w[4],
                 &w[5],
                 &w[6],
@@ -11807,7 +11848,7 @@ impl ResidentDecodeState {
         // forward. (gemma3 additionally never reaches here: head_dim 256 > 128.)
         if layers
             .iter()
-            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some())
+            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some() || l.ffn_geglu)
         {
             return None;
         }
@@ -12928,7 +12969,7 @@ impl ResidentDecodeState {
         // head_dim 256 > 128 — this is the belt-and-braces gate.)
         if layers
             .iter()
-            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some())
+            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some() || l.ffn_geglu)
         {
             return None;
         }
@@ -19325,6 +19366,7 @@ mod tests {
                 k_norm: None,
                 post_attn_norm: None,
                 post_ffw_norm: None,
+                ffn_geglu: false,
             })
             .collect();
 
@@ -19653,6 +19695,7 @@ mod tests {
                     k_norm: with_qk_norm.then_some(d.k_norm.as_slice()),
                     post_attn_norm: None,
                     post_ffw_norm: None,
+                    ffn_geglu: false,
                     q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
                     k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
                     v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
@@ -19882,6 +19925,7 @@ mod tests {
                     k_norm: Some(&d.k_norm),
                     post_attn_norm: with_post_norms.then_some(d.post_attn_norm.as_slice()),
                     post_ffw_norm: with_post_norms.then_some(d.post_ffw_norm.as_slice()),
+                    ffn_geglu: false,
                     q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
                     k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
                     v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
@@ -20045,6 +20089,7 @@ mod tests {
             k_norm: None,
             post_attn_norm: Some(&post),
             post_ffw_norm: Some(&post),
+            ffn_geglu: false,
             q_weight_blocks: ResidentWeightBytes::Blocks36(&q),
             k_weight_blocks: ResidentWeightBytes::Blocks36(&kv),
             v_weight_blocks: ResidentWeightBytes::Blocks36(&v),
@@ -20073,6 +20118,263 @@ mod tests {
                 .is_none(),
             "batched prefill must fail closed for sandwich-norm layers"
         );
+        // A GeGLU layer set (no sandwich norms) must decline too: the prefill
+        // FFN encodes SiLU only.
+        let geglu_layer = ResidentLayerWeights {
+            post_attn_norm: None,
+            post_ffw_norm: None,
+            ffn_geglu: true,
+            ..layer
+        };
+        assert!(
+            session
+                .prefill_tokens(
+                    &embeddings,
+                    2,
+                    std::slice::from_ref(&geglu_layer),
+                    &cos_all,
+                    &sin_all,
+                    1.0
+                )
+                .is_none(),
+            "batched prefill must fail closed for GeGLU layers"
+        );
+    }
+
+    // gemma3→Metal Phase 2c: the resident FFN encodes GeGLU — gelu_tanh(gate)
+    // * up via the existing gelu_mul_f32 kernel (reference
+    // src/runnable/model.rs:865-873) — at the gemma3-1B geometry, on top of
+    // the QK-norm and sandwich norms. Pure-CPU independent reference over 3
+    // tokens, plus a non-vacuity guard (a SiLU decode of the same weights must
+    // differ materially at every token).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_gemma3_geglu_decode_selfparity() {
+        if !detect_metal_device().available {
+            return;
+        }
+        if f32y_gemv_enabled() {
+            eprintln!(
+                "SKIP metal_resident_gemma3_geglu_decode_selfparity: CAMELID_METAL_F32Y \
+                 latched on earlier in this process; the CPU reference mirrors the quantize path"
+            );
+            return;
+        }
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let tokens = 3usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    post_attn_norm: (0..hidden)
+                        .map(|i| 0.9 + ((i + li) as f32 % 3.0) * 0.03)
+                        .collect(),
+                    post_ffw_norm: (0..hidden)
+                        .map(|i| 0.95 + ((i + li) as f32 % 6.0) * 0.02)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let mk_views = |geglu: bool| -> Vec<ResidentLayerWeights<'_>> {
+            data.iter()
+                .map(|d| ResidentLayerWeights {
+                    attn_norm: &d.attn_norm,
+                    ffn_norm: &d.ffn_norm,
+                    q_norm: Some(&d.q_norm),
+                    k_norm: Some(&d.k_norm),
+                    post_attn_norm: Some(&d.post_attn_norm),
+                    post_ffw_norm: Some(&d.post_ffw_norm),
+                    ffn_geglu: geglu,
+                    q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                    k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                    v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                    o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                    gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                    up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                    down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                })
+                .collect()
+        };
+        let weights = mk_views(true);
+        let weights_silu = mk_views(false);
+
+        let mut session = ResidentDecodeState::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+        )
+        .unwrap();
+        let mut session_silu = ResidentDecodeState::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+        )
+        .unwrap();
+
+        // gelu_pytorch_tanh — same constants as the kernel and the runnable
+        // reference (`gelu_tanh`, src/runnable/model.rs:2053-2056).
+        fn gelu_tanh(x: f32) -> f32 {
+            const C: f32 = 0.797_884_6;
+            0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
+        }
+
+        let mut ref_k: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut ref_v: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+
+        for t in 0..tokens {
+            let emb: Vec<f32> = (0..hidden)
+                .map(|i| (((i + t) as f32 % 11.0) - 5.0) * 0.2)
+                .collect();
+            let cos_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).cos())
+                .collect();
+            let sin_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).sin())
+                .collect();
+
+            // CPU reference token step: full gemma3 block structure with GeGLU.
+            let mut x = emb.clone();
+            for (li, d) in data.iter().enumerate() {
+                let xn = cpu_ref_rms_norm(&x, &d.attn_norm, eps);
+                let mut q = cpu_ref_q8_matvec(&xn, &d.q, q_dim);
+                let mut kx = cpu_ref_q8_matvec(&xn, &d.k, kv_dim);
+                let v = cpu_ref_q8_matvec(&xn, &d.v, kv_dim);
+                cpu_ref_rms_norm_per_head(&mut q, n_heads, head_dim, &d.q_norm, eps);
+                cpu_ref_rms_norm_per_head(&mut kx, n_kv, head_dim, &d.k_norm, eps);
+                cpu_ref_rope_split_half(&mut q, n_heads, head_dim, &cos_t, &sin_t);
+                cpu_ref_rope_split_half(&mut kx, n_kv, head_dim, &cos_t, &sin_t);
+                ref_k[li].extend_from_slice(&kx);
+                ref_v[li].extend_from_slice(&v);
+                let ctx = cpu_ref_attention(
+                    &q,
+                    &ref_k[li],
+                    &ref_v[li],
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    t + 1,
+                    0,
+                    t + 1,
+                    scale,
+                );
+                let o = cpu_ref_q8_matvec(&ctx, &d.o, hidden);
+                let on = cpu_ref_rms_norm(&o, &d.post_attn_norm, eps);
+                for (h, ov) in x.iter_mut().zip(&on) {
+                    *h += *ov;
+                }
+                let xn2 = cpu_ref_rms_norm(&x, &d.ffn_norm, eps);
+                let g = cpu_ref_q8_matvec(&xn2, &d.gate, ffn);
+                let u = cpu_ref_q8_matvec(&xn2, &d.up, ffn);
+                let act: Vec<f32> = g
+                    .iter()
+                    .zip(&u)
+                    .map(|(gv, uv)| gelu_tanh(*gv) * uv)
+                    .collect();
+                let dn = cpu_ref_q8_matvec(&act, &d.down, hidden);
+                let dnn = cpu_ref_rms_norm(&dn, &d.post_ffw_norm, eps);
+                for (h, dv) in x.iter_mut().zip(&dnn) {
+                    *h += *dv;
+                }
+            }
+
+            let got = match session
+                .forward_token(
+                    &emb, &weights, &cos_t, &sin_t, t, scale, None, None, 0, None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            assert_eq!(got.len(), hidden);
+            // Tolerance note: unlike 2a/2b (elementwise exp/rsqrt agree to ~1e-6
+            // between MSL and libm), tanh differs by a few ULPs between the two,
+            // and on the quantize path a single activation crossing a Q8_0
+            // rounding boundary shifts one quant by 1 — contributing up to
+            // ws*act_scale ≈ 1e-2 to a down-projection dot. The non-vacuity
+            // guard below (GeGLU vs SiLU) is the structural check; this bound
+            // still catches a wrong activation outright (delta would be O(1e-1)).
+            let mut max_diff = 0.0f32;
+            for (a, b) in got.iter().zip(&x) {
+                max_diff = max_diff.max((a - b).abs());
+                assert!((a - b).abs() < 1.5e-2, "token {t}: {a} != {b}");
+            }
+            eprintln!("[2c-selfparity] token {t}: max |gpu-cpu| = {max_diff:.2e}");
+
+            // Non-vacuity: the SiLU decode of the same weights must differ.
+            let got_silu = match session_silu
+                .forward_token(
+                    &emb,
+                    &weights_silu,
+                    &cos_t,
+                    &sin_t,
+                    t,
+                    scale,
+                    None,
+                    None,
+                    0,
+                    None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            let delta = got
+                .iter()
+                .zip(&got_silu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                delta > 0.02,
+                "token {t}: GeGLU had no material effect vs SiLU (max delta {delta}); the \
+                 wiring is not engaging"
+            );
+        }
     }
 
     /// WIN2METAL Phase 3 C2/C3 gate. `verify_batch` over `k` rows at positions
@@ -20193,6 +20495,7 @@ mod tests {
                 k_norm: None,
                 post_attn_norm: None,
                 post_ffw_norm: None,
+                ffn_geglu: false,
             })
             .collect();
         // Output projection + final norm (the LogitsStage).
@@ -20467,6 +20770,7 @@ mod tests {
                 k_norm: None,
                 post_attn_norm: None,
                 post_ffw_norm: None,
+                ffn_geglu: false,
             })
             .collect();
         let final_norm: Vec<f32> = (0..hidden)
