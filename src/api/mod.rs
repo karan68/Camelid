@@ -519,6 +519,9 @@ pub struct HealthResponse {
     pub engine_active_generated_tokens: u64,
     pub engine_active_elapsed_seconds: u64,
     pub engine_stalled_seconds: u64,
+    /// Maximum streaming sessions retained by the engine's round-robin scheduler.
+    /// One active stream still uses the single-request Metal encode-ahead path.
+    pub continuous_batch_slots: usize,
     /// Absolute path of the running `camelid` binary, so the WebUI can tell a
     /// user exactly how to start the engine again after it stops. `camelid
     /// serve` is only runnable when the binary is on PATH, which it is NOT for
@@ -2696,6 +2699,7 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         engine_active_generated_tokens: slot.completed_units,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
+        continuous_batch_slots: state.engine.continuous_batch_slots(),
         executable: loopback_executable_path(state.serve_addr),
         listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
     }
@@ -2724,6 +2728,7 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         engine_active_generated_tokens: slot.completed_units,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
+        continuous_batch_slots: state.engine.continuous_batch_slots(),
         executable: loopback_executable_path(state.serve_addr),
         listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
     }
@@ -3038,6 +3043,15 @@ async fn llama_server_props(
                 stopping_word: "",
             },
         },
+        // In llama-server semantics `total_slots` is the length of the `/slots`
+        // array, and `GET /slots?fail_on_no_slot=1` arbitrates against those
+        // same slots. Camelid exposes exactly one read-only aggregate slot (see
+        // `llama_server_slots`, whose `unsupported` list already declares
+        // `continuous_batching_metrics`), so reporting the cooperative capacity
+        // here would make the two routes disagree and let a capacity-aware
+        // client compute utilisation against slots it can never observe. The
+        // real streaming capacity is disclosed natively as
+        // `continuous_batch_slots` on `/health`.
         total_slots: 1,
         model_path: None,
         model_id,
@@ -14447,6 +14461,139 @@ fn stream_error_parts(response: &Response) -> (String, String) {
 /// between steps and stops within one step. The job is never detached from
 /// the engine's serialization — the next request's job starts only after this
 /// one returns.
+/// Mutable decode state the shared streaming prologue seeds.
+struct StreamPrologueState<'a> {
+    input: &'a mut Vec<u32>,
+    history: &'a mut Vec<u32>,
+    generated: &'a mut Vec<u32>,
+    top_logits: &'a mut Vec<RawLogitDiagnostic>,
+    output_projection: &'a mut Vec<LlamaOutputProjectionDiagnostic>,
+    dense: &'a mut Option<LlamaForwardDiagnostics>,
+    finish_reason: &'a mut &'static str,
+    sample: &'a mut u128,
+    streamed_text: &'a mut String,
+    first_content_ms: &'a mut Option<u128>,
+}
+
+/// Whether the caller should keep decoding after the prologue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPrologue {
+    Ready,
+    /// A terminal event was already sent, or the client hung up. Stop.
+    Stop,
+}
+
+/// Prompt-prefix cache seeding for a streaming generation, shared by the
+/// run-to-completion job and the cooperative one so the two paths cannot drift.
+/// Restores a cached session (exact hit or longest common prefix), emits the
+/// first delta an exact hit already sampled, and reports whether decoding
+/// should continue.
+///
+/// Bypass the prompt-prefix cache when the CUDA-resident engine drives
+/// decode: reusing a cached session reseeds the GPU KV from f16-rounded
+/// host history (a different reduction order than a clean GPU prefill),
+/// which corrupts the resumed decode — mild for greedy (a few near-tie
+/// flips) but catastrophic under temperature sampling, where it produces
+/// garbled, off-topic output. The non-streaming path already gates the
+/// cache this way (see resident_decode_cuda_active); the streaming path
+/// must too. The CPU lane is reduction-order-stable and keeps the cache.
+fn stream_prompt_cache_prologue(
+    prepared: &mut PreparedGeneration,
+    state: StreamPrologueState<'_>,
+    generation_started: Instant,
+    send: &dyn Fn(StreamDecodeEvent) -> bool,
+) -> StreamPrologue {
+    let StreamPrologueState {
+        input,
+        history,
+        generated,
+        top_logits,
+        output_projection,
+        dense,
+        finish_reason,
+        sample,
+        streamed_text,
+        first_content_ms,
+    } = state;
+    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
+        if let Some(match_res) = lookup_prompt_prefix_cache(prepared) {
+            let mut cached_session = match_res.cached.session.clone();
+            cached_session
+                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
+            if match_res.is_exact_match {
+                prepared.session = cached_session;
+                input.clear();
+                match sample_cached_prompt_prefix(&match_res.cached, history) {
+                    Ok(first_step) => {
+                        let cached_next_token = first_step.next_token_id;
+                        prepared.timings.prompt_cache_hit = true;
+                        *sample += first_step.sample;
+                        if let Err(response) = consume_generation_step(
+                            prepared,
+                            first_step,
+                            GenerationStepAccumulator {
+                                generated,
+                                history,
+                                top_logits,
+                                output_projection,
+                                dense,
+                                finish_reason,
+                            },
+                        ) {
+                            let (code, message) = stream_error_parts(&response);
+                            send(StreamDecodeEvent::Failed { code, message });
+                            return StreamPrologue::Stop;
+                        }
+                        if *finish_reason == "length" {
+                            input.push(cached_next_token);
+                        }
+                    }
+                    Err(response) => {
+                        let (code, message) = stream_error_parts(&response);
+                        send(StreamDecodeEvent::Failed { code, message });
+                        return StreamPrologue::Stop;
+                    }
+                }
+            } else {
+                let k = match_res.prefix_len;
+                if cached_session.rollback_to_position(k).is_ok() {
+                    prepared.session = cached_session;
+                    *input = prepared.token_ids[k..].to_vec();
+                    prepared.timings.prompt_cache_hit = true;
+                }
+            }
+        }
+    }
+
+    // An exact prompt-cache hit samples the first token above, before the main
+    // loop. Emit it now; otherwise a one-token cached stream reaches Finished
+    // with correct usage but no content delta. Longer cached streams also must
+    // establish `streamed_text` before subsequent deltas are diffed.
+    if !generated.is_empty() {
+        let mut text = match prepared.tokenizer.decode(generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                return StreamPrologue::Stop;
+            }
+        };
+        if *finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
+        }
+        if !text.is_empty() {
+            *streamed_text = text.clone();
+            *first_content_ms = Some(generation_started.elapsed().as_millis());
+            if !send(StreamDecodeEvent::Delta(text)) {
+                return StreamPrologue::Stop;
+            }
+        }
+    }
+    StreamPrologue::Ready
+}
+
 fn run_stream_decode_job(
     mut prepared: PreparedGeneration,
     events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
@@ -14492,89 +14639,25 @@ fn run_stream_decode_job(
     let mut forward_timings = LlamaForwardTimings::default();
     let mut sample = 0;
 
-    // Bypass the prompt-prefix cache when the CUDA-resident engine drives
-    // decode: reusing a cached session reseeds the GPU KV from f16-rounded
-    // host history (a different reduction order than a clean GPU prefill),
-    // which corrupts the resumed decode â€” mild for greedy (a few near-tie
-    // flips) but catastrophic under temperature sampling, where it produces
-    // garbled, off-topic output. The non-streaming path already gates the
-    // cache this way (see resident_decode_cuda_active); the streaming path
-    // must too. The CPU lane is reduction-order-stable and keeps the cache.
-    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
-        if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
-            let mut cached_session = match_res.cached.session.clone();
-            cached_session
-                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
-            if match_res.is_exact_match {
-                prepared.session = cached_session;
-                input.clear();
-                match sample_cached_prompt_prefix(&match_res.cached, &history) {
-                    Ok(first_step) => {
-                        let cached_next_token = first_step.next_token_id;
-                        prepared.timings.prompt_cache_hit = true;
-                        sample += first_step.sample;
-                        if let Err(response) = consume_generation_step(
-                            &prepared,
-                            first_step,
-                            GenerationStepAccumulator {
-                                generated: &mut generated,
-                                history: &mut history,
-                                top_logits: &mut top_logits,
-                                output_projection: &mut output_projection,
-                                dense: &mut dense,
-                                finish_reason: &mut finish_reason,
-                            },
-                        ) {
-                            let (code, message) = stream_error_parts(&response);
-                            send(StreamDecodeEvent::Failed { code, message });
-                            return;
-                        }
-                        if finish_reason == "length" {
-                            input.push(cached_next_token);
-                        }
-                    }
-                    Err(response) => {
-                        let (code, message) = stream_error_parts(&response);
-                        send(StreamDecodeEvent::Failed { code, message });
-                        return;
-                    }
-                }
-            } else {
-                let k = match_res.prefix_len;
-                if cached_session.rollback_to_position(k).is_ok() {
-                    prepared.session = cached_session;
-                    input = prepared.token_ids[k..].to_vec();
-                    prepared.timings.prompt_cache_hit = true;
-                }
-            }
-        }
-    }
-
-    // An exact prompt-cache hit samples the first token above, before the main
-    // loop. Emit it now; otherwise a one-token cached stream reaches Finished
-    // with correct usage but no content delta. Longer cached streams also must
-    // establish `streamed_text` before subsequent deltas are diffed.
-    if !generated.is_empty() {
-        let mut text = match prepared.tokenizer.decode(&generated, true) {
-            Ok(text) => text,
-            Err(err) => {
-                send(StreamDecodeEvent::Failed {
-                    code: "token_decode_failed".to_string(),
-                    message: err.to_string(),
-                });
-                return;
-            }
-        };
-        if finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
-        if !text.is_empty() {
-            streamed_text = text.clone();
-            first_content_ms = Some(generation_started.elapsed().as_millis());
-            if !send(StreamDecodeEvent::Delta(text)) {
-                return;
-            }
-        }
+    match stream_prompt_cache_prologue(
+        &mut prepared,
+        StreamPrologueState {
+            input: &mut input,
+            history: &mut history,
+            generated: &mut generated,
+            top_logits: &mut top_logits,
+            output_projection: &mut output_projection,
+            dense: &mut dense,
+            finish_reason: &mut finish_reason,
+            sample: &mut sample,
+            streamed_text: &mut streamed_text,
+            first_content_ms: &mut first_content_ms,
+        },
+        generation_started,
+        &send,
+    ) {
+        StreamPrologue::Ready => {}
+        StreamPrologue::Stop => return,
     }
 
     for _ in generated.len() as u32..prepared.max_tokens {
@@ -14738,6 +14821,340 @@ fn run_stream_decode_job(
     });
 }
 
+/// Cooperative streaming state machine for continuous batching. Unlike
+/// `run_stream_decode_job`, one call to `step` performs at most one model token and then
+/// yields ownership back to the engine scheduler.
+struct CooperativeStreamDecodeJob {
+    prepared: PreparedGeneration,
+    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+    telemetry_guard: Option<telemetry::RequestGuard>,
+    generation_started: Instant,
+    request_timeout: Duration,
+    collect_q8_schedule: bool,
+    input: Vec<u32>,
+    history: Vec<u32>,
+    generated: Vec<u32>,
+    top_logits: Vec<RawLogitDiagnostic>,
+    output_projection: Vec<LlamaOutputProjectionDiagnostic>,
+    dense: Option<LlamaForwardDiagnostics>,
+    finish_reason: &'static str,
+    streamed_text: String,
+    first_content_ms: Option<u128>,
+    forward_timings: LlamaForwardTimings,
+    sample: u128,
+    finished: bool,
+    #[cfg(test)]
+    initial_step_delay: Option<Duration>,
+}
+
+impl CooperativeStreamDecodeJob {
+    fn new(
+        mut prepared: PreparedGeneration,
+        events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+    ) -> Option<Self> {
+        let request_timeout = match generation_timeout_duration() {
+            Ok(timeout) => timeout,
+            Err(response) => {
+                let (code, message) = stream_error_parts(&response);
+                let _ = events.blocking_send(StreamDecodeEvent::Failed { code, message });
+                return None;
+            }
+        };
+        let collect_q8_schedule =
+            stream_timing_diagnostics_enabled() && q8_schedule_telemetry_enabled();
+        if collect_q8_schedule {
+            reset_q8_schedule_telemetry();
+        }
+        let telemetry_guard = prepared
+            .telemetry
+            .take()
+            .map(telemetry::RequestGuard::begin);
+        let generation_started = Instant::now();
+        let mut input = prepared.token_ids.clone();
+        let mut history = prepared.token_ids.clone();
+        let mut generated = Vec::new();
+        let mut top_logits = Vec::new();
+        let mut output_projection = Vec::new();
+        let mut dense = None;
+        let mut finish_reason = "length";
+        let mut streamed_text = String::new();
+        let mut first_content_ms = None;
+        let mut sample = 0;
+        // Same prompt-prefix cache seeding the run-to-completion job does:
+        // without it every turn of a growing chat re-prefills the whole
+        // conversation, which on the now-default cooperative path would be a
+        // large silent regression.
+        let send_event = |event: StreamDecodeEvent| events.blocking_send(event).is_ok();
+        if stream_prompt_cache_prologue(
+            &mut prepared,
+            StreamPrologueState {
+                input: &mut input,
+                history: &mut history,
+                generated: &mut generated,
+                top_logits: &mut top_logits,
+                output_projection: &mut output_projection,
+                dense: &mut dense,
+                finish_reason: &mut finish_reason,
+                sample: &mut sample,
+                streamed_text: &mut streamed_text,
+                first_content_ms: &mut first_content_ms,
+            },
+            generation_started,
+            &send_event,
+        ) == StreamPrologue::Stop
+        {
+            return None;
+        }
+        Some(Self {
+            prepared,
+            events,
+            telemetry_guard,
+            generation_started,
+            request_timeout,
+            collect_q8_schedule,
+            input,
+            history,
+            generated,
+            top_logits,
+            output_projection,
+            dense,
+            finish_reason,
+            streamed_text,
+            first_content_ms,
+            forward_timings: LlamaForwardTimings::default(),
+            sample,
+            finished: false,
+            #[cfg(test)]
+            initial_step_delay: generation_step_test_sleep_duration(),
+        })
+    }
+
+    fn send(&self, event: StreamDecodeEvent) -> bool {
+        self.events.blocking_send(event).is_ok()
+    }
+
+    fn fail(&mut self, response: &Response) -> engine::StepOutcome {
+        let (code, message) = stream_error_parts(response);
+        self.send(StreamDecodeEvent::Failed { code, message });
+        self.finished = true;
+        engine::StepOutcome::Complete
+    }
+
+    fn finish_clean(&mut self) -> engine::StepOutcome {
+        if self.finished {
+            return engine::StepOutcome::Complete;
+        }
+        self.prepared.timings.generate = self.generation_started.elapsed().as_millis();
+        self.prepared.timings.generation =
+            generation_phase_timings_from_forward(&self.forward_timings, self.sample);
+        self.prepared.timings.layers =
+            generation_layer_timings_from_forward(&self.forward_timings.layers);
+        self.prepared.timings.memory = self.forward_timings.memory.clone();
+        if self.collect_q8_schedule {
+            self.prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+        }
+        self.prepared.metrics.record_generation(
+            self.prepared.token_ids.len(),
+            self.generated.len(),
+            &self.prepared.timings,
+        );
+        if let Some(guard) = self.telemetry_guard.take() {
+            let ttft_ms = self.first_content_ms.map(|ms| ms as u64);
+            let decode_tps = match (self.first_content_ms, self.generated.len()) {
+                (Some(first_ms), count) if count > 1 => {
+                    let decode_ms = self
+                        .generation_started
+                        .elapsed()
+                        .as_millis()
+                        .saturating_sub(first_ms);
+                    (decode_ms > 0).then(|| (count - 1) as f64 * 1000.0 / decode_ms as f64)
+                }
+                _ => None,
+            };
+            guard.finish(telemetry::RequestFinish {
+                status: "ok",
+                finish_reason: Some(self.finish_reason.to_string()),
+                completion_tokens: self.generated.len(),
+                ttft_ms,
+                decode_tps,
+                prefill_tps: None,
+                error: None,
+            });
+        }
+        crate::gait::sentinel::mark_healthy();
+        let timings = std::mem::take(&mut self.prepared.timings);
+        self.send(StreamDecodeEvent::Finished {
+            finish_reason: self.finish_reason,
+            completion_tokens: self.generated.len(),
+            timings: Box::new(timings),
+            first_content_ms: self.first_content_ms,
+        });
+        self.finished = true;
+        engine::StepOutcome::Complete
+    }
+
+    fn step(&mut self, context: engine::CooperativeStepContext) -> engine::StepOutcome {
+        #[cfg(test)]
+        let _decode_probe = decode_probe::enter();
+        // Preserve the exclusive stream job's test contract: its synthetic initial
+        // delay is observed as live decode work, not as untracked job construction.
+        #[cfg(test)]
+        if let Some(duration) = self.initial_step_delay.take() {
+            std::thread::sleep(duration);
+        }
+        if self.finished {
+            return engine::StepOutcome::Complete;
+        }
+        // Preserve the fast single-request pipeline when this is the only active stream.
+        // With contention, consume any already-prepared current graph but do not enqueue
+        // another session-local future graph ahead of the next round-robin participant.
+        self.prepared
+            .session
+            .set_resident_encode_ahead_enabled(context.active_slots <= 1);
+        if let Some(guard) = &self.telemetry_guard {
+            guard.activate();
+        }
+        if self.prepared.cancel.token.is_cancelled() || self.events.is_closed() {
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+        if self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize
+        {
+            return self.finish_clean();
+        }
+        if self
+            .request_timeout
+            .checked_sub(self.generation_started.elapsed())
+            .is_none()
+        {
+            self.send(StreamDecodeEvent::TimedOut {
+                timeout: self.request_timeout,
+                elapsed: self.generation_started.elapsed(),
+                generated_tokens: self.generated.len(),
+            });
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+
+        let generated_index = self.generated.len();
+        let collect_dense_for_step =
+            collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index);
+        let mut sampling = self.prepared.sampling.clone();
+        if let Some(seed) = sampling.seed {
+            sampling.seed = Some(seed.wrapping_add(self.generated.len() as u64));
+        }
+        let sampler = if sampling == SamplingConfig::default() {
+            LlamaSampler::Greedy
+        } else {
+            LlamaSampler::Sampling(sampling)
+        };
+        let greedy_fast = self.input.len() == 1
+            && matches!(sampler, LlamaSampler::Greedy)
+            && !collect_dense_for_step
+            && !self.top_logits.is_empty();
+        let step = match run_stream_step(
+            &mut self.prepared.session,
+            StreamStepRequest {
+                greedy_fast,
+                input: self.input.clone(),
+                sampler,
+                history: self.history.clone(),
+                collect_dense_diagnostics: collect_dense_for_step,
+            },
+        ) {
+            Ok(step) => step,
+            Err(response) => return self.fail(&response),
+        };
+        if self.generated.is_empty()
+            && !self.prepared.collect_dense_diagnostics
+            && step.diagnostics.is_none()
+        {
+            store_prompt_prefix_cache(&self.prepared, &step);
+        }
+        if self.generated.is_empty() {
+            self.prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+        }
+        self.forward_timings.add_assign(&step.timings);
+        self.sample += step.sample;
+        if let Err(response) = consume_generation_step(
+            &self.prepared,
+            step,
+            GenerationStepAccumulator {
+                generated: &mut self.generated,
+                history: &mut self.history,
+                top_logits: &mut self.top_logits,
+                output_projection: &mut self.output_projection,
+                dense: &mut self.dense,
+                finish_reason: &mut self.finish_reason,
+            },
+        ) {
+            return self.fail(&response);
+        }
+        self.prepared
+            .engine_progress
+            .record_progress(self.generated.len());
+
+        let mut text = match self.prepared.tokenizer.decode(&self.generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                self.send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                self.finished = true;
+                return engine::StepOutcome::Complete;
+            }
+        };
+        if self.finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &self.prepared.stop_sequences);
+        }
+        let delta = text
+            .strip_prefix(&self.streamed_text)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text.clone());
+        self.streamed_text = text;
+        if !delta.is_empty() {
+            if self.first_content_ms.is_none() {
+                self.first_content_ms = Some(self.generation_started.elapsed().as_millis());
+            }
+            if !self.send(StreamDecodeEvent::Delta(delta)) {
+                self.finished = true;
+                return engine::StepOutcome::Complete;
+            }
+        }
+        self.input.clear();
+        if let Some(last_token) = self.generated.last().copied() {
+            self.input.push(last_token);
+        }
+        if self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize
+        {
+            self.finish_clean()
+        } else {
+            engine::StepOutcome::Continue
+        }
+    }
+}
+
+fn cooperative_stream_decode_task(
+    prepared: PreparedGeneration,
+    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+) -> impl FnMut(engine::CooperativeStepContext) -> engine::StepOutcome + Send + 'static {
+    let mut pending = Some((prepared, events));
+    let mut job: Option<CooperativeStreamDecodeJob> = None;
+    move |context| {
+        if job.is_none() {
+            let (prepared, events) = pending.take().expect("cooperative job initializes once");
+            let Some(initialized) = CooperativeStreamDecodeJob::new(prepared, events) else {
+                return engine::StepOutcome::Complete;
+            };
+            job = Some(initialized);
+        }
+        job.as_mut().expect("initialized").step(context)
+    }
+}
+
 fn stream_completion(
     state: &AppState,
     mut prepared: PreparedGeneration,
@@ -14768,12 +15185,22 @@ fn stream_completion(
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
     // Post the decode job before returning the SSE response. A full queue is
     // the same typed backpressure non-streaming requests get.
-    if let Err(err) = state
-        .engine
-        .post(engine::EngineTask::Exclusive(Box::new(move || {
-            run_stream_decode_job(prepared, events_tx);
-        })))
+    // Cooperative round-robin requires each session to own its GPU decode
+    // state. Metal's `ResidentDecodeState` is per-session, but the CUDA
+    // resident engine (and its on-GPU KV cache) is a PROCESS-GLOBAL slot keyed
+    // by model id — two sessions of the same model would share one KV cache and
+    // interleave each other's history. Keep those runs run-to-completion.
+    let task = if state.engine.continuous_batch_slots() > 1
+        && !crate::inference::resident_decode_cuda_active()
     {
+        let job = cooperative_stream_decode_task(prepared, events_tx);
+        engine::EngineTask::Cooperative(Box::new(job))
+    } else {
+        engine::EngineTask::Exclusive(Box::new(move || {
+            run_stream_decode_job(prepared, events_tx);
+        }))
+    };
+    if let Err(err) = state.engine.post(task) {
         return *engine_post_error_response(err);
     }
     let events = async_stream::stream! {
@@ -17363,8 +17790,8 @@ mod tests {
             "CPU prefill promotion remains evidence-gated"
         );
         assert!(
-            !projects[&7].default_enabled,
-            "continuous batching remains default-neutral until integrated"
+            projects[&7].default_enabled,
+            "bounded two-slot streaming fairness is part of appliance mode"
         );
         assert!(
             !projects[&3].default_enabled,
@@ -18730,6 +19157,66 @@ mod tests {
         );
 
         std::env::remove_var("CAMELID_X86_Q4K_DECODE");
+    }
+
+    /// Both streaming jobs must seed from the prompt-prefix cache. The
+    /// cooperative one is the DEFAULT path now that
+    /// `DEFAULT_CONTINUOUS_BATCH_SLOTS` is 2, and it originally seeded straight
+    /// from `prepared.token_ids` while still storing into the cache — so every
+    /// turn of a growing chat re-prefilled the whole conversation. Measured on
+    /// an Apple M4 with a 1974-token prompt on the CPU lane: repeat turns went
+    /// 12.68s -> 12.76s -> 13.06s without the lookup and 12.98s -> 0.49s ->
+    /// 0.47s with it.
+    // Plain `#[test]`, not `#[tokio::test]`: the prologue emits its first delta
+    // with `blocking_send`, exactly as it does on the engine thread, and that
+    // panics if it runs on a thread driving a tokio runtime.
+    #[test]
+    fn cooperative_stream_job_seeds_from_the_prompt_prefix_cache() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let cached_next_token = step.next_token_id;
+        let warm = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&warm, &step);
+
+        // A second request for the identical prompt, sharing the same pool.
+        let cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let mut repeat = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], cold);
+        repeat.cached_prompt_prefix = Arc::clone(&warm.cached_prompt_prefix);
+
+        // The shared `test_tokenizer` has an empty vocabulary, so it cannot
+        // render the cached token. Give this request one that covers the tiny
+        // model's 3-token vocabulary.
+        repeat.tokenizer = Arc::new(tiny_vocab_tokenizer());
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+        let job = CooperativeStreamDecodeJob::new(repeat, events_tx).expect("job initializes");
+        assert!(
+            job.prepared.timings.prompt_cache_hit,
+            "the cooperative streaming job must consume the prompt-prefix cache, \
+             not re-prefill the prompt it already has"
+        );
+        assert_eq!(
+            job.generated,
+            vec![cached_next_token],
+            "an exact hit carries the already-sampled first token into the job"
+        );
+        assert_eq!(
+            job.input,
+            vec![cached_next_token],
+            "decode resumes from the cached token, not from the whole prompt"
+        );
     }
 
     #[test]
@@ -20615,6 +21102,26 @@ mod tests {
                 ffn_down: orientation,
             },
         }
+    }
+
+    /// `test_tokenizer` with a vocabulary: three ordinary tokens covering
+    /// `tiny_config`'s `vocab_size`, so a sampled id can actually be decoded.
+    fn tiny_vocab_tokenizer() -> Tokenizer {
+        let mut tokenizer = test_tokenizer();
+        tokenizer.tokens = (0..3)
+            .map(|id| Token {
+                id,
+                text: format!("t{id}"),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            })
+            .collect();
+        tokenizer.token_to_id = tokenizer
+            .tokens
+            .iter()
+            .map(|t| (t.text.clone(), t.id))
+            .collect();
+        tokenizer
     }
 
     fn test_tokenizer() -> Tokenizer {

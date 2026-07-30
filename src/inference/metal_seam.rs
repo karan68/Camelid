@@ -57,6 +57,11 @@ pub(super) fn wire_mode_active() -> bool {
     false
 }
 
+#[inline]
+pub(super) fn kquant_resident_enabled() -> bool {
+    crate::metal::kquant_resident_enabled()
+}
+
 // ---- Per-matmul Q8_0 offload (block reader, encoded single row) ----
 // Was inline in `matmul_rhs_transposed_q8_0_block_reader_with_flags` (~15868).
 

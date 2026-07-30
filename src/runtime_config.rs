@@ -18,7 +18,11 @@ pub const MIXTRAL_LONG_GENERATION_ENV: &str = "CAMELID_MIXTRAL_LONG_GENERATION";
 pub const DEFAULT_ENGINE_QUEUE_DEPTH: usize = 8;
 pub const DEFAULT_NGRAM_INDEX_MAX_ENTRIES: usize = 131_072;
 pub const DEFAULT_KV_POOL_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-pub const DEFAULT_CONTINUOUS_BATCH_SLOTS: usize = 1;
+/// Two streaming sessions may take turns out of the box. The engine still owns one
+/// compute thread and runs one token step at a time; a lone stream keeps the ordinary
+/// single-request fast path. Set CAMELID_CONTINUOUS_BATCH_SLOTS=1 to force legacy
+/// run-to-completion scheduling.
+pub const DEFAULT_CONTINUOUS_BATCH_SLOTS: usize = 2;
 
 const MAX_ENGINE_QUEUE_DEPTH: usize = 65_536;
 const MAX_NGRAM_INDEX_ENTRIES: usize = 4_194_304;

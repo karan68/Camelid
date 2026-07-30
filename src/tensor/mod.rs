@@ -1180,6 +1180,12 @@ pub struct CpuTensor {
     pub q8_0_file_backing: Option<Q8_0FileBacking>,
     pub q8_0_wire_mmap: Option<crate::wire_mmap::WireMmapTensor>,
     pub q8_0_wire_pages: Option<std::sync::Arc<crate::wire_mmap::WirePages>>,
+    /// Page-aligned raw GGUF wire bytes for a rank-2 K-quant tensor. This is
+    /// the no-copy Metal counterpart of the format-specific `*_wire_bytes`
+    /// fields below: only one representation is populated. The tensor's
+    /// `source_type` identifies whether the pages contain Q4_K, Q5_K, Q6_K,
+    /// Q2_K, or Q3_K super-blocks.
+    pub kquant_wire_pages: Option<std::sync::Arc<crate::wire_mmap::WirePages>>,
     pub q8_0_split_file_backing: Option<Vec<Q8_0FileBacking>>,
     /// Q4_K_M super-block wire bytes (144 bytes/super-block, row-major), retained
     /// when the tensor's `source_type` is `Q4K` so the GPU-resident decode path can
@@ -1223,6 +1229,32 @@ pub struct CpuTensor {
     /// otherwise.
     pub iq4_xs_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     pub data: Vec<f32>,
+}
+
+impl CpuTensor {
+    /// Raw Q4_K wire bytes irrespective of whether the loader retained an
+    /// ordinary `Vec` (portable/CUDA path) or page-aligned storage (Metal
+    /// no-copy path).
+    pub fn q4_k_wire(&self) -> Option<&[u8]> {
+        if self.source_type != Some(GgufTensorType::Q4K) {
+            return None;
+        }
+        self.q4_k_wire_bytes
+            .as_deref()
+            .map(Vec::as_slice)
+            .or_else(|| self.kquant_wire_pages.as_deref().map(|pages| pages.bytes()))
+    }
+
+    /// Raw Q6_K wire bytes across ordinary and page-aligned storage.
+    pub fn q6_k_wire(&self) -> Option<&[u8]> {
+        if self.source_type != Some(GgufTensorType::Q6K) {
+            return None;
+        }
+        self.q6_k_wire_bytes
+            .as_deref()
+            .map(Vec::as_slice)
+            .or_else(|| self.kquant_wire_pages.as_deref().map(|pages| pages.bytes()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1373,6 +1405,7 @@ impl Q8_0TensorBlocks {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -1457,6 +1490,7 @@ impl CpuTensor {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -1549,6 +1583,7 @@ impl CpuTensor {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -1595,6 +1630,7 @@ impl CpuTensor {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -1639,6 +1675,7 @@ impl CpuTensor {
             q8_0_file_backing: Some(backing),
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -1670,6 +1707,7 @@ impl CpuTensor {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -1701,6 +1739,7 @@ impl CpuTensor {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: Some(backings),
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -2301,7 +2340,7 @@ impl CpuTensor {
         }
         // K-quant token-embedding: the wire-only loader leaves `data` empty, so gather
         // each requested row by dequantizing its super-blocks straight from wire bytes.
-        if let Some(wire) = self.q4_k_wire_bytes.as_deref() {
+        if let Some(wire) = self.q4_k_wire() {
             return self.embedding_lookup_kquant_wire(
                 token_ids,
                 name,
@@ -2329,7 +2368,7 @@ impl CpuTensor {
                 },
             );
         }
-        if let Some(wire) = self.q6_k_wire_bytes.as_deref() {
+        if let Some(wire) = self.q6_k_wire() {
             return self.embedding_lookup_kquant_wire(
                 token_ids,
                 name,
@@ -3897,6 +3936,7 @@ impl TensorStore {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -3904,6 +3944,75 @@ impl TensorStore {
             q6_k_wire_bytes,
             q2_k_wire_bytes,
             q3_k_wire_bytes,
+            tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
+            data: Vec::new(),
+        })
+    }
+
+    /// Metal no-copy variant of [`load_kquant_wire_linear`]. The raw GGUF
+    /// super-blocks are read once into page-aligned storage which Metal can
+    /// wrap with `newBufferWithBytesNoCopy`; no second `Vec` or GPU upload is
+    /// retained. CPU consumers use [`CpuTensor::q4_k_wire`] and
+    /// [`CpuTensor::q6_k_wire`] to read the same pages when a resident path
+    /// falls back.
+    pub fn load_kquant_wire_pages_linear(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        let block_bytes = match desc.tensor_type {
+            GgufTensorType::Q4K => 144,
+            GgufTensorType::Q6K => 210,
+            // The first Metal resident campaign covers the mixed Q4_K_M
+            // pair. Other K-quants retain their existing Vec-backed loader
+            // until they have device kernels and CPU page-backed consumers.
+            GgufTensorType::Q2K | GgufTensorType::Q3K | GgufTensorType::Q5K => {
+                return self.load_kquant_wire_linear(name);
+            }
+            _ => return self.load_cpu_f32(name),
+        };
+        if shape.dims.len() != 2 {
+            return self.load_cpu_f32(name);
+        }
+        let elements = shape.element_count()?;
+        const KQUANT_BLOCK_VALUES: usize = 256;
+        if !elements.is_multiple_of(KQUANT_BLOCK_VALUES) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "tensor {name} {:?} element count {elements} is not 256-value super-block aligned",
+                desc.tensor_type
+            )));
+        }
+        let wire_bytes = elements / KQUANT_BLOCK_VALUES * block_bytes;
+        let file = File::open(&self.path).map_err(|err| {
+            BackendError::InvalidTensorData(format!(
+                "K-quant wire pages open failed for {}: {err}",
+                self.path.display()
+            ))
+        })?;
+        Ok(CpuTensor {
+            name: name.to_string(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(desc.tensor_type),
+            q8_0_blocks: None,
+            q8_0_shared_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            kquant_wire_pages: Some(crate::wire_mmap::WirePages::read_from_file(
+                &file,
+                desc.absolute_offset,
+                wire_bytes,
+            )?),
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
+            q5_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
             iq4_xs_wire_bytes: None,
             data: Vec::new(),
@@ -3933,6 +4042,7 @@ impl TensorStore {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -3969,6 +4079,7 @@ impl TensorStore {
             q8_0_file_backing: None,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
@@ -4264,6 +4375,7 @@ impl TensorStore {
             q8_0_file_backing,
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
+            kquant_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q4_k_repack8: Q4KRepack8Cell::default(),
