@@ -91,10 +91,17 @@ cooperative streaming scheduler — see item 5.
   the same 1974-token turn repeated three times: **33.23s / 33.33s / 33.54s**
   before, **33.35s / 0.50s / 0.49s** after, with byte-identical greedy
   completions across cold and cached turns.
-- `/props.total_slots` continues to report `1`, matching the single aggregate
-  slot `GET /slots` exposes and the `fail_on_no_slot` arbitration built on it.
-  The cooperative capacity is reported natively as `continuous_batch_slots` on
-  `/health`.
+- `/props.total_slots`, the `GET /slots` array length, and `fail_on_no_slot=1`
+  all answer from one number, `EngineHandle::total_slots`. It is the cooperative
+  capacity except on the CUDA resident lane, where `stream_completion` runs every
+  stream exclusive and the honest answer is `1`. `fail_on_no_slot` refuses only
+  when every slot is busy, so a second stream is admissible while the first is
+  mid-generation; an exclusive job (model load/unload, a non-streaming
+  completion, a cache reset) saturates all slots, because it owns the engine
+  while it runs and no slot can produce a token until it returns. Per-slot task
+  identity and per-slot progress are engine-wide values repeated on the busy
+  entries, declared as `per_slot_task_identity` / `per_slot_progress` in the
+  route's `unsupported` list rather than quietly implied.
 - The plan only labels a model `metal_resident_kquant_runtime` when its tensor
   types are an allow-listed Q4_K/Q6_K/F32/F16/BF16 mix AND its architecture is
   one the resident dense kernels can express. Everything else — including

@@ -80,6 +80,12 @@ pub(crate) struct EngineHandle {
     active_completed_units: Arc<AtomicU64>,
     next_task_id: Arc<AtomicU64>,
     continuous_batch_slots: usize,
+    /// Cooperative slots the worker currently holds. Published by the worker
+    /// itself, which already computes it for `CooperativeStepContext`.
+    occupied_slots: Arc<AtomicUsize>,
+    /// 1 while an exclusive job owns the engine. It is not a slot, but it does
+    /// block every slot, so capacity questions must count it.
+    exclusive_active: Arc<AtomicUsize>,
 }
 
 fn queue_depth_from_env() -> usize {
@@ -154,6 +160,10 @@ impl EngineHandle {
         let active_started_epoch_millis = Arc::new(AtomicU64::new(0));
         let active_last_progress_epoch_millis = Arc::new(AtomicU64::new(0));
         let active_completed_units = Arc::new(AtomicU64::new(0));
+        let occupied_slots = Arc::new(AtomicUsize::new(0));
+        let exclusive_active = Arc::new(AtomicUsize::new(0));
+        let worker_occupied = Arc::clone(&occupied_slots);
+        let worker_exclusive = Arc::clone(&exclusive_active);
         std::thread::Builder::new()
             .name("camelid-engine".to_string())
             .spawn(move || {
@@ -204,7 +214,9 @@ impl EngineHandle {
                             // non-streaming completions, the parity probe and
                             // resident-cache resets indefinitely.
                             EngineTask::Exclusive(job) => {
+                                worker_exclusive.store(1, Ordering::Relaxed);
                                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                                worker_exclusive.store(0, Ordering::Relaxed);
                                 worker_depth.fetch_sub(1, Ordering::SeqCst);
                             }
                             EngineTask::Cooperative(job) => {
@@ -225,10 +237,14 @@ impl EngineHandle {
                     let step_context = CooperativeStepContext {
                         active_slots: batch.scheduled_len(),
                     };
+                    worker_occupied.store(step_context.active_slots, Ordering::Relaxed);
                     let completed = batch.run_round(|_, job| {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(step_context)))
                             .unwrap_or(StepOutcome::Complete)
                     });
+                    // Republish after the round so a finished stream frees its
+                    // slot immediately rather than at the next admit.
+                    worker_occupied.store(batch.active_len(), Ordering::Relaxed);
                     if !completed.is_empty() {
                         worker_depth.fetch_sub(completed.len(), Ordering::SeqCst);
                     }
@@ -244,6 +260,8 @@ impl EngineHandle {
             active_completed_units,
             next_task_id: Arc::new(AtomicU64::new(1)),
             continuous_batch_slots,
+            occupied_slots,
+            exclusive_active,
         }
     }
 
@@ -255,6 +273,37 @@ impl EngineHandle {
     /// Configured cooperative streaming capacity captured when the worker starts.
     pub(crate) fn continuous_batch_slots(&self) -> usize {
         self.continuous_batch_slots
+    }
+
+    /// Streaming slots this engine will actually admit right now.
+    ///
+    /// Not the same as [`continuous_batch_slots`](Self::continuous_batch_slots):
+    /// `stream_completion` only builds a cooperative job when the CUDA resident
+    /// engine is NOT driving decode, because that engine is a process-global slot
+    /// keyed by model id. On such a deployment every stream runs exclusive, so
+    /// advertising two slots would invite a client to dispatch against capacity
+    /// that does not exist.
+    pub(crate) fn total_slots(&self) -> usize {
+        if crate::inference::resident_decode_cuda_active() {
+            1
+        } else {
+            self.continuous_batch_slots
+        }
+    }
+
+    /// Slots that cannot accept a new stream right now, as a usable
+    /// `busy / total` pair against [`total_slots`](Self::total_slots).
+    ///
+    /// An exclusive job saturates: it owns the entire engine while it runs, so
+    /// no slot can start a token until it finishes. Counting it as ONE busy slot
+    /// would tell a capacity-aware client to dispatch into a slot that cannot
+    /// run — the same false-capacity failure this pair exists to prevent.
+    pub(crate) fn busy_slots(&self) -> usize {
+        let total = self.total_slots();
+        if self.exclusive_active.load(Ordering::Relaxed) > 0 {
+            return total;
+        }
+        self.occupied_slots.load(Ordering::Relaxed).min(total)
     }
 
     /// Privacy-safe, read-only state for the production engine's real slot.
@@ -633,6 +682,114 @@ mod tests {
             "the active task id is stable across yields: {ids:?}"
         );
         assert_eq!(engine.slot_snapshot().active_task_id, None, "slot released");
+    }
+
+    /// `/slots`, `/props.total_slots` and `fail_on_no_slot` all arbitrate against
+    /// `busy_slots` / `total_slots`, so a second stream must be admissible while
+    /// the first is mid-generation, and an exclusive job must count as busy
+    /// because it owns the whole engine while it runs.
+    #[tokio::test]
+    async fn slot_occupancy_tracks_cooperative_and_exclusive_work() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        assert_eq!(engine.total_slots(), 2);
+        assert_eq!(engine.busy_slots(), 0, "idle engine has every slot free");
+
+        // An exclusive job ALONE must saturate: it owns the whole engine, so
+        // reporting one free slot would invite a dispatch that cannot run.
+        // (Checked before any stream exists, or `1 cooperative + 1 exclusive`
+        // would reach `total` by arithmetic accident.)
+        let (solo_tx, solo_rx) = std::sync::mpsc::channel::<()>();
+        let (solo_release_tx, solo_release_rx) = std::sync::mpsc::channel::<()>();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                solo_tx.send(()).unwrap();
+                solo_release_rx.recv().ok();
+            })))
+            .unwrap();
+        solo_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("exclusive job starts");
+        assert_eq!(
+            engine.busy_slots(),
+            engine.total_slots(),
+            "a lone exclusive job blocks every slot"
+        );
+        solo_release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.busy_slots() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an exclusive job must release capacity when it returns"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let stop_rx = Arc::new(std::sync::Mutex::new(stop_rx));
+        let running = Arc::new(AtomicUsize::new(0));
+        {
+            let stop_rx = Arc::clone(&stop_rx);
+            let running = Arc::clone(&running);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    running.fetch_add(1, Ordering::SeqCst);
+                    if stop_rx.lock().unwrap().try_recv().is_ok() {
+                        StepOutcome::Complete
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while running.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline, "stream never started");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(engine.busy_slots(), 1, "one stream occupies one slot");
+        assert!(
+            engine.busy_slots() < engine.total_slots(),
+            "a second stream is still admissible"
+        );
+
+        // An exclusive job owns the engine, so capacity must read as saturated.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().ok();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("exclusive job runs even with a stream active");
+        assert_eq!(
+            engine.busy_slots(),
+            engine.total_slots(),
+            "an exclusive job blocks every slot while it runs"
+        );
+        release_tx.send(()).unwrap();
+
+        let _ = stop_tx.send(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.busy_slots() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slots must free when work finishes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
     }
 
     /// The bounded channel is the backpressure device. A worker that drains it

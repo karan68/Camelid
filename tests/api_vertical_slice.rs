@@ -117,12 +117,12 @@ async fn props_reports_public_fail_closed_llama_server_shape() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    // Deliberately 1, not the cooperative capacity: in llama-server semantics
-    // `total_slots` is the length of the `/slots` array, which Camelid exposes
-    // as exactly one read-only aggregate slot, and `GET /slots?fail_on_no_slot=1`
-    // arbitrates against that same slot. The streaming capacity is reported
-    // natively as `continuous_batch_slots` on `/health`.
-    assert_eq!(body["total_slots"], 1);
+    // `total_slots` is the length of the `/slots` array, which is one entry per
+    // admissible cooperative streaming slot (see `slots_reports_public_...`).
+    assert_eq!(
+        body["total_slots"],
+        camelid::runtime_config::DEFAULT_CONTINUOUS_BATCH_SLOTS
+    );
     assert_eq!(body["model_path"], Value::Null);
     assert_eq!(body["model_id"], Value::Null);
     assert_eq!(body["chat_template"], Value::Null);
@@ -834,7 +834,17 @@ async fn slots_reports_public_fail_closed_llama_server_shape() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let slots = body.as_array().unwrap();
-    assert_eq!(slots.len(), 1);
+    // One entry per admissible streaming slot, so this length is what `/props`
+    // reports as `total_slots` and what `fail_on_no_slot` arbitrates against.
+    assert_eq!(
+        slots.len(),
+        camelid::runtime_config::DEFAULT_CONTINUOUS_BATCH_SLOTS
+    );
+    for (index, slot) in slots.iter().enumerate() {
+        assert_eq!(slot["id"], index);
+        assert_eq!(slot["is_processing"], false);
+        assert_eq!(slot["id_task"], -1);
+    }
     let slot = &slots[0];
     assert_eq!(slot["id"], 0);
     assert_eq!(slot["id_task"], -1);

@@ -229,7 +229,7 @@ pub(super) const API_CONFORMANCE_CASES: &[ApiConformanceCase] = &[
     ApiConformanceCase {
         id: "llama_server_slots",
         status: SupportStatus::Partial,
-        notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported.",
+        notes: "GET /slots returns one read-only, privacy-safe entry per admissible cooperative streaming slot, matching /props total_slots, with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling that refuses only when every slot is busy. Per-slot task identity and per-slot progress are engine-wide values repeated on the busy entries, declared as per_slot_task_identity and per_slot_progress. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported.",
         routes: &[get("/slots"), post("/slots")],
         supported_modes: &["read"],
         unsupported_modes: &["write", "cache_actions", "cancellation"],

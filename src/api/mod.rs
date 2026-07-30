@@ -3044,15 +3044,11 @@ async fn llama_server_props(
             },
         },
         // In llama-server semantics `total_slots` is the length of the `/slots`
-        // array, and `GET /slots?fail_on_no_slot=1` arbitrates against those
-        // same slots. Camelid exposes exactly one read-only aggregate slot (see
-        // `llama_server_slots`, whose `unsupported` list already declares
-        // `continuous_batching_metrics`), so reporting the cooperative capacity
-        // here would make the two routes disagree and let a capacity-aware
-        // client compute utilisation against slots it can never observe. The
-        // real streaming capacity is disclosed natively as
-        // `continuous_batch_slots` on `/health`.
-        total_slots: 1,
+        // array, and `GET /slots?fail_on_no_slot=1` arbitrates against those same
+        // slots — so all three answer from `EngineHandle::total_slots`, which is
+        // the cooperative capacity except on the CUDA resident lane, where every
+        // stream runs exclusive and the honest answer is 1.
+        total_slots: state.engine.total_slots().try_into().unwrap_or(u32::MAX),
         model_path: None,
         model_id,
         chat_template,
@@ -3143,7 +3139,13 @@ async fn llama_server_slots(
     let generation_ready = model.is_some_and(loaded_model_generation_ready);
     let slot = state.engine.slot_snapshot();
 
-    if query.fail_on_no_slot.as_deref() == Some("1") && (!generation_ready || slot.is_processing())
+    let total_slots = state.engine.total_slots();
+    let busy_slots = state.engine.busy_slots();
+
+    // Refuse only when there is genuinely no room: with cooperative streaming a
+    // second stream is admissible while the first is mid-generation.
+    if query.fail_on_no_slot.as_deref() == Some("1")
+        && (!generation_ready || busy_slots >= total_slots)
     {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3169,57 +3171,75 @@ async fn llama_server_slots(
         .map(|id| id.min(i32::MAX as u64) as i32)
         .unwrap_or(-1);
 
-    (
-        StatusCode::OK,
-        Json(vec![LlamaServerSlotResponse {
-            id: 0,
-            id_task,
-            n_ctx,
-            speculative: false,
-            is_processing: slot.is_processing(),
-            params: LlamaServerDefaultGenerationParams {
-                n_predict: -1,
-                seed: u32::MAX,
-                temperature: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                presence_penalty: 0.0,
-                frequency_penalty: 0.0,
-                stop: Vec::new(),
-                max_tokens: -1,
-                ignore_eos: false,
-                stream: true,
-                n_probs: 0,
-                samplers: vec!["greedy"],
-            },
-            prompt: "",
-            next_token: LlamaServerNextTokenProps {
-                has_next_token: generation_ready,
-                has_new_line: false,
-                n_remain: -1,
-                n_decoded: 0,
-                stopping_word: "",
-            },
-            camelid: LlamaServerSlotCamelid {
-                compatibility: "partial_llama_server_slots_read_only",
-                generation_ready,
-                status,
-                engine_queue_depth: state.engine.depth(),
-                queued_tasks: slot.queued_tasks,
-                active_generated_tokens: slot.completed_units,
-                active_elapsed_seconds: slot.active_elapsed_seconds,
-                stalled_seconds: slot.stalled_seconds,
-                unsupported: vec![
-                    "post_slots",
-                    "slot_cache_save_restore_erase",
-                    "prompt_cache_metadata",
-                    "cancellation_metadata",
-                    "continuous_batching_metrics",
-                ],
-            },
-        }]),
-    )
-        .into_response()
+    // One entry per admissible slot, so this array's length is `total_slots` on
+    // `/props` and the denominator `fail_on_no_slot` arbitrates against. The
+    // engine tracks WHICH slots are busy but keeps a single set of progress
+    // atomics for whichever job is stepping, so `id_task` and the progress
+    // fields are engine-wide values repeated on the busy entries rather than
+    // per-slot truth — declared as `per_slot_task_identity` /
+    // `per_slot_progress` in `unsupported` rather than quietly implied.
+    let slots: Vec<LlamaServerSlotResponse> = (0..total_slots)
+        .map(|index| {
+            let busy = index < busy_slots;
+            LlamaServerSlotResponse {
+                id: index.try_into().unwrap_or(u32::MAX),
+                id_task: if busy { id_task } else { -1 },
+                n_ctx,
+                speculative: false,
+                is_processing: busy,
+                params: LlamaServerDefaultGenerationParams {
+                    n_predict: -1,
+                    seed: u32::MAX,
+                    temperature: 0.0,
+                    top_k: 0,
+                    top_p: 1.0,
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    stop: Vec::new(),
+                    max_tokens: -1,
+                    ignore_eos: false,
+                    stream: true,
+                    n_probs: 0,
+                    samplers: vec!["greedy"],
+                },
+                prompt: "",
+                next_token: LlamaServerNextTokenProps {
+                    has_next_token: generation_ready,
+                    has_new_line: false,
+                    n_remain: -1,
+                    n_decoded: 0,
+                    stopping_word: "",
+                },
+                camelid: LlamaServerSlotCamelid {
+                    compatibility: "partial_llama_server_slots_read_only",
+                    generation_ready,
+                    status: if busy {
+                        status
+                    } else if generation_ready {
+                        "idle_generation_ready"
+                    } else {
+                        "unavailable"
+                    },
+                    engine_queue_depth: state.engine.depth(),
+                    queued_tasks: slot.queued_tasks,
+                    active_generated_tokens: if busy { slot.completed_units } else { 0 },
+                    active_elapsed_seconds: if busy { slot.active_elapsed_seconds } else { 0 },
+                    stalled_seconds: if busy { slot.stalled_seconds } else { 0 },
+                    unsupported: vec![
+                        "post_slots",
+                        "slot_cache_save_restore_erase",
+                        "prompt_cache_metadata",
+                        "cancellation_metadata",
+                        "continuous_batching_metrics",
+                        "per_slot_task_identity",
+                        "per_slot_progress",
+                    ],
+                },
+            }
+        })
+        .collect();
+
+    (StatusCode::OK, Json(slots)).into_response()
 }
 
 async fn unsupported_llama_server_slots() -> Response {
