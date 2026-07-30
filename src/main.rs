@@ -5747,12 +5747,11 @@ fn ensure_arch_has_direct_dense_session(gguf: &camelid::gguf::GgufFile) -> anyho
     Ok(())
 }
 
-/// The measured-fastest Metal configuration is on by default for the CLI: Q8_0 weights
-/// upload in wire format, NSG=8 GEMV dispatch, f32-activation GEMV chain, tiled decode
-/// attention, and the one-command-buffer GPU prefill. Each remains overridable: set the
-/// variable to 0 to opt out, and the resident decode itself stays opt-in via
-/// CAMELID_METAL_RESIDENT_DECODE. (Library defaults are unchanged: this runs only in the
-/// CLI entry, so test suites and embedders see the conservative paths unless they enable.)
+/// The measured-fastest Metal configuration is on by default for the CLI: Q8_0/Q4_K/Q6_K
+/// weights stay in wire format, NSG=8 GEMV dispatch, f32-activation GEMV chain, tiled
+/// decode attention, and one-command-buffer GPU prefill. Each remains overridable by
+/// setting its variable to 0. Library defaults are unchanged: this runs only in the CLI
+/// entry, so embedders retain conservative policy unless they opt in.
 fn apply_default_fast_stack() {
     for key in [
         "CAMELID_METAL_RESIDENT_DECODE",
@@ -5766,6 +5765,12 @@ fn apply_default_fast_stack() {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, "1");
         }
+    }
+    // K-quant Metal kernels are macOS-only. Runtime tensor/dimension admission is still
+    // authoritative, so Q5/other unsupported mixes transparently keep their CPU route.
+    // An explicit value, including 0, is never overwritten.
+    if cfg!(target_os = "macos") && std::env::var_os("CAMELID_METAL_KQUANT").is_none() {
+        std::env::set_var("CAMELID_METAL_KQUANT", "1");
     }
 }
 
@@ -5809,9 +5814,11 @@ fn apply_deterministic_mode() {
         "CAMELID_METAL_Q8_RETAINED",
         "CAMELID_HYBRID_Q8_RETAINED",
         "CAMELID_METAL_NOCOPY",
+        "CAMELID_METAL_KQUANT",
     ] {
         std::env::set_var(key, "0");
     }
+    std::env::set_var("CAMELID_METAL_KV_DTYPE", "f32");
     std::env::set_var("CAMELID_NO_GPU_SAMPLE", "1");
     eprintln!(
         "[deterministic] pinned to the order-stable CPU forward pass (Metal/GPU stack off). \
@@ -5820,10 +5827,9 @@ fn apply_deterministic_mode() {
 }
 
 /// Default the single-node serve/benchmark path to fast-load
-/// (CAMELID_METAL_NOCOPY): Q8_0
-/// weights map straight into page-aligned wire pages the GPU reads in place — same
-/// decode speed, ~36% lower peak RSS, and warm reloads in seconds instead of the
-/// full disk pass. Gated to exactly the configuration that can consume wire pages:
+/// (`CAMELID_METAL_NOCOPY`): Q8_0/Q4_K/Q6_K weights map straight into page-aligned
+/// wire pages the GPU reads in place. Gated to exactly the configuration that can
+/// consume wire pages:
 /// macOS, the resident decode path active, and the wire kernel stack on. This is
 /// why callers apply it after command-specific mode selection instead of from
 /// `apply_default_fast_stack` — speculative

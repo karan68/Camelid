@@ -4,9 +4,9 @@
 //! Ownership contract (mirrors llama.cpp's `server_queue` + single consumer
 //! thread, see docs/recon/ENGINE_INVERSION_CONDUCTOR.md): HTTP handlers
 //! validate and prepare OUTSIDE any serialization, then post a job on a
-//! bounded queue and await its result. The engine thread executes jobs one at
-//! a time, so "at most one decode in flight" holds by construction — there is
-//! no lock whose misuse can corrupt shared decode state. Anything that touches
+//! bounded queue and await its result. The engine thread executes at most one
+//! compute step at a time; opt-in streaming jobs may yield between tokens and
+//! rotate round-robin, but never execute concurrently. Anything that touches
 //! engine-owned state (decode loops, the GPU-runnable parity probe,
 //! resident-cache resets) must run as an engine job, never inline in a
 //! handler.
@@ -16,10 +16,14 @@
 //! dropped handler (client disconnect) stops the running job within one step
 //! and queued jobs from dropped handlers return immediately when they run.
 
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
+
+use super::continuous_batch::ContinuousBatch;
+pub(crate) use super::continuous_batch::StepOutcome;
 
 /// Bounded queue depth (queued jobs, not counting the one running).
 /// Overridable for hardening runs; the default keeps a small, honest queue —
@@ -28,14 +32,27 @@ pub(crate) const QUEUE_DEPTH_ENV: &str = crate::runtime_config::ENGINE_QUEUE_DEP
 
 type ExclusiveJob = Box<dyn FnOnce() + Send + 'static>;
 
-/// A unit of engine work. Every variant runs to completion on the engine
-/// thread before the next is picked up.
+/// Scheduler state visible to one cooperative token step. A single active stream may
+/// retain Metal encode-ahead; contention disables it before another session reaches
+/// the shared command queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CooperativeStepContext {
+    pub(crate) active_slots: usize,
+}
+
+type CooperativeJob = Box<dyn FnMut(CooperativeStepContext) -> StepOutcome + Send + 'static>;
+
+/// A unit of engine work. Exclusive jobs run to completion; cooperative jobs
+/// yield at token boundaries and rotate on the same engine thread.
 pub(crate) enum EngineTask {
     /// A serialized blocking job: a decode loop, the GPU-runnable parity
     /// probe, a resident-cache reset, a prompt-cache mutation. The closure
     /// owns everything it needs and reports back through a channel it
     /// captured (typically `tokio::sync::oneshot`).
     Exclusive(ExclusiveJob),
+    /// One-token-at-a-time streaming decode. The worker rotates active jobs
+    /// round-robin; returning `Complete` releases the slot.
+    Cooperative(CooperativeJob),
 }
 
 /// Why a post failed. `QueueFull` maps to the typed 503
@@ -63,6 +80,7 @@ pub(crate) struct EngineHandle {
     active_last_progress_epoch_millis: Arc<AtomicU64>,
     active_completed_units: Arc<AtomicU64>,
     next_task_id: Arc<AtomicU64>,
+    continuous_batch_slots: usize,
 }
 
 fn queue_depth_from_env() -> usize {
@@ -114,6 +132,10 @@ impl EngineHandle {
     /// Spawn the engine worker thread and return the posting handle.
     pub(crate) fn spawn() -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<EngineTask>(queue_depth_from_env());
+        // Resolve configuration on the spawning thread. Reading it lazily
+        // inside the worker races tests and embedders that scope environment
+        // overrides around `spawn()`.
+        let continuous_batch_slots = crate::runtime_config::continuous_batch_slots();
         let depth = Arc::new(AtomicUsize::new(0));
         let worker_depth = Arc::clone(&depth);
         let active_task_id = Arc::new(AtomicU64::new(0));
@@ -123,19 +145,49 @@ impl EngineHandle {
         std::thread::Builder::new()
             .name("camelid-engine".to_string())
             .spawn(move || {
-                while let Some(task) = rx.blocking_recv() {
-                    match task {
-                        EngineTask::Exclusive(job) => {
-                            // The engine thread must survive a panicking job
-                            // (uncurated models can panic deep in engine
-                            // builds). The job's oneshot is dropped by the
-                            // unwind, so the caller sees `Unavailable`; jobs
-                            // that need to fail closed on panic wrap their own
-                            // body in catch_unwind and return a verdict.
+                let mut batch = ContinuousBatch::<CooperativeJob>::new(continuous_batch_slots);
+                let mut exclusive = VecDeque::<ExclusiveJob>::new();
+                let mut disconnected = false;
+                loop {
+                    if batch.is_empty() {
+                        if let Some(job) = exclusive.pop_front() {
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                            worker_depth.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        if disconnected {
+                            break;
+                        }
+                        match rx.blocking_recv() {
+                            Some(EngineTask::Exclusive(job)) => exclusive.push_back(job),
+                            Some(EngineTask::Cooperative(job)) => {
+                                batch.admit(job);
+                            }
+                            None => {
+                                disconnected = true;
+                                continue;
+                            }
                         }
                     }
-                    worker_depth.fetch_sub(1, Ordering::SeqCst);
+
+                    while let Ok(task) = rx.try_recv() {
+                        match task {
+                            EngineTask::Exclusive(job) => exclusive.push_back(job),
+                            EngineTask::Cooperative(job) => {
+                                batch.admit(job);
+                            }
+                        }
+                    }
+                    let step_context = CooperativeStepContext {
+                        active_slots: batch.scheduled_len(),
+                    };
+                    let completed = batch.run_round(|_, job| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(step_context)))
+                            .unwrap_or(StepOutcome::Complete)
+                    });
+                    if !completed.is_empty() {
+                        worker_depth.fetch_sub(completed.len(), Ordering::SeqCst);
+                    }
                 }
             })
             .expect("spawn camelid-engine worker thread");
@@ -147,12 +199,18 @@ impl EngineHandle {
             active_last_progress_epoch_millis,
             active_completed_units,
             next_task_id: Arc::new(AtomicU64::new(1)),
+            continuous_batch_slots,
         }
     }
 
     /// Jobs accepted and not yet finished.
     pub(crate) fn depth(&self) -> usize {
         self.depth.load(Ordering::SeqCst)
+    }
+
+    /// Configured cooperative streaming capacity captured when the worker starts.
+    pub(crate) fn continuous_batch_slots(&self) -> usize {
+        self.continuous_batch_slots
     }
 
     /// Privacy-safe, read-only state for the production engine's real slot.
@@ -223,6 +281,22 @@ impl EngineHandle {
                     active_completed_units,
                 };
                 job();
+            })),
+            EngineTask::Cooperative(mut job) => EngineTask::Cooperative(Box::new(move |context| {
+                let started = epoch_millis();
+                active_started_epoch_millis.store(started, Ordering::SeqCst);
+                active_last_progress_epoch_millis.store(started, Ordering::SeqCst);
+                active_completed_units.store(0, Ordering::SeqCst);
+                active_task_id.store(task_id, Ordering::SeqCst);
+                let _guard = ActiveTaskGuard {
+                    active_task_id: Arc::clone(&active_task_id),
+                    active_started_epoch_millis: Arc::clone(&active_started_epoch_millis),
+                    active_last_progress_epoch_millis: Arc::clone(
+                        &active_last_progress_epoch_millis,
+                    ),
+                    active_completed_units: Arc::clone(&active_completed_units),
+                };
+                job(context)
             })),
         };
         self.depth.fetch_add(1, Ordering::SeqCst);
@@ -300,6 +374,110 @@ mod tests {
             max_seen.load(Ordering::SeqCst),
             1,
             "engine must never run two jobs concurrently",
+        );
+    }
+
+    #[tokio::test]
+    async fn cooperative_jobs_interleave_one_step_per_round() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        // Hold the worker so both cooperative jobs are queued before the first round.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for label in ['a', 'b'] {
+            let order = Arc::clone(&order);
+            let mut steps = 0usize;
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    order.lock().unwrap().push(label);
+                    steps += 1;
+                    if steps == 3 {
+                        StepOutcome::Complete
+                    } else {
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(*order.lock().unwrap(), vec!['a', 'b', 'a', 'b', 'a', 'b']);
+    }
+
+    #[tokio::test]
+    async fn cooperative_context_returns_to_single_stream_fast_path() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        // Hold the worker until both jobs are waiting so the first round is contended.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            let mut steps = 0usize;
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |context| {
+                    seen.lock().unwrap().push(('a', context.active_slots));
+                    steps += 1;
+                    if steps == 2 {
+                        StepOutcome::Complete
+                    } else {
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+        {
+            let seen = Arc::clone(&seen);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |context| {
+                    seen.lock().unwrap().push(('b', context.active_slots));
+                    StepOutcome::Complete
+                })))
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![('a', 2), ('b', 2), ('a', 1)],
+            "after contention clears, the remaining stream regains encode-ahead eligibility"
         );
     }
 

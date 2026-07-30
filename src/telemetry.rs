@@ -305,6 +305,7 @@ pub fn active() -> bool {
 pub struct RequestGuard {
     started: Instant,
     finished: bool,
+    context: RequestContext,
 }
 
 pub struct RequestStart {
@@ -332,10 +333,11 @@ pub struct RequestFinish {
 
 impl RequestGuard {
     pub fn begin(start: RequestStart) -> Self {
-        hub().set_request(RequestContext {
+        let context = RequestContext {
             request_id: start.request_id,
             model_id: start.model_id,
-        });
+        };
+        hub().set_request(context.clone());
         emit(Event::InferenceStarted {
             backend: start.backend,
             quantization: start.quantization,
@@ -349,10 +351,12 @@ impl RequestGuard {
         Self {
             started: Instant::now(),
             finished: false,
+            context,
         }
     }
 
     pub fn finish(mut self, finish: RequestFinish) {
+        self.activate();
         self.emit_finished(finish);
         self.finished = true;
         hub().clear_request();
@@ -370,11 +374,18 @@ impl RequestGuard {
             error: finish.error,
         });
     }
+
+    /// Re-select this request as the attribution context. Cooperative decode
+    /// calls this at each token boundary before emitting any per-step events.
+    pub fn activate(&self) {
+        hub().set_request(self.context.clone());
+    }
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         if !self.finished {
+            self.activate();
             self.emit_finished(RequestFinish {
                 status: "disconnected",
                 finish_reason: None,

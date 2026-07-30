@@ -1,0 +1,193 @@
+{
+  "schema": "camelid.metal-kquant-before-after/v1",
+  "generated_utc": "2026-07-30T05:39:03Z",
+  "status": "qualified_opt_in",
+  "host": {
+    "cpu": "Apple M4",
+    "arch": "arm64",
+    "os": "macOS 26.5 (25F5058e)",
+    "metal_capability": {
+      "available": true,
+      "resident_kernels": true,
+      "device": "Apple M4",
+      "unified_memory": true
+    }
+  },
+  "source": {
+    "before_commit": "1efe1ed29943f615f4516ef3ee50e2d730848bee",
+    "after": "uncommitted worktree over before_commit",
+    "after_rollout": {
+      "CAMELID_METAL_KQUANT": "1",
+      "CAMELID_METAL_KV_DTYPE": "f16",
+      "CAMELID_METAL_NOCOPY": "CLI default-on"
+    },
+    "build": {
+      "cargo_profile": "release",
+      "lto_override": false,
+      "codegen_units_override": 16,
+      "incremental": false
+    }
+  },
+  "model": {
+    "path": "/Volumes/Untitled/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "bytes": 807694464,
+    "sha256": "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83"
+  },
+  "method": {
+    "command": "camelid bench-generate MODEL --temperature 0 --iterations 5 --warmup --json",
+    "statistic": "median of five measured iterations after one unmeasured warmup",
+    "cache_note": "Model load time is recorded but not compared because the before/after processes saw different OS file-cache states."
+  },
+  "confident_decode_probe": {
+    "prompt": "The capital of France is",
+    "prompt_tokens": 6,
+    "generated_tokens": 50,
+    "before": {
+      "prefill_ms": [96.194, 118.787, 101.179, 162.025, 102.124],
+      "ttft_ms": [123.35925, 150.700125, 129.552042, 188.569125, 128.968333],
+      "decode_ms": [1519.767708, 1448.361834, 1373.325209, 1341.005333, 1462.727042],
+      "decode_tokens_per_second": [32.241769, 33.831325, 35.679823, 36.53975, 33.499073],
+      "peak_memory_bytes": [2732670976, 2757607424, 2781429760, 2805841920, 2829975552],
+      "token_ids_sha256": "3e3dc48276c74c242ea981bd6134cd00e53e795c2ac92467690d152e2ecd3d49"
+    },
+    "after_f16_primary": {
+      "prefill_ms": [150.061, 151.005, 149.646, 149.69, 150.11],
+      "ttft_ms": [175.323041, 170.445667, 167.811792, 171.815666, 169.222916],
+      "decode_ms": [828.86175, 821.135875, 847.961791, 829.231542, 828.881166],
+      "decode_tokens_per_second": [59.117217, 59.673437, 57.785623, 59.090854, 59.115832],
+      "peak_memory_bytes": [971210752, 971522048, 971620352, 971718656, 971784192],
+      "token_ids_sha256": "3e3dc48276c74c242ea981bd6134cd00e53e795c2ac92467690d152e2ecd3d49"
+    },
+    "median": {
+      "before_prefill_ms": 102.124,
+      "after_prefill_ms": 150.061,
+      "prefill_time_change_percent": 46.94,
+      "before_ttft_ms": 129.552042,
+      "after_ttft_ms": 170.445667,
+      "ttft_change_percent": 31.57,
+      "before_decode_ms": 1448.361834,
+      "after_decode_ms": 828.881166,
+      "before_decode_tokens_per_second": 33.831325,
+      "after_decode_tokens_per_second": 59.115832,
+      "decode_throughput_change_percent": 74.74,
+      "before_peak_memory_bytes": 2781429760,
+      "after_peak_memory_bytes": 971620352,
+      "peak_memory_change_percent": -65.07
+    },
+    "parity": {
+      "identical_all_five_runs": true,
+      "first_divergent_generated_token_index": -1
+    },
+    "verdict": "F16-primary is the qualified K-quant rollout: exact 50-token probe, faster decode, and substantially lower peak memory. Very short prefill/TTFT regresses from fixed GPU launch overhead."
+  },
+  "long_prefill_decode_probe": {
+    "prompt_sha256": "cff8e63132282450a8446e660f569ae3cccfaa776671b9892c65a5af56878825",
+    "prompt_tokens": 142,
+    "generated_tokens": 64,
+    "before": {
+      "prefill_ms": [2652.689, 2783.269, 2714.045, 2801.198, 2676.889],
+      "ttft_ms": [2685.590041, 2819.834833, 2747.441458, 2838.391333, 2709.146625],
+      "decode_ms": [2067.680333, 2012.995375, 2152.417292, 2127.388208, 2052.406291],
+      "decode_tokens_per_second": [30.468926, 31.296644, 29.269417, 29.613777, 30.695677],
+      "peak_memory_bytes": [2777546752, 2811576320, 2841788416, 2872033280, 2902278144],
+      "token_ids_sha256": "62ba8dedba423c5a788ab53fd1c822697badd5def12eb22a247cdb57b7e53101"
+    },
+    "after_f32_primary": {
+      "prefill_ms": [2016.356, 2014.316, 2014.095, 2008.367, 2009.815],
+      "ttft_ms": [2037.226875, 2035.301833, 2035.043084, 2029.257416, 2031.099625],
+      "decode_ms": [1038.067959, 1078.179, 1079.924375, 1076.468042, 1069.123375],
+      "decode_tokens_per_second": [60.689668, 58.431856, 58.337418, 58.524729, 58.926782],
+      "peak_memory_bytes": [996589568, 997474304, 997621760, 997720064, 997883904],
+      "token_ids_sha256": "2c92a09267e9bdc0a9d0b7221f586530c589a8b21742fa7ff5bbba5848e249e5"
+    },
+    "median": {
+      "before_prefill_ms": 2714.045,
+      "after_prefill_ms": 2014.095,
+      "prefill_time_change_percent": -25.79,
+      "before_ttft_ms": 2747.441458,
+      "after_ttft_ms": 2035.043084,
+      "ttft_change_percent": -25.93,
+      "before_decode_ms": 2067.680333,
+      "after_decode_ms": 1076.468042,
+      "before_decode_tokens_per_second": 30.468926,
+      "after_decode_tokens_per_second": 58.524729,
+      "decode_throughput_change_percent": 92.08,
+      "before_peak_memory_bytes": 2841788416,
+      "after_peak_memory_bytes": 997621760,
+      "peak_memory_change_percent": -64.89
+    },
+    "parity": {
+      "identical_within_each_configuration": true,
+      "first_divergent_generated_token_index_before_vs_after": 5,
+      "classification": "near-tie diagnostic; not used as the confident parity promotion probe"
+    }
+  },
+  "q8_primary_probe": {
+    "median_decode_tokens_per_second": 58.991303,
+    "median_peak_memory_bytes": 971456512,
+    "first_divergent_generated_token_index_vs_f16": 31,
+    "classification": "explicitly lossy opt-in; GPU attention matches a dequantized-Q8 cache oracle, but token identity is not claimed"
+  },
+  "continuous_batch_live_probe": {
+    "endpoint": "/v1/completions with stream=true",
+    "configuration": {
+      "CAMELID_CONTINUOUS_BATCH_SLOTS": "2",
+      "CAMELID_METAL_KQUANT": "1",
+      "CAMELID_METAL_KV_DTYPE": "f16",
+      "CAMELID_METAL_RESIDENT_DECODE": "1",
+      "CAMELID_METAL_RESIDENT_PREFILL": "1"
+    },
+    "prompt": "Once upon a time, in a quiet village beyond the mountains,",
+    "generated_tokens_per_request": 24,
+    "client_start_stagger_ms": 50,
+    "before_queue_handoff_fix": {
+      "attempts": [
+        {
+          "a_first_ms": 442.0,
+          "a_finish_ms": 6497.0,
+          "b_first_ms": 5793.6,
+          "b_finish_ms": 11502.0
+        },
+        {
+          "a_first_ms": 456.6,
+          "a_finish_ms": 11395.6,
+          "b_first_ms": 5869.4,
+          "b_finish_ms": 6387.8
+        }
+      ],
+      "classification": "failed: a session's Metal encode-ahead graph caused shared-queue head-of-line stalls after the scheduler yielded"
+    },
+    "after_queue_handoff_fix": {
+      "a_first_ms": 341.5,
+      "a_finish_ms": 1399.7,
+      "b_first_ms": 625.9,
+      "b_finish_ms": 1434.9,
+      "a_delta_count": 24,
+      "b_delta_count": 24,
+      "a_delta_times_ms": [341.5, 358.2, 643.2, 677.3, 712.3, 746.7, 781.2, 816.4, 851.3, 887.3, 923.0, 958.7, 994.2, 1029.9, 1067.1, 1103.9, 1139.2, 1174.7, 1210.0, 1245.8, 1283.9, 1322.2, 1359.9, 1399.5],
+      "b_delta_times_ms": [625.9, 660.1, 694.8, 729.7, 763.9, 798.9, 833.7, 869.1, 904.7, 940.9, 976.4, 1012.0, 1048.6, 1084.7, 1121.2, 1156.9, 1192.2, 1227.5, 1264.2, 1301.1, 1341.4, 1381.2, 1417.3, 1434.9],
+      "generated_text_identical": true,
+      "classification": "pass: after the second prompt prefill, the two sessions alternate one token step per round without multi-second stalls"
+    },
+    "implementation_note": "The scheduler enables single-request encode-ahead whenever only one session is scheduled. Contended rounds disable future session-local graphs before rotating to the next session.",
+    "scope": "Fair interleaving on the sole compute owner, not fused multi-sequence kernels; aggregate steady-state throughput is expected to remain near one resident stream."
+  },
+  "validation": {
+    "targeted": [
+      "metal_kquant_resident_projection_matches_cpu_oracles: pass (single-token SIMD plus five-token tiled prefill)",
+      "metal_q8_primary_kv_scatter_and_attention_match_dequantized_reference: pass",
+      "metal_attention_decode_splitk_kv16_matches_cpu_reference: pass",
+      "cooperative_jobs_interleave_one_step_per_round: pass",
+      "round_robin_is_fair_and_slot_bounded: pass",
+      "metal_lane_capability_probe: pass on Apple M4"
+    ],
+    "full_library_suite": {
+      "passed": 1336,
+      "failed": 1,
+      "ignored": 23,
+      "failure": "tensor::nvfp4_tests::encode_vectors_reproduce_pin_wire_bytes_and_dequant",
+      "baseline_reproduction": "The untouched 1efe1ed29943f615f4516ef3ee50e2d730848bee worktree fails the same path-snan-first fixture with identical actual and expected wire bytes; classified as pre-existing."
+    }
+  },
+  "merge_verdict": "Do not enable Q8-primary by default. K-quant plus F16-primary and bounded continuous streaming qualify for automatic macOS CLI/server selection with explicit opt-out and runtime fallback; library defaults remain conservative."
+}

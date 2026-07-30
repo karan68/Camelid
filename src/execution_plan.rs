@@ -307,6 +307,12 @@ pub fn plan_for_model_with_platform(
     let has_tensor = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0_tensors = has_tensor(GgufTensorType::Q8_0);
     let has_kquant_tensors = has_tensor(GgufTensorType::Q4K) || has_tensor(GgufTensorType::Q6K);
+    let metal_kquant_tensor_mix_supported = !gguf.tensors.iter().any(|tensor| {
+        matches!(
+            tensor.tensor_type,
+            GgufTensorType::Q2K | GgufTensorType::Q3K | GgufTensorType::Q5K | GgufTensorType::IQ4XS
+        )
+    });
 
     let (
         selected_backend,
@@ -348,7 +354,12 @@ pub fn plan_for_model_with_platform(
         );
         cuda_resident_q8_runnable_plan()
     } else if !has_q8_0_tensors && has_kquant_tensors {
-        select_kquant_plan(&platform, &mut reasons)
+        select_kquant_plan(
+            &profile,
+            &platform,
+            metal_kquant_tensor_mix_supported,
+            &mut reasons,
+        )
     } else {
         reasons.push("non-validated row or quant; failing closed to safe path".into());
         (
@@ -856,7 +867,9 @@ fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
 /// that actually runs GPU-resident (K-quant conductor disclosure fix). Greedy parity vs
 /// llama.cpp is recorded in the `*-q4_k_m-*-parity-*` evidence bundles.
 fn select_kquant_plan(
+    profile: &ExecutionProfile,
     platform: &PlanPlatform,
+    metal_tensor_mix_supported: bool,
     reasons: &mut Vec<String>,
 ) -> (
     &'static str,
@@ -877,6 +890,30 @@ fn select_kquant_plan(
             "kquant_cuda_resident_prefill",
             "resident_single_shot_prefill",
             "kquant_cuda_resident_decode",
+            "kquant_cpu_block_dot_reference_path",
+        )
+    } else if !matches!(profile, ExecutionProfile::Safe)
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && metal_tensor_mix_supported
+        && env_flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
+        && env_flag_enabled("CAMELID_METAL_KQUANT")
+        && env_flag_enabled("CAMELID_METAL_F32Y")
+        && env_flag_enabled("CAMELID_METAL_WIRE")
+    {
+        reasons.push(
+            "Metal resident K-quant stack selected automatically; Q4_K/Q6_K weights stay \
+             wire-resident, prefill and decode run on Metal, and unsupported tensor mixes \
+             retain the CPU block-dot fallback"
+                .into(),
+        );
+        (
+            "metal_resident_kquant_runtime",
+            "metal_resident_kquant_wire",
+            "kquant_metal_resident_prefill",
+            "resident_single_command_buffer_prefill",
+            "kquant_metal_resident_decode",
             "kquant_cpu_block_dot_reference_path",
         )
     } else if crate::inference::q4_k_cpu_block_dot_enabled() {
@@ -1351,6 +1388,10 @@ mod tests {
             "CAMELID_MAC_Q8_SCHED",
             "CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER",
             "CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+            "CAMELID_METAL_RESIDENT_DECODE",
+            "CAMELID_METAL_KQUANT",
+            "CAMELID_METAL_F32Y",
+            "CAMELID_METAL_WIRE",
             "CAMELID_X86_Q8_REPACK",
             "CAMELID_X86_Q8_KERNEL",
             "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
@@ -1577,6 +1618,54 @@ mod tests {
         );
         assert_eq!(off.plan.selected_backend, "cpu_reference");
         env::remove_var("CAMELID_X86_Q4K_DECODE");
+        clear_profile_env();
+    }
+
+    #[test]
+    fn mac_metal_kquant_plan_is_automatic_but_fail_closed_for_unsupported_mix() {
+        let _guard = env_lock();
+        clear_profile_env();
+        for key in [
+            "CAMELID_METAL_RESIDENT_DECODE",
+            "CAMELID_METAL_KQUANT",
+            "CAMELID_METAL_F32Y",
+            "CAMELID_METAL_WIRE",
+        ] {
+            env::set_var(key, "1");
+        }
+        let path = PathBuf::from("/tmp/Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+        let supported = quant_fixture(
+            "Llama 3.2 1B Instruct",
+            Some(15),
+            &[GgufTensorType::Q4K, GgufTensorType::Q6K],
+        );
+        let metal = plan_for_model_with_platform(
+            &path,
+            &supported,
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(metal.plan.selected_backend, "metal_resident_kquant_runtime");
+        assert_eq!(metal.plan.decode_path, "kquant_metal_resident_decode");
+        assert_eq!(metal.plan.prefill_path, "kquant_metal_resident_prefill");
+        assert_eq!(
+            metal.plan.fallback_path,
+            "kquant_cpu_block_dot_reference_path"
+        );
+
+        let unsupported = quant_fixture(
+            "Llama 3.2 3B Instruct",
+            Some(17),
+            &[GgufTensorType::Q5K, GgufTensorType::Q6K],
+        );
+        let fallback = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q5_K_M.gguf"),
+            &unsupported,
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(fallback.plan.selected_backend, "cpu_kquant_block_dot");
+        assert_eq!(fallback.plan.decode_path, "kquant_cpu_block_dot_decode");
         clear_profile_env();
     }
 

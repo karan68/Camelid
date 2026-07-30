@@ -89,8 +89,8 @@
     {
       "id": "continuous-batch-scheduler",
       "project": 7,
-      "status": "foundation_default_one_slot",
-      "default_enabled": false,
+      "status": "integrated_default_two_streaming_slots",
+      "default_enabled": true,
       "configuration": [
         "CAMELID_CONTINUOUS_BATCH_SLOTS"
       ],
@@ -100,9 +100,11 @@
       ],
       "evidence": [
         "api::continuous_batch::tests::round_robin_is_fair_and_slot_bounded",
-        "api::engine::tests::slot_snapshot_tracks_real_active_task"
+        "api::engine::tests::cooperative_jobs_interleave_one_step_per_round",
+        "api::engine::tests::slot_snapshot_tracks_real_active_task",
+        "docs/perf-deep-dive/PERF_RECEIPTS/same-host/metal-kquant-m4-before-after-20260730.json"
       ],
-      "safety_contract": "The production engine remains single-owner by default; multi-slot token stepping is not advertised as production-ready until inference integration and throughput/parity receipts land."
+      "safety_contract": "The engine remains the sole compute owner. The two-slot default gives concurrent streaming requests bounded round-robin token stepping; a lone active stream retains Metal encode-ahead, contended rounds suppress future session-local graphs before yielding to keep the shared Metal queue unblocked, and cancellation plus terminal events are observed at every yield. CAMELID_CONTINUOUS_BATCH_SLOTS=1 restores run-to-completion scheduling."
     },
     {
       "id": "production-server-hardening",

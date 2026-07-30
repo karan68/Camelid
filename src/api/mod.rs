@@ -519,6 +519,9 @@ pub struct HealthResponse {
     pub engine_active_generated_tokens: u64,
     pub engine_active_elapsed_seconds: u64,
     pub engine_stalled_seconds: u64,
+    /// Maximum streaming sessions retained by the engine's round-robin scheduler.
+    /// One active stream still uses the single-request Metal encode-ahead path.
+    pub continuous_batch_slots: usize,
     /// Absolute path of the running `camelid` binary, so the WebUI can tell a
     /// user exactly how to start the engine again after it stops. `camelid
     /// serve` is only runnable when the binary is on PATH, which it is NOT for
@@ -2696,6 +2699,7 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         engine_active_generated_tokens: slot.completed_units,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
+        continuous_batch_slots: state.engine.continuous_batch_slots(),
         executable: loopback_executable_path(state.serve_addr),
         listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
     }
@@ -2724,6 +2728,7 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         engine_active_generated_tokens: slot.completed_units,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
+        continuous_batch_slots: state.engine.continuous_batch_slots(),
         executable: loopback_executable_path(state.serve_addr),
         listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
     }
@@ -3038,7 +3043,11 @@ async fn llama_server_props(
                 stopping_word: "",
             },
         },
-        total_slots: 1,
+        total_slots: state
+            .engine
+            .continuous_batch_slots()
+            .try_into()
+            .unwrap_or(u32::MAX),
         model_path: None,
         model_id,
         chat_template,
@@ -14738,6 +14747,306 @@ fn run_stream_decode_job(
     });
 }
 
+/// Cooperative streaming state machine for continuous batching. Unlike
+/// `run_stream_decode_job`, one call to `step` performs at most one model token and then
+/// yields ownership back to the engine scheduler.
+struct CooperativeStreamDecodeJob {
+    prepared: PreparedGeneration,
+    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+    telemetry_guard: Option<telemetry::RequestGuard>,
+    generation_started: Instant,
+    request_timeout: Duration,
+    collect_q8_schedule: bool,
+    input: Vec<u32>,
+    history: Vec<u32>,
+    generated: Vec<u32>,
+    top_logits: Vec<RawLogitDiagnostic>,
+    output_projection: Vec<LlamaOutputProjectionDiagnostic>,
+    dense: Option<LlamaForwardDiagnostics>,
+    finish_reason: &'static str,
+    streamed_text: String,
+    first_content_ms: Option<u128>,
+    forward_timings: LlamaForwardTimings,
+    sample: u128,
+    finished: bool,
+    #[cfg(test)]
+    initial_step_delay: Option<Duration>,
+}
+
+impl CooperativeStreamDecodeJob {
+    fn new(
+        mut prepared: PreparedGeneration,
+        events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+    ) -> Option<Self> {
+        let request_timeout = match generation_timeout_duration() {
+            Ok(timeout) => timeout,
+            Err(response) => {
+                let (code, message) = stream_error_parts(&response);
+                let _ = events.blocking_send(StreamDecodeEvent::Failed { code, message });
+                return None;
+            }
+        };
+        let collect_q8_schedule =
+            stream_timing_diagnostics_enabled() && q8_schedule_telemetry_enabled();
+        if collect_q8_schedule {
+            reset_q8_schedule_telemetry();
+        }
+        let telemetry_guard = prepared
+            .telemetry
+            .take()
+            .map(telemetry::RequestGuard::begin);
+        let input = prepared.token_ids.clone();
+        let history = prepared.token_ids.clone();
+        Some(Self {
+            prepared,
+            events,
+            telemetry_guard,
+            generation_started: Instant::now(),
+            request_timeout,
+            collect_q8_schedule,
+            input,
+            history,
+            generated: Vec::new(),
+            top_logits: Vec::new(),
+            output_projection: Vec::new(),
+            dense: None,
+            finish_reason: "length",
+            streamed_text: String::new(),
+            first_content_ms: None,
+            forward_timings: LlamaForwardTimings::default(),
+            sample: 0,
+            finished: false,
+            #[cfg(test)]
+            initial_step_delay: generation_step_test_sleep_duration(),
+        })
+    }
+
+    fn send(&self, event: StreamDecodeEvent) -> bool {
+        self.events.blocking_send(event).is_ok()
+    }
+
+    fn fail(&mut self, response: &Response) -> engine::StepOutcome {
+        let (code, message) = stream_error_parts(response);
+        self.send(StreamDecodeEvent::Failed { code, message });
+        self.finished = true;
+        engine::StepOutcome::Complete
+    }
+
+    fn finish_clean(&mut self) -> engine::StepOutcome {
+        if self.finished {
+            return engine::StepOutcome::Complete;
+        }
+        self.prepared.timings.generate = self.generation_started.elapsed().as_millis();
+        self.prepared.timings.generation =
+            generation_phase_timings_from_forward(&self.forward_timings, self.sample);
+        self.prepared.timings.layers =
+            generation_layer_timings_from_forward(&self.forward_timings.layers);
+        self.prepared.timings.memory = self.forward_timings.memory.clone();
+        if self.collect_q8_schedule {
+            self.prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+        }
+        self.prepared.metrics.record_generation(
+            self.prepared.token_ids.len(),
+            self.generated.len(),
+            &self.prepared.timings,
+        );
+        if let Some(guard) = self.telemetry_guard.take() {
+            let ttft_ms = self.first_content_ms.map(|ms| ms as u64);
+            let decode_tps = match (self.first_content_ms, self.generated.len()) {
+                (Some(first_ms), count) if count > 1 => {
+                    let decode_ms = self
+                        .generation_started
+                        .elapsed()
+                        .as_millis()
+                        .saturating_sub(first_ms);
+                    (decode_ms > 0).then(|| (count - 1) as f64 * 1000.0 / decode_ms as f64)
+                }
+                _ => None,
+            };
+            guard.finish(telemetry::RequestFinish {
+                status: "ok",
+                finish_reason: Some(self.finish_reason.to_string()),
+                completion_tokens: self.generated.len(),
+                ttft_ms,
+                decode_tps,
+                prefill_tps: None,
+                error: None,
+            });
+        }
+        crate::gait::sentinel::mark_healthy();
+        let timings = std::mem::take(&mut self.prepared.timings);
+        self.send(StreamDecodeEvent::Finished {
+            finish_reason: self.finish_reason,
+            completion_tokens: self.generated.len(),
+            timings: Box::new(timings),
+            first_content_ms: self.first_content_ms,
+        });
+        self.finished = true;
+        engine::StepOutcome::Complete
+    }
+
+    fn step(&mut self, context: engine::CooperativeStepContext) -> engine::StepOutcome {
+        #[cfg(test)]
+        let _decode_probe = decode_probe::enter();
+        // Preserve the exclusive stream job's test contract: its synthetic initial
+        // delay is observed as live decode work, not as untracked job construction.
+        #[cfg(test)]
+        if let Some(duration) = self.initial_step_delay.take() {
+            std::thread::sleep(duration);
+        }
+        if self.finished {
+            return engine::StepOutcome::Complete;
+        }
+        // Preserve the fast single-request pipeline when this is the only active stream.
+        // With contention, consume any already-prepared current graph but do not enqueue
+        // another session-local future graph ahead of the next round-robin participant.
+        self.prepared
+            .session
+            .set_resident_encode_ahead_enabled(context.active_slots <= 1);
+        if let Some(guard) = &self.telemetry_guard {
+            guard.activate();
+        }
+        if self.prepared.cancel.token.is_cancelled() || self.events.is_closed() {
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+        if self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize
+        {
+            return self.finish_clean();
+        }
+        if self
+            .request_timeout
+            .checked_sub(self.generation_started.elapsed())
+            .is_none()
+        {
+            self.send(StreamDecodeEvent::TimedOut {
+                timeout: self.request_timeout,
+                elapsed: self.generation_started.elapsed(),
+                generated_tokens: self.generated.len(),
+            });
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+
+        let generated_index = self.generated.len();
+        let collect_dense_for_step =
+            collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index);
+        let mut sampling = self.prepared.sampling.clone();
+        if let Some(seed) = sampling.seed {
+            sampling.seed = Some(seed.wrapping_add(self.generated.len() as u64));
+        }
+        let sampler = if sampling == SamplingConfig::default() {
+            LlamaSampler::Greedy
+        } else {
+            LlamaSampler::Sampling(sampling)
+        };
+        let greedy_fast = self.input.len() == 1
+            && matches!(sampler, LlamaSampler::Greedy)
+            && !collect_dense_for_step
+            && !self.top_logits.is_empty();
+        let step = match run_stream_step(
+            &mut self.prepared.session,
+            StreamStepRequest {
+                greedy_fast,
+                input: self.input.clone(),
+                sampler,
+                history: self.history.clone(),
+                collect_dense_diagnostics: collect_dense_for_step,
+            },
+        ) {
+            Ok(step) => step,
+            Err(response) => return self.fail(&response),
+        };
+        if self.generated.is_empty()
+            && !self.prepared.collect_dense_diagnostics
+            && step.diagnostics.is_none()
+        {
+            store_prompt_prefix_cache(&self.prepared, &step);
+        }
+        if self.generated.is_empty() {
+            self.prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+        }
+        self.forward_timings.add_assign(&step.timings);
+        self.sample += step.sample;
+        if let Err(response) = consume_generation_step(
+            &self.prepared,
+            step,
+            GenerationStepAccumulator {
+                generated: &mut self.generated,
+                history: &mut self.history,
+                top_logits: &mut self.top_logits,
+                output_projection: &mut self.output_projection,
+                dense: &mut self.dense,
+                finish_reason: &mut self.finish_reason,
+            },
+        ) {
+            return self.fail(&response);
+        }
+        self.prepared
+            .engine_progress
+            .record_progress(self.generated.len());
+
+        let mut text = match self.prepared.tokenizer.decode(&self.generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                self.send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                self.finished = true;
+                return engine::StepOutcome::Complete;
+            }
+        };
+        if self.finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &self.prepared.stop_sequences);
+        }
+        let delta = text
+            .strip_prefix(&self.streamed_text)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text.clone());
+        self.streamed_text = text;
+        if !delta.is_empty() {
+            if self.first_content_ms.is_none() {
+                self.first_content_ms = Some(self.generation_started.elapsed().as_millis());
+            }
+            if !self.send(StreamDecodeEvent::Delta(delta)) {
+                self.finished = true;
+                return engine::StepOutcome::Complete;
+            }
+        }
+        self.input.clear();
+        if let Some(last_token) = self.generated.last().copied() {
+            self.input.push(last_token);
+        }
+        if self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize
+        {
+            self.finish_clean()
+        } else {
+            engine::StepOutcome::Continue
+        }
+    }
+}
+
+fn cooperative_stream_decode_task(
+    prepared: PreparedGeneration,
+    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+) -> impl FnMut(engine::CooperativeStepContext) -> engine::StepOutcome + Send + 'static {
+    let mut pending = Some((prepared, events));
+    let mut job: Option<CooperativeStreamDecodeJob> = None;
+    move |context| {
+        if job.is_none() {
+            let (prepared, events) = pending.take().expect("cooperative job initializes once");
+            let Some(initialized) = CooperativeStreamDecodeJob::new(prepared, events) else {
+                return engine::StepOutcome::Complete;
+            };
+            job = Some(initialized);
+        }
+        job.as_mut().expect("initialized").step(context)
+    }
+}
+
 fn stream_completion(
     state: &AppState,
     mut prepared: PreparedGeneration,
@@ -14768,12 +15077,15 @@ fn stream_completion(
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
     // Post the decode job before returning the SSE response. A full queue is
     // the same typed backpressure non-streaming requests get.
-    if let Err(err) = state
-        .engine
-        .post(engine::EngineTask::Exclusive(Box::new(move || {
+    let task = if state.engine.continuous_batch_slots() > 1 {
+        let mut job = cooperative_stream_decode_task(prepared, events_tx);
+        engine::EngineTask::Cooperative(Box::new(move |context| job(context)))
+    } else {
+        engine::EngineTask::Exclusive(Box::new(move || {
             run_stream_decode_job(prepared, events_tx);
-        })))
-    {
+        }))
+    };
+    if let Err(err) = state.engine.post(task) {
         return *engine_post_error_response(err);
     }
     let events = async_stream::stream! {
@@ -17363,8 +17675,8 @@ mod tests {
             "CPU prefill promotion remains evidence-gated"
         );
         assert!(
-            !projects[&7].default_enabled,
-            "continuous batching remains default-neutral until integrated"
+            projects[&7].default_enabled,
+            "bounded two-slot streaming fairness is part of appliance mode"
         );
         assert!(
             !projects[&3].default_enabled,

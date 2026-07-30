@@ -55,10 +55,30 @@ pub(super) const MAX_VERIFY_K: usize = 8;
 /// the fast-load path attached them (the GPU wraps them in place), else the
 /// materialized 36-byte CPU blocks.
 pub(super) fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeightBytes<'_> {
+    let kquant = match tensor.source_type {
+        Some(GgufTensorType::Q4K) => Some((metal::ResidentWeightFormat::Q4K, tensor.q4_k_wire())),
+        Some(GgufTensorType::Q6K) => Some((metal::ResidentWeightFormat::Q6K, tensor.q6_k_wire())),
+        _ => None,
+    };
+    if let Some((format, wire)) = kquant {
+        if let Some(pages) = tensor.kquant_wire_pages.as_ref() {
+            return metal::ResidentWeightBytes::WirePages { format, pages };
+        }
+        return metal::ResidentWeightBytes::KQuantBytes {
+            format,
+            bytes: wire.expect("resident K-quant eligibility requires wire bytes"),
+        };
+    }
     match tensor.q8_0_wire_pages.as_ref() {
-        Some(pages) => metal::ResidentWeightBytes::WirePages(pages),
+        Some(pages) => metal::ResidentWeightBytes::WirePages {
+            format: metal::ResidentWeightFormat::Q8_0,
+            pages,
+        },
         None => metal::ResidentWeightBytes::Blocks36(q8_0_blocks_as_bytes(
-            tensor.q8_0_blocks.as_ref().unwrap(),
+            tensor
+                .q8_0_blocks
+                .as_ref()
+                .expect("resident Q8 eligibility requires blocks or wire pages"),
         )),
     }
 }
@@ -505,12 +525,16 @@ impl super::LlamaInferenceSession {
 
         // Rope tables for position+1 feed the encode-ahead pipeline: the session encodes
         // the NEXT token's command buffer while this token executes on the GPU.
-        let next_tables = rope::resident_decode_rope_tables(
-            position + 1,
-            head_dim,
-            &self.config,
-            weights.rope_freqs.as_ref(),
-        )?;
+        let next_tables = if self.resident_encode_ahead_enabled {
+            rope::resident_decode_rope_tables(
+                position + 1,
+                head_dim,
+                &self.config,
+                weights.rope_freqs.as_ref(),
+            )?
+        } else {
+            None
+        };
         let session = self
             .resident_decode
             .as_mut()

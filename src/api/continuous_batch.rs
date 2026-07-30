@@ -1,9 +1,8 @@
-//! Cooperative round-robin scheduler foundation for continuous batching.
+//! Cooperative round-robin scheduler for opt-in continuous batching.
 //!
-//! The current production engine still runs one exclusive closure at a time.
-//! This scheduler captures the lifecycle and fairness rules needed when decode
-//! jobs are converted to one-token `step` tasks.  Keeping it independent makes
-//! those rules testable before the hot inference path is switched over.
+//! Streaming decode jobs retain their own session state and yield after one
+//! token. The engine remains the sole compute owner; this scheduler only
+//! interleaves those token steps and bounds the number of active sessions.
 
 use std::collections::VecDeque;
 
@@ -57,6 +56,12 @@ impl<T> ContinuousBatch<T> {
 
     pub(crate) fn active_len(&self) -> usize {
         self.active.len()
+    }
+
+    /// Number of active slots the next round will have after waiting work is admitted.
+    pub(crate) fn scheduled_len(&self) -> usize {
+        self.max_slots
+            .min(self.active.len().saturating_add(self.waiting.len()))
     }
 
     pub(crate) fn waiting_len(&self) -> usize {

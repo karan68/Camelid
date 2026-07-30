@@ -629,13 +629,13 @@ impl LlamaLoadedWeights {
         // streaming when the estimate crossed a cap: ~100x slower decode, and it disqualified
         // the GPU-resident path (which requires q8_0_blocks). The only way off the resident
         // path now is the explicit CAMELID_LAZY_Q8_0_LINEAR opt-out, and it is loud.
-        // Fast-load (CAMELID_METAL_NOCOPY): Q8_0 linears read their wire bytes once
+        // Fast-load (CAMELID_METAL_NOCOPY): Q8_0/Q4_K/Q6_K linears read wire bytes once
         // into page-aligned allocations the GPU wraps in place ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no 36-byte decode, no
         // upload copy, and the page cache stays warm so reloading a model is fast.
         let nocopy_fast_load = metal_nocopy_fast_load_enabled();
         if nocopy_fast_load {
             eprintln!(
-                "[camelid] CAMELID_METAL_NOCOPY: loading Q8_0 weights as page-aligned wire \
+                "[camelid] CAMELID_METAL_NOCOPY: loading Q8_0/Q4_K/Q6_K weights as page-aligned wire \
                  pages (GPU reads them in place; requires the wire kernel stack)"
             );
         }
@@ -683,7 +683,13 @@ impl LlamaLoadedWeights {
                         | GgufTensorType::Q3K
                 ) && desc.dimensions.len() == 2
                 {
-                    return store.load_kquant_wire_linear(name);
+                    return if nocopy_fast_load
+                        && matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
+                    {
+                        store.load_kquant_wire_pages_linear(name)
+                    } else {
+                        store.load_kquant_wire_linear(name)
+                    };
                 }
             }
             if nocopy_fast_load {
@@ -740,25 +746,18 @@ impl LlamaLoadedWeights {
 
         let output = if load_output {
             if binding.output_is_tied_embedding {
-                if nocopy_fast_load {
-                    let mut output = store.load_q8_0_file_backed_tensor_as(
-                        &binding.token_embedding.name,
-                        "output.weight",
-                    )?;
-                    // Tied projection: share the embedding's wire pages (same bytes).
-                    output.q8_0_wire_pages = token_embedding.q8_0_wire_pages.clone();
-                    Some(output)
-                } else if force_lazy_q8_0 {
-                    Some(store.load_q8_0_file_backed_tensor_as(
-                        &binding.token_embedding.name,
-                        "output.weight",
-                    )?)
+                // A tied projection is the same physical tensor. Reuse the
+                // already-loaded backing when this node owns embeddings; on a
+                // last-only pipeline shard load it through the same quant-aware
+                // policy. This is important for K-quant no-copy weights: routing
+                // them through the Q8-specific loader would materialize f32.
+                let mut output = if load_embedding {
+                    token_embedding.clone()
                 } else {
-                    Some(store.load_q8_0_block_backed_linear_as(
-                        &binding.token_embedding.name,
-                        "output.weight",
-                    )?)
-                }
+                    load_linear(&binding.token_embedding.name)?
+                };
+                output.name = "output.weight".to_string();
+                Some(output)
             } else {
                 Some(load_linear(&binding.output.name)?)
             }
@@ -2348,6 +2347,11 @@ pub struct LlamaInferenceSession {
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
     resident_paths_disabled: bool,
+    /// Whether Metal resident decode may pre-commit the next token graph. Continuous-batch
+    /// jobs disable this because another session can run before this one is scheduled again:
+    /// a session-local graph waiting at the head of Metal's shared serial queue would
+    /// otherwise head-of-line block every other request.
+    resident_encode_ahead_enabled: bool,
     /// When set, the deterministic forward pass folds each layer's output hidden state and the
     /// final logits into a streaming SHA-256 rollup (an execution-trace digest). Transient
     /// proof-carrying state, not part of the session's logical identity ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â skipped by
@@ -2432,6 +2436,7 @@ impl LlamaInferenceSession {
             ),
             resident_decode: self.resident_decode.take(),
             resident_paths_disabled: self.resident_paths_disabled,
+            resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: self.execution_trace.take(),
             resident_cache_key: self.resident_cache_key,
             is_drafter: self.is_drafter,
@@ -2522,6 +2527,7 @@ impl Clone for LlamaInferenceSession {
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
             resident_paths_disabled: self.resident_paths_disabled,
+            resident_encode_ahead_enabled: self.resident_encode_ahead_enabled,
             execution_trace: None,
             resident_cache_key: self.resident_cache_key,
             is_drafter: self.is_drafter,
@@ -2562,6 +2568,7 @@ impl LlamaInferenceSession {
             kv_cache: LlamaKvCache::new(plan, kv_quant)?,
             resident_decode: None,
             resident_paths_disabled: false,
+            resident_encode_ahead_enabled: true,
             execution_trace: None,
             resident_cache_key: None,
             is_drafter: false,
@@ -2586,6 +2593,16 @@ impl LlamaInferenceSession {
     /// pins sessions to CPU because KV rollback only exists for CPU state.
     pub fn set_resident_paths_disabled(&mut self, disabled: bool) {
         self.resident_paths_disabled = disabled;
+    }
+
+    /// Enable or disable Metal's single-session next-token encode-ahead pipeline.
+    ///
+    /// A continuous-batch scheduler deliberately yields between tokens, so leaving a future
+    /// graph from one session on Metal's shared serial queue can block the session selected
+    /// for the next round. Cooperative jobs turn encode-ahead off before their first step;
+    /// ordinary single-request generation keeps it enabled.
+    pub fn set_resident_encode_ahead_enabled(&mut self, enabled: bool) {
+        self.resident_encode_ahead_enabled = enabled;
     }
 
     /// Arm the execution-trace rollup: subsequent forward passes fold every layer's output
@@ -2765,7 +2782,7 @@ impl LlamaInferenceSession {
         // makes checking the wrong dim wrongly reject it.)
         let is_q4k = |t: &CpuTensor| {
             t.source_type == Some(GgufTensorType::Q4K)
-                && t.q4_k_wire_bytes.is_some()
+                && t.q4_k_wire().is_some()
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
@@ -2786,7 +2803,7 @@ impl LlamaInferenceSession {
         // attn_v/ffn_down (and the lm_head) to Q6_K, so a Q4_K_M model is mixed Q4K+Q6K.
         let is_q6k = |t: &CpuTensor| {
             t.source_type == Some(GgufTensorType::Q6K)
-                && t.q6_k_wire_bytes.is_some()
+                && t.q6_k_wire().is_some()
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
@@ -2826,13 +2843,11 @@ impl LlamaInferenceSession {
         let metal_only = resident_decode_metal_enabled() && !resident_decode_cuda_enabled();
         let is_resident_quant = |t: &CpuTensor| {
             is_q8(t)
-                || (!metal_only
-                    && (is_q4k(t)
-                        || is_q5k(t)
-                        || is_q6k(t)
-                        || is_q2k(t)
-                        || is_q3k(t)
-                        || is_iq4xs(t)))
+                || (if metal_only {
+                    metal_seam::kquant_resident_enabled() && (is_q4k(t) || is_q6k(t))
+                } else {
+                    is_q4k(t) || is_q5k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t) || is_iq4xs(t)
+                })
         };
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
@@ -9065,13 +9080,13 @@ fn linear_with_diagnostic_layouts_with_plan(
         if weight.source_type == Some(GgufTensorType::Q3K) && weight.q3_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q3_k_block_dot(input, weight, name);
         }
-        if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
+        if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire().is_some() {
             return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
         }
         if weight.source_type == Some(GgufTensorType::Q5K) && weight.q5_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q5_k_block_dot(input, weight, name);
         }
-        if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
+        if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire().is_some() {
             return matmul_rhs_transposed_q6_k_block_dot(input, weight, name);
         }
     }
@@ -9224,9 +9239,9 @@ impl<'a> BorrowedLinearWeight<'a> {
             iq4_xs_wire_bytes: weight.iq4_xs_wire_bytes.as_deref().map(|v| v.as_slice()),
             q2_k_wire_bytes: weight.q2_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q3_k_wire_bytes: weight.q3_k_wire_bytes.as_deref().map(|v| v.as_slice()),
-            q4_k_wire_bytes: weight.q4_k_wire_bytes.as_deref().map(|v| v.as_slice()),
+            q4_k_wire_bytes: weight.q4_k_wire(),
             q5_k_wire_bytes: weight.q5_k_wire_bytes.as_deref().map(|v| v.as_slice()),
-            q6_k_wire_bytes: weight.q6_k_wire_bytes.as_deref().map(|v| v.as_slice()),
+            q6_k_wire_bytes: weight.q6_k_wire(),
         })
     }
 
@@ -9441,7 +9456,7 @@ fn output_projection_with_layout_with_plan(
             }
             // Tied Q6_K embed/lm_head: stream the Q6_K wire blocks instead of the generic
             // f32 matmul over the materialised embedding (which dominated decode at ~88%).
-            if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
+            if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire().is_some() {
                 return matmul_rhs_transposed_q6_k_block_dot(input, weight, name.as_str());
             }
             if let Some(output) =
@@ -9534,13 +9549,13 @@ fn matmul_rhs_transposed_with_precision_with_plan(
         if weight.source_type == Some(GgufTensorType::Q3K) && weight.q3_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q3_k_block_dot(input, weight, name);
         }
-        if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
+        if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire().is_some() {
             return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
         }
         if weight.source_type == Some(GgufTensorType::Q5K) && weight.q5_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q5_k_block_dot(input, weight, name);
         }
-        if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
+        if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire().is_some() {
             return matmul_rhs_transposed_q6_k_block_dot(input, weight, name);
         }
     }
@@ -12571,8 +12586,8 @@ fn build_resident_cuda_engine(
             return Some(q8_0_blocks_as_bytes(b));
         }
         if t.source_type == Some(GgufTensorType::Q4K) {
-            if let Some(w) = t.q4_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+            if let Some(w) = t.q4_k_wire() {
+                return Some(w);
             }
         }
         if t.source_type == Some(GgufTensorType::Q5K) {
@@ -12581,8 +12596,8 @@ fn build_resident_cuda_engine(
             }
         }
         if t.source_type == Some(GgufTensorType::Q6K) {
-            if let Some(w) = t.q6_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+            if let Some(w) = t.q6_k_wire() {
+                return Some(w);
             }
         }
         if t.source_type == Some(GgufTensorType::Q2K) {
@@ -12606,9 +12621,9 @@ fn build_resident_cuda_engine(
     // the per-tensor kernel/activation-quantizer choice). Defaults to Q8_0.
     fn proj_quant(t: &CpuTensor) -> ProjQuant {
         match t.source_type {
-            Some(GgufTensorType::Q4K) if t.q4_k_wire_bytes.is_some() => ProjQuant::Q4K,
+            Some(GgufTensorType::Q4K) if t.q4_k_wire().is_some() => ProjQuant::Q4K,
             Some(GgufTensorType::Q5K) if t.q5_k_wire_bytes.is_some() => ProjQuant::Q5K,
-            Some(GgufTensorType::Q6K) if t.q6_k_wire_bytes.is_some() => ProjQuant::Q6K,
+            Some(GgufTensorType::Q6K) if t.q6_k_wire().is_some() => ProjQuant::Q6K,
             Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
             Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
             Some(GgufTensorType::IQ4XS) if t.iq4_xs_wire_bytes.is_some() => ProjQuant::IQ4XS,
@@ -19177,7 +19192,7 @@ fn matmul_rhs_transposed_q6_k_block_dot(
             "Q6_K block-dot requires in_dim multiple of 256, got {in_dim}"
         )));
     }
-    let wire = weight.q6_k_wire_bytes.as_deref().ok_or_else(|| {
+    let wire = weight.q6_k_wire().ok_or_else(|| {
         BackendError::RuntimeShapeMismatch("Q6_K weight missing wire bytes".to_string())
     })?;
     let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q6_K_WIRE_BYTES_PER_BLOCK;
@@ -19305,7 +19320,7 @@ fn matmul_rhs_transposed_q4_k_block_dot(
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
     let in_dim = input.dim(1)?;
-    let wire = weight.q4_k_wire_bytes.as_deref().ok_or_else(|| {
+    let wire = weight.q4_k_wire().ok_or_else(|| {
         BackendError::RuntimeShapeMismatch("Q4_K weight missing wire bytes".to_string())
     })?;
     if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {

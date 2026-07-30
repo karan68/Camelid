@@ -141,6 +141,13 @@ catalog. `camelid serve` starts the engine, the OpenAI-style API, and the web UI
 (`127.0.0.1:8181` by default) and opens the browser automatically — pass `--no-open` to skip that.
 Prefer the terminal? Run `camelid chat` instead for a full-screen chat UI over the same engine.
 
+On Apple Silicon, the CLI and desktop sidecar automatically select the qualified Metal resident
+path, no-copy Q8_0/Q4_K/Q6_K weights, F16 resident KV for K-quant models, and two-slot streaming
+fairness. Unsupported tensor mixes or devices transparently retain their validated fallback. No
+performance flags are required; `CAMELID_METAL_KQUANT=0`,
+`CAMELID_METAL_NOCOPY=0`, or `CAMELID_CONTINUOUS_BATCH_SLOTS=1` remain available as diagnostic
+escape hatches.
+
 > [!WARNING]
 > A non-loopback listener now fails closed unless an API key is configured. Prefer a key file so
 > the secret is not exposed in the process list:
