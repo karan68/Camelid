@@ -51,17 +51,34 @@ impl MetalSampleRequest {
 #[allow(dead_code)]
 pub(super) const MAX_VERIFY_K: usize = 8;
 
-/// Whether a GPU-resident session may mirror its KV back so the prompt-prefix
-/// cache can store it. Default ON: the alternative is re-prefilling every
-/// repeated or growing chat prompt, which on this lane costs seconds. Set
-/// `CAMELID_PREFIX_CACHE_RESIDENT=0` to keep the CPU KV at zero bytes on the
-/// resident lane and accept the re-prefill.
+/// Whether `prepare_for_prompt_prefix_cache` may vouch for ANY session — the
+/// prompt-prefix-cache kill switch. Default ON: the alternative is
+/// re-prefilling every repeated or growing chat prompt, which on the resident
+/// lane costs seconds. Set `CAMELID_PREFIX_CACHE_RESIDENT=0` to refuse every
+/// preparation: no session is stored, the CPU KV stays at zero bytes on the
+/// resident lane, and every turn pays the re-prefill. (Historically this gate
+/// sat AFTER the CPU-authoritative early accept, so it only ever suppressed
+/// the resident mirror and did nothing at all for CPU-authoritative sessions
+/// — see `prepare_for_prompt_prefix_cache_gated`.)
 pub(super) fn resident_prefix_cache_mirror_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        !std::env::var("CAMELID_PREFIX_CACHE_RESIDENT")
-            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        prefix_cache_setting_enables(
+            std::env::var("CAMELID_PREFIX_CACHE_RESIDENT")
+                .ok()
+                .as_deref(),
+        )
     })
+}
+
+/// Pure parse of the `CAMELID_PREFIX_CACHE_RESIDENT` value. Split from the
+/// latched gate above so the documented opt-out can be tested without an
+/// in-test `set_var` — the gate is a process-wide OnceLock, and latching it
+/// from inside a test flips every sibling test in the binary
+/// (GEMMA3_METAL_CONDUCTOR.md §9d: arm gates from the shell, never from a
+/// test).
+pub(super) fn prefix_cache_setting_enables(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
 /// True when any dense projection this resident engine will consume is a
@@ -404,14 +421,29 @@ impl super::LlamaInferenceSession {
     /// Returns whether the session is safe to cache now. Never fails the
     /// caller's request: a refusal just means no cache entry.
     pub fn prepare_for_prompt_prefix_cache(&mut self) -> bool {
+        self.prepare_for_prompt_prefix_cache_gated(resident_prefix_cache_mirror_enabled())
+    }
+
+    /// `cache_enabled` is `resident_prefix_cache_mirror_enabled()` in
+    /// production; parameterized so tests can prove the kill-switch ordering
+    /// without touching the process-latched env gate (§9d).
+    pub(super) fn prepare_for_prompt_prefix_cache_gated(&mut self, cache_enabled: bool) -> bool {
+        // KILL SWITCH FIRST. `CAMELID_PREFIX_CACHE_RESIDENT=0` must refuse
+        // every session, including a CPU-authoritative one. The early accept
+        // below used to run first, so on any session whose forward stayed on
+        // the CPU the variable did nothing at all: on windowed archs (whose
+        // sessions are all CPU-authoritative until the gemma3 Phase 3b flip)
+        // it was not a kill switch, and on the ordinary CPU lane it never was
+        // one either. Arch-independent live-main bug, fixed as gemma3 Phase
+        // 3a-H3 (GEMMA3_METAL_CONDUCTOR.md §9e-2).
+        if !cache_enabled {
+            return false;
+        }
         if self.cpu_kv_authoritative() {
             return true;
         }
         let position = self.kv_cache.position;
         if position == 0 {
-            return false;
-        }
-        if !resident_prefix_cache_mirror_enabled() {
             return false;
         }
         // BOTH halves of the round trip must be lossless.

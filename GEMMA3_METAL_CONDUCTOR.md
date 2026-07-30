@@ -766,3 +766,138 @@ commit that removes `is_runnable_only_arch` / the `resident_decode_eligible` dis
 gates on Phase 3, not Phase 3 work. Until they are closed, the ≥512-token correctness claim this
 campaign exists to retire can be re-broken by any fallback, and the serve router divert remains
 the only production correctness guard.
+
+## 10. Phase 3a record (2026-07-30)
+
+Phase 3a closed the three blocking hazards from §9e-2/§9f so the Phase 3b routing flip
+(removing the arch disqualifiers) becomes a safety-neutral change. gemma3 stayed FAIL-CLOSED
+throughout: nothing here changes production routing for any arch — this is the safety plumbing
+the flip will stand on. Three commits, one per hazard, each gated by
+fmt / clippy --all-targets -D warnings / cargo test --all-targets.
+
+### 10a. H1 — prompt-prefix cache bypass for windowed archs
+
+New predicate `crate::model::arch_has_windowed_attention(&LlamaModelConfig)`
+(src/model.rs:167, beside `is_runnable_only_arch` at :150): keyed on the PARSED metadata
+(`config.gemma3.is_some()`), not the arch string, so gemma3-4B and any future windowed arch
+inherit every guard that consults it.
+
+Enforced at the three prompt-prefix-cache decision sites in src/api/mod.rs:
+
+- STORE (`store_prompt_prefix_cache`, :13053): a windowed arch never stores an entry — checked
+  before the position check and before `prepare_for_prompt_prefix_cache`, so no mirror cost is
+  ever paid on the refusal.
+- Both PARTIAL-RESUME sites now share one decision point, `resume_partial_prefix_hit` (:13116,
+  extracted so the non-streaming handler and `stream_prompt_cache_prologue` cannot drift),
+  which refuses a windowed arch: the divergent suffix would be re-prefilled at
+  `kv_position > 0`, the resident prefill hook refuses any non-zero start, and the CPU dense
+  forward has no window — the H1 failing case is ordinary multi-turn chat. Declining costs one
+  cold full prefill: slower, never wrong.
+- EXACT hits stay allowed: no forward runs on that path, and with the store site refusing, no
+  windowed entry can exist outside a stale pool — which the resume guard also covers.
+
+Tests: `windowed_arch_never_stores_a_prompt_prefix_entry` (store site; a non-windowed control
+run proves the bypass is the thing that fired), `windowed_arch_never_takes_a_partial_prefix_resume`
+(the shared resume decision point, with control), and
+`stream_prologue_windowed_arch_partial_hit_falls_back_to_cold_prefill` (the streaming site
+end-to-end through `CooperativeStreamDecodeJob::new` against a hand-inserted stale entry).
+
+### 10b. H2 — session-level token-by-token prefill for windowed archs
+
+`session_prefill_chunk_tokens(config, prefill_count)` (src/inference.rs:5510) is now the
+prefill routing decision consumed by `generate_next_token_with_history_diagnostics`: a windowed
+arch forces the single-token lane (chunk = 1), so every prompt token flows through
+`forward_single_token_timed_internal` → `try_resident_decode_forward` — the only lane whose
+forward carries the sliding-window / dual-theta schedule once the arch is admitted (the gemma4
+runtime's token-by-token prefill is the semantic precedent, per §9e-2). Every other arch keeps
+`prefill_chunk_token_count` verbatim — byte-identical routing, pinned by
+`non_windowed_arch_prefill_chunking_is_byte_identical` next to
+`windowed_arch_prefill_forces_the_single_token_lane`.
+
+The production arch disqualifier (src/inference.rs:2779) stays up. A cfg(test)-only seam,
+`TEST_ADMIT_WINDOWED_ARCH_RESIDENT` (src/inference.rs:12303, compiled out of production builds
+entirely), admits the arch for the duration of one targeted test so the routing could be proven
+BEFORE the flip: `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle`
+(src/metal.rs) drives the PRODUCTION session entry over the real 1B row with a multi-token
+prompt. Measured (M4 mini, release, f32y+wire+NSG8 armed, CAMELID_METAL_RESIDENT_DECODE=1):
+
+| depth | session argmax | oracle argmax | max abs logit diff |
+|---|---|---|---|
+| 1 | 108 | 108 | 6.247e-5 |
+| 2 | 584 | 584 | 6.676e-5 |
+| 3 | 568 | 568 | 5.627e-5 |
+| 4 | 2364 | 2364 | 5.913e-5 |
+| 5 | 1077 | 1077 | 7.820e-5 |
+
+5/5 greedy tokens identical, overall max abs logit diff 7.820e-5; depth 1 matches the Phase 2
+gate bit-for-bit-in-report (108 / 6.247e-5) — same forward, now reached through the session.
+The routing itself is pinned by `!session.cpu_kv_authoritative()` at the end: a CPU dense
+prefill of any flavor materializes the CPU KV as it goes; the resident lane leaves it hollow.
+
+### 10c. H3 — the cache kill switch is real (arch-independent live-main bug)
+
+`prepare_for_prompt_prefix_cache` returned `true` for a CPU-authoritative session BEFORE
+consulting `CAMELID_PREFIX_CACHE_RESIDENT`, so the documented opt-out did nothing on any
+CPU-authoritative session — which today is every windowed-arch session (H2) and the entire
+ordinary CPU lane. The gate is now consulted FIRST
+(`prepare_for_prompt_prefix_cache_gated`, src/inference/metal_resident.rs:428): with the
+variable set to `0`/`false`, preparation refuses every session, making the variable a real
+kill switch for cache storage (`store_prompt_prefix_cache` refuses on `false`).
+
+Tests: `prompt_prefix_cache_preparation_env_opt_out_is_a_kill_switch` drives the parameterized
+seam on a session that caches under `true`;
+`prefix_cache_env_setting_parses_the_documented_opt_out` covers the env-value parse
+(`prefix_cache_setting_enables`, split pure from the OnceLock). Deliberately NOT an in-test
+`set_var`: the gate is a process-wide OnceLock and §9d's standing note applies — gates are
+armed from the shell, never latched from inside a test.
+
+### 10d. Gates
+
+Per commit: cargo fmt clean; clippy --all-targets -D warnings clean; cargo test --all-targets
+green (H1 commit: pipeline exit 0 under pipefail, lib suite 1387 tests started, no failures —
+the tally lines were lost to an output filter; H2 commit: 1367 lib passed / 0 failed / 23
+ignored plus every integration suite green, exit 0; H3 commit: recorded below in this section's
+final battery). check-public-scrub.sh clean. Env-keyed battery at phase end (release,
+production GEMV configuration armed from the shell): the H2 session-level gate above, and the
+Phase 2 real-row final gate re-run:
+
+H3-commit full battery: cargo test --all-targets exit 0, lib 1369 passed / 0 failed / 23
+ignored, every integration suite green (60 green tallies). Phase 2 real-row final gate re-run
+(release, no SKIP, 570.08 s): depth 1 argmax 108 = oracle, max abs logit diff 6.247e-5; depth 5
+argmax 1077 = oracle, 7.820e-5; depth 50 argmax 578 = oracle, 9.584e-5 — 50/50 greedy tokens
+identical, overall max abs logit diff 2.122e-4, bit-for-bit the §9b record. The whole Phase 2
+stack is therefore proven UNCHANGED under the Phase 3a plumbing.
+
+### 10e. What Phase 3b still owes (restated against current line numbers)
+
+- The flip commit must remove/condition BOTH `is_runnable_only_arch` (src/model.rs:150) and
+  the `resident_decode_eligible` arch disqualifier (src/inference.rs:2779) AND land the
+  explicit gemma3 fail-closed on the CPU dense fallback in the SAME commit (H4, §9f).
+- Scope the flip to the Q8_0 exact row in the MECHANISM (H5): main's Metal K-quant admission
+  (`is_resident_quant` / `metal_only`, src/inference.rs:2894-2903) would otherwise admit a
+  gemma3 Q4_K_M to an F16-primary resident lane whose K-quant gather drops `embed_scale` (the
+  H6 fail-closed covers only the GPU sampling tail).
+- Eligibility surfaces, current locations: `is_gpu_runnable_arch` (src/execution_plan.rs:863;
+  consumed at :353 Q8 GPU-runnable tier and :375 K-quant plan selection),
+  `recognized_row_level` (src/execution_plan.rs:1027) / `is_supported_exact_q8_row` (:1066),
+  `is_runnable_serve_arch` (src/api/mod.rs:7337, a delegate to `is_runnable_only_arch`).
+- NEW since the §3 checklist was written (the #549/#554 merges):
+  - `prepare_generation` (src/api/mod.rs:11523) carries the raw-completions choke-point gate
+    (`completions_unsupported_for_arch` at :11587, delegating to `is_runnable_serve_arch`)
+    covering `/completion`, `/v1/completions` n>1 fan-out, `/api/generation/preflight`,
+    `/api/generation/sessions`, and receipt replay; `/v1/completions` itself also gates via
+    `reject_completions_for_runnable_arch` (:7684, applied at :10065). Flipping
+    `is_runnable_only_arch` membership REOPENS all of these for gemma3 in the same motion —
+    the flip commit must decide whether that is intended and cover it with tests (the #554
+    test module `runnable_completions_gate_api_tests` pins today's behavior).
+  - `/v1/responses` delegates to `chat_completions` (src/api/responses.rs:169) and so inherits
+    whatever chat routing the flip leaves behind.
+  - The runnable serve lane's tools threading (`runnable_request_tools`, src/api/mod.rs:14066,
+    consumed by `runnable_chat_nonstreaming` :7731 and `runnable_chat_streaming` :7854) serves
+    gemma3 chat today and goes dormant for gemma3 when the arch leaves
+    `is_runnable_serve_arch` — tool-calling parity on the dense lane is NOT covered by any
+    existing gemma3 test.
+- H1's bypass keys on `arch_has_windowed_attention`, which is INDEPENDENT of the runnable
+  predicates: the flip does not reopen the prompt-prefix cache for gemma3. Reopening it later
+  is §9e-5/H11 territory (F32 primary never qualifies; a window-aware mirror changes the
+  round-trip exactness argument) and stays out of 3b.

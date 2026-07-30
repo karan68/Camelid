@@ -14182,6 +14182,47 @@ fn prompt_prefix_cache_preparation_is_a_no_op_for_a_cpu_authoritative_session() 
     assert_eq!(session.kv_cache.materialized_through, 0);
 }
 
+/// gemma3→Metal Phase 3a hazard H3 (arch-independent live-main bug):
+/// `CAMELID_PREFIX_CACHE_RESIDENT=0` is the prompt-prefix-cache kill switch,
+/// and it must be consulted BEFORE the CPU-authoritative early accept —
+/// historically the accept ran first, so the variable did nothing for any
+/// session whose forward stayed on the CPU (today: every windowed-arch
+/// session, and the whole ordinary CPU lane). Drives the parameterized seam
+/// rather than `set_var`: the production gate is a process-wide OnceLock, and
+/// latching it from inside a test flips sibling tests
+/// (GEMMA3_METAL_CONDUCTOR.md §9d — arm gates from the shell). The
+/// env-value-to-bool half is covered separately by the pure parse test below,
+/// so the chain var=0 -> enabled=false -> refusal is closed without touching
+/// process env.
+#[test]
+fn prompt_prefix_cache_preparation_env_opt_out_is_a_kill_switch() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(64);
+    assert!(session.cpu_kv_authoritative());
+    assert!(
+        session.prepare_for_prompt_prefix_cache_gated(true),
+        "this session caches when the switch is on (the control)"
+    );
+    assert!(
+        !session.prepare_for_prompt_prefix_cache_gated(false),
+        "with CAMELID_PREFIX_CACHE_RESIDENT=0 the SAME session must refuse — the kill \
+         switch beats the CPU-authoritative early accept"
+    );
+}
+
+/// The pure parse half of the H3 chain: the documented opt-out values (`0`,
+/// `false` case-insensitive) disable, everything else keeps the default ON.
+#[test]
+fn prefix_cache_env_setting_parses_the_documented_opt_out() {
+    use super::metal_resident::prefix_cache_setting_enables;
+    assert!(prefix_cache_setting_enables(None));
+    assert!(prefix_cache_setting_enables(Some("1")));
+    assert!(prefix_cache_setting_enables(Some("true")));
+    assert!(prefix_cache_setting_enables(Some("yes")));
+    assert!(!prefix_cache_setting_enables(Some("0")));
+    assert!(!prefix_cache_setting_enables(Some("false")));
+    assert!(!prefix_cache_setting_enables(Some("FALSE")));
+}
+
 /// BOTH halves of the mirror must be lossless. An F16 resident cache round-trips
 /// through an F32/F16 CPU cache exactly, but `--kv-quant q8_0|q4_0` re-quantizes
 /// on the way in — so a quantized CPU KV must refuse regardless of what the GPU
