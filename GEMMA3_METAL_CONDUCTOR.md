@@ -411,3 +411,74 @@ bundle's single position-16 flip at 0.3416 nats); the new ≥512-token windowed 
 — any flip in it is individually adjudicated before the bundle lands rather than waved through
 under the envelope; and no undisclosed divergence of any size is acceptable. This pins the
 Phase 4 adjudication rule before any comparison runs (risk 8).
+
+---
+
+## 8. Phase 1 record (2026-07-29)
+
+Landed on this branch after rebasing onto origin/main @ bce31c2c (clean rebase; PR #553 merged
+the fail-closed CLI/resident guard with the shared `model::is_runnable_only_arch` predicate and
+the new `LlamaModelConfig.architecture` field — that PR IS amendment §7a-2's "Phase 1 must ADD a
+fail-closed disqualifier" deliverable, landed ahead of this branch, so Phase 1 here keeps and
+tests it rather than re-adding it).
+
+**Config metadata (gap row 17).** New `Gemma3Metadata` on `LlamaModelConfig` (`config.gemma3`,
+parsed in `from_gguf` for gemma3 only; src/model.rs): `sliding_window`,
+`sliding_window_pattern`, `rope_freq_base_global`, `rope_freq_base_local`,
+`layer_is_sliding` (schedule: layer i global iff (i+1) % pattern == 0 — NO forced-global final
+layer, unlike gemma4), `embed_scale` = sqrt(d_model), `ffn_geglu`, `rope_neox_pairing`, plus
+accessors `is_sliding_layer`/`rope_freq_base_at`/`layer_window` (window INCLUDES the current
+position, same convention as `Gemma4LayerPlan::window`). Phase 2 consumes this struct for the
+resident encodes.
+
+**Key-name verification finding (deviation from the section-3 sketch).** The real row
+(gemma-3-1b-it-Q8_0.gguf, 38 metadata keys dumped raw) carries ONLY two window/rope keys:
+`gemma3.attention.sliding_window = 512` (u32) and `gemma3.rope.freq_base = 1e6` (f32). There is
+NO sliding-window-pattern key and NO local-freq-base key in the file — no gemma3 conversion
+writes them; the reference implementations hardcode pattern 6 / local base 10000 (the same
+no-GGUF-key situation as smollm3's `no_rope_layer_step`). Resolution, honoring "no silent
+defaults" as far as the file format allows: the two keys that exist are REQUIRED (absent or
+malformed → typed parse error; a gemma3 GGUF without `attention.sliding_window` or
+`rope.freq_base` no longer loads anywhere, including the runnable lane, which shares
+`from_gguf`); pattern and local base are reference-pinned constants
+(`Gemma3Metadata::REFERENCE_SLIDING_WINDOW_PATTERN = 6`,
+`REFERENCE_LOCAL_ROPE_FREQ_BASE = 10000.0`) disclosed in the struct docs, with explicit
+override keys (`gemma3.attention.sliding_window_pattern` scalar,
+`gemma3.rope.freq_base_swa`) honored if present and hard-erroring if present-but-malformed —
+never a silent fallback over an explicit key. The runnable lane's hardcoded schedule
+(src/runnable/model.rs:607-626) is untouched; it remains the CPU reference.
+
+**Dense binder (gap rows 5/6/18).** gemma3 moved from unclassified to `expects_qk_norm`
+(alongside qwen3/command-r, with the key_length==value_length gate now arch-labeled), and a new
+`expects_post_norms` (gemma3-only) requirement binds `post_attention_norm`/`post_ffw_norm` —
+new `Option` fields on `LlamaLayerTensors`, shape-validated `[embedding_length]` as a
+must-be-paired set. All 26×4 = 104 norm tensors now bind non-None from the real file, and a
+gemma3 row missing ANY of the four fails closed at bind — mis-binding to `(None, None)` is
+impossible. `arch_uses_neox_rope_pairing` (and `LlamaModelConfig::rope_neox_pairing`) are
+deliberately UNCHANGED for gemma3 per the §7b lane decision: the resident lane forces
+split-half pairing host-side in Phase 2 from `Gemma3Metadata.rope_neox_pairing` (gemma4-encode
+precedent), leaving the guarded-off CPU dense path unperturbed.
+
+**Safety invariant (unchanged, now co-tested with binding).** `is_runnable_only_arch` still
+matches gemma3; the serve divert, the CLI direct-session guard, and the resident-eligibility
+arch disqualifier (src/inference.rs, PR #553) are untouched, and PR #553's
+`runnable_only_arch_disqualifies_the_resident_gpu_path` still passes. The new binding tests
+additionally assert the predicate fires AFTER a successful bind — tensors available, lanes
+unreachable. No serve routing, gemma2/qwen35, or Metal encode change (Phase 2/3 scope).
+
+**Parity gate tests** (tests/model_binding.rs; real-row test env-keyed on `CAMELID_GEMMA3_GGUF`
+per the `CAMELID_GEMMA4_GGUF` convention, run PASS against the real file):
+- `gemma3_real_row_binds_all_104_norm_tensors_and_window_schedule` — (a) 104/104 norms bind
+  with real shapes ([256] QK, [1152] sandwich), (b) window 512 / pattern 6 / globals at
+  5/11/17/23 / layer 25 local / local 10000 / global 1e6 round-trip, (c) GeGLU + sqrt(1152)
+  embed scale + pairing flags set, plus the guard-still-fires assertion.
+- `gemma3_binds_qk_and_sandwich_norms_with_window_metadata` (synthetic twin),
+  `gemma3_without_qk_norm_fails_closed`, `gemma3_without_sandwich_norms_fails_closed`,
+  `gemma3_without_sliding_window_key_fails_closed`,
+  `gemma3_explicit_pattern_and_local_base_keys_override_reference_constants`,
+  `gemma3_malformed_pattern_key_fails_closed`.
+- `model::gemma3_tests::one_b_schedule_globals_at_5_11_17_23_and_no_forced_global_final_layer`
+  (unit, schedule/accessor semantics).
+
+Gates: cargo fmt clean, clippy --all-targets -D warnings clean, cargo test --all-targets green
+(with the real-row test exercised via CAMELID_GEMMA3_GGUF), check-public-scrub.sh clean.

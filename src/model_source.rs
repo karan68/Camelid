@@ -129,6 +129,7 @@ impl HfLlamaConfigSummary {
             no_rope_layer_step: None,
             logit_scale: None,
             moe: None,
+            gemma3: None,
             gemma4: None,
             qwen35: None,
             mla: None,

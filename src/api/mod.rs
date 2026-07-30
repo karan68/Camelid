@@ -19923,7 +19923,9 @@ mod tests {
                     k_norm: None,
                 },
                 attention_output: desc("blk.0.attn_output.weight"),
+                post_attention_norm: None,
                 ffn_norm: desc("blk.0.ffn_norm.weight"),
+                post_ffw_norm: None,
                 ffn: LlamaFfnTensors::Dense {
                     gate: desc("blk.0.ffn_gate.weight"),
                     up: desc("blk.0.ffn_up.weight"),
@@ -20269,6 +20271,7 @@ mod tests {
             attention_key_length: None,
             logit_scale: None,
             moe: None,
+            gemma3: None,
             gemma4: None,
             qwen35: None,
             mla: None,
