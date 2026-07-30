@@ -66,6 +66,17 @@ cooperative streaming scheduler — see item 5.
 - Continuous batching applies only to streaming generation. Non-streaming
   work and management jobs remain exclusive, and run ahead of the streaming
   batch in post order rather than behind it.
+- Cooperative streaming jobs seed from the prompt-prefix cache exactly as the
+  run-to-completion job does — both call `stream_prompt_cache_prologue`. Note
+  that the cache itself is inoperative whenever the GPU-resident prefill drives
+  the prompt: `store_prompt_prefix_cache` requires `cpu_kv_authoritative()`,
+  and a resident prefill advances `kv_cache.position` while leaving the CPU
+  buffers empty, so a cloned-and-resumed session would reseed from zeros. The
+  cache therefore pays off on the CPU lane (and on any run with
+  `CAMELID_METAL_RESIDENT_DECODE=0`), not on the resident lane this PR makes
+  automatic. Measured on an Apple M4, 1974-token prompt, identical turns
+  repeated: 12.68s / 12.76s / 13.06s without the lookup, 12.98s / 0.49s / 0.47s
+  with it.
 - `/props.total_slots` continues to report `1`, matching the single aggregate
   slot `GET /slots` exposes and the `fail_on_no_slot` arbitration built on it.
   The cooperative capacity is reported natively as `continuous_batch_slots` on

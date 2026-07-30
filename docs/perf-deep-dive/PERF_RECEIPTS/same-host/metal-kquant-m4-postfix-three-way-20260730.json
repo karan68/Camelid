@@ -948,5 +948,28 @@
       "token_identity": "all three arms produced the same generated token IDs",
       "notes": "Samples for this scenario were captured in an earlier sitting than A and B, with heavier background load on the same host (main's prefill reads 44.5 s here vs 46.1 s in a later partial re-run). Arms within the scenario are still back-to-back and comparable; do not compare its absolute numbers against A or B."
     }
-  ]
+  ],
+  "streaming_prompt_cache_probe": {
+    "purpose": "The PR's cooperative streaming job never looked the prompt-prefix cache up (it only stored into it), and two slots is now the default, so every streaming request took that path. This probe isolates the effect.",
+    "method": "camelid serve --model Llama-3.2-1B-Instruct-Q8_0.gguf, then the SAME 1974-token chat completion posted three times with stream=true, max_tokens=1 so prefill dominates; wall time of the whole SSE response. CAMELID_METAL_RESIDENT_DECODE=0 because the prompt-prefix cache requires cpu_kv_authoritative(), which a GPU-resident prefill deliberately does not satisfy.",
+    "turn_wall_seconds": {
+      "main (slots=1, run-to-completion)": [
+        12.582042,
+        0.485037,
+        0.472609
+      ],
+      "pr-as-submitted (slots=2, cooperative)": [
+        12.682108,
+        12.75584,
+        13.060694
+      ],
+      "pr-plus-fixes (slots=2, cooperative)": [
+        12.982943,
+        0.48802,
+        0.470449
+      ]
+    },
+    "verdict": "As submitted, repeat turns re-prefilled the whole prompt every time (no speedup at all). With the shared prologue restored, repeat turns are ~26x faster and match the run-to-completion path. Regression test: api::tests::cooperative_stream_job_seeds_from_the_prompt_prefix_cache.",
+    "scope_note": "This probe runs on the CPU lane. On the GPU-resident lane that this PR makes automatic the prompt-prefix cache does not engage at all \u2014 before or after this PR \u2014 because a resident prefill leaves the CPU KV buffers empty. That is a pre-existing design boundary, not a regression, and it is now recorded in METAL_KQUANT_ROADMAP_RESULT.md."
+  }
 }

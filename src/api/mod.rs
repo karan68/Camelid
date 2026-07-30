@@ -19159,6 +19159,66 @@ mod tests {
         std::env::remove_var("CAMELID_X86_Q4K_DECODE");
     }
 
+    /// Both streaming jobs must seed from the prompt-prefix cache. The
+    /// cooperative one is the DEFAULT path now that
+    /// `DEFAULT_CONTINUOUS_BATCH_SLOTS` is 2, and it originally seeded straight
+    /// from `prepared.token_ids` while still storing into the cache — so every
+    /// turn of a growing chat re-prefilled the whole conversation. Measured on
+    /// an Apple M4 with a 1974-token prompt on the CPU lane: repeat turns went
+    /// 12.68s -> 12.76s -> 13.06s without the lookup and 12.98s -> 0.49s ->
+    /// 0.47s with it.
+    // Plain `#[test]`, not `#[tokio::test]`: the prologue emits its first delta
+    // with `blocking_send`, exactly as it does on the engine thread, and that
+    // panics if it runs on a thread driving a tokio runtime.
+    #[test]
+    fn cooperative_stream_job_seeds_from_the_prompt_prefix_cache() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let cached_next_token = step.next_token_id;
+        let warm = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&warm, &step);
+
+        // A second request for the identical prompt, sharing the same pool.
+        let cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let mut repeat = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], cold);
+        repeat.cached_prompt_prefix = Arc::clone(&warm.cached_prompt_prefix);
+
+        // The shared `test_tokenizer` has an empty vocabulary, so it cannot
+        // render the cached token. Give this request one that covers the tiny
+        // model's 3-token vocabulary.
+        repeat.tokenizer = Arc::new(tiny_vocab_tokenizer());
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+        let job = CooperativeStreamDecodeJob::new(repeat, events_tx).expect("job initializes");
+        assert!(
+            job.prepared.timings.prompt_cache_hit,
+            "the cooperative streaming job must consume the prompt-prefix cache, \
+             not re-prefill the prompt it already has"
+        );
+        assert_eq!(
+            job.generated,
+            vec![cached_next_token],
+            "an exact hit carries the already-sampled first token into the job"
+        );
+        assert_eq!(
+            job.input,
+            vec![cached_next_token],
+            "decode resumes from the cached token, not from the whole prompt"
+        );
+    }
+
     #[test]
     fn prompt_prefix_cache_reuses_exact_prompt_and_invalidates_key_changes() {
         let _env_guard = crate::test_support::env_lock();
@@ -21042,6 +21102,26 @@ mod tests {
                 ffn_down: orientation,
             },
         }
+    }
+
+    /// `test_tokenizer` with a vocabulary: three ordinary tokens covering
+    /// `tiny_config`'s `vocab_size`, so a sampled id can actually be decoded.
+    fn tiny_vocab_tokenizer() -> Tokenizer {
+        let mut tokenizer = test_tokenizer();
+        tokenizer.tokens = (0..3)
+            .map(|id| Token {
+                id,
+                text: format!("t{id}"),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            })
+            .collect();
+        tokenizer.token_to_id = tokenizer
+            .tokens
+            .iter()
+            .map(|t| (t.text.clone(), t.id))
+            .collect();
+        tokenizer
     }
 
     fn test_tokenizer() -> Tokenizer {
