@@ -2388,16 +2388,6 @@ pub async fn serve(
         .with_models_dir(models_dir)
         .with_serve_addr(addr)
         .with_server_policy(&policy);
-    if let Some(model_path) = initial_model {
-        if let Err(err) = load_model_from_path(&state, model_path, None, true).await {
-            tracing::error!(error=%err, "failed to load startup model");
-            eprintln!("\n  Could not load that model: {err}");
-            eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
-            eprintln!("      camelid pull            # list supported models");
-            eprintln!("      camelid pull <id>       # download one into ./models\n");
-            return Err(std::io::Error::other(err.to_string()));
-        }
-    }
     let workspace_cli_credential = if addr.ip().is_loopback() {
         match crate::workspace_auth::WorkspaceCliCredential::issue(addr) {
             Ok(credential) => Some(credential),
@@ -2447,16 +2437,10 @@ pub async fn serve(
             .collect(),
     );
 
-    // Warm the generation path BEFORE telling the user we're ready. The GPU resident
-    // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
-    // lazily on the first generation â€” a one-time cost of several seconds. If it lands
-    // on the user's first prompt the model looks "dog slow" (it's really the cold
-    // build, on the GPU the whole time). So: start serving in the background, fire one
-    // tiny self-request through the exact same code path to build the engine, BLOCK on
-    // it, and only then print "ready". After this the first real request is warm
-    // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
-    // to the old lazy build and is not fatal.
-    let warm_model_id = state.active_model_id.read().await.clone();
+    // The router owns `state`; the startup load below shares the same Arcs, so
+    // a model it loads is visible to every request the listener is already
+    // answering.
+    let startup_state = state.clone();
     let app = router_with_state_and_policy(state, policy.clone());
     let tls_enabled = policy.tls.is_some();
     let server = if let Some(tls) = &policy.tls {
@@ -2479,6 +2463,33 @@ pub async fn serve(
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
         tokio::spawn(async move { axum::serve(listener, app).await })
     };
+    // Load the startup model AFTER the listener is accepting, so /health and
+    // /api/capabilities answer throughout the load. The desktop supervisor
+    // kills the sidecar when its health poll goes unanswered for 40s, and a
+    // large startup model (auto-selected whenever the models dir is populated)
+    // used to keep the port closed for the entire load — a healthy engine
+    // looked dead exactly when it had the most work to do. Failure still exits
+    // `serve` with the same message and non-zero status as before.
+    if let Some(model_path) = initial_model {
+        if let Err(err) = load_model_from_path(&startup_state, model_path, None, true).await {
+            tracing::error!(error=%err, "failed to load startup model");
+            eprintln!("\n  Could not load that model: {err}");
+            eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
+            eprintln!("      camelid pull            # list supported models");
+            eprintln!("      camelid pull <id>       # download one into ./models\n");
+            return Err(std::io::Error::other(err.to_string()));
+        }
+    }
+    // Warm the generation path BEFORE telling the user we're ready. The GPU resident
+    // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
+    // lazily on the first generation â€” a one-time cost of several seconds. If it lands
+    // on the user's first prompt the model looks "dog slow" (it's really the cold
+    // build, on the GPU the whole time). So: start serving in the background, fire one
+    // tiny self-request through the exact same code path to build the engine, BLOCK on
+    // it, and only then print "ready". After this the first real request is warm
+    // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
+    // to the old lazy build and is not fatal.
+    let warm_model_id = startup_state.active_model_id.read().await.clone();
     if let Some(model_id) = warm_model_id {
         // Word the banner for the device that will actually serve â€” saying "GPU"
         // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
@@ -2606,7 +2617,30 @@ async fn telemetry_stream() -> Response {
         .into_response()
 }
 
+/// Upper bound on how long the liveness endpoints (`/health`, `/v1/health`,
+/// `/api/capabilities`) may wait on the shared model registries.
+///
+/// These endpoints gate external supervision — the desktop app kills the
+/// sidecar when a health poll goes unanswered for its 40s startup window — so
+/// a model load/unload mutating the registries must never make them
+/// unresponsive. The registry locks are fair: once a load's write is queued,
+/// new readers park behind it, so an unbounded `read().await` here inherits
+/// the full latency of whatever the writer is stuck on. On timeout the
+/// endpoints answer from lock-free state instead of parking.
+const LIVENESS_LOCK_BUDGET: Duration = Duration::from_millis(500);
+
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    match tokio::time::timeout(LIVENESS_LOCK_BUDGET, health_registry_snapshot(&state)).await {
+        Ok(response) => Json(response),
+        // A model transition is holding the registries: answer from lock-free
+        // state rather than queueing behind the writer. `ok` stays true — the
+        // process is alive and serving; the registry-derived fields report
+        // not-ready, which the next poll refreshes once the transition ends.
+        Err(_busy) => Json(busy_health_response(&state)),
+    }
+}
+
+async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     let active_id_lock = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
@@ -2645,7 +2679,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         .and_then(|id| execution_plans.get(id))
         .cloned();
     let slot = state.engine.slot_snapshot();
-    Json(HealthResponse {
+    HealthResponse {
         ok: true,
         engine: "camelid",
         loaded_now,
@@ -2664,7 +2698,35 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         engine_stalled_seconds: slot.stalled_seconds,
         executable: loopback_executable_path(state.serve_addr),
         listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
-    })
+    }
+}
+
+/// `/health` while a model transition holds the registries: every field that
+/// would need a registry lock reports the in-flux state as not-ready; the
+/// engine gauges, Q8 policy, and listener identity are lock-free and stay
+/// live. The process is alive and serving, so `ok` remains true.
+fn busy_health_response(state: &AppState) -> HealthResponse {
+    let slot = state.engine.slot_snapshot();
+    HealthResponse {
+        ok: true,
+        engine: "camelid",
+        loaded_now: false,
+        generation_ready: false,
+        active_model_id: None,
+        q8_runtime: q8_runtime_health(),
+        execution_plan: None,
+        backend: health_backend(false, false, false, false),
+        model_family: None,
+        gemma4_available: false,
+        engine_queue_depth: state.engine.depth(),
+        engine_queued_tasks: slot.queued_tasks,
+        engine_active_task_id: slot.active_task_id,
+        engine_active_generated_tokens: slot.completed_units,
+        engine_active_elapsed_seconds: slot.active_elapsed_seconds,
+        engine_stalled_seconds: slot.stalled_seconds,
+        executable: loopback_executable_path(state.serve_addr),
+        listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
+    }
 }
 
 /// Resolve the running binary's path for [`HealthResponse::executable`].
@@ -3842,12 +3904,21 @@ async fn set_gpu_runtime(Json(req): Json<GpuRuntimeRequest>) -> Json<GpuRuntimeS
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
-    let active_id_lock = state.active_model_id.read().await;
-    let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock
-        .as_ref()
-        .and_then(|id| execution_plans.get(id))
-        .cloned();
+    // Bounded like /health: capabilities is polled by supervisors while loads
+    // are in flight. Everything except the active execution plan is static, so
+    // a busy registry degrades to the static response with no plan instead of
+    // queueing behind the transition's writer.
+    let execution_plan = tokio::time::timeout(LIVENESS_LOCK_BUDGET, async {
+        let active_id_lock = state.active_model_id.read().await;
+        let execution_plans = state.execution_plans.read().await;
+        active_id_lock
+            .as_ref()
+            .and_then(|id| execution_plans.get(id))
+            .cloned()
+    })
+    .await
+    .ok()
+    .flatten();
     Json(capabilities_response_with_plan(execution_plan))
 }
 
@@ -8563,65 +8634,41 @@ async fn load_model_from_path_with_activation(
             }
         }
     }
-    let mut gguf = read_metadata(&path)?;
-    let outcome = plan_for_model(&path, &gguf, state.configured_threads);
+    // The load pipeline's heavy phases run on blocking threads, never inline on
+    // this async worker. Inline they pin a tokio worker for seconds on a large
+    // model (metadata read, tokenizer build, and a full-file receipt hash), and
+    // under CPU/memory contention that starves trivially cheap requests — the
+    // desktop's /v1/health poll goes unanswered and it kills a healthy engine
+    // at its 40s startup gate.
+    //
+    // Phase 1: GGUF metadata read + execution planning (file I/O + hardware
+    // probing). env_updates are applied between the phases, preserving the
+    // ordering the old inline pipeline had.
+    let metadata_path = path.clone();
+    let configured_threads = state.configured_threads;
+    let (gguf, outcome) = tokio::task::spawn_blocking(move || {
+        let gguf = read_metadata(&metadata_path)?;
+        let outcome = plan_for_model(&metadata_path, &gguf, configured_threads);
+        Ok::<_, BackendError>((gguf, outcome))
+    })
+    .await
+    .map_err(|join_error| {
+        BackendError::InvalidModelMetadata(format!("model metadata task panicked: {join_error}"))
+    })??;
     state.planner_env.apply(&outcome.env_updates);
     log_selected_execution_plan(&outcome.plan);
     let id = id
         .or_else(|| gguf.model_name().map(ToOwned::to_owned))
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "loaded-model".to_string());
-    let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
-    // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
-    // the split tensors the binder + forward path expect (no-op for already-split rows),
-    // so the fused layout becomes attemptable without touching the parity-gated path.
-    if let Ok(config) = &llama_config_result {
-        if let Err(err) = crate::model::expand_fused_dense_tensors(&mut gguf, config) {
-            eprintln!("[camelid] fused-tensor expansion skipped: {err}");
-        }
-    }
-    // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
-    // WHY it fails closed (architecture not implemented, missing/invalid metadata,
-    // DiffusionGemma redirect, â€¦) instead of silently sitting non-generative.
-    let unsupported_runtime = match &llama_config_result {
-        Err(
-            err @ (BackendError::UnsupportedModelArchitecture(_)
-            | BackendError::InvalidModelMetadata(_)
-            | BackendError::UnsupportedGguf(_)),
-        ) => Some(UnsupportedRuntimeSummary {
-            code: backend_error_code(err),
-            message: err.to_string(),
-        }),
-        _ => None,
-    };
-    let llama_config = llama_config_result.ok();
-    let llama_tensors = llama_config
-        .as_ref()
-        .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
-    let tokenizer_result = Tokenizer::from_gguf(&gguf);
-    let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
-    let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
-    // Hash the exact GGUF bytes once at load time so receipts can name the
-    // lane without re-hashing per request.
-    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
-        receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
-        other => BackendError::InvalidModelMetadata(other.to_string()),
-    })?;
-    let tokenizer_kind = tokenizer_runtime
-        .as_ref()
-        .map(|tokenizer| tokenizer.model.as_summary_model());
-    let lane = LaneIdentity::capture(&id, &path, &gguf, tokenizer_kind, gguf_sha256);
-    let loaded = LoadedModel {
-        id: id.clone(),
-        path,
-        gguf,
-        llama_config,
-        llama_tensors,
-        unsupported_runtime,
-        tokenizer,
-        tokenizer_runtime,
-        lane,
-    };
+    // Phase 2: config/tensor binding, tokenizer construction, and the
+    // multi-gigabyte lane hash.
+    let build_id = id.clone();
+    let loaded = tokio::task::spawn_blocking(move || build_loaded_model(path, build_id, gguf))
+        .await
+        .map_err(|join_error| {
+            BackendError::InvalidModelMetadata(format!("model load task panicked: {join_error}"))
+        })??;
 
     state
         .loaded_models
@@ -8667,6 +8714,68 @@ async fn load_model_from_path_with_activation(
     }
 
     Ok(loaded)
+}
+
+/// Blocking phase 2 of a model load: fused-tensor expansion, config + tensor
+/// binding, tokenizer construction, and the full-file lane hash. Pure CPU and
+/// file work — always entered via `spawn_blocking` from
+/// `load_model_from_path_with_activation`, never inline on an async worker.
+fn build_loaded_model(
+    path: PathBuf,
+    id: String,
+    mut gguf: GgufFile,
+) -> Result<LoadedModel, BackendError> {
+    let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
+    // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
+    // the split tensors the binder + forward path expect (no-op for already-split rows),
+    // so the fused layout becomes attemptable without touching the parity-gated path.
+    if let Ok(config) = &llama_config_result {
+        if let Err(err) = crate::model::expand_fused_dense_tensors(&mut gguf, config) {
+            eprintln!("[camelid] fused-tensor expansion skipped: {err}");
+        }
+    }
+    // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
+    // WHY it fails closed (architecture not implemented, missing/invalid metadata,
+    // DiffusionGemma redirect, â€¦) instead of silently sitting non-generative.
+    let unsupported_runtime = match &llama_config_result {
+        Err(
+            err @ (BackendError::UnsupportedModelArchitecture(_)
+            | BackendError::InvalidModelMetadata(_)
+            | BackendError::UnsupportedGguf(_)),
+        ) => Some(UnsupportedRuntimeSummary {
+            code: backend_error_code(err),
+            message: err.to_string(),
+        }),
+        _ => None,
+    };
+    let llama_config = llama_config_result.ok();
+    let llama_tensors = llama_config
+        .as_ref()
+        .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
+    let tokenizer_result = Tokenizer::from_gguf(&gguf);
+    let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
+    let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
+    // Hash the exact GGUF bytes once at load time so receipts can name the
+    // lane without re-hashing per request.
+    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
+        receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
+        other => BackendError::InvalidModelMetadata(other.to_string()),
+    })?;
+    let tokenizer_kind = tokenizer_runtime
+        .as_ref()
+        .map(|tokenizer| tokenizer.model.as_summary_model());
+    let lane = LaneIdentity::capture(&id, &path, &gguf, tokenizer_kind, gguf_sha256);
+    Ok(LoadedModel {
+        id,
+        path,
+        gguf,
+        llama_config,
+        llama_tensors,
+        unsupported_runtime,
+        tokenizer,
+        tokenizer_runtime,
+        lane,
+    })
 }
 
 /// Load (or reload) the gemma4 serve runtime for a model id. With
@@ -16086,6 +16195,54 @@ mod tests {
             "gemma4-runtime",
             "the eagerly loaded Gemma4 runtime has highest precedence"
         );
+    }
+
+    /// The liveness endpoints must answer while a model transition holds the
+    /// registry locks. The desktop supervisor kills the sidecar when its
+    /// health poll goes unanswered for 40s, and the registry RwLocks are
+    /// fair — a queued load writer parks every later reader — so an unbounded
+    /// `read().await` in these handlers inherits the whole transition's
+    /// latency. Regression for the desktop killing a healthy engine mid-load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_and_capabilities_answer_while_registry_writers_hold_the_locks() {
+        use tower::ServiceExt;
+
+        let state = AppState::default();
+        let app = router_with_state(state.clone());
+
+        // Wedge every registry lock the liveness endpoints read, the way a
+        // stuck load/unload would.
+        let _loaded = state.loaded_models.write().await;
+        let _active = state.active_model_id.write().await;
+        let _plans = state.execution_plans.write().await;
+
+        for uri in ["/health", "/v1/health", "/api/capabilities"] {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{uri} must answer while the registries are held"))
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["engine"], "camelid", "{uri}");
+            if uri != "/api/capabilities" {
+                assert_eq!(body["ok"], true, "{uri} must stay ok while busy");
+                assert_eq!(
+                    body["backend"], "none",
+                    "{uri} busy snapshot reports the in-flux registries as not ready"
+                );
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
