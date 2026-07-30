@@ -13054,6 +13054,17 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
     if prepared.constraint.is_some() {
         return;
     }
+    // Windowed-attention archs (gemma3): NEVER store a prefix entry. Any later
+    // partial hit would resume the cached session at `kv_position = k > 0` and
+    // re-prefill the divergent suffix on the CPU dense forward — which has no
+    // sliding-window mask and none of the arch's structure, so ordinary
+    // multi-turn chat would silently attend full-causal over the whole cached
+    // history (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1). Refused at the
+    // store site AND at both partial-resume sites (`resume_partial_prefix_hit`)
+    // so the bypass holds even against a stale pool.
+    if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return;
+    }
     // A GPU-resident prefill leaves the CPU KV buffers empty, which used to make
     // this bail out and so kept the prompt cache off the lane the CLI selects
     // automatically. `prepare_for_prompt_prefix_cache` mirrors the GPU history
@@ -13083,6 +13094,38 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
 
     if let Ok(mut pool) = prepared.cached_prompt_prefix.lock() {
         pool.insert(cached);
+    }
+}
+
+/// Resume a PARTIAL prompt-prefix-cache hit: roll the cached session back to
+/// the common prefix and hand the divergent suffix to the caller's prefill.
+/// Shared by the non-streaming handler and `stream_prompt_cache_prologue` so
+/// the two resume sites cannot drift.
+///
+/// Windowed-attention archs (gemma3) must never take this path: the suffix
+/// would be re-prefilled at `kv_position > 0`, which the resident prefill
+/// hook refuses, so the CPU dense forward — no sliding-window mask, none of
+/// the arch's structure — would evaluate it full-causal over the whole cached
+/// history (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1). Declining costs one
+/// cold full prefill: slower, never wrong. The store site refuses windowed
+/// entries too; this guard keeps the resume safe even against a stale pool.
+///
+/// A malformed/stale cache entry must never make generation fail: when
+/// rollback cannot establish the requested prefix position the caller retains
+/// the fresh session and performs a cold prefill.
+fn resume_partial_prefix_hit(
+    prepared: &mut PreparedGeneration,
+    mut cached_session: LlamaInferenceSession,
+    prefix_len: usize,
+    input: &mut Vec<u32>,
+) {
+    if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return;
+    }
+    if cached_session.rollback_to_position(prefix_len).is_ok() {
+        prepared.session = cached_session;
+        *input = prepared.token_ids[prefix_len..].to_vec();
+        prepared.timings.prompt_cache_hit = true;
     }
 }
 
@@ -13285,15 +13328,12 @@ fn generate_token_ids(
                     input.push(cached_next_token);
                 }
             } else {
-                let k = match_res.prefix_len;
-                // A malformed/stale cache entry must never make generation fail:
-                // retain the fresh session and perform a cold prefill if rollback
-                // cannot establish the requested prefix position.
-                if cached_session.rollback_to_position(k).is_ok() {
-                    prepared.session = cached_session;
-                    input = prepared.token_ids[k..].to_vec();
-                    prepared.timings.prompt_cache_hit = true;
-                }
+                resume_partial_prefix_hit(
+                    &mut prepared,
+                    cached_session,
+                    match_res.prefix_len,
+                    &mut input,
+                );
             }
         }
     }
@@ -14587,12 +14627,7 @@ fn stream_prompt_cache_prologue(
                     }
                 }
             } else {
-                let k = match_res.prefix_len;
-                if cached_session.rollback_to_position(k).is_ok() {
-                    prepared.session = cached_session;
-                    *input = prepared.token_ids[k..].to_vec();
-                    prepared.timings.prompt_cache_hit = true;
-                }
+                resume_partial_prefix_hit(prepared, cached_session, match_res.prefix_len, input);
             }
         }
     }
@@ -19598,6 +19633,190 @@ mod tests {
         );
     }
 
+    /// gemma3→Metal Phase 3a hazard H1, store site: a windowed-attention arch
+    /// must NEVER store a prompt-prefix entry. The fixture satisfies every
+    /// other store precondition (no constraint, kv position == prompt length,
+    /// CPU-authoritative session), so the ONLY thing that can refuse the store
+    /// is the windowed-arch bypass — proven by the control run, which strips
+    /// the window schedule from the identical fixture and stores fine.
+    #[test]
+    fn windowed_arch_never_stores_a_prompt_prefix_entry() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(session.kv_position(), 2, "store preconditions must hold");
+        let mut prepared = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert!(
+            lookup_prompt_prefix_cache(&prepared).is_none(),
+            "a windowed-attention arch must never populate the prompt-prefix cache"
+        );
+
+        // Control: the identical fixture minus the window schedule stores.
+        let mut control_session =
+            LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let control_step = control_session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut control = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], control_session);
+        store_prompt_prefix_cache(&mut control, &control_step);
+        assert!(
+            lookup_prompt_prefix_cache(&control).is_some(),
+            "the control fixture must store — otherwise this test is not \
+             exercising the windowed-arch bypass"
+        );
+    }
+
+    /// gemma3→Metal Phase 3a hazard H1, resume sites: a windowed-attention
+    /// arch must never take a PARTIAL prefix-cache resume. Drives
+    /// `resume_partial_prefix_hit` — the single decision point both the
+    /// non-streaming handler and `stream_prompt_cache_prologue` delegate to —
+    /// with a cached session that would resume cleanly, and requires the
+    /// request to keep its fresh session for a cold full prefill. The control
+    /// run proves the identical fixture resumes once the schedule is absent.
+    #[test]
+    fn windowed_arch_never_takes_a_partial_prefix_resume() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        // Cached session: the two-token prefix already evaluated.
+        let mut warm = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        warm.generate_next_token_with_history_diagnostics(
+            &[1, 2],
+            crate::inference::LlamaSampler::Greedy,
+            &[1, 2],
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(warm.kv_position(), 2);
+
+        // Fresh request: the same prefix plus a divergent suffix token.
+        let cold = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let mut prepared = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2, 1], cold);
+        let mut input = prepared.token_ids.clone();
+        resume_partial_prefix_hit(&mut prepared, warm, 2, &mut input);
+        assert!(
+            !prepared.timings.prompt_cache_hit,
+            "a windowed arch must not report a prompt-cache hit on a partial match"
+        );
+        assert_eq!(
+            input,
+            vec![1, 2, 1],
+            "the input must stay the FULL prompt: the caller performs a cold prefill"
+        );
+        assert_eq!(
+            prepared.session.kv_position(),
+            0,
+            "the fresh session must be retained, not swapped for the cached one"
+        );
+
+        // Control: identical shapes without the window schedule resume fine.
+        let mut control_warm = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        control_warm
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let control_cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let mut control = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 1], control_cold);
+        let mut control_input = control.token_ids.clone();
+        resume_partial_prefix_hit(&mut control, control_warm, 2, &mut control_input);
+        assert!(control.timings.prompt_cache_hit);
+        assert_eq!(
+            control_input,
+            vec![1],
+            "the control resumes from the suffix"
+        );
+        assert_eq!(control.session.kv_position(), 2);
+    }
+
+    /// gemma3→Metal Phase 3a hazard H1, streaming resume site end-to-end: even
+    /// against a STALE pool that already holds a windowed-arch entry (the store
+    /// site refuses to create one, so this is hand-inserted), a partial hit in
+    /// `stream_prompt_cache_prologue` must fall back to a cold full prefill.
+    // Plain `#[test]`, not `#[tokio::test]`: the prologue emits deltas with
+    // `blocking_send`, which panics on a thread driving a tokio runtime.
+    #[test]
+    fn stream_prologue_windowed_arch_partial_hit_falls_back_to_cold_prefill() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+        // The tiny two-token prefix must qualify as a partial hit (default
+        // admission floor is 16 tokens). Read live per lookup, not latched.
+        std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "2");
+
+        let mut warm_session =
+            LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let step = warm_session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let warm = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2], warm_session);
+        // Hand-insert the entry the store site rightly refuses to create.
+        warm.cached_prompt_prefix
+            .lock()
+            .unwrap()
+            .insert(CachedPromptPrefix {
+                model_id: warm.model_id.clone(),
+                model_path: warm.model_path.clone(),
+                token_ids: warm.token_ids.clone(),
+                sampling: warm.sampling.clone(),
+                session: warm.session.clone(),
+                logits: step.logits.clone(),
+                hidden_state: step.hidden_state.clone(),
+                output_norm_state: step.output_norm_state.clone(),
+            });
+
+        // A longer prompt sharing the pool: a partial hit (the shared
+        // `test_tokenizer` is fine here — the partial path never decodes).
+        let cold = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let mut repeat = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2, 1], cold);
+        repeat.cached_prompt_prefix = Arc::clone(&warm.cached_prompt_prefix);
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+        let job = CooperativeStreamDecodeJob::new(repeat, events_tx).expect("job initializes");
+        assert!(
+            !job.prepared.timings.prompt_cache_hit,
+            "the streaming prologue must not take a partial resume on a windowed arch"
+        );
+        assert_eq!(
+            job.input,
+            vec![1, 2, 1],
+            "decode must start from the FULL prompt (cold prefill), not the suffix"
+        );
+        assert!(job.generated.is_empty());
+        assert_eq!(job.prepared.session.kv_position(), 0);
+        std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+    }
+
     #[test]
     fn cached_prompt_prefix_followed_by_longer_completion_keeps_generating() {
         let config = tiny_config();
@@ -21394,6 +21613,27 @@ mod tests {
             qwen35: None,
             mla: None,
         }
+    }
+
+    /// `tiny_config` with a gemma3 sliding-window schedule attached: the
+    /// smallest config for which `arch_has_windowed_attention` is true. The
+    /// CPU dense forward runs it mechanically (structure-less — exactly the
+    /// hazard the windowed-arch cache bypasses exist to contain), which is all
+    /// the store/resume decision tests need.
+    fn tiny_gemma3_config() -> LlamaModelConfig {
+        let mut config = tiny_config();
+        config.architecture = "gemma3".to_string();
+        config.gemma3 = Some(crate::model::Gemma3Metadata {
+            sliding_window: 2,
+            sliding_window_pattern: 2,
+            rope_freq_base_global: 10_000.0,
+            rope_freq_base_local: 10_000.0,
+            layer_is_sliding: vec![true],
+            embed_scale: 2.0,
+            ffn_geglu: true,
+            rope_neox_pairing: true,
+        });
+        config
     }
 
     fn tiny_weights() -> LlamaLoadedWeights {

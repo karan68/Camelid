@@ -151,6 +151,23 @@ pub fn is_runnable_only_arch(architecture: &str) -> bool {
     matches!(architecture, "qwen35" | "gemma2" | "gemma3")
 }
 
+/// Whether this model's attention carries a per-layer sliding-window schedule
+/// (gemma3 today). Keyed on the PARSED metadata (`config.gemma3`), not the
+/// arch string, so a future windowed arch that binds the same schedule
+/// inherits every guard that consults this.
+///
+/// Why the guards exist (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1/H2): the
+/// CPU dense prefill lanes and the prompt-prefix-cache resume path have no
+/// sliding-window mask at all. A windowed arch must therefore never store a
+/// prompt-prefix-cache entry, never take a partial-hit resume (the divergent
+/// suffix would be re-prefilled at `kv_position > 0`, which the resident
+/// prefill hook refuses, landing it on the window-less CPU dense forward),
+/// and must prefill token-by-token through the single-token decode path — the
+/// only lane whose resident forward carries the schedule.
+pub fn arch_has_windowed_attention(config: &LlamaModelConfig) -> bool {
+    config.gemma3.is_some()
+}
+
 impl LlamaModelConfig {
     /// True when decoder layer `layer_idx` (0-based) applies RoPE to Q and K.
     ///
