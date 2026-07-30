@@ -43,7 +43,6 @@ struct MetalLinearKernel {
     #[allow(dead_code)] // batched-column verify GEMV; exercised by the C0 unit test,
     // consumed by the speculative-verify lane in a later checkpoint
     q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline: ComputePipelineState,
-    q8_0_block_ksplit_f32y_wire_gemm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
     quantize_q8k_rows_pipeline: ComputePipelineState,
@@ -5736,14 +5735,6 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                     &q8_0_block_ksplit_f32y_wire_nsg8_verify_function,
                 )
                 .ok()?;
-            let q8_0_block_ksplit_f32y_wire_gemm_function = library
-                .get_function("q8_0_block_linear_ksplit_f32y_wire_gemm", None)
-                .ok()?;
-            let q8_0_block_ksplit_f32y_wire_gemm_pipeline = device
-                .new_compute_pipeline_state_with_function(
-                    &q8_0_block_ksplit_f32y_wire_gemm_function,
-                )
-                .ok()?;
             let q8_0_block_wire_mm_function =
                 library.get_function("q8_0_block_wire_mm", None).ok()?;
             let q8_0_block_wire_mm_pipeline = device
@@ -5805,7 +5796,6 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 nvfp4_block_ksplit_f32y_wire_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline,
-                q8_0_block_ksplit_f32y_wire_gemm_pipeline,
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
                 quantize_q8k_rows_pipeline,
@@ -12034,6 +12024,7 @@ pub enum ResidentWeightFormat {
 }
 
 impl ResidentWeightFormat {
+    #[cfg(target_os = "macos")]
     fn values_per_block(self) -> usize {
         match self {
             Self::Q8_0 => 32,
@@ -12090,6 +12081,7 @@ impl ResidentWeightBytes<'_> {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn matches_shape(&self, input_width: usize, rows: usize) -> bool {
         let format = self.format();
         input_width.is_multiple_of(format.values_per_block())

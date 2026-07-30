@@ -15078,8 +15078,8 @@ fn stream_completion(
     // Post the decode job before returning the SSE response. A full queue is
     // the same typed backpressure non-streaming requests get.
     let task = if state.engine.continuous_batch_slots() > 1 {
-        let mut job = cooperative_stream_decode_task(prepared, events_tx);
-        engine::EngineTask::Cooperative(Box::new(move |context| job(context)))
+        let job = cooperative_stream_decode_task(prepared, events_tx);
+        engine::EngineTask::Cooperative(Box::new(job))
     } else {
         engine::EngineTask::Exclusive(Box::new(move || {
             run_stream_decode_job(prepared, events_tx);
