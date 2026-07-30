@@ -89,6 +89,22 @@ async function waitHealthy(url, attempts = 240) {
   throw new Error(`server at ${url} never became healthy`)
 }
 
+// Camelid opens its port before the startup model finishes loading (health
+// checks stay answerable during the load), so reachability alone does not mean
+// the model is served. Gate on the health payload's generation_ready instead.
+// llama-server keeps using waitHealthy: its /health 503s until the model is
+// ready, so res.ok already implies loaded there.
+async function waitGenerationReady(url, attempts = 240) {
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const res = await fetch(url)
+      if (res.ok && (await res.json()).generation_ready === true) return
+    } catch {}
+    await sleep(1000)
+  }
+  throw new Error(`server at ${url} never reported generation_ready`)
+}
+
 async function postJson(url, body) {
   const res = await fetch(url, {
     method: 'POST',
@@ -139,7 +155,7 @@ async function probeCamelid(port) {
   console.error(`[camelid] starting on :${port} ...`)
   const { child } = spawnProcess(camelidBin, ['serve', '--addr', `127.0.0.1:${port}`, '--model', modelPath], 'camelid')
   try {
-    await waitHealthy(`${base}/health`)
+    await waitGenerationReady(`${base}/health`)
     let version = 'camelid'
     try {
       const caps = await (await fetch(`${base}/api/capabilities`)).json()
