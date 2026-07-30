@@ -294,6 +294,17 @@ pub struct LlamaLayerWeights {
     /// Per-head RMSNorm weight for the K projection; bound in lockstep with
     /// [`Self::attention_q_norm`].
     pub attention_k_norm: Option<CpuTensor>,
+    /// gemma3 sandwich norms (`[embedding_length]`, F32): RMSNorm applied to
+    /// the attention block's output BEFORE its residual add
+    /// (`post_attention_norm`) and to the FFN block's output BEFORE its
+    /// residual add (`post_ffw_norm`). Loaded in lockstep from the gemma3
+    /// binder's descriptor pair (Phase 1); `None` for the Llama 2-norm
+    /// structure. Applied only by the Metal resident decode encodes (Phase 2
+    /// of the gemma3 Metal campaign) — the CPU dense forward does not apply
+    /// them, which is one reason gemma3 stays behind `is_runnable_only_arch`.
+    pub post_attention_norm: Option<CpuTensor>,
+    /// See [`Self::post_attention_norm`].
+    pub post_ffw_norm: Option<CpuTensor>,
     /// Qwen2/Qwen2.5 projection biases, applied before RoPE.
     pub attention_biases: Option<LlamaAttentionBiasWeights>,
     pub ffn_norm: CpuTensor,
@@ -1019,6 +1030,20 @@ impl LlamaLoadedWeights {
                     mla_kv_b_proj_opt = None;
                 }
 
+                // gemma3 sandwich norms: the binder produces the descriptor pair
+                // in lockstep (both present or a typed bind error), so loading
+                // them independently here cannot produce a half-loaded pair.
+                let post_attention_norm = layer
+                    .post_attention_norm
+                    .as_ref()
+                    .map(|desc| store.load_cpu_f32(&desc.name))
+                    .transpose()?;
+                let post_ffw_norm = layer
+                    .post_ffw_norm
+                    .as_ref()
+                    .map(|desc| store.load_cpu_f32(&desc.name))
+                    .transpose()?;
+
                 layers.push(LlamaLayerWeights {
                     attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
                     attention_q,
@@ -1027,6 +1052,8 @@ impl LlamaLoadedWeights {
                     attention_output,
                     attention_q_norm,
                     attention_k_norm,
+                    post_attention_norm,
+                    post_ffw_norm,
                     attention_biases,
                     mla_q_a_proj,
                     mla_q_a_layernorm,
@@ -1170,6 +1197,8 @@ impl LlamaLoadedWeights {
                     )?,
                     attention_q_norm: None,
                     attention_k_norm: None,
+                    post_attention_norm: None,
+                    post_ffw_norm: None,
                     attention_biases: None,
                     mla_q_a_proj,
                     mla_q_a_layernorm,

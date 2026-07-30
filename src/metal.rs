@@ -9781,6 +9781,7 @@ fn encode_ffn_block(
     out_buf: &Buffer,
     ffn_norm: &[f32],
     eps: f32,
+    post_ffw_norm: Option<&[f32]>,
     gate_w: &Buffer,
     up_w: &Buffer,
     down_w: &Buffer,
@@ -9878,15 +9879,41 @@ fn encode_ffn_block(
             hidden,
         );
     }
-    encode_binary(
-        e,
-        &k.residual_add_pipeline,
-        in_buf,
-        &down_buf,
-        out_buf,
-        &resid_n,
-        hidden,
-    );
+    // gemma3 sandwich norm: RMSNorm on the FFN output BEFORE the residual add
+    // (reference src/runnable/model.rs:875-877; gemma4-encode precedent
+    // encode_gemma4_ffn). No-op for Llama-family rows.
+    if let Some(pn) = post_ffw_norm {
+        let postnorm_w = nb((hidden * 4) as u64);
+        let post_scalar = nb(8);
+        let dn_buf = nb((hidden * 4) as u64);
+        write_buffer_f32(&postnorm_w, pn);
+        unsafe {
+            let p = post_scalar.contents() as *mut u8;
+            *(p as *mut u32) = hidden as u32;
+            *(p.add(4) as *mut f32) = eps;
+        }
+        encode_rms_norm_f32(e, k, &down_buf, &postnorm_w, &dn_buf, &post_scalar);
+        encode_binary(
+            e,
+            &k.residual_add_pipeline,
+            in_buf,
+            &dn_buf,
+            out_buf,
+            &resid_n,
+            hidden,
+        );
+        keep.extend([postnorm_w, post_scalar, dn_buf]);
+    } else {
+        encode_binary(
+            e,
+            &k.residual_add_pipeline,
+            in_buf,
+            &down_buf,
+            out_buf,
+            &resid_n,
+            hidden,
+        );
+    }
 
     keep.extend([
         norm_w_buf,
@@ -9927,6 +9954,7 @@ fn encode_attention_block(
     eps: f32,
     q_norm: Option<&[f32]>,
     k_norm: Option<&[f32]>,
+    post_attn_norm: Option<&[f32]>,
     q_w_buf: &Buffer,
     k_w_buf: &Buffer,
     v_w_buf: &Buffer,
@@ -10211,15 +10239,41 @@ fn encode_attention_block(
     if let Some(normf) = normf_attn {
         keep.push(normf);
     }
-    encode_binary(
-        e,
-        &k.residual_add_pipeline,
-        in_buf,
-        &o_buf,
-        out_buf,
-        &resid_n,
-        hidden,
-    );
+    // gemma3 sandwich norm: RMSNorm on the attention output BEFORE the residual
+    // add (reference src/runnable/model.rs:851-853; gemma4-encode precedent
+    // src/metal.rs encode_gemma4_attention). No-op for Llama-family rows.
+    if let Some(pn) = post_attn_norm {
+        let postnorm_w = f32b(hidden);
+        let post_scalar = nb(8);
+        let on_buf = f32b(hidden);
+        write_buffer_f32(&postnorm_w, pn);
+        unsafe {
+            let p = post_scalar.contents() as *mut u8;
+            *(p as *mut u32) = hidden as u32;
+            *(p.add(4) as *mut f32) = eps;
+        }
+        encode_rms_norm_f32(e, k, &o_buf, &postnorm_w, &on_buf, &post_scalar);
+        encode_binary(
+            e,
+            &k.residual_add_pipeline,
+            in_buf,
+            &on_buf,
+            out_buf,
+            &resid_n,
+            hidden,
+        );
+        keep.extend([postnorm_w, post_scalar, on_buf]);
+    } else {
+        encode_binary(
+            e,
+            &k.residual_add_pipeline,
+            in_buf,
+            &o_buf,
+            out_buf,
+            &resid_n,
+            hidden,
+        );
+    }
 
     keep.extend([
         norm_w_buf,
@@ -10352,7 +10406,7 @@ pub fn try_ffn_block_resident(
     let cb = k.queue.new_command_buffer();
     let e = cb.new_compute_command_encoder();
     encode_ffn_block(
-        e, k, &mut keep, &in_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
+        e, k, &mut keep, &in_buf, &out_buf, ffn_norm, eps, None, &gate_w, &up_w, &down_w, ffn_dim,
     );
     e.end_encoding();
     cb.commit();
@@ -10446,6 +10500,7 @@ pub fn try_attention_block_resident(
         &out_buf,
         attn_norm,
         eps,
+        None,
         None,
         None,
         &q_w,
@@ -10576,6 +10631,7 @@ pub fn try_decode_layer_resident(
         eps,
         None,
         None,
+        None,
         &q_w,
         &k_w,
         &v_w,
@@ -10595,7 +10651,7 @@ pub fn try_decode_layer_resident(
         split_half_pairing,
     );
     encode_ffn_block(
-        e, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
+        e, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, None, &gate_w, &up_w, &down_w, ffn_dim,
     );
     e.end_encoding();
     cb.commit();
@@ -10745,6 +10801,7 @@ pub fn try_decode_forward_resident(
             eps,
             None,
             None,
+            None,
             &w[0],
             &w[1],
             &w[2],
@@ -10771,6 +10828,7 @@ pub fn try_decode_forward_resident(
             out_buf,
             layer.ffn_norm,
             eps,
+            None,
             &w[4],
             &w[5],
             &w[6],
@@ -10799,9 +10857,18 @@ pub struct ResidentLayerWeights<'a> {
     pub attn_norm: &'a [f32],
     pub ffn_norm: &'a [f32],
     /// Per-head QK-norm weights (`[head_dim]`, F32), applied to Q/K after the
-    /// projection and before RoPE (Qwen3). `None` for plain Llama-family rows.
+    /// projection and before RoPE (Qwen3/gemma3). `None` for plain Llama-family
+    /// rows.
     pub q_norm: Option<&'a [f32]>,
     pub k_norm: Option<&'a [f32]>,
+    /// gemma3 sandwich norms (`[hidden]`, F32): RMSNorm applied to the
+    /// attention block's output BEFORE its residual add (`post_attention_norm`)
+    /// and to the FFN block's output BEFORE its residual add (`post_ffw_norm`).
+    /// Reference semantics: src/runnable/model.rs:851-853, :875-877. `None` for
+    /// the Llama 2-norm structure. The batched prefill and speculative-verify
+    /// paths do not apply them and fail closed when they are present.
+    pub post_attn_norm: Option<&'a [f32]>,
+    pub post_ffw_norm: Option<&'a [f32]>,
     pub q_weight_blocks: ResidentWeightBytes<'a>,
     pub k_weight_blocks: ResidentWeightBytes<'a>,
     pub v_weight_blocks: ResidentWeightBytes<'a>,
@@ -11531,6 +11598,7 @@ impl ResidentDecodeState {
                 self.eps,
                 layer.q_norm,
                 layer.k_norm,
+                layer.post_attn_norm,
                 &w[0],
                 &w[1],
                 &w[2],
@@ -11561,6 +11629,7 @@ impl ResidentDecodeState {
                 out_buf,
                 layer.ffn_norm,
                 self.eps,
+                layer.post_ffw_norm,
                 &w[4],
                 &w[5],
                 &w[6],
@@ -11729,6 +11798,16 @@ impl ResidentDecodeState {
             || embeddings.len() != n_tokens * self.hidden
             || self.filled != 0
             || !self.ensure_capacity(n_tokens)
+        {
+            return None;
+        }
+        // gemma3 sandwich norms are wired into the decode encodes only
+        // (encode_attention_block / encode_ffn_block); this batched prefill does
+        // not apply them, so it must fail closed rather than run an incomplete
+        // forward. (gemma3 additionally never reaches here: head_dim 256 > 128.)
+        if layers
+            .iter()
+            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some())
         {
             return None;
         }
@@ -12841,6 +12920,17 @@ impl ResidentDecodeState {
         }
         if !self.head_dim.is_multiple_of(32) || self.head_dim > 128 {
             return None; // v2 / split-K attention precondition
+        }
+        // gemma3 sandwich norms are wired into the decode encodes only; the
+        // batched verify layouts do not apply them (and hardcode
+        // kv_base_offset=0), so fail closed rather than verify with an
+        // incomplete forward. (gemma3 additionally never reaches here:
+        // head_dim 256 > 128 — this is the belt-and-braces gate.)
+        if layers
+            .iter()
+            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some())
+        {
+            return None;
         }
         if base_position != self.filled() {
             return None;
@@ -19233,6 +19323,8 @@ mod tests {
                 down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
                 q_norm: None,
                 k_norm: None,
+                post_attn_norm: None,
+                post_ffw_norm: None,
             })
             .collect();
 
@@ -19559,6 +19651,8 @@ mod tests {
                     ffn_norm: &d.ffn_norm,
                     q_norm: with_qk_norm.then_some(d.q_norm.as_slice()),
                     k_norm: with_qk_norm.then_some(d.k_norm.as_slice()),
+                    post_attn_norm: None,
+                    post_ffw_norm: None,
                     q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
                     k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
                     v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
@@ -19694,6 +19788,293 @@ mod tests {
         }
     }
 
+    // gemma3→Metal Phase 2b: the resident decode applies the gemma3 sandwich
+    // norms — RMSNorm on the attention output BEFORE its residual add
+    // (post_attention_norm) and on the FFN output BEFORE its residual add
+    // (post_ffw_norm), reference src/runnable/model.rs:851-853/:875-877 — at
+    // the gemma3-1B geometry, alongside the QK-norm. Pure-CPU independent
+    // reference over 3 tokens, plus a non-vacuity guard (dropping the sandwich
+    // norms must change the output at every token, including t=0: the
+    // post-attention norm rescales the value path itself).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_gemma3_sandwich_norms_decode_selfparity() {
+        if !detect_metal_device().available {
+            return;
+        }
+        if f32y_gemv_enabled() {
+            eprintln!(
+                "SKIP metal_resident_gemma3_sandwich_norms_decode_selfparity: \
+                 CAMELID_METAL_F32Y latched on earlier in this process; the CPU reference \
+                 mirrors the quantize path"
+            );
+            return;
+        }
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let tokens = 3usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    post_attn_norm: (0..hidden)
+                        .map(|i| 0.9 + ((i + li) as f32 % 3.0) * 0.03)
+                        .collect(),
+                    post_ffw_norm: (0..hidden)
+                        .map(|i| 0.95 + ((i + li) as f32 % 6.0) * 0.02)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let mk_views = |with_post_norms: bool| -> Vec<ResidentLayerWeights<'_>> {
+            data.iter()
+                .map(|d| ResidentLayerWeights {
+                    attn_norm: &d.attn_norm,
+                    ffn_norm: &d.ffn_norm,
+                    q_norm: Some(&d.q_norm),
+                    k_norm: Some(&d.k_norm),
+                    post_attn_norm: with_post_norms.then_some(d.post_attn_norm.as_slice()),
+                    post_ffw_norm: with_post_norms.then_some(d.post_ffw_norm.as_slice()),
+                    q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                    k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                    v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                    o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                    gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                    up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                    down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                })
+                .collect()
+        };
+        let weights = mk_views(true);
+        let weights_no_post = mk_views(false);
+
+        let mut session = ResidentDecodeState::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+        )
+        .unwrap();
+        let mut session_no_post = ResidentDecodeState::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+        )
+        .unwrap();
+
+        let mut ref_k: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut ref_v: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+
+        for t in 0..tokens {
+            let emb: Vec<f32> = (0..hidden)
+                .map(|i| (((i + t) as f32 % 11.0) - 5.0) * 0.2)
+                .collect();
+            let cos_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).cos())
+                .collect();
+            let sin_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).sin())
+                .collect();
+
+            // CPU reference token step with the sandwich norms.
+            let mut x = emb.clone();
+            for (li, d) in data.iter().enumerate() {
+                let xn = cpu_ref_rms_norm(&x, &d.attn_norm, eps);
+                let mut q = cpu_ref_q8_matvec(&xn, &d.q, q_dim);
+                let mut kx = cpu_ref_q8_matvec(&xn, &d.k, kv_dim);
+                let v = cpu_ref_q8_matvec(&xn, &d.v, kv_dim);
+                cpu_ref_rms_norm_per_head(&mut q, n_heads, head_dim, &d.q_norm, eps);
+                cpu_ref_rms_norm_per_head(&mut kx, n_kv, head_dim, &d.k_norm, eps);
+                cpu_ref_rope_split_half(&mut q, n_heads, head_dim, &cos_t, &sin_t);
+                cpu_ref_rope_split_half(&mut kx, n_kv, head_dim, &cos_t, &sin_t);
+                ref_k[li].extend_from_slice(&kx);
+                ref_v[li].extend_from_slice(&v);
+                let ctx = cpu_ref_attention(
+                    &q,
+                    &ref_k[li],
+                    &ref_v[li],
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    t + 1,
+                    0,
+                    t + 1,
+                    scale,
+                );
+                let o = cpu_ref_q8_matvec(&ctx, &d.o, hidden);
+                let on = cpu_ref_rms_norm(&o, &d.post_attn_norm, eps);
+                for (h, ov) in x.iter_mut().zip(&on) {
+                    *h += *ov;
+                }
+                let xn2 = cpu_ref_rms_norm(&x, &d.ffn_norm, eps);
+                let g = cpu_ref_q8_matvec(&xn2, &d.gate, ffn);
+                let u = cpu_ref_q8_matvec(&xn2, &d.up, ffn);
+                let act: Vec<f32> = g
+                    .iter()
+                    .zip(&u)
+                    .map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv)
+                    .collect();
+                let dn = cpu_ref_q8_matvec(&act, &d.down, hidden);
+                let dnn = cpu_ref_rms_norm(&dn, &d.post_ffw_norm, eps);
+                for (h, dv) in x.iter_mut().zip(&dnn) {
+                    *h += *dv;
+                }
+            }
+
+            let got = match session
+                .forward_token(
+                    &emb, &weights, &cos_t, &sin_t, t, scale, None, None, 0, None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            assert_eq!(got.len(), hidden);
+            let mut max_diff = 0.0f32;
+            for (a, b) in got.iter().zip(&x) {
+                max_diff = max_diff.max((a - b).abs());
+                assert!((a - b).abs() < 3.0e-3, "token {t}: {a} != {b}");
+            }
+            eprintln!("[2b-selfparity] token {t}: max |gpu-cpu| = {max_diff:.2e}");
+
+            // Non-vacuity: dropping BOTH sandwich norms must change the output
+            // materially at every token (the post-attention norm rescales the
+            // value path itself, so this holds at t=0 too).
+            let got_no_post = match session_no_post
+                .forward_token(
+                    &emb,
+                    &weights_no_post,
+                    &cos_t,
+                    &sin_t,
+                    t,
+                    scale,
+                    None,
+                    None,
+                    0,
+                    None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            let delta = got
+                .iter()
+                .zip(&got_no_post)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                delta > 0.05,
+                "token {t}: sandwich norms had no material effect (max delta {delta}); the \
+                 wiring is not engaging"
+            );
+        }
+    }
+
+    // gemma3→Metal Phase 2b: the batched prefill and speculative-verify paths
+    // do not APPLY the sandwich norms, so they must fail closed when a layer
+    // carries them (the decode path is the only sanctioned lane).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_post_norm_layers_fail_closed_on_prefill() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let hidden = 64usize;
+        let head_dim = 32usize;
+        let ffn = 64usize;
+        let bpr_hidden = hidden / 32;
+        let q_dim = 2 * head_dim;
+        let attn_norm: Vec<f32> = vec![1.0; hidden];
+        let ffn_norm: Vec<f32> = vec![1.0; hidden];
+        let post: Vec<f32> = vec![1.0; hidden];
+        let q = mk_w36(q_dim, bpr_hidden, 1);
+        let kv = mk_w36(head_dim, bpr_hidden, 2);
+        let v = mk_w36(head_dim, bpr_hidden, 3);
+        let o = mk_w36(hidden, q_dim / 32, 4);
+        let gate = mk_w36(ffn, bpr_hidden, 5);
+        let up = mk_w36(ffn, bpr_hidden, 6);
+        let down = mk_w36(hidden, ffn / 32, 7);
+        let layer = ResidentLayerWeights {
+            attn_norm: &attn_norm,
+            ffn_norm: &ffn_norm,
+            q_norm: None,
+            k_norm: None,
+            post_attn_norm: Some(&post),
+            post_ffw_norm: Some(&post),
+            q_weight_blocks: ResidentWeightBytes::Blocks36(&q),
+            k_weight_blocks: ResidentWeightBytes::Blocks36(&kv),
+            v_weight_blocks: ResidentWeightBytes::Blocks36(&v),
+            o_weight_blocks: ResidentWeightBytes::Blocks36(&o),
+            gate_weight_blocks: ResidentWeightBytes::Blocks36(&gate),
+            up_weight_blocks: ResidentWeightBytes::Blocks36(&up),
+            down_weight_blocks: ResidentWeightBytes::Blocks36(&down),
+        };
+        let mut session =
+            ResidentDecodeState::new(1, 2, 1, head_dim, hidden, ffn, 8, 8, 1.0e-6, true).unwrap();
+        let embeddings = vec![0.1f32; 2 * hidden];
+        let cos_all = vec![0.5f32; 2 * (head_dim / 2)];
+        let sin_all = vec![0.5f32; 2 * (head_dim / 2)];
+        // The layer carries sandwich norms -> batched prefill must decline
+        // regardless of every other precondition.
+        assert!(
+            session
+                .prefill_tokens(
+                    &embeddings,
+                    2,
+                    std::slice::from_ref(&layer),
+                    &cos_all,
+                    &sin_all,
+                    1.0
+                )
+                .is_none(),
+            "batched prefill must fail closed for sandwich-norm layers"
+        );
+    }
+
     /// WIN2METAL Phase 3 C2/C3 gate. `verify_batch` over `k` rows at positions
     /// `[base, base+k)` must be BIT-IDENTICAL — exact u32 `to_bits`, not epsilon — to `k`
     /// independent `forward_token` decodes seeded with the same KV history. The straddle
@@ -19810,6 +20191,8 @@ mod tests {
                 down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
                 q_norm: None,
                 k_norm: None,
+                post_attn_norm: None,
+                post_ffw_norm: None,
             })
             .collect();
         // Output projection + final norm (the LogitsStage).
@@ -20082,6 +20465,8 @@ mod tests {
                 down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
                 q_norm: None,
                 k_norm: None,
+                post_attn_norm: None,
+                post_ffw_norm: None,
             })
             .collect();
         let final_norm: Vec<f32> = (0..hidden)

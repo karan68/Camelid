@@ -20317,6 +20317,8 @@ mod tests {
                 ffn_down: select_rows("blk.0.ffn_down.weight", hidden, ffn, &[0, 1, 2, 3]),
                 attention_q_norm: None,
                 attention_k_norm: None,
+                post_attention_norm: None,
+                post_ffw_norm: None,
                 moe_router: None,
                 mla_q_a_proj: None,
                 mla_q_a_layernorm: None,

@@ -1066,6 +1066,8 @@ fn tiny_weights() -> LlamaLoadedWeights {
             attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
+            post_attention_norm: None,
+            post_ffw_norm: None,
             moe_router: None,
             mla_q_a_proj: None,
             mla_q_a_layernorm: None,
