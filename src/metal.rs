@@ -10066,7 +10066,8 @@ fn encode_attention_block(
         );
         None
     };
-    // Qwen3 QK-norm: per-head RMSNorm on Q/K after the projection and BEFORE RoPE.
+    // Qwen3/gemma3 QK-norm: per-head RMSNorm on Q/K after the projection and BEFORE
+    // RoPE (both archs share the order; reference src/runnable/model.rs:804-812).
     // In-place is safe — the per-head kernel reduces the sum-of-squares via
     // threadgroup memory before the (per-index) write. No-op for Llama rows.
     if let (Some(qn), Some(kn)) = (q_norm, k_norm) {
@@ -19327,6 +19328,368 @@ mod tests {
             assert_eq!(got.len(), hidden);
             for (a, b) in got.iter().zip(&expected) {
                 assert!((a - b).abs() < 1.0e-4, "token {t}: {a} != {b}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // gemma3→Metal Phase 2 self-parity scaffolding: a pure-CPU emulation of the
+    // resident decode op chain on its NON-f32y path (rms_norm → Q8_0 activation
+    // quantize → integer-dot GEMV → …). The activation quantization uses the
+    // same per-block formula as the GPU quantize kernels
+    // (`crate::inference::quantize_q8_0_blocks`), so the remaining CPU/GPU
+    // delta is f32 reduction order only. Weights are the 36-byte CPU Q8_0
+    // blocks the sibling tests build with `mkw`-style generators. Tests using
+    // this reference SKIP when the f32y GEMV OnceLock latched on earlier in the
+    // process (the reference mirrors the quantize path).
+    #[cfg(target_os = "macos")]
+    fn cpu_ref_q8_matvec(x: &[f32], w36: &[u8], rows: usize) -> Vec<f32> {
+        use crate::inference::quantize_q8_0_blocks;
+        let bpr = x.len() / 32;
+        assert_eq!(w36.len(), rows * bpr * 36, "weight byte length");
+        let xq = quantize_q8_0_blocks(x);
+        (0..rows)
+            .map(|r| {
+                let mut acc = 0.0f32;
+                for (b, xb) in xq.iter().enumerate() {
+                    let base = (r * bpr + b) * 36;
+                    let ws = f32::from_le_bytes(w36[base..base + 4].try_into().unwrap());
+                    let mut int = 0i32;
+                    for (l, &qv) in xb.quants.iter().enumerate() {
+                        int += w36[base + 4 + l] as i8 as i32 * qv as i32;
+                    }
+                    acc += ws * xb.scale * int as f32;
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// RMSNorm — same formula as the GPU kernel and the runnable reference.
+    #[cfg(target_os = "macos")]
+    fn cpu_ref_rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+        let ss: f32 = x.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / x.len() as f32 + eps).sqrt();
+        x.iter().zip(w).map(|(v, wv)| v * inv * wv).collect()
+    }
+
+    /// Per-head RMSNorm over contiguous `head_dim` slices (QK-norm), in place.
+    #[cfg(target_os = "macos")]
+    fn cpu_ref_rms_norm_per_head(
+        vec: &mut [f32],
+        n_heads: usize,
+        head_dim: usize,
+        w: &[f32],
+        eps: f32,
+    ) {
+        for h in 0..n_heads {
+            let s = &mut vec[h * head_dim..(h + 1) * head_dim];
+            let ss: f32 = s.iter().map(|v| v * v).sum();
+            let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+            for (x, wv) in s.iter_mut().zip(w) {
+                *x = *x * inv * *wv;
+            }
+        }
+    }
+
+    /// Split-half (NEOX) RoPE in place — pair `(i, i + half)` per head.
+    #[cfg(target_os = "macos")]
+    fn cpu_ref_rope_split_half(
+        vec: &mut [f32],
+        n_heads: usize,
+        head_dim: usize,
+        cos_t: &[f32],
+        sin_t: &[f32],
+    ) {
+        let half = cos_t.len();
+        for h in 0..n_heads {
+            let base = h * head_dim;
+            for i in 0..half {
+                let (a, b) = (base + i, base + i + half);
+                let (x0, x1) = (vec[a], vec[b]);
+                vec[a] = x0 * cos_t[i] - x1 * sin_t[i];
+                vec[b] = x0 * sin_t[i] + x1 * cos_t[i];
+            }
+        }
+    }
+
+    /// Softmax attention for ONE query row over a `[kv_head][total][head_dim]`
+    /// cache, restricted to the contiguous position range `[lo, lo + count)`.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_ref_attention(
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        total: usize,
+        lo: usize,
+        count: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let group = n_heads / n_kv_heads;
+        let kv_head_stride = total * head_dim;
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let kvh = h / group;
+            let q = &query[h * head_dim..(h + 1) * head_dim];
+            let mut scores = vec![0.0f32; count];
+            let mut m = f32::NEG_INFINITY;
+            for (i, s) in scores.iter_mut().enumerate() {
+                let p = lo + i;
+                let krow = &keys[kvh * kv_head_stride + p * head_dim..][..head_dim];
+                *s = scale * q.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>();
+                m = m.max(*s);
+            }
+            let mut den = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - m).exp();
+                den += *s;
+            }
+            let o = &mut out[h * head_dim..(h + 1) * head_dim];
+            for (i, &sc) in scores.iter().enumerate() {
+                let p = lo + i;
+                let vrow = &values[kvh * kv_head_stride + p * head_dim..][..head_dim];
+                let w = sc / den;
+                for d in 0..head_dim {
+                    o[d] += w * vrow[d];
+                }
+            }
+        }
+        out
+    }
+
+    /// 36-byte Q8_0 CPU-block weight generator shared by the Phase 2 tests
+    /// (same value pattern as the sibling `mkw` closures).
+    #[cfg(target_os = "macos")]
+    fn mk_w36(rows: usize, bpr: usize, seed: usize) -> Vec<u8> {
+        let mut w: Vec<u8> = Vec::with_capacity(rows * bpr * 36);
+        for r in 0..rows {
+            for b in 0..bpr {
+                let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                w.extend_from_slice(&s.to_le_bytes());
+                for l in 0..32 {
+                    w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                }
+            }
+        }
+        w
+    }
+
+    // gemma3→Metal Phase 2a: the generic resident decode applies per-head
+    // QK-norm at the gemma3-1B geometry (hidden 1152, 4 Q heads / 1 KV head,
+    // head_dim 256, split-half RoPE pairing) — the qwen3 wiring (d56f7da2)
+    // admits the gemma3 shape unchanged. Pure-CPU independent reference over 3
+    // tokens (so the KV cache carries real history), plus a non-vacuity guard:
+    // dropping the QK-norm weights must change the output materially.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_gemma3_qk_norm_decode_selfparity() {
+        if !detect_metal_device().available {
+            return;
+        }
+        if f32y_gemv_enabled() {
+            eprintln!(
+                "SKIP metal_resident_gemma3_qk_norm_decode_selfparity: CAMELID_METAL_F32Y \
+                 latched on earlier in this process; the CPU reference mirrors the quantize path"
+            );
+            return;
+        }
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let tokens = 3usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let mk_views = |with_qk_norm: bool| -> Vec<ResidentLayerWeights<'_>> {
+            data.iter()
+                .map(|d| ResidentLayerWeights {
+                    attn_norm: &d.attn_norm,
+                    ffn_norm: &d.ffn_norm,
+                    q_norm: with_qk_norm.then_some(d.q_norm.as_slice()),
+                    k_norm: with_qk_norm.then_some(d.k_norm.as_slice()),
+                    q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                    k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                    v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                    o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                    gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                    up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                    down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                })
+                .collect()
+        };
+        let weights = mk_views(true);
+        let weights_no_norm = mk_views(false);
+
+        let mut session = ResidentDecodeState::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps,
+            true, // gemma3 forces split-half (NEOX) pairing host-side
+        )
+        .unwrap();
+        let mut session_no_norm = ResidentDecodeState::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+        )
+        .unwrap();
+
+        // Reference caches: per layer, [kv_head=1][pos][head_dim] grown per token.
+        let mut ref_k: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut ref_v: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+
+        for t in 0..tokens {
+            let emb: Vec<f32> = (0..hidden)
+                .map(|i| (((i + t) as f32 % 11.0) - 5.0) * 0.2)
+                .collect();
+            let cos_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).cos())
+                .collect();
+            let sin_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).sin())
+                .collect();
+
+            // CPU reference token step.
+            let mut x = emb.clone();
+            for (li, d) in data.iter().enumerate() {
+                let xn = cpu_ref_rms_norm(&x, &d.attn_norm, eps);
+                let mut q = cpu_ref_q8_matvec(&xn, &d.q, q_dim);
+                let mut kx = cpu_ref_q8_matvec(&xn, &d.k, kv_dim);
+                let v = cpu_ref_q8_matvec(&xn, &d.v, kv_dim);
+                cpu_ref_rms_norm_per_head(&mut q, n_heads, head_dim, &d.q_norm, eps);
+                cpu_ref_rms_norm_per_head(&mut kx, n_kv, head_dim, &d.k_norm, eps);
+                cpu_ref_rope_split_half(&mut q, n_heads, head_dim, &cos_t, &sin_t);
+                cpu_ref_rope_split_half(&mut kx, n_kv, head_dim, &cos_t, &sin_t);
+                ref_k[li].extend_from_slice(&kx);
+                ref_v[li].extend_from_slice(&v);
+                let ctx = cpu_ref_attention(
+                    &q,
+                    &ref_k[li],
+                    &ref_v[li],
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    t + 1,
+                    0,
+                    t + 1,
+                    scale,
+                );
+                let o = cpu_ref_q8_matvec(&ctx, &d.o, hidden);
+                for (h, ov) in x.iter_mut().zip(&o) {
+                    *h += *ov;
+                }
+                let xn2 = cpu_ref_rms_norm(&x, &d.ffn_norm, eps);
+                let g = cpu_ref_q8_matvec(&xn2, &d.gate, ffn);
+                let u = cpu_ref_q8_matvec(&xn2, &d.up, ffn);
+                let act: Vec<f32> = g
+                    .iter()
+                    .zip(&u)
+                    .map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv)
+                    .collect();
+                let dn = cpu_ref_q8_matvec(&act, &d.down, hidden);
+                for (h, dv) in x.iter_mut().zip(&dn) {
+                    *h += *dv;
+                }
+            }
+
+            let got = match session
+                .forward_token(
+                    &emb, &weights, &cos_t, &sin_t, t, scale, None, None, 0, None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            assert_eq!(got.len(), hidden);
+            let mut max_diff = 0.0f32;
+            for (a, b) in got.iter().zip(&x) {
+                max_diff = max_diff.max((a - b).abs());
+                assert!((a - b).abs() < 3.0e-3, "token {t}: {a} != {b}");
+            }
+            eprintln!("[2a-selfparity] token {t}: max |gpu-cpu| = {max_diff:.2e}");
+
+            // Non-vacuity: the same decode WITHOUT QK-norm must differ materially,
+            // proving the norm actually engaged on the GPU path.
+            let got_no_norm = match session_no_norm
+                .forward_token(
+                    &emb,
+                    &weights_no_norm,
+                    &cos_t,
+                    &sin_t,
+                    t,
+                    scale,
+                    None,
+                    None,
+                    0,
+                    None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            let delta = got
+                .iter()
+                .zip(&got_no_norm)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // At t=0 the softmax runs over a single position, so QK-norm cannot
+            // affect the output (scores are irrelevant); from t>=1 it must.
+            if t >= 1 {
+                assert!(
+                    delta > 0.05,
+                    "token {t}: QK-norm had no material effect (max delta {delta}); the \
+                     wiring is not engaging"
+                );
             }
         }
     }

@@ -2743,9 +2743,11 @@ impl LlamaInferenceSession {
         if want_logits && self.config.logit_scale.is_some() {
             bail!("logit_scale is not supported in the GPU logit kernel yet");
         }
-        // QK-norm (Qwen3) is applied in the resident path (decode:
-        // encode_attention_block, prefill: prefill_tokens) via the per-head
-        // RMSNorm kernel, so it no longer disqualifies the resident path.
+        // QK-norm (Qwen3, and gemma3 since Phase 2a of the gemma3 Metal campaign)
+        // is applied in the resident path (decode: encode_attention_block,
+        // prefill: prefill_tokens) via the per-head RMSNorm kernel, so it no
+        // longer disqualifies the resident path. (gemma3 itself remains behind
+        // the arch disqualifier above until its full correctness encodes land.)
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
             || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
             || diagnostic_ffn_gate_up_order()? != FfnGateUpOrder::GateUp
