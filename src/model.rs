@@ -77,9 +77,10 @@ pub struct LlamaModelConfig {
     /// layer cadence, the dual RoPE bases, and the structural forward-pass facts
     /// (GeGLU, sqrt(d_model) embed scale, forced split-half RoPE pairing) that a
     /// Llama-shaped config cannot express. Parsed fail-closed — see
-    /// [`Gemma3Metadata::from_gguf`]. Carried for the GPU-resident lane (Phase 2
-    /// of the gemma3 Metal campaign); parsing it makes NO lane reachable —
-    /// gemma3 stays behind [`is_runnable_only_arch`].
+    /// [`Gemma3Metadata::from_gguf`]. Consumed by the Metal-resident lane
+    /// (Phase 2/3b of the gemma3 Metal campaign) and by
+    /// [`arch_has_windowed_attention`], which keys every windowed-arch guard
+    /// (prefix-cache bypass, single-token prefill, the CPU dense fail-closed).
     pub gemma3: Option<Gemma3Metadata>,
     /// Gemma 4 (`general.architecture = "gemma4"`) specific metadata. `None` for
     /// every other architecture. Holds the per-layer-type attention dims, dual
@@ -135,20 +136,57 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 }
 
 /// Architectures whose ONLY correct forward pass lives in the runnable lane
-/// (`crate::runnable`), because the optimized dense forward cannot run them
-/// correctly. gemma3: since Phase 1 of the Metal campaign the dense binder
-/// binds all four extra norms name-pinned and fail-closed — and the dense
-/// forward would apply the QK pair — but it still does not APPLY the bound
-/// sandwich norms and has no GeGLU, no dual-theta RoPE (local/global
-/// schedule), and no sliding-window mask. gemma2: the binder still silently
-/// drops its sandwich norms, and the dense forward lacks its soft-caps and
-/// alternating-attention schedule. qwen35: the hybrid gated-delta-net layers
-/// do not fit the dense tensor map at all. `camelid serve` routes these archs
-/// to the runnable serve bridge (`api::is_runnable_serve_arch` delegates
-/// here); every OTHER lane that would construct a direct dense session for
-/// them must fail closed instead of decoding fluent-looking garbage.
+/// (`crate::runnable`), on EVERY host, because no optimized lane can run them
+/// correctly. gemma2: the binder still silently drops its sandwich norms, and
+/// the dense forward lacks its soft-caps and alternating-attention schedule.
+/// qwen35: the hybrid gated-delta-net layers do not fit the dense tensor map
+/// at all. Every lane that would construct a direct dense session for these
+/// archs must fail closed instead of decoding fluent-looking garbage.
+///
+/// gemma3 LEFT this set in Phase 3b of the Metal campaign: the Metal-resident
+/// forward carries its full structure (QK + sandwich norms, GeGLU, dual-theta
+/// RoPE, sliding-window mask — Phase 2, real-row parity §9b/§10b), so on a
+/// host where that lane can serve, gemma3 chat runs dense/resident. Routing
+/// for gemma3 is therefore CAPABILITY-AWARE — see
+/// [`arch_requires_runnable_bridge`], the predicate serve and the CLI direct
+/// lanes now key on. The CPU dense forward remains WRONG for gemma3 (no
+/// window mask; hazard H4) and fails closed at forward dispatch.
 pub fn is_runnable_only_arch(architecture: &str) -> bool {
-    matches!(architecture, "qwen35" | "gemma2" | "gemma3")
+    matches!(architecture, "qwen35" | "gemma2")
+}
+
+/// Capability-aware serve/direct-session routing predicate (gemma3→Metal
+/// Phase 3b): true when this arch, ON THIS HOST, must be served through the
+/// runnable bridge because no optimized lane can run it correctly here.
+///
+/// - qwen35 / gemma2: always true ([`is_runnable_only_arch`]).
+/// - gemma3: true only where the Metal-resident lane cannot serve it
+///   (non-macOS hosts, `CAMELID_METAL_RESIDENT_DECODE=0` / deterministic
+///   mode, no Metal device, or a CUDA-resident process — the CUDA engine has
+///   no windowed forward). On a resident-capable host gemma3 routes to the
+///   dense/resident path and this returns false.
+///
+/// The fallback is the runnable bridge, NEVER the CPU dense forward: the CPU
+/// dense forward has no sliding-window mask and fails closed for windowed
+/// archs at forward dispatch (hazard H4), so a routing mistake surfaces as a
+/// typed error instead of fluent-looking full-causal garbage.
+pub fn arch_requires_runnable_bridge(architecture: &str) -> bool {
+    arch_requires_runnable_bridge_given(
+        architecture,
+        crate::inference::windowed_arch_resident_host_available(),
+    )
+}
+
+/// Pure decision half of [`arch_requires_runnable_bridge`], split so the
+/// capability split is unit-testable without touching process env or a Metal
+/// device: `windowed_resident_host_available` is the host-capability probe
+/// result ([`crate::inference::windowed_arch_resident_host_available`]).
+pub fn arch_requires_runnable_bridge_given(
+    architecture: &str,
+    windowed_resident_host_available: bool,
+) -> bool {
+    is_runnable_only_arch(architecture)
+        || (architecture == "gemma3" && !windowed_resident_host_available)
 }
 
 /// Whether this model's attention carries a per-layer sliding-window schedule
@@ -821,10 +859,11 @@ mod gemma4_tests {
 ///   one, and a malformed value for either is a hard error, never a silent
 ///   fallback.
 ///
-/// This struct only records parsed values for the GPU-resident lane (Phase 2 of
-/// the gemma3 Metal campaign). Nothing here makes an optimized lane reachable:
-/// gemma3 remains fail-closed behind [`is_runnable_only_arch`] and the
-/// resident-eligibility arch gate until that lane's correctness encodes land.
+/// This struct records the parsed values the Metal-resident lane consumes.
+/// Since Phase 3b of the gemma3 Metal campaign that lane is REACHABLE on a
+/// resident-capable host (Q8_0 exact row only, hazard H5); everywhere else
+/// gemma3 serves via the runnable bridge ([`arch_requires_runnable_bridge`])
+/// and the CPU dense forward stays fail-closed (hazard H4).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Gemma3Metadata {
     /// Local attention window in positions — GGUF `attention.sliding_window`
@@ -1336,9 +1375,9 @@ impl LlamaTensorBinding {
         // (which silently bound `(None, None)` and dropped all 104 of the 1B's
         // norm tensors — the mis-binding disclosed by the serve router's
         // fail-closed divert) to EXPECTED in Phase 1 of the gemma3 Metal
-        // campaign: binding the tensors makes them AVAILABLE to the resident
-        // lane, while `is_runnable_only_arch` keeps every optimized forward
-        // fail-closed for gemma3 until that lane's correctness encodes land.
+        // campaign; since Phase 3b the Metal-resident forward APPLIES them on
+        // resident-capable hosts, while the CPU dense forward stays fail-closed
+        // for windowed archs (hazard H4).
         let architecture = gguf.architecture().unwrap_or_default();
         let expects_qk_norm = matches!(architecture, "qwen3" | "command-r" | "gemma3");
         let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
@@ -2535,29 +2574,59 @@ mod tests {
     }
 
     #[test]
-    fn runnable_only_arch_set_is_exactly_the_serve_bridge_set() {
-        // Must stay in lockstep with the serve router's runnable bridge
-        // (`api::is_runnable_serve_arch` delegates here): these archs have no
-        // correct dense forward — gemma3's norms bind (Phase 1) but the dense
-        // forward does not apply the sandwich norms and has no GeGLU,
-        // dual-theta RoPE, or window mask; gemma2's sandwich norms are still
-        // dropped at bind; and qwen35's hybrid layers do not fit the dense
-        // tensor map — so every direct dense-session lane fails closed for
-        // them instead of decoding fluent-looking garbage.
-        for arch in ["qwen35", "gemma2", "gemma3"] {
+    fn runnable_only_arch_set_is_exactly_the_unconditional_bridge_set() {
+        // These archs have no correct optimized forward on ANY host: gemma2's
+        // sandwich norms are still dropped at bind, and qwen35's hybrid layers
+        // do not fit the dense tensor map — so every direct dense-session lane
+        // fails closed for them instead of decoding fluent-looking garbage.
+        // gemma3 left this set in Phase 3b of the Metal campaign (its routing
+        // is capability-aware — pinned by the split test below).
+        for arch in ["qwen35", "gemma2"] {
             assert!(
                 super::is_runnable_only_arch(arch),
                 "{arch} must be classified runnable-lane-only"
             );
         }
         for arch in [
-            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma4", "phi3", "lfm2", "",
+            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "lfm2", "",
         ] {
             assert!(
                 !super::is_runnable_only_arch(arch),
                 "{arch:?} must not be classified runnable-lane-only"
             );
         }
+    }
+
+    #[test]
+    fn runnable_bridge_predicate_splits_gemma3_by_host_capability() {
+        // gemma3→Metal Phase 3b: the serve router and the CLI direct-session
+        // guard key on `arch_requires_runnable_bridge`. The split under test:
+        // gemma3 rides the dense/resident lane ONLY where the Metal-resident
+        // host capability holds, and falls back to the runnable bridge —
+        // never the CPU dense forward — everywhere else. qwen35/gemma2 are
+        // bridge-only regardless of capability; dense archs never bridge.
+        for capable in [false, true] {
+            for arch in ["qwen35", "gemma2"] {
+                assert!(
+                    super::arch_requires_runnable_bridge_given(arch, capable),
+                    "{arch} must require the runnable bridge on every host"
+                );
+            }
+            for arch in ["llama", "mistral", "qwen2", "qwen3", "gemma4", "phi3", ""] {
+                assert!(
+                    !super::arch_requires_runnable_bridge_given(arch, capable),
+                    "{arch:?} must never require the runnable bridge"
+                );
+            }
+        }
+        assert!(
+            super::arch_requires_runnable_bridge_given("gemma3", false),
+            "gemma3 must fall back to the runnable bridge where the resident lane cannot serve"
+        );
+        assert!(
+            !super::arch_requires_runnable_bridge_given("gemma3", true),
+            "gemma3 must route to the dense/resident lane on a resident-capable host"
+        );
     }
 
     #[test]

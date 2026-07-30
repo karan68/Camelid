@@ -333,7 +333,27 @@ pub fn plan_for_model_with_platform(
         fallback_path,
     ) = if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
-            select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+            select_macos_q8_plan(
+                &profile,
+                &platform,
+                is_windowed_attention_arch(gguf),
+                &mut env_updates,
+                &mut reasons,
+            )
+        } else if is_windowed_attention_arch(gguf) {
+            // gemma3 (windowed attention): the ONLY validated dense lane is the
+            // Metal-resident forward — the CPU dense paths (x86 repack included)
+            // have no sliding-window mask and fail closed at forward dispatch
+            // (hazard H4). On non-Metal hosts `camelid serve` routes gemma3
+            // chat through the runnable bridge; the plan must not advertise a
+            // CPU dense lane it can never run.
+            reasons.push(
+                "windowed-attention row (gemma3): the only validated dense lane is Metal-resident; \
+                 no CPU dense plan exists for this arch — serve chats via the runnable bridge on \
+                 this host; failing closed to safe path"
+                    .into(),
+            );
+            safe_q8_plan()
         } else if platform.architecture == "x86_64"
             && (platform.operating_system == "linux" || platform.operating_system == "windows")
         {
@@ -415,6 +435,7 @@ pub fn plan_for_model_with_platform(
 fn select_macos_q8_plan(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,
+    windowed_attention_arch: bool,
     env_updates: &mut BTreeMap<&'static str, Option<&'static str>>,
     reasons: &mut Vec<String>,
 ) -> (
@@ -463,6 +484,23 @@ fn select_macos_q8_plan(
             "q8_0_metal_resident_decode",
             "retained_q8_reference_path",
         );
+    }
+
+    // gemma3 (windowed attention): every plan below this point is a CPU dense
+    // lane, which has no sliding-window mask and fails closed at forward
+    // dispatch for this arch (hazard H4). When the Metal-resident selection
+    // above did not fire (resident decode not armed, no Metal device, or the
+    // CAMELID_MAC_Q8_METAL_PLAN opt-out), serve routes gemma3 chat through the
+    // runnable bridge — advertise the safe fail-closed plan, not a CPU repack
+    // lane the arch can never run.
+    if windowed_attention_arch {
+        reasons.push(
+            "windowed-attention row (gemma3) without an active Metal-resident selection: no CPU \
+             dense plan exists for this arch — serve chats via the runnable bridge; failing \
+             closed to safe path"
+                .into(),
+        );
+        return safe_q8_plan();
     }
 
     let dotprod = has_feature(&platform.cpu_features, "dotprod");
@@ -860,6 +898,14 @@ fn cuda_resident_q8_runnable_plan() -> (
 /// (expert routing) and not-yet-resident archs (gemma/phi/ssm/qwen35) are excluded so we
 /// never route a model the resident dense kernel cannot run under a GPU label. The
 /// runtime `resident_decode_eligible` check + the parity self-check are the backstops.
+///
+/// gemma3 stays EXCLUDED here even though its Metal-resident lane shipped (Phase 3b):
+/// both consumers of this predicate are non-Q8-exact tiers that hazard H5 forbids for
+/// windowed archs — the Q8 GPU-runnable tier is CUDA-resident (the CUDA engine has no
+/// sliding-window/dual-theta forward), and the K-quant plan selection would advertise a
+/// Metal-resident K-quant lane whose gather drops the gemma3 embed scale and has no
+/// windowed parity receipt. gemma3's dense lane is selected via its curated exact row
+/// (`is_supported_exact_q8_row` → the macOS Metal-resident Q8 plan) instead.
 fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
     let arch = gguf.architecture().unwrap_or("");
     if !matches!(arch, "llama" | "qwen2" | "qwen3" | "mistral") {
@@ -1056,6 +1102,15 @@ fn recognized_row_level(row: &str) -> &'static str {
         // label claimed 512/1024/2048 context packs and matched MoE/base/other
         // sizes — neither validated for qwen3.)
         "supported_exact_row_smoke_chatml"
+    } else if normalized.contains("gemma_3_1b_it") {
+        // gemma-3-1b-it Q8_0 (gemma3→Metal Phase 3b): the Metal-resident lane
+        // carries the full windowed forward, token-identical to the runnable
+        // oracle at depths 1/5/50 under the <512-token Phase 2/3a gates
+        // (GEMMA3_METAL_CONDUCTOR.md §9b/§10b/§10d). The ≥512-token windowed
+        // receipt is Phase 4; this level string stays sub-512 until it lands.
+        // Non-Q8_0 quants of the same name report unknown via `support_level`
+        // and are declined by the resident admission (hazard H5).
+        "supported_exact_row_smoke_sub512"
     } else if normalized.contains("mixtral_8x7b_instruct_v0_1") {
         "bounded_runtime_only_unsupported"
     } else {
@@ -1070,7 +1125,16 @@ fn is_supported_exact_q8_row(row: &str) -> bool {
             | "supported_exact_row_smoke_512_1024_2048_4096_8192"
             | "supported_exact_row_smoke_512_1024_2048"
             | "supported_exact_row_smoke_chatml"
+            | "supported_exact_row_smoke_sub512"
     )
+}
+
+/// Plan-level mirror of `crate::model::arch_has_windowed_attention`, keyed on
+/// the GGUF arch string because the planner works pre-config-parse. gemma3 is
+/// the only windowed arch today; a future one must be added in lockstep with
+/// the parsed-metadata predicate.
+fn is_windowed_attention_arch(gguf: &GgufFile) -> bool {
+    gguf.architecture() == Some("gemma3")
 }
 
 fn model_family(row: &str, gguf: &GgufFile) -> String {
@@ -1599,6 +1663,118 @@ mod tests {
         );
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
         clear_profile_env();
+    }
+
+    /// `fixture` with the arch overridden to gemma3 (windowed attention).
+    fn gemma3_fixture(name: &str) -> GgufFile {
+        let mut gguf = fixture(name);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("gemma3".into()),
+        );
+        gguf
+    }
+
+    #[test]
+    fn gemma3_q8_row_selects_metal_resident_plan_on_a_resident_mac() {
+        // gemma3→Metal Phase 3b: the curated gemma-3-1b-it Q8_0 row must reach
+        // the Metal-resident Q8 plan on a resident-capable macOS host — this
+        // selection was absent from the historical checklist and is
+        // load-bearing (§3 Phase 3).
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/models/gemma-3-1b-it-Q8_0.gguf"),
+            &gemma3_fixture("gemma-3-1b-it"),
+            Some(8),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        clear_profile_env();
+        assert_eq!(outcome.plan.selected_backend, "metal_resident_q8_runtime");
+        assert_eq!(outcome.plan.decode_path, "q8_0_metal_resident_decode");
+        assert_eq!(
+            outcome.plan.support_level,
+            "supported_exact_row_smoke_sub512"
+        );
+    }
+
+    #[test]
+    fn gemma3_q8_row_fails_closed_to_safe_plan_where_metal_resident_cannot_run() {
+        // The windowed arch has NO CPU dense plan (hazard H4): off-macOS hosts
+        // and macOS-without-resident-selection must fail closed to the safe
+        // labels — serve chats via the runnable bridge there — and must never
+        // advertise the x86 repack / Mac CPU repack lanes.
+        let _guard = env_lock();
+        clear_profile_env();
+        let linux = plan_for_model_with_platform(
+            &PathBuf::from("/models/gemma-3-1b-it-Q8_0.gguf"),
+            &gemma3_fixture("gemma-3-1b-it"),
+            Some(8),
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(linux.plan.selected_backend, "cpu_reference");
+        assert_eq!(linux.plan.decode_path, "safe_cpu_decode");
+        // Recognition is not support: the row is still recognized on the
+        // fallback host (support_level reflects the curated Q8_0 evidence).
+        assert_eq!(linux.plan.support_level, "supported_exact_row_smoke_sub512");
+
+        // macOS with the resident decode gate unset: the Metal selection in
+        // select_macos_q8_plan cannot fire, and the CPU repack lanes must not
+        // be advertised for a windowed arch.
+        env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        let mac_no_resident = plan_for_model_with_platform(
+            &PathBuf::from("/models/gemma-3-1b-it-Q8_0.gguf"),
+            &gemma3_fixture("gemma-3-1b-it"),
+            Some(8),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        clear_profile_env();
+        assert_eq!(mac_no_resident.plan.selected_backend, "cpu_reference");
+        assert_eq!(mac_no_resident.plan.decode_path, "safe_cpu_decode");
+    }
+
+    #[test]
+    fn gemma3_kquant_never_takes_the_metal_resident_kquant_plan() {
+        // Hazard H5: a gemma3 Q4_K_M must not be advertised onto the Metal
+        // resident K-quant lane (no windowed K-quant receipt; the gather drops
+        // the embed scale). With every Metal K-quant gate armed, the plan must
+        // still fall back to the CPU block-dot labels because
+        // `is_gpu_runnable_arch` excludes gemma3.
+        let _guard = env_lock();
+        clear_profile_env();
+        for key in [
+            "CAMELID_METAL_RESIDENT_DECODE",
+            "CAMELID_METAL_KQUANT",
+            "CAMELID_METAL_F32Y",
+            "CAMELID_METAL_WIRE",
+        ] {
+            env::set_var(key, "1");
+        }
+        let mut gguf = gemma3_fixture("gemma-3-1b-it");
+        gguf.tensors = vec![GgufTensorDescriptor {
+            name: "blk.0.attn_q.weight".into(),
+            dimensions: vec![256, 256],
+            tensor_type: GgufTensorType::Q4K,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 144,
+        }];
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/models/gemma-3-1b-it-Q4_K_M.gguf"),
+            &gguf,
+            Some(8),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        clear_profile_env();
+        assert_ne!(
+            outcome.plan.selected_backend, "metal_resident_kquant_runtime",
+            "H5: a windowed arch must never be advertised onto the Metal K-quant lane"
+        );
+        assert_eq!(
+            outcome.plan.support_level, "unknown_or_unvalidated",
+            "a non-Q8_0 gemma3 must not echo the curated Q8_0 row's level"
+        );
     }
 
     #[test]

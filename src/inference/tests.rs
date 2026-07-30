@@ -1636,38 +1636,60 @@ fn nope_config_disqualifies_the_resident_gpu_path() {
     );
 }
 
-/// gemma3/gemma2 must never reach the resident GPU engines. gemma3's four
-/// extra norms now BIND name-pinned (campaign Phase 1) — and the dense forward
-/// would apply the QK pair — but the forward (resident or CPU dense) still
-/// does not apply the sandwich norms and has no GeGLU, dual-theta RoPE, or
-/// sliding-window mask; gemma2's sandwich norms are still silently dropped at
-/// bind. Either way the resident lane would decode fluent-looking garbage
-/// under a supported label. TEMPORARY until the gemma3 Metal campaign
-/// (feat/gemma3-metal-resident) lands its resident encode in Phase 3 — this
-/// test then flips alongside the disqualifier's removal.
+/// gemma2 must never reach the resident GPU engines: its sandwich norms are
+/// still silently dropped at bind, so the lane would decode fluent-looking
+/// garbage under a supported label. Like the NoPE test above, the arch check
+/// sits before the backend-enabled gate in `resident_decode_eligible`, so the
+/// assertion is causal on a CPU-only host too.
 ///
-/// Like the NoPE test above, the arch check sits before the backend-enabled
-/// gate in `resident_decode_eligible`, so the assertion is causal on a
-/// CPU-only host too.
+/// gemma3 left the arch disqualifier in Phase 3b of the Metal campaign (the
+/// resident encode carries its full structure). Its remaining resident-
+/// eligibility pins are asserted here too: a windowed session over non-Q8_0
+/// weights must be refused — by the H5 Q8_0-exact-row pin / weight admission
+/// when a resident backend is armed, and by the backend-enabled gate when
+/// none is (either way, never admitted). The positive admission is proven by
+/// the env-keyed real-row gates in `src/metal.rs`.
 #[test]
-fn runnable_only_arch_disqualifies_the_resident_gpu_path() {
+fn arch_disqualifiers_refuse_the_resident_gpu_path() {
     let (mut session, _temp) = tiny_kv_budget_session(64);
 
-    for arch in ["gemma3", "gemma2"] {
-        session.config.architecture = arch.to_string();
-        assert!(
-            !session
-                .resident_decode_eligible(false)
-                .expect("eligibility check should not error"),
-            "a {arch} config must be refused by the resident GPU gate"
-        );
-        assert!(
-            !session
-                .resident_decode_eligible(true)
-                .expect("eligibility check should not error"),
-            "a {arch} config must be refused for the want-logits path too"
-        );
-    }
+    session.config.architecture = "gemma2".to_string();
+    assert!(
+        !session
+            .resident_decode_eligible(false)
+            .expect("eligibility check should not error"),
+        "a gemma2 config must be refused by the resident GPU gate"
+    );
+    assert!(
+        !session
+            .resident_decode_eligible(true)
+            .expect("eligibility check should not error"),
+        "a gemma2 config must be refused for the want-logits path too"
+    );
+
+    session.config.architecture = "gemma3".to_string();
+    session.config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 2,
+        sliding_window_pattern: 2,
+        rope_freq_base_global: 10_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 2.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    assert!(
+        !session
+            .resident_decode_eligible(false)
+            .expect("eligibility check should not error"),
+        "a windowed gemma3 session over non-Q8_0 weights must be refused"
+    );
+    assert!(
+        !session
+            .resident_decode_eligible(true)
+            .expect("eligibility check should not error"),
+        "a windowed gemma3 session over non-Q8_0 weights must be refused (want-logits too)"
+    );
 }
 
 /// End-to-end proof that the KV predict-and-abort budget guard fires through the

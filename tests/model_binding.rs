@@ -1018,8 +1018,10 @@ fn qwen3_explicit_head_dim_binds_wide_q_projection() {
 // serve router's fail-closed divert. The binder must now carry all four and
 // fail closed when any is missing, and `LlamaModelConfig::from_gguf` must
 // parse the window/rope schedule metadata fail-closed (no silent defaults for
-// required keys). Binding the tensors makes NO lane reachable: gemma3 stays
-// runnable-lane-only until the resident encodes land (campaign Phase 3).
+// required keys). Since the campaign's Phase 3b flip, the Metal-resident lane
+// consumes these tensors on resident-capable hosts; everywhere else gemma3
+// still routes to the runnable bridge (capability-aware predicate) and the
+// CPU dense forward fails closed at forward dispatch (hazard H4).
 // ---------------------------------------------------------------------------
 
 struct Gemma3FixtureOptions {
@@ -1217,11 +1219,17 @@ fn gemma3_binds_qk_and_sandwich_norms_with_window_metadata() {
     // the metadata flag above).
     assert!(!config.rope_neox_pairing);
 
-    // CRITICAL invariant: successful binding makes the tensors AVAILABLE, not
-    // the lanes reachable — gemma3 must still classify runnable-lane-only so
-    // the serve router divert, the CLI direct-session guard, and the
-    // resident-eligibility arch gate all keep failing closed.
-    assert!(is_runnable_only_arch(&config.architecture));
+    // CRITICAL invariant, updated for the Phase 3b flip: gemma3 is no longer
+    // UNCONDITIONALLY runnable-only (on a resident-capable host the Metal
+    // lane serves it), but on every host where the resident lane cannot serve
+    // it must still classify for the runnable bridge — never the CPU dense
+    // forward, whose forward dispatch fails closed for windowed archs (H4).
+    assert!(!is_runnable_only_arch(&config.architecture));
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        false
+    ));
+    assert!(camelid::model::arch_has_windowed_attention(&config));
 }
 
 #[test]
@@ -1669,10 +1677,16 @@ fn gemma3_real_row_binds_all_104_norm_tensors_and_window_schedule() {
     assert!(meta.rope_neox_pairing);
     assert!(!config.rope_neox_pairing);
 
-    // CRITICAL invariant: binding succeeded, yet gemma3 must still classify
-    // runnable-lane-only — the serve divert, the CLI direct-session guard, and
-    // the resident-eligibility arch gate all key on this predicate (or its
-    // architecture string) and must keep failing closed until the campaign's
-    // Phase 3 removes the disqualifier with the resident encodes in hand.
-    assert!(is_runnable_only_arch(&config.architecture));
+    // CRITICAL invariant, updated for the Phase 3b flip: binding succeeded
+    // and the resident encodes are in hand, so gemma3 left the unconditional
+    // runnable-only set — but the routing stays capability-aware: on a host
+    // where the Metal-resident lane cannot serve, the runnable bridge is
+    // still the only correct serve path, and the CPU dense forward fails
+    // closed at forward dispatch (H4) via `arch_has_windowed_attention`.
+    assert!(!is_runnable_only_arch(&config.architecture));
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        false
+    ));
+    assert!(camelid::model::arch_has_windowed_attention(&config));
 }

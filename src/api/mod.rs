@@ -6459,11 +6459,19 @@ mod gemma4_template_tests {
     #[test]
     fn completions_fail_closed_for_runnable_serve_archs() {
         // Runnable-served archs have no raw-completions bridge: the gate must
-        // reject them (falling through would reach the optimized engine, which
-        // mis-binds gemma3), and must NOT touch the optimized-lane archs.
+        // reject them, and must NOT touch the optimized-lane archs. qwen35 and
+        // gemma2 are bridge-only on every host; gemma3 is capability-aware
+        // since the Phase 3b flip — the gate follows the live routing
+        // predicate exactly (reopen where the resident lane serves, closed on
+        // the runnable fallback), pinned host-independently here and at the
+        // HTTP level in `runnable_completions_gate_api_tests`.
         assert!(completions_unsupported_for_arch("qwen35"));
         assert!(completions_unsupported_for_arch("gemma2"));
-        assert!(completions_unsupported_for_arch("gemma3"));
+        assert_eq!(
+            completions_unsupported_for_arch("gemma3"),
+            crate::model::arch_requires_runnable_bridge("gemma3"),
+            "the gemma3 completions gate must track the capability-aware routing predicate"
+        );
         assert!(!completions_unsupported_for_arch("llama"));
         assert!(!completions_unsupported_for_arch("qwen3"));
         assert!(!completions_unsupported_for_arch("mistral"));
@@ -7323,19 +7331,23 @@ fn runnable_serve_flag(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// True for architectures served through the runnable bridge (qwen35, and — since
-/// MUSTER M-A1 — gemma3, whose only correct forward lives in the runnable lane; the
-/// optimized dense lane now binds gemma3's QK/post norms — Metal-campaign Phase 1 —
-/// but still does not apply the sandwich norms and has no GeGLU, dual-theta RoPE,
-/// or sliding-window mask).
-/// Deliberate side effect of listing an arch here: when the lane is opted out
-/// (`CAMELID_RUNNABLE_SERVE=0`) its chat requests get a typed 503 instead of
-/// falling through to the incomplete optimized engine — fail-closed by design.
-/// Delegates to [`crate::model::is_runnable_only_arch`] — the single source of
-/// truth shared with the CLI direct-session guard — so the serve router and the
-/// direct lanes can never disagree about which archs must fail closed.
+/// True for architectures served through the runnable bridge ON THIS HOST:
+/// qwen35 and gemma2 always, and gemma3 only where the Metal-resident lane
+/// cannot serve it (gemma3→Metal Phase 3b made gemma3's routing
+/// CAPABILITY-AWARE — on a resident-capable macOS host its chat runs the
+/// dense/resident lane, and the raw-completions surfaces reopen with it; on
+/// non-Metal hosts, with `CAMELID_METAL_RESIDENT_DECODE=0`, or in a
+/// CUDA-resident process it falls back to the runnable bridge exactly as
+/// before the flip, never to the CPU dense forward, which fails closed for
+/// windowed archs at forward dispatch — hazard H4).
+/// Deliberate side effect of an arch classifying runnable here: when the lane
+/// is opted out (`CAMELID_RUNNABLE_SERVE=0`) its chat requests get a typed 503
+/// instead of falling through to an engine that cannot run it — fail-closed by
+/// design. Delegates to [`crate::model::arch_requires_runnable_bridge`] — the
+/// single source of truth shared with the CLI direct-session guard — so the
+/// serve router and the direct lanes can never disagree about routing.
 fn is_runnable_serve_arch(arch: &str) -> bool {
-    crate::model::is_runnable_only_arch(arch)
+    crate::model::arch_requires_runnable_bridge(arch)
 }
 
 /// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
@@ -7643,12 +7655,14 @@ async fn resolve_runnable_runtime(
 }
 
 /// True when raw `/v1/completions` must fail closed for this architecture: the
-/// runnable-served archs have no completions bridge, and falling through would
-/// reach the optimized engine — which for gemma3 is numerically incomplete (its
-/// norms now bind, Metal-campaign Phase 1, but the forward does not apply the
-/// sandwich norms and has no GeGLU, dual-theta RoPE, or window mask). Their
-/// only served surface is `/v1/chat/completions`. Pure decision half of
-/// [`reject_completions_for_runnable_arch`] so the gate itself is unit-testable.
+/// runnable-served archs have no completions bridge, and their only served
+/// surface is `/v1/chat/completions`. Capability-aware since the gemma3 Phase
+/// 3b flip: on a resident-capable host gemma3 leaves the runnable set, so its
+/// raw-completions surfaces REOPEN onto the dense/resident lane in the same
+/// motion (deliberate — the resident forward is the correct engine there),
+/// while on runnable-fallback hosts they stay 422-gated exactly as before.
+/// Pure decision half of [`reject_completions_for_runnable_arch`] so the gate
+/// itself is unit-testable.
 fn completions_unsupported_for_arch(arch: &str) -> bool {
     is_runnable_serve_arch(arch)
 }
@@ -10059,9 +10073,11 @@ async fn completions(
         Ok(None) => {}
         Err(resp) => return resp,
     }
-    // Runnable-served architectures (qwen35, gemma3) fail closed on raw
-    // completions — chat is their only served surface. This also covers the
-    // multi-choice fan-out below, which is reached only through this handler.
+    // Runnable-served architectures (qwen35, gemma2, and gemma3 where the
+    // resident lane cannot serve it — the predicate is capability-aware since
+    // the gemma3 Phase 3b flip) fail closed on raw completions — chat is
+    // their only served surface. This also covers the multi-choice fan-out
+    // below, which is reached only through this handler.
     if let Some(resp) = reject_completions_for_runnable_arch(&state, &req.model).await {
         return resp;
     }
@@ -11575,15 +11591,18 @@ async fn prepare_generation(
         Ok(m) => m,
         Err(res) => return Err(res),
     };
-    // Fail closed for runnable-lane-only archs at the dense chokepoint. Every
+    // Fail closed for runnable-served archs at the dense chokepoint. Every
     // raw completions-style surface funnels through here (`/completion`,
     // `/v1/completions` and its n>1 fan-out, `/api/generation/preflight`,
-    // `/api/generation/sessions`, receipt replay), and the dense engine is
-    // mis-bound for these archs — it drops their QK/sandwich norm tensors and
-    // has no GeGLU/dual-RoPE — so falling through produces fluent-looking
-    // garbage, not an error. Chat requests never reach this: the runnable
-    // short-circuit in `chat_completions` serves them or returns a typed 503
-    // before prepare_generation.
+    // `/api/generation/sessions`, receipt replay), and no engine this function
+    // can reach runs those archs correctly — falling through would produce
+    // fluent-looking garbage (qwen35/gemma2) or a windowed-arch H4 error
+    // (gemma3 on a fallback host), not a useful completion. Chat requests for
+    // runnable-served archs never reach this: the runnable short-circuit in
+    // `chat_completions` serves them or returns a typed 503 first. gemma3 on a
+    // resident-capable host is NOT runnable-served (capability-aware Phase 3b
+    // predicate): its chat AND raw completions flow through here onto the
+    // dense/resident lane deliberately.
     if completions_unsupported_for_arch(model.gguf.architecture().unwrap_or_default()) {
         return Err(runnable_completions_rejection(&model.id));
     }
@@ -15679,6 +15698,21 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        // gemma3: the template has no tools branch and no tool-call grammar is
+        // certified for this row, so tool requests fail closed on the dense
+        // lane with the SAME contract the runnable bridge enforces (its typed
+        // `unsupported_tools` refusal) — the Phase 3b routing flip must not
+        // silently degrade an explicit refusal into tools being dropped from
+        // the prompt. The generic no-`tools`-in-template check below would
+        // also fail it; this branch keeps the message row-accurate.
+        if is_gemma3_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the gemma3 chat template has no tools branch and no tool-call grammar is \
+                 certified for this row; tool requests fail closed on the dense lane exactly \
+                 as on the runnable bridge",
+            ));
+        }
         if is_phi4_compact_template(template) {
             return Err(MiniJinjaError::new(
                 MiniJinjaErrorKind::InvalidOperation,
@@ -15771,6 +15805,23 @@ fn render_chat_prompt_for_tokenization_fallback(
                 add_special: true,
                 // Parse specials so <|user|>/<|assistant|>/<|end|> become the control
                 // token ids â€” in particular <|end|> as the end-of-turn stop token.
+                parse_special: true,
+            };
+        }
+        // gemma3 (gemma3→Metal Phase 3b): once the capability-aware serve
+        // routing lets gemma3 chat fall through to the dense/resident lane,
+        // this fallback is its prompt renderer. Reuse the byte-faithful
+        // gemma3 renderer the runnable bridge already ships (oracle
+        // /apply-template parity, MUSTER M-A1) with the identical encode
+        // contract: the rendered string carries NO BOS — BOS lands at token
+        // level (add_special=true, the GGUF declares add_bos_token=true) —
+        // and specials parse so <start_of_turn>/<end_of_turn> become their
+        // control ids. Without this branch gemma3 fell to the role-colon
+        // renderer, which the model was never trained on.
+        if is_gemma3_chat_template(template) {
+            return RenderedPrompt {
+                text: render_gemma3_prompt(messages),
+                add_special: true,
                 parse_special: true,
             };
         }
@@ -15979,6 +16030,17 @@ fn is_tinyllama_marker_template(template: &str) -> bool {
     template.contains("<|user|>")
         && template.contains("<|assistant|>")
         && template.contains("<|system|>")
+}
+
+/// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
+/// `<end_of_turn>` turn markers plus the `first_user_prefix` system-folding
+/// variable (which distinguishes it from other turn-marker templates). Chat
+/// for a matching model renders through [`render_gemma3_prompt`], the
+/// byte-faithful renderer shared with the runnable bridge.
+fn is_gemma3_chat_template(template: &str) -> bool {
+    template.contains("<start_of_turn>")
+        && template.contains("<end_of_turn>")
+        && template.contains("first_user_prefix")
 }
 
 fn is_llama3_instruct_template(template: &str) -> bool {
@@ -19642,6 +19704,7 @@ mod tests {
     #[test]
     fn windowed_arch_never_stores_a_prompt_prefix_entry() {
         let _env_guard = crate::test_support::env_lock();
+        let _admit = admit_windowed_cpu_dense_for_test();
         std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
         std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
@@ -19694,6 +19757,7 @@ mod tests {
     #[test]
     fn windowed_arch_never_takes_a_partial_prefix_resume() {
         let _env_guard = crate::test_support::env_lock();
+        let _admit = admit_windowed_cpu_dense_for_test();
         std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
         std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
@@ -19762,6 +19826,7 @@ mod tests {
     #[test]
     fn stream_prologue_windowed_arch_partial_hit_falls_back_to_cold_prefill() {
         let _env_guard = crate::test_support::env_lock();
+        let _admit = admit_windowed_cpu_dense_for_test();
         std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
         std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
         // The tiny two-token prefix must qualify as a partial hit (default
@@ -19815,6 +19880,50 @@ mod tests {
         assert!(job.generated.is_empty());
         assert_eq!(job.prepared.session.kv_position(), 0);
         std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+    }
+
+    /// gemma3→Metal Phase 3b hazard H4: the CPU dense forward must fail
+    /// closed for a windowed-attention arch at forward dispatch — a typed,
+    /// actionable error, never a silent full-causal decode. The control run
+    /// proves the identical fixture minus the window schedule still runs, so
+    /// the guard (not some other failure) is what fired.
+    #[test]
+    fn windowed_arch_cpu_dense_forward_fails_closed() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let err = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .expect_err("a windowed arch must not run the CPU dense forward");
+        let message = err.to_string();
+        assert!(
+            message.contains("sliding-window"),
+            "the H4 error must name the windowed-attention hazard: {message}"
+        );
+        assert!(
+            message.contains("fails closed"),
+            "the H4 error must be explicit about failing closed: {message}"
+        );
+
+        // Control: identical fixture without the window schedule runs fine.
+        let mut control = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        control
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .expect("the non-windowed control must keep running on the CPU dense forward");
     }
 
     #[test]
@@ -19898,6 +20007,74 @@ mod tests {
             "<|user|>\nhello</s>\n<|assistant|>\n"
         );
     }
+    /// gemma3→Metal Phase 3b: once the capability-aware routing lets gemma3
+    /// chat fall through to the dense lane, the fallback renderer must route
+    /// its template to `render_gemma3_prompt` (byte-faithful, shared with the
+    /// runnable bridge) with the runnable bridge's exact encode contract —
+    /// BOS at token level (add_special) and specials parsed — and NOT to the
+    /// role-colon fallback the model was never trained on.
+    #[test]
+    fn gemma3_template_renders_through_the_shared_gemma3_renderer_on_the_dense_lane() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let mut tokenizer = test_tokenizer();
+        // The load-bearing shape of the real gemma-3-1b-it template: turn
+        // markers + the first_user_prefix system-folding variable.
+        tokenizer.chat_template = Some(
+            "{{ bos_token }}{%- set first_user_prefix = \"\" -%}\
+             {{ '<start_of_turn>' + role }}{{ '<end_of_turn>\n' }}"
+                .to_string(),
+        );
+        assert!(is_gemma3_chat_template(
+            tokenizer.chat_template.as_deref().unwrap()
+        ));
+
+        let rendered = render_chat_prompt_for_tokenization(
+            &[
+                ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: "system".to_string(),
+                    content: "Be terse.".to_string(),
+                },
+                ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                },
+            ],
+            &tokenizer,
+        );
+        assert_eq!(
+            rendered.text,
+            "<start_of_turn>user\nBe terse.\n\nhello<end_of_turn>\n<start_of_turn>model\n",
+            "must byte-match the runnable bridge's render (system folded into the first turn)"
+        );
+        assert!(
+            rendered.add_special,
+            "BOS lands at token level, exactly like the runnable bridge encode"
+        );
+        assert!(rendered.parse_special);
+
+        // Tools on the dense lane fail closed with the same contract as the
+        // runnable bridge's typed refusal — never silently dropped from the
+        // prompt (gemma3's template has no tools branch and no certified
+        // grammar).
+        let err = render_chat_prompt_for_tokenization_with_tools(
+            &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            &tokenizer,
+            &[serde_json::json!({"name": "get_weather", "parameters": {}})],
+        )
+        .expect_err("gemma3 tools must fail closed on the dense lane");
+        assert!(
+            err.to_string().contains("no tools branch"),
+            "the refusal must state the reason: {err}"
+        );
+    }
+
     #[test]
     fn renders_llama3_instruct_prompt_with_header_tokens_and_special_parsing() {
         let _guard = crate::test_support::env_lock();
@@ -21615,11 +21792,32 @@ mod tests {
         }
     }
 
+    /// Admit a windowed arch onto the CPU dense forward for the duration of
+    /// one test (drop guard restores fail-closed). Since the Phase 3b flip the
+    /// CPU dense forward errors for windowed archs at dispatch (hazard H4);
+    /// the cache-decision tests below drive tiny synthetic gemma3 configs
+    /// through it mechanically because all they assert is the store/resume
+    /// DECISION. The seam is process-global — arm it only while holding
+    /// `crate::test_support::env_lock()` (every user below already does).
+    struct AdmitWindowedCpuDenseGuard;
+    impl Drop for AdmitWindowedCpuDenseGuard {
+        fn drop(&mut self) {
+            crate::inference::TEST_ADMIT_WINDOWED_ARCH_CPU_DENSE
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn admit_windowed_cpu_dense_for_test() -> AdmitWindowedCpuDenseGuard {
+        crate::inference::TEST_ADMIT_WINDOWED_ARCH_CPU_DENSE
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        AdmitWindowedCpuDenseGuard
+    }
+
     /// `tiny_config` with a gemma3 sliding-window schedule attached: the
     /// smallest config for which `arch_has_windowed_attention` is true. The
     /// CPU dense forward runs it mechanically (structure-less — exactly the
     /// hazard the windowed-arch cache bypasses exist to contain), which is all
-    /// the store/resume decision tests need.
+    /// the store/resume decision tests need (they hold the H4 test admit
+    /// guard, `admit_windowed_cpu_dense_for_test`).
     fn tiny_gemma3_config() -> LlamaModelConfig {
         let mut config = tiny_config();
         config.architecture = "gemma3".to_string();
@@ -22904,7 +23102,7 @@ mod runnable_completions_gate_api_tests {
 
     #[tokio::test]
     async fn llama_server_completion_fails_closed_for_runnable_arch() {
-        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
         let (status, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
         assert_gate_rejection(status, &body);
     }
@@ -22932,7 +23130,7 @@ mod runnable_completions_gate_api_tests {
 
     #[tokio::test]
     async fn completions_multi_choice_fails_closed_for_runnable_arch() {
-        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let app = router_with_state(state_with_loaded_arch("gemma2").await);
         let (status, body) =
             post_json(app, "/v1/completions", json!({ "prompt": "hi", "n": 2 })).await;
         assert_gate_rejection(status, &body);
@@ -22940,7 +23138,7 @@ mod runnable_completions_gate_api_tests {
 
     #[tokio::test]
     async fn receipt_replay_fails_closed_for_runnable_arch() {
-        let state = state_with_loaded_arch("gemma3").await;
+        let state = state_with_loaded_arch("qwen35").await;
         let request = receipt::ReceiptRequest {
             endpoint: "/v1/completions".to_string(),
             messages_or_prompt: json!("hello"),
@@ -22963,7 +23161,7 @@ mod runnable_completions_gate_api_tests {
     /// must keep returning its own typed 503, not the completions gate's 422.
     #[tokio::test]
     async fn chat_completions_keep_their_runnable_lane_error() {
-        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
         let (status, body) = post_json(
             app,
             "/v1/chat/completions",
@@ -22981,6 +23179,64 @@ mod runnable_completions_gate_api_tests {
         let app = router_with_state(state_with_loaded_arch("llama").await);
         let (_, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
         assert_ne!(body["error"]["code"], "unsupported_completions_lane");
+    }
+
+    /// gemma3→Metal Phase 3b: the completions gate is CAPABILITY-AWARE for
+    /// gemma3. On a host where the resident lane cannot serve
+    /// (`CAMELID_METAL_RESIDENT_DECODE=0` — the runnable-fallback
+    /// configuration, and the state of every non-macOS CI leg regardless of
+    /// env), the raw surfaces stay 422-gated exactly as before the flip.
+    /// Plain `#[test]` + a local runtime so the env mutation happens strictly
+    /// under `env_lock` with no guard held across an await point.
+    #[test]
+    fn completions_gate_stays_closed_for_gemma3_on_a_runnable_fallback_host() {
+        let _guard = crate::test_support::env_lock();
+        // Restore the caller's value on exit: a shell-armed targeted battery
+        // (CAMELID_METAL_RESIDENT_DECODE=1, §9d discipline) must not be
+        // disarmed mid-run by this test — the resident gates read env LIVE.
+        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (status, body) = runtime.block_on(async {
+            let app = router_with_state(state_with_loaded_arch("gemma3").await);
+            post_json(app, "/completion", json!({ "prompt": "hi" })).await
+        });
+        match prior {
+            Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
+            None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        assert_gate_rejection(status, &body);
+    }
+
+    /// gemma3→Metal Phase 3b, the other half of the split: where the resident
+    /// lane CAN serve (macOS, Metal device, resident decode armed — the
+    /// `camelid serve` default fast stack), the raw-completions surfaces
+    /// REOPEN for gemma3 onto the dense lane: the request must proceed past
+    /// the gate (this synthetic model then fails on its missing tokenizer —
+    /// any code but the gate's proves the routing).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn completions_gate_reopens_for_gemma3_where_the_resident_lane_serves() {
+        if !crate::metal::detect_metal_device().available {
+            return;
+        }
+        let _guard = crate::test_support::env_lock();
+        // Restore the caller's value on exit (see the fallback-host test).
+        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_, body) = runtime.block_on(async {
+            let app = router_with_state(state_with_loaded_arch("gemma3").await);
+            post_json(app, "/completion", json!({ "prompt": "hi" })).await
+        });
+        match prior {
+            Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
+            None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        assert_ne!(
+            body["error"]["code"], "unsupported_completions_lane",
+            "on a resident-capable host the gemma3 completions gate must reopen: {body}"
+        );
     }
 }
 

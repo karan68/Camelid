@@ -5725,27 +5725,29 @@ fn infer_quantization(path: &std::path::Path) -> String {
 }
 
 /// Fail closed BEFORE weights load on every CLI lane that would construct a
-/// direct dense `LlamaInferenceSession` for a runnable-lane-only architecture
-/// (qwen35 / gemma2 / gemma3). gemma3's norms now bind (Metal-campaign
-/// Phase 1) and the dense forward would apply the QK pair, but it still does
-/// not apply the sandwich norms and has no GeGLU, dual-theta RoPE, or
-/// sliding-window mask; gemma2's sandwich norms are still silently dropped at
-/// bind; qwen35's hybrid layers do not fit the dense tensor map at all. So
-/// BOTH the CPU dense forward and the GPU resident lane would decode
-/// fluent-looking garbage for these archs. `camelid serve` (and
-/// `camelid chat`, which drives serve over HTTP) route them to the correct
-/// runnable bridge — point the user there instead of running an incomplete
-/// forward. Mirrors serve's `is_runnable_serve_arch` via the shared
-/// `camelid::model::is_runnable_only_arch` predicate.
+/// direct dense `LlamaInferenceSession` for an architecture the runnable
+/// bridge must serve ON THIS HOST. qwen35 / gemma2: always (qwen35's hybrid
+/// layers do not fit the dense tensor map; gemma2's sandwich norms are still
+/// silently dropped at bind). gemma3: capability-aware since the Metal
+/// campaign's Phase 3b flip — on a resident-capable macOS host the direct
+/// dense session runs the Metal-resident windowed forward correctly, so it is
+/// allowed through; where the resident lane cannot serve (no Metal device,
+/// `CAMELID_METAL_RESIDENT_DECODE=0` / `--deterministic`, CUDA-resident), the
+/// CPU dense forward would be the only engine left and it has no
+/// sliding-window mask, so fail here and point the user at `camelid serve`
+/// (whose router falls back to the runnable bridge). The forward-dispatch
+/// guard (hazard H4) backstops this with a typed error either way. Mirrors
+/// serve's `is_runnable_serve_arch` via the shared
+/// `camelid::model::arch_requires_runnable_bridge` predicate.
 fn ensure_arch_has_direct_dense_session(gguf: &camelid::gguf::GgufFile) -> anyhow::Result<()> {
     let arch = gguf.architecture().unwrap_or_default();
-    if camelid::model::is_runnable_only_arch(arch) {
+    if camelid::model::arch_requires_runnable_bridge(arch) {
         anyhow::bail!(
-            "architecture '{arch}' is served only through the runnable lane; this command's \
-             direct dense-session path would run an incomplete forward (missing norm/rope/\
-             window application) and emit wrong output, so it fails closed. Use `camelid \
-             serve` (or `camelid chat`), which routes this architecture to its correct \
-             runtime."
+            "architecture '{arch}' is served only through the runnable lane on this host; this \
+             command's direct dense-session path would run an incomplete forward (missing \
+             norm/rope/window application) and emit wrong output, so it fails closed. Use \
+             `camelid serve` (or `camelid chat`), which routes this architecture to its \
+             correct runtime."
         );
     }
     Ok(())
