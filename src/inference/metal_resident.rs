@@ -77,7 +77,13 @@ impl super::LlamaInferenceSession {
             .gemma3
             .as_ref()
             .map(|g| metal::ResidentLayerSchedule {
-                use_alt_rope: range.map(|l| g.is_sliding_layer(l)).collect(),
+                use_alt_rope: range.clone().map(|l| g.is_sliding_layer(l)).collect(),
+                // Window INCLUDES the current position (attend
+                // [pos+1-window ..= pos]) — Gemma3Metadata::layer_window keeps
+                // the same convention, so this is a straight copy.
+                window: range
+                    .map(|l| g.layer_window(l).map(|w| w as usize))
+                    .collect(),
             })
     }
 

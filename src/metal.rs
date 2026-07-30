@@ -10002,6 +10002,12 @@ fn encode_attention_block(
     n_kv_heads: usize,
     head_dim: usize,
     position_count: usize,
+    // First cache position the attention reads (sliding-window layers; 0 =
+    // full causal). The caller supplies the gemma4-math pair: `window_start =
+    // filled.saturating_sub(window)`, `position_count = filled - window_start`;
+    // the kernels then read `[window_start, window_start + position_count)`
+    // via `kv_base_offset = window_start * head_dim`.
+    window_start: usize,
     scale: f32,
     split_half_pairing: bool,
 ) {
@@ -10066,10 +10072,12 @@ fn encode_attention_block(
         *(a.add(12) as *mut u32) = group;
         *(a.add(16) as *mut f32) = scale;
         // Per-layer cache [kv_head][max_positions][head_dim]: position stride is one head_dim,
-        // head stride spans the full allocated position capacity, no base offset.
+        // head stride spans the full allocated position capacity. The base
+        // offset shifts the read range to the sliding window's start (0 for
+        // full-causal layers — byte-identical to the pre-window encode).
         *(a.add(20) as *mut u32) = head_dim as u32;
         *(a.add(24) as *mut u32) = (max_positions * head_dim) as u32;
-        *(a.add(28) as *mut u32) = 0u32;
+        *(a.add(28) as *mut u32) = (window_start * head_dim) as u32;
         *(nblocks_ctx.contents() as *mut u32) = bpr_q as u32;
         let o = o_mm_scalar.contents() as *mut u32;
         *o = bpr_q as u32;
@@ -10551,6 +10559,7 @@ pub fn try_attention_block_resident(
         n_kv_heads,
         head_dim,
         position_count,
+        0,
         scale,
         split_half_pairing,
     );
@@ -10680,6 +10689,7 @@ pub fn try_decode_layer_resident(
         n_kv_heads,
         head_dim,
         position_count,
+        0,
         scale,
         split_half_pairing,
     );
@@ -10851,6 +10861,7 @@ pub fn try_decode_forward_resident(
             n_kv_heads,
             head_dim,
             position_count,
+            0,
             scale,
             split_half_pairing,
         );
@@ -11013,6 +11024,12 @@ pub enum ResidentTokenOut {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentLayerSchedule {
     pub use_alt_rope: Vec<bool>,
+    /// Per-layer sliding window in positions, INCLUDING the current one: a
+    /// local layer at position `pos` attends `[pos + 1 - w ..= pos]` (same
+    /// convention as `Gemma3Metadata::layer_window` / `Gemma4LayerPlan::window`
+    /// — reference src/model.rs `is_position_visible`). `None` = full causal
+    /// attention (global layers, and every non-gemma3 arch).
+    pub window: Vec<Option<usize>>,
 }
 
 impl ResidentLayerSchedule {
@@ -11144,7 +11161,7 @@ impl ResidentDecodeState {
         let q_dim = n_heads * head_dim;
         if schedule
             .as_ref()
-            .is_some_and(|s| s.use_alt_rope.len() != n_layers)
+            .is_some_and(|s| s.use_alt_rope.len() != n_layers || s.window.len() != n_layers)
         {
             return None;
         }
@@ -11665,7 +11682,7 @@ impl ResidentDecodeState {
                 _ => None,
             };
         }
-        let position_count = position + 1;
+        let filled = position + 1;
         let mut keep = Vec::new();
         let encode_started = std::time::Instant::now();
         self.event_counter += 1;
@@ -11688,6 +11705,16 @@ impl ResidentDecodeState {
                 (Some(sched), Some((ac, as_))) if sched.use_alt_rope[i] => (ac, as_),
                 _ => (cos_t, sin_t),
             };
+            // Sliding-window layers read only the trailing `window` positions
+            // (window INCLUDES the current position — gemma4 math verbatim:
+            // window_start = filled.saturating_sub(window), position_count =
+            // filled - window_start). Full-causal layers keep window_start = 0.
+            let window_start = self
+                .schedule
+                .as_ref()
+                .and_then(|s| s.window[i])
+                .map_or(0, |w| filled.saturating_sub(w));
+            let position_count = filled - window_start;
             encode_attention_block(
                 e,
                 k,
@@ -11718,6 +11745,7 @@ impl ResidentDecodeState {
                 self.n_kv_heads,
                 self.head_dim,
                 position_count,
+                window_start,
                 scale,
                 self.split_half_pairing,
             );
@@ -20570,6 +20598,7 @@ mod tests {
         // builder — the same code the production wiring uses.
         let schedule = ResidentLayerSchedule {
             use_alt_rope: vec![true, false],
+            window: vec![None, None],
         };
         // Mis-sized schedule fails construction.
         assert!(
@@ -20586,6 +20615,7 @@ mod tests {
                 true,
                 Some(ResidentLayerSchedule {
                     use_alt_rope: vec![true],
+                    window: vec![None],
                 }),
             )
             .is_none(),
@@ -20619,6 +20649,7 @@ mod tests {
             true,
             Some(ResidentLayerSchedule {
                 use_alt_rope: vec![false, false],
+                window: vec![None, None],
             }),
         )
         .unwrap();
@@ -20814,6 +20845,455 @@ mod tests {
                 );
             }
         }
+    }
+
+    // gemma3→Metal Phase 2e: the sliding-window decode mask. A schedule layer
+    // with `window: Some(w)` attends only `[pos + 1 - w ..= pos]` — the window
+    // INCLUDES the current position (src/model.rs `is_position_visible`
+    // convention) — via the gemma4 math (window_start = filled - w,
+    // position_count = filled - window_start, kv_base_offset = window_start *
+    // head_dim) on the UNCHANGED v1 decode-attention kernel.
+    //
+    // Assertion layers, strongest first:
+    // 1. BIT-EXACT window oracle (single sliding layer, every depth): the
+    //    windowed decode at position t must equal, to the bit, a fresh session
+    //    seeded with EXACTLY the window's cache rows and decoded full-causal
+    //    (same rope tables — `position` only picks the write slot). Any error
+    //    in window_start, position_count, or the kv_base_offset shift changes
+    //    the attention range and the bits. This is GPU-vs-GPU: no
+    //    CPU-emulation noise at all.
+    // 2. Off-by-one lock, both directions (two-layer mixed schedule): through
+    //    t = w-1 (filled <= window) the windowed decode is BIT-identical to a
+    //    windowless twin — a window-excludes-current bug would diverge at
+    //    t = w-1 — and from t = w it must differ materially — a one-too-wide
+    //    bug would still match there.
+    // 3. CPU-reference smoke over 10 tokens with flip-tolerant bounds. The
+    //    Q8_0 quantize path turns ~ULP CPU/GPU differences (reduction order in
+    //    the fused rms_norm_quantize) into occasional rounding-boundary flips
+    //    whose effect broadcasts through a whole projection (observed as
+    //    isolated tokens at rms ~1e-2..7e-2 even on a WINDOWLESS decode, e.g.
+    //    tokens 6/7/9 of this fixture while token 8 agrees to 1e-6 — data-
+    //    dependent, not positional). A structural window bug instead diverges
+    //    at EVERY clipped token with rms ~2e-1+, so the smoke bound is
+    //    per-token loose (max < 2e-1, rms < 1e-1) — above all observed flip
+    //    noise, below any wrong-range signal from t=5 on.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_gemma3_sliding_window_decode_selfparity() {
+        if !detect_metal_device().available {
+            return;
+        }
+        if f32y_gemv_enabled() {
+            eprintln!(
+                "SKIP metal_resident_gemma3_sliding_window_decode_selfparity: \
+                 CAMELID_METAL_F32Y latched on earlier in this process; the CPU reference \
+                 mirrors the quantize path"
+            );
+            return;
+        }
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let tokens = 10usize;
+        let window = 4usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    post_attn_norm: (0..hidden)
+                        .map(|i| 0.9 + ((i + li) as f32 % 3.0) * 0.03)
+                        .collect(),
+                    post_ffw_norm: (0..hidden)
+                        .map(|i| 0.95 + ((i + li) as f32 % 6.0) * 0.02)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        // SiLU FFN here, deliberately: windowing is orthogonal to the
+        // activation (GeGLU is locked by 2c and the real-row full-forward
+        // gate), and SiLU keeps the CPU smoke reference's quantize-flip rate
+        // down (the MSL/libm tanh gap adds flips of its own — see 2c).
+        fn mk_views(set: &[LW]) -> Vec<ResidentLayerWeights<'_>> {
+            set.iter()
+                .map(|d| ResidentLayerWeights {
+                    attn_norm: &d.attn_norm,
+                    ffn_norm: &d.ffn_norm,
+                    q_norm: Some(&d.q_norm),
+                    k_norm: Some(&d.k_norm),
+                    post_attn_norm: Some(&d.post_attn_norm),
+                    post_ffw_norm: Some(&d.post_ffw_norm),
+                    ffn_geglu: false,
+                    q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                    k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                    v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                    o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                    gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                    up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                    down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                })
+                .collect()
+        }
+        let weights = mk_views(&data);
+        let weights_single = mk_views(&data[..1]);
+
+        // ------------------------------------------------------------------
+        // 1. Bit-exact window oracle: single sliding layer, every depth.
+        // ------------------------------------------------------------------
+        {
+            let mut a = ResidentDecodeState::new(
+                1,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                tokens,
+                tokens,
+                eps,
+                true,
+                Some(ResidentLayerSchedule {
+                    use_alt_rope: vec![true],
+                    window: vec![Some(window)],
+                }),
+            )
+            .unwrap();
+            for t in 0..tokens {
+                let emb: Vec<f32> = (0..hidden)
+                    .map(|i| ((((i * 7 + t * 13) % 23) as f32) - 11.0) * 0.13)
+                    .collect();
+                let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+                let filled = t + 1;
+                let ws = filled.saturating_sub(window);
+                let count = filled - ws;
+                // Seed the oracle with EXACTLY the window's history rows,
+                // copied bit-for-bit out of A's GPU cache (positions [ws, t)),
+                // BEFORE A appends the current token.
+                let hist_k = a.cache_k_contiguous(0, t);
+                let hist_v = a.cache_v_contiguous(0, t);
+                let seed = count - 1; // history rows inside the window
+                let mut b = ResidentDecodeState::new(
+                    1, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+                    None, // full causal: the oracle's range IS the seed
+                )
+                .unwrap();
+                if seed > 0 {
+                    let ck = &hist_k[ws * head_dim..(ws + seed) * head_dim];
+                    let cv = &hist_v[ws * head_dim..(ws + seed) * head_dim];
+                    assert!(b.seed_layer(0, ck, cv, seed), "oracle seed");
+                }
+                b.set_filled(seed);
+                let run = |s: &mut ResidentDecodeState, pos: usize| -> Vec<f32> {
+                    match s
+                        .forward_token(
+                            &emb,
+                            &weights_single,
+                            &cos_l,
+                            &sin_l,
+                            Some((&cos_l, &sin_l)),
+                            pos,
+                            scale,
+                            None,
+                            None,
+                            0,
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                    {
+                        ResidentTokenOut::Data(v) => v,
+                        ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                    }
+                };
+                let got_a = run(&mut a, t);
+                let got_b = run(&mut b, seed);
+                for (i, (av, bv)) in got_a.iter().zip(&got_b).enumerate() {
+                    assert_eq!(
+                        av.to_bits(),
+                        bv.to_bits(),
+                        "depth {t} element {i}: windowed decode must be BIT-identical to the \
+                         seeded-window full-causal oracle ({av} vs {bv}) — window range wrong"
+                    );
+                }
+            }
+            eprintln!(
+                "[2e-oracle] windowed decode bit-identical to the seeded-window oracle at \
+                 depths 0..{tokens} (window {window})"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // 2+3. Two-layer mixed schedule: off-by-one bit-probe, mandatory
+        // divergence, CPU smoke with flip-count gate. Layer 0 slides (local
+        // theta, window 4); layer 1 is global (primary theta, full causal).
+        // ------------------------------------------------------------------
+        let schedule = ResidentLayerSchedule {
+            use_alt_rope: vec![true, false],
+            window: vec![Some(window), None],
+        };
+        let mut session = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            tokens,
+            tokens,
+            eps,
+            true,
+            Some(schedule.clone()),
+        )
+        .unwrap();
+        let mut session_full = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            tokens,
+            tokens,
+            eps,
+            true,
+            Some(ResidentLayerSchedule {
+                use_alt_rope: vec![true, false],
+                window: vec![None, None],
+            }),
+        )
+        .unwrap();
+        // Window-vector length is validated too.
+        assert!(
+            ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                tokens,
+                tokens,
+                eps,
+                true,
+                Some(ResidentLayerSchedule {
+                    use_alt_rope: vec![true, false],
+                    window: vec![Some(window)],
+                }),
+            )
+            .is_none(),
+            "window/layer-count mismatch must decline construction"
+        );
+
+        let mut ref_k: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut ref_v: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        // The windowless twin needs its OWN reference history: layer 1's K/V
+        // derive from layer 0's output, which differs between the windowed and
+        // full runs once the mask clips.
+        let mut ref_k_full: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut ref_v_full: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut noisy_tokens = 0usize;
+
+        for t in 0..tokens {
+            // Decorrelated across tokens (multiplicative index mix), so the
+            // windowed softmax does not sit on near-collinear K rows.
+            let emb: Vec<f32> = (0..hidden)
+                .map(|i| ((((i * 7 + t * 13) % 23) as f32) - 11.0) * 0.13)
+                .collect();
+            let (cos_g, sin_g) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e6);
+            let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+
+            // CPU reference: layer 0 restricts its softmax to the trailing
+            // window (lo = filled - window, count = filled - lo); layer 1 is
+            // full causal.
+            let filled = t + 1;
+            let step = |windowed: bool,
+                        ref_k: &mut Vec<Vec<f32>>,
+                        ref_v: &mut Vec<Vec<f32>>|
+             -> Vec<f32> {
+                let mut x = emb.clone();
+                for (li, d) in data.iter().enumerate() {
+                    let (lc, ls) = if schedule.use_alt_rope[li] {
+                        (&cos_l, &sin_l)
+                    } else {
+                        (&cos_g, &sin_g)
+                    };
+                    let lo = if windowed {
+                        schedule.window[li].map_or(0, |w| filled.saturating_sub(w))
+                    } else {
+                        0
+                    };
+                    let count = filled - lo;
+                    let xn = cpu_ref_rms_norm(&x, &d.attn_norm, eps);
+                    let mut q = cpu_ref_q8_matvec(&xn, &d.q, q_dim);
+                    let mut kx = cpu_ref_q8_matvec(&xn, &d.k, kv_dim);
+                    let v = cpu_ref_q8_matvec(&xn, &d.v, kv_dim);
+                    cpu_ref_rms_norm_per_head(&mut q, n_heads, head_dim, &d.q_norm, eps);
+                    cpu_ref_rms_norm_per_head(&mut kx, n_kv, head_dim, &d.k_norm, eps);
+                    cpu_ref_rope_split_half(&mut q, n_heads, head_dim, lc, ls);
+                    cpu_ref_rope_split_half(&mut kx, n_kv, head_dim, lc, ls);
+                    ref_k[li].extend_from_slice(&kx);
+                    ref_v[li].extend_from_slice(&v);
+                    let ctx = cpu_ref_attention(
+                        &q, &ref_k[li], &ref_v[li], n_heads, n_kv, head_dim, filled, lo, count,
+                        scale,
+                    );
+                    let o = cpu_ref_q8_matvec(&ctx, &d.o, hidden);
+                    let on = cpu_ref_rms_norm(&o, &d.post_attn_norm, eps);
+                    for (h, ov) in x.iter_mut().zip(&on) {
+                        *h += *ov;
+                    }
+                    let xn2 = cpu_ref_rms_norm(&x, &d.ffn_norm, eps);
+                    let g = cpu_ref_q8_matvec(&xn2, &d.gate, ffn);
+                    let u = cpu_ref_q8_matvec(&xn2, &d.up, ffn);
+                    let act: Vec<f32> = g
+                        .iter()
+                        .zip(&u)
+                        .map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv)
+                        .collect();
+                    let dn = cpu_ref_q8_matvec(&act, &d.down, hidden);
+                    let dnn = cpu_ref_rms_norm(&dn, &d.post_ffw_norm, eps);
+                    for (h, dv) in x.iter_mut().zip(&dnn) {
+                        *h += *dv;
+                    }
+                }
+                x
+            };
+            let x = step(true, &mut ref_k, &mut ref_v);
+            let x_full = step(false, &mut ref_k_full, &mut ref_v_full);
+
+            let run = |s: &mut ResidentDecodeState| -> Vec<f32> {
+                match s
+                    .forward_token(
+                        &emb,
+                        &weights,
+                        &cos_g,
+                        &sin_g,
+                        Some((&cos_l, &sin_l)),
+                        t,
+                        scale,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                {
+                    ResidentTokenOut::Data(v) => v,
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            };
+            let got = run(&mut session);
+            let got_full = run(&mut session_full);
+
+            assert_eq!(got.len(), hidden);
+            let metrics = |got: &[f32], want: &[f32]| {
+                let mut max_diff = 0.0f32;
+                let mut sum_sq = 0.0f64;
+                for (a, b) in got.iter().zip(want) {
+                    let d = (a - b).abs();
+                    max_diff = max_diff.max(d);
+                    sum_sq += (d as f64) * (d as f64);
+                }
+                (max_diff, (sum_sq / got.len() as f64).sqrt())
+            };
+            let (max_diff, rms) = metrics(&got, &x);
+            let (max_full, rms_full) = metrics(&got_full, &x_full);
+            eprintln!(
+                "[2e-selfparity] token {t}: windowed max = {max_diff:.2e} rms = {rms:.2e} | \
+                 windowless max = {max_full:.2e} rms = {rms_full:.2e}"
+            );
+            assert!(
+                max_diff < 2.0e-1 && rms < 1.0e-1,
+                "token {t} (windowed): max |gpu-cpu| = {max_diff:.2e}, rms = {rms:.2e}"
+            );
+            assert!(
+                max_full < 2.0e-1 && rms_full < 1.0e-1,
+                "token {t} (windowless): max |gpu-cpu| = {max_full:.2e}, rms = {rms_full:.2e}"
+            );
+            if rms >= 5.0e-3 {
+                noisy_tokens += 1;
+            }
+
+            let delta = got
+                .iter()
+                .zip(&got_full)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            if filled <= window {
+                // The window still covers every position: the mask must be a
+                // bit-exact no-op. A window-excludes-current off-by-one would
+                // first diverge here at t = window - 1.
+                for (i, (a, b)) in got.iter().zip(&got_full).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "token {t} element {i}: windowed decode must be bit-identical to \
+                         windowless while filled <= window ({a} vs {b})"
+                    );
+                }
+            } else {
+                // The mask now drops at least one position: outputs must
+                // differ. A one-too-wide off-by-one would still match at t=4.
+                assert!(
+                    delta > 1.0e-3,
+                    "token {t}: sliding window had no effect (max delta {delta}); the mask \
+                     is not engaging"
+                );
+            }
+        }
+        // Informational: how many tokens carried quantize-flip noise. Once a
+        // flip lands, layer 1's cache rows carry it forward, so consecutive
+        // noisy tokens are one event, not many — an assert on the count would
+        // be brittle across devices (flip positions are fixture- and
+        // device-dependent). The structural load is carried by the bit-exact
+        // oracle above and the per-token rms bound (a mis-indexed window
+        // produces rms ~2e-1+ at clipped depths, over the 1e-1 bound).
+        eprintln!("[2e-selfparity] {noisy_tokens}/10 tokens above rms 5e-3 (quantize flips)");
     }
 
     /// WIN2METAL Phase 3 C2/C3 gate. `verify_batch` over `k` rows at positions
