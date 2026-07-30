@@ -2776,7 +2776,9 @@ impl LlamaInferenceSession {
         // before the backend-enabled gate because this is a property of the model,
         // not of the available backends (same rationale as the NoPE check above;
         // keeps the regression test causal on CPU-only hosts).
-        if matches!(self.config.architecture.as_str(), "gemma2" | "gemma3") {
+        if matches!(self.config.architecture.as_str(), "gemma2" | "gemma3")
+            && !windowed_arch_resident_admitted_for_tests()
+        {
             bail!(format!(
                 "architecture {:?} is runnable-lane-only: the dense forward does not apply its \
                  full norm/activation structure (sandwich norms, GeGLU, per-layer rope/window \
@@ -5069,7 +5071,7 @@ impl LlamaInferenceSession {
         let mut prefill_timings = LlamaForwardTimings::default();
         let mut first_token_timings = LlamaForwardTimings::default();
         let prefill_count = token_ids.len().saturating_sub(1);
-        let prefill_chunk_tokens = prefill_chunk_token_count(prefill_count);
+        let prefill_chunk_tokens = session_prefill_chunk_tokens(&self.config, prefill_count);
         let telemetry_layers_total = self.weights.layers.len();
         if prefill_count > 0 {
             telemetry::emit(telemetry::Event::PrefillStarted {
@@ -5491,6 +5493,26 @@ fn prefill_chunk_token_count(prefill_count: usize) -> usize {
         prefill_count,
         DEFAULT_PREFILL_CHUNK_TOKENS,
     )
+}
+
+/// Prefill chunking for THIS session's model. Windowed-attention archs
+/// (gemma3) force the single-token lane: every prompt token must flow through
+/// `forward_single_token_timed_internal` → `try_resident_decode_forward` — the
+/// only lane whose forward carries the per-layer sliding-window / dual-theta
+/// schedule once the arch is admitted to the resident path (the gemma4
+/// runtime's token-by-token prefill is the semantic precedent). The batched
+/// CPU prefill lanes (layer-major and chunked) have no window mask, so a
+/// chunked prefill would silently evaluate the prompt full-causal and the
+/// prompt-prefix cache would then persist that wrong history
+/// (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H2). Not an env override —
+/// `CAMELID_PREFILL_CHUNK_TOKENS` still applies to every other arch, which
+/// keeps the existing chunking byte-identically.
+fn session_prefill_chunk_tokens(config: &LlamaModelConfig, prefill_count: usize) -> usize {
+    if crate::model::arch_has_windowed_attention(config) {
+        1
+    } else {
+        prefill_chunk_token_count(prefill_count)
+    }
 }
 
 fn prefill_layer_major_chunk_token_count(prefill_count: usize) -> usize {
@@ -12265,6 +12287,31 @@ fn q8_0_metal_enabled() -> bool {
 fn resident_decode_metal_enabled() -> bool {
     !deterministic_mode_enabled()
         && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+}
+
+/// TEST-ONLY seam for the windowed-arch (gemma2/gemma3) resident disqualifier
+/// in `resident_decode_eligible`: the gemma3→Metal Phase 3a session-level gate
+/// must prove the token-by-token prefill routing against the real row BEFORE
+/// the Phase 3b flip removes the disqualifier, and the only way to exercise
+/// that routing end-to-end is to admit the arch for the duration of one test.
+/// Compiled out of production builds entirely (`cfg(test)`), so the
+/// disqualifier is unconditional there — gemma3 stays fail-closed. A process
+/// global rather than a thread-local because the prefill loop hops threads
+/// (`run_on_prefill_pool`); the armed window is bounded by the test's drop
+/// guard, and the env-keyed gate test only ever runs targeted.
+#[cfg(test)]
+pub(crate) static TEST_ADMIT_WINDOWED_ARCH_RESIDENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn windowed_arch_resident_admitted_for_tests() -> bool {
+    #[cfg(test)]
+    {
+        TEST_ADMIT_WINDOWED_ARCH_RESIDENT.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) -> bool {

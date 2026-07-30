@@ -14201,6 +14201,53 @@ fn prompt_prefix_cache_preparation_refuses_a_quantized_cpu_kv() {
     }
 }
 
+/// gemma3→Metal Phase 3a hazard H2: a windowed-attention arch must prefill
+/// token-by-token through the single-token decode lane — the only lane whose
+/// forward reaches `try_resident_decode_forward` and with it the per-layer
+/// sliding-window / dual-theta schedule. The batched CPU prefill lanes have no
+/// window mask. `session_prefill_chunk_tokens` is the routing decision
+/// `generate_next_token_with_history_diagnostics` consumes.
+#[test]
+fn windowed_arch_prefill_forces_the_single_token_lane() {
+    let (session, _temp_file) = tiny_kv_budget_session(64);
+    let mut config = session.config.clone();
+    config.architecture = "gemma3".to_string();
+    config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 4,
+        sliding_window_pattern: 2,
+        rope_freq_base_global: 10_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 2.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    for prefill_count in [0usize, 1, 2, 3, 8, 64, 255, 256, 257, 511, 512, 513, 4096] {
+        assert_eq!(
+            super::session_prefill_chunk_tokens(&config, prefill_count),
+            1,
+            "a windowed arch must take the single-token prefill lane at count {prefill_count}"
+        );
+    }
+}
+
+/// The other half of H2's contract: every non-windowed arch keeps its prefill
+/// chunking BYTE-IDENTICAL to the pre-H2 decision (`prefill_chunk_token_count`
+/// verbatim), so existing resident archs see zero behavior change from the
+/// windowed-arch routing.
+#[test]
+fn non_windowed_arch_prefill_chunking_is_byte_identical() {
+    let (session, _temp_file) = tiny_kv_budget_session(64);
+    assert!(session.config.gemma3.is_none());
+    for prefill_count in [0usize, 1, 2, 3, 8, 64, 255, 256, 257, 511, 512, 513, 4096] {
+        assert_eq!(
+            super::session_prefill_chunk_tokens(&session.config, prefill_count),
+            super::prefill_chunk_token_count(prefill_count),
+            "non-windowed chunking must be unchanged at count {prefill_count}"
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn metal_resident_rollback_moves_filled_with_the_kv_position() {

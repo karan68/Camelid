@@ -23820,6 +23820,172 @@ mod tests {
         );
     }
 
+    // gemma3→Metal Phase 3a hazard H2 gate: the SESSION-level token-by-token
+    // prefill. The Phase 2 final gate above drives ResidentDecodeState
+    // directly; this test drives the production entry —
+    // LlamaInferenceSession::generate_next_token_with_history_diagnostics —
+    // over a MULTI-TOKEN prompt and requires the same token-identical greedy
+    // continuation against the runnable oracle. What it proves is the ROUTING:
+    // `session_prefill_chunk_tokens` forces the single-token lane for the
+    // windowed arch, so every prompt token reaches
+    // `try_resident_decode_forward` and the resident windowed forward (whose
+    // correctness the Phase 2 gate already proves at depth 50) serves the
+    // whole prompt and decode. Short depth deliberately: the forward is
+    // proven, the routing is the claim.
+    //
+    // The production arch disqualifier stays up until Phase 3b; the cfg(test)
+    // seam `TEST_ADMIT_WINDOWED_ARCH_RESIDENT` stands in for the flip for the
+    // duration of this test only (drop guard restores fail-closed).
+    //
+    // Run targeted, gates armed from the SHELL (they are process-latched; see
+    // the Phase 2 gate test comment above):
+    // CAMELID_METAL_RESIDENT_DECODE=1 CAMELID_METAL_F32Y=1 \
+    // CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
+    //   cargo test --release --lib gemma3_session_level -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_session_level_token_by_token_prefill_matches_runnable_oracle() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_session_level_token_by_token_prefill_matches_runnable_oracle: \
+                 set CAMELID_GEMMA3_GGUF to the gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_session_level_token_by_token_prefill_matches_runnable_oracle: \
+                 the production GEMV gates (f32y/wire/NSG8) are not armed; arm them from the \
+                 shell (never from inside a test — they are process-wide OnceLocks)"
+            );
+            return;
+        }
+        // The session-level resident decode gate reads its env live (not
+        // latched), but the same shell discipline applies — require the caller
+        // to arm it rather than mutating process env from a test.
+        let resident_armed = std::env::var("CAMELID_METAL_RESIDENT_DECODE")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "on" | "enabled" | "yes")
+            })
+            .unwrap_or(false);
+        if !resident_armed {
+            eprintln!(
+                "SKIP gemma3_session_level_token_by_token_prefill_matches_runnable_oracle: \
+                 set CAMELID_METAL_RESIDENT_DECODE=1 (from the shell) to arm the session-level \
+                 resident decode lane"
+            );
+            return;
+        }
+
+        use std::sync::atomic::Ordering;
+        // Admit the windowed arch past the Phase 3b disqualifier for THIS test
+        // only; the drop guard restores fail-closed even on panic.
+        struct AdmitGuard;
+        impl Drop for AdmitGuard {
+            fn drop(&mut self) {
+                crate::inference::TEST_ADMIT_WINDOWED_ARCH_RESIDENT.store(false, Ordering::SeqCst);
+            }
+        }
+        crate::inference::TEST_ADMIT_WINDOWED_ARCH_RESIDENT.store(true, Ordering::SeqCst);
+        let _admit = AdmitGuard;
+
+        let path = path.to_string_lossy().to_string();
+        let gguf = crate::gguf::read_metadata(&path).expect("gguf metadata");
+        let config = crate::model::LlamaModelConfig::from_gguf(&gguf).expect("config");
+        assert!(
+            crate::model::arch_has_windowed_attention(&config),
+            "the fixture must be a windowed arch"
+        );
+        let binding = crate::model::LlamaTensorBinding::bind(&gguf, &config).expect("binding");
+        let store = crate::tensor::TensorStore::open(&path, &gguf);
+        let weights =
+            crate::inference::LlamaLoadedWeights::load(&store, &binding, None).expect("weights");
+        let mut session =
+            crate::inference::LlamaInferenceSession::new(config, weights).expect("session");
+
+        eprintln!("[session-level] loading the runnable oracle");
+        let oracle = crate::runnable::RunnableModel::load(&path).expect("runnable oracle");
+
+        fn argmax(v: &[f32]) -> u32 {
+            let mut best = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &x) in v.iter().enumerate() {
+                if x > best_v {
+                    best_v = x;
+                    best = i;
+                }
+            }
+            best as u32
+        }
+
+        let prompt: Vec<u32> = vec![2, 2364, 1077, 4056, 9062, 578, 6146, 236881];
+        let gen_tokens = 5usize;
+        let mut seq = prompt.clone();
+        let mut max_abs_diff_overall = 0.0f32;
+        for step in 0..gen_tokens {
+            // Step 0 feeds the whole multi-token prompt through the session
+            // entry (the H2 routing under test); later steps feed one token.
+            let step_input: Vec<u32> = if step == 0 {
+                prompt.clone()
+            } else {
+                vec![*seq.last().expect("non-empty")]
+            };
+            let out = session
+                .generate_next_token_with_history_diagnostics(
+                    &step_input,
+                    crate::inference::LlamaSampler::Greedy,
+                    &seq,
+                    false,
+                    None,
+                )
+                .expect("session step");
+            let oracle_logits = oracle.forward_logits(&seq).expect("oracle forward");
+            assert_eq!(out.logits.data.len(), oracle_logits.len());
+            let o_tok = argmax(&oracle_logits);
+            let mut max_diff = 0.0f32;
+            for (a, b) in out.logits.data.iter().zip(&oracle_logits) {
+                max_diff = max_diff.max((a - b).abs());
+            }
+            max_abs_diff_overall = max_abs_diff_overall.max(max_diff);
+            let depth = step + 1;
+            eprintln!(
+                "[session-level] depth {depth}: argmax session={} oracle={o_tok}, \
+                 max |logit diff| = {max_diff:.3e}",
+                out.next_token_id
+            );
+            if out.next_token_id != o_tok {
+                let gap = oracle_logits[o_tok as usize] - oracle_logits[out.next_token_id as usize];
+                panic!(
+                    "depth {depth}: argmax diverged (session {} vs oracle {o_tok}, \
+                     oracle logit gap {gap:.6}, max |logit diff| {max_diff:.3e})",
+                    out.next_token_id
+                );
+            }
+            seq.push(o_tok);
+        }
+        // Routing proof, not just parity: the resident lane served the whole
+        // prompt. A CPU dense prefill — chunked, layer-major, OR single-token —
+        // materializes the CPU KV history as it goes; the resident lane leaves
+        // it hollow (F32 primary, no mirror requested), so authority here means
+        // some prompt token fell back to the window-less CPU forward.
+        assert_eq!(session.kv_position(), prompt.len() + gen_tokens - 1);
+        assert!(
+            !session.cpu_kv_authoritative(),
+            "the CPU KV must stay hollow: every prompt token must be served by the resident \
+             lane, never the CPU dense prefill"
+        );
+        eprintln!(
+            "[session-level] PASS: {gen_tokens}/{gen_tokens} greedy tokens identical to the \
+             runnable oracle via the session-level token-by-token prefill; overall \
+             max |logit diff| = {max_abs_diff_overall:.3e}"
+        );
+    }
+
     // gemma3→Metal merge gate H7 (recorded in GEMMA3_METAL_CONDUCTOR.md §9c).
     // The Phase 2e window self-parity fixture runs 10 tokens and the real-row
     // final gate asserts `total < 512`, so NEITHER exercises the sliding window
