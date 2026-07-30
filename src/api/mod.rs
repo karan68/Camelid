@@ -7160,8 +7160,11 @@ fn runnable_serve_flag(value: Option<&str>) -> bool {
 /// Deliberate side effect of listing an arch here: when the lane is opted out
 /// (`CAMELID_RUNNABLE_SERVE=0`) its chat requests get a typed 503 instead of
 /// falling through to the mis-bound optimized engine — fail-closed by design.
+/// Delegates to [`crate::model::is_runnable_only_arch`] — the single source of
+/// truth shared with the CLI direct-session guard — so the serve router and the
+/// direct lanes can never disagree about which archs must fail closed.
 fn is_runnable_serve_arch(arch: &str) -> bool {
-    matches!(arch, "qwen35" | "gemma2" | "gemma3")
+    crate::model::is_runnable_only_arch(arch)
 }
 
 /// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
@@ -20058,6 +20061,7 @@ mod tests {
 
     fn tiny_spec_config() -> LlamaModelConfig {
         LlamaModelConfig {
+            architecture: "llama".to_string(),
             context_length: 48,
             ..tiny_config()
         }
@@ -20242,6 +20246,7 @@ mod tests {
 
     fn tiny_config() -> LlamaModelConfig {
         LlamaModelConfig {
+            architecture: "llama".to_string(),
             context_length: 4,
             embedding_length: 4,
             block_count: 1,

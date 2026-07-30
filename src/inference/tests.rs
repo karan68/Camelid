@@ -1410,6 +1410,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
     temp_file.flush().unwrap();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 2,
         embedding_length: 32,
         block_count: 1,
@@ -1521,6 +1522,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
     temp_file.flush().unwrap();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length,
         embedding_length: 32,
         block_count: 1,
@@ -1624,6 +1626,37 @@ fn nope_config_disqualifies_the_resident_gpu_path() {
             .expect("eligibility check should not error"),
         "a NoPE config must be refused for the want-logits path too"
     );
+}
+
+/// gemma3/gemma2 must never reach the resident GPU engines: the dense binder
+/// silently drops their QK-norm and post-attention/post-FFN ("sandwich") norm
+/// tensors and the dense forward has no GeGLU, so the resident lane would decode
+/// fluent-looking garbage under a supported label. TEMPORARY until the gemma3
+/// Metal campaign (feat/gemma3-metal-resident) lands its resident encode in
+/// Phase 3 — this test then flips alongside the disqualifier's removal.
+///
+/// Like the NoPE test above, the arch check sits before the backend-enabled
+/// gate in `resident_decode_eligible`, so the assertion is causal on a
+/// CPU-only host too.
+#[test]
+fn runnable_only_arch_disqualifies_the_resident_gpu_path() {
+    let (mut session, _temp) = tiny_kv_budget_session(64);
+
+    for arch in ["gemma3", "gemma2"] {
+        session.config.architecture = arch.to_string();
+        assert!(
+            !session
+                .resident_decode_eligible(false)
+                .expect("eligibility check should not error"),
+            "a {arch} config must be refused by the resident GPU gate"
+        );
+        assert!(
+            !session
+                .resident_decode_eligible(true)
+                .expect("eligibility check should not error"),
+            "a {arch} config must be refused for the want-logits path too"
+        );
+    }
 }
 
 /// End-to-end proof that the KV predict-and-abort budget guard fires through the
@@ -8618,6 +8651,7 @@ fn applies_rope_to_each_attention_head() {
     std::env::remove_var("CAMELID_ROPE_POSITION_MODE");
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 4,
         embedding_length: 4,
         block_count: 1,
@@ -8662,6 +8696,7 @@ fn apply_rope_uses_configured_frequency_base() {
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 8192,
         embedding_length: 4,
         block_count: 1,
@@ -8716,6 +8751,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 32,
         embedding_length: 4,
         block_count: 1,
@@ -8774,6 +8810,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 32,
         embedding_length: 4,
         block_count: 1,
@@ -8839,6 +8876,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
     std::env::remove_var("CAMELID_ROPE_POSITION_MODE");
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 4,
         embedding_length: 4,
         block_count: 1,
@@ -8909,6 +8947,7 @@ fn zero_delta_selector_accepts_all_none_and_layer_lists() {
 #[test]
 fn split_half_rope_pairing_is_available_for_diagnostics() {
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 4,
         embedding_length: 4,
         block_count: 1,
@@ -8993,6 +9032,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
 #[test]
 fn inverse_rope_direction_is_available_for_diagnostics() {
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 4,
         embedding_length: 2,
         block_count: 1,
@@ -9076,6 +9116,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
     std::env::set_var("CAMELID_ROPE_POSITION_MODE", "one_based");
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 4,
         embedding_length: 2,
         block_count: 1,
@@ -10695,6 +10736,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
     std::env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "1");
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 4,
         embedding_length: 2,
         block_count: 1,
@@ -10986,6 +11028,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 12,
         embedding_length: 2,
         block_count: 1,
@@ -11217,6 +11260,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 8,
         embedding_length: 2,
         block_count: 1,
@@ -11332,6 +11376,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 2,
         embedding_length: 2,
         block_count: 1,
@@ -11486,6 +11531,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 8,
         embedding_length: 2,
         block_count: 1,
@@ -12372,6 +12418,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
     // Llama3-scaled config so the batched builder exercises the smooth-factor path the
     // 3B row actually uses; the claim is bit-identical tables, not approximate ones.
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 64,
         embedding_length: 8,
         block_count: 1,
