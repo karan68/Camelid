@@ -13025,12 +13025,19 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(&x, &y)| x == y).count()
 }
 
-fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
+fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGenerationStep) {
     if prepared.constraint.is_some() {
         return;
     }
-    if !prepared.session.cpu_kv_authoritative()
-        || prepared.session.kv_position() != prepared.token_ids.len()
+    // A GPU-resident prefill leaves the CPU KV buffers empty, which used to make
+    // this bail out and so kept the prompt cache off the lane the CLI selects
+    // automatically. `prepare_for_prompt_prefix_cache` mirrors the GPU history
+    // back when that round trip is bit-exact, and refuses otherwise — a cached
+    // entry must never be a differently-answering shortcut.
+    // Position check FIRST: it is free, and mirroring is not — a session that is
+    // about to be rejected must not pay for hundreds of MiB of KV readback.
+    if prepared.session.kv_position() != prepared.token_ids.len()
+        || !prepared.session.prepare_for_prompt_prefix_cache()
     {
         return;
     }
@@ -13554,7 +13561,7 @@ fn generate_token_ids(
             // by a fresh GPU prefill, and the lookup above is skipped while the resident
             // CUDA engine is active anyway. Keeping it out also avoids a CPU request
             // (after a GPU-off toggle) reusing a GPU-built (f16-seeded) session.
-            store_prompt_prefix_cache(&prepared, &step);
+            store_prompt_prefix_cache(&mut prepared, &step);
         }
         if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -14718,7 +14725,7 @@ fn run_stream_decode_job(
         };
         if generated.is_empty() && !prepared.collect_dense_diagnostics && step.diagnostics.is_none()
         {
-            store_prompt_prefix_cache(&prepared, &step);
+            store_prompt_prefix_cache(&mut prepared, &step);
         }
         if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -15070,7 +15077,7 @@ impl CooperativeStreamDecodeJob {
             && !self.prepared.collect_dense_diagnostics
             && step.diagnostics.is_none()
         {
-            store_prompt_prefix_cache(&self.prepared, &step);
+            store_prompt_prefix_cache(&mut self.prepared, &step);
         }
         if self.generated.is_empty() {
             self.prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -19187,8 +19194,8 @@ mod tests {
             )
             .unwrap();
         let cached_next_token = step.next_token_id;
-        let warm = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&warm, &step);
+        let mut warm = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut warm, &step);
 
         // A second request for the identical prompt, sharing the same pool.
         let cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
@@ -19237,10 +19244,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
 
         assert!(lookup_prompt_prefix_cache(&prepared).is_none());
-        store_prompt_prefix_cache(&prepared, &step);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let match_res = lookup_prompt_prefix_cache(&prepared).expect("exact key cache hit");
         assert_eq!(match_res.cached.session.kv_cache.position, 2);
@@ -19267,7 +19274,7 @@ mod tests {
             .unwrap();
         let mut longer = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 0], longer_session);
         longer.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
-        store_prompt_prefix_cache(&longer, &longer_step);
+        store_prompt_prefix_cache(&mut longer, &longer_step);
         let exact = lookup_prompt_prefix_cache(&prepared).expect("exact entry still wins");
         assert!(exact.is_exact_match);
         assert_eq!(exact.cached.token_ids, vec![1, 2]);
@@ -19320,8 +19327,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let mut extended = prepared_for_cache(
             "tiny",
@@ -19412,8 +19419,8 @@ mod tests {
         let mut prep3 = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session3);
         prep3.cached_prompt_prefix = pool_ref.clone();
 
-        store_prompt_prefix_cache(&prep1, &step1);
-        store_prompt_prefix_cache(&prep2, &step2);
+        store_prompt_prefix_cache(&mut prep1, &step1);
+        store_prompt_prefix_cache(&mut prep2, &step2);
         assert!(lookup_prompt_prefix_cache(&prep1).is_some());
         {
             let mut pool = pool_ref.lock().unwrap();
@@ -19427,7 +19434,7 @@ mod tests {
             }
         }
 
-        store_prompt_prefix_cache(&prep3, &step3);
+        store_prompt_prefix_cache(&mut prep3, &step3);
         let remaining = pool_ref
             .lock()
             .unwrap()
@@ -19478,8 +19485,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
         assert!(prepared
             .cached_prompt_prefix
             .lock()
@@ -19507,8 +19514,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&unconstrained, &step);
+        let mut unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut unconstrained, &step);
         assert!(
             lookup_prompt_prefix_cache(&unconstrained).is_some(),
             "control: the unconstrained twin hits the warm cache"
@@ -19551,7 +19558,7 @@ mod tests {
             .unwrap();
         let mut constrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
         constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
-        store_prompt_prefix_cache(&constrained, &step);
+        store_prompt_prefix_cache(&mut constrained, &step);
 
         let mut unconstrained = prepared_for_cache(
             "tiny",
@@ -19580,8 +19587,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let generated = generate_token_ids(prepared).expect("cached generation should succeed");
 

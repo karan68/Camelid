@@ -12587,6 +12587,25 @@ impl ResidentDecodeState {
         self.filled
     }
 
+    /// Whether THIS engine's KV survives a GPU -> CPU -> GPU round trip unchanged.
+    ///
+    /// The CPU KV history always stores f16-ROUNDED values — `store_kv_head_row`
+    /// rounds through f16 even in `KvDtype::F32` mode, and every writer including
+    /// the GPU mirror-back routes through it. So an F16 primary round-trips
+    /// exactly (f16 -> f32 is exact; f32 -> f16 of a value that came from f16 is
+    /// the identity), while an F32 primary would be silently rounded on the way
+    /// out and a resumed sequence would attend over different K/V than its
+    /// prefill produced. Q8 is lossy by construction.
+    ///
+    /// Deliberately reads the format THIS engine was built with rather than the
+    /// process-global `resident_kv_format()`: a model switch re-decides the
+    /// global (`set_resident_kquant_lane`) while an older session still holds an
+    /// engine built under the previous format, so the global is a time-of-check
+    /// answer to a time-of-use question.
+    pub fn kv_roundtrips_through_cpu_exactly(&self) -> bool {
+        self.kv16
+    }
+
     /// Mark `n` positions as materialized (called after seeding history from a CPU cache).
     pub fn set_filled(&mut self, n: usize) {
         self.filled = n;
@@ -15790,6 +15809,10 @@ impl ResidentDecodeState {
 
     pub fn filled(&self) -> usize {
         0
+    }
+
+    pub fn kv_roundtrips_through_cpu_exactly(&self) -> bool {
+        false
     }
 
     pub fn set_filled(&mut self, _n: usize) {}
