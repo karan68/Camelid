@@ -23447,6 +23447,345 @@ mod tests {
         eprintln!("[2e-selfparity] {noisy_tokens}/10 tokens above rms 5e-3 (quantize flips)");
     }
 
+    // gemma3→Metal Phase 2 FINAL GATE: full-forward parity on the REAL row.
+    // The resident lane (all Phase 2 encodes: QK-norm, sandwich norms, GeGLU,
+    // dual-theta RoPE with forced split-half pairing, sliding-window schedule,
+    // sqrt(d_model) embed scale, token-by-token prefill through the decode
+    // path) must produce a TOKEN-IDENTICAL greedy continuation to the runnable
+    // lane — the CPU oracle that is itself bit-pinned to HF transformers
+    // (qa/runnable/gemma3-parity.json) — at depths 1/5/50, everything under
+    // 512 tokens (the window is active but unclipped, matching the oracle's
+    // no-mask semantics). The resident machinery is driven DIRECTLY (the
+    // production arch disqualifier stays up until Phase 3).
+    //
+    // The comparison runs the resident lane in its PRODUCTION GEMV
+    // configuration (f32y + wire + NSG8, the CLI fast stack): activations stay
+    // f32 end-to-end, so the only resident-vs-oracle delta is reduction order.
+    // The default-latched quantize path is NOT the production lane and its Q8
+    // activation noise (~0.5 logit over 26 layers) flips near-ties; like
+    // metal_spec_verify_bit_identical, this test latches the gates ON and
+    // SKIPS if an earlier test in the process latched them off — the targeted
+    // run below is the enforced proof lane.
+    //
+    // Run: CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
+    //      cargo test --release --lib gemma3_real_row_resident_forward -- --nocapture
+    // (~5-10 min: the oracle re-runs its stateless f32 forward per step.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_resident_forward_matches_runnable_oracle() {
+        if !detect_metal_device().available {
+            return;
+        }
+        std::env::set_var("CAMELID_METAL_F32Y", "1");
+        std::env::set_var("CAMELID_METAL_WIRE", "1");
+        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_resident_forward_matches_runnable_oracle: the \
+                 production GEMV gates (f32y/wire/NSG8) latched off earlier in this \
+                 process; run targeted: CAMELID_GEMMA3_GGUF=... cargo test --release \
+                 --lib gemma3_real_row_resident_forward -- --nocapture"
+            );
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_resident_forward_matches_runnable_oracle: \
+                 set CAMELID_GEMMA3_GGUF to the gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        let path = path.to_string_lossy().to_string();
+        use crate::gguf::{GgufTensorType, read_metadata};
+        use crate::model::LlamaModelConfig;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let gguf = read_metadata(&path).expect("gguf metadata");
+        let cfg = LlamaModelConfig::from_gguf(&gguf).expect("config");
+        let g3 = cfg.gemma3.clone().expect("gemma3 metadata");
+        let n_layers = cfg.block_count as usize;
+        let n_heads = cfg.attention_head_count as usize;
+        let n_kv = cfg.attention_head_count_kv as usize;
+        let hidden = cfg.embedding_length as usize;
+        let head_dim = cfg
+            .attention_key_length
+            .map(|v| v as usize)
+            .unwrap_or(hidden / n_heads);
+        let rope_dim = cfg
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+        let eps = cfg.rms_norm_epsilon;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // ---- raw tensor loading: Q8_0 wire (34B) -> 36B CPU blocks, F32 -> Vec.
+        let f = std::cell::RefCell::new(std::fs::File::open(&path).expect("open gguf"));
+        let desc = |name: &str| {
+            gguf.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("tensor {name} missing"))
+        };
+        let read_bytes = |name: &str| -> Vec<u8> {
+            let d = desc(name);
+            let mut bytes = vec![0u8; d.n_bytes as usize];
+            let mut f = f.borrow_mut();
+            f.seek(SeekFrom::Start(d.absolute_offset)).expect("seek");
+            f.read_exact(&mut bytes).expect("read");
+            bytes
+        };
+        fn f16_bits_to_f32(h: u16) -> f32 {
+            let h = h as u32;
+            let sign = (h & 0x8000) << 16;
+            let exp = (h >> 10) & 0x1f;
+            let man = h & 0x3ff;
+            f32::from_bits(if exp == 0 && man == 0 {
+                sign
+            } else if exp == 0 {
+                let mut e = 127 - 15 + 1;
+                let mut m = man;
+                while m & 0x400 == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                sign | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+            } else {
+                sign | ((exp + 127 - 15) << 23) | (man << 13)
+            })
+        }
+        let to_blocks36 = |wire: &[u8]| -> Vec<u8> {
+            assert_eq!(wire.len() % 34, 0);
+            let mut out = Vec::with_capacity(wire.len() / 34 * 36);
+            for b in wire.chunks_exact(34) {
+                let s = f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                out.extend_from_slice(&s.to_le_bytes());
+                out.extend_from_slice(&b[2..34]);
+            }
+            out
+        };
+        let to_f32 = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let load_q8 = |name: &str| -> Vec<u8> {
+            assert_eq!(desc(name).tensor_type, GgufTensorType::Q8_0, "{name}");
+            let bytes = read_bytes(name);
+            to_blocks36(&bytes)
+        };
+        let load_f32 = |name: &str| -> Vec<f32> {
+            assert_eq!(desc(name).tensor_type, GgufTensorType::F32, "{name}");
+            to_f32(&read_bytes(name))
+        };
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        eprintln!("[real-row] loading {n_layers} layers from {path}");
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let p = |t: &str| format!("blk.{li}.{t}.weight");
+                LW {
+                    attn_norm: load_f32(&p("attn_norm")),
+                    ffn_norm: load_f32(&p("ffn_norm")),
+                    q_norm: load_f32(&p("attn_q_norm")),
+                    k_norm: load_f32(&p("attn_k_norm")),
+                    post_attn_norm: load_f32(&p("post_attention_norm")),
+                    post_ffw_norm: load_f32(&p("post_ffw_norm")),
+                    q: load_q8(&p("attn_q")),
+                    k: load_q8(&p("attn_k")),
+                    v: load_q8(&p("attn_v")),
+                    o: load_q8(&p("attn_output")),
+                    gate: load_q8(&p("ffn_gate")),
+                    up: load_q8(&p("ffn_up")),
+                    down: load_q8(&p("ffn_down")),
+                }
+            })
+            .collect();
+        let output_norm = load_f32("output_norm.weight");
+        // Tied LM head: the row has no output.weight; the logits projection IS
+        // the token embedding (runnable lane does the same).
+        assert!(
+            !gguf.tensors.iter().any(|t| t.name == "output.weight"),
+            "expected a tied LM head on the 1B row"
+        );
+        let token_embd = load_q8("token_embd.weight");
+        let bpr_hidden = hidden / 32;
+        let vocab = token_embd.len() / 36 / bpr_hidden;
+
+        let weights: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_norm: Some(&d.q_norm),
+                k_norm: Some(&d.k_norm),
+                post_attn_norm: Some(&d.post_attn_norm),
+                post_ffw_norm: Some(&d.post_ffw_norm),
+                ffn_geglu: g3.ffn_geglu,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+            })
+            .collect();
+
+        // Schedule straight from the parsed metadata — the same source the
+        // production wiring uses.
+        let schedule = ResidentLayerSchedule {
+            use_alt_rope: (0..n_layers).map(|l| g3.is_sliding_layer(l)).collect(),
+            window: (0..n_layers)
+                .map(|l| g3.layer_window(l).map(|w| w as usize))
+                .collect(),
+        };
+        let prompt: Vec<u32> = vec![2, 2364, 1077, 4056, 9062, 578, 6146, 236881];
+        let gen_tokens = 50usize;
+        let total = prompt.len() + gen_tokens;
+        assert!(total < 512, "comparison must stay inside the window");
+        let mut session = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            cfg.feed_forward_length as usize,
+            total + 1,
+            512,
+            eps,
+            g3.rope_neox_pairing, // forced split-half, from the metadata
+            Some(schedule),
+        )
+        .expect("resident session");
+
+        // Scaled embedding row, dequantized exactly like the oracle's
+        // (f16-widened scale times i8 quant), times sqrt(d_model).
+        let embed = |tok: u32| -> Vec<f32> {
+            let base = tok as usize * bpr_hidden * 36;
+            let mut row = Vec::with_capacity(hidden);
+            for b in 0..bpr_hidden {
+                let blk = &token_embd[base + b * 36..base + (b + 1) * 36];
+                let s = f32::from_le_bytes(blk[..4].try_into().unwrap());
+                for &q in &blk[4..36] {
+                    row.push(q as i8 as f32 * s * g3.embed_scale);
+                }
+            }
+            row
+        };
+        let mut forward = |tok: u32, pos: usize, want_logits: bool| -> Option<Vec<f32>> {
+            let (cos_g, sin_g) =
+                crate::inference::gemma3_rope_tables(pos, rope_dim, g3.rope_freq_base_global);
+            let (cos_l, sin_l) =
+                crate::inference::gemma3_rope_tables(pos, rope_dim, g3.rope_freq_base_local);
+            let stage = want_logits.then_some(LogitsStage {
+                final_norm: &output_norm,
+                output_weight_blocks: ResidentWeightBytes::Blocks36(&token_embd),
+                vocab_size: vocab,
+            });
+            match session
+                .forward_token(
+                    &embed(tok),
+                    &weights,
+                    &cos_g,
+                    &sin_g,
+                    Some((&cos_l, &sin_l)),
+                    pos,
+                    scale,
+                    stage,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .expect("resident forward")
+            {
+                ResidentTokenOut::Data(v) => Some(v),
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            }
+        };
+
+        // The oracle: the runnable lane, bit-pinned to HF transformers.
+        eprintln!("[real-row] loading the runnable oracle");
+        let oracle = crate::runnable::RunnableModel::load(&path).expect("runnable oracle");
+
+        fn argmax(v: &[f32]) -> u32 {
+            let mut best = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &x) in v.iter().enumerate() {
+                if x > best_v {
+                    best_v = x;
+                    best = i;
+                }
+            }
+            best as u32
+        }
+
+        // Token-by-token prefill through the decode path (gemma4 precedent):
+        // the prompt runs the same per-token resident graph, no batched
+        // prefill (head_dim 256 exceeds every prefill kernel cap by design).
+        // The LAST prompt token is left for the first co-decode step, which
+        // runs it with the logits stage attached.
+        for (i, &tok) in prompt.iter().enumerate().take(prompt.len() - 1) {
+            forward(tok, i, false);
+        }
+
+        // Greedy co-decode: at every step the resident argmax must equal the
+        // oracle argmax; report the max abs logit diff at depths 1/5/50.
+        let mut seq = prompt.clone();
+        let mut max_abs_diff_overall = 0.0f32;
+        for step in 0..gen_tokens {
+            let oracle_logits = oracle.forward_logits(&seq).expect("oracle forward");
+            let resident_logits = forward(*seq.last().unwrap(), seq.len() - 1, true)
+                .expect("resident logits");
+            assert_eq!(resident_logits.len(), oracle_logits.len());
+            let o_tok = argmax(&oracle_logits);
+            let r_tok = argmax(&resident_logits);
+            let mut max_diff = 0.0f32;
+            for (a, b) in resident_logits.iter().zip(&oracle_logits) {
+                max_diff = max_diff.max((a - b).abs());
+            }
+            max_abs_diff_overall = max_abs_diff_overall.max(max_diff);
+            let depth = step + 1;
+            if depth == 1 || depth == 5 || depth == 50 {
+                eprintln!(
+                    "[real-row] depth {depth}: argmax resident={r_tok} oracle={o_tok}, \
+                     max |logit diff| = {max_diff:.3e}"
+                );
+            }
+            if r_tok != o_tok {
+                // Diagnose before failing: report the near-tie gap.
+                let gap = oracle_logits[o_tok as usize] - oracle_logits[r_tok as usize];
+                panic!(
+                    "depth {depth}: argmax diverged (resident {r_tok} vs oracle {o_tok}, \
+                     oracle logit gap {gap:.6}, max |logit diff| {max_diff:.3e})"
+                );
+            }
+            seq.push(o_tok);
+        }
+        // Bookkeeping: every position except the final generated token (which
+        // never needs its KV appended) went through the resident decode once.
+        assert_eq!(session.filled(), prompt.len() + gen_tokens - 1);
+        eprintln!(
+            "[real-row] PASS: 50/50 greedy tokens identical to the runnable oracle; \
+             overall max |logit diff| = {max_abs_diff_overall:.3e}"
+        );
+    }
+
     /// WIN2METAL Phase 3 C2/C3 gate. `verify_batch` over `k` rows at positions
     /// `[base, base+k)` must be BIT-IDENTICAL — exact u32 `to_bits`, not epsilon — to `k`
     /// independent `forward_token` decodes seeded with the same KV history. The straddle
