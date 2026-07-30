@@ -12408,6 +12408,19 @@ pub struct SampleStage<'a> {
     pub embed_scale: f32,
 }
 
+/// Whether the device-side sampling tail can honour `SampleStage::embed_scale`
+/// on an embedding table of this format. Only `embed_row_gather_q8_wire`
+/// declares the scale at buffer(4); `embed_row_gather_q4k`/`_q6k` declare
+/// buffers 0..3 and apply no factor, so binding buffer(4) on them is legal and
+/// INERT — a non-unit scale would be silently dropped on the fast lane's
+/// self-fed next token while the CPU-written path applies it. When this returns
+/// false the tail is not encoded at all and the caller samples on the CPU from
+/// the returned logits, which is slower but correct.
+#[cfg(target_os = "macos")]
+fn gpu_sampling_tail_is_scale_safe(format: ResidentWeightFormat, embed_scale: f32) -> bool {
+    embed_scale == 1.0 || format == ResidentWeightFormat::Q8_0
+}
+
 /// What a resident forward_token call produced: the raw logits/hidden vector (CPU
 /// sampling path), or the GPU-sampled next token id (greedy fast path).
 pub enum ResidentTokenOut {
@@ -13271,6 +13284,15 @@ impl ResidentDecodeState {
         // embedding row into buf_a — the input the NEXT pre-encoded graph reads.
         // Both operations are hazard-ordered after the logits matmul by Metal.
         let sampled_buf = match (&logits_buf, &emb_buf, logits_stage, sample_stage) {
+            // Fail closed rather than gather an unscaled embedding row: the
+            // K-quant gathers ignore buffer(4). Unreachable from the production
+            // caller (it requires a Q8_0 embedding table before it builds the
+            // stage at all), so this costs the fast lane nothing today.
+            (Some(_), Some(eb), Some(_), Some(sample))
+                if !gpu_sampling_tail_is_scale_safe(eb.format, sample.embed_scale) =>
+            {
+                None
+            }
             (Some(lb), Some(eb), Some(s), Some(sample)) => {
                 let nb = |bytes: u64| pool_get(k, bytes);
                 let id_buf = nb(4);
@@ -23795,6 +23817,521 @@ mod tests {
         eprintln!(
             "[real-row] PASS: 50/50 greedy tokens identical to the runnable oracle; \
              overall max |logit diff| = {max_abs_diff_overall:.3e}"
+        );
+    }
+
+    // gemma3→Metal merge gate H7 (recorded in GEMMA3_METAL_CONDUCTOR.md §9c).
+    // The Phase 2e window self-parity fixture runs 10 tokens and the real-row
+    // final gate asserts `total < 512`, so NEITHER exercises the sliding window
+    // past the row's real 512-position boundary — the depth at which
+    // `window_start` stops being a rounding detail and becomes the whole read
+    // range. This pins a windowed decode at `filled` up to 600 bit-for-bit
+    // against a full-causal oracle seeded with exactly the window's rows, so a
+    // `kv_base_offset` pinned to 0 (or scaled in the wrong units) diverges
+    // loudly instead of silently reading the OLDEST positions.
+    //
+    // The history is SEEDED, not decoded: `MetalLinearKernel` owns one shared
+    // serial command queue, so a test that walks 600 tokens holds it for
+    // hundreds of gated command buffers and starves every other Metal test in
+    // the binary (observed: unrelated one-dispatch kernel tests returning their
+    // untouched input). Two command buffers per checkpoint is the same proof at
+    // 1/300th of the queue occupancy.
+    //
+    // head_dim 64 deliberately: it admits the v2/split-K decode-attention
+    // geometry (head_dim % 32 == 0 && <= 128) that the gemma3-1B shape
+    // (head_dim 256) can never reach, so the window base offset is proven on
+    // the fast kernels too, not only on the v1 fallback the 1B row runs. That
+    // also makes the Q8 primary KV reachable, where `kv_base_offset` is a BYTE
+    // offset — `CAMELID_METAL_KV_DTYPE=q8 cargo test --lib
+    // metal_resident_window_start_beyond_512` is the run that distinguishes
+    // `window_start * kv_position_stride` from `window_start * head_dim`
+    // (the format override is process-latched, so it cannot be set from here).
+    // Sensitivity verified by temporarily breaking the packed word: pinning
+    // byte 28 to 0 fails this test and the Phase 2e self-parity; using element
+    // units fails this test under `CAMELID_METAL_KV_DTYPE=q8`. Green on all
+    // three primaries (f32 default, q8, f16).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_window_start_beyond_512_matches_seeded_window_oracle() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 64usize;
+        let hidden = 256usize;
+        let ffn = 64usize;
+        let window = 512usize; // the gemma3 row's real window
+        let cap = 600usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data = LW {
+            attn_norm: (0..hidden).map(|i| 0.5 + (i as f32 % 3.0) * 0.1).collect(),
+            ffn_norm: (0..hidden).map(|i| 0.4 + (i as f32 % 5.0) * 0.07).collect(),
+            q_norm: (0..head_dim)
+                .map(|i| 0.7 + (i as f32 % 11.0) * 0.02)
+                .collect(),
+            k_norm: (0..head_dim)
+                .map(|i| 0.6 + (i as f32 % 7.0) * 0.03)
+                .collect(),
+            post_attn_norm: (0..hidden).map(|i| 0.9 + (i as f32 % 3.0) * 0.03).collect(),
+            post_ffw_norm: (0..hidden)
+                .map(|i| 0.95 + (i as f32 % 6.0) * 0.02)
+                .collect(),
+            q: mk_w36(q_dim, bpr_hidden, 1),
+            k: mk_w36(kv_dim, bpr_hidden, 2),
+            v: mk_w36(kv_dim, bpr_hidden, 3),
+            o: mk_w36(hidden, bpr_q, 4),
+            gate: mk_w36(ffn, bpr_hidden, 5),
+            up: mk_w36(ffn, bpr_hidden, 6),
+            down: mk_w36(hidden, bpr_ffn, 7),
+        };
+        let weights = vec![ResidentLayerWeights {
+            attn_norm: &data.attn_norm,
+            ffn_norm: &data.ffn_norm,
+            q_norm: Some(&data.q_norm),
+            k_norm: Some(&data.k_norm),
+            post_attn_norm: Some(&data.post_attn_norm),
+            post_ffw_norm: Some(&data.post_ffw_norm),
+            ffn_geglu: false,
+            q_weight_blocks: ResidentWeightBytes::Blocks36(&data.q),
+            k_weight_blocks: ResidentWeightBytes::Blocks36(&data.k),
+            v_weight_blocks: ResidentWeightBytes::Blocks36(&data.v),
+            o_weight_blocks: ResidentWeightBytes::Blocks36(&data.o),
+            gate_weight_blocks: ResidentWeightBytes::Blocks36(&data.gate),
+            up_weight_blocks: ResidentWeightBytes::Blocks36(&data.up),
+            down_weight_blocks: ResidentWeightBytes::Blocks36(&data.down),
+        }];
+
+        // Deterministic already-roped K / raw V history, indexed by ABSOLUTE
+        // position so both sessions see byte-identical rows for the positions
+        // they share.
+        let hist = |from: usize, to: usize, salt: usize| -> Vec<f32> {
+            let mut out = Vec::with_capacity((to - from) * kv_dim);
+            for p in from..to {
+                for d in 0..kv_dim {
+                    out.push(((((p * 31 + d * 7 + salt) % 41) as f32) - 20.0) * 0.037);
+                }
+            }
+            out
+        };
+        let run = |s: &mut ResidentDecodeState,
+                   emb: &[f32],
+                   cos: &[f32],
+                   sin: &[f32],
+                   pos: usize|
+         -> Vec<f32> {
+            match s
+                .forward_token(
+                    emb,
+                    &weights,
+                    cos,
+                    sin,
+                    Some((cos, sin)),
+                    pos,
+                    scale,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            }
+        };
+
+        // 512 is the last unclipped depth; 513 is the first clipped one; 600
+        // puts the window 88 positions off the base of the cache.
+        let depths = [256usize, 512, 513, 561, 600];
+        let mut clipped = 0usize;
+        for filled in depths {
+            let position = filled - 1; // the token being decoded
+            let ws = filled.saturating_sub(window);
+            let count = filled - ws;
+            let seed = count - 1; // history rows inside the window
+            let emb: Vec<f32> = (0..hidden)
+                .map(|i| ((((i * 7 + filled * 13) % 23) as f32) - 11.0) * 0.13)
+                .collect();
+            let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(position, head_dim, 1.0e4);
+
+            // A: windowed layer, full history seeded, decoding at `position`.
+            let mut a = ResidentDecodeState::new(
+                1,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                cap,
+                cap,
+                eps,
+                true,
+                Some(ResidentLayerSchedule {
+                    use_alt_rope: vec![true],
+                    window: vec![Some(window)],
+                }),
+            )
+            .unwrap();
+            assert!(
+                a.seed_layer(0, &hist(0, position, 5), &hist(0, position, 9), position),
+                "windowed seed at filled {filled}"
+            );
+            a.set_filled(position);
+
+            // B: full causal, seeded with ONLY the window's rows [ws, position).
+            let mut b = ResidentDecodeState::new(
+                1, n_heads, n_kv, head_dim, hidden, ffn, window, window, eps, true, None,
+            )
+            .unwrap();
+            assert!(
+                b.seed_layer(
+                    0,
+                    &hist(ws, position, 5),
+                    &hist(ws, position, 9),
+                    position - ws
+                ),
+                "oracle seed at filled {filled}"
+            );
+            b.set_filled(seed);
+
+            let got_a = run(&mut a, &emb, &cos_l, &sin_l, position);
+            let got_b = run(&mut b, &emb, &cos_l, &sin_l, seed);
+            for (i, (av, bv)) in got_a.iter().zip(&got_b).enumerate() {
+                assert_eq!(
+                    av.to_bits(),
+                    bv.to_bits(),
+                    "filled {filled} (window_start {ws}, position_count {count}) element {i}: \
+                     the windowed decode must be BIT-identical to the seeded-window oracle \
+                     ({av} vs {bv}) — kv_base_offset wrong"
+                );
+            }
+            assert_eq!(a.filled(), filled);
+            if ws > 0 {
+                clipped += 1;
+            }
+        }
+        // Non-vacuity: the point of this test is the clipped regime.
+        assert!(
+            clipped >= 3,
+            "expected at least three depths past the window boundary, got {clipped}"
+        );
+        eprintln!(
+            "[h7-window] windowed decode bit-identical to the seeded-window oracle at filled \
+             {depths:?} (window {window}, max window_start {})",
+            cap - window
+        );
+    }
+
+    // gemma3→Metal merge gate MR2/H9 (recorded in GEMMA3_METAL_CONDUCTOR.md §9c). Appliance mode (2+ active
+    // slots) sets `resident_encode_ahead_enabled = false`, which reaches the
+    // engine as `next_rope: None` and suppresses the pre-encode pipeline
+    // entirely. The merge nests the gemma3 dual-theta table build INSIDE that
+    // gate, so the two configurations must be observationally identical — this
+    // pins that claim on a gemma3-shaped session (dual theta + sliding window +
+    // QK/sandwich norms) bit-for-bit, at every token.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_gemma3_decode_is_identical_with_encode_ahead_off() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let tokens = 12usize;
+        let window = 4usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    post_attn_norm: (0..hidden)
+                        .map(|i| 0.9 + ((i + li) as f32 % 3.0) * 0.03)
+                        .collect(),
+                    post_ffw_norm: (0..hidden)
+                        .map(|i| 0.95 + ((i + li) as f32 % 6.0) * 0.02)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let weights: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_norm: Some(&d.q_norm),
+                k_norm: Some(&d.k_norm),
+                post_attn_norm: Some(&d.post_attn_norm),
+                post_ffw_norm: Some(&d.post_ffw_norm),
+                ffn_geglu: true,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+            })
+            .collect();
+        let schedule = ResidentLayerSchedule {
+            use_alt_rope: vec![true, false],
+            window: vec![Some(window), None],
+        };
+        let mk = || {
+            ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                tokens,
+                tokens,
+                eps,
+                true,
+                Some(schedule.clone()),
+            )
+            .unwrap()
+        };
+        let take = |out: Option<ResidentTokenOut>| -> Vec<f32> {
+            match out.unwrap() {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            }
+        };
+        // The two sessions run SEQUENTIALLY, never interleaved: encode-ahead
+        // leaves a committed-but-gated command buffer parked on the kernel's
+        // ONE shared serial queue between iterations, so a second live session
+        // would sit behind it (and so would every concurrently running Metal
+        // test). Each session is also dropped before the next starts, which is
+        // what releases a trailing pending graph.
+        let sweep = |encode_ahead: bool| -> Vec<Vec<f32>> {
+            let mut session = mk();
+            let mut outs = Vec::with_capacity(tokens);
+            for t in 0..tokens {
+                let emb: Vec<f32> = (0..hidden)
+                    .map(|i| ((((i * 11 + t * 17) % 29) as f32) - 14.0) * 0.11)
+                    .collect();
+                let (cos_g, sin_g) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e6);
+                let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+                let (ncos_g, nsin_g) = crate::inference::gemma3_rope_tables(t + 1, head_dim, 1.0e6);
+                let (ncos_l, nsin_l) = crate::inference::gemma3_rope_tables(t + 1, head_dim, 1.0e4);
+                let (next_primary, next_alt) = if encode_ahead {
+                    (
+                        Some((ncos_g.as_slice(), nsin_g.as_slice())),
+                        Some((ncos_l.as_slice(), nsin_l.as_slice())),
+                    )
+                } else {
+                    (None, None)
+                };
+                outs.push(take(session.forward_token(
+                    &emb,
+                    &weights,
+                    &cos_g,
+                    &sin_g,
+                    Some((&cos_l, &sin_l)),
+                    t,
+                    scale,
+                    None,
+                    None,
+                    0,
+                    next_primary,
+                    next_alt,
+                )));
+            }
+            assert_eq!(session.filled(), tokens);
+            outs
+        };
+        let ahead = sweep(true);
+        let inline = sweep(false);
+        for (t, (a, b)) in ahead.iter().zip(&inline).enumerate() {
+            for (i, (av, bv)) in a.iter().zip(b).enumerate() {
+                assert_eq!(
+                    av.to_bits(),
+                    bv.to_bits(),
+                    "token {t} element {i}: encode-ahead must not change the decode \
+                     ({av} vs {bv})"
+                );
+            }
+        }
+        eprintln!(
+            "[mr2] {tokens}/{tokens} gemma3 tokens bit-identical with encode-ahead on and off"
+        );
+    }
+
+    // gemma3→Metal merge gate H6 (recorded in GEMMA3_METAL_CONDUCTOR.md §9c). `embed_row_gather_q8_wire` is
+    // the ONLY gather that reads `embed_scale` at buffer(4); the K-quant
+    // gathers declare buffers 0..3, so binding the scale there is legal and
+    // silently inert. Part 1 proves the inertness on the device; part 2 pins
+    // the host fail-closed that keeps a non-unit scale off those kernels.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kquant_embed_gather_drops_embed_scale_so_gpu_sampling_fails_closed() {
+        // Part 2 first: the guard is pure arithmetic and needs no device.
+        let g3 = (1152.0f32).sqrt();
+        for format in [
+            ResidentWeightFormat::Q8_0,
+            ResidentWeightFormat::Q4K,
+            ResidentWeightFormat::Q6K,
+        ] {
+            assert!(
+                gpu_sampling_tail_is_scale_safe(format, 1.0),
+                "a unit scale is a no-op on every gather ({format:?})"
+            );
+        }
+        assert!(
+            gpu_sampling_tail_is_scale_safe(ResidentWeightFormat::Q8_0, g3),
+            "the Q8_0 wire gather applies embed_scale"
+        );
+        assert!(
+            !gpu_sampling_tail_is_scale_safe(ResidentWeightFormat::Q4K, g3),
+            "a gemma3-style embed scale must refuse the Q4_K gather"
+        );
+        assert!(
+            !gpu_sampling_tail_is_scale_safe(ResidentWeightFormat::Q6K, g3),
+            "a gemma3-style embed scale must refuse the Q6_K gather"
+        );
+
+        if !detect_metal_device().available {
+            return;
+        }
+        let k = metal_linear_kernel().expect("metal");
+        let vocab = 4usize;
+        let n_sb = 1usize; // one 256-weight super-block per row
+        let hidden = n_sb * 256;
+        // Deterministic non-degenerate Q4_K super-blocks: real d/dmin halves in
+        // bytes 0..4, arbitrary but fixed scale/min and quant nibbles after.
+        let mut blocks = vec![0u8; vocab * n_sb * 144];
+        for (b, blk) in blocks.chunks_mut(144).enumerate() {
+            blk[..2].copy_from_slice(&f32_to_f16_bits(0.05 + b as f32 * 0.003).to_le_bytes());
+            blk[2..4].copy_from_slice(&f32_to_f16_bits(0.01 + b as f32 * 0.001).to_le_bytes());
+            for (j, byte) in blk[4..].iter_mut().enumerate() {
+                *byte = ((j * 37 + b * 11) % 251) as u8;
+            }
+        }
+        let wb = k.device.new_buffer_with_data(
+            blocks.as_ptr() as *const _,
+            blocks.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let ib = k
+            .device
+            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        unsafe { *(ib.contents() as *mut u32) = 2u32 };
+        let ob = k
+            .device
+            .new_buffer((hidden * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let gather = |embed_scale: f32| -> Vec<f32> {
+            let sc = k
+                .device
+                .new_buffer(8, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = sc.contents() as *mut u8;
+                *(p as *mut u32) = n_sb as u32;
+                *(p.add(4) as *mut f32) = embed_scale;
+            }
+            let cb = k.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&k.embed_row_gather_q4k_pipeline);
+            e.set_buffer(0, Some(&wb), 0);
+            e.set_buffer(1, Some(&ib), 0);
+            e.set_buffer(2, Some(&ob), 0);
+            e.set_buffer(3, Some(&sc), 0);
+            // Legal on a kernel that never declared it — this is the hazard.
+            e.set_buffer(4, Some(&sc), 4);
+            dispatch_1d(e, &k.embed_row_gather_q4k_pipeline, hidden);
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let mut got = vec![0.0f32; hidden];
+            read_buffer_f32(&ob, &mut got);
+            got
+        };
+        let plain = gather(1.0);
+        let scaled = gather(g3);
+        assert!(
+            plain.iter().any(|v| v.abs() > 1.0e-6),
+            "fixture must produce a non-trivial row"
+        );
+        for (i, (a, b)) in scaled.iter().zip(&plain).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "element {i}: the Q4_K gather must be BIT-identical with and without a \
+                 buffer(4) embed_scale ({a} vs {b}) — if this now differs the kernel gained \
+                 the parameter and `gpu_sampling_tail_is_scale_safe` should be relaxed"
+            );
+        }
+        eprintln!(
+            "[h6] Q4_K gather ignores buffer(4) embed_scale; GPU sampling fails closed instead"
         );
     }
 

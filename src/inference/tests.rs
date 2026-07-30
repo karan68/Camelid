@@ -14250,3 +14250,35 @@ fn metal_resident_rollback_moves_filled_with_the_kv_position() {
     session.rollback_resident_to_position(0).unwrap();
     assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 0);
 }
+
+// gemma3→Metal merge gate MR1 (recorded in GEMMA3_METAL_CONDUCTOR.md §9c). `ResidentDecodeState::new` reads
+// the process-global K-quant lane flag through `resident_kv_format()` to pick
+// the primary KV format, so `set_resident_kquant_lane` must run immediately
+// before EVERY resident session construction: the prefill builder and the
+// decode rebuild branch. Dropping either one is silent — the session just gets
+// an F32 primary where it should have had F16, with no failing assertion
+// anywhere — and both sites sit in hunks that conflict on every rebase onto a
+// branch that touches session construction. A source-level count is crude but
+// it is the only thing that fails when a merge quietly deletes one.
+#[test]
+fn resident_session_construction_sets_the_kquant_lane_at_both_sites() {
+    let src = include_str!("metal_resident.rs");
+    let calls: Vec<usize> = src
+        .match_indices("metal::set_resident_kquant_lane(weights_use_kquant(")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected the K-quant lane to be recorded at both resident construction \
+         sites (prefill + decode rebuild), found {}",
+        calls.len()
+    );
+    for at in calls {
+        assert!(
+            src[at..].contains("metal::ResidentDecodeState::new("),
+            "a set_resident_kquant_lane call must precede the session construction \
+             it configures"
+        );
+    }
+}
