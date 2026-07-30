@@ -28,8 +28,11 @@ use tower_http::trace::TraceLayer;
 
 #[allow(dead_code)]
 mod continuous_batch;
+mod contract;
 mod engine;
 mod metrics;
+mod responses;
+mod responses_store;
 mod server;
 mod workspace;
 
@@ -148,6 +151,13 @@ pub struct AppState {
     allow_local_model_delete: bool,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
+    /// Durable local state for opt-in Responses objects and Conversations.
+    /// The store opens short-lived SQLite connections so cloned routers share
+    /// on-disk state without tying a connection to an async executor thread.
+    responses_store: responses_store::ResponsesStore,
+    /// Requests that mutate the same durable conversation (or reuse the same
+    /// idempotency key) are serialized through a process-local keyed lock.
+    responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
     /// Browser requests continue to use the independent same-origin predicate.
@@ -203,6 +213,8 @@ impl Default for AppState {
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             verification_reports: Arc::new(RwLock::new(HashMap::new())),
+            responses_store: responses_store::ResponsesStore::default(),
+            responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
             workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
@@ -246,6 +258,17 @@ impl AppState {
     /// here, once, so it stays stable however the process was launched.
     pub fn with_models_dir(mut self, models_dir: Option<PathBuf>) -> Self {
         self.models_dir = resolve_models_dir(models_dir);
+        self
+    }
+
+    /// Override the durable Responses/Conversations SQLite path.
+    ///
+    /// The default is `CAMELID_RESPONSES_DB` or the platform data directory.
+    /// This builder is also useful for embedding Camelid with an isolated
+    /// persistence boundary.
+    pub fn with_responses_store_path(mut self, path: PathBuf) -> Self {
+        self.responses_store = responses_store::ResponsesStore::new(path);
+        self.responses_locks = responses_store::ResponseLockPool::default();
         self
     }
 
@@ -549,6 +572,10 @@ pub struct CapabilitiesResponse {
     /// This registry is intentionally separate from model support rows.
     pub runtime_projects: Vec<crate::runtime_manifest::RuntimeProjectCapability>,
     pub api_features: Vec<SupportItem>,
+    /// Executable API contract descriptors. The vertical-slice conformance
+    /// tests drive these routes and modes; `api_features` is the compact
+    /// frontend-compatible projection of the same typed registry.
+    pub api_conformance: Vec<serde_json::Value>,
     pub notes: Vec<&'static str>,
 }
 
@@ -696,8 +723,8 @@ pub struct ChatCompletionRequest {
     /// OpenAI-style tool/function definitions. When present, they are rendered
     /// into the prompt through the loaded model's own chat template (Hybrid agent
     /// mode); the model's tool-call output is parsed back into `tool_calls` (for
-    /// templates that render tools â€” Llama 3.x etc.). Models whose template does
-    /// not render tools simply ignore them.
+    /// certified templates such as Llama 3.x, Mistral, and Qwen3). Models without
+    /// a certified tool branch fail closed instead of silently dropping tools.
     pub tools: Option<Vec<serde_json::Value>>,
     /// OpenAI `tool_choice`: `"auto"` (default), `"none"` (suppress parsing), or
     /// `"required"`/a specific function (treated as `auto`). Parsed permissively
@@ -803,7 +830,23 @@ pub struct ChatMessage {
 #[derive(Deserialize)]
 struct ChatMessageWire {
     role: String,
-    content: ChatContentWire,
+    #[serde(default)]
+    content: Option<ChatContentWire>,
+    /// Assistant tool calls from a previous turn. Camelid canonicalizes these
+    /// into the exact JSON envelope its certified templates train on, so the
+    /// next request can include the model call and the matching tool result
+    /// instead of losing the call at the HTTP boundary.
+    #[serde(default)]
+    tool_calls: Vec<IncomingToolCall>,
+    /// Accepted for OpenAI tool-result round trips. The id links client-side
+    /// execution to the preceding call; the model prompt needs the tool output
+    /// content, not the opaque id, so it is intentionally not rendered.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    /// Legacy function-message name. Accepted so clients can replay older
+    /// function-call conversations through the same canonical tool role.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -820,15 +863,65 @@ struct ChatContentPartWire {
     text: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct IncomingToolCall {
+    #[allow(dead_code)]
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    function: IncomingToolCallFunction,
+}
+
+#[derive(Deserialize)]
+struct IncomingToolCallFunction {
+    name: String,
+    /// Chat Completions carries arguments as a JSON-encoded string. Accept a
+    /// raw JSON value too because several local clients use that convenient
+    /// form; it is normalized to an object/value before prompt rendering.
+    arguments: serde_json::Value,
+}
+
+fn canonical_incoming_tool_calls(
+    calls: &[IncomingToolCall],
+) -> std::result::Result<String, String> {
+    let mut rendered = Vec::with_capacity(calls.len());
+    for call in calls {
+        if call.kind.as_deref().is_some_and(|kind| kind != "function") {
+            return Err("only function tool calls are supported".to_string());
+        }
+        if call.function.name.trim().is_empty() {
+            return Err("tool call function names must not be empty".to_string());
+        }
+        let arguments = match &call.function.arguments {
+            serde_json::Value::String(value) => serde_json::from_str(value).map_err(|err| {
+                format!(
+                    "tool call arguments for {:?} must contain valid JSON: {err}",
+                    call.function.name
+                )
+            })?,
+            value => value.clone(),
+        };
+        rendered.push(
+            serde_json::json!({
+                "name": call.function.name,
+                "parameters": arguments,
+            })
+            .to_string(),
+        );
+    }
+    Ok(rendered.join("\n"))
+}
+
 impl<'de> Deserialize<'de> for ChatMessage {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = ChatMessageWire::deserialize(deserializer)?;
-        let (content, unsupported_content_parts) = match wire.content {
-            ChatContentWire::Text(text) => (text, Vec::new()),
-            ChatContentWire::Parts(parts) => {
+        let mut wire = ChatMessageWire::deserialize(deserializer)?;
+        let (mut content, unsupported_content_parts) = match wire.content {
+            Some(ChatContentWire::Text(text)) => (text, Vec::new()),
+            Some(ChatContentWire::Parts(parts)) => {
                 let mut text = String::new();
                 let mut unsupported = Vec::new();
                 for part in parts {
@@ -840,7 +933,33 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 }
                 (text, unsupported)
             }
+            None => (String::new(), Vec::new()),
         };
+        if !wire.tool_calls.is_empty() {
+            if wire.role != "assistant" {
+                return Err(serde::de::Error::custom(
+                    "tool_calls are only valid on assistant messages",
+                ));
+            }
+            let canonical = canonical_incoming_tool_calls(&wire.tool_calls)
+                .map_err(serde::de::Error::custom)?;
+            if content.trim().is_empty() {
+                content = canonical;
+            } else {
+                content.push('\n');
+                content.push_str(&canonical);
+            }
+        }
+        if wire.tool_call_id.is_some() && wire.role != "tool" {
+            return Err(serde::de::Error::custom(
+                "tool_call_id is only valid on tool messages",
+            ));
+        }
+        if wire.name.is_some() && wire.role == "function" {
+            // Legacy `function` messages are rendered through the same tool
+            // result role modern templates understand.
+            wire.role = "tool".to_string();
+        }
         Ok(ChatMessage {
             role: wire.role,
             content,
@@ -1495,7 +1614,7 @@ pub struct ChatCompletionMessage {
 }
 
 /// OpenAI tool-call object surfaced in an assistant message.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -1503,7 +1622,7 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolCallFunction {
     pub name: String,
     /// JSON-encoded arguments string (OpenAI shape).
@@ -1584,6 +1703,28 @@ pub struct ChatCompletionDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatCompletionToolCallDelta>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatCompletionToolCallDelta {
+    pub index: usize,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: ToolCallFunction,
+}
+
+impl From<(usize, ToolCall)> for ChatCompletionToolCallDelta {
+    fn from((index, call): (usize, ToolCall)) -> Self {
+        Self {
+            index,
+            id: call.id,
+            kind: call.kind,
+            function: call.function,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2191,7 +2332,26 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
-        .route("/v1/responses", post(unsupported_responses))
+        .route("/v1/responses", post(responses::create))
+        .route(
+            "/v1/responses/:id",
+            get(responses::get_response).delete(responses::delete_response),
+        )
+        .route("/v1/conversations", post(responses::create_conversation))
+        .route(
+            "/v1/conversations/:id",
+            get(responses::get_conversation)
+                .post(responses::update_conversation)
+                .delete(responses::delete_conversation),
+        )
+        .route(
+            "/v1/conversations/:id/items",
+            get(responses::list_conversation_items).post(responses::add_conversation_items),
+        )
+        .route(
+            "/v1/conversations/:id/items/:item_id",
+            get(responses::get_conversation_item).delete(responses::delete_conversation_item),
+        )
         .route("/v1/messages", post(unsupported_messages))
         .route("/v1/rerank", post(rerank))
         .route("/v1/reranking", post(rerank))
@@ -3613,14 +3773,6 @@ async fn rerank(
         }),
     )
         .into_response()
-}
-
-async fn unsupported_responses() -> Response {
-    unsupported_route(
-        "unsupported_responses",
-        "OpenAI Responses compatibility is not supported yet; Camelid keeps generation on /v1/completions and /v1/chat/completions until request conversion, streaming, tool, and cancellation semantics are implemented and tested",
-        Some("input"),
-    )
 }
 
 async fn unsupported_messages() -> Response {
@@ -5450,98 +5602,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
             .projects
             .clone(),
-        api_features: vec![
-            SupportItem {
-                id: "camelid_verify",
-                status: "partial",
-                notes: "CLI `camelid verify <gguf>` plus GET/POST /api/models/verify replay one pinned deterministic request for a built-in exact-GGUF-hash profile and emit a digest-sealed report. The initial profile covers only the tracked Llama 3.2 1B Instruct Q8_0 Windows artifact. A pass proves that one request on those exact bytes; it is not a digital signature, broad certification, support promotion, or performance claim.",
-            },
-            SupportItem {
-                id: "openai_chat_completions",
-                status: "supported_current_gate",
-                notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
-            },
-            SupportItem {
-                id: "llguidance_structured_outputs",
-                status: "supported_current_gate_nonstreaming",
-                notes: "non-streaming /v1/chat/completions constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and non-chat generation lanes remain typed unsupported.",
-            },
-            SupportItem {
-                id: "openai_embeddings",
-                status: "supported_exact_model_row",
-                notes: "POST /v1/embeddings plus /embedding and /embeddings aliases accept one string or a bounded string batch, return finite unit-normalized float vectors and exact tokenizer usage, and support Nomic Matryoshka dimensions. The current gate is the exact Nomic Embed Text v1.5 Q8_0 catalog row; base64 encoding, token-id input, arbitrary encoder families/quants, and GPU execution are unsupported.",
-            },
-            SupportItem {
-                id: "embedding_similarity_reranking",
-                status: "supported_exact_model_row",
-                notes: "POST /rerank, /reranking, /v1/rerank, and /v1/reranking rank bounded string/object documents by cosine similarity using Nomic search_query/search_document prefixes, stable score ordering, optional top_n, and optional returned documents. This is bi-encoder embedding-similarity reranking, not a classifier-head cross-encoder claim.",
-            },
-            SupportItem {
-                id: "web_workspace",
-                status: "supported_current_gate",
-                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim.",
-            },
-            SupportItem {
-                id: "stream_options.include_usage",
-                status: "supported_current_gate",
-                notes: "chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/.",
-            },
-            SupportItem {
-                id: "tokenizer_encode_decode",
-                status: "supported_current_gate",
-                notes: "loaded-model tokenizer APIs for supported tokenizer families",
-            },
-            SupportItem {
-                id: "llama_server_tokenizer_aliases",
-                status: "partial",
-                notes: "POST /tokenize and POST /detokenize are bounded loaded-model tokenizer aliases that return token ids/text, with /tokenize with_pieces=true exposing id/piece objects for supported tokenizer lanes. Arbitrary tokenizer kwargs and broader tokenizer parity remain unsupported.",
-            },
-            SupportItem {
-                id: "llama_server_models",
-                status: "partial",
-                notes: "GET /models returns a privacy-safe read-only list of currently loaded Camelid models with redacted paths and text-only architecture metadata. POST /models/load is a narrow local-path alias over Camelid's stable /api/models/load path and returns a redacted compatibility response. Router-mode query params such as reload/autoload/model selection, cache listing, POST /models/unload, multimodal metadata, and full llama-server model-management parity remain unsupported.",
-            },
-            SupportItem {
-                id: "llama_server_props",
-                status: "partial",
-                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, generic embedding-model compatibility, or full llama-server WebUI parity.",
-            },
-            SupportItem {
-                id: "llama_server_slots",
-                status: "partial",
-                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported.",
-            },
-            SupportItem {
-                id: "production_server_hardening",
-                status: "supported",
-                notes: "Startup-resolved bearer/X-API-Key authentication with key-file support, fail-closed non-loopback binding, explicit CORS origin allowlists, optional rustls TLS, request/prompt/generation/download ceilings, and a Prometheus /metrics surface for HTTP/generation/token/cache/queue/slot/RSS/VRAM telemetry. Anonymous same-origin loopback remains the default.",
-            },
-            SupportItem {
-                id: "llama_server_apply_template",
-                status: "partial",
-                notes: "POST /apply-template renders loaded-model chat messages to a prompt string without inference. It is scoped to Camelid's supported tokenizer/template renderers and returns typed unsupported errors for unknown request fields or unsupported templates.",
-            },
-            SupportItem {
-                id: "llama_server_completion",
-                status: "partial",
-                notes: "POST /completion accepts a narrow non-streaming text-generation subset: text prompts, token-id prompt arrays, n_predict/max_tokens, supported sampler fields, and stop sequences are mapped onto Camelid's existing generation path. Native stream=true chunks, slot selection, cache_prompt controls, llama-server timings shape, rich token probabilities, and full llama-server generation parity remain unsupported.",
-            },
-            SupportItem {
-                id: "fail_closed_native_compatibility_routes",
-                status: "unsupported",
-                notes: "Native /infill, /v1/messages, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row.",
-            },
-            SupportItem {
-                id: "multi_choice_generation",
-                status: "unsupported",
-                notes: "typed unsupported until implemented and tested",
-            },
-            SupportItem {
-                id: "rich_logprobs",
-                status: "partial",
-                notes: "diagnostic logit surfaces exist; full OpenAI-compatible logprobs remain planned",
-            },
-        ],
+        api_features: contract::api_feature_contract(),
+        api_conformance: contract::api_conformance_contract(),
         notes: vec![
             "GGUF metadata, tokenizer metadata, tensor loading, Camelid dense config extraction, and tensor binding are available",
             "public completion endpoints can generate small OpenAI-compatible non-streaming responses and SSE token streams from a loaded Camelid-supported dense GGUF model",
@@ -7548,13 +7610,7 @@ async fn runnable_chat_nonstreaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
-    let tools: Vec<serde_json::Value> = req
-        .tools
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
-        .collect();
+    let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
@@ -7613,7 +7669,15 @@ async fn runnable_chat_nonstreaming(
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
-    let tool_calls = parse_ornith_tool_calls_json(&content);
+    // Gated on tool_choice, not tool presence: the agent loop deliberately
+    // lifts envelopes with no tools in the request, but a `tool_choice:"none"`
+    // response must never carry tool_calls (OpenAI semantics), even if the
+    // model mimics envelope syntax from its conversation history.
+    let tool_calls = if tool_choice_allows_calls(req.tool_choice.as_ref()) {
+        parse_ornith_tool_calls_json(&content)
+    } else {
+        Vec::new()
+    };
     let finish_reason = if tool_calls.is_empty() {
         "stop"
     } else {
@@ -7653,11 +7717,12 @@ async fn runnable_chat_nonstreaming(
 
 /// Streaming chat for a runnable-served model (qwen35/Ornith), SSE. Mirrors the
 /// OpenAI `chat.completion.chunk` shape and the non-streaming bridge's semantics:
-/// think-block tokens stream as `delta.reasoning_content`, post-`</think>` tokens
-/// as `delta.content` (tool-call XML included, as in non-streaming), then one
-/// aggregate `tool_calls` delta when the finished content lifts into structured
-/// calls, the finish_reason chunk, an optional `stream_options.include_usage`
-/// terminal usage chunk, and `[DONE]`. The phase switch keys on the `</think>`
+/// think-block tokens stream as `delta.reasoning_content`. Tool-enabled content
+/// is held until completion so a raw `<tool_call>` envelope is never leaked:
+/// the stream then emits either one ordinary content delta or structured
+/// `tool_calls` deltas, followed by the finish_reason chunk, an optional
+/// `stream_options.include_usage` terminal usage chunk, and `[DONE]`. The phase
+/// switch keys on the `</think>`
 /// TOKEN ID (a single user_defined token in the qwen35 vocab), so no text
 /// scanning is needed; per-phase text is decoded incrementally with UTF-8
 /// hold-back (a multi-token code point emits only once complete).
@@ -7668,13 +7733,7 @@ async fn runnable_chat_streaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
-    let tools: Vec<serde_json::Value> = req
-        .tools
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
-        .collect();
+    let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
@@ -7707,6 +7766,13 @@ async fn runnable_chat_streaming(
     let prompt_token_count = prompt_ids.len();
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
+    let parse_stream_tool_calls = !tools.is_empty();
+    // Post-hoc envelope lifting is gated on tool_choice, not tool presence:
+    // the agent loop lifts with no tools in the request, but under
+    // `tool_choice:"none"` the content has already streamed as plain deltas
+    // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
+    // duplicate the streamed text as a structured tool_calls delta.
+    let lift_tool_calls = tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
     let created = unix_secs();
 
@@ -7795,6 +7861,13 @@ async fn runnable_chat_streaming(
                     let delta = if in_think {
                         serde_json::json!({ "reasoning_content": delta_text })
                     } else {
+                        if parse_stream_tool_calls {
+                            // Hold the model envelope until it can be classified
+                            // as a tool call. The completed text below is the
+                            // single source for either structured calls or
+                            // ordinary fallback content.
+                            continue;
+                        }
                         serde_json::json!({ "content": delta_text })
                     };
                     yield Ok(Event::default().data(chunk(delta, None).to_string()));
@@ -7813,7 +7886,11 @@ async fn runnable_chat_streaming(
         match final_state {
             Some(Ok((text, ids))) => {
                 let (_reasoning, content) = split_ornith_think(&text);
-                let tool_calls = parse_ornith_tool_calls_json(&content);
+                let tool_calls = if lift_tool_calls {
+                    parse_ornith_tool_calls_json(&content)
+                } else {
+                    Vec::new()
+                };
                 let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
                 if !tool_calls.is_empty() {
                     let deltas: Vec<serde_json::Value> = tool_calls
@@ -7827,6 +7904,10 @@ async fn runnable_chat_streaming(
                         .collect();
                     yield Ok(Event::default().data(
                         chunk(serde_json::json!({ "tool_calls": deltas }), None).to_string(),
+                    ));
+                } else if parse_stream_tool_calls && !content.is_empty() {
+                    yield Ok(Event::default().data(
+                        chunk(serde_json::json!({ "content": content }), None).to_string(),
                     ));
                 }
                 yield Ok(Event::default().data(chunk(serde_json::json!({}), Some(finish)).to_string()));
@@ -9945,7 +10026,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false);
+        return stream_completion(&state, prepared, false, false, false);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -10149,6 +10230,18 @@ async fn chat_completions(
             Some("response_format"),
         )
     };
+    let tools_active = req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        && tool_choice_allows_calls(req.tool_choice.as_ref());
+    let tools_unsupported_on_lane = |lane: &str| {
+        api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_tools",
+            format!(
+                "the {lane} serve lane does not support tools: its chat template has no certified tool-call branch"
+            ),
+            Some("tools"),
+        )
+    };
     // Gemma 4 serve path (additive, on by default; opt-out CAMELID_GEMMA4_SERVE=0).
     // Short-circuits if this request targets a loaded gemma4 runtime; otherwise falls
     // through to the existing Llama/3B path unchanged.
@@ -10156,6 +10249,9 @@ async fn chat_completions(
         Ok(Some((id, runtime))) => {
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
+            }
+            if tools_active {
+                return tools_unsupported_on_lane("gemma4");
             }
             return if req.stream.unwrap_or(false) {
                 gemma4_chat_streaming(id, runtime, &req).await
@@ -10189,6 +10285,9 @@ async fn chat_completions(
         Ok(Some((id, runtime))) => {
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
+            }
+            if tools_active {
+                return tools_unsupported_on_lane("diffusion-gemma");
             }
             if req.stream.unwrap_or(false) {
                 return dg_chat_streaming(id, runtime, &req).await;
@@ -10234,6 +10333,15 @@ async fn chat_completions(
             Some("camelid_receipt"),
         );
     }
+    if n_choices > 1 && tools_active {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "tool calls are not supported with n greater than 1; request one choice so call ids and arguments have an unambiguous continuation"
+                .to_string(),
+            Some("n"),
+        );
+    }
     // Capture the receipt stamp before the request is consumed. Receipts are
     // strictly opt-in and never silently attached.
     let receipt_stamp = if req.camelid_receipt.unwrap_or(false) {
@@ -10257,8 +10365,6 @@ async fn chat_completions(
     let wants_logprobs = matches!(req.logprobs, Some(true)) || req.top_logprobs.is_some();
     // Tool calls are surfaced on the non-streaming single-choice path when the
     // request supplied tools and tool_choice is not "none".
-    let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
-        && tool_choice_allows_calls(req.tool_choice.as_ref());
     // The constraint itself was parsed before lane dispatch (see above); this
     // captures whether one is active before `constraint` moves into the
     // generation request, for the tool-call parse gate below.
@@ -10328,7 +10434,11 @@ async fn chat_completions(
         camelid_enable_thinking: req
             .camelid_enable_thinking
             .or(state.default_enable_thinking.then_some(true)),
-        tools: req.tools,
+        // `tool_choice: "none"` disables tool calling for this request (OpenAI
+        // semantics), so render the prompt without tools: rows whose template
+        // has no certified tools branch keep serving plain chat instead of
+        // failing closed on a request that never wanted calls.
+        tools: if tools_active { req.tools } else { None },
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         constraint,
@@ -10349,7 +10459,13 @@ async fn chat_completions(
     if stream {
         // Streaming decodes are engine jobs too; the SSE layer just maps the
         // job's events onto chunks.
-        return stream_completion(&state, prepared, true, include_usage);
+        return stream_completion(
+            &state,
+            prepared,
+            true,
+            include_usage,
+            tools_active && !constraint_active,
+        );
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -13717,6 +13833,26 @@ fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
     !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
 }
 
+/// Tools the runnable serve lane should render and parse for this request,
+/// unwrapped from the OpenAI `{"type":"function","function":{...}}` envelope.
+/// `tool_choice: "none"` disables tool calling for the request (OpenAI
+/// semantics): the lane then renders and streams plain chat instead of
+/// rendering tools into the prompt and holding tool envelopes the caller
+/// opted out of. The lanes' post-hoc `<function=...>` lifting is gated
+/// separately on `tool_choice_allows_calls` (not on this list being empty,
+/// because the agent loop lifts envelopes with no tools in the request).
+fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value> {
+    if !tool_choice_allows_calls(req.tool_choice.as_ref()) {
+        return Vec::new();
+    }
+    req.tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.get("function").cloned().unwrap_or(t))
+        .collect()
+}
+
 /// Whether the model's raw content should be probed for a tool call.
 /// Constrained output is content by definition: OpenAI allows tools and
 /// response_format together, and a schema that legitimately declares a `name`
@@ -13728,37 +13864,96 @@ fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool 
     tools_active && !constraint_active
 }
 
-/// Parse a model's tool-call output into OpenAI `tool_calls`. Handles the Llama
-/// 3.x form `{"name": <fn>, "parameters": {...}}` (also `"arguments"`), optionally
-/// `<|python_tag|>`-prefixed, and tolerates trailing junk small models emit.
-/// Returns `None` when the text is prose, not a tool call.
+/// Parse a model's tool-call output into OpenAI `tool_calls`.
+///
+/// Certified local templates emit one of three shapes:
+/// - Llama 3.x bare JSON, optionally `<|python_tag|>` prefixed;
+/// - Qwen/Hermes `<tool_call>{...}</tool_call>` blocks;
+/// - Mistral `[TOOL_CALLS] [...]`.
+///
+/// The parser tolerates trailing junk after a complete JSON value but remains
+/// strict about function names and JSON arguments, so ordinary prose is never
+/// reclassified as a call.
 fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let trimmed = text.trim();
     let trimmed = trimmed
         .strip_prefix("<|python_tag|>")
         .unwrap_or(trimmed)
         .trim_start();
-    // Read the first complete JSON value; ignore any trailing junk.
-    let value = serde_json::Deserializer::from_str(trimmed)
+
+    let mut values = Vec::new();
+    let mut remainder = trimmed;
+    while let Some(start) = remainder.find("<tool_call>") {
+        let after_start = &remainder[start + "<tool_call>".len()..];
+        let Some(end) = after_start.find("</tool_call>") else {
+            break;
+        };
+        if let Some(value) = first_json_value(&after_start[..end]) {
+            values.push(value);
+        }
+        remainder = &after_start[end + "</tool_call>".len()..];
+    }
+    if values.is_empty() {
+        let mistral = trimmed
+            .strip_prefix("[TOOL_CALLS]")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        values.push(first_json_value(mistral)?);
+    }
+
+    let values = values
+        .into_iter()
+        .flat_map(|value| match value {
+            serde_json::Value::Array(values) => values,
+            value => vec![value],
+        })
+        .collect::<Vec<_>>();
+    let calls = values
+        .iter()
+        .filter_map(tool_call_from_value)
+        .collect::<Vec<_>>();
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn first_json_value(text: &str) -> Option<serde_json::Value> {
+    serde_json::Deserializer::from_str(text.trim())
         .into_iter::<serde_json::Value>()
         .next()?
-        .ok()?;
+        .ok()
+}
+
+fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
     let obj = value.as_object()?;
-    let name = obj.get("name")?.as_str()?.to_string();
+    let function = obj.get("function").and_then(serde_json::Value::as_object);
+    let name = function
+        .and_then(|function| function.get("name"))
+        .or_else(|| obj.get("name"))?
+        .as_str()?
+        .trim();
     if name.is_empty() {
         return None;
     }
-    let args = obj
-        .get("parameters")
+    let args = function
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| obj.get("parameters"))
         .or_else(|| obj.get("arguments"))
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let args = match args {
+        serde_json::Value::String(encoded) => {
+            serde_json::from_str(&encoded).unwrap_or(serde_json::Value::String(encoded))
+        }
+        args => args,
+    };
     let arguments = serde_json::to_string(&args).ok()?;
-    Some(vec![ToolCall {
+    Some(ToolCall {
         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
         kind: "function",
-        function: ToolCallFunction { name, arguments },
-    }])
+        function: ToolCallFunction {
+            name: name.to_string(),
+            arguments,
+        },
+    })
 }
 
 fn top_logit_diagnostics(
@@ -14219,6 +14414,33 @@ fn run_stream_decode_job(
         }
     }
 
+    // An exact prompt-cache hit samples the first token above, before the main
+    // loop. Emit it now; otherwise a one-token cached stream reaches Finished
+    // with correct usage but no content delta. Longer cached streams also must
+    // establish `streamed_text` before subsequent deltas are diffed.
+    if !generated.is_empty() {
+        let mut text = match prepared.tokenizer.decode(&generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                return;
+            }
+        };
+        if finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
+        }
+        if !text.is_empty() {
+            streamed_text = text.clone();
+            first_content_ms = Some(generation_started.elapsed().as_millis());
+            if !send(StreamDecodeEvent::Delta(text)) {
+                return;
+            }
+        }
+    }
+
     for _ in generated.len() as u32..prepared.max_tokens {
         if finish_reason != "length" {
             break;
@@ -14385,6 +14607,7 @@ fn stream_completion(
     mut prepared: PreparedGeneration,
     chat: bool,
     include_usage: bool,
+    parse_stream_tool_calls: bool,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -14428,6 +14651,11 @@ fn stream_completion(
             poll_yield_enabled: stream_poll_yield,
             ..StreamEventTimings::default()
         };
+        // A certified tool-call envelope must never leak through `delta.content`
+        // before it is recognized. Tool-enabled streams therefore hold content
+        // until completion, then emit either one normal content delta or
+        // structured OpenAI `tool_calls` deltas.
+        let mut tool_candidate = String::new();
         if chat {
             stream_event_timings.role_yield = Some(stream_started.elapsed().as_millis());
             let role_chunk = ChatCompletionStreamChunk {
@@ -14440,6 +14668,7 @@ fn stream_completion(
                     delta: ChatCompletionDelta {
                         role: Some("assistant"),
                         content: None,
+                        tool_calls: None,
                     },
                     finish_reason: None,
                 }],
@@ -14461,6 +14690,10 @@ fn stream_completion(
                             Some(stream_started.elapsed().as_millis());
                     }
                     if chat {
+                        if parse_stream_tool_calls {
+                            tool_candidate.push_str(&delta);
+                            continue;
+                        }
                         let chunk = ChatCompletionStreamChunk {
                             id: stream_id.clone(),
                             object: "chat.completion.chunk",
@@ -14471,6 +14704,7 @@ fn stream_completion(
                                 delta: ChatCompletionDelta {
                                     role: None,
                                     content: Some(delta),
+                                    tool_calls: None,
                                 },
                                 finish_reason: None,
                             }],
@@ -14518,6 +14752,54 @@ fn stream_completion(
                         stream_timing_diagnostics_json(&timings, first_content_ms, stream_event_timings)
                     });
                     if chat {
+                        let mut resolved_finish_reason = finish_reason;
+                        if parse_stream_tool_calls {
+                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate) {
+                                resolved_finish_reason = "tool_calls";
+                                let tool_calls = tool_calls
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(ChatCompletionToolCallDelta::from)
+                                    .collect();
+                                let chunk = ChatCompletionStreamChunk {
+                                    id: stream_id.clone(),
+                                    object: "chat.completion.chunk",
+                                    created: 0,
+                                    model: model_id.clone(),
+                                    choices: vec![ChatCompletionStreamChoice {
+                                        index: 0,
+                                        delta: ChatCompletionDelta {
+                                            role: None,
+                                            content: None,
+                                            tool_calls: Some(tool_calls),
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                    camelid: None,
+                                    usage: None,
+                                };
+                                yield sse_json_event(&chunk);
+                            } else if !tool_candidate.is_empty() {
+                                let chunk = ChatCompletionStreamChunk {
+                                    id: stream_id.clone(),
+                                    object: "chat.completion.chunk",
+                                    created: 0,
+                                    model: model_id.clone(),
+                                    choices: vec![ChatCompletionStreamChoice {
+                                        index: 0,
+                                        delta: ChatCompletionDelta {
+                                            role: None,
+                                            content: Some(mem::take(&mut tool_candidate)),
+                                            tool_calls: None,
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                    camelid: None,
+                                    usage: None,
+                                };
+                                yield sse_json_event(&chunk);
+                            }
+                        }
                         let final_chunk = ChatCompletionStreamChunk {
                             id: stream_id.clone(),
                             object: "chat.completion.chunk",
@@ -14528,8 +14810,9 @@ fn stream_completion(
                                 delta: ChatCompletionDelta {
                                     role: None,
                                     content: None,
+                                    tool_calls: None,
                                 },
-                                finish_reason: Some(finish_reason),
+                                finish_reason: Some(resolved_finish_reason),
                             }],
                             camelid: camelid_diagnostics.clone(),
                             usage: None,
@@ -14797,6 +15080,12 @@ fn render_chat_prompt_for_tokenization_with_tools(
                 parse_special: true,
             });
         }
+        if !template.contains("tools") && !template.contains("custom_tools") {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the loaded chat template has no certified tools branch; failing closed",
+            ));
+        }
         return render_metadata_jinja_chat_template_prompt(
             messages,
             tokenizer,
@@ -14804,9 +15093,9 @@ fn render_chat_prompt_for_tokenization_with_tools(
             Some(&normalized),
         );
     }
-    // Agent/tools rendering is the deterministic thinking-disabled path.
-    Ok(render_chat_prompt_for_tokenization_fallback(
-        messages, tokenizer, false,
+    Err(MiniJinjaError::new(
+        MiniJinjaErrorKind::InvalidOperation,
+        "the loaded tokenizer has no chat template for tool rendering; failing closed",
     ))
 }
 
@@ -15645,6 +15934,7 @@ fn api_error(
         });
     }
     let error_type = match status {
+        StatusCode::INTERNAL_SERVER_ERROR => "server_error",
         StatusCode::NOT_IMPLEMENTED => "not_implemented",
         StatusCode::SERVICE_UNAVAILABLE => "runtime_unavailable",
         StatusCode::UNPROCESSABLE_ENTITY => "model_unavailable",
@@ -15987,7 +16277,13 @@ mod tests {
         std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
 
         let state = AppState::default();
-        let response = stream_completion(&state, orphan_test_prepared("model-a.gguf"), true, false);
+        let response = stream_completion(
+            &state,
+            orphan_test_prepared("model-a.gguf"),
+            true,
+            false,
+            false,
+        );
 
         // Drive the SSE body the way a client does. The reader task polls the
         // stream into its first token step; aborting it is the hangup — the
@@ -16188,6 +16484,7 @@ mod tests {
                 delta: ChatCompletionDelta {
                     role: Some("assistant"),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -16492,6 +16789,79 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_calls_handles_qwen_blocks_and_mistral_arrays() {
+        let qwen = parse_tool_calls(
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>
+<tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>"#,
+        )
+        .unwrap();
+        assert_eq!(qwen.len(), 2);
+        assert_eq!(qwen[0].function.name, "read_file");
+        assert_eq!(qwen[0].function.arguments, r#"{"path":"a.txt"}"#);
+        assert_eq!(qwen[1].function.name, "list_dir");
+
+        let mistral = parse_tool_calls(
+            r#"[TOOL_CALLS] [{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}]"#,
+        )
+        .unwrap();
+        assert_eq!(mistral.len(), 1);
+        assert_eq!(mistral[0].function.name, "read_file");
+        assert_eq!(mistral[0].function.arguments, r#"{"path":"b.txt"}"#);
+    }
+
+    #[test]
+    fn chat_message_accepts_tool_call_roundtrip_wire_shape() {
+        let assistant: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "arguments": "{\"city\":\"Paris\"}"
+                }
+            }]
+        }))
+        .unwrap();
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(
+            assistant.content,
+            r#"{"name":"weather","parameters":{"city":"Paris"}}"#
+        );
+
+        let tool: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "{\"temp\":25}"
+        }))
+        .unwrap();
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.content, r#"{"temp":25}"#);
+    }
+
+    #[test]
+    fn chat_tool_call_delta_uses_openai_stream_shape() {
+        let call = parse_tool_calls(r#"{"name":"weather","parameters":{"city":"Paris"}}"#)
+            .unwrap()
+            .remove(0);
+        let delta = ChatCompletionDelta {
+            role: None,
+            content: None,
+            tool_calls: Some(vec![ChatCompletionToolCallDelta::from((0, call))]),
+        };
+        let value = serde_json::to_value(delta).unwrap();
+        assert_eq!(value["tool_calls"][0]["index"], 0);
+        assert_eq!(value["tool_calls"][0]["type"], "function");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "weather");
+        assert_eq!(
+            value["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+        assert!(value.get("content").is_none());
+    }
+
+    #[test]
     fn tool_choice_none_suppresses_calls() {
         assert!(!tool_choice_allows_calls(Some(&serde_json::json!("none"))));
         assert!(tool_choice_allows_calls(Some(&serde_json::json!("auto"))));
@@ -16499,6 +16869,31 @@ mod tests {
             "required"
         ))));
         assert!(tool_choice_allows_calls(None));
+    }
+
+    #[test]
+    fn runnable_request_tools_respects_tool_choice_none() {
+        let with_choice = |tool_choice: Option<&str>| {
+            let mut request = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }]
+            });
+            if let Some(choice) = tool_choice {
+                request["tool_choice"] = serde_json::json!(choice);
+            }
+            serde_json::from_value::<ChatCompletionRequest>(request).unwrap()
+        };
+        assert!(
+            runnable_request_tools(&with_choice(Some("none"))).is_empty(),
+            "tool_choice none must disable rendering and envelope holding"
+        );
+        let tools = runnable_request_tools(&with_choice(None));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "weather");
     }
 
     #[test]

@@ -2,12 +2,13 @@
 // extract-capabilities-to-ledger.mjs — CAIRN Phase 2, ONE-TIME bootstrap.
 //
 // Parses the static `CapabilitiesResponse { ... }` literal that
-// capabilities_response_with_plan() builds in src/api/mod.rs and emits
+// capabilities_response_with_plan() builds in src/api/mod.rs plus the typed
+// `API_CONFORMANCE_CASES` registry in src/api/contract.rs, then emits
 // ledger/camelid-ledger.json (camelid.ledger/v1). The capability structs derive
-// plain serde `Serialize` with no renames, and every field value is a
-// single-line literal with no escaped quotes, so the parsed field names + values
-// are byte-identical to what /api/capabilities serves — no build, no server, no
-// model load (this box is memory-constrained; see the bench-safety rules).
+// plain serde `Serialize` with no renames, and every parsed string field is a
+// single-line literal with no escaped quotes, so the values are byte-identical
+// to what /api/capabilities serves — no build, no server, no model load (this
+// box is memory-constrained; see the bench-safety rules).
 //
 // This is a bootstrap tool: once the Phase 3 generator exists it runs the OTHER
 // way (ledger -> capabilities), and this script is retired. The output is
@@ -69,7 +70,14 @@ function parse(toks) {
       if (t.v === 'true' || t.v === 'false') { p++; return t.v === 'true' }
       if (t.v === 'vec') { p++; if (peek()?.t === '!') p++; return array() }
       if (toks[p + 1]?.t === '{') return object() // TypeName { ... }
-      p++; return { __ident: t.v } // bare identifier (field-init shorthand target)
+      const path = [t.v]
+      p++
+      while (peek()?.t === ':' && toks[p + 1]?.t === ':' && toks[p + 2]?.t === 'ident') {
+        p += 2
+        path.push(toks[p].v)
+        p++
+      }
+      return { __ident: path.join('::') } // bare/path identifier (field-init shorthand target)
     }
     p++; return null
   }
@@ -102,6 +110,79 @@ const RECEIPT_RE = /qa\/evidence-bundles\/[A-Za-z0-9._/-]+?\/(?:manifest\.json|S
 
 async function exists(p) { try { await access(p); return true } catch { return false } }
 
+// --- api_features: projected from the typed registry in contract.rs --------
+// balancedBlock and tokenize assume the Rust-literal subset: no escape
+// sequences and no comments inside the extracted block. Violations would
+// corrupt or truncate the parse SILENTLY (the drift check re-derives through
+// this same parser, so CI would stay green on a wrong ledger) — fail loudly
+// here instead so the contract.rs edit that introduced them gets fixed.
+function assertLiteralSubset(block) {
+  let inStr = false
+  for (let i = 0; i < block.length; i++) {
+    const c = block[i]
+    if (c === '\\') {
+      throw new Error(
+        'API_CONFORMANCE_CASES contains a backslash escape, which the ledger extractor cannot represent — rewrite the string without escapes or extend scripts/extract-capabilities-to-ledger.mjs'
+      )
+    }
+    if (inStr) {
+      if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') {
+      inStr = true
+      continue
+    }
+    if (c === '/' && block[i + 1] === '/') {
+      throw new Error(
+        'API_CONFORMANCE_CASES contains a // comment inside the literal, which the block extractor cannot skip — move the comment outside the const or extend scripts/extract-capabilities-to-ledger.mjs'
+      )
+    }
+  }
+}
+
+async function extractApiFeatureContract(root) {
+  const src = await readFile(join(root, 'src', 'api', 'contract.rs'), 'utf8')
+
+  // Status strings come from SupportStatus::as_str() itself rather than a
+  // hand-maintained mirror, so a variant OR string rename flows through; only
+  // reshaping as_str() (or a variant missing from it) fails loudly below.
+  const statuses = new Map()
+  for (const m of src.matchAll(/Self::([A-Za-z0-9_]+) => "([^"]+)"/g)) statuses.set(m[1], m[2])
+  if (statuses.size === 0) {
+    throw new Error('SupportStatus::as_str() match arms not found in src/api/contract.rs')
+  }
+
+  const marker = 'pub(super) const API_CONFORMANCE_CASES'
+  const markerIndex = src.indexOf(marker)
+  if (markerIndex < 0) throw new Error('API_CONFORMANCE_CASES registry not found')
+  const assignmentIndex = src.indexOf('=', markerIndex)
+  const referenceIndex = src.indexOf('&[', assignmentIndex)
+  if (referenceIndex < 0) throw new Error('API_CONFORMANCE_CASES array not found')
+  const block = balancedBlock(src, referenceIndex + 1, '[', ']')
+  assertLiteralSubset(block)
+  const cases = parse(tokenize(block))
+  // Truncation backstop: every case the source declares must have parsed.
+  const declared = (src.slice(assignmentIndex).match(/ApiConformanceCase \{/g) || []).length
+  if (!Array.isArray(cases) || declared === 0 || cases.length !== declared) {
+    throw new Error(
+      `API_CONFORMANCE_CASES parsed to ${Array.isArray(cases) ? cases.length : 'a non-array'} case(s) but the source declares ${declared}`
+    )
+  }
+  return cases.map((entry, index) => {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`API_CONFORMANCE_CASES[${index}] is not an object`)
+    }
+    const statusPath = entry.status?.__ident
+    const statusName = typeof statusPath === 'string' ? statusPath.split('::').at(-1) : null
+    const status = statuses.get(statusName)
+    if (typeof entry.id !== 'string' || typeof entry.notes !== 'string' || !status) {
+      throw new Error(`API_CONFORMANCE_CASES[${index}] is missing a supported id/status/notes field: ${JSON.stringify(entry)}`)
+    }
+    return { id: entry.id, status, notes: entry.notes }
+  })
+}
+
 export async function buildLedger(root = ROOT) {
   const src = await readFile(join(root, 'src', 'api', 'mod.rs'), 'utf8')
   const marker = 'CapabilitiesResponse {'
@@ -120,6 +201,7 @@ export async function buildLedger(root = ROOT) {
 
   const rows = cr.model_compatibility
   if (!Array.isArray(rows)) throw new Error('model_compatibility did not parse to an array')
+  const apiFeatures = await extractApiFeatureContract(root)
 
   const receiptWarnings = []
   const model_rows = []
@@ -160,7 +242,7 @@ export async function buildLedger(root = ROOT) {
     planned_quantization: cr.planned_quantization,
     supported_model_families: cr.supported_model_families,
     planned_model_families: cr.planned_model_families,
-    api_features: cr.api_features,
+    api_features: apiFeatures,
     notes: cr.notes,
   }
 
@@ -171,7 +253,7 @@ export async function buildLedger(root = ROOT) {
     ledger_version: 'camelid.ledger/v1',
     provenance: {
       source_head: head,
-      note: 'Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded).',
+      note: 'Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded).',
     },
     capabilities,
     model_rows,

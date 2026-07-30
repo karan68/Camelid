@@ -1,8 +1,8 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "443336f6",
-    "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
+    "source_head": "c90022c9",
+    "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
     "engine": "camelid",
@@ -146,12 +146,22 @@
       {
         "id": "openai_chat_completions",
         "status": "supported_current_gate",
-        "notes": "non-streaming and SSE streaming for loaded supported dense GGUF models"
+        "notes": "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows."
+      },
+      {
+        "id": "openai_responses",
+        "status": "supported_current_gate",
+        "notes": "POST /v1/responses supports stateless generation by default plus opt-in local SQLite durability through store:true, previous_response_id, and /v1/conversations. Canonical message/function-call/function-call-output items survive restarts; stored Responses and conversation items can be retrieved or deleted; conversation mutation and idempotent requests are serialized. The same evidence-gated generation core supports text/JSON formats, SSE events, usage, and disconnect cancellation. State is local-only and bounded to 512 items/8 MiB; background mode, hosted built-in tools, multimodal input, cross-process request serialization, and remote OpenAI state remain unsupported."
+      },
+      {
+        "id": "streaming_tool_calls",
+        "status": "supported_current_gate",
+        "notes": "Tool-capable chat streams emit OpenAI tool_calls deltas with stable call ids, function names, JSON argument strings, and finish_reason=tool_calls without leaking the model's raw tool-call envelope. The Responses adapter maps the same generation to response.output_item and response.function_call_arguments events. Models without a certified tool template remain fail-closed."
       },
       {
         "id": "llguidance_structured_outputs",
         "status": "supported_current_gate_nonstreaming",
-        "notes": "non-streaming /v1/chat/completions constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and non-chat generation lanes remain typed unsupported."
+        "notes": "Non-streaming /v1/chat/completions and stateless /v1/responses constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and raw-completions constrained generation remain typed unsupported."
       },
       {
         "id": "openai_embeddings",
@@ -166,17 +176,17 @@
       {
         "id": "web_workspace",
         "status": "supported_current_gate",
-        "notes": "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim."
+        "notes": "Loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim."
       },
       {
         "id": "stream_options.include_usage",
         "status": "supported_current_gate",
-        "notes": "chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/."
+        "notes": "Chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/."
       },
       {
         "id": "tokenizer_encode_decode",
         "status": "supported_current_gate",
-        "notes": "loaded-model tokenizer APIs for supported tokenizer families"
+        "notes": "Loaded-model tokenizer APIs for supported tokenizer families."
       },
       {
         "id": "llama_server_tokenizer_aliases",
@@ -216,17 +226,17 @@
       {
         "id": "fail_closed_native_compatibility_routes",
         "status": "unsupported",
-        "notes": "Native /infill, /v1/messages, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row."
+        "notes": "Native /infill, /v1/messages, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row."
       },
       {
         "id": "multi_choice_generation",
-        "status": "unsupported",
-        "notes": "typed unsupported until implemented and tested"
+        "status": "supported_current_gate_nonstreaming",
+        "notes": "POST /v1/chat/completions and /v1/completions support 1..=8 independent, reproducibly seeded choices in non-streaming mode. Streaming multi-choice, receipts, and logprobs with n>1 remain typed unsupported."
       },
       {
         "id": "rich_logprobs",
-        "status": "partial",
-        "notes": "diagnostic logit surfaces exist; full OpenAI-compatible logprobs remain planned"
+        "status": "supported_current_gate_nonstreaming",
+        "notes": "POST /v1/chat/completions supports OpenAI-shaped logprobs/top_logprobs and POST /v1/completions supports legacy parallel-array logprobs for one non-streaming choice. Streaming and n>1 logprobs remain typed unsupported."
       }
     ],
     "notes": [
