@@ -543,3 +543,226 @@ non-positive `rope.freq_base`, wrong-typed `rope.freq_base_swa`, non-positive
 Gates re-run after the fixes: cargo fmt clean, clippy --all-targets -D warnings clean,
 cargo test --all-targets green, real-row + runnable-schedule tests green under
 CAMELID_GEMMA3_GGUF, check-public-scrub.sh clean.
+
+---
+
+## 9. Phase 2 record (2026-07-30)
+
+Phase 2 landed the correctness-first Metal resident forward for gemma3 in the six sub-steps
+sketched in §3, each with its self-parity gate in the same commit (`8b9247d1` 2a QK-norm,
+`94ae0263` 2b sandwich post-norms, `55a2e961` 2c GeGLU, `8c476e45` 2d dual-theta RoPE schedule,
+`9dad6544` 2e sliding-window decode mask, `462bedec` 2f embed scale), then merged `origin/main`
+@ `e28f0f76` underneath them and re-proved the whole stack against the real row. The lane
+decision from §7b held: zero new MSL kernels, all host wiring in the generic resident lane.
+
+### 9a. The merge (`origin/main` @ e28f0f76 → the branch)
+
+Merged, not rebased. Five of the six Phase 2 commits touch the same hunks in src/metal.rs, so a
+rebase would have replayed the same three-way weave five times against five different
+intermediate states; a merge resolves each region once against the final state. Nine conflict
+regions in exactly two files (src/metal.rs ×7, src/inference/metal_resident.rs ×2). Main's side
+is PR #556 (`ResidentLinearWeight` GEMV dispatch, Q8/F16 primary KV formats, format-dispatched
+embed gather, appliance-mode encode-ahead gating) plus PR #557 (prompt-prefix cache).
+
+Three regions have a resolution that **compiles and is silently wrong**, and they are the reason
+this is recorded rather than left in the commit message:
+
+1. **FFN f32y GEMV.** Keeping the campaign's `encode_q8_matmul_f32y` and satisfying the type
+   checker with `&gate_w.buffer` compiles and pushes Q4_K/Q6_K FFN weights through the Q8_0
+   GEMV — garbage on exactly the K-quant rows #556 exists to serve. Resolution takes main's
+   `encode_resident_matmul_f32` call *shape* and appends the campaign's GeGLU/SiLU
+   `act_pipeline` binding.
+2. **Attention scalar byte 28 (`kv_base_offset`).** After #556 the shared encode computes a
+   conditional `kv_position_stride` — BYTES on the Q8 primary, elements on f32/f16 — and
+   `kv_base_offset` shares those units. Neither side's text is acceptable: main pins byte 28 to
+   0, which does not merely revert to full-causal (the caller still passes the narrowed
+   `position_count`, so the kernel reads the OLDEST rows and never the current position); the
+   campaign reverts bytes 20/24 to element strides, breaking the Q8 primary KV lane for every
+   `head_dim <= 128` row. The correct weave is `window_start * kv_position_stride`.
+3. **`prepare_token` gather scalar.** The 8-byte allocation and the shader's `buffer(4)` read
+   auto-merge from the campaign, and `pool_get` classes by `bytes.max(32).next_power_of_two()`
+   and never zeroes, so main's format-derived bytes-per-row alone leaves bytes 4..8 unwritten
+   while the kernel reads them — every GPU-sampled token's embedding multiplied by a recycled
+   stale float, on ALL resident rows, not just gemma3. The weave writes both fields.
+
+Two more were loud-but-easy to get wrong: `ResidentDecodeState::new` needed BOTH prologues
+(main's text alone silently deletes the fail-closed schedule-length check, turning a clean
+`None` into an out-of-bounds panic on the first decode token), and the decode encode-ahead
+tables had to be NESTED inside `resident_encode_ahead_enabled` rather than replaced (taking the
+campaign hunk wholesale compiles and reinstates unconditional encode-ahead, undoing #556's
+cooperative-batching head-of-line-blocking fix).
+
+**Hardening taken while the attention region was open (was §5 landmine material, now closed):**
+`encode_attention_block` no longer re-reads the process-global KV-format gates. It takes the
+session's `kv16`/`kvq8` as parameters, because the call site, the KV readback and the KV seed
+already use the per-session fields and the window offset now rides in the same scalar. The three
+standalone (non-session) helpers pass the globals, so their behaviour is byte-identical. Residual,
+recorded: the inner `encode_attention` helper still selects its pipeline from the globals — it is
+shared with the gemma4 lane and the speculative-verify path, so threading it is a separate change.
+
+### 9b. Phase 2 final gate — real-row parity
+
+`gemma3_real_row_resident_forward_matches_runnable_oracle` drives the resident machinery directly
+(the production arch disqualifier stays up until Phase 3) with every Phase 2 encode live, and
+requires a token-identical greedy continuation to the runnable lane — the CPU oracle pinned to HF
+transformers by qa/runnable/gemma3-parity.json. Run targeted and in `--release` with the
+production GEMV configuration (f32y + wire + NSG8), because those gates are process-latched and a
+full `--lib` run silently SKIPs the test:
+
+```
+CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+CAMELID_GEMMA3_GGUF=<gemma-3-1b-it-Q8_0.gguf> \
+  cargo test --release --lib gemma3_real_row_resident_forward -- --nocapture
+```
+
+Measured on the M4 mini against the real `gemma-3-1b-it-Q8_0` row, no SKIP line, 590.94 s:
+
+| depth | resident argmax | oracle argmax | max abs logit diff |
+|---|---|---|---|
+| 1 | 108 | 108 | 6.247e-5 |
+| 5 | 1077 | 1077 | 7.820e-5 |
+| 50 | 578 | 578 | 9.584e-5 |
+
+**PASS: 50/50 greedy tokens identical; overall max abs logit diff 2.122e-4.** Zero flips, so the
+§7d envelope is not drawn on at all — this receipt is clean, not disclosed-flip. Per §5 landmine
+below, the slot count matters: this run is the `active_slots <= 1` equivalent with encode-ahead
+OFF (the test passes `next_rope: None`), and 9c's MR2 regression proves encode-ahead ON is
+bit-identical to it.
+
+The gate asserts `total < 512`, so the whole comparison sits inside the window and it cannot
+distinguish a correct window base from one pinned to 0. That is 9c's job.
+
+**Landmine found while re-applying this test: it must not arm its own gates.** As written it
+opened with `std::env::set_var("CAMELID_METAL_F32Y"/"..._WIRE"/"..._WIRE_NSG8", "1")` *before*
+its own SKIP checks, so it mutated the process environment on every run, including a plain
+`cargo test` with no gemma3 GGUF present. Those gates are process-wide `OnceLock`s read by every
+other Metal test in the binary; whichever siblings had not read them yet then latched onto the
+wire path, where the standalone block helpers' 36-byte uploads are read as 34-byte wire blocks
+and come back NaN. Measured: `cargo test --lib metal::tests` is green twice at the merge commit
+and fails five resident/standalone tests with the gate test added; a full `cargo test
+--all-targets` failed those five plus `metal_gemma4_layer_matches_cpu`. Whether a given sibling
+is hit is a race, so an earlier full run happening to pass proves nothing. The test now checks
+`CAMELID_GEMMA3_GGUF` first, never sets the gates, and SKIPs with the full armed invocation in
+its message. **Three pre-existing tests on main still use the in-test `set_var` pattern**
+(`metal_verify_gemv_batched_bit_identical`, `metal_spec_verify_bit_identical`,
+`metal_tree_verify_bit_identical`) — same hazard, untouched here, worth the same treatment.
+
+### 9c. Post-merge regressions added
+
+- `metal_resident_window_start_beyond_512_matches_seeded_window_oracle` — pins a windowed decode
+  at `filled` 256/512/513/561/600 (the row's real window of 512, `window_start` up to 88)
+  bit-for-bit against a full-causal oracle seeded with exactly the window's rows. head_dim 64 is
+  deliberate: it admits the v2/split-K attention geometry the 1B's head_dim 256 can never reach,
+  and it makes the Q8 primary KV reachable, where `kv_base_offset` is a byte offset. Verified
+  sensitive in both directions by temporarily breaking the packed word — byte 28 pinned to 0
+  fails this test AND the Phase 2e self-parity; element units fail this test under
+  `CAMELID_METAL_KV_DTYPE=q8`. Green on all three primaries (f32 default, q8, f16).
+  The history is SEEDED rather than decoded, and that is load-bearing: the first cut walked 600
+  real tokens and destabilised the whole suite. `MetalLinearKernel` owns ONE shared serial
+  command queue (the `Drop` impl for `ResidentDecodeState` already warns that a gated pending
+  graph "would block every future commit on the shared serial queue"), so a test holding it for
+  hundreds of gated command buffers starves the others — observed as unrelated one-dispatch
+  kernel tests (`metal_rms_norm_matches_cpu`, `metal_silu_mul_matches_cpu`,
+  `metal_rope_rotate_matches_reference`, `metal_soft_cap_matches_cpu`, `metal_residual_add…`)
+  returning their untouched input, and as NaN in the resident/standalone comparisons. Two
+  command buffers per depth is the same proof at 1/300th of the occupancy (0.34 s vs 10 s).
+  **Rule for future Metal tests on this lane: budget command buffers, not wall time.**
+- `metal_resident_gemma3_decode_is_identical_with_encode_ahead_off` — 12/12 tokens bit-identical
+  on a gemma3-shaped session (dual theta + sliding window + QK/sandwich norms) with the next
+  token's tables supplied and withheld. This is the claim that makes the appliance-mode
+  `(None, None)` arm safe, and it is the coverage the Phase 2 gate cannot give (that test is
+  already the encode-ahead-off configuration). Note this is the **only** in-suite exercise of the
+  encode-ahead pipeline: before it, every `forward_token` call in `mod tests` passed
+  `next_rope: None`. The two configurations run SEQUENTIALLY, each session dropped before the
+  next starts; the first cut interleaved them and deterministically broke the five gemma3
+  self-parity tests plus `metal_gemma4_layer_matches_cpu` — a pre-encoded graph is committed and
+  gated, so with two live sessions the second one's work (and every concurrent Metal test's)
+  queues behind a command buffer that only unblocks on the next loop iteration.
+- `metal_kquant_embed_gather_drops_embed_scale_so_gpu_sampling_fails_closed` — proves on the
+  device that binding `buffer(4)` on `embed_row_gather_q4k` is legal and INERT, and pins the new
+  host fail-closed (`gpu_sampling_tail_is_scale_safe`) that refuses the device-side sampling tail
+  when a non-unit `embed_scale` meets a non-Q8_0 embedding table. Note the production caller
+  already requires a Q8_0 token embedding before it builds the stage at all, so this is
+  defence-in-depth at the enforcement point rather than a live bug fix.
+- `resident_session_construction_sets_the_kquant_lane_at_both_sites` — `ResidentDecodeState::new`
+  reads the global that `set_resident_kquant_lane` writes, and both call sites sit in
+  merge-conflicting hunks; dropping either is silent (an F32 primary where F16 was intended, no
+  failing assertion anywhere). A source-level count is crude but it is the only thing that fails
+  when a merge quietly deletes one.
+
+### 9d. Gates
+
+cargo fmt clean; `clippy --all-targets -D warnings` clean (load-bearing here: it is what turns a
+dead `window_start` parameter into a red build — do not silence it by underscoring the
+parameter); `cargo test --all-targets` green twice in a row (1734 passed / 0 failed, against
+1730/0 at the commit before these four tests); `cargo test --lib metal::tests` green three times in a row
+(the filtered run is the sensitive one for queue starvation); the real-row gate green with the
+numbers in 9b; check-public-scrub.sh clean.
+
+**Standing note for anyone adding Metal tests here.** The three failure modes hit in this pass
+all came from process-wide or device-wide sharing, never from the maths: (1) a test that sets a
+gate env var latches sibling tests onto a different kernel; (2) a test that holds the single
+shared serial command queue for hundreds of command buffers starves siblings until they read
+back unwritten buffers; (3) two live resident sessions with encode-ahead park a gated command
+buffer in front of each other. All three present as "unrelated test returns 0 or NaN", and (2)
+and (3) look like flakes until you re-run the filtered subset. Budget command buffers, keep one
+resident session live at a time, and arm gates from the shell.
+
+### 9e. Amendments to sections 3-6 (recorded, not yet applied to those sections)
+
+1. **§3 Phase 3 — a fourth eligibility surface.** Main added `is_gpu_runnable_arch`
+   (src/execution_plan.rs), an allow-list of `llama | qwen2 | qwen3 | mistral` consumed by the Q8
+   GPU-runnable tier and by K-quant plan selection, whose comment explicitly names gemma3 as a
+   mirror of `resident_decode_eligible`. Without it the Metal-resident K-quant plan is never
+   advertised and the Q8 GPU-runnable tier stays closed. Add it beside
+   `resident_decode_eligible`, `recognized_row_level`/`is_supported_exact_q8_row` and
+   `is_runnable_serve_arch`. The §3/§5 line citations for all of these are stale after main's
+   +2775 lines in src/metal.rs alone — re-derive rather than trusting them.
+2. **§3 Phase 3 — the prompt-prefix cache is a first-class blocker.** PR #557 did not exist when
+   Phase 3 was scoped. On a non-exact cache hit the resume path rolls back to `k` and re-prefills
+   the divergent suffix at `kv_position = k > 0`; the only GPU-prefill hook refuses any non-zero
+   start, so the suffix is evaluated by the CPU dense forward — which has none of gemma3's
+   structure and no window at all. Partial hits are admitted from 16 tokens. The failing case is
+   ordinary multi-turn chat. The bypass must be a new explicit windowed-arch predicate at the
+   lookup sites and the store site, NOT inside `try_metal_resident_prefill` (unreachable at
+   position > 0) and NOT `CAMELID_PREFIX_CACHE_RESIDENT=0` (`prepare_for_prompt_prefix_cache`
+   returns before consulting it). Related: the campaign's "token-by-token prefill through the
+   decode path" bullet needs a location — it must be at the session level in
+   `generate_next_token_with_history_diagnostics`, forcing a single-token prefill chunk.
+3. **§3 Phase 3 — pin the flip to the Q8_0 row in the mechanism, not only the risk register.**
+   The disqualifier is arch-keyed (`matches!(architecture, "gemma2" | "gemma3")`), and main has
+   since opened the Metal resident lane to Q4_K/Q6_K weights. A gemma3 Q4_K_M GGUF would reach
+   the resident lane, take an F16 primary, and activate the whole mirror/store/partial-hit path.
+   Scope the flip to the Q8_0 exact row, or exclude gemma3 from the K-quant Metal admission,
+   until a windowed K-quant lane has its own receipt.
+4. **§3 Phase 2 — the "two-line gemma4 math" is no longer two lines.** After #556 the shared
+   `encode_attention_block` computes `kv_position_stride` conditionally, so the window base is
+   `window_start * kv_position_stride`. The gemma4 lane keeps element units legitimately (f32 KV
+   only) and is no longer a copyable precedent for the shared encode.
+5. **§4 / §6 — state the prefix-cache exclusion with any throughput claim.** On the Q8_0 row
+   gemma3 gets ZERO prompt-prefix reuse: `prepare_for_prompt_prefix_cache` requires
+   `kv_roundtrips_through_cpu_exactly()`, which is literally the F16-primary flag. Multi-turn
+   chat therefore pays a full token-by-token prefill every turn. The §4 "0.2 tok/s baseline /
+   ~110 tok/s roofline" framing predates #557 and must carry this caveat.
+6. **§5 — two new landmines.** (a) The process-global vs per-session KV-format split inside the
+   shared attention encode; closed for `encode_attention_block` in 9a, still open for the inner
+   `encode_attention`. (b) Appliance mode drops encode-ahead at 2+ active slots, which makes
+   `SampleStage.embed_scale` dormant — the sqrt(d_model) scale is applied twice by design (CPU
+   input and GPU gather) and the two paths are never both exercised in one run. Every gemma3
+   parity receipt must state its slot count; the Phase 4 bundle should carry both.
+   Also: a window-aware KV mirror is tempting (25 of 26 layers can only read the trailing 512
+   positions, yet the mirror copies `[0, position)` per layer — ~53 KiB/position, ~3.4 GB at the
+   row's 32,768-token context) but it changes the round-trip exactness argument and must not be
+   attempted before the Phase 3 blockers.
+7. **§3 Phase 4 — the ≥512-token receipt has a second job.** Because the Phase 2 gate asserts
+   `total < 512`, the windowed pack is the only external artifact that can distinguish a correct
+   window base from a zeroed one. It is merge-correctness evidence, not only a context claim.
+
+### 9f. Phase 3 is NOT open
+
+The blockers in 9e-2/9e-3 (prompt-prefix-cache routing, arch-vs-quantization scope) plus the
+requirement that an explicit gemma3 fail-closed on the CPU dense fallback lands in the SAME
+commit that removes `is_runnable_only_arch` / the `resident_decode_eligible` disqualifier are
+gates on Phase 3, not Phase 3 work. Until they are closed, the ≥512-token correctness claim this
+campaign exists to retire can be re-broken by any fallback, and the serve router divert remains
+the only production correctness guard.
