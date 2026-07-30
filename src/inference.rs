@@ -5666,18 +5666,20 @@ pub fn windows_physical_core_count() -> Option<usize> {
 fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
     let global = rayon::current_num_threads();
     // Promoted default policy (Windows x86_64): decode runs on a dedicated
-    // pool at the DETECTED PHYSICAL core count, never the SMT logical count.
-    // Fail-closed: no detection → no pool (pre-promotion behavior); an
-    // operator-pinned global (CAMELID_THREADS, mirroring the prefill pool's
-    // pinning contract) or a global already narrower than physical is never
-    // silently overridden. The per-host optimum is deferred to GAIT; only
-    // the physical-core policy ships, not this host's tuned width.
+    // pool at the DETECTED PHYSICAL core count, never the SMT logical count,
+    // and on a hybrid part at the PERFORMANCE-core count rather than the raw
+    // physical count (see `win_pin`). Fail-closed: no detection → no pool
+    // (pre-promotion behavior); an operator-pinned global (CAMELID_THREADS,
+    // mirroring the prefill pool's pinning contract) or a global already
+    // narrower than physical is never silently overridden. The per-host
+    // optimum is deferred to GAIT; only the core-class policy ships, not this
+    // host's tuned width.
     let default_physical = if env::var("CAMELID_THREADS").is_ok() {
         None
     } else {
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         {
-            windows_physical_core_count()
+            win_pin::hybrid_decode_core_count().or_else(windows_physical_core_count)
         }
         #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
         {
