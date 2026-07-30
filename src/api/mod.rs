@@ -7543,10 +7543,34 @@ fn completions_unsupported_for_arch(arch: &str) -> bool {
     is_runnable_serve_arch(arch)
 }
 
+/// The typed rejection every raw completions-style surface returns for a
+/// runnable-lane-only model: these archs are served only via
+/// `/v1/chat/completions`, and no raw-completions surface may fall through to
+/// the optimized dense engine (mis-bound for them — see
+/// [`completions_unsupported_for_arch`]).
+fn runnable_completions_rejection(model_id: &str) -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_completions_lane",
+        format!(
+            "model '{model_id}' is a runnable-lane architecture served only via \
+             /v1/chat/completions; raw completion surfaces have no runnable bridge and \
+             fail closed rather than falling through to the optimized engine"
+        ),
+        None,
+    )
+}
+
 /// Fail-closed guard for `/v1/completions` (MUSTER M-A1 follow-up): reject
 /// requests targeting a loaded runnable-served model with a typed error that
 /// points callers at the chat endpoint, instead of silently serving them from
 /// the wrong engine. Returns `Some(response)` when the request must be rejected.
+///
+/// This handler-level gate is the early, cheap rejection; the backstop that
+/// covers EVERY raw-completions surface (`/completion`,
+/// `/api/generation/preflight`, `/api/generation/sessions`, multi-choice
+/// fan-out, receipt replay) lives at the dense chokepoint in
+/// [`prepare_generation`].
 async fn reject_completions_for_runnable_arch(
     state: &AppState,
     model: &Option<String>,
@@ -7563,16 +7587,7 @@ async fn reject_completions_for_runnable_arch(
         .map(|m| completions_unsupported_for_arch(m.gguf.architecture().unwrap_or_default()))
         .unwrap_or(false);
     if unsupported {
-        return Some(api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_completions_lane",
-            format!(
-                "model '{id}' is a runnable-lane architecture served only via \
-                 /v1/chat/completions; raw /v1/completions has no runnable bridge and \
-                 fails closed rather than falling through to the optimized engine"
-            ),
-            None,
-        ));
+        return Some(runnable_completions_rejection(&id));
     }
     None
 }
@@ -11412,6 +11427,18 @@ async fn prepare_generation(
         Ok(m) => m,
         Err(res) => return Err(res),
     };
+    // Fail closed for runnable-lane-only archs at the dense chokepoint. Every
+    // raw completions-style surface funnels through here (`/completion`,
+    // `/v1/completions` and its n>1 fan-out, `/api/generation/preflight`,
+    // `/api/generation/sessions`, receipt replay), and the dense engine is
+    // mis-bound for these archs — it drops their QK/sandwich norm tensors and
+    // has no GeGLU/dual-RoPE — so falling through produces fluent-looking
+    // garbage, not an error. Chat requests never reach this: the runnable
+    // short-circuit in `chat_completions` serves them or returns a typed 503
+    // before prepare_generation.
+    if completions_unsupported_for_arch(model.gguf.architecture().unwrap_or_default()) {
+        return Err(runnable_completions_rejection(&model.id));
+    }
     let draft_may_be_used = speculative_mode == Some(SpecDecodeMode::DraftModel)
         && sampling == SamplingConfig::default()
         && !collect_dense_diagnostics
@@ -21838,6 +21865,181 @@ mod default_model_api_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_default_model");
+    }
+}
+
+/// Every raw completions-style surface must fail closed for runnable-lane-only
+/// archs (qwen35/gemma2/gemma3): the optimized dense engine is mis-bound for
+/// them, so falling through returns fluent-looking garbage instead of an
+/// error. One regression test per surface, over the real router.
+#[cfg(test)]
+mod runnable_completions_gate_api_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::gguf::GgufMetadataValue;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    /// A loaded model whose GGUF reports the given architecture — just enough
+    /// model to resolve through `get_or_load_model`. The gate must fire before
+    /// any tensor or tokenizer access, so the synthetic GGUF stays empty.
+    async fn state_with_loaded_arch(arch: &str) -> AppState {
+        let state = AppState::default();
+        let model = LoadedModel {
+            id: "gate-test".to_string(),
+            path: PathBuf::from("/private/models/Gate-Test.gguf"),
+            gguf: GgufFile {
+                path: PathBuf::from("/private/models/Gate-Test.gguf"),
+                version: 3,
+                tensor_count: 0,
+                metadata_count: 1,
+                alignment: 32,
+                data_start_offset: 0,
+                metadata: BTreeMap::from([(
+                    "general.architecture".to_string(),
+                    GgufMetadataValue::String(arch.to_string()),
+                )]),
+                tensors: Vec::new(),
+            },
+            llama_config: None,
+            llama_tensors: None,
+            unsupported_runtime: None,
+            tokenizer: TokenizerLoadState::Unavailable {
+                code: "tokenizer_unavailable",
+                message: "synthetic gate-test model carries no tokenizer".to_string(),
+            },
+            tokenizer_runtime: None,
+            lane: LaneIdentity {
+                model_id: "gate-test".to_string(),
+                gguf_sha256: "ab".repeat(32),
+                gguf_filename: "Gate-Test.gguf".to_string(),
+                quantization: "unknown".to_string(),
+                architecture: arch.to_string(),
+                tokenizer_kind: "unknown".to_string(),
+                tokenizer_sha256: None,
+                camelid_version: receipt::camelid_version(),
+                camelid_commit: receipt::camelid_commit(),
+            },
+        };
+        state
+            .loaded_models
+            .write()
+            .await
+            .insert("gate-test".to_string(), model);
+        *state.active_model_id.write().await = Some("gate-test".to_string());
+        state
+    }
+
+    async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    fn assert_gate_rejection(status: StatusCode, body: &Value) {
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "unsupported_completions_lane");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("/v1/chat/completions"),
+            "rejection must point callers at the served chat surface: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_server_completion_fails_closed_for_runnable_arch() {
+        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let (status, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
+        assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn generation_preflight_fails_closed_for_runnable_arch() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) =
+            post_json(app, "/api/generation/preflight", json!({ "prompt": "hi" })).await;
+        assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn generation_session_create_fails_closed_for_runnable_arch() {
+        let state = state_with_loaded_arch("gemma2").await;
+        let app = router_with_state(state.clone());
+        let (status, body) =
+            post_json(app, "/api/generation/sessions", json!({ "prompt": "hi" })).await;
+        assert_gate_rejection(status, &body);
+        assert!(
+            state.generation_sessions.read().await.is_empty(),
+            "a rejected request must not leave a validated session behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn completions_multi_choice_fails_closed_for_runnable_arch() {
+        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let (status, body) =
+            post_json(app, "/v1/completions", json!({ "prompt": "hi", "n": 2 })).await;
+        assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn receipt_replay_fails_closed_for_runnable_arch() {
+        let state = state_with_loaded_arch("gemma3").await;
+        let request = receipt::ReceiptRequest {
+            endpoint: "/v1/completions".to_string(),
+            messages_or_prompt: json!("hello"),
+            max_tokens: 4,
+            temperature: 0.0,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: Vec::new(),
+            response_format: None,
+        };
+        let err = match replay_loaded_receipt_request(&state, "gate-test", &request).await {
+            Ok(_) => panic!("replay must fail closed for a runnable-lane-only arch"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unsupported_completions_lane"), "{err}");
+    }
+
+    /// Chat is the served surface for runnable archs: with no runtime loaded it
+    /// must keep returning its own typed 503, not the completions gate's 422.
+    #[tokio::test]
+    async fn chat_completions_keep_their_runnable_lane_error() {
+        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let (status, body) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_not_ready");
+    }
+
+    /// The gate is arch-scoped: a dense-lane arch on the same surfaces must
+    /// fail (synthetic model, no tokenizer) with anything BUT the gate's code.
+    #[tokio::test]
+    async fn completion_gate_is_scoped_to_runnable_archs() {
+        let app = router_with_state(state_with_loaded_arch("llama").await);
+        let (_, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
+        assert_ne!(body["error"]["code"], "unsupported_completions_lane");
     }
 }
 
