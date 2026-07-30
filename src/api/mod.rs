@@ -7544,13 +7544,7 @@ async fn runnable_chat_nonstreaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
-    let tools: Vec<serde_json::Value> = req
-        .tools
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
-        .collect();
+    let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
@@ -7609,7 +7603,15 @@ async fn runnable_chat_nonstreaming(
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
-    let tool_calls = parse_ornith_tool_calls_json(&content);
+    // Gated on tool_choice, not tool presence: the agent loop deliberately
+    // lifts envelopes with no tools in the request, but a `tool_choice:"none"`
+    // response must never carry tool_calls (OpenAI semantics), even if the
+    // model mimics envelope syntax from its conversation history.
+    let tool_calls = if tool_choice_allows_calls(req.tool_choice.as_ref()) {
+        parse_ornith_tool_calls_json(&content)
+    } else {
+        Vec::new()
+    };
     let finish_reason = if tool_calls.is_empty() {
         "stop"
     } else {
@@ -7657,13 +7659,7 @@ async fn runnable_chat_streaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
-    let tools: Vec<serde_json::Value> = req
-        .tools
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
-        .collect();
+    let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
@@ -7697,6 +7693,12 @@ async fn runnable_chat_streaming(
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
+    // Post-hoc envelope lifting is gated on tool_choice, not tool presence:
+    // the agent loop lifts with no tools in the request, but under
+    // `tool_choice:"none"` the content has already streamed as plain deltas
+    // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
+    // duplicate the streamed text as a structured tool_calls delta.
+    let lift_tool_calls = tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
     let created = unix_secs();
 
@@ -7810,7 +7812,11 @@ async fn runnable_chat_streaming(
         match final_state {
             Some(Ok((text, ids))) => {
                 let (_reasoning, content) = split_ornith_think(&text);
-                let tool_calls = parse_ornith_tool_calls_json(&content);
+                let tool_calls = if lift_tool_calls {
+                    parse_ornith_tool_calls_json(&content)
+                } else {
+                    Vec::new()
+                };
                 let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
                 if !tool_calls.is_empty() {
                     let deltas: Vec<serde_json::Value> = tool_calls
@@ -10333,7 +10339,11 @@ async fn chat_completions(
         camelid_enable_thinking: req
             .camelid_enable_thinking
             .or(state.default_enable_thinking.then_some(true)),
-        tools: req.tools,
+        // `tool_choice: "none"` disables tool calling for this request (OpenAI
+        // semantics), so render the prompt without tools: rows whose template
+        // has no certified tools branch keep serving plain chat instead of
+        // failing closed on a request that never wanted calls.
+        tools: if tools_active { req.tools } else { None },
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         constraint,
@@ -13728,6 +13738,26 @@ fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
     !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
 }
 
+/// Tools the runnable serve lane should render and parse for this request,
+/// unwrapped from the OpenAI `{"type":"function","function":{...}}` envelope.
+/// `tool_choice: "none"` disables tool calling for the request (OpenAI
+/// semantics): the lane then renders and streams plain chat instead of
+/// rendering tools into the prompt and holding tool envelopes the caller
+/// opted out of. The lanes' post-hoc `<function=...>` lifting is gated
+/// separately on `tool_choice_allows_calls` (not on this list being empty,
+/// because the agent loop lifts envelopes with no tools in the request).
+fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value> {
+    if !tool_choice_allows_calls(req.tool_choice.as_ref()) {
+        return Vec::new();
+    }
+    req.tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.get("function").cloned().unwrap_or(t))
+        .collect()
+}
+
 /// Whether the model's raw content should be probed for a tool call.
 /// Constrained output is content by definition: OpenAI allows tools and
 /// response_format together, and a schema that legitimately declares a `name`
@@ -16744,6 +16774,31 @@ mod tests {
             "required"
         ))));
         assert!(tool_choice_allows_calls(None));
+    }
+
+    #[test]
+    fn runnable_request_tools_respects_tool_choice_none() {
+        let with_choice = |tool_choice: Option<&str>| {
+            let mut request = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }]
+            });
+            if let Some(choice) = tool_choice {
+                request["tool_choice"] = serde_json::json!(choice);
+            }
+            serde_json::from_value::<ChatCompletionRequest>(request).unwrap()
+        };
+        assert!(
+            runnable_request_tools(&with_choice(Some("none"))).is_empty(),
+            "tool_choice none must disable rendering and envelope holding"
+        );
+        let tools = runnable_request_tools(&with_choice(None));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "weather");
     }
 
     #[test]

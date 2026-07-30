@@ -110,24 +110,64 @@ const RECEIPT_RE = /qa\/evidence-bundles\/[A-Za-z0-9._/-]+?\/(?:manifest\.json|S
 
 async function exists(p) { try { await access(p); return true } catch { return false } }
 
+// --- api_features: projected from the typed registry in contract.rs --------
+// balancedBlock and tokenize assume the Rust-literal subset: no escape
+// sequences and no comments inside the extracted block. Violations would
+// corrupt or truncate the parse SILENTLY (the drift check re-derives through
+// this same parser, so CI would stay green on a wrong ledger) — fail loudly
+// here instead so the contract.rs edit that introduced them gets fixed.
+function assertLiteralSubset(block) {
+  let inStr = false
+  for (let i = 0; i < block.length; i++) {
+    const c = block[i]
+    if (c === '\\') {
+      throw new Error(
+        'API_CONFORMANCE_CASES contains a backslash escape, which the ledger extractor cannot represent — rewrite the string without escapes or extend scripts/extract-capabilities-to-ledger.mjs'
+      )
+    }
+    if (inStr) {
+      if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') {
+      inStr = true
+      continue
+    }
+    if (c === '/' && block[i + 1] === '/') {
+      throw new Error(
+        'API_CONFORMANCE_CASES contains a // comment inside the literal, which the block extractor cannot skip — move the comment outside the const or extend scripts/extract-capabilities-to-ledger.mjs'
+      )
+    }
+  }
+}
+
 async function extractApiFeatureContract(root) {
   const src = await readFile(join(root, 'src', 'api', 'contract.rs'), 'utf8')
+
+  // Status strings come from SupportStatus::as_str() itself rather than a
+  // hand-maintained mirror, so a variant OR string rename flows through; only
+  // reshaping as_str() (or a variant missing from it) fails loudly below.
+  const statuses = new Map()
+  for (const m of src.matchAll(/Self::([A-Za-z0-9_]+) => "([^"]+)"/g)) statuses.set(m[1], m[2])
+  if (statuses.size === 0) {
+    throw new Error('SupportStatus::as_str() match arms not found in src/api/contract.rs')
+  }
+
   const marker = 'pub(super) const API_CONFORMANCE_CASES'
   const markerIndex = src.indexOf(marker)
   if (markerIndex < 0) throw new Error('API_CONFORMANCE_CASES registry not found')
   const assignmentIndex = src.indexOf('=', markerIndex)
   const referenceIndex = src.indexOf('&[', assignmentIndex)
   if (referenceIndex < 0) throw new Error('API_CONFORMANCE_CASES array not found')
-  const cases = parse(tokenize(balancedBlock(src, referenceIndex + 1, '[', ']')))
-  if (!Array.isArray(cases)) throw new Error('API_CONFORMANCE_CASES did not parse to an array')
-
-  const statuses = {
-    Partial: 'partial',
-    Supported: 'supported',
-    SupportedCurrentGate: 'supported_current_gate',
-    SupportedCurrentGateNonStreaming: 'supported_current_gate_nonstreaming',
-    SupportedExactModelRow: 'supported_exact_model_row',
-    Unsupported: 'unsupported',
+  const block = balancedBlock(src, referenceIndex + 1, '[', ']')
+  assertLiteralSubset(block)
+  const cases = parse(tokenize(block))
+  // Truncation backstop: every case the source declares must have parsed.
+  const declared = (src.slice(assignmentIndex).match(/ApiConformanceCase \{/g) || []).length
+  if (!Array.isArray(cases) || declared === 0 || cases.length !== declared) {
+    throw new Error(
+      `API_CONFORMANCE_CASES parsed to ${Array.isArray(cases) ? cases.length : 'a non-array'} case(s) but the source declares ${declared}`
+    )
   }
   return cases.map((entry, index) => {
     if (!entry || typeof entry !== 'object') {
@@ -135,7 +175,7 @@ async function extractApiFeatureContract(root) {
     }
     const statusPath = entry.status?.__ident
     const statusName = typeof statusPath === 'string' ? statusPath.split('::').at(-1) : null
-    const status = statuses[statusName]
+    const status = statuses.get(statusName)
     if (typeof entry.id !== 'string' || typeof entry.notes !== 'string' || !status) {
       throw new Error(`API_CONFORMANCE_CASES[${index}] is missing a supported id/status/notes field: ${JSON.stringify(entry)}`)
     }

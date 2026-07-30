@@ -698,6 +698,92 @@ async fn chat_route_accepts_assistant_tool_calls_and_tool_results_for_the_next_t
 }
 
 #[tokio::test]
+async fn chat_tools_fail_closed_without_template_but_tool_choice_none_still_generates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-tool-choice.gguf");
+    write_generation_gguf(&path);
+
+    let app = camelid::api::router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path": path, "id": "tiny-tool-choice"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_body = |tool_choice: Option<&str>| {
+        let mut body = json!({
+            "model": "tiny-tool-choice",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "weather", "parameters": {"type": "object"}}
+            }]
+        });
+        if let Some(choice) = tool_choice {
+            body["tool_choice"] = json!(choice);
+        }
+        body.to_string()
+    };
+
+    // The tiny fixture has no chat template, so a request that wants tool
+    // calls fails closed instead of silently rendering without tools.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body(None)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_chat_template");
+
+    // `tool_choice: "none"` opts out of tool calling (OpenAI semantics), so
+    // the same request must render as plain chat and generate.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body(Some("none"))))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "<unk>");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+}
+
+#[tokio::test]
 async fn metrics_exposes_prometheus_runtime_counters() {
     let response = camelid::api::router()
         .oneshot(
