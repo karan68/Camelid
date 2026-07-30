@@ -17189,20 +17189,27 @@ mod tests {
             return;
         }
         // The reference path is `encode_q8_matmul_f32y`, which only selects the NSG=8
-        // wire kernel when the f32y/wire/nsg8 gates are on. Those are process-wide
-        // OnceLocks; set the env BEFORE the first gate read so they latch on. If a
-        // sibling test in this process already latched them off (e.g. a full --lib
-        // run that read them earlier), SKIP rather than compare against a different
-        // kernel. A targeted run (`--lib metal_verify_gemv_batched_bit_identical`) has
-        // no such sibling, so the gates latch on here.
-        std::env::set_var("CAMELID_METAL_F32Y", "1");
-        std::env::set_var("CAMELID_METAL_WIRE", "1");
-        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
+        // wire kernel when the f32y/wire/nsg8 gates are on. Those gates must be armed
+        // BY THE CALLER, never with an in-test `set_var`: they are process-wide
+        // OnceLocks read by every other Metal test in this binary, so setting them here
+        // latches whichever siblings have not read them yet onto the wire path — where
+        // the standalone block helpers' 36-byte uploads are read as 34-byte wire blocks
+        // and come back NaN. Measured: with the gates armed across a shared
+        // `cargo test --lib metal::tests`, metal_attention_block_resident_matches_standalone,
+        // metal_ffn_block_resident_matches_standalone, metal_decode_layer_resident_matches_blocks,
+        // metal_decode_forward_resident_matches_per_layer and
+        // metal_resident_decode_state_matches_full_upload fail on NaN comparisons. Setting
+        // them here bought nothing either: in a shared run a sibling latches the gates
+        // first, so this test skipped anyway. Unarmed it is a no-op; the enforced proof
+        // lane is qa/speed/verify-gates.sh, which exports the gates and runs each gate in
+        // its own process.
         if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
             eprintln!(
-                "SKIP metal_verify_gemv_batched_bit_identical: f32y/wire/nsg8 gates \
-                 inactive (OnceLock latched off earlier in this process); run targeted: \
-                 cargo test --release --lib metal_verify_gemv_batched_bit_identical"
+                "SKIP metal_verify_gemv_batched_bit_identical: the f32y/wire/nsg8 GEMV \
+                 gates are not armed. Run targeted: CAMELID_METAL_F32Y=1 \
+                 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 cargo test --release \
+                 --lib metal_verify_gemv_batched_bit_identical -- --nocapture \
+                 (or qa/speed/verify-gates.sh, which arms all three gates)"
             );
             return;
         }
@@ -24515,20 +24522,17 @@ mod tests {
         if !detect_metal_device().available {
             return;
         }
-        // Production GEMV stack + tiled/split-K attention. Latch the OnceLock gates ON
-        // before the first read; if a sibling test already latched f32y/wire/nsg8 OFF (a
-        // full --lib run read them earlier), SKIP rather than compare against a different
-        // kernel. A targeted run has no such sibling, so the gates latch on here (and ATTN2
-        // engages the split-K path the straddle windows are designed to exercise).
-        std::env::set_var("CAMELID_METAL_F32Y", "1");
-        std::env::set_var("CAMELID_METAL_WIRE", "1");
-        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
-        std::env::set_var("CAMELID_METAL_ATTN2", "1");
-        // Require the split-K attention path (ATTN2 + split-K) too, so the straddle-126 / deep-510
-        // windows genuinely exercise the split-K verify kernels instead of silently falling to the
-        // v2 path when a sibling latched attn2/split-K OFF first. SKIP loudly otherwise — the
-        // targeted run (qa/speed/verify-gates.sh, --test-threads=1) is the enforced proof lane; a
-        // green --all-targets does NOT by itself exercise these byte-exact gates.
+        // Production GEMV stack + tiled/split-K attention. These gates must be armed BY THE
+        // CALLER, never with an in-test `set_var`: they are process-wide OnceLocks read by
+        // every other Metal test in this binary, so setting them here latches whichever
+        // siblings have not read them yet onto the wire path and NaNs them (the five measured
+        // casualties are listed on metal_verify_gemv_batched_bit_identical).
+        // Requiring ATTN2 + split-K as well keeps the straddle-126 / deep-510 windows on the
+        // split-K verify kernels instead of silently falling to the v2 path. Unarmed this test
+        // is a no-op — which is what a shared run already got, since a sibling latches the
+        // gates first — and a green --all-targets does NOT exercise these byte-exact
+        // assertions. The enforced proof lane is qa/speed/verify-gates.sh (--test-threads=1),
+        // which exports the gates and runs each one in its own process.
         if !(f32y_gemv_enabled()
             && wire_weights_enabled()
             && wire_nsg8_enabled()
@@ -24536,10 +24540,11 @@ mod tests {
             && splitk_attention_enabled())
         {
             eprintln!(
-                "SKIP metal_spec_verify_bit_identical: f32y/wire/nsg8/attn2/split-K gates inactive \
-                 (OnceLock latched off earlier in this process); run targeted: \
-                 qa/speed/verify-gates.sh (or cargo test --release --lib \
-                 metal_spec_verify_bit_identical)"
+                "SKIP metal_spec_verify_bit_identical: the f32y/wire/nsg8/attn2/split-K gates are \
+                 not armed. Run targeted: qa/speed/verify-gates.sh (or CAMELID_METAL_F32Y=1 \
+                 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 CAMELID_METAL_ATTN2=1 cargo test \
+                 --release --lib metal_spec_verify_bit_identical -- --nocapture, leaving \
+                 CAMELID_METAL_ATTN_SPLITK unset — split-K is default-on)"
             );
             return;
         }
@@ -24798,15 +24803,12 @@ mod tests {
         if !detect_metal_device().available {
             return;
         }
-        // Latch the production GEMV + tiled/split-K attention gates ON before the first read
-        // (identical to the linear gate); SKIP if a sibling latched them off earlier.
-        std::env::set_var("CAMELID_METAL_F32Y", "1");
-        std::env::set_var("CAMELID_METAL_WIRE", "1");
-        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
-        std::env::set_var("CAMELID_METAL_ATTN2", "1");
-        // Require the split-K attention path too (see metal_spec_verify_bit_identical) so the
-        // linear-anchor straddle-126 / deep-510 windows really exercise split-K; SKIP loudly
-        // otherwise. Targeted proof lane: qa/speed/verify-gates.sh (--test-threads=1).
+        // Same contract as metal_spec_verify_bit_identical: the production GEMV + tiled/split-K
+        // attention gates are armed BY THE CALLER, never with an in-test `set_var` (those gates
+        // are process-wide OnceLocks; setting them here latches siblings onto the wire path and
+        // NaNs them). Requiring split-K too keeps the linear-anchor straddle-126 / deep-510
+        // windows on the split-K kernels. Unarmed this test is a no-op; the enforced proof lane
+        // is qa/speed/verify-gates.sh (--test-threads=1).
         if !(f32y_gemv_enabled()
             && wire_weights_enabled()
             && wire_nsg8_enabled()
@@ -24814,10 +24816,11 @@ mod tests {
             && splitk_attention_enabled())
         {
             eprintln!(
-                "SKIP metal_tree_verify_bit_identical: f32y/wire/nsg8/attn2/split-K gates inactive \
-                 (OnceLock latched off earlier in this process); run targeted: \
-                 qa/speed/verify-gates.sh (or cargo test --release --lib \
-                 metal_tree_verify_bit_identical)"
+                "SKIP metal_tree_verify_bit_identical: the f32y/wire/nsg8/attn2/split-K gates are \
+                 not armed. Run targeted: qa/speed/verify-gates.sh (or CAMELID_METAL_F32Y=1 \
+                 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 CAMELID_METAL_ATTN2=1 cargo test \
+                 --release --lib metal_tree_verify_bit_identical -- --nocapture, leaving \
+                 CAMELID_METAL_ATTN_SPLITK unset — split-K is default-on)"
             );
             return;
         }
