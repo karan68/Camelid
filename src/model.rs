@@ -135,14 +135,18 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 }
 
 /// Architectures whose ONLY correct forward pass lives in the runnable lane
-/// (`crate::runnable`): the optimized dense binder cannot represent them —
-/// for gemma3/gemma2 it silently drops the QK-norm and post-attention/post-FFN
-/// ("sandwich") norm tensors and the dense forward has no GeGLU or dual-RoPE,
-/// and qwen35's hybrid gated-delta-net layers do not fit the dense tensor map
-/// at all. `camelid serve` routes these archs to the runnable serve bridge
-/// (`api::is_runnable_serve_arch` delegates here); every OTHER lane that would
-/// construct a direct dense session for them must fail closed instead of
-/// decoding fluent-looking garbage.
+/// (`crate::runnable`), because the optimized dense forward cannot run them
+/// correctly. gemma3: since Phase 1 of the Metal campaign the dense binder
+/// binds all four extra norms name-pinned and fail-closed — and the dense
+/// forward would apply the QK pair — but it still does not APPLY the bound
+/// sandwich norms and has no GeGLU, no dual-theta RoPE (local/global
+/// schedule), and no sliding-window mask. gemma2: the binder still silently
+/// drops its sandwich norms, and the dense forward lacks its soft-caps and
+/// alternating-attention schedule. qwen35: the hybrid gated-delta-net layers
+/// do not fit the dense tensor map at all. `camelid serve` routes these archs
+/// to the runnable serve bridge (`api::is_runnable_serve_arch` delegates
+/// here); every OTHER lane that would construct a direct dense session for
+/// them must fail closed instead of decoding fluent-looking garbage.
 pub fn is_runnable_only_arch(architecture: &str) -> bool {
     matches!(architecture, "qwen35" | "gemma2" | "gemma3")
 }
@@ -983,12 +987,26 @@ mod gemma3_tests {
     use super::Gemma3Metadata;
 
     fn one_b_meta() -> Gemma3Metadata {
+        // The schedule is a LITERAL list (false = global at 5/11/17/23), not
+        // the production `(i + 1) % pattern` expression — duplicating the
+        // formula here would make the test a tautology that passes even if the
+        // derivation regressed. The `from_gguf`-driven fixture tests
+        // (tests/model_binding.rs) cover the derivation itself; this unit test
+        // covers the accessors over a known schedule.
+        #[rustfmt::skip]
+        let layer_is_sliding = vec![
+            true, true, true, true, true, false, // layers 0-5
+            true, true, true, true, true, false, // layers 6-11
+            true, true, true, true, true, false, // layers 12-17
+            true, true, true, true, true, false, // layers 18-23
+            true, true, // layers 24-25 (no forced-global final layer)
+        ];
         Gemma3Metadata {
             sliding_window: 512,
             sliding_window_pattern: 6,
             rope_freq_base_global: 1_000_000.0,
             rope_freq_base_local: 10_000.0,
-            layer_is_sliding: (0..26u32).map(|i| !(i + 1).is_multiple_of(6)).collect(),
+            layer_is_sliding,
             embed_scale: (1152.0f32).sqrt(),
             ffn_geglu: true,
             rope_neox_pairing: true,
@@ -2503,10 +2521,12 @@ mod tests {
     fn runnable_only_arch_set_is_exactly_the_serve_bridge_set() {
         // Must stay in lockstep with the serve router's runnable bridge
         // (`api::is_runnable_serve_arch` delegates here): these archs have no
-        // correct dense forward — the dense binder drops gemma3/gemma2's
-        // QK/sandwich norms and has no GeGLU, and qwen35's hybrid layers do not
-        // fit the dense tensor map — so every direct dense-session lane fails
-        // closed for them instead of decoding fluent-looking garbage.
+        // correct dense forward — gemma3's norms bind (Phase 1) but the dense
+        // forward does not apply the sandwich norms and has no GeGLU,
+        // dual-theta RoPE, or window mask; gemma2's sandwich norms are still
+        // dropped at bind; and qwen35's hybrid layers do not fit the dense
+        // tensor map — so every direct dense-session lane fails closed for
+        // them instead of decoding fluent-looking garbage.
         for arch in ["qwen35", "gemma2", "gemma3"] {
             assert!(
                 super::is_runnable_only_arch(arch),

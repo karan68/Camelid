@@ -4034,9 +4034,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "preserve the parity-certified runnable lane + the read/list/write agent capability for this exact row; an optimized-lane qwen35 kernel for production throughput, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
             },
             // MUSTER M-A1 (2026-07-16): gemma3 1B promoted on the runnable serve lane
-            // (the only lane with a correct gemma3 forward — the optimized dense binder
-            // silently drops gemma3's norms and has no GeGLU, so it stays fail-closed
-            // for chat via is_runnable_serve_arch). Filename-anchored id
+            // (the only lane with a correct gemma3 forward — the optimized dense lane
+            // now BINDS gemma3's norms, gemma3-Metal campaign Phase 1, but still does
+            // not apply the sandwich norms and has no GeGLU, dual-theta RoPE, or
+            // sliding-window mask, so it stays fail-closed for chat via
+            // is_runnable_serve_arch). Filename-anchored id
             // (`gemma_3_1b_it_q8_0` = normalized GGUF filename) so the frontend
             // exact-row identity matcher resolves the local file; the catalog entry
             // `gemma3_1b_it_q8_0` resolves via the filename/name match.
@@ -7156,10 +7158,12 @@ fn runnable_serve_flag(value: Option<&str>) -> bool {
 
 /// True for architectures served through the runnable bridge (qwen35, and — since
 /// MUSTER M-A1 — gemma3, whose only correct forward lives in the runnable lane; the
-/// optimized dense binder silently drops gemma3's QK/post norms and has no GeGLU).
+/// optimized dense lane now binds gemma3's QK/post norms — Metal-campaign Phase 1 —
+/// but still does not apply the sandwich norms and has no GeGLU, dual-theta RoPE,
+/// or sliding-window mask).
 /// Deliberate side effect of listing an arch here: when the lane is opted out
 /// (`CAMELID_RUNNABLE_SERVE=0`) its chat requests get a typed 503 instead of
-/// falling through to the mis-bound optimized engine — fail-closed by design.
+/// falling through to the incomplete optimized engine — fail-closed by design.
 /// Delegates to [`crate::model::is_runnable_only_arch`] — the single source of
 /// truth shared with the CLI direct-session guard — so the serve router and the
 /// direct lanes can never disagree about which archs must fail closed.
@@ -7473,8 +7477,9 @@ async fn resolve_runnable_runtime(
 
 /// True when raw `/v1/completions` must fail closed for this architecture: the
 /// runnable-served archs have no completions bridge, and falling through would
-/// reach the optimized engine — which for gemma3 is numerically mis-bound (its
-/// norms are silently dropped and the forward has no GeGLU/dual-RoPE). Their
+/// reach the optimized engine — which for gemma3 is numerically incomplete (its
+/// norms now bind, Metal-campaign Phase 1, but the forward does not apply the
+/// sandwich norms and has no GeGLU, dual-theta RoPE, or window mask). Their
 /// only served surface is `/v1/chat/completions`. Pure decision half of
 /// [`reject_completions_for_runnable_arch`] so the gate itself is unit-testable.
 fn completions_unsupported_for_arch(arch: &str) -> bool {

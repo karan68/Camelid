@@ -604,23 +604,20 @@ impl RunnableModel {
         // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3/command-r (unpermuted weights);
         // LLAMA (interleaved) for standard variants.
         let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3" || is_command_r;
-        // gemma3 dual RoPE: every Nth layer (sliding_window_pattern, default 6) is a
-        // GLOBAL-attention layer using the GGUF freq_base (1e6); the rest are local
-        // sliding-window layers using the gemma3 default local base (10000). The
-        // sliding window itself is a no-op for prompts shorter than the window.
-        let layer_rope_base = if arch == "gemma3" {
-            let global = rope_base;
-            let local = 10_000.0_f32;
-            let pattern = 6usize;
-            (0..n_layers)
-                .map(|i| {
-                    if (i + 1) % pattern == 0 {
-                        global
-                    } else {
-                        local
-                    }
-                })
-                .collect()
+        // gemma3 dual RoPE: the per-layer global/local schedule and both RoPE bases
+        // come from the SAME parsed `Gemma3Metadata` the resident lane consumes
+        // (`LlamaModelConfig::from_gguf` -> `cfg.gemma3`) — single source of truth,
+        // so a row carrying the explicit override keys
+        // (`gemma3.attention.sliding_window_pattern` / `gemma3.rope.freq_base_swa`)
+        // can never make the two lanes derive different schedules for one file.
+        // For the real 1B row (no override keys) the metadata resolves to the
+        // reference-pinned pattern 6 / local base 10000 and the required GGUF
+        // `rope.freq_base` (1e6) for globals — bit-identical to the constants this
+        // lane hardcoded before Phase 1b. The sliding window itself is a no-op for
+        // prompts shorter than the window (this lane implements no window mask —
+        // a documented full-support blocker).
+        let layer_rope_base = if let Some(gemma3) = cfg.gemma3.as_ref() {
+            (0..n_layers).map(|i| gemma3.rope_freq_base_at(i)).collect()
         } else {
             vec![rope_base; n_layers]
         };
@@ -3124,6 +3121,61 @@ mod gpu_ssm_layer_tests {
         assert!(
             decoded.iter().all(|&t| (t as usize) < model.vocab),
             "decoded token out of range"
+        );
+    }
+}
+
+/// Env-gated real-row check that the runnable lane's per-layer RoPE schedule is
+/// EXACTLY the reference 1B schedule (globals at 5/11/17/23 on base 1e6, every
+/// other layer local on base 10000) — expectations are literal lists, not the
+/// derivation formula. Run before AND after the Phase 1b metadata unification
+/// (runnable `layer_rope_base` now derives from `cfg.gemma3` instead of local
+/// constants) to prove the rewiring is bit-identical for the real row; the
+/// printed forward fingerprint makes the before/after comparison exact.
+#[cfg(test)]
+mod gemma3_schedule_tests {
+    use super::RunnableModel;
+
+    #[test]
+    fn gemma3_real_row_runnable_rope_schedule_is_the_reference_schedule() {
+        let Ok(path) = std::env::var("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_runnable_rope_schedule_is_the_reference_schedule: \
+                 set CAMELID_GEMMA3_GGUF to the gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load gemma3 runnable model");
+        assert_eq!(model.architecture, "gemma3");
+        assert_eq!(model.n_layers, 26);
+
+        // Literal expected bases: 1e6 on the four global layers, 10000 elsewhere.
+        const G: f32 = 1_000_000.0;
+        const L: f32 = 10_000.0;
+        let expected: Vec<f32> = vec![
+            L, L, L, L, L, G, // layers 0-5
+            L, L, L, L, L, G, // layers 6-11
+            L, L, L, L, L, G, // layers 12-17
+            L, L, L, L, L, G, // layers 18-23
+            L, L, // layers 24-25 (no forced-global final layer)
+        ];
+        assert_eq!(model.layer_rope_base, expected);
+        assert!(model.rope_neox, "gemma3 runnable lane must pair NEOX");
+        assert_eq!(model.embed_scale, Some((1152.0f32).sqrt()));
+
+        // Bit-exact forward fingerprint over a short prompt: identical output
+        // proves the schedule rewiring changed nothing for the real row.
+        let logits = model.forward_logits(&[2, 651, 6037]).expect("forward");
+        let sum_bits: u64 = logits
+            .iter()
+            .fold(0u64, |acc, v| acc.wrapping_add(v.to_bits() as u64));
+        let head: Vec<String> = logits[..8]
+            .iter()
+            .map(|v| format!("{:08x}", v.to_bits()))
+            .collect();
+        eprintln!(
+            "gemma3 runnable forward fingerprint: len={} sum_bits={sum_bits:#018x} head={head:?}",
+            logits.len()
         );
     }
 }

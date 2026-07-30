@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use camelid::{
+    error::BackendError,
     gguf::read_metadata,
     inference::LlamaKvCachePlan,
     model::{
@@ -1024,13 +1025,24 @@ fn qwen3_explicit_head_dim_binds_wide_q_projection() {
 struct Gemma3FixtureOptions {
     include_qk_norm: bool,
     include_post_norms: bool,
-    include_sliding_window: bool,
+    /// Decoder depth: `gemma3.block_count` AND the per-block tensor set both
+    /// follow this, so schedule-derivation tests can run `from_gguf` at the
+    /// real row's 26-layer depth (not just the CI-default single block).
+    block_count: u32,
+    /// `Some(w)` writes `gemma3.attention.sliding_window = w` (including a
+    /// fail-closed `0`); `None` omits the key entirely.
+    sliding_window: Option<u32>,
+    /// `Some(b)` writes `gemma3.rope.freq_base = b` (including fail-closed
+    /// non-positive values); `None` omits the key entirely.
+    global_base: Option<f32>,
     /// `Some` writes an explicit scalar `gemma3.attention.sliding_window_pattern`.
     pattern_key: Option<u32>,
     /// Writes the pattern key as an f32 (malformed: the key must be an integer).
     pattern_key_malformed: bool,
     /// `Some` writes an explicit `gemma3.rope.freq_base_swa`.
     local_base_key: Option<f32>,
+    /// Writes `gemma3.rope.freq_base_swa` as a u32 (malformed: must be a float).
+    local_base_key_malformed: bool,
 }
 
 impl Default for Gemma3FixtureOptions {
@@ -1038,51 +1050,60 @@ impl Default for Gemma3FixtureOptions {
         Self {
             include_qk_norm: true,
             include_post_norms: true,
-            include_sliding_window: true,
+            block_count: 1,
+            sliding_window: Some(512),
+            global_base: Some(1_000_000.0),
             pattern_key: None,
             pattern_key_malformed: false,
             local_base_key: None,
+            local_base_key_malformed: false,
         }
     }
 }
 
-/// Build a tiny gemma3 GGUF (1 block, embedding 16, 2 heads, 1 KV head,
-/// head_dim 8, tied embeddings) mirroring the real row's key/tensor layout:
-/// `attention.sliding_window` + `rope.freq_base` are the only window/rope keys
-/// the real gemma-3-1b-it-Q8_0 file carries.
+/// Build a tiny gemma3 GGUF (`block_count` blocks, embedding 16, 2 heads, 1 KV
+/// head, head_dim 8, tied embeddings) mirroring the real row's key/tensor
+/// layout: `attention.sliding_window` + `rope.freq_base` are the only
+/// window/rope keys the real gemma-3-1b-it-Q8_0 file carries.
 fn write_gemma3_gguf(path: &Path, options: &Gemma3FixtureOptions) {
-    let mut tensors: Vec<(&str, Vec<i64>)> = vec![
-        ("token_embd.weight", vec![4, 16]),
-        ("output_norm.weight", vec![16]),
-        ("blk.0.attn_norm.weight", vec![16]),
-        ("blk.0.attn_q.weight", vec![16, 16]),
-        ("blk.0.attn_k.weight", vec![16, 8]),
-        ("blk.0.attn_v.weight", vec![16, 8]),
-        ("blk.0.attn_output.weight", vec![16, 16]),
-        ("blk.0.ffn_norm.weight", vec![16]),
-        ("blk.0.ffn_gate.weight", vec![16, 32]),
-        ("blk.0.ffn_up.weight", vec![16, 32]),
-        ("blk.0.ffn_down.weight", vec![32, 16]),
+    let mut tensors: Vec<(String, Vec<i64>)> = vec![
+        ("token_embd.weight".to_string(), vec![4, 16]),
+        ("output_norm.weight".to_string(), vec![16]),
     ];
-    if options.include_qk_norm {
-        // head_dim = attention.key_length = 8.
-        tensors.push(("blk.0.attn_q_norm.weight", vec![8]));
-        tensors.push(("blk.0.attn_k_norm.weight", vec![8]));
-    }
-    if options.include_post_norms {
-        // Sandwich norms are full-width [embedding_length].
-        tensors.push(("blk.0.post_attention_norm.weight", vec![16]));
-        tensors.push(("blk.0.post_ffw_norm.weight", vec![16]));
+    for blk in 0..options.block_count {
+        let name = |t: &str| format!("blk.{blk}.{t}.weight");
+        tensors.push((name("attn_norm"), vec![16]));
+        tensors.push((name("attn_q"), vec![16, 16]));
+        tensors.push((name("attn_k"), vec![16, 8]));
+        tensors.push((name("attn_v"), vec![16, 8]));
+        tensors.push((name("attn_output"), vec![16, 16]));
+        tensors.push((name("ffn_norm"), vec![16]));
+        tensors.push((name("ffn_gate"), vec![16, 32]));
+        tensors.push((name("ffn_up"), vec![16, 32]));
+        tensors.push((name("ffn_down"), vec![32, 16]));
+        if options.include_qk_norm {
+            // head_dim = attention.key_length = 8.
+            tensors.push((name("attn_q_norm"), vec![8]));
+            tensors.push((name("attn_k_norm"), vec![8]));
+        }
+        if options.include_post_norms {
+            // Sandwich norms are full-width [embedding_length].
+            tensors.push((name("post_attention_norm"), vec![16]));
+            tensors.push((name("post_ffw_norm"), vec![16]));
+        }
     }
 
-    let mut metadata_count = 13i64;
-    if options.include_sliding_window {
+    let mut metadata_count = 12i64;
+    if options.sliding_window.is_some() {
+        metadata_count += 1;
+    }
+    if options.global_base.is_some() {
         metadata_count += 1;
     }
     if options.pattern_key.is_some() || options.pattern_key_malformed {
         metadata_count += 1;
     }
-    if options.local_base_key.is_some() {
+    if options.local_base_key.is_some() || options.local_base_key_malformed {
         metadata_count += 1;
     }
 
@@ -1097,16 +1118,18 @@ fn write_gemma3_gguf(path: &Path, options: &Gemma3FixtureOptions) {
     push_kv_u32(&mut b, "general.file_type", 0);
     push_kv_u32(&mut b, "gemma3.context_length", 128);
     push_kv_u32(&mut b, "gemma3.embedding_length", 16);
-    push_kv_u32(&mut b, "gemma3.block_count", 1);
+    push_kv_u32(&mut b, "gemma3.block_count", options.block_count);
     push_kv_u32(&mut b, "gemma3.feed_forward_length", 32);
     push_kv_u32(&mut b, "gemma3.attention.head_count", 2);
     push_kv_u32(&mut b, "gemma3.attention.head_count_kv", 1);
     push_kv_u32(&mut b, "gemma3.attention.key_length", 8);
     push_kv_u32(&mut b, "gemma3.attention.value_length", 8);
-    push_kv_f32(&mut b, "gemma3.rope.freq_base", 1_000_000.0);
+    if let Some(base) = options.global_base {
+        push_kv_f32(&mut b, "gemma3.rope.freq_base", base);
+    }
     push_kv_f32(&mut b, "gemma3.attention.layer_norm_rms_epsilon", 1e-6);
-    if options.include_sliding_window {
-        push_kv_u32(&mut b, "gemma3.attention.sliding_window", 512);
+    if let Some(window) = options.sliding_window {
+        push_kv_u32(&mut b, "gemma3.attention.sliding_window", window);
     }
     if let Some(period) = options.pattern_key {
         push_kv_u32(&mut b, "gemma3.attention.sliding_window_pattern", period);
@@ -1115,6 +1138,8 @@ fn write_gemma3_gguf(path: &Path, options: &Gemma3FixtureOptions) {
     }
     if let Some(base) = options.local_base_key {
         push_kv_f32(&mut b, "gemma3.rope.freq_base_swa", base);
+    } else if options.local_base_key_malformed {
+        push_kv_u32(&mut b, "gemma3.rope.freq_base_swa", 10_000);
     }
 
     let mut relative_offset = 0u64;
@@ -1149,36 +1174,32 @@ fn gemma3_binds_qk_and_sandwich_norms_with_window_metadata() {
     let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
 
     let layer = &binding.layers[0];
-    assert_eq!(
-        layer
-            .attention_q_norm()
-            .expect("gemma3 must bind attn_q_norm")
-            .dimensions,
-        vec![8]
-    );
-    assert_eq!(
-        layer
-            .attention_k_norm()
-            .expect("gemma3 must bind attn_k_norm")
-            .dimensions,
-        vec![8]
-    );
-    assert_eq!(
-        layer
-            .post_attention_norm
-            .as_ref()
-            .expect("gemma3 must bind post_attention_norm")
-            .dimensions,
-        vec![16]
-    );
-    assert_eq!(
-        layer
-            .post_ffw_norm
-            .as_ref()
-            .expect("gemma3 must bind post_ffw_norm")
-            .dimensions,
-        vec![16]
-    );
+    // NAME-pinned bindings: the two QK norms share shape [8] and the two
+    // sandwich norms share shape [16], so `.dimensions` alone cannot tell a
+    // transposed `find_tensor` lookup from a correct one — asserting the bound
+    // descriptor's `.name` on the specific field makes a swap fail loudly.
+    let q_norm = layer
+        .attention_q_norm()
+        .expect("gemma3 must bind attn_q_norm");
+    assert_eq!(q_norm.name, "blk.0.attn_q_norm.weight");
+    assert_eq!(q_norm.dimensions, vec![8]);
+    let k_norm = layer
+        .attention_k_norm()
+        .expect("gemma3 must bind attn_k_norm");
+    assert_eq!(k_norm.name, "blk.0.attn_k_norm.weight");
+    assert_eq!(k_norm.dimensions, vec![8]);
+    let post_attn = layer
+        .post_attention_norm
+        .as_ref()
+        .expect("gemma3 must bind post_attention_norm");
+    assert_eq!(post_attn.name, "blk.0.post_attention_norm.weight");
+    assert_eq!(post_attn.dimensions, vec![16]);
+    let post_ffw = layer
+        .post_ffw_norm
+        .as_ref()
+        .expect("gemma3 must bind post_ffw_norm");
+    assert_eq!(post_ffw.name, "blk.0.post_ffw_norm.weight");
+    assert_eq!(post_ffw.dimensions, vec![16]);
 
     // Window/rope metadata parses from the same keys the real row carries,
     // with the reference-pinned constants for the keys no conversion writes.
@@ -1256,7 +1277,7 @@ fn gemma3_without_sliding_window_key_fails_closed() {
     write_gemma3_gguf(
         &path,
         &Gemma3FixtureOptions {
-            include_sliding_window: false,
+            sliding_window: None,
             ..Default::default()
         },
     );
@@ -1314,6 +1335,228 @@ fn gemma3_malformed_pattern_key_fails_closed() {
     );
 }
 
+/// Schedule derivation exercised THROUGH `from_gguf` at the real row's depth
+/// (the unit test hand-builds the struct; this one proves the parse itself
+/// derives the schedule from the resolved pattern). Expectations are literal
+/// lists — NOT the production `(i + 1) % pattern` expression — so a regression
+/// in the derivation (e.g. deriving from `REFERENCE_SLIDING_WINDOW_PATTERN`
+/// instead of the resolved pattern) cannot be mirrored into the expectation.
+#[test]
+fn gemma3_from_gguf_derives_the_26_layer_reference_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-26-layers.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            block_count: 26,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let meta = config.gemma3.as_ref().expect("gemma3 metadata must parse");
+
+    assert_eq!(meta.layer_is_sliding.len(), 26);
+    let globals: Vec<usize> = meta
+        .layer_is_sliding
+        .iter()
+        .enumerate()
+        .filter(|(_, sliding)| !**sliding)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(globals, vec![5, 11, 17, 23]);
+    assert!(
+        meta.is_sliding_layer(25),
+        "layer 25 must be local (no forced-global final layer)"
+    );
+    for idx in 0..26 {
+        let expect_global = matches!(idx, 5 | 11 | 17 | 23);
+        assert_eq!(!meta.is_sliding_layer(idx), expect_global, "layer {idx}");
+        assert_eq!(
+            meta.rope_freq_base_at(idx),
+            if expect_global { 1_000_000.0 } else { 10_000.0 },
+            "layer {idx} rope base"
+        );
+        assert_eq!(
+            meta.layer_window(idx),
+            if expect_global { None } else { Some(512) },
+            "layer {idx} window"
+        );
+    }
+}
+
+/// The explicit `gemma3.attention.sliding_window_pattern` override must reach
+/// the schedule DERIVATION through `from_gguf` (not merely the stored field):
+/// 12 layers at pattern 4 puts the globals at 3/7/11 (literal list), and the
+/// `gemma3.rope.freq_base_swa` override must reach the per-layer accessor.
+#[test]
+fn gemma3_from_gguf_pattern_override_drives_the_schedule_derivation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-12-layers-pattern-4.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            block_count: 12,
+            pattern_key: Some(4),
+            local_base_key: Some(50_000.0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let meta = config.gemma3.as_ref().expect("gemma3 metadata must parse");
+
+    assert_eq!(meta.sliding_window_pattern, 4);
+    assert_eq!(meta.layer_is_sliding.len(), 12);
+    let globals: Vec<usize> = meta
+        .layer_is_sliding
+        .iter()
+        .enumerate()
+        .filter(|(_, sliding)| !**sliding)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(globals, vec![3, 7, 11]);
+    for idx in 0..12 {
+        let expect_global = matches!(idx, 3 | 7 | 11);
+        assert_eq!(!meta.is_sliding_layer(idx), expect_global, "layer {idx}");
+        assert_eq!(
+            meta.rope_freq_base_at(idx),
+            if expect_global { 1_000_000.0 } else { 50_000.0 },
+            "layer {idx} rope base"
+        );
+    }
+}
+
+#[test]
+fn gemma3_zero_sliding_window_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-zero-window.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            sliding_window: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf)
+        .expect_err("a zero-width sliding window must fail closed at config parse");
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("gemma3.attention.sliding_window") && msg.contains("greater than zero"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_missing_global_rope_base_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-no-global-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            global_base: None,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf)
+        .expect_err("gemma3 missing rope.freq_base must fail closed at config parse");
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("gemma3.rope.freq_base") && msg.contains("fails closed"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_non_positive_global_rope_base_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-zero-global-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            global_base: Some(0.0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf)
+        .expect_err("gemma3 non-positive rope.freq_base must fail closed at config parse");
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("gemma3.rope.freq_base") && msg.contains("greater than zero"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_malformed_local_base_key_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-bad-local-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            local_base_key_malformed: true,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf).expect_err(
+        "an explicit but non-float rope.freq_base_swa must fail closed, not fall back to \
+         the reference local base",
+    );
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(msg.contains("freq_base_swa"), "unexpected error: {msg}");
+}
+
+#[test]
+fn gemma3_non_positive_local_base_key_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-zero-local-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            local_base_key: Some(0.0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf).expect_err(
+        "an explicit but non-positive rope.freq_base_swa must fail closed, not fall back to \
+         the reference local base",
+    );
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(msg.contains("freq_base_swa"), "unexpected error: {msg}");
+}
+
 /// Real-row gate (campaign Phase 1 parity gate): every one of the 1B row's
 /// 26x4 = 104 norm tensors binds non-None from the actual GGUF, the window/
 /// pattern/rope-base metadata round-trips exactly, the structural flags are
@@ -1353,6 +1596,29 @@ fn gemma3_real_row_binds_all_104_norm_tensors_and_window_schedule() {
             .post_ffw_norm
             .as_ref()
             .unwrap_or_else(|| panic!("layer {idx} post_ffw_norm must bind"));
+        // NAME-pinned per layer: both QK norms are [256] and both sandwich
+        // norms are [1152], so shape assertions alone would pass with the
+        // lookups transposed — pin each field to its exact tensor name.
+        assert_eq!(
+            q_norm.name,
+            format!("blk.{idx}.attn_q_norm.weight"),
+            "layer {idx} q_norm name"
+        );
+        assert_eq!(
+            k_norm.name,
+            format!("blk.{idx}.attn_k_norm.weight"),
+            "layer {idx} k_norm name"
+        );
+        assert_eq!(
+            post_attn.name,
+            format!("blk.{idx}.post_attention_norm.weight"),
+            "layer {idx} post_attention_norm name"
+        );
+        assert_eq!(
+            post_ffw.name,
+            format!("blk.{idx}.post_ffw_norm.weight"),
+            "layer {idx} post_ffw_norm name"
+        );
         assert_eq!(q_norm.dimensions, vec![256], "layer {idx} q_norm shape");
         assert_eq!(k_norm.dimensions, vec![256], "layer {idx} k_norm shape");
         assert_eq!(

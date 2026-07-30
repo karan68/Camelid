@@ -482,3 +482,64 @@ per the `CAMELID_GEMMA4_GGUF` convention, run PASS against the real file):
 
 Gates: cargo fmt clean, clippy --all-targets -D warnings clean, cargo test --all-targets green
 (with the real-row test exercised via CAMELID_GEMMA3_GGUF), check-public-scrub.sh clean.
+
+### 8a. Phase 1b review record (2026-07-29)
+
+Five confirmed adversarial-review findings against the Phase 1 landing, all fixed in one
+commit on this branch:
+
+**R1 (major) — swapped sandwich-norm bindings were test-invisible.** `post_attention_norm`
+and `post_ffw_norm` are both `[1152]` and every Phase 1 test asserted only `.dimensions`, so
+transposing the `find_tensor` lookups passed the whole suite. Fixed by NAME-pinning: the
+synthetic binding test and the real-row test now assert the bound descriptor's `.name`
+(`blk.{i}.post_attention_norm.weight` on the `post_attention_norm` field, and likewise for
+`post_ffw_norm` and — same blindness, both `[256]` — `attn_q_norm`/`attn_k_norm`) on every
+layer. Verified by temporarily transposing the lookups (sandwich pair AND QK pair): both the
+synthetic and the real-row test fail on the name assertion in each case; restored, both green.
+
+**R2 (major) — schedule derivation was only CI-exercised at block_count=1, and the 26-layer
+unit test duplicated the production expression (tautology).** The fixture writer now takes a
+`block_count` option (per-block tensors follow it), and two new `from_gguf`-driven tests
+assert THROUGH the parsed metadata's accessors with literal expected lists (never the
+`(i+1) % pattern` formula): (a) 26 layers, no override → globals exactly at 5/11/17/23,
+layer 25 local; (b) 12 layers with an explicit `sliding_window_pattern = 4` override →
+globals at 3/7/11, plus a `freq_base_swa = 50000` override reaching `rope_freq_base_at` —
+proving the resolved (possibly overridden) pattern, not `REFERENCE_SLIDING_WINDOW_PATTERN`,
+drives the derivation. The unit test's hand-built fixture now uses a literal 26-entry
+schedule list instead of the formula; it remains the accessor-semantics test.
+
+**R3 (minor, design) — override keys honored by `Gemma3Metadata` but not by the runnable
+lane.** CHOICE: single source of truth (the preferred option), not the fail-closed fallback.
+The runnable lane's hardcoded pattern-6/local-10000 schedule (src/runnable/model.rs) now
+derives `layer_rope_base` from the SAME parsed `Gemma3Metadata` (`cfg.gemma3`, shared
+`from_gguf`) via `rope_freq_base_at`, so an override-carrying row can no longer make the
+runnable (CPU parity oracle) and resident lanes compute different schedules for one file.
+Bit-identity for the real 1B row proven by a new env-gated test
+(`runnable::model::gemma3_schedule_tests::gemma3_real_row_runnable_rope_schedule_is_the_reference_schedule`,
+literal expected base list + forward-logits fingerprint over a short prompt): fingerprint
+`sum_bits=0x0002eec61740012f` identical before and after the rewiring, and the Phase 1
+real-row binding/schedule test still passes. Note the runnable lane still implements no
+window mask (documented full-support blocker) — R3 unifies the schedule/rope-base inputs,
+not the mask.
+
+**R4 (minor) — stale "silently drops the norms" safety comments.** With Phase 1 binding the
+norms (and the dense forward path applying QK norms where bound), five comments describing
+the pre-Phase-1 binder as present-tense fact were rewritten to the current rationale (binds,
+but does not APPLY the sandwich norms; no GeGLU, dual-theta RoPE, or sliding-window mask;
+gemma2's sandwich norms still dropped at bind): src/model.rs (`is_runnable_only_arch` doc),
+src/inference/tests.rs (resident-disqualifier test doc), src/main.rs
+(`ensure_arch_has_direct_dense_session` doc + its bail message), src/api/mod.rs (M-A1 compat
+row comment, `is_runnable_serve_arch` doc). A grep sweep caught three more the list missed:
+src/inference.rs (resident disqualifier comment + bail message), src/model.rs
+(`runnable_only_arch_set_is_exactly_the_serve_bridge_set` comment), src/api/mod.rs
+(`completions_unsupported_for_arch` doc).
+
+**R5 (minor) — untested fail-closed branches in `Gemma3Metadata::from_gguf`.** Fixture
+options added for each; five new tests assert the typed `InvalidModelMetadata` error (not a
+silent reference-constant fallback): `sliding_window == 0`, missing `rope.freq_base`,
+non-positive `rope.freq_base`, wrong-typed `rope.freq_base_swa`, non-positive
+`rope.freq_base_swa`.
+
+Gates re-run after the fixes: cargo fmt clean, clippy --all-targets -D warnings clean,
+cargo test --all-targets green, real-row + runnable-schedule tests green under
+CAMELID_GEMMA3_GGUF, check-public-scrub.sh clean.

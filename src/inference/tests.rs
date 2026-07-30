@@ -1630,12 +1630,15 @@ fn nope_config_disqualifies_the_resident_gpu_path() {
     );
 }
 
-/// gemma3/gemma2 must never reach the resident GPU engines: the dense binder
-/// silently drops their QK-norm and post-attention/post-FFN ("sandwich") norm
-/// tensors and the dense forward has no GeGLU, so the resident lane would decode
-/// fluent-looking garbage under a supported label. TEMPORARY until the gemma3
-/// Metal campaign (feat/gemma3-metal-resident) lands its resident encode in
-/// Phase 3 — this test then flips alongside the disqualifier's removal.
+/// gemma3/gemma2 must never reach the resident GPU engines. gemma3's four
+/// extra norms now BIND name-pinned (campaign Phase 1) — and the dense forward
+/// would apply the QK pair — but the forward (resident or CPU dense) still
+/// does not apply the sandwich norms and has no GeGLU, dual-theta RoPE, or
+/// sliding-window mask; gemma2's sandwich norms are still silently dropped at
+/// bind. Either way the resident lane would decode fluent-looking garbage
+/// under a supported label. TEMPORARY until the gemma3 Metal campaign
+/// (feat/gemma3-metal-resident) lands its resident encode in Phase 3 — this
+/// test then flips alongside the disqualifier's removal.
 ///
 /// Like the NoPE test above, the arch check sits before the backend-enabled
 /// gate in `resident_decode_eligible`, so the assertion is causal on a

@@ -5726,23 +5726,26 @@ fn infer_quantization(path: &std::path::Path) -> String {
 
 /// Fail closed BEFORE weights load on every CLI lane that would construct a
 /// direct dense `LlamaInferenceSession` for a runnable-lane-only architecture
-/// (qwen35 / gemma2 / gemma3). The dense binder silently drops gemma3's
-/// QK-norm and post-attention/post-FFN norm tensors and the dense forward has
-/// no GeGLU, so BOTH the CPU dense forward and the GPU resident lane decode
-/// fluent-looking garbage for these archs; qwen35's hybrid layers do not fit
-/// the dense tensor map at all. `camelid serve` (and `camelid chat`, which
-/// drives serve over HTTP) route these archs to the correct runnable bridge —
-/// point the user there instead of running a mis-bound forward. Mirrors
-/// serve's `is_runnable_serve_arch` via the shared
+/// (qwen35 / gemma2 / gemma3). gemma3's norms now bind (Metal-campaign
+/// Phase 1) and the dense forward would apply the QK pair, but it still does
+/// not apply the sandwich norms and has no GeGLU, dual-theta RoPE, or
+/// sliding-window mask; gemma2's sandwich norms are still silently dropped at
+/// bind; qwen35's hybrid layers do not fit the dense tensor map at all. So
+/// BOTH the CPU dense forward and the GPU resident lane would decode
+/// fluent-looking garbage for these archs. `camelid serve` (and
+/// `camelid chat`, which drives serve over HTTP) route them to the correct
+/// runnable bridge — point the user there instead of running an incomplete
+/// forward. Mirrors serve's `is_runnable_serve_arch` via the shared
 /// `camelid::model::is_runnable_only_arch` predicate.
 fn ensure_arch_has_direct_dense_session(gguf: &camelid::gguf::GgufFile) -> anyhow::Result<()> {
     let arch = gguf.architecture().unwrap_or_default();
     if camelid::model::is_runnable_only_arch(arch) {
         anyhow::bail!(
             "architecture '{arch}' is served only through the runnable lane; this command's \
-             direct dense-session path would run a mis-bound forward and emit wrong output, \
-             so it fails closed. Use `camelid serve` (or `camelid chat`), which routes this \
-             architecture to its correct runtime."
+             direct dense-session path would run an incomplete forward (missing norm/rope/\
+             window application) and emit wrong output, so it fails closed. Use `camelid \
+             serve` (or `camelid chat`), which routes this architecture to its correct \
+             runtime."
         );
     }
     Ok(())

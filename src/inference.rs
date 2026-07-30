@@ -2706,18 +2706,21 @@ impl LlamaInferenceSession {
         // TEMPORARY arch-keyed disqualifier — remove in Phase 3 of the gemma3 Metal
         // campaign (branch feat/gemma3-metal-resident), which lands a resident encode
         // that applies these tensors. gemma3/gemma2 must never reach the resident
-        // dense kernels today: the dense binder drops their QK-norm and
-        // post-attention/post-FFN ("sandwich") norm tensors (gemma3-1b: 104 of them)
-        // and the dense forward has no GeGLU or dual-RoPE, so the resident lane —
-        // like the CPU dense forward — would decode fluent-looking garbage under a
-        // supported label. Checked before the backend-enabled gate because this is a
-        // property of the model, not of the available backends (same rationale as
-        // the NoPE check above; keeps the regression test causal on CPU-only hosts).
+        // dense kernels today: gemma3's QK/sandwich norms now BIND name-pinned
+        // (Phase 1; 104 tensors on the 1B) and the QK pair would even be applied,
+        // but the forward — resident or CPU dense — still does not apply the
+        // sandwich norms and has no GeGLU, dual-theta RoPE, or sliding-window mask;
+        // gemma2's sandwich norms are still silently dropped at bind. Either lane
+        // would decode fluent-looking garbage under a supported label. Checked
+        // before the backend-enabled gate because this is a property of the model,
+        // not of the available backends (same rationale as the NoPE check above;
+        // keeps the regression test causal on CPU-only hosts).
         if matches!(self.config.architecture.as_str(), "gemma2" | "gemma3") {
             bail!(format!(
-                "architecture {:?} is runnable-lane-only: the dense binder drops its QK/sandwich \
-                 norm tensors and has no GeGLU, so the resident kernels would run a mis-bound \
-                 forward; serve/chat route it to the runnable bridge instead",
+                "architecture {:?} is runnable-lane-only: the dense forward does not apply its \
+                 full norm/activation structure (sandwich norms, GeGLU, per-layer rope/window \
+                 schedule), so the resident kernels would run an incomplete forward; \
+                 serve/chat route it to the runnable bridge instead",
                 self.config.architecture
             ));
         }
