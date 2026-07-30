@@ -901,3 +901,174 @@ stack is therefore proven UNCHANGED under the Phase 3a plumbing.
   predicates: the flip does not reopen the prompt-prefix cache for gemma3. Reopening it later
   is §9e-5/H11 territory (F32 primary never qualifies; a window-aware mirror changes the
   round-trip exactness argument) and stays out of 3b.
+
+## 11. Phase 3b record (2026-07-30)
+
+Phase 3b is the routing flip: gemma3 is servable on the Metal GPU-resident lane. One commit
+(ba6de7f7), standing entirely on the 3a plumbing; nothing in it touches kernels or the forward.
+
+### 11a. The capability-aware predicate
+
+The flip is NOT a bare list edit. gemma3 left `is_runnable_only_arch` (src/model.rs, now
+`qwen35 | gemma2` only), and routing keys on a new pair beside it:
+
+- `model::arch_requires_runnable_bridge(arch)` — the live predicate serve and the CLI direct
+  lanes consult. True for qwen35/gemma2 always; true for gemma3 only where the resident lane
+  cannot serve it.
+- `model::arch_requires_runnable_bridge_given(arch, capable)` — the pure half, so the split is
+  unit-testable without env or a device.
+- `inference::windowed_arch_resident_host_available()` — the host probe:
+  macOS build AND `resident_decode_metal_enabled()` (live env; deterministic mode force-off)
+  AND NOT `resident_decode_cuda_enabled()` (the CUDA engine has no windowed forward)
+  AND a real Metal device (`detect_metal_device().available`, cached in a OnceLock).
+
+Consumers rewired: `api::is_runnable_serve_arch` (serve router + runnable-runtime load +
+`completions_unsupported_for_arch`) and `main::ensure_arch_has_direct_dense_session` both
+delegate to `arch_requires_runnable_bridge`, so serve and the CLI cannot disagree. Outcome:
+on a resident-capable host gemma3 chat falls through the runnable short-circuit onto the dense
+lane and the resident engine serves it; on every other host (non-macOS CI legs, resident decode
+opted out, deterministic mode, CUDA-resident, no device) gemma3 loads the runnable runtime and
+serves exactly as before the flip — never the CPU dense forward.
+
+### 11b. H4 — the CPU dense forward fails closed for windowed archs (same commit)
+
+`LlamaInferenceSession::ensure_windowed_arch_off_cpu_dense` (src/inference.rs), keyed on
+`arch_has_windowed_attention`, returns a typed `BackendError::UnsupportedModelArchitecture`
+naming the hazard and both correct lanes. Guarded at ALL THREE CPU dense forward dispatches:
+the single-token decode fallback (the else-branch after `try_resident_decode_forward`
+declines), `forward_prefill_chunk_timed_fast`, and
+`forward_prefill_layer_major_timed_fast_inner`. No routing mistake can silently run gemma3
+full-causal. A second cfg(test)-only seam (`TEST_ADMIT_WINDOWED_ARCH_CPU_DENSE`, drop-guarded,
+armed only under `env_lock`) lets the 3a prompt-prefix-cache decision tests keep driving tiny
+synthetic gemma3 configs through the CPU forward mechanically; the 3a resident seam is
+unchanged and now effectively covers only gemma2. Pinned by
+`windowed_arch_cpu_dense_forward_fails_closed` (with a non-windowed control proving causality).
+
+### 11c. H5 — resident admission pinned to the Q8_0 exact row (same commit)
+
+In `resident_decode_eligible`: the arch disqualifier is now gemma2-only; windowed archs gained
+(a) a CUDA-resident bail (the CUDA engine would run the window full-causal) and (b) a Q8_0 pin
+— `is_resident_quant` returns `is_q8` only for windowed archs, plus an explicit pre-loop typed
+decline when any layer linear is non-Q8_0 (a gemma3 Q4_K_M would otherwise ride the Metal
+K-quant admission onto an F16-primary lane whose gather drops `embed_scale`, with no windowed
+receipt). Serve falls back to the runnable bridge for such files.
+
+### 11d. Execution plan
+
+- `recognized_row_level`: gemma-3-1b-it row added at a NEW honest level string
+  `supported_exact_row_smoke_sub512` (the ≥512 receipt is Phase 4's), included in
+  `is_supported_exact_q8_row`; `support_level` already gates it to Q8_0 files only.
+- Plan selection is platform-split for windowed archs: macOS+Metal+resident →
+  `metal_resident_q8_runtime` (the load-bearing selection §3 called out); anywhere the Metal
+  selection cannot fire (non-macOS, resident unset, `CAMELID_MAC_Q8_METAL_PLAN=0`) the plan
+  FAILS CLOSED to `safe_q8_plan` with a windowed-arch reason instead of advertising a CPU
+  dense lane H4 forbids (`select_macos_q8_plan` gained a `windowed_attention_arch` param;
+  the x86 arm is bypassed via `is_windowed_attention_arch`).
+- `is_gpu_runnable_arch`: gemma3 deliberately NOT added. Both consumers are non-Q8-exact
+  tiers H5 forbids — the Q8 GPU-runnable tier is CUDA-resident (no windowed CUDA forward) and
+  the K-quant plan selection would advertise the Metal K-quant lane. Decision recorded in the
+  function comment; pinned by `gemma3_kquant_never_takes_the_metal_resident_kquant_plan`.
+- New plan tests: `gemma3_q8_row_selects_metal_resident_plan_on_a_resident_mac`,
+  `gemma3_q8_row_fails_closed_to_safe_plan_where_metal_resident_cannot_run`, and the K-quant
+  pin above.
+
+### 11e. Raw-completions surfaces (#554) and the dense chat renderer
+
+The #554 chokepoints (`prepare_generation` dense gate, `reject_completions_for_runnable_arch`)
+key on the capability-aware predicate, so gemma3's raw surfaces (`/completion`,
+`/v1/completions` + n>1 fan-out, `/api/generation/preflight`, `/api/generation/sessions`,
+receipt replay) REOPEN exactly where the resident lane serves and stay 422-gated on the
+runnable fallback. `api::runnable_completions_gate_api_tests` pins the split: the always-gated
+tests moved to qwen35/gemma2, and two new tests pin gemma3 both ways
+(`completions_gate_stays_closed_for_gemma3_on_a_runnable_fallback_host` — env=0 under
+env_lock, restores the caller's value; `completions_gate_reopens_for_gemma3_where_the_
+resident_lane_serves` — macOS+device gated).
+
+The dense chat lane gained gemma3's prompt renderer: without it the fallback renderer dropped
+gemma3 chats onto the role-colon prompt. `is_gemma3_chat_template` (`<start_of_turn>` +
+`<end_of_turn>` + `first_user_prefix`) routes to the SAME byte-faithful `render_gemma3_prompt`
+the runnable bridge uses, with the identical encode contract (no BOS in the string,
+add_special=true, parse_special=true). Pinned by
+`gemma3_template_renders_through_the_shared_gemma3_renderer_on_the_dense_lane`.
+
+### 11f. Tool calling (#549) — decision
+
+gemma3 tool calling has never been supported on ANY lane: the row is `tool_capable: false` and
+the runnable bridge returns a typed 422 (`unsupported_tools` — "no tools branch, no certified
+grammar") by design. "Fixing dense-lane tool threading" would mean inventing an uncertified
+tool grammar for a template that has none — the opposite of this repo's fail-closed policy.
+The flip therefore PRESERVES the explicit refusal contract on the dense lane:
+`render_chat_prompt_for_tokenization_with_tools` declines gemma3's template with the same
+row-accurate reason (surfaced as 422 `unsupported_chat_template`), pinned by test. Tools are
+never silently dropped from the prompt, and `tool_choice:"none"` still renders plain chat
+(verified live). This is behavior-IDENTICAL to pre-flip from the API user's perspective.
+
+### 11g. Serve smokes (release, this M4 mini 16 GB, no special env vars)
+
+Resident smoke (`camelid serve --model gemma-3-1b-it-Q8_0.gguf --no-open`):
+- /v1/health: `generation_ready:true`, `selected_backend:"metal_resident_q8_runtime"`,
+  `decode_path:"q8_0_metal_resident_decode"`, `support_level:"supported_exact_row_smoke_sub512"`,
+  backend `"llama"` (dense serve lane; NO runnable runtime loaded).
+- Greedy chat ("Why is the sky blue? Answer in one sentence.", 20 prompt tok): coherent
+  Rayleigh-scattering sentence, finish stop, 26 tokens. Run 1 wall 0.825 s, run 2 (warm)
+  0.788 s — byte-identical token ids across runs. Warm timings: prefill 19 tok / 302.2 ms
+  = 62.9 tok/s (token-by-token per H2), first token 40.4 ms, decode 25 tok / 389.4 ms
+  = **64.2 tok/s decode** at short depth.
+- Long greedy (33 prompt / 256 completion, two runs, byte-identical): prefill 81.5 / 86.1
+  tok/s; decode 255 tok in 5662.0 / 5543.3 ms = **45.0 / 46.0 tok/s decode** at depth ~289.
+  Within the §4 25-60 target band; ~0.4-0.6x of the ~110 tok/s roofline.
+- Oracle check: first 8 greedy token ids [818, 7217, 7412, 3730, 1547, 529, 496, 20284]
+  IDENTICAL 8/8 to the runnable oracle's (same prompt, fallback server below). No envelope
+  flip needed.
+- Tools (tools + tool_choice auto): typed 422 `unsupported_chat_template` — "the gemma3 chat
+  template has no tools branch and no tool-call grammar is certified for this row; tool
+  requests fail closed on the dense lane exactly as on the runnable bridge" (§11f).
+- Raw `/v1/completions` REOPENED: "The capital of France is" → " Paris.\n\nThe largest city
+  in France" (200).
+- Response `lane` discloses `"experimental"`: `filename_is_supported_exact_row` still fails on
+  the catalog/row id mismatch (`gemma3_1b_it_q8_0` vs `gemma_3_1b_it_q8_0`) — the KNOWN
+  Phase 5 deliverable (§3 Phase 5, precedent c2c33fb5), pre-existing, not new breakage.
+
+Fallback smoke (`CAMELID_METAL_RESIDENT_DECODE=0`, same command):
+- /v1/health: backend `"runnable-runtime"`; plan fails closed to `cpu_reference` /
+  `safe_cpu_decode` with the windowed-arch reason string.
+- Greedy chat 8 tok: 27.07 s wall (the known ~0.2-0.3 tok/s runnable lane), token ids above.
+- `/v1/completions`: 422 `unsupported_completions_lane` (gate intact verbatim).
+- Tools: 422 `unsupported_tools` (runnable lane refusal unchanged).
+Both servers killed by saved PID only.
+
+### 11h. Gates
+
+Flip commit: cargo fmt clean; clippy --all-targets -D warnings clean; cargo test --all-targets
+exit 0 under pipefail (lib 1376 passed / 0 failed / 23 ignored; every integration suite green).
+check-public-scrub.sh clean; scripts/check-ledger-drift.mjs passed (no capability-row or
+readiness-gate string touched — the row rewrite is Phase 5's). Env-keyed battery (release,
+production GEMV gates + resident decode armed from the shell, targeted names so the
+env-mutating gate tests never run alongside):
+- Phase 2 real-row final gate re-run: depth 1 argmax 108 = oracle, max abs logit diff
+  6.247e-5; depth 5 argmax 1077 = oracle, 7.820e-5; depth 50 argmax 578 = oracle, 9.584e-5 —
+  50/50 greedy tokens identical, overall max abs logit diff 2.122e-4, 564.04 s. Bit-for-bit
+  the §9b/§10d record: the whole Phase 2 stack is UNCHANGED under the flip.
+- 3a session-level prefill gate re-run: 5/5 greedy identical (108/584/568/2364/1077),
+  overall max abs logit diff 7.820e-5, 21.92 s — bit-for-bit the §10b record.
+- `gemma3_real_row_runnable_rope_schedule_is_the_reference_schedule` (release): PASS,
+  fingerprint sum_bits 0x0002eec61740012f unchanged.
+- `gemma3_real_row_binds_all_104_norm_tensors_and_window_schedule` (env-keyed, with the
+  updated Phase 3b invariants): PASS.
+
+### 11i. What Phase 4/5 inherit
+
+- The ≥512-token windowed receipt (Phase 4) is now reachable over the SERVED lane — depth >512
+  decode measured working here at speed (45-46 tok/s at depth ~289; §9e-7's merge-correctness
+  role stands).
+- Phase 5 owes: the capabilities-row rewrite (it still describes the runnable lane) + ledger
+  regen; the catalog/row id mismatch fix that currently makes dense responses disclose
+  `lane:"experimental"` and keeps `filename_is_supported_exact_row` false for this row;
+  frontend fixtures; docs sweep. The plan's new `supported_exact_row_smoke_sub512` level
+  string is deliberately scoped until the Phase 4 receipt lands.
+- Multi-turn chat pays a full token-by-token prefill every turn (prefix cache stays closed for
+  windowed archs, H1/§9e-5) — at 60-80 tok/s prefill this is now noticeable but not painful;
+  reopening the cache stays H11 territory.
+- Speculative decode: opt-in env only; on gemma3 the CPU verify path now H4-errors (typed)
+  and no explicit spec gate was added — flagged for Phase 5/6 if spec decode is ever pointed
+  at this row.
