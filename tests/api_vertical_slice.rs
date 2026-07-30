@@ -117,7 +117,10 @@ async fn props_reports_public_fail_closed_llama_server_shape() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["total_slots"], 1);
+    assert_eq!(
+        body["total_slots"],
+        camelid::runtime_config::DEFAULT_CONTINUOUS_BATCH_SLOTS
+    );
     assert_eq!(body["model_path"], Value::Null);
     assert_eq!(body["model_id"], Value::Null);
     assert_eq!(body["chat_template"], Value::Null);
