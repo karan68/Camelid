@@ -64,6 +64,23 @@ pub(super) fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeight
 }
 
 impl super::LlamaInferenceSession {
+    /// gemma3 per-layer dual-theta RoPE schedule for a resident session built
+    /// over the node's OWNED layer range (absolute layer ids — pipeline-sharded
+    /// nodes hold a subrange). Sliding layers select the ALT (local-theta)
+    /// tables; globals the primary. `None` for every non-gemma3 arch — the
+    /// session then behaves byte-identically to before the schedule existed.
+    fn gemma3_resident_schedule(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Option<metal::ResidentLayerSchedule> {
+        self.config
+            .gemma3
+            .as_ref()
+            .map(|g| metal::ResidentLayerSchedule {
+                use_alt_rope: range.map(|l| g.is_sliding_layer(l)).collect(),
+            })
+    }
+
     pub(super) fn try_metal_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
         if std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
             .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
@@ -109,6 +126,19 @@ impl super::LlamaInferenceSession {
         let rope_us = edge_started.elapsed().as_micros();
         let session_started = Instant::now();
         let initial_positions = (n + 1).next_multiple_of(512).min(kv_cap);
+        // gemma3: force split-half (NEOX) pairing host-side from the parsed
+        // metadata (NOT `LlamaModelConfig::rope_neox_pairing`, which stays false
+        // for gemma3 — Phase 1b design note), and attach the per-layer
+        // dual-theta schedule. The schedule makes `prefill_tokens` decline
+        // (single table set), so a gemma3 session built here would fall back —
+        // today gemma3 never reaches this path at all (arch disqualifier).
+        let split_half_pairing = split_half_pairing
+            || self
+                .config
+                .gemma3
+                .as_ref()
+                .is_some_and(|g| g.rope_neox_pairing);
+        let schedule = self.gemma3_resident_schedule(0..n_layers);
         let mut session = match metal::ResidentDecodeState::new(
             n_layers,
             n_heads,
@@ -120,6 +150,7 @@ impl super::LlamaInferenceSession {
             kv_cap,
             rms_eps,
             split_half_pairing,
+            schedule,
         ) {
             Some(s) => s,
             None => return Ok(false),
@@ -371,7 +402,7 @@ impl super::LlamaInferenceSession {
             return Ok(None);
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
-        let tables = match rope::resident_decode_rope_tables(
+        let mut tables = match rope::resident_decode_rope_tables(
             position,
             head_dim,
             &self.config,
@@ -379,6 +410,31 @@ impl super::LlamaInferenceSession {
         )? {
             Some(t) => t,
             None => return Ok(None),
+        };
+        // gemma3 dual-theta RoPE: replace the generic single-table build with
+        // the VERBATIM runnable-oracle frequency form for BOTH thetas (global
+        // primary + local ALT; see `rope::gemma3_rope_tables` on why the
+        // negated-exponent generic form is not used), and force split-half
+        // pairing from the parsed metadata (`Gemma3Metadata.rope_neox_pairing`
+        // — NOT `LlamaModelConfig::rope_neox_pairing`, which stays false for
+        // gemma3 per the Phase 1b design note).
+        let rope_dim = self
+            .config
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+        let gemma3_alt = if let Some(g) = self.config.gemma3.as_ref() {
+            let (cos, sin) = rope::gemma3_rope_tables(position, rope_dim, g.rope_freq_base_global);
+            tables.cos = cos;
+            tables.sin = sin;
+            tables.split_half_pairing = g.rope_neox_pairing || tables.split_half_pairing;
+            Some(rope::gemma3_rope_tables(
+                position,
+                rope_dim,
+                g.rope_freq_base_local,
+            ))
+        } else {
+            None
         };
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
 
@@ -401,6 +457,9 @@ impl super::LlamaInferenceSession {
                 kv_cap,
                 rms_eps,
                 tables.split_half_pairing,
+                // gemma3: per-layer dual-theta schedule over the OWNED layer
+                // range (pipeline-sharded nodes hold a subrange).
+                self.gemma3_resident_schedule(range.clone()),
             ) {
                 Some(s) => s,
                 None => return Ok(None),
@@ -515,12 +574,34 @@ impl super::LlamaInferenceSession {
 
         // Rope tables for position+1 feed the encode-ahead pipeline: the session encodes
         // the NEXT token's command buffer while this token executes on the GPU.
-        let next_tables = rope::resident_decode_rope_tables(
-            position + 1,
-            head_dim,
-            &self.config,
-            weights.rope_freqs.as_ref(),
-        )?;
+        // gemma3 rebuilds both theta tables with the oracle-form builder, same
+        // as the current token's.
+        let (next_tables, next_gemma3_alt) = if let Some(g) = self.config.gemma3.as_ref() {
+            let (cos, sin) =
+                rope::gemma3_rope_tables(position + 1, rope_dim, g.rope_freq_base_global);
+            (
+                Some(rope::ResidentRopeTables {
+                    cos,
+                    sin,
+                    split_half_pairing: tables.split_half_pairing,
+                }),
+                Some(rope::gemma3_rope_tables(
+                    position + 1,
+                    rope_dim,
+                    g.rope_freq_base_local,
+                )),
+            )
+        } else {
+            (
+                rope::resident_decode_rope_tables(
+                    position + 1,
+                    head_dim,
+                    &self.config,
+                    weights.rope_freqs.as_ref(),
+                )?,
+                None,
+            )
+        };
         let session = self
             .resident_decode
             .as_mut()
@@ -530,6 +611,9 @@ impl super::LlamaInferenceSession {
             &layer_views,
             &tables.cos,
             &tables.sin,
+            gemma3_alt
+                .as_ref()
+                .map(|(c, s)| (c.as_slice(), s.as_slice())),
             position,
             scale,
             logits_stage,
@@ -540,6 +624,9 @@ impl super::LlamaInferenceSession {
             next_tables
                 .as_ref()
                 .map(|t| (t.cos.as_slice(), t.sin.as_slice())),
+            next_gemma3_alt
+                .as_ref()
+                .map(|(c, s)| (c.as_slice(), s.as_slice())),
         ) {
             Some(o) => o,
             None => return Ok(None),

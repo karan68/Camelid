@@ -14148,7 +14148,7 @@ fn metal_resident_rollback_moves_filled_with_the_kv_position() {
     let (mut session, _temp_file) = tiny_kv_budget_session(64);
     // tiny_kv_budget_session: 1 layer, 1 head, 1 kv head, head_dim 32, hidden 32, ffn 32.
     let Some(mut state) =
-        crate::metal::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false)
+        crate::metal::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false, None)
     else {
         // No usable Metal lane. This is the ONLY guard for the draft-rollback regression that
         // needs no model file, so a silent skip here means the regression is unguarded — and

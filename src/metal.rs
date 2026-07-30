@@ -11002,6 +11002,27 @@ pub enum ResidentTokenOut {
     Sampled(u32),
 }
 
+/// Per-layer RoPE-theta selection for dual-theta architectures (gemma3): layer
+/// `i` ropes with the token's ALT (local-theta) cos/sin tables when
+/// `use_alt_rope[i]`, else the primary tables. Built host-side from
+/// `Gemma3Metadata::layer_is_sliding` (locals use the local base, globals the
+/// GGUF `rope.freq_base`). `None` schedule on the session = the existing
+/// single-table behavior, byte-identical. The batched prefill and
+/// speculative-verify paths cannot express a per-layer table and fail closed
+/// when a schedule is present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidentLayerSchedule {
+    pub use_alt_rope: Vec<bool>,
+}
+
+impl ResidentLayerSchedule {
+    /// True when any layer needs the ALT tables (callers must then pass
+    /// `alt_rope` to `forward_token`).
+    pub fn needs_alt_rope(&self) -> bool {
+        self.use_alt_rope.iter().any(|&b| b)
+    }
+}
+
 /// A resident decode session that owns the on-GPU KV cache (per layer, sized to
 /// `max_positions`) and the reused hidden ping-pong buffers. A multi-token greedy decode runs
 /// each token in ONE command buffer with the KV cache persisting on the GPU across tokens --
@@ -11022,6 +11043,9 @@ pub struct ResidentDecodeState {
     cap: usize,
     eps: f32,
     split_half_pairing: bool,
+    /// Per-layer dual-theta RoPE schedule (gemma3). `None` for every other
+    /// arch — zero behavior change.
+    schedule: Option<ResidentLayerSchedule>,
     cache_k: Vec<Buffer>,
     cache_v: Vec<Buffer>,
     /// Half-precision mirrors of cache_k/cache_v (empty in kv16-primary mode, where the
@@ -11115,8 +11139,15 @@ impl ResidentDecodeState {
         cap: usize,
         eps: f32,
         split_half_pairing: bool,
+        schedule: Option<ResidentLayerSchedule>,
     ) -> Option<Self> {
         let q_dim = n_heads * head_dim;
+        if schedule
+            .as_ref()
+            .is_some_and(|s| s.use_alt_rope.len() != n_layers)
+        {
+            return None;
+        }
         if n_layers == 0
             || hidden == 0
             || !hidden.is_multiple_of(32)
@@ -11178,6 +11209,7 @@ impl ResidentDecodeState {
             cap,
             eps,
             split_half_pairing,
+            schedule,
             cache_k,
             cache_v,
             cache_k16,
@@ -11334,15 +11366,27 @@ impl ResidentDecodeState {
         layers: &[ResidentLayerWeights],
         cos_t: &[f32],
         sin_t: &[f32],
+        alt_rope: Option<(&[f32], &[f32])>,
         position: usize,
         scale: f32,
         logits_stage: Option<LogitsStage>,
         sample_stage: Option<SampleStage>,
         input_token_id: u32,
         next_rope: Option<(&[f32], &[f32])>,
+        next_alt_rope: Option<(&[f32], &[f32])>,
     ) -> Option<ResidentTokenOut> {
         let fn_started = std::time::Instant::now();
         let half_rope = cos_t.len();
+        // Dual-theta schedule (gemma3): when any layer selects the ALT table,
+        // the caller must supply it for this token — fail closed, never rope
+        // with the wrong theta. The tables share the primary's pair count.
+        let needs_alt = self.schedule.as_ref().is_some_and(|s| s.needs_alt_rope());
+        if needs_alt {
+            match alt_rope {
+                Some((ac, as_)) if ac.len() == half_rope && as_.len() == half_rope => {}
+                _ => return None,
+            }
+        }
         // Grow the on-GPU KV cache if this token's position is past the current capacity.
         // Growth reallocates the cache buffers, so any pre-encoded pending graph (which
         // references the old buffers) must be dropped.
@@ -11435,6 +11479,7 @@ impl ResidentDecodeState {
                 layers,
                 cos_t,
                 sin_t,
+                alt_rope,
                 position,
                 scale,
                 logits_stage.as_ref(),
@@ -11454,12 +11499,19 @@ impl ResidentDecodeState {
         // call grows first and encodes inline once.
         let mut next_encode_us = 0u128;
         if let Some((cos_n, sin_n)) = next_rope {
-            if position + 2 <= self.max_positions {
+            // Encode-ahead needs the NEXT token's ALT tables too when the
+            // schedule selects them; without them, skip the pipeline (correct,
+            // just not overlapped) rather than encode a wrong-theta graph.
+            let next_alt_ok = !needs_alt
+                || next_alt_rope
+                    .is_some_and(|(ac, as_)| ac.len() == half_rope && as_.len() == half_rope);
+            if position + 2 <= self.max_positions && next_alt_ok {
                 if let Some(next) = self.prepare_token(
                     k,
                     layers,
                     cos_n,
                     sin_n,
+                    next_alt_rope,
                     position + 1,
                     scale,
                     logits_stage.as_ref(),
@@ -11551,6 +11603,7 @@ impl ResidentDecodeState {
         layers: &[ResidentLayerWeights],
         cos_t: &[f32],
         sin_t: &[f32],
+        alt_rope: Option<(&[f32], &[f32])>,
         position: usize,
         scale: f32,
         logits_stage: Option<&LogitsStage>,
@@ -11628,6 +11681,13 @@ impl ResidentDecodeState {
                 (&self.buf_b, &self.buf_a)
             };
             let w = &resident[i];
+            // Dual-theta schedule (gemma3): sliding layers rope with the ALT
+            // (local-theta) tables, globals with the primary. The caller
+            // validated availability (forward_token fails closed without them).
+            let (l_cos, l_sin) = match (&self.schedule, alt_rope) {
+                (Some(sched), Some((ac, as_))) if sched.use_alt_rope[i] => (ac, as_),
+                _ => (cos_t, sin_t),
+            };
             encode_attention_block(
                 e,
                 k,
@@ -11643,8 +11703,8 @@ impl ResidentDecodeState {
                 &w[1],
                 &w[2],
                 &w[3],
-                cos_t,
-                sin_t,
+                l_cos,
+                l_sin,
                 &self.cache_k[i],
                 &self.cache_v[i],
                 if self.kv16 {
@@ -11845,10 +11905,13 @@ impl ResidentDecodeState {
         // gemma3 sandwich norms are wired into the decode encodes only
         // (encode_attention_block / encode_ffn_block); this batched prefill does
         // not apply them, so it must fail closed rather than run an incomplete
-        // forward. (gemma3 additionally never reaches here: head_dim 256 > 128.)
-        if layers
-            .iter()
-            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some() || l.ffn_geglu)
+        // forward. Likewise the per-layer dual-theta schedule: this prefill
+        // ropes every layer from ONE table set. (gemma3 additionally never
+        // reaches here: head_dim 256 > 128.)
+        if self.schedule.is_some()
+            || layers
+                .iter()
+                .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some() || l.ffn_geglu)
         {
             return None;
         }
@@ -12964,12 +13027,14 @@ impl ResidentDecodeState {
         }
         // gemma3 sandwich norms are wired into the decode encodes only; the
         // batched verify layouts do not apply them (and hardcode
-        // kv_base_offset=0), so fail closed rather than verify with an
-        // incomplete forward. (gemma3 additionally never reaches here:
-        // head_dim 256 > 128 — this is the belt-and-braces gate.)
-        if layers
-            .iter()
-            .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some() || l.ffn_geglu)
+        // kv_base_offset=0), and the per-layer dual-theta schedule cannot be
+        // expressed by the verify's single table set — fail closed rather than
+        // verify with an incomplete forward. (gemma3 additionally never
+        // reaches here: head_dim 256 > 128 — this is the belt-and-braces gate.)
+        if self.schedule.is_some()
+            || layers
+                .iter()
+                .any(|l| l.post_attn_norm.is_some() || l.post_ffw_norm.is_some() || l.ffn_geglu)
         {
             return None;
         }
@@ -14209,6 +14274,7 @@ impl ResidentDecodeState {
         _cap: usize,
         _eps: f32,
         _split_half_pairing: bool,
+        _schedule: Option<ResidentLayerSchedule>,
     ) -> Option<Self> {
         None
     }
@@ -14221,12 +14287,14 @@ impl ResidentDecodeState {
         _layers: &[ResidentLayerWeights],
         _cos_t: &[f32],
         _sin_t: &[f32],
+        _alt_rope: Option<(&[f32], &[f32])>,
         _position: usize,
         _scale: f32,
         _logits_stage: Option<LogitsStage>,
         _sample_stage: Option<SampleStage>,
         _input_token_id: u32,
         _next_rope: Option<(&[f32], &[f32])>,
+        _next_alt_rope: Option<(&[f32], &[f32])>,
     ) -> Option<ResidentTokenOut> {
         None
     }
@@ -14704,7 +14772,8 @@ mod tests {
         // Same shape as `tiny_kv_budget_session` (1 layer / 1 head / 1 kv head, dims 32,
         // kv budget 64), so this reaches the kernel build with every dimension guard
         // satisfied: `Some(..)` proves device + shader libraries + compute pipelines.
-        let resident = super::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false);
+        let resident =
+            super::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false, None);
         let resident_kernels = resident.is_some();
         eprintln!(
             "CAMELID_METAL_CAPABILITY available={} resident_kernels={} device={:?} \
@@ -19383,6 +19452,7 @@ mod tests {
             max_positions,
             eps,
             false,
+            None,
         )
         .unwrap();
 
@@ -19452,7 +19522,7 @@ mod tests {
 
             let got = match session
                 .forward_token(
-                    &emb, &weights, &cos_t, &sin_t, t, scale, None, None, 0, None,
+                    &emb, &weights, &cos_t, &sin_t, None, t, scale, None, None, 0, None, None,
                 )
                 .unwrap()
             {
@@ -19712,10 +19782,11 @@ mod tests {
         let mut session = ResidentDecodeState::new(
             n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps,
             true, // gemma3 forces split-half (NEOX) pairing host-side
+            None,
         )
         .unwrap();
         let mut session_no_norm = ResidentDecodeState::new(
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true, None,
         )
         .unwrap();
 
@@ -19779,7 +19850,7 @@ mod tests {
 
             let got = match session
                 .forward_token(
-                    &emb, &weights, &cos_t, &sin_t, t, scale, None, None, 0, None,
+                    &emb, &weights, &cos_t, &sin_t, None, t, scale, None, None, 0, None, None,
                 )
                 .unwrap()
             {
@@ -19802,11 +19873,13 @@ mod tests {
                     &weights_no_norm,
                     &cos_t,
                     &sin_t,
+                    None,
                     t,
                     scale,
                     None,
                     None,
                     0,
+                    None,
                     None,
                 )
                 .unwrap()
@@ -19940,11 +20013,11 @@ mod tests {
         let weights_no_post = mk_views(false);
 
         let mut session = ResidentDecodeState::new(
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true, None,
         )
         .unwrap();
         let mut session_no_post = ResidentDecodeState::new(
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true, None,
         )
         .unwrap();
 
@@ -20009,7 +20082,7 @@ mod tests {
 
             let got = match session
                 .forward_token(
-                    &emb, &weights, &cos_t, &sin_t, t, scale, None, None, 0, None,
+                    &emb, &weights, &cos_t, &sin_t, None, t, scale, None, None, 0, None, None,
                 )
                 .unwrap()
             {
@@ -20033,11 +20106,13 @@ mod tests {
                     &weights_no_post,
                     &cos_t,
                     &sin_t,
+                    None,
                     t,
                     scale,
                     None,
                     None,
                     0,
+                    None,
                     None,
                 )
                 .unwrap()
@@ -20099,7 +20174,8 @@ mod tests {
             down_weight_blocks: ResidentWeightBytes::Blocks36(&down),
         };
         let mut session =
-            ResidentDecodeState::new(1, 2, 1, head_dim, hidden, ffn, 8, 8, 1.0e-6, true).unwrap();
+            ResidentDecodeState::new(1, 2, 1, head_dim, hidden, ffn, 8, 8, 1.0e-6, true, None)
+                .unwrap();
         let embeddings = vec![0.1f32; 2 * hidden];
         let cos_all = vec![0.5f32; 2 * (head_dim / 2)];
         let sin_all = vec![0.5f32; 2 * (head_dim / 2)];
@@ -20247,11 +20323,11 @@ mod tests {
         let weights_silu = mk_views(false);
 
         let mut session = ResidentDecodeState::new(
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true, None,
         )
         .unwrap();
         let mut session_silu = ResidentDecodeState::new(
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true,
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true, None,
         )
         .unwrap();
 
@@ -20323,7 +20399,7 @@ mod tests {
 
             let got = match session
                 .forward_token(
-                    &emb, &weights, &cos_t, &sin_t, t, scale, None, None, 0, None,
+                    &emb, &weights, &cos_t, &sin_t, None, t, scale, None, None, 0, None, None,
                 )
                 .unwrap()
             {
@@ -20352,11 +20428,13 @@ mod tests {
                     &weights_silu,
                     &cos_t,
                     &sin_t,
+                    None,
                     t,
                     scale,
                     None,
                     None,
                     0,
+                    None,
                     None,
                 )
                 .unwrap()
@@ -20374,6 +20452,367 @@ mod tests {
                 "token {t}: GeGLU had no material effect vs SiLU (max delta {delta}); the \
                  wiring is not engaging"
             );
+        }
+    }
+
+    // gemma3→Metal Phase 2d: per-layer dual-theta RoPE. A session built with a
+    // ResidentLayerSchedule ropes each layer with its own theta's cos/sin
+    // tables (primary = global, ALT = local), per Gemma3Metadata's
+    // local:global cadence. Pure-CPU reference over 3 tokens at the 1B
+    // geometry with the full gemma3 block structure; plus:
+    // - a bit-identity guard: an all-primary schedule (no layer selects ALT)
+    //   decodes to_bits-identically to a schedule-less session — the threading
+    //   is provably a no-op when disengaged;
+    // - fail-closed guards: missing ALT tables decline the forward, a
+    //   mis-sized schedule declines construction, and a schedule-carrying
+    //   session declines batched prefill;
+    // - a non-vacuity guard from t>=1 (at t=0 the softmax runs over one
+    //   position, so RoPE cannot affect the output).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_gemma3_dual_theta_rope_decode_selfparity() {
+        if !detect_metal_device().available {
+            return;
+        }
+        if f32y_gemv_enabled() {
+            eprintln!(
+                "SKIP metal_resident_gemma3_dual_theta_rope_decode_selfparity: \
+                 CAMELID_METAL_F32Y latched on earlier in this process; the CPU reference \
+                 mirrors the quantize path"
+            );
+            return;
+        }
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let tokens = 3usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    post_attn_norm: (0..hidden)
+                        .map(|i| 0.9 + ((i + li) as f32 % 3.0) * 0.03)
+                        .collect(),
+                    post_ffw_norm: (0..hidden)
+                        .map(|i| 0.95 + ((i + li) as f32 % 6.0) * 0.02)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let weights: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_norm: Some(&d.q_norm),
+                k_norm: Some(&d.k_norm),
+                post_attn_norm: Some(&d.post_attn_norm),
+                post_ffw_norm: Some(&d.post_ffw_norm),
+                ffn_geglu: true,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+            })
+            .collect();
+
+        // gemma3-1B cadence over 2 layers: layer 0 sliding (ALT/local theta),
+        // layer 1 global (primary theta). Real thetas via the oracle-form
+        // builder — the same code the production wiring uses.
+        let schedule = ResidentLayerSchedule {
+            use_alt_rope: vec![true, false],
+        };
+        // Mis-sized schedule fails construction.
+        assert!(
+            ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                tokens,
+                tokens,
+                eps,
+                true,
+                Some(ResidentLayerSchedule {
+                    use_alt_rope: vec![true],
+                }),
+            )
+            .is_none(),
+            "schedule/layer-count mismatch must decline construction"
+        );
+        let mut session = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            tokens,
+            tokens,
+            eps,
+            true,
+            Some(schedule.clone()),
+        )
+        .unwrap();
+        // Bit-identity pair: all-primary schedule vs no schedule.
+        let mut session_trivial = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            tokens,
+            tokens,
+            eps,
+            true,
+            Some(ResidentLayerSchedule {
+                use_alt_rope: vec![false, false],
+            }),
+        )
+        .unwrap();
+        let mut session_none = ResidentDecodeState::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, tokens, tokens, eps, true, None,
+        )
+        .unwrap();
+
+        // Schedule-carrying sessions decline batched prefill (single table set).
+        {
+            let mut prefill_session = ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                tokens,
+                tokens,
+                eps,
+                true,
+                Some(schedule.clone()),
+            )
+            .unwrap();
+            let embeddings = vec![0.1f32; 2 * hidden];
+            let cs = vec![0.5f32; 2 * half];
+            assert!(
+                prefill_session
+                    .prefill_tokens(&embeddings, 2, &weights, &cs, &cs, scale)
+                    .is_none(),
+                "batched prefill must fail closed for schedule-carrying sessions"
+            );
+        }
+
+        fn gelu_tanh(x: f32) -> f32 {
+            const C: f32 = 0.797_884_6;
+            0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
+        }
+
+        let mut ref_k: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut ref_v: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+
+        for t in 0..tokens {
+            let emb: Vec<f32> = (0..hidden)
+                .map(|i| (((i + t) as f32 % 11.0) - 5.0) * 0.2)
+                .collect();
+            // Real gemma3 thetas: primary = global 1e6, ALT = local 1e4.
+            let (cos_g, sin_g) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e6);
+            let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+
+            // Missing ALT tables fail closed (the schedule selects ALT on layer 0).
+            assert!(
+                session
+                    .forward_token(
+                        &emb, &weights, &cos_g, &sin_g, None, t, scale, None, None, 0, None, None,
+                    )
+                    .is_none(),
+                "token {t}: forward_token must decline when the schedule needs ALT tables \
+                 and none were passed"
+            );
+
+            // CPU reference: layer 0 ropes with the LOCAL tables, layer 1 with
+            // the GLOBAL tables.
+            let mut x = emb.clone();
+            for (li, d) in data.iter().enumerate() {
+                let (lc, ls) = if schedule.use_alt_rope[li] {
+                    (&cos_l, &sin_l)
+                } else {
+                    (&cos_g, &sin_g)
+                };
+                let xn = cpu_ref_rms_norm(&x, &d.attn_norm, eps);
+                let mut q = cpu_ref_q8_matvec(&xn, &d.q, q_dim);
+                let mut kx = cpu_ref_q8_matvec(&xn, &d.k, kv_dim);
+                let v = cpu_ref_q8_matvec(&xn, &d.v, kv_dim);
+                cpu_ref_rms_norm_per_head(&mut q, n_heads, head_dim, &d.q_norm, eps);
+                cpu_ref_rms_norm_per_head(&mut kx, n_kv, head_dim, &d.k_norm, eps);
+                cpu_ref_rope_split_half(&mut q, n_heads, head_dim, lc, ls);
+                cpu_ref_rope_split_half(&mut kx, n_kv, head_dim, lc, ls);
+                ref_k[li].extend_from_slice(&kx);
+                ref_v[li].extend_from_slice(&v);
+                let ctx = cpu_ref_attention(
+                    &q,
+                    &ref_k[li],
+                    &ref_v[li],
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    t + 1,
+                    0,
+                    t + 1,
+                    scale,
+                );
+                let o = cpu_ref_q8_matvec(&ctx, &d.o, hidden);
+                let on = cpu_ref_rms_norm(&o, &d.post_attn_norm, eps);
+                for (h, ov) in x.iter_mut().zip(&on) {
+                    *h += *ov;
+                }
+                let xn2 = cpu_ref_rms_norm(&x, &d.ffn_norm, eps);
+                let g = cpu_ref_q8_matvec(&xn2, &d.gate, ffn);
+                let u = cpu_ref_q8_matvec(&xn2, &d.up, ffn);
+                let act: Vec<f32> = g
+                    .iter()
+                    .zip(&u)
+                    .map(|(gv, uv)| gelu_tanh(*gv) * uv)
+                    .collect();
+                let dn = cpu_ref_q8_matvec(&act, &d.down, hidden);
+                let dnn = cpu_ref_rms_norm(&dn, &d.post_ffw_norm, eps);
+                for (h, dv) in x.iter_mut().zip(&dnn) {
+                    *h += *dv;
+                }
+            }
+
+            let got = match session
+                .forward_token(
+                    &emb,
+                    &weights,
+                    &cos_g,
+                    &sin_g,
+                    Some((&cos_l, &sin_l)),
+                    t,
+                    scale,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            assert_eq!(got.len(), hidden);
+            let mut max_diff = 0.0f32;
+            for (a, b) in got.iter().zip(&x) {
+                max_diff = max_diff.max((a - b).abs());
+                assert!((a - b).abs() < 1.5e-2, "token {t}: {a} != {b}");
+            }
+            eprintln!("[2d-selfparity] token {t}: max |gpu-cpu| = {max_diff:.2e}");
+
+            // Bit-identity: all-primary schedule (ALT provided but never
+            // selected) == schedule-less session, exactly.
+            let got_trivial = match session_trivial
+                .forward_token(
+                    &emb,
+                    &weights,
+                    &cos_g,
+                    &sin_g,
+                    Some((&cos_l, &sin_l)),
+                    t,
+                    scale,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            let got_none = match session_none
+                .forward_token(
+                    &emb, &weights, &cos_g, &sin_g, None, t, scale, None, None, 0, None, None,
+                )
+                .unwrap()
+            {
+                ResidentTokenOut::Data(v) => v,
+                ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+            };
+            for (i, (a, b)) in got_trivial.iter().zip(&got_none).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "token {t} element {i}: all-primary schedule must be bit-identical to \
+                     no schedule ({a} vs {b})"
+                );
+            }
+
+            // Non-vacuity from t>=1: the dual-theta decode must differ from the
+            // single-theta (schedule-less) decode once scores matter.
+            if t >= 1 {
+                let delta = got
+                    .iter()
+                    .zip(&got_none)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    delta > 0.02,
+                    "token {t}: dual-theta RoPE had no material effect (max delta {delta}); \
+                     the schedule is not engaging"
+                );
+            }
         }
     }
 
@@ -20554,6 +20993,7 @@ mod tests {
                     cap,
                     eps,
                     false,
+                    None,
                 )
                 .unwrap();
                 for layer in 0..n_layers {
@@ -20579,11 +21019,13 @@ mod tests {
                         &weights,
                         cos_i,
                         sin_i,
+                        None,
                         base + i,
                         scale,
                         Some(make_stage()),
                         None,
                         0,
+                        None,
                         None,
                     )
                     .expect("reference forward_token");
@@ -20833,6 +21275,7 @@ mod tests {
                     cap,
                     eps,
                     false,
+                    None,
                 )
                 .unwrap();
                 for layer in 0..n_layers {
@@ -20944,6 +21387,7 @@ mod tests {
                     cap,
                     eps,
                     false,
+                    None,
                 )
                 .unwrap();
                 for layer in 0..n_layers {
@@ -21027,11 +21471,13 @@ mod tests {
                         &weights,
                         cos_i,
                         sin_i,
+                        None,
                         pos,
                         scale,
                         Some(make_stage()),
                         None,
                         0,
+                        None,
                         None,
                     )
                     .expect("reference forward_token");

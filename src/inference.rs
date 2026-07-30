@@ -38,6 +38,11 @@ mod q8_block_reader;
 mod q8_runtime;
 mod q8_telemetry;
 mod rope;
+/// Test-only re-export: the gemma3 self-parity/full-forward tests in
+/// `crate::metal::tests` build their RoPE tables with the SAME oracle-form
+/// builder the production wiring uses, so the two can never drift.
+#[cfg(test)]
+pub(crate) use rope::gemma3_rope_tables;
 pub mod spec_tree;
 #[cfg(test)]
 mod spec_tree_lossless;
