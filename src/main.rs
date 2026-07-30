@@ -1939,6 +1939,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
+                ensure_arch_has_direct_dense_session(&gguf)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
                 let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
                 let store = camelid::tensor::TensorStore::open(&model, &gguf);
@@ -2626,6 +2627,9 @@ async fn main() -> anyhow::Result<()> {
             trace_big,
             max_per_token,
         } => {
+            // The alloc gate runs a real dense decode; refuse runnable-lane-only
+            // archs before the library loads weights (metadata read is cheap).
+            ensure_arch_has_direct_dense_session(&read_metadata(&model)?)?;
             let report = camelid::alloc_gate::run_decode_alloc_gate(
                 &model,
                 warmup,
@@ -3381,6 +3385,7 @@ fn run_ghost(
 
     println!("[ghost] loading GGUF metadata from {:?}...", model);
     let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
     let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&model, &gguf);
@@ -3815,6 +3820,7 @@ fn gait_profile_trial(
     }
 
     let gguf = read_metadata(model)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     // Apply this candidate's plan before loading weights, exactly as bench-generate does.
     let plan = camelid::execution_plan::plan_for_model(model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan.env_updates);
@@ -4478,6 +4484,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         other => anyhow::bail!("unknown --arch {other:?}; known: llama-8b"),
     };
     Ok(LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length,
         embedding_length,
         block_count,
@@ -4538,6 +4545,7 @@ fn run_bench_owner_sweep(
     // Load once. The owner is selected at runtime (env read per linear call), so a single load
     // serves every config; the PackedRows4 repack the owner consumes is built at load regardless.
     let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
     let config = LlamaModelConfig::from_gguf(&gguf)?;
@@ -4693,6 +4701,7 @@ fn run_bench_generate(
     // Load the model once; this cost is measured separately from generation.
     let load_start = Instant::now();
     let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     // Apply the model's execution plan (as serve/chat do) BEFORE loading weights so the
     // CPU Q8 runtime repack + packed-rows4 fast path is selected at load time. Without
     // this, bench-generate measures the unplanned safe (scalar) path.
@@ -5362,6 +5371,7 @@ fn load_model_drafter(
     threads: Option<usize>,
 ) -> anyhow::Result<SpeculativeDrafter> {
     let gguf = read_metadata(path)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(path, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
     let config = LlamaModelConfig::from_gguf(&gguf)?;
@@ -5416,6 +5426,7 @@ fn run_bench_speculative(
 
     // Load the target exactly as bench-generate does (execution plan applied before weights).
     let gguf = read_metadata(&model)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
     let config = LlamaModelConfig::from_gguf(&gguf)?;
@@ -5712,6 +5723,30 @@ fn infer_quantization(path: &std::path::Path) -> String {
     "unknown".to_string()
 }
 
+/// Fail closed BEFORE weights load on every CLI lane that would construct a
+/// direct dense `LlamaInferenceSession` for a runnable-lane-only architecture
+/// (qwen35 / gemma2 / gemma3). The dense binder silently drops gemma3's
+/// QK-norm and post-attention/post-FFN norm tensors and the dense forward has
+/// no GeGLU, so BOTH the CPU dense forward and the GPU resident lane decode
+/// fluent-looking garbage for these archs; qwen35's hybrid layers do not fit
+/// the dense tensor map at all. `camelid serve` (and `camelid chat`, which
+/// drives serve over HTTP) route these archs to the correct runnable bridge —
+/// point the user there instead of running a mis-bound forward. Mirrors
+/// serve's `is_runnable_serve_arch` via the shared
+/// `camelid::model::is_runnable_only_arch` predicate.
+fn ensure_arch_has_direct_dense_session(gguf: &camelid::gguf::GgufFile) -> anyhow::Result<()> {
+    let arch = gguf.architecture().unwrap_or_default();
+    if camelid::model::is_runnable_only_arch(arch) {
+        anyhow::bail!(
+            "architecture '{arch}' is served only through the runnable lane; this command's \
+             direct dense-session path would run a mis-bound forward and emit wrong output, \
+             so it fails closed. Use `camelid serve` (or `camelid chat`), which routes this \
+             architecture to its correct runtime."
+        );
+    }
+    Ok(())
+}
+
 /// The measured-fastest Metal configuration is on by default for the CLI: Q8_0 weights
 /// upload in wire format, NSG=8 GEMV dispatch, f32-activation GEMV chain, tiled decode
 /// attention, and the one-command-buffer GPU prefill. Each remains overridable: set the
@@ -5981,6 +6016,7 @@ async fn run_distribute_worker(
 
     println!("Loading GGUF metadata from {:?}...", path);
     let gguf = read_metadata(&path)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
     let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&path, &gguf);
@@ -6112,6 +6148,7 @@ async fn run_distribute_master(
 
     println!("Loading GGUF metadata from {:?}...", path);
     let gguf = read_metadata(&path)?;
+    ensure_arch_has_direct_dense_session(&gguf)?;
     let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
     let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&path, &gguf);
