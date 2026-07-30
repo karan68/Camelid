@@ -277,13 +277,29 @@ impl Client {
         if connect_timeout.is_zero() {
             anyhow::bail!("request exceeded its deadline");
         }
-        let mut stream = TcpStream::connect_timeout(&self.addr, connect_timeout)?;
+        // When a budget below was set by the caller's deadline (rather than a
+        // fixed reachability/stall cap), an OS-level timeout on it IS the
+        // deadline elapsing — report it as such instead of leaking the
+        // platform's socket-timeout message.
+        let mut stream = TcpStream::connect_timeout(&self.addr, connect_timeout).map_err(
+            |error| -> anyhow::Error {
+                if connect_timeout == timeout && is_timeout(&error) {
+                    anyhow::anyhow!("request exceeded its deadline")
+                } else {
+                    error.into()
+                }
+            },
+        )?;
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        stream.set_write_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(30)),
-        ))?;
+        let write_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(30));
+        if write_timeout.is_zero() {
+            // set_write_timeout rejects a zero Duration; a spent budget means
+            // the deadline elapsed during connect/encode.
+            anyhow::bail!("request exceeded its deadline");
+        }
+        stream.set_write_timeout(Some(write_timeout))?;
         let raw_request = encode_request(
             method,
             path,
@@ -294,8 +310,15 @@ impl Client {
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("request cancelled");
         }
-        stream.write_all(&raw_request.0)?;
-        stream.write_all(&raw_request.1)?;
+        let map_write_error = |error: std::io::Error| -> anyhow::Error {
+            if write_timeout < Duration::from_secs(30) && is_timeout(&error) {
+                anyhow::anyhow!("request exceeded its deadline")
+            } else {
+                error.into()
+            }
+        };
+        stream.write_all(&raw_request.0).map_err(map_write_error)?;
+        stream.write_all(&raw_request.1).map_err(map_write_error)?;
 
         let mut raw = Vec::new();
         let mut chunk = [0_u8; 4096];
