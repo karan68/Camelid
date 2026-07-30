@@ -96,12 +96,13 @@ cleanup() {
 trap cleanup EXIT
 
 # --- 3. wait for generation_ready -------------------------------------------
-# `serve` loads the model *before* it binds the port, so /health stays
-# unreachable until load finishes — then reports generation_ready almost at
-# once. A long silent wait therefore means a slow/stuck load (often memory
-# pressure), not a half-ready server. Budget is generous and configurable.
+# `serve` opens the port before the startup model finishes loading (so health
+# checks stay answerable during the load); /health reports generation_ready
+# only once the model is actually served. A long wait therefore means a
+# slow/stuck load (often memory pressure), not a half-ready server. Budget is
+# generous and configurable.
 TIMEOUT="${CAMELID_SMOKE_TIMEOUT:-300}"
-say "waiting for the model to load (up to ${TIMEOUT}s; the port opens only once load finishes)"
+say "waiting for the model to load (up to ${TIMEOUT}s; the port opens before load finishes)"
 ready=""
 for _ in $(seq 1 "$TIMEOUT"); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -117,7 +118,7 @@ for _ in $(seq 1 "$TIMEOUT"); do
 done
 if [[ -z "$ready" ]]; then
   echo "--- server log ---" >&2; cat "$SERVER_LOG" >&2
-  fail "model did not finish loading within ${TIMEOUT}s — the port never opened. Likely a slow/stuck load (e.g. low free memory). Raise CAMELID_SMOKE_TIMEOUT or free up RAM and retry."
+  fail "model did not become generation_ready within ${TIMEOUT}s. Likely a slow/stuck load (e.g. low free memory). Raise CAMELID_SMOKE_TIMEOUT or free up RAM and retry."
 fi
 say "server reports generation_ready"
 

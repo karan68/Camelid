@@ -43,6 +43,29 @@ export function embeddingsBody(modelId) {
   }
 }
 
+export function responsesBody(modelId) {
+  return {
+    model: modelId,
+    input: 'Reply with one short sentence.',
+    temperature: 0,
+    max_output_tokens: 64,
+    stream: true,
+    store: true,
+    metadata: { source: 'camelid-workbench' },
+  }
+}
+
+export function conversationBody() {
+  return {
+    metadata: { source: 'camelid-workbench' },
+    items: [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'Keep this local conversation item.' }],
+    }],
+  }
+}
+
 function curlGet(apiBase, path) {
   return `curl ${apiBase}${path}`
 }
@@ -102,6 +125,24 @@ function pythonSdk(apiBase, modelId, kind) {
       '    dimensions=256,',
       ')',
       'print(len(result.data[0].embedding))',
+    ].join('\n')
+  }
+  if (kind === 'responses') {
+    return [
+      'from openai import OpenAI',
+      '',
+      `client = OpenAI(base_url="${apiBase}/v1", api_key="not-needed-locally")`,
+      'stream = client.responses.create(',
+      `    model="${modelId}",`,
+      '    input="Reply with one short sentence.",',
+      '    max_output_tokens=64,',
+      '    stream=True,',
+      '    store=True,',
+      '    metadata={"source": "camelid-workbench"},',
+      ')',
+      'for event in stream:',
+      '    if event.type == "response.output_text.delta":',
+      '        print(event.delta, end="", flush=True)',
     ].join('\n')
   }
   return null
@@ -256,9 +297,30 @@ export function workbenchEndpoints({ apiBase, modelId }) {
       id: 'v1_responses',
       method: 'POST',
       path: '/v1/responses',
-      gate: 'blocked',
-      featureRowId: 'fail_closed_native_compatibility_routes',
-      summary: 'Fail-closed: the responses surface has no contract; the route returns a typed error instead of pretending.',
+      gate: 'chat',
+      sse: true,
+      featureRowId: 'openai_responses',
+      summary: 'Responses generation with opt-in local SQLite storage, restart-safe previous_response_id chaining, complete function-tool items, streaming events, usage, and cancellation. Hosted tools remain typed unsupported.',
+      body: responsesBody(model),
+      examples: {
+        curl: curlPost(base, '/v1/responses', responsesBody(model)),
+        python: pythonSdk(base, model, 'responses'),
+        js: jsFetch(base, '/v1/responses', responsesBody(model), true),
+      },
+    },
+    {
+      id: 'v1_conversations',
+      method: 'POST',
+      path: '/v1/conversations',
+      gate: 'none',
+      featureRowId: 'openai_responses',
+      summary: 'Create a local durable conversation. Conversation and item retrieval/deletion routes are published by the same live conformance row.',
+      body: conversationBody(),
+      examples: {
+        curl: curlPost(base, '/v1/conversations', conversationBody()),
+        python: pythonRequests(base, '/v1/conversations', conversationBody()),
+        js: jsFetch(base, '/v1/conversations', conversationBody()),
+      },
     },
     {
       id: 'v1_messages',

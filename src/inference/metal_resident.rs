@@ -51,14 +51,71 @@ impl MetalSampleRequest {
 #[allow(dead_code)]
 pub(super) const MAX_VERIFY_K: usize = 8;
 
+/// Whether a GPU-resident session may mirror its KV back so the prompt-prefix
+/// cache can store it. Default ON: the alternative is re-prefilling every
+/// repeated or growing chat prompt, which on this lane costs seconds. Set
+/// `CAMELID_PREFIX_CACHE_RESIDENT=0` to keep the CPU KV at zero bytes on the
+/// resident lane and accept the re-prefill.
+pub(super) fn resident_prefix_cache_mirror_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_PREFIX_CACHE_RESIDENT")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
+/// True when any dense projection this resident engine will consume is a
+/// K-quant super-block tensor. The F16-primary resident KV cache is qualified
+/// for that lane only; a Q8_0 model must keep its F32 cache (and with it the
+/// split-K decode attention and attention-as-matmul prefill, both gated on an
+/// F32 primary). Recorded before each `ResidentDecodeState::new` so switching
+/// models re-decides.
+pub(super) fn weights_use_kquant(weights: &super::LlamaLoadedWeights) -> bool {
+    let is_kquant = |t: &CpuTensor| {
+        matches!(
+            t.source_type,
+            Some(GgufTensorType::Q4K) | Some(GgufTensorType::Q6K)
+        )
+    };
+    weights.layers.iter().any(|l| {
+        is_kquant(&l.attention_q)
+            || is_kquant(&l.attention_k)
+            || is_kquant(&l.attention_v)
+            || is_kquant(&l.attention_output)
+            || is_kquant(&l.ffn_gate)
+            || is_kquant(&l.ffn_up)
+            || is_kquant(&l.ffn_down)
+    })
+}
+
 /// The resident stack's view of one weight's bytes: page-aligned wire pages when
 /// the fast-load path attached them (the GPU wraps them in place), else the
 /// materialized 36-byte CPU blocks.
 pub(super) fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeightBytes<'_> {
+    let kquant = match tensor.source_type {
+        Some(GgufTensorType::Q4K) => Some((metal::ResidentWeightFormat::Q4K, tensor.q4_k_wire())),
+        Some(GgufTensorType::Q6K) => Some((metal::ResidentWeightFormat::Q6K, tensor.q6_k_wire())),
+        _ => None,
+    };
+    if let Some((format, wire)) = kquant {
+        if let Some(pages) = tensor.kquant_wire_pages.as_ref() {
+            return metal::ResidentWeightBytes::WirePages { format, pages };
+        }
+        return metal::ResidentWeightBytes::KQuantBytes {
+            format,
+            bytes: wire.expect("resident K-quant eligibility requires wire bytes"),
+        };
+    }
     match tensor.q8_0_wire_pages.as_ref() {
-        Some(pages) => metal::ResidentWeightBytes::WirePages(pages),
+        Some(pages) => metal::ResidentWeightBytes::WirePages {
+            format: metal::ResidentWeightFormat::Q8_0,
+            pages,
+        },
         None => metal::ResidentWeightBytes::Blocks36(q8_0_blocks_as_bytes(
-            tensor.q8_0_blocks.as_ref().unwrap(),
+            tensor
+                .q8_0_blocks
+                .as_ref()
+                .expect("resident Q8 eligibility requires blocks or wire pages"),
         )),
     }
 }
@@ -132,6 +189,9 @@ impl super::LlamaInferenceSession {
         let rope_us = edge_started.elapsed().as_micros();
         let session_started = Instant::now();
         let initial_positions = (n + 1).next_multiple_of(512).min(kv_cap);
+        // Must precede `ResidentDecodeState::new`, which reads the lane flag
+        // through `resident_kv_format()` to pick the primary KV format.
+        metal::set_resident_kquant_lane(weights_use_kquant(&weights));
         // gemma3: force split-half (NEOX) pairing host-side from the parsed
         // metadata (NOT `LlamaModelConfig::rope_neox_pairing`, which stays false
         // for gemma3 — Phase 1b design note), and attach the per-layer
@@ -305,6 +365,102 @@ impl super::LlamaInferenceSession {
         Ok(())
     }
 
+    /// Make the CPU KV history authoritative so this session can be cloned into
+    /// the prompt-prefix cache — but only when that mirror is LOSSLESS.
+    ///
+    /// A GPU-resident prefill advances `kv_cache.position` while leaving the CPU
+    /// buffers empty, so `cpu_kv_authoritative()` is false and
+    /// `store_prompt_prefix_cache` refuses to store. That is why a repeated or
+    /// growing chat prompt re-prefills from scratch on the lane the CLI now
+    /// selects automatically — ~30 s for a 2k-token Q4_K_M prompt on an M4,
+    /// where a cached resume costs one GPU re-seed instead.
+    ///
+    /// Mirroring back is only safe when the round trip cannot change the K/V:
+    /// see [`crate::metal::ResidentDecodeState::kv_roundtrips_through_cpu_exactly`].
+    /// With an F32 or Q8 primary the CPU copy would be rounded and the resumed
+    /// sequence would attend over different K/V than its prefill produced — the
+    /// same hazard that makes the streaming path bypass this cache entirely when
+    /// the CUDA resident engine is driving. So this helps Q4_K/Q6_K models (which
+    /// default to an F16 primary) and deliberately does NOT help Q8_0 ones.
+    ///
+    /// Opt out with `CAMELID_PREFIX_CACHE_RESIDENT=0`: mirroring takes the CPU KV
+    /// for this sequence from zero bytes to full size, and `store_prompt_prefix_cache`
+    /// then clones it, so a cached entry costs roughly twice the CPU KV of one
+    /// prompt. The pool holds one entry by default and `ensure_position_capacity`
+    /// still enforces the session's KV budget, so the growth is bounded — but on a
+    /// 16 GB box with a long prompt it is not free.
+    ///
+    /// Two consequences worth knowing about, both accepted:
+    ///
+    /// * The mirror is a scalar pass over the whole history and it runs inside
+    ///   the engine step, so with two cooperative slots it briefly delays the
+    ///   other stream. It happens once, on the step that populates the cache,
+    ///   and is orders of magnitude cheaper than the re-prefill it removes.
+    /// * Making the CPU history real also makes `rollback_to_position` succeed
+    ///   on this session where it used to fail closed. That is the honest
+    ///   answer — the history it would roll back is now genuinely CPU-side —
+    ///   but it is a behaviour change for anything that relied on the refusal.
+    ///
+    /// Returns whether the session is safe to cache now. Never fails the
+    /// caller's request: a refusal just means no cache entry.
+    pub fn prepare_for_prompt_prefix_cache(&mut self) -> bool {
+        if self.cpu_kv_authoritative() {
+            return true;
+        }
+        let position = self.kv_cache.position;
+        if position == 0 {
+            return false;
+        }
+        if !resident_prefix_cache_mirror_enabled() {
+            return false;
+        }
+        // BOTH halves of the round trip must be lossless.
+        //
+        // Destination: an F32/F16 CPU cache stores f16-rounded values, which is
+        // exactly what an F16 resident cache holds. A QUANTIZED CPU cache
+        // (`--kv-quant q8_0|q4_0`, reachable together with the resident lane)
+        // re-quantizes on the way in, so the mirror would not round-trip.
+        if !matches!(self.kv_cache.dtype, KvDtype::F32 | KvDtype::F16) {
+            return false;
+        }
+        // Source: ask THIS session's engine, never the process-global KV format.
+        // A model switch re-decides the global (`set_resident_kquant_lane`) while
+        // this session still holds an engine built under the previous format, so
+        // the global is a time-of-check answer to a time-of-use question.
+        //
+        // Reading [0, position) is safe against the encode-ahead window: a
+        // pre-committed future graph writes the NEXT position's row, so it cannot
+        // touch the range being mirrored.
+        if !self
+            .resident_decode
+            .as_ref()
+            .is_some_and(|state| state.kv_roundtrips_through_cpu_exactly())
+        {
+            return false;
+        }
+        // Same rollback discipline as `ensure_cpu_kv_materialized`: a mirror that
+        // dies part way through must not leave the watermark vouching for rows it
+        // never wrote, or every later `cpu_kv_authoritative` check would pass over
+        // a hollow prefix. The error arm also covers `ensure_position_capacity`
+        // refusing the allocation, which on this lane is newly reachable — the CPU
+        // buffers were never grown before.
+        let restore = self.kv_cache.materialized_through;
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        match self.recover_cpu_kv_from_metal_resident(position) {
+            Ok(true) => self.cpu_kv_authoritative(),
+            Ok(false) => false,
+            Err(err) => {
+                self.kv_cache.materialized_through = restore;
+                if trace {
+                    eprintln!(
+                        "[prefix-cache] declining to cache {position} resident positions: {err}"
+                    );
+                }
+                false
+            }
+        }
+    }
+
     /// Recover `[0, position)` from the SESSION-resident Metal engine. `Ok(false)` when this
     /// session has no Metal engine, or it does not hold the range (so the caller tries the next
     /// backend); `Ok(true)` when the CPU history is materialized on return.
@@ -459,6 +615,7 @@ impl super::LlamaInferenceSession {
             None => true,
         };
         if rebuild {
+            metal::set_resident_kquant_lane(weights_use_kquant(&weights));
             let mut session = match metal::ResidentDecodeState::new(
                 n_layers,
                 n_heads,
@@ -597,9 +754,16 @@ impl super::LlamaInferenceSession {
 
         // Rope tables for position+1 feed the encode-ahead pipeline: the session encodes
         // the NEXT token's command buffer while this token executes on the GPU.
-        // gemma3 rebuilds both theta tables with the oracle-form builder, same
-        // as the current token's.
-        let (next_tables, next_gemma3_alt) = if let Some(g) = self.config.gemma3.as_ref() {
+        // Appliance mode (2+ active slots) suppresses encode-ahead entirely:
+        // `next_rope: None` is the only thing that stops `forward_token` from
+        // pre-encoding the next command buffer. gemma3 rebuilds BOTH theta
+        // tables with the oracle-form builder, same as the current token's;
+        // `forward_token` skips the pre-encode when a gemma3 session's ALT
+        // tables are absent, so `(None, None)` is safe rather than encoding a
+        // wrong-theta graph.
+        let (next_tables, next_gemma3_alt) = if !self.resident_encode_ahead_enabled {
+            (None, None)
+        } else if let Some(g) = self.config.gemma3.as_ref() {
             let (cos, sin) =
                 rope::gemma3_rope_tables(position + 1, rope_dim, g.rope_freq_base_global);
             (
@@ -628,7 +792,8 @@ impl super::LlamaInferenceSession {
         // gemma3 scales token embeddings by sqrt(d_model) before layer 0
         // (reference src/runnable/model.rs:787-792). Applied here on the
         // resident lane's input; the GPU sampling gather applies the same
-        // scale for the fast lane's self-fed next token.
+        // scale for the fast lane's self-fed next token. Ungated: the CPU-side
+        // scale is what every token uses when encode-ahead is off.
         let scaled_embedding: Vec<f32>;
         let embedding_data: &[f32] = if let Some(g) = self.config.gemma3.as_ref() {
             scaled_embedding = embedding.data.iter().map(|v| v * g.embed_scale).collect();

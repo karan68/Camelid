@@ -14142,6 +14142,65 @@ fn f32_history_addressable_declines_kv_buffers_a_resident_session_never_grew() {
 /// position. Leaving it stale is what made the next resident decode treat the session as
 /// a new sequence and reseed from a CPU KV history the GPU-resident drafter never wrote
 /// (`range end index <head_dim> out of range for slice of length 0`).
+/// `prepare_for_prompt_prefix_cache` exists so a GPU-resident prefill can still
+/// populate the prompt-prefix cache, but it must FAIL CLOSED: a session whose
+/// `position` was advanced by a resident prefill and whose history cannot be
+/// mirrored back (no engine holds it, or the KV format would not round-trip
+/// exactly) must not be advertised as cacheable, and must not leave the
+/// materialized-through watermark vouching for rows nobody wrote. Storing such a
+/// session would hand a later request a prompt cache full of zeros.
+#[test]
+fn prompt_prefix_cache_preparation_fails_closed_on_a_hollow_history() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(64);
+    // Exactly what `try_metal_resident_prefill` leaves behind: position advanced,
+    // CPU buffers untouched — but here with no resident engine to mirror from.
+    session.kv_cache.position = 6;
+    assert!(session.kv_cache.keys.is_empty());
+    assert!(!session.cpu_kv_authoritative());
+
+    assert!(
+        !session.prepare_for_prompt_prefix_cache(),
+        "nothing holds positions [0, 6), so the session is not cacheable"
+    );
+    assert_eq!(
+        session.kv_cache.materialized_through, 0,
+        "a refused preparation must leave the watermark exactly where it was"
+    );
+    assert!(
+        !session.cpu_kv_authoritative(),
+        "and must not flip the authority flag it just declined to earn"
+    );
+}
+
+/// The ordinary CPU lane is already authoritative, so preparation is a no-op
+/// that reports success — the prompt-prefix cache must keep working there.
+#[test]
+fn prompt_prefix_cache_preparation_is_a_no_op_for_a_cpu_authoritative_session() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(64);
+    assert!(session.cpu_kv_authoritative());
+    assert!(session.prepare_for_prompt_prefix_cache());
+    assert_eq!(session.kv_cache.materialized_through, 0);
+}
+
+/// BOTH halves of the mirror must be lossless. An F16 resident cache round-trips
+/// through an F32/F16 CPU cache exactly, but `--kv-quant q8_0|q4_0` re-quantizes
+/// on the way in — so a quantized CPU KV must refuse regardless of what the GPU
+/// holds, or a cached resume would attend over K/V its prefill never produced.
+#[test]
+fn prompt_prefix_cache_preparation_refuses_a_quantized_cpu_kv() {
+    for dtype in [KvDtype::Q8_0, KvDtype::Q4_0] {
+        let (mut session, _temp_file) = tiny_kv_budget_session(64);
+        session.kv_cache.dtype = dtype;
+        session.kv_cache.position = 6;
+        assert!(!session.cpu_kv_authoritative());
+        assert!(
+            !session.prepare_for_prompt_prefix_cache(),
+            "{dtype:?} CPU KV must not be advertised as a lossless mirror target"
+        );
+        assert_eq!(session.kv_cache.materialized_through, 0);
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn metal_resident_rollback_moves_filled_with_the_kv_position() {

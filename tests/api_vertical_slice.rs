@@ -117,7 +117,12 @@ async fn props_reports_public_fail_closed_llama_server_shape() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["total_slots"], 1);
+    // `total_slots` is the length of the `/slots` array, which is one entry per
+    // admissible cooperative streaming slot (see `slots_reports_public_...`).
+    assert_eq!(
+        body["total_slots"],
+        camelid::runtime_config::DEFAULT_CONTINUOUS_BATCH_SLOTS
+    );
     assert_eq!(body["model_path"], Value::Null);
     assert_eq!(body["model_id"], Value::Null);
     assert_eq!(body["chat_template"], Value::Null);
@@ -443,7 +448,6 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
             "unsupported_llama_server_infill",
             "input",
         ),
-        ("POST", "/v1/responses", "unsupported_responses", "input"),
         ("POST", "/v1/messages", "unsupported_messages", "input"),
     ];
 
@@ -465,6 +469,323 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         assert_eq!(body["error"]["code"], code, "{uri}");
         assert_eq!(body["error"]["param"], param, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn responses_route_accepts_stateless_text_and_reaches_the_runtime_gate() {
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"not-loaded","input":"hello","store":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_ne!(body["error"]["code"], "unsupported_responses");
+    assert!(
+        body["error"]["code"] == "model_not_loaded",
+        "stateless Responses input should pass request conversion and stop at the model gate: {body}"
+    );
+}
+
+#[tokio::test]
+async fn responses_route_resolves_stateful_ids_and_keeps_hosted_features_typed_unsupported() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing_previous = camelid::api::router_with_state(
+        camelid::api::AppState::default()
+            .with_responses_store_path(temp.path().join("responses.sqlite3")),
+    )
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"input":"hello","previous_response_id":"resp_prior"}"#,
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(missing_previous.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(missing_previous.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["code"], "resource_not_found");
+    assert_eq!(body["error"]["param"], "previous_response_id");
+
+    let cases = [
+        (r#"{"input":"hello","background":true}"#, "background"),
+        (
+            r#"{"input":"hello","tools":[{"type":"web_search"}]}"#,
+            "tools",
+        ),
+    ];
+    for (request_body, param) in cases {
+        let response = camelid::api::router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+        assert_eq!(body["error"]["param"], param);
+    }
+}
+
+#[tokio::test]
+async fn conversations_crud_survives_router_restart_and_preserves_tool_items() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("responses.sqlite3");
+    let app = camelid::api::router_with_state(
+        camelid::api::AppState::default().with_responses_store_path(database.clone()),
+    );
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/conversations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "metadata":{"owner":"vertical-test"},
+                        "items":[{
+                            "type":"function_call",
+                            "call_id":"call_1",
+                            "name":"weather",
+                            "arguments":"{\"city\":\"Paris\"}"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let conversation_id = created["id"].as_str().unwrap().to_string();
+
+    let added = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/conversations/{conversation_id}/items"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"items":[{
+                        "type":"function_call_output",
+                        "call_id":"call_1",
+                        "output":"{\"temp\":25}"
+                    }]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::OK);
+
+    // A new state/router instance must observe the same on-disk rows.
+    let restarted = camelid::api::router_with_state(
+        camelid::api::AppState::default().with_responses_store_path(database),
+    );
+    let listed = restarted
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/conversations/{conversation_id}/items?order=asc"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(listed["data"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["data"][0]["type"], "function_call");
+    assert_eq!(listed["data"][0]["call_id"], "call_1");
+    assert_eq!(listed["data"][1]["type"], "function_call_output");
+    assert_eq!(listed["data"][1]["call_id"], "call_1");
+    let item_id = listed["data"][0]["id"].as_str().unwrap();
+
+    let deleted_item = restarted
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/v1/conversations/{conversation_id}/items/{item_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_item.status(), StatusCode::OK);
+
+    let deleted = restarted
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/conversations/{conversation_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn chat_route_accepts_assistant_tool_calls_and_tool_results_for_the_next_turn() {
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"not-loaded",
+                        "messages":[
+                            {"role":"user","content":"weather?"},
+                            {"role":"assistant","content":null,"tool_calls":[{
+                                "id":"call_1",
+                                "type":"function",
+                                "function":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}
+                            }]},
+                            {"role":"tool","tool_call_id":"call_1","content":"{\"temp\":25}"}
+                        ],
+                        "tools":[{
+                            "type":"function",
+                            "function":{"name":"weather","parameters":{"type":"object"}}
+                        }]
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_ne!(body["error"]["code"], "malformed_json");
+    assert_ne!(body["error"]["code"], "invalid_message_content");
+}
+
+#[tokio::test]
+async fn chat_tools_fail_closed_without_template_but_tool_choice_none_still_generates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-tool-choice.gguf");
+    write_generation_gguf(&path);
+
+    let app = camelid::api::router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path": path, "id": "tiny-tool-choice"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_body = |tool_choice: Option<&str>| {
+        let mut body = json!({
+            "model": "tiny-tool-choice",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "stream": false,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "weather", "parameters": {"type": "object"}}
+            }]
+        });
+        if let Some(choice) = tool_choice {
+            body["tool_choice"] = json!(choice);
+        }
+        body.to_string()
+    };
+
+    // The tiny fixture has no chat template, so a request that wants tool
+    // calls fails closed instead of silently rendering without tools.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body(None)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_chat_template");
+
+    // `tool_choice: "none"` opts out of tool calling (OpenAI semantics), so
+    // the same request must render as plain chat and generate.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body(Some("none"))))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "<unk>");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert!(body["choices"][0]["message"].get("tool_calls").is_none());
 }
 
 #[tokio::test]
@@ -513,7 +834,17 @@ async fn slots_reports_public_fail_closed_llama_server_shape() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let slots = body.as_array().unwrap();
-    assert_eq!(slots.len(), 1);
+    // One entry per admissible streaming slot, so this length is what `/props`
+    // reports as `total_slots` and what `fail_on_no_slot` arbitrates against.
+    assert_eq!(
+        slots.len(),
+        camelid::runtime_config::DEFAULT_CONTINUOUS_BATCH_SLOTS
+    );
+    for (index, slot) in slots.iter().enumerate() {
+        assert_eq!(slot["id"], index);
+        assert_eq!(slot["is_processing"], false);
+        assert_eq!(slot["id_task"], -1);
+    }
     let slot = &slots[0];
     assert_eq!(slot["id"], 0);
     assert_eq!(slot["id_task"], -1);
@@ -677,11 +1008,79 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             .iter()
             .any(|item| item["id"] == id && item["status"] == "planned_exact_row_candidate"));
     }
-    assert!(body["api_features"]
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "multi_choice_generation"
+            && item["status"] == "supported_current_gate_nonstreaming"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("1..=8 independent")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "rich_logprobs"
+            && item["status"] == "supported_current_gate_nonstreaming"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("OpenAI-shaped logprobs")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "openai_responses"
+            && item["status"] == "supported_current_gate"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("opt-in local SQLite durability")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "streaming_tool_calls"
+            && item["status"] == "supported_current_gate"
+            && item["notes"].as_str().unwrap().contains("without leaking")
+    }));
+    let api_feature_ids = body["api_features"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "multi_choice_generation" && item["status"] == "unsupported"));
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    let api_conformance = body["api_conformance"].as_array().unwrap();
+    let conformance_ids = api_conformance
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        api_feature_ids, conformance_ids,
+        "compact feature rows and executable conformance descriptors must be projections of one registry"
+    );
+    let responses_contract = api_conformance
+        .iter()
+        .find(|item| item["id"] == "openai_responses")
+        .unwrap();
+    assert!(responses_contract["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|route| route["method"] == "POST" && route["path"] == "/v1/responses"));
+    assert!(responses_contract["supported_modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|mode| mode == "stateless_streaming"));
+    assert!(responses_contract["supported_modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|mode| mode == "previous_response_id"));
+    assert!(responses_contract["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|route| route["method"] == "POST" && route["path"] == "/v1/conversations"));
+    assert!(responses_contract["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|route| route["method"] == "DELETE" && route["path"] == "/v1/responses/:id"));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "llama_server_tokenizer_aliases"
             && item["status"] == "partial"
@@ -774,7 +1173,6 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         item["id"] == "fail_closed_native_compatibility_routes"
             && item["status"] == "unsupported"
             && notes.contains("/infill")
-            && notes.contains("/v1/responses")
             && notes.contains("/v1/messages")
             && notes.contains("Unsupported /models/load router-mode fields")
             && notes.contains("POST /models/unload")
@@ -3808,6 +4206,320 @@ async fn chat_completion_streams_openai_compatible_sse_chunks() {
     assert!(body.contains("\"delta\":{\"content\":\"<unk>\"}"));
     assert!(body.contains("\"finish_reason\":\"length\""));
     assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn responses_adapter_generates_nonstreaming_and_streaming_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-responses.gguf");
+    let database = dir.path().join("responses.sqlite3");
+    write_generation_gguf(&path);
+
+    let app = camelid::api::router_with_state(
+        camelid::api::AppState::default().with_responses_store_path(database.clone()),
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path": path, "id": "tiny-responses"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-responses","input":"hello","max_output_tokens":1,"stream":false,"store":true,"metadata":{"test":"durable"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["model"], "tiny-responses");
+    assert_eq!(body["status"], "incomplete");
+    assert_eq!(body["incomplete_details"]["reason"], "max_output_tokens");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(body["output"][0]["content"][0]["text"], "<unk>");
+    assert_eq!(body["usage"]["output_tokens"], 1);
+    assert_eq!(body["store"], true);
+    assert_eq!(body["metadata"]["test"], "durable");
+    let stored_response_id = body["id"].as_str().unwrap().to_string();
+
+    let retrieved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/responses/{stored_response_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retrieved.status(), StatusCode::OK);
+    let retrieved: Value =
+        serde_json::from_slice(&to_bytes(retrieved.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(retrieved["id"], stored_response_id);
+
+    let continuation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model":"tiny-responses",
+                        "input":"continue",
+                        "previous_response_id":stored_response_id,
+                        "max_output_tokens":1,
+                        "store":true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continuation.status(), StatusCode::OK);
+    let continuation: Value = serde_json::from_slice(
+        &to_bytes(continuation.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(continuation["previous_response_id"], stored_response_id);
+
+    let idempotent_body =
+        r#"{"model":"tiny-responses","input":"once","max_output_tokens":1,"store":true}"#;
+    let mut idempotent_ids = Vec::new();
+    for _ in 0..2 {
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "responses-vertical-test")
+                    .body(Body::from(idempotent_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value =
+            serde_json::from_slice(&to_bytes(replay.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        idempotent_ids.push(replay["id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(idempotent_ids[0], idempotent_ids[1]);
+    let idempotency_conflict = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "responses-vertical-test")
+                .body(Body::from(
+                    r#"{"model":"tiny-responses","input":"different","max_output_tokens":1,"store":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(idempotency_conflict.status(), StatusCode::CONFLICT);
+
+    let conversation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/conversations")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let conversation: Value = serde_json::from_slice(
+        &to_bytes(conversation.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap();
+    let conversation_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model":"tiny-responses",
+                        "input":"remember this",
+                        "conversation":conversation_id,
+                        "max_output_tokens":1,
+                        "store":false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conversation_response.status(), StatusCode::OK);
+    let conversation_response: Value = serde_json::from_slice(
+        &to_bytes(conversation_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(conversation_response["conversation"]["id"], conversation_id);
+    let conversation_items = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/conversations/{conversation_id}/items?order=asc"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let conversation_items: Value = serde_json::from_slice(
+        &to_bytes(conversation_items.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(conversation_items["data"].as_array().unwrap().len(), 2);
+    assert_eq!(conversation_items["data"][0]["role"], "user");
+    assert_eq!(conversation_items["data"][1]["role"], "assistant");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-responses","input":"hello","max_output_tokens":1,"stream":true,"store":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let stream = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for event_type in [
+        "response.created",
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_item.done",
+        "response.incomplete",
+    ] {
+        assert!(
+            stream.contains(&format!("\"type\":\"{event_type}\"")),
+            "missing {event_type} in stream: {stream}"
+        );
+    }
+    assert!(stream.contains("\"output_tokens\":1"));
+
+    let terminal_response = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("response.completed" | "response.incomplete")
+            )
+        })
+        .unwrap();
+    let streamed_response_id = terminal_response["response"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let restarted = camelid::api::router_with_state(
+        camelid::api::AppState::default().with_responses_store_path(database),
+    );
+    let retrieved_after_restart = restarted
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/responses/{streamed_response_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retrieved_after_restart.status(), StatusCode::OK);
+
+    let deleted = restarted
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/responses/{streamed_response_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let missing = restarted
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/responses/{streamed_response_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

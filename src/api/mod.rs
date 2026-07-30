@@ -28,8 +28,11 @@ use tower_http::trace::TraceLayer;
 
 #[allow(dead_code)]
 mod continuous_batch;
+mod contract;
 mod engine;
 mod metrics;
+mod responses;
+mod responses_store;
 mod server;
 mod workspace;
 
@@ -148,6 +151,13 @@ pub struct AppState {
     allow_local_model_delete: bool,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     verification_reports: Arc<RwLock<HashMap<String, crate::verify::VerificationReport>>>,
+    /// Durable local state for opt-in Responses objects and Conversations.
+    /// The store opens short-lived SQLite connections so cloned routers share
+    /// on-disk state without tying a connection to an async executor thread.
+    responses_store: responses_store::ResponsesStore,
+    /// Requests that mutate the same durable conversation (or reuse the same
+    /// idempotency key) are serialized through a process-local keyed lock.
+    responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
     /// Browser requests continue to use the independent same-origin predicate.
@@ -203,6 +213,8 @@ impl Default for AppState {
             allow_local_model_delete: false,
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             verification_reports: Arc::new(RwLock::new(HashMap::new())),
+            responses_store: responses_store::ResponsesStore::default(),
+            responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
             workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
@@ -246,6 +258,17 @@ impl AppState {
     /// here, once, so it stays stable however the process was launched.
     pub fn with_models_dir(mut self, models_dir: Option<PathBuf>) -> Self {
         self.models_dir = resolve_models_dir(models_dir);
+        self
+    }
+
+    /// Override the durable Responses/Conversations SQLite path.
+    ///
+    /// The default is `CAMELID_RESPONSES_DB` or the platform data directory.
+    /// This builder is also useful for embedding Camelid with an isolated
+    /// persistence boundary.
+    pub fn with_responses_store_path(mut self, path: PathBuf) -> Self {
+        self.responses_store = responses_store::ResponsesStore::new(path);
+        self.responses_locks = responses_store::ResponseLockPool::default();
         self
     }
 
@@ -496,6 +519,9 @@ pub struct HealthResponse {
     pub engine_active_generated_tokens: u64,
     pub engine_active_elapsed_seconds: u64,
     pub engine_stalled_seconds: u64,
+    /// Maximum streaming sessions retained by the engine's round-robin scheduler.
+    /// One active stream still uses the single-request Metal encode-ahead path.
+    pub continuous_batch_slots: usize,
     /// Absolute path of the running `camelid` binary, so the WebUI can tell a
     /// user exactly how to start the engine again after it stops. `camelid
     /// serve` is only runnable when the binary is on PATH, which it is NOT for
@@ -549,6 +575,10 @@ pub struct CapabilitiesResponse {
     /// This registry is intentionally separate from model support rows.
     pub runtime_projects: Vec<crate::runtime_manifest::RuntimeProjectCapability>,
     pub api_features: Vec<SupportItem>,
+    /// Executable API contract descriptors. The vertical-slice conformance
+    /// tests drive these routes and modes; `api_features` is the compact
+    /// frontend-compatible projection of the same typed registry.
+    pub api_conformance: Vec<serde_json::Value>,
     pub notes: Vec<&'static str>,
 }
 
@@ -696,8 +726,8 @@ pub struct ChatCompletionRequest {
     /// OpenAI-style tool/function definitions. When present, they are rendered
     /// into the prompt through the loaded model's own chat template (Hybrid agent
     /// mode); the model's tool-call output is parsed back into `tool_calls` (for
-    /// templates that render tools â€” Llama 3.x etc.). Models whose template does
-    /// not render tools simply ignore them.
+    /// certified templates such as Llama 3.x, Mistral, and Qwen3). Models without
+    /// a certified tool branch fail closed instead of silently dropping tools.
     pub tools: Option<Vec<serde_json::Value>>,
     /// OpenAI `tool_choice`: `"auto"` (default), `"none"` (suppress parsing), or
     /// `"required"`/a specific function (treated as `auto`). Parsed permissively
@@ -803,7 +833,23 @@ pub struct ChatMessage {
 #[derive(Deserialize)]
 struct ChatMessageWire {
     role: String,
-    content: ChatContentWire,
+    #[serde(default)]
+    content: Option<ChatContentWire>,
+    /// Assistant tool calls from a previous turn. Camelid canonicalizes these
+    /// into the exact JSON envelope its certified templates train on, so the
+    /// next request can include the model call and the matching tool result
+    /// instead of losing the call at the HTTP boundary.
+    #[serde(default)]
+    tool_calls: Vec<IncomingToolCall>,
+    /// Accepted for OpenAI tool-result round trips. The id links client-side
+    /// execution to the preceding call; the model prompt needs the tool output
+    /// content, not the opaque id, so it is intentionally not rendered.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    /// Legacy function-message name. Accepted so clients can replay older
+    /// function-call conversations through the same canonical tool role.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -820,15 +866,65 @@ struct ChatContentPartWire {
     text: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct IncomingToolCall {
+    #[allow(dead_code)]
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    function: IncomingToolCallFunction,
+}
+
+#[derive(Deserialize)]
+struct IncomingToolCallFunction {
+    name: String,
+    /// Chat Completions carries arguments as a JSON-encoded string. Accept a
+    /// raw JSON value too because several local clients use that convenient
+    /// form; it is normalized to an object/value before prompt rendering.
+    arguments: serde_json::Value,
+}
+
+fn canonical_incoming_tool_calls(
+    calls: &[IncomingToolCall],
+) -> std::result::Result<String, String> {
+    let mut rendered = Vec::with_capacity(calls.len());
+    for call in calls {
+        if call.kind.as_deref().is_some_and(|kind| kind != "function") {
+            return Err("only function tool calls are supported".to_string());
+        }
+        if call.function.name.trim().is_empty() {
+            return Err("tool call function names must not be empty".to_string());
+        }
+        let arguments = match &call.function.arguments {
+            serde_json::Value::String(value) => serde_json::from_str(value).map_err(|err| {
+                format!(
+                    "tool call arguments for {:?} must contain valid JSON: {err}",
+                    call.function.name
+                )
+            })?,
+            value => value.clone(),
+        };
+        rendered.push(
+            serde_json::json!({
+                "name": call.function.name,
+                "parameters": arguments,
+            })
+            .to_string(),
+        );
+    }
+    Ok(rendered.join("\n"))
+}
+
 impl<'de> Deserialize<'de> for ChatMessage {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = ChatMessageWire::deserialize(deserializer)?;
-        let (content, unsupported_content_parts) = match wire.content {
-            ChatContentWire::Text(text) => (text, Vec::new()),
-            ChatContentWire::Parts(parts) => {
+        let mut wire = ChatMessageWire::deserialize(deserializer)?;
+        let (mut content, unsupported_content_parts) = match wire.content {
+            Some(ChatContentWire::Text(text)) => (text, Vec::new()),
+            Some(ChatContentWire::Parts(parts)) => {
                 let mut text = String::new();
                 let mut unsupported = Vec::new();
                 for part in parts {
@@ -840,7 +936,33 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 }
                 (text, unsupported)
             }
+            None => (String::new(), Vec::new()),
         };
+        if !wire.tool_calls.is_empty() {
+            if wire.role != "assistant" {
+                return Err(serde::de::Error::custom(
+                    "tool_calls are only valid on assistant messages",
+                ));
+            }
+            let canonical = canonical_incoming_tool_calls(&wire.tool_calls)
+                .map_err(serde::de::Error::custom)?;
+            if content.trim().is_empty() {
+                content = canonical;
+            } else {
+                content.push('\n');
+                content.push_str(&canonical);
+            }
+        }
+        if wire.tool_call_id.is_some() && wire.role != "tool" {
+            return Err(serde::de::Error::custom(
+                "tool_call_id is only valid on tool messages",
+            ));
+        }
+        if wire.name.is_some() && wire.role == "function" {
+            // Legacy `function` messages are rendered through the same tool
+            // result role modern templates understand.
+            wire.role = "tool".to_string();
+        }
         Ok(ChatMessage {
             role: wire.role,
             content,
@@ -1495,7 +1617,7 @@ pub struct ChatCompletionMessage {
 }
 
 /// OpenAI tool-call object surfaced in an assistant message.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -1503,7 +1625,7 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolCallFunction {
     pub name: String,
     /// JSON-encoded arguments string (OpenAI shape).
@@ -1584,6 +1706,28 @@ pub struct ChatCompletionDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatCompletionToolCallDelta>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatCompletionToolCallDelta {
+    pub index: usize,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: ToolCallFunction,
+}
+
+impl From<(usize, ToolCall)> for ChatCompletionToolCallDelta {
+    fn from((index, call): (usize, ToolCall)) -> Self {
+        Self {
+            index,
+            id: call.id,
+            kind: call.kind,
+            function: call.function,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2191,7 +2335,26 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
-        .route("/v1/responses", post(unsupported_responses))
+        .route("/v1/responses", post(responses::create))
+        .route(
+            "/v1/responses/:id",
+            get(responses::get_response).delete(responses::delete_response),
+        )
+        .route("/v1/conversations", post(responses::create_conversation))
+        .route(
+            "/v1/conversations/:id",
+            get(responses::get_conversation)
+                .post(responses::update_conversation)
+                .delete(responses::delete_conversation),
+        )
+        .route(
+            "/v1/conversations/:id/items",
+            get(responses::list_conversation_items).post(responses::add_conversation_items),
+        )
+        .route(
+            "/v1/conversations/:id/items/:item_id",
+            get(responses::get_conversation_item).delete(responses::delete_conversation_item),
+        )
         .route("/v1/messages", post(unsupported_messages))
         .route("/v1/rerank", post(rerank))
         .route("/v1/reranking", post(rerank))
@@ -2228,16 +2391,6 @@ pub async fn serve(
         .with_models_dir(models_dir)
         .with_serve_addr(addr)
         .with_server_policy(&policy);
-    if let Some(model_path) = initial_model {
-        if let Err(err) = load_model_from_path(&state, model_path, None, true).await {
-            tracing::error!(error=%err, "failed to load startup model");
-            eprintln!("\n  Could not load that model: {err}");
-            eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
-            eprintln!("      camelid pull            # list supported models");
-            eprintln!("      camelid pull <id>       # download one into ./models\n");
-            return Err(std::io::Error::other(err.to_string()));
-        }
-    }
     let workspace_cli_credential = if addr.ip().is_loopback() {
         match crate::workspace_auth::WorkspaceCliCredential::issue(addr) {
             Ok(credential) => Some(credential),
@@ -2287,16 +2440,10 @@ pub async fn serve(
             .collect(),
     );
 
-    // Warm the generation path BEFORE telling the user we're ready. The GPU resident
-    // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
-    // lazily on the first generation â€” a one-time cost of several seconds. If it lands
-    // on the user's first prompt the model looks "dog slow" (it's really the cold
-    // build, on the GPU the whole time). So: start serving in the background, fire one
-    // tiny self-request through the exact same code path to build the engine, BLOCK on
-    // it, and only then print "ready". After this the first real request is warm
-    // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
-    // to the old lazy build and is not fatal.
-    let warm_model_id = state.active_model_id.read().await.clone();
+    // The router owns `state`; the startup load below shares the same Arcs, so
+    // a model it loads is visible to every request the listener is already
+    // answering.
+    let startup_state = state.clone();
     let app = router_with_state_and_policy(state, policy.clone());
     let tls_enabled = policy.tls.is_some();
     let server = if let Some(tls) = &policy.tls {
@@ -2319,6 +2466,33 @@ pub async fn serve(
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
         tokio::spawn(async move { axum::serve(listener, app).await })
     };
+    // Load the startup model AFTER the listener is accepting, so /health and
+    // /api/capabilities answer throughout the load. The desktop supervisor
+    // kills the sidecar when its health poll goes unanswered for 40s, and a
+    // large startup model (auto-selected whenever the models dir is populated)
+    // used to keep the port closed for the entire load — a healthy engine
+    // looked dead exactly when it had the most work to do. Failure still exits
+    // `serve` with the same message and non-zero status as before.
+    if let Some(model_path) = initial_model {
+        if let Err(err) = load_model_from_path(&startup_state, model_path, None, true).await {
+            tracing::error!(error=%err, "failed to load startup model");
+            eprintln!("\n  Could not load that model: {err}");
+            eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
+            eprintln!("      camelid pull            # list supported models");
+            eprintln!("      camelid pull <id>       # download one into ./models\n");
+            return Err(std::io::Error::other(err.to_string()));
+        }
+    }
+    // Warm the generation path BEFORE telling the user we're ready. The GPU resident
+    // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
+    // lazily on the first generation â€” a one-time cost of several seconds. If it lands
+    // on the user's first prompt the model looks "dog slow" (it's really the cold
+    // build, on the GPU the whole time). So: start serving in the background, fire one
+    // tiny self-request through the exact same code path to build the engine, BLOCK on
+    // it, and only then print "ready". After this the first real request is warm
+    // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
+    // to the old lazy build and is not fatal.
+    let warm_model_id = startup_state.active_model_id.read().await.clone();
     if let Some(model_id) = warm_model_id {
         // Word the banner for the device that will actually serve â€” saying "GPU"
         // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
@@ -2446,7 +2620,30 @@ async fn telemetry_stream() -> Response {
         .into_response()
 }
 
+/// Upper bound on how long the liveness endpoints (`/health`, `/v1/health`,
+/// `/api/capabilities`) may wait on the shared model registries.
+///
+/// These endpoints gate external supervision — the desktop app kills the
+/// sidecar when a health poll goes unanswered for its 40s startup window — so
+/// a model load/unload mutating the registries must never make them
+/// unresponsive. The registry locks are fair: once a load's write is queued,
+/// new readers park behind it, so an unbounded `read().await` here inherits
+/// the full latency of whatever the writer is stuck on. On timeout the
+/// endpoints answer from lock-free state instead of parking.
+const LIVENESS_LOCK_BUDGET: Duration = Duration::from_millis(500);
+
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    match tokio::time::timeout(LIVENESS_LOCK_BUDGET, health_registry_snapshot(&state)).await {
+        Ok(response) => Json(response),
+        // A model transition is holding the registries: answer from lock-free
+        // state rather than queueing behind the writer. `ok` stays true — the
+        // process is alive and serving; the registry-derived fields report
+        // not-ready, which the next poll refreshes once the transition ends.
+        Err(_busy) => Json(busy_health_response(&state)),
+    }
+}
+
+async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     let active_id_lock = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
@@ -2485,7 +2682,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         .and_then(|id| execution_plans.get(id))
         .cloned();
     let slot = state.engine.slot_snapshot();
-    Json(HealthResponse {
+    HealthResponse {
         ok: true,
         engine: "camelid",
         loaded_now,
@@ -2502,9 +2699,39 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         engine_active_generated_tokens: slot.completed_units,
         engine_active_elapsed_seconds: slot.active_elapsed_seconds,
         engine_stalled_seconds: slot.stalled_seconds,
+        continuous_batch_slots: state.engine.continuous_batch_slots(),
         executable: loopback_executable_path(state.serve_addr),
         listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
-    })
+    }
+}
+
+/// `/health` while a model transition holds the registries: every field that
+/// would need a registry lock reports the in-flux state as not-ready; the
+/// engine gauges, Q8 policy, and listener identity are lock-free and stay
+/// live. The process is alive and serving, so `ok` remains true.
+fn busy_health_response(state: &AppState) -> HealthResponse {
+    let slot = state.engine.slot_snapshot();
+    HealthResponse {
+        ok: true,
+        engine: "camelid",
+        loaded_now: false,
+        generation_ready: false,
+        active_model_id: None,
+        q8_runtime: q8_runtime_health(),
+        execution_plan: None,
+        backend: health_backend(false, false, false, false),
+        model_family: None,
+        gemma4_available: false,
+        engine_queue_depth: state.engine.depth(),
+        engine_queued_tasks: slot.queued_tasks,
+        engine_active_task_id: slot.active_task_id,
+        engine_active_generated_tokens: slot.completed_units,
+        engine_active_elapsed_seconds: slot.active_elapsed_seconds,
+        engine_stalled_seconds: slot.stalled_seconds,
+        continuous_batch_slots: state.engine.continuous_batch_slots(),
+        executable: loopback_executable_path(state.serve_addr),
+        listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
+    }
 }
 
 /// Resolve the running binary's path for [`HealthResponse::executable`].
@@ -2816,7 +3043,12 @@ async fn llama_server_props(
                 stopping_word: "",
             },
         },
-        total_slots: 1,
+        // In llama-server semantics `total_slots` is the length of the `/slots`
+        // array, and `GET /slots?fail_on_no_slot=1` arbitrates against those same
+        // slots — so all three answer from `EngineHandle::total_slots`, which is
+        // the cooperative capacity except on the CUDA resident lane, where every
+        // stream runs exclusive and the honest answer is 1.
+        total_slots: state.engine.total_slots().try_into().unwrap_or(u32::MAX),
         model_path: None,
         model_id,
         chat_template,
@@ -2907,7 +3139,13 @@ async fn llama_server_slots(
     let generation_ready = model.is_some_and(loaded_model_generation_ready);
     let slot = state.engine.slot_snapshot();
 
-    if query.fail_on_no_slot.as_deref() == Some("1") && (!generation_ready || slot.is_processing())
+    let total_slots = state.engine.total_slots();
+    let busy_slots = state.engine.busy_slots();
+
+    // Refuse only when there is genuinely no room: with cooperative streaming a
+    // second stream is admissible while the first is mid-generation.
+    if query.fail_on_no_slot.as_deref() == Some("1")
+        && (!generation_ready || busy_slots >= total_slots)
     {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2933,57 +3171,75 @@ async fn llama_server_slots(
         .map(|id| id.min(i32::MAX as u64) as i32)
         .unwrap_or(-1);
 
-    (
-        StatusCode::OK,
-        Json(vec![LlamaServerSlotResponse {
-            id: 0,
-            id_task,
-            n_ctx,
-            speculative: false,
-            is_processing: slot.is_processing(),
-            params: LlamaServerDefaultGenerationParams {
-                n_predict: -1,
-                seed: u32::MAX,
-                temperature: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                presence_penalty: 0.0,
-                frequency_penalty: 0.0,
-                stop: Vec::new(),
-                max_tokens: -1,
-                ignore_eos: false,
-                stream: true,
-                n_probs: 0,
-                samplers: vec!["greedy"],
-            },
-            prompt: "",
-            next_token: LlamaServerNextTokenProps {
-                has_next_token: generation_ready,
-                has_new_line: false,
-                n_remain: -1,
-                n_decoded: 0,
-                stopping_word: "",
-            },
-            camelid: LlamaServerSlotCamelid {
-                compatibility: "partial_llama_server_slots_read_only",
-                generation_ready,
-                status,
-                engine_queue_depth: state.engine.depth(),
-                queued_tasks: slot.queued_tasks,
-                active_generated_tokens: slot.completed_units,
-                active_elapsed_seconds: slot.active_elapsed_seconds,
-                stalled_seconds: slot.stalled_seconds,
-                unsupported: vec![
-                    "post_slots",
-                    "slot_cache_save_restore_erase",
-                    "prompt_cache_metadata",
-                    "cancellation_metadata",
-                    "continuous_batching_metrics",
-                ],
-            },
-        }]),
-    )
-        .into_response()
+    // One entry per admissible slot, so this array's length is `total_slots` on
+    // `/props` and the denominator `fail_on_no_slot` arbitrates against. The
+    // engine tracks WHICH slots are busy but keeps a single set of progress
+    // atomics for whichever job is stepping, so `id_task` and the progress
+    // fields are engine-wide values repeated on the busy entries rather than
+    // per-slot truth — declared as `per_slot_task_identity` /
+    // `per_slot_progress` in `unsupported` rather than quietly implied.
+    let slots: Vec<LlamaServerSlotResponse> = (0..total_slots)
+        .map(|index| {
+            let busy = index < busy_slots;
+            LlamaServerSlotResponse {
+                id: index.try_into().unwrap_or(u32::MAX),
+                id_task: if busy { id_task } else { -1 },
+                n_ctx,
+                speculative: false,
+                is_processing: busy,
+                params: LlamaServerDefaultGenerationParams {
+                    n_predict: -1,
+                    seed: u32::MAX,
+                    temperature: 0.0,
+                    top_k: 0,
+                    top_p: 1.0,
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    stop: Vec::new(),
+                    max_tokens: -1,
+                    ignore_eos: false,
+                    stream: true,
+                    n_probs: 0,
+                    samplers: vec!["greedy"],
+                },
+                prompt: "",
+                next_token: LlamaServerNextTokenProps {
+                    has_next_token: generation_ready,
+                    has_new_line: false,
+                    n_remain: -1,
+                    n_decoded: 0,
+                    stopping_word: "",
+                },
+                camelid: LlamaServerSlotCamelid {
+                    compatibility: "partial_llama_server_slots_read_only",
+                    generation_ready,
+                    status: if busy {
+                        status
+                    } else if generation_ready {
+                        "idle_generation_ready"
+                    } else {
+                        "unavailable"
+                    },
+                    engine_queue_depth: state.engine.depth(),
+                    queued_tasks: slot.queued_tasks,
+                    active_generated_tokens: if busy { slot.completed_units } else { 0 },
+                    active_elapsed_seconds: if busy { slot.active_elapsed_seconds } else { 0 },
+                    stalled_seconds: if busy { slot.stalled_seconds } else { 0 },
+                    unsupported: vec![
+                        "post_slots",
+                        "slot_cache_save_restore_erase",
+                        "prompt_cache_metadata",
+                        "cancellation_metadata",
+                        "continuous_batching_metrics",
+                        "per_slot_task_identity",
+                        "per_slot_progress",
+                    ],
+                },
+            }
+        })
+        .collect();
+
+    (StatusCode::OK, Json(slots)).into_response()
 }
 
 async fn unsupported_llama_server_slots() -> Response {
@@ -3615,14 +3871,6 @@ async fn rerank(
         .into_response()
 }
 
-async fn unsupported_responses() -> Response {
-    unsupported_route(
-        "unsupported_responses",
-        "OpenAI Responses compatibility is not supported yet; Camelid keeps generation on /v1/completions and /v1/chat/completions until request conversion, streaming, tool, and cancellation semantics are implemented and tested",
-        Some("input"),
-    )
-}
-
 async fn unsupported_messages() -> Response {
     unsupported_route(
         "unsupported_messages",
@@ -3690,12 +3938,21 @@ async fn set_gpu_runtime(Json(req): Json<GpuRuntimeRequest>) -> Json<GpuRuntimeS
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
-    let active_id_lock = state.active_model_id.read().await;
-    let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock
-        .as_ref()
-        .and_then(|id| execution_plans.get(id))
-        .cloned();
+    // Bounded like /health: capabilities is polled by supervisors while loads
+    // are in flight. Everything except the active execution plan is static, so
+    // a busy registry degrades to the static response with no plan instead of
+    // queueing behind the transition's writer.
+    let execution_plan = tokio::time::timeout(LIVENESS_LOCK_BUDGET, async {
+        let active_id_lock = state.active_model_id.read().await;
+        let execution_plans = state.execution_plans.read().await;
+        active_id_lock
+            .as_ref()
+            .and_then(|id| execution_plans.get(id))
+            .cloned()
+    })
+    .await
+    .ok()
+    .flatten();
     Json(capabilities_response_with_plan(execution_plan))
 }
 
@@ -5452,98 +5709,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
             .projects
             .clone(),
-        api_features: vec![
-            SupportItem {
-                id: "camelid_verify",
-                status: "partial",
-                notes: "CLI `camelid verify <gguf>` plus GET/POST /api/models/verify replay one pinned deterministic request for a built-in exact-GGUF-hash profile and emit a digest-sealed report. The initial profile covers only the tracked Llama 3.2 1B Instruct Q8_0 Windows artifact. A pass proves that one request on those exact bytes; it is not a digital signature, broad certification, support promotion, or performance claim.",
-            },
-            SupportItem {
-                id: "openai_chat_completions",
-                status: "supported_current_gate",
-                notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
-            },
-            SupportItem {
-                id: "llguidance_structured_outputs",
-                status: "supported_current_gate_nonstreaming",
-                notes: "non-streaming /v1/chat/completions constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and non-chat generation lanes remain typed unsupported.",
-            },
-            SupportItem {
-                id: "openai_embeddings",
-                status: "supported_exact_model_row",
-                notes: "POST /v1/embeddings plus /embedding and /embeddings aliases accept one string or a bounded string batch, return finite unit-normalized float vectors and exact tokenizer usage, and support Nomic Matryoshka dimensions. The current gate is the exact Nomic Embed Text v1.5 Q8_0 catalog row; base64 encoding, token-id input, arbitrary encoder families/quants, and GPU execution are unsupported.",
-            },
-            SupportItem {
-                id: "embedding_similarity_reranking",
-                status: "supported_exact_model_row",
-                notes: "POST /rerank, /reranking, /v1/rerank, and /v1/reranking rank bounded string/object documents by cosine similarity using Nomic search_query/search_document prefixes, stable score ordering, optional top_n, and optional returned documents. This is bi-encoder embedding-similarity reranking, not a classifier-head cross-encoder claim.",
-            },
-            SupportItem {
-                id: "web_workspace",
-                status: "supported_current_gate",
-                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim.",
-            },
-            SupportItem {
-                id: "stream_options.include_usage",
-                status: "supported_current_gate",
-                notes: "chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/.",
-            },
-            SupportItem {
-                id: "tokenizer_encode_decode",
-                status: "supported_current_gate",
-                notes: "loaded-model tokenizer APIs for supported tokenizer families",
-            },
-            SupportItem {
-                id: "llama_server_tokenizer_aliases",
-                status: "partial",
-                notes: "POST /tokenize and POST /detokenize are bounded loaded-model tokenizer aliases that return token ids/text, with /tokenize with_pieces=true exposing id/piece objects for supported tokenizer lanes. Arbitrary tokenizer kwargs and broader tokenizer parity remain unsupported.",
-            },
-            SupportItem {
-                id: "llama_server_models",
-                status: "partial",
-                notes: "GET /models returns a privacy-safe read-only list of currently loaded Camelid models with redacted paths and text-only architecture metadata. POST /models/load is a narrow local-path alias over Camelid's stable /api/models/load path and returns a redacted compatibility response. Router-mode query params such as reload/autoload/model selection, cache listing, POST /models/unload, multimodal metadata, and full llama-server model-management parity remain unsupported.",
-            },
-            SupportItem {
-                id: "llama_server_props",
-                status: "partial",
-                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, generic embedding-model compatibility, or full llama-server WebUI parity.",
-            },
-            SupportItem {
-                id: "llama_server_slots",
-                status: "partial",
-                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported.",
-            },
-            SupportItem {
-                id: "production_server_hardening",
-                status: "supported",
-                notes: "Startup-resolved bearer/X-API-Key authentication with key-file support, fail-closed non-loopback binding, explicit CORS origin allowlists, optional rustls TLS, request/prompt/generation/download ceilings, and a Prometheus /metrics surface for HTTP/generation/token/cache/queue/slot/RSS/VRAM telemetry. Anonymous same-origin loopback remains the default.",
-            },
-            SupportItem {
-                id: "llama_server_apply_template",
-                status: "partial",
-                notes: "POST /apply-template renders loaded-model chat messages to a prompt string without inference. It is scoped to Camelid's supported tokenizer/template renderers and returns typed unsupported errors for unknown request fields or unsupported templates.",
-            },
-            SupportItem {
-                id: "llama_server_completion",
-                status: "partial",
-                notes: "POST /completion accepts a narrow non-streaming text-generation subset: text prompts, token-id prompt arrays, n_predict/max_tokens, supported sampler fields, and stop sequences are mapped onto Camelid's existing generation path. Native stream=true chunks, slot selection, cache_prompt controls, llama-server timings shape, rich token probabilities, and full llama-server generation parity remain unsupported.",
-            },
-            SupportItem {
-                id: "fail_closed_native_compatibility_routes",
-                status: "unsupported",
-                notes: "Native /infill, /v1/messages, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row.",
-            },
-            SupportItem {
-                id: "multi_choice_generation",
-                status: "unsupported",
-                notes: "typed unsupported until implemented and tested",
-            },
-            SupportItem {
-                id: "rich_logprobs",
-                status: "partial",
-                notes: "diagnostic logit surfaces exist; full OpenAI-compatible logprobs remain planned",
-            },
-        ],
+        api_features: contract::api_feature_contract(),
+        api_conformance: contract::api_conformance_contract(),
         notes: vec![
             "GGUF metadata, tokenizer metadata, tensor loading, Camelid dense config extraction, and tensor binding are available",
             "public completion endpoints can generate small OpenAI-compatible non-streaming responses and SSE token streams from a loaded Camelid-supported dense GGUF model",
@@ -7486,10 +7653,34 @@ fn completions_unsupported_for_arch(arch: &str) -> bool {
     is_runnable_serve_arch(arch)
 }
 
+/// The typed rejection every raw completions-style surface returns for a
+/// runnable-lane-only model: these archs are served only via
+/// `/v1/chat/completions`, and no raw-completions surface may fall through to
+/// the optimized dense engine (mis-bound for them — see
+/// [`completions_unsupported_for_arch`]).
+fn runnable_completions_rejection(model_id: &str) -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_completions_lane",
+        format!(
+            "model '{model_id}' is a runnable-lane architecture served only via \
+             /v1/chat/completions; raw completion surfaces have no runnable bridge and \
+             fail closed rather than falling through to the optimized engine"
+        ),
+        None,
+    )
+}
+
 /// Fail-closed guard for `/v1/completions` (MUSTER M-A1 follow-up): reject
 /// requests targeting a loaded runnable-served model with a typed error that
 /// points callers at the chat endpoint, instead of silently serving them from
 /// the wrong engine. Returns `Some(response)` when the request must be rejected.
+///
+/// This handler-level gate is the early, cheap rejection; the backstop that
+/// covers EVERY raw-completions surface (`/completion`,
+/// `/api/generation/preflight`, `/api/generation/sessions`, multi-choice
+/// fan-out, receipt replay) lives at the dense chokepoint in
+/// [`prepare_generation`].
 async fn reject_completions_for_runnable_arch(
     state: &AppState,
     model: &Option<String>,
@@ -7506,16 +7697,7 @@ async fn reject_completions_for_runnable_arch(
         .map(|m| completions_unsupported_for_arch(m.gguf.architecture().unwrap_or_default()))
         .unwrap_or(false);
     if unsupported {
-        return Some(api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_completions_lane",
-            format!(
-                "model '{id}' is a runnable-lane architecture served only via \
-                 /v1/chat/completions; raw /v1/completions has no runnable bridge and \
-                 fails closed rather than falling through to the optimized engine"
-            ),
-            None,
-        ));
+        return Some(runnable_completions_rejection(&id));
     }
     None
 }
@@ -7553,13 +7735,7 @@ async fn runnable_chat_nonstreaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
-    let tools: Vec<serde_json::Value> = req
-        .tools
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
-        .collect();
+    let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
@@ -7618,7 +7794,15 @@ async fn runnable_chat_nonstreaming(
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
-    let tool_calls = parse_ornith_tool_calls_json(&content);
+    // Gated on tool_choice, not tool presence: the agent loop deliberately
+    // lifts envelopes with no tools in the request, but a `tool_choice:"none"`
+    // response must never carry tool_calls (OpenAI semantics), even if the
+    // model mimics envelope syntax from its conversation history.
+    let tool_calls = if tool_choice_allows_calls(req.tool_choice.as_ref()) {
+        parse_ornith_tool_calls_json(&content)
+    } else {
+        Vec::new()
+    };
     let finish_reason = if tool_calls.is_empty() {
         "stop"
     } else {
@@ -7658,11 +7842,12 @@ async fn runnable_chat_nonstreaming(
 
 /// Streaming chat for a runnable-served model (qwen35/Ornith), SSE. Mirrors the
 /// OpenAI `chat.completion.chunk` shape and the non-streaming bridge's semantics:
-/// think-block tokens stream as `delta.reasoning_content`, post-`</think>` tokens
-/// as `delta.content` (tool-call XML included, as in non-streaming), then one
-/// aggregate `tool_calls` delta when the finished content lifts into structured
-/// calls, the finish_reason chunk, an optional `stream_options.include_usage`
-/// terminal usage chunk, and `[DONE]`. The phase switch keys on the `</think>`
+/// think-block tokens stream as `delta.reasoning_content`. Tool-enabled content
+/// is held until completion so a raw `<tool_call>` envelope is never leaked:
+/// the stream then emits either one ordinary content delta or structured
+/// `tool_calls` deltas, followed by the finish_reason chunk, an optional
+/// `stream_options.include_usage` terminal usage chunk, and `[DONE]`. The phase
+/// switch keys on the `</think>`
 /// TOKEN ID (a single user_defined token in the qwen35 vocab), so no text
 /// scanning is needed; per-phase text is decoded incrementally with UTF-8
 /// hold-back (a multi-token code point emits only once complete).
@@ -7673,13 +7858,7 @@ async fn runnable_chat_streaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
-    let tools: Vec<serde_json::Value> = req
-        .tools
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.get("function").cloned().unwrap_or(t))
-        .collect();
+    let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
             return api_error(
@@ -7712,6 +7891,13 @@ async fn runnable_chat_streaming(
     let prompt_token_count = prompt_ids.len();
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
+    let parse_stream_tool_calls = !tools.is_empty();
+    // Post-hoc envelope lifting is gated on tool_choice, not tool presence:
+    // the agent loop lifts with no tools in the request, but under
+    // `tool_choice:"none"` the content has already streamed as plain deltas
+    // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
+    // duplicate the streamed text as a structured tool_calls delta.
+    let lift_tool_calls = tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
     let created = unix_secs();
 
@@ -7800,6 +7986,13 @@ async fn runnable_chat_streaming(
                     let delta = if in_think {
                         serde_json::json!({ "reasoning_content": delta_text })
                     } else {
+                        if parse_stream_tool_calls {
+                            // Hold the model envelope until it can be classified
+                            // as a tool call. The completed text below is the
+                            // single source for either structured calls or
+                            // ordinary fallback content.
+                            continue;
+                        }
                         serde_json::json!({ "content": delta_text })
                     };
                     yield Ok(Event::default().data(chunk(delta, None).to_string()));
@@ -7818,7 +8011,11 @@ async fn runnable_chat_streaming(
         match final_state {
             Some(Ok((text, ids))) => {
                 let (_reasoning, content) = split_ornith_think(&text);
-                let tool_calls = parse_ornith_tool_calls_json(&content);
+                let tool_calls = if lift_tool_calls {
+                    parse_ornith_tool_calls_json(&content)
+                } else {
+                    Vec::new()
+                };
                 let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
                 if !tool_calls.is_empty() {
                     let deltas: Vec<serde_json::Value> = tool_calls
@@ -7832,6 +8029,10 @@ async fn runnable_chat_streaming(
                         .collect();
                     yield Ok(Event::default().data(
                         chunk(serde_json::json!({ "tool_calls": deltas }), None).to_string(),
+                    ));
+                } else if parse_stream_tool_calls && !content.is_empty() {
+                    yield Ok(Event::default().data(
+                        chunk(serde_json::json!({ "content": content }), None).to_string(),
                     ));
                 }
                 yield Ok(Event::default().data(chunk(serde_json::json!({}), Some(finish)).to_string()));
@@ -8472,65 +8673,41 @@ async fn load_model_from_path_with_activation(
             }
         }
     }
-    let mut gguf = read_metadata(&path)?;
-    let outcome = plan_for_model(&path, &gguf, state.configured_threads);
+    // The load pipeline's heavy phases run on blocking threads, never inline on
+    // this async worker. Inline they pin a tokio worker for seconds on a large
+    // model (metadata read, tokenizer build, and a full-file receipt hash), and
+    // under CPU/memory contention that starves trivially cheap requests — the
+    // desktop's /v1/health poll goes unanswered and it kills a healthy engine
+    // at its 40s startup gate.
+    //
+    // Phase 1: GGUF metadata read + execution planning (file I/O + hardware
+    // probing). env_updates are applied between the phases, preserving the
+    // ordering the old inline pipeline had.
+    let metadata_path = path.clone();
+    let configured_threads = state.configured_threads;
+    let (gguf, outcome) = tokio::task::spawn_blocking(move || {
+        let gguf = read_metadata(&metadata_path)?;
+        let outcome = plan_for_model(&metadata_path, &gguf, configured_threads);
+        Ok::<_, BackendError>((gguf, outcome))
+    })
+    .await
+    .map_err(|join_error| {
+        BackendError::InvalidModelMetadata(format!("model metadata task panicked: {join_error}"))
+    })??;
     state.planner_env.apply(&outcome.env_updates);
     log_selected_execution_plan(&outcome.plan);
     let id = id
         .or_else(|| gguf.model_name().map(ToOwned::to_owned))
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "loaded-model".to_string());
-    let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
-    // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
-    // the split tensors the binder + forward path expect (no-op for already-split rows),
-    // so the fused layout becomes attemptable without touching the parity-gated path.
-    if let Ok(config) = &llama_config_result {
-        if let Err(err) = crate::model::expand_fused_dense_tensors(&mut gguf, config) {
-            eprintln!("[camelid] fused-tensor expansion skipped: {err}");
-        }
-    }
-    // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
-    // WHY it fails closed (architecture not implemented, missing/invalid metadata,
-    // DiffusionGemma redirect, â€¦) instead of silently sitting non-generative.
-    let unsupported_runtime = match &llama_config_result {
-        Err(
-            err @ (BackendError::UnsupportedModelArchitecture(_)
-            | BackendError::InvalidModelMetadata(_)
-            | BackendError::UnsupportedGguf(_)),
-        ) => Some(UnsupportedRuntimeSummary {
-            code: backend_error_code(err),
-            message: err.to_string(),
-        }),
-        _ => None,
-    };
-    let llama_config = llama_config_result.ok();
-    let llama_tensors = llama_config
-        .as_ref()
-        .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
-    let tokenizer_result = Tokenizer::from_gguf(&gguf);
-    let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
-    let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
-    // Hash the exact GGUF bytes once at load time so receipts can name the
-    // lane without re-hashing per request.
-    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
-        receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
-        other => BackendError::InvalidModelMetadata(other.to_string()),
-    })?;
-    let tokenizer_kind = tokenizer_runtime
-        .as_ref()
-        .map(|tokenizer| tokenizer.model.as_summary_model());
-    let lane = LaneIdentity::capture(&id, &path, &gguf, tokenizer_kind, gguf_sha256);
-    let loaded = LoadedModel {
-        id: id.clone(),
-        path,
-        gguf,
-        llama_config,
-        llama_tensors,
-        unsupported_runtime,
-        tokenizer,
-        tokenizer_runtime,
-        lane,
-    };
+    // Phase 2: config/tensor binding, tokenizer construction, and the
+    // multi-gigabyte lane hash.
+    let build_id = id.clone();
+    let loaded = tokio::task::spawn_blocking(move || build_loaded_model(path, build_id, gguf))
+        .await
+        .map_err(|join_error| {
+            BackendError::InvalidModelMetadata(format!("model load task panicked: {join_error}"))
+        })??;
 
     state
         .loaded_models
@@ -8576,6 +8753,68 @@ async fn load_model_from_path_with_activation(
     }
 
     Ok(loaded)
+}
+
+/// Blocking phase 2 of a model load: fused-tensor expansion, config + tensor
+/// binding, tokenizer construction, and the full-file lane hash. Pure CPU and
+/// file work — always entered via `spawn_blocking` from
+/// `load_model_from_path_with_activation`, never inline on an async worker.
+fn build_loaded_model(
+    path: PathBuf,
+    id: String,
+    mut gguf: GgufFile,
+) -> Result<LoadedModel, BackendError> {
+    let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
+    // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
+    // the split tensors the binder + forward path expect (no-op for already-split rows),
+    // so the fused layout becomes attemptable without touching the parity-gated path.
+    if let Ok(config) = &llama_config_result {
+        if let Err(err) = crate::model::expand_fused_dense_tensors(&mut gguf, config) {
+            eprintln!("[camelid] fused-tensor expansion skipped: {err}");
+        }
+    }
+    // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
+    // WHY it fails closed (architecture not implemented, missing/invalid metadata,
+    // DiffusionGemma redirect, â€¦) instead of silently sitting non-generative.
+    let unsupported_runtime = match &llama_config_result {
+        Err(
+            err @ (BackendError::UnsupportedModelArchitecture(_)
+            | BackendError::InvalidModelMetadata(_)
+            | BackendError::UnsupportedGguf(_)),
+        ) => Some(UnsupportedRuntimeSummary {
+            code: backend_error_code(err),
+            message: err.to_string(),
+        }),
+        _ => None,
+    };
+    let llama_config = llama_config_result.ok();
+    let llama_tensors = llama_config
+        .as_ref()
+        .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
+    let tokenizer_result = Tokenizer::from_gguf(&gguf);
+    let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
+    let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
+    // Hash the exact GGUF bytes once at load time so receipts can name the
+    // lane without re-hashing per request.
+    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
+        receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
+        other => BackendError::InvalidModelMetadata(other.to_string()),
+    })?;
+    let tokenizer_kind = tokenizer_runtime
+        .as_ref()
+        .map(|tokenizer| tokenizer.model.as_summary_model());
+    let lane = LaneIdentity::capture(&id, &path, &gguf, tokenizer_kind, gguf_sha256);
+    Ok(LoadedModel {
+        id,
+        path,
+        gguf,
+        llama_config,
+        llama_tensors,
+        unsupported_runtime,
+        tokenizer,
+        tokenizer_runtime,
+        lane,
+    })
 }
 
 /// Load (or reload) the gemma4 serve runtime for a model id. With
@@ -9950,7 +10189,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false);
+        return stream_completion(&state, prepared, false, false, false);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -10154,6 +10393,18 @@ async fn chat_completions(
             Some("response_format"),
         )
     };
+    let tools_active = req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        && tool_choice_allows_calls(req.tool_choice.as_ref());
+    let tools_unsupported_on_lane = |lane: &str| {
+        api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_tools",
+            format!(
+                "the {lane} serve lane does not support tools: its chat template has no certified tool-call branch"
+            ),
+            Some("tools"),
+        )
+    };
     // Gemma 4 serve path (additive, on by default; opt-out CAMELID_GEMMA4_SERVE=0).
     // Short-circuits if this request targets a loaded gemma4 runtime; otherwise falls
     // through to the existing Llama/3B path unchanged.
@@ -10161,6 +10412,9 @@ async fn chat_completions(
         Ok(Some((id, runtime))) => {
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
+            }
+            if tools_active {
+                return tools_unsupported_on_lane("gemma4");
             }
             return if req.stream.unwrap_or(false) {
                 gemma4_chat_streaming(id, runtime, &req).await
@@ -10194,6 +10448,9 @@ async fn chat_completions(
         Ok(Some((id, runtime))) => {
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
+            }
+            if tools_active {
+                return tools_unsupported_on_lane("diffusion-gemma");
             }
             if req.stream.unwrap_or(false) {
                 return dg_chat_streaming(id, runtime, &req).await;
@@ -10239,6 +10496,15 @@ async fn chat_completions(
             Some("camelid_receipt"),
         );
     }
+    if n_choices > 1 && tools_active {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "tool calls are not supported with n greater than 1; request one choice so call ids and arguments have an unambiguous continuation"
+                .to_string(),
+            Some("n"),
+        );
+    }
     // Capture the receipt stamp before the request is consumed. Receipts are
     // strictly opt-in and never silently attached.
     let receipt_stamp = if req.camelid_receipt.unwrap_or(false) {
@@ -10262,8 +10528,6 @@ async fn chat_completions(
     let wants_logprobs = matches!(req.logprobs, Some(true)) || req.top_logprobs.is_some();
     // Tool calls are surfaced on the non-streaming single-choice path when the
     // request supplied tools and tool_choice is not "none".
-    let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
-        && tool_choice_allows_calls(req.tool_choice.as_ref());
     // The constraint itself was parsed before lane dispatch (see above); this
     // captures whether one is active before `constraint` moves into the
     // generation request, for the tool-call parse gate below.
@@ -10333,7 +10597,11 @@ async fn chat_completions(
         camelid_enable_thinking: req
             .camelid_enable_thinking
             .or(state.default_enable_thinking.then_some(true)),
-        tools: req.tools,
+        // `tool_choice: "none"` disables tool calling for this request (OpenAI
+        // semantics), so render the prompt without tools: rows whose template
+        // has no certified tools branch keep serving plain chat instead of
+        // failing closed on a request that never wanted calls.
+        tools: if tools_active { req.tools } else { None },
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         constraint,
@@ -10354,7 +10622,13 @@ async fn chat_completions(
     if stream {
         // Streaming decodes are engine jobs too; the SSE layer just maps the
         // job's events onto chunks.
-        return stream_completion(&state, prepared, true, include_usage);
+        return stream_completion(
+            &state,
+            prepared,
+            true,
+            include_usage,
+            tools_active && !constraint_active,
+        );
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -11301,6 +11575,18 @@ async fn prepare_generation(
         Ok(m) => m,
         Err(res) => return Err(res),
     };
+    // Fail closed for runnable-lane-only archs at the dense chokepoint. Every
+    // raw completions-style surface funnels through here (`/completion`,
+    // `/v1/completions` and its n>1 fan-out, `/api/generation/preflight`,
+    // `/api/generation/sessions`, receipt replay), and the dense engine is
+    // mis-bound for these archs — it drops their QK/sandwich norm tensors and
+    // has no GeGLU/dual-RoPE — so falling through produces fluent-looking
+    // garbage, not an error. Chat requests never reach this: the runnable
+    // short-circuit in `chat_completions` serves them or returns a typed 503
+    // before prepare_generation.
+    if completions_unsupported_for_arch(model.gguf.architecture().unwrap_or_default()) {
+        return Err(runnable_completions_rejection(&model.id));
+    }
     let draft_may_be_used = speculative_mode == Some(SpecDecodeMode::DraftModel)
         && sampling == SamplingConfig::default()
         && !collect_dense_diagnostics
@@ -12764,12 +13050,19 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(&x, &y)| x == y).count()
 }
 
-fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
+fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGenerationStep) {
     if prepared.constraint.is_some() {
         return;
     }
-    if !prepared.session.cpu_kv_authoritative()
-        || prepared.session.kv_position() != prepared.token_ids.len()
+    // A GPU-resident prefill leaves the CPU KV buffers empty, which used to make
+    // this bail out and so kept the prompt cache off the lane the CLI selects
+    // automatically. `prepare_for_prompt_prefix_cache` mirrors the GPU history
+    // back when that round trip is bit-exact, and refuses otherwise — a cached
+    // entry must never be a differently-answering shortcut.
+    // Position check FIRST: it is free, and mirroring is not — a session that is
+    // about to be rejected must not pay for hundreds of MiB of KV readback.
+    if prepared.session.kv_position() != prepared.token_ids.len()
+        || !prepared.session.prepare_for_prompt_prefix_cache()
     {
         return;
     }
@@ -13293,7 +13586,7 @@ fn generate_token_ids(
             // by a fresh GPU prefill, and the lookup above is skipped while the resident
             // CUDA engine is active anyway. Keeping it out also avoids a CPU request
             // (after a GPU-off toggle) reusing a GPU-built (f16-seeded) session.
-            store_prompt_prefix_cache(&prepared, &step);
+            store_prompt_prefix_cache(&mut prepared, &step);
         }
         if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -13722,6 +14015,26 @@ fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
     !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
 }
 
+/// Tools the runnable serve lane should render and parse for this request,
+/// unwrapped from the OpenAI `{"type":"function","function":{...}}` envelope.
+/// `tool_choice: "none"` disables tool calling for the request (OpenAI
+/// semantics): the lane then renders and streams plain chat instead of
+/// rendering tools into the prompt and holding tool envelopes the caller
+/// opted out of. The lanes' post-hoc `<function=...>` lifting is gated
+/// separately on `tool_choice_allows_calls` (not on this list being empty,
+/// because the agent loop lifts envelopes with no tools in the request).
+fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value> {
+    if !tool_choice_allows_calls(req.tool_choice.as_ref()) {
+        return Vec::new();
+    }
+    req.tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.get("function").cloned().unwrap_or(t))
+        .collect()
+}
+
 /// Whether the model's raw content should be probed for a tool call.
 /// Constrained output is content by definition: OpenAI allows tools and
 /// response_format together, and a schema that legitimately declares a `name`
@@ -13733,37 +14046,96 @@ fn should_parse_tool_calls(tools_active: bool, constraint_active: bool) -> bool 
     tools_active && !constraint_active
 }
 
-/// Parse a model's tool-call output into OpenAI `tool_calls`. Handles the Llama
-/// 3.x form `{"name": <fn>, "parameters": {...}}` (also `"arguments"`), optionally
-/// `<|python_tag|>`-prefixed, and tolerates trailing junk small models emit.
-/// Returns `None` when the text is prose, not a tool call.
+/// Parse a model's tool-call output into OpenAI `tool_calls`.
+///
+/// Certified local templates emit one of three shapes:
+/// - Llama 3.x bare JSON, optionally `<|python_tag|>` prefixed;
+/// - Qwen/Hermes `<tool_call>{...}</tool_call>` blocks;
+/// - Mistral `[TOOL_CALLS] [...]`.
+///
+/// The parser tolerates trailing junk after a complete JSON value but remains
+/// strict about function names and JSON arguments, so ordinary prose is never
+/// reclassified as a call.
 fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let trimmed = text.trim();
     let trimmed = trimmed
         .strip_prefix("<|python_tag|>")
         .unwrap_or(trimmed)
         .trim_start();
-    // Read the first complete JSON value; ignore any trailing junk.
-    let value = serde_json::Deserializer::from_str(trimmed)
+
+    let mut values = Vec::new();
+    let mut remainder = trimmed;
+    while let Some(start) = remainder.find("<tool_call>") {
+        let after_start = &remainder[start + "<tool_call>".len()..];
+        let Some(end) = after_start.find("</tool_call>") else {
+            break;
+        };
+        if let Some(value) = first_json_value(&after_start[..end]) {
+            values.push(value);
+        }
+        remainder = &after_start[end + "</tool_call>".len()..];
+    }
+    if values.is_empty() {
+        let mistral = trimmed
+            .strip_prefix("[TOOL_CALLS]")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        values.push(first_json_value(mistral)?);
+    }
+
+    let values = values
+        .into_iter()
+        .flat_map(|value| match value {
+            serde_json::Value::Array(values) => values,
+            value => vec![value],
+        })
+        .collect::<Vec<_>>();
+    let calls = values
+        .iter()
+        .filter_map(tool_call_from_value)
+        .collect::<Vec<_>>();
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn first_json_value(text: &str) -> Option<serde_json::Value> {
+    serde_json::Deserializer::from_str(text.trim())
         .into_iter::<serde_json::Value>()
         .next()?
-        .ok()?;
+        .ok()
+}
+
+fn tool_call_from_value(value: &serde_json::Value) -> Option<ToolCall> {
     let obj = value.as_object()?;
-    let name = obj.get("name")?.as_str()?.to_string();
+    let function = obj.get("function").and_then(serde_json::Value::as_object);
+    let name = function
+        .and_then(|function| function.get("name"))
+        .or_else(|| obj.get("name"))?
+        .as_str()?
+        .trim();
     if name.is_empty() {
         return None;
     }
-    let args = obj
-        .get("parameters")
+    let args = function
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| obj.get("parameters"))
         .or_else(|| obj.get("arguments"))
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let args = match args {
+        serde_json::Value::String(encoded) => {
+            serde_json::from_str(&encoded).unwrap_or(serde_json::Value::String(encoded))
+        }
+        args => args,
+    };
     let arguments = serde_json::to_string(&args).ok()?;
-    Some(vec![ToolCall {
+    Some(ToolCall {
         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
         kind: "function",
-        function: ToolCallFunction { name, arguments },
-    }])
+        function: ToolCallFunction {
+            name: name.to_string(),
+            arguments,
+        },
+    })
 }
 
 fn top_logit_diagnostics(
@@ -14121,6 +14493,139 @@ fn stream_error_parts(response: &Response) -> (String, String) {
 /// between steps and stops within one step. The job is never detached from
 /// the engine's serialization — the next request's job starts only after this
 /// one returns.
+/// Mutable decode state the shared streaming prologue seeds.
+struct StreamPrologueState<'a> {
+    input: &'a mut Vec<u32>,
+    history: &'a mut Vec<u32>,
+    generated: &'a mut Vec<u32>,
+    top_logits: &'a mut Vec<RawLogitDiagnostic>,
+    output_projection: &'a mut Vec<LlamaOutputProjectionDiagnostic>,
+    dense: &'a mut Option<LlamaForwardDiagnostics>,
+    finish_reason: &'a mut &'static str,
+    sample: &'a mut u128,
+    streamed_text: &'a mut String,
+    first_content_ms: &'a mut Option<u128>,
+}
+
+/// Whether the caller should keep decoding after the prologue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPrologue {
+    Ready,
+    /// A terminal event was already sent, or the client hung up. Stop.
+    Stop,
+}
+
+/// Prompt-prefix cache seeding for a streaming generation, shared by the
+/// run-to-completion job and the cooperative one so the two paths cannot drift.
+/// Restores a cached session (exact hit or longest common prefix), emits the
+/// first delta an exact hit already sampled, and reports whether decoding
+/// should continue.
+///
+/// Bypass the prompt-prefix cache when the CUDA-resident engine drives
+/// decode: reusing a cached session reseeds the GPU KV from f16-rounded
+/// host history (a different reduction order than a clean GPU prefill),
+/// which corrupts the resumed decode — mild for greedy (a few near-tie
+/// flips) but catastrophic under temperature sampling, where it produces
+/// garbled, off-topic output. The non-streaming path already gates the
+/// cache this way (see resident_decode_cuda_active); the streaming path
+/// must too. The CPU lane is reduction-order-stable and keeps the cache.
+fn stream_prompt_cache_prologue(
+    prepared: &mut PreparedGeneration,
+    state: StreamPrologueState<'_>,
+    generation_started: Instant,
+    send: &dyn Fn(StreamDecodeEvent) -> bool,
+) -> StreamPrologue {
+    let StreamPrologueState {
+        input,
+        history,
+        generated,
+        top_logits,
+        output_projection,
+        dense,
+        finish_reason,
+        sample,
+        streamed_text,
+        first_content_ms,
+    } = state;
+    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
+        if let Some(match_res) = lookup_prompt_prefix_cache(prepared) {
+            let mut cached_session = match_res.cached.session.clone();
+            cached_session
+                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
+            if match_res.is_exact_match {
+                prepared.session = cached_session;
+                input.clear();
+                match sample_cached_prompt_prefix(&match_res.cached, history) {
+                    Ok(first_step) => {
+                        let cached_next_token = first_step.next_token_id;
+                        prepared.timings.prompt_cache_hit = true;
+                        *sample += first_step.sample;
+                        if let Err(response) = consume_generation_step(
+                            prepared,
+                            first_step,
+                            GenerationStepAccumulator {
+                                generated,
+                                history,
+                                top_logits,
+                                output_projection,
+                                dense,
+                                finish_reason,
+                            },
+                        ) {
+                            let (code, message) = stream_error_parts(&response);
+                            send(StreamDecodeEvent::Failed { code, message });
+                            return StreamPrologue::Stop;
+                        }
+                        if *finish_reason == "length" {
+                            input.push(cached_next_token);
+                        }
+                    }
+                    Err(response) => {
+                        let (code, message) = stream_error_parts(&response);
+                        send(StreamDecodeEvent::Failed { code, message });
+                        return StreamPrologue::Stop;
+                    }
+                }
+            } else {
+                let k = match_res.prefix_len;
+                if cached_session.rollback_to_position(k).is_ok() {
+                    prepared.session = cached_session;
+                    *input = prepared.token_ids[k..].to_vec();
+                    prepared.timings.prompt_cache_hit = true;
+                }
+            }
+        }
+    }
+
+    // An exact prompt-cache hit samples the first token above, before the main
+    // loop. Emit it now; otherwise a one-token cached stream reaches Finished
+    // with correct usage but no content delta. Longer cached streams also must
+    // establish `streamed_text` before subsequent deltas are diffed.
+    if !generated.is_empty() {
+        let mut text = match prepared.tokenizer.decode(generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                return StreamPrologue::Stop;
+            }
+        };
+        if *finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
+        }
+        if !text.is_empty() {
+            *streamed_text = text.clone();
+            *first_content_ms = Some(generation_started.elapsed().as_millis());
+            if !send(StreamDecodeEvent::Delta(text)) {
+                return StreamPrologue::Stop;
+            }
+        }
+    }
+    StreamPrologue::Ready
+}
+
 fn run_stream_decode_job(
     mut prepared: PreparedGeneration,
     events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
@@ -14166,62 +14671,25 @@ fn run_stream_decode_job(
     let mut forward_timings = LlamaForwardTimings::default();
     let mut sample = 0;
 
-    // Bypass the prompt-prefix cache when the CUDA-resident engine drives
-    // decode: reusing a cached session reseeds the GPU KV from f16-rounded
-    // host history (a different reduction order than a clean GPU prefill),
-    // which corrupts the resumed decode â€” mild for greedy (a few near-tie
-    // flips) but catastrophic under temperature sampling, where it produces
-    // garbled, off-topic output. The non-streaming path already gates the
-    // cache this way (see resident_decode_cuda_active); the streaming path
-    // must too. The CPU lane is reduction-order-stable and keeps the cache.
-    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
-        if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
-            let mut cached_session = match_res.cached.session.clone();
-            cached_session
-                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
-            if match_res.is_exact_match {
-                prepared.session = cached_session;
-                input.clear();
-                match sample_cached_prompt_prefix(&match_res.cached, &history) {
-                    Ok(first_step) => {
-                        let cached_next_token = first_step.next_token_id;
-                        prepared.timings.prompt_cache_hit = true;
-                        sample += first_step.sample;
-                        if let Err(response) = consume_generation_step(
-                            &prepared,
-                            first_step,
-                            GenerationStepAccumulator {
-                                generated: &mut generated,
-                                history: &mut history,
-                                top_logits: &mut top_logits,
-                                output_projection: &mut output_projection,
-                                dense: &mut dense,
-                                finish_reason: &mut finish_reason,
-                            },
-                        ) {
-                            let (code, message) = stream_error_parts(&response);
-                            send(StreamDecodeEvent::Failed { code, message });
-                            return;
-                        }
-                        if finish_reason == "length" {
-                            input.push(cached_next_token);
-                        }
-                    }
-                    Err(response) => {
-                        let (code, message) = stream_error_parts(&response);
-                        send(StreamDecodeEvent::Failed { code, message });
-                        return;
-                    }
-                }
-            } else {
-                let k = match_res.prefix_len;
-                if cached_session.rollback_to_position(k).is_ok() {
-                    prepared.session = cached_session;
-                    input = prepared.token_ids[k..].to_vec();
-                    prepared.timings.prompt_cache_hit = true;
-                }
-            }
-        }
+    match stream_prompt_cache_prologue(
+        &mut prepared,
+        StreamPrologueState {
+            input: &mut input,
+            history: &mut history,
+            generated: &mut generated,
+            top_logits: &mut top_logits,
+            output_projection: &mut output_projection,
+            dense: &mut dense,
+            finish_reason: &mut finish_reason,
+            sample: &mut sample,
+            streamed_text: &mut streamed_text,
+            first_content_ms: &mut first_content_ms,
+        },
+        generation_started,
+        &send,
+    ) {
+        StreamPrologue::Ready => {}
+        StreamPrologue::Stop => return,
     }
 
     for _ in generated.len() as u32..prepared.max_tokens {
@@ -14282,7 +14750,7 @@ fn run_stream_decode_job(
         };
         if generated.is_empty() && !prepared.collect_dense_diagnostics && step.diagnostics.is_none()
         {
-            store_prompt_prefix_cache(&prepared, &step);
+            store_prompt_prefix_cache(&mut prepared, &step);
         }
         if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -14385,11 +14853,346 @@ fn run_stream_decode_job(
     });
 }
 
+/// Cooperative streaming state machine for continuous batching. Unlike
+/// `run_stream_decode_job`, one call to `step` performs at most one model token and then
+/// yields ownership back to the engine scheduler.
+struct CooperativeStreamDecodeJob {
+    prepared: PreparedGeneration,
+    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+    telemetry_guard: Option<telemetry::RequestGuard>,
+    generation_started: Instant,
+    request_timeout: Duration,
+    collect_q8_schedule: bool,
+    input: Vec<u32>,
+    history: Vec<u32>,
+    generated: Vec<u32>,
+    top_logits: Vec<RawLogitDiagnostic>,
+    output_projection: Vec<LlamaOutputProjectionDiagnostic>,
+    dense: Option<LlamaForwardDiagnostics>,
+    finish_reason: &'static str,
+    streamed_text: String,
+    first_content_ms: Option<u128>,
+    forward_timings: LlamaForwardTimings,
+    sample: u128,
+    finished: bool,
+    #[cfg(test)]
+    initial_step_delay: Option<Duration>,
+}
+
+impl CooperativeStreamDecodeJob {
+    fn new(
+        mut prepared: PreparedGeneration,
+        events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+    ) -> Option<Self> {
+        let request_timeout = match generation_timeout_duration() {
+            Ok(timeout) => timeout,
+            Err(response) => {
+                let (code, message) = stream_error_parts(&response);
+                let _ = events.blocking_send(StreamDecodeEvent::Failed { code, message });
+                return None;
+            }
+        };
+        let collect_q8_schedule =
+            stream_timing_diagnostics_enabled() && q8_schedule_telemetry_enabled();
+        if collect_q8_schedule {
+            reset_q8_schedule_telemetry();
+        }
+        let telemetry_guard = prepared
+            .telemetry
+            .take()
+            .map(telemetry::RequestGuard::begin);
+        let generation_started = Instant::now();
+        let mut input = prepared.token_ids.clone();
+        let mut history = prepared.token_ids.clone();
+        let mut generated = Vec::new();
+        let mut top_logits = Vec::new();
+        let mut output_projection = Vec::new();
+        let mut dense = None;
+        let mut finish_reason = "length";
+        let mut streamed_text = String::new();
+        let mut first_content_ms = None;
+        let mut sample = 0;
+        // Same prompt-prefix cache seeding the run-to-completion job does:
+        // without it every turn of a growing chat re-prefills the whole
+        // conversation, which on the now-default cooperative path would be a
+        // large silent regression.
+        let send_event = |event: StreamDecodeEvent| events.blocking_send(event).is_ok();
+        if stream_prompt_cache_prologue(
+            &mut prepared,
+            StreamPrologueState {
+                input: &mut input,
+                history: &mut history,
+                generated: &mut generated,
+                top_logits: &mut top_logits,
+                output_projection: &mut output_projection,
+                dense: &mut dense,
+                finish_reason: &mut finish_reason,
+                sample: &mut sample,
+                streamed_text: &mut streamed_text,
+                first_content_ms: &mut first_content_ms,
+            },
+            generation_started,
+            &send_event,
+        ) == StreamPrologue::Stop
+        {
+            return None;
+        }
+        Some(Self {
+            prepared,
+            events,
+            telemetry_guard,
+            generation_started,
+            request_timeout,
+            collect_q8_schedule,
+            input,
+            history,
+            generated,
+            top_logits,
+            output_projection,
+            dense,
+            finish_reason,
+            streamed_text,
+            first_content_ms,
+            forward_timings: LlamaForwardTimings::default(),
+            sample,
+            finished: false,
+            #[cfg(test)]
+            initial_step_delay: generation_step_test_sleep_duration(),
+        })
+    }
+
+    fn send(&self, event: StreamDecodeEvent) -> bool {
+        self.events.blocking_send(event).is_ok()
+    }
+
+    fn fail(&mut self, response: &Response) -> engine::StepOutcome {
+        let (code, message) = stream_error_parts(response);
+        self.send(StreamDecodeEvent::Failed { code, message });
+        self.finished = true;
+        engine::StepOutcome::Complete
+    }
+
+    fn finish_clean(&mut self) -> engine::StepOutcome {
+        if self.finished {
+            return engine::StepOutcome::Complete;
+        }
+        self.prepared.timings.generate = self.generation_started.elapsed().as_millis();
+        self.prepared.timings.generation =
+            generation_phase_timings_from_forward(&self.forward_timings, self.sample);
+        self.prepared.timings.layers =
+            generation_layer_timings_from_forward(&self.forward_timings.layers);
+        self.prepared.timings.memory = self.forward_timings.memory.clone();
+        if self.collect_q8_schedule {
+            self.prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+        }
+        self.prepared.metrics.record_generation(
+            self.prepared.token_ids.len(),
+            self.generated.len(),
+            &self.prepared.timings,
+        );
+        if let Some(guard) = self.telemetry_guard.take() {
+            let ttft_ms = self.first_content_ms.map(|ms| ms as u64);
+            let decode_tps = match (self.first_content_ms, self.generated.len()) {
+                (Some(first_ms), count) if count > 1 => {
+                    let decode_ms = self
+                        .generation_started
+                        .elapsed()
+                        .as_millis()
+                        .saturating_sub(first_ms);
+                    (decode_ms > 0).then(|| (count - 1) as f64 * 1000.0 / decode_ms as f64)
+                }
+                _ => None,
+            };
+            guard.finish(telemetry::RequestFinish {
+                status: "ok",
+                finish_reason: Some(self.finish_reason.to_string()),
+                completion_tokens: self.generated.len(),
+                ttft_ms,
+                decode_tps,
+                prefill_tps: None,
+                error: None,
+            });
+        }
+        crate::gait::sentinel::mark_healthy();
+        let timings = std::mem::take(&mut self.prepared.timings);
+        self.send(StreamDecodeEvent::Finished {
+            finish_reason: self.finish_reason,
+            completion_tokens: self.generated.len(),
+            timings: Box::new(timings),
+            first_content_ms: self.first_content_ms,
+        });
+        self.finished = true;
+        engine::StepOutcome::Complete
+    }
+
+    fn step(&mut self, context: engine::CooperativeStepContext) -> engine::StepOutcome {
+        #[cfg(test)]
+        let _decode_probe = decode_probe::enter();
+        // Preserve the exclusive stream job's test contract: its synthetic initial
+        // delay is observed as live decode work, not as untracked job construction.
+        #[cfg(test)]
+        if let Some(duration) = self.initial_step_delay.take() {
+            std::thread::sleep(duration);
+        }
+        if self.finished {
+            return engine::StepOutcome::Complete;
+        }
+        // Preserve the fast single-request pipeline when this is the only active stream.
+        // With contention, consume any already-prepared current graph but do not enqueue
+        // another session-local future graph ahead of the next round-robin participant.
+        self.prepared
+            .session
+            .set_resident_encode_ahead_enabled(context.active_slots <= 1);
+        if let Some(guard) = &self.telemetry_guard {
+            guard.activate();
+        }
+        if self.prepared.cancel.token.is_cancelled() || self.events.is_closed() {
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+        if self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize
+        {
+            return self.finish_clean();
+        }
+        if self
+            .request_timeout
+            .checked_sub(self.generation_started.elapsed())
+            .is_none()
+        {
+            self.send(StreamDecodeEvent::TimedOut {
+                timeout: self.request_timeout,
+                elapsed: self.generation_started.elapsed(),
+                generated_tokens: self.generated.len(),
+            });
+            self.finished = true;
+            return engine::StepOutcome::Complete;
+        }
+
+        let generated_index = self.generated.len();
+        let collect_dense_for_step =
+            collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index);
+        let mut sampling = self.prepared.sampling.clone();
+        if let Some(seed) = sampling.seed {
+            sampling.seed = Some(seed.wrapping_add(self.generated.len() as u64));
+        }
+        let sampler = if sampling == SamplingConfig::default() {
+            LlamaSampler::Greedy
+        } else {
+            LlamaSampler::Sampling(sampling)
+        };
+        let greedy_fast = self.input.len() == 1
+            && matches!(sampler, LlamaSampler::Greedy)
+            && !collect_dense_for_step
+            && !self.top_logits.is_empty();
+        let step = match run_stream_step(
+            &mut self.prepared.session,
+            StreamStepRequest {
+                greedy_fast,
+                input: self.input.clone(),
+                sampler,
+                history: self.history.clone(),
+                collect_dense_diagnostics: collect_dense_for_step,
+            },
+        ) {
+            Ok(step) => step,
+            Err(response) => return self.fail(&response),
+        };
+        if self.generated.is_empty()
+            && !self.prepared.collect_dense_diagnostics
+            && step.diagnostics.is_none()
+        {
+            store_prompt_prefix_cache(&mut self.prepared, &step);
+        }
+        if self.generated.is_empty() {
+            self.prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+        }
+        self.forward_timings.add_assign(&step.timings);
+        self.sample += step.sample;
+        if let Err(response) = consume_generation_step(
+            &self.prepared,
+            step,
+            GenerationStepAccumulator {
+                generated: &mut self.generated,
+                history: &mut self.history,
+                top_logits: &mut self.top_logits,
+                output_projection: &mut self.output_projection,
+                dense: &mut self.dense,
+                finish_reason: &mut self.finish_reason,
+            },
+        ) {
+            return self.fail(&response);
+        }
+        self.prepared
+            .engine_progress
+            .record_progress(self.generated.len());
+
+        let mut text = match self.prepared.tokenizer.decode(&self.generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                self.send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                self.finished = true;
+                return engine::StepOutcome::Complete;
+            }
+        };
+        if self.finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &self.prepared.stop_sequences);
+        }
+        let delta = text
+            .strip_prefix(&self.streamed_text)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text.clone());
+        self.streamed_text = text;
+        if !delta.is_empty() {
+            if self.first_content_ms.is_none() {
+                self.first_content_ms = Some(self.generation_started.elapsed().as_millis());
+            }
+            if !self.send(StreamDecodeEvent::Delta(delta)) {
+                self.finished = true;
+                return engine::StepOutcome::Complete;
+            }
+        }
+        self.input.clear();
+        if let Some(last_token) = self.generated.last().copied() {
+            self.input.push(last_token);
+        }
+        if self.finish_reason != "length"
+            || self.generated.len() >= self.prepared.max_tokens as usize
+        {
+            self.finish_clean()
+        } else {
+            engine::StepOutcome::Continue
+        }
+    }
+}
+
+fn cooperative_stream_decode_task(
+    prepared: PreparedGeneration,
+    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+) -> impl FnMut(engine::CooperativeStepContext) -> engine::StepOutcome + Send + 'static {
+    let mut pending = Some((prepared, events));
+    let mut job: Option<CooperativeStreamDecodeJob> = None;
+    move |context| {
+        if job.is_none() {
+            let (prepared, events) = pending.take().expect("cooperative job initializes once");
+            let Some(initialized) = CooperativeStreamDecodeJob::new(prepared, events) else {
+                return engine::StepOutcome::Complete;
+            };
+            job = Some(initialized);
+        }
+        job.as_mut().expect("initialized").step(context)
+    }
+}
+
 fn stream_completion(
     state: &AppState,
     mut prepared: PreparedGeneration,
     chat: bool,
     include_usage: bool,
+    parse_stream_tool_calls: bool,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -14414,12 +15217,22 @@ fn stream_completion(
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
     // Post the decode job before returning the SSE response. A full queue is
     // the same typed backpressure non-streaming requests get.
-    if let Err(err) = state
-        .engine
-        .post(engine::EngineTask::Exclusive(Box::new(move || {
-            run_stream_decode_job(prepared, events_tx);
-        })))
+    // Cooperative round-robin requires each session to own its GPU decode
+    // state. Metal's `ResidentDecodeState` is per-session, but the CUDA
+    // resident engine (and its on-GPU KV cache) is a PROCESS-GLOBAL slot keyed
+    // by model id — two sessions of the same model would share one KV cache and
+    // interleave each other's history. Keep those runs run-to-completion.
+    let task = if state.engine.continuous_batch_slots() > 1
+        && !crate::inference::resident_decode_cuda_active()
     {
+        let job = cooperative_stream_decode_task(prepared, events_tx);
+        engine::EngineTask::Cooperative(Box::new(job))
+    } else {
+        engine::EngineTask::Exclusive(Box::new(move || {
+            run_stream_decode_job(prepared, events_tx);
+        }))
+    };
+    if let Err(err) = state.engine.post(task) {
         return *engine_post_error_response(err);
     }
     let events = async_stream::stream! {
@@ -14433,6 +15246,11 @@ fn stream_completion(
             poll_yield_enabled: stream_poll_yield,
             ..StreamEventTimings::default()
         };
+        // A certified tool-call envelope must never leak through `delta.content`
+        // before it is recognized. Tool-enabled streams therefore hold content
+        // until completion, then emit either one normal content delta or
+        // structured OpenAI `tool_calls` deltas.
+        let mut tool_candidate = String::new();
         if chat {
             stream_event_timings.role_yield = Some(stream_started.elapsed().as_millis());
             let role_chunk = ChatCompletionStreamChunk {
@@ -14445,6 +15263,7 @@ fn stream_completion(
                     delta: ChatCompletionDelta {
                         role: Some("assistant"),
                         content: None,
+                        tool_calls: None,
                     },
                     finish_reason: None,
                 }],
@@ -14466,6 +15285,10 @@ fn stream_completion(
                             Some(stream_started.elapsed().as_millis());
                     }
                     if chat {
+                        if parse_stream_tool_calls {
+                            tool_candidate.push_str(&delta);
+                            continue;
+                        }
                         let chunk = ChatCompletionStreamChunk {
                             id: stream_id.clone(),
                             object: "chat.completion.chunk",
@@ -14476,6 +15299,7 @@ fn stream_completion(
                                 delta: ChatCompletionDelta {
                                     role: None,
                                     content: Some(delta),
+                                    tool_calls: None,
                                 },
                                 finish_reason: None,
                             }],
@@ -14523,6 +15347,54 @@ fn stream_completion(
                         stream_timing_diagnostics_json(&timings, first_content_ms, stream_event_timings)
                     });
                     if chat {
+                        let mut resolved_finish_reason = finish_reason;
+                        if parse_stream_tool_calls {
+                            if let Some(tool_calls) = parse_tool_calls(&tool_candidate) {
+                                resolved_finish_reason = "tool_calls";
+                                let tool_calls = tool_calls
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(ChatCompletionToolCallDelta::from)
+                                    .collect();
+                                let chunk = ChatCompletionStreamChunk {
+                                    id: stream_id.clone(),
+                                    object: "chat.completion.chunk",
+                                    created: 0,
+                                    model: model_id.clone(),
+                                    choices: vec![ChatCompletionStreamChoice {
+                                        index: 0,
+                                        delta: ChatCompletionDelta {
+                                            role: None,
+                                            content: None,
+                                            tool_calls: Some(tool_calls),
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                    camelid: None,
+                                    usage: None,
+                                };
+                                yield sse_json_event(&chunk);
+                            } else if !tool_candidate.is_empty() {
+                                let chunk = ChatCompletionStreamChunk {
+                                    id: stream_id.clone(),
+                                    object: "chat.completion.chunk",
+                                    created: 0,
+                                    model: model_id.clone(),
+                                    choices: vec![ChatCompletionStreamChoice {
+                                        index: 0,
+                                        delta: ChatCompletionDelta {
+                                            role: None,
+                                            content: Some(mem::take(&mut tool_candidate)),
+                                            tool_calls: None,
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                    camelid: None,
+                                    usage: None,
+                                };
+                                yield sse_json_event(&chunk);
+                            }
+                        }
                         let final_chunk = ChatCompletionStreamChunk {
                             id: stream_id.clone(),
                             object: "chat.completion.chunk",
@@ -14533,8 +15405,9 @@ fn stream_completion(
                                 delta: ChatCompletionDelta {
                                     role: None,
                                     content: None,
+                                    tool_calls: None,
                                 },
-                                finish_reason: Some(finish_reason),
+                                finish_reason: Some(resolved_finish_reason),
                             }],
                             camelid: camelid_diagnostics.clone(),
                             usage: None,
@@ -14802,6 +15675,12 @@ fn render_chat_prompt_for_tokenization_with_tools(
                 parse_special: true,
             });
         }
+        if !template.contains("tools") && !template.contains("custom_tools") {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the loaded chat template has no certified tools branch; failing closed",
+            ));
+        }
         return render_metadata_jinja_chat_template_prompt(
             messages,
             tokenizer,
@@ -14809,9 +15688,9 @@ fn render_chat_prompt_for_tokenization_with_tools(
             Some(&normalized),
         );
     }
-    // Agent/tools rendering is the deterministic thinking-disabled path.
-    Ok(render_chat_prompt_for_tokenization_fallback(
-        messages, tokenizer, false,
+    Err(MiniJinjaError::new(
+        MiniJinjaErrorKind::InvalidOperation,
+        "the loaded tokenizer has no chat template for tool rendering; failing closed",
     ))
 }
 
@@ -15650,6 +16529,7 @@ fn api_error(
         });
     }
     let error_type = match status {
+        StatusCode::INTERNAL_SERVER_ERROR => "server_error",
         StatusCode::NOT_IMPLEMENTED => "not_implemented",
         StatusCode::SERVICE_UNAVAILABLE => "runtime_unavailable",
         StatusCode::UNPROCESSABLE_ENTITY => "model_unavailable",
@@ -15774,6 +16654,54 @@ mod tests {
             "gemma4-runtime",
             "the eagerly loaded Gemma4 runtime has highest precedence"
         );
+    }
+
+    /// The liveness endpoints must answer while a model transition holds the
+    /// registry locks. The desktop supervisor kills the sidecar when its
+    /// health poll goes unanswered for 40s, and the registry RwLocks are
+    /// fair — a queued load writer parks every later reader — so an unbounded
+    /// `read().await` in these handlers inherits the whole transition's
+    /// latency. Regression for the desktop killing a healthy engine mid-load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_and_capabilities_answer_while_registry_writers_hold_the_locks() {
+        use tower::ServiceExt;
+
+        let state = AppState::default();
+        let app = router_with_state(state.clone());
+
+        // Wedge every registry lock the liveness endpoints read, the way a
+        // stuck load/unload would.
+        let _loaded = state.loaded_models.write().await;
+        let _active = state.active_model_id.write().await;
+        let _plans = state.execution_plans.write().await;
+
+        for uri in ["/health", "/v1/health", "/api/capabilities"] {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{uri} must answer while the registries are held"))
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["engine"], "camelid", "{uri}");
+            if uri != "/api/capabilities" {
+                assert_eq!(body["ok"], true, "{uri} must stay ok while busy");
+                assert_eq!(
+                    body["backend"], "none",
+                    "{uri} busy snapshot reports the in-flux registries as not ready"
+                );
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -15992,7 +16920,13 @@ mod tests {
         std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
 
         let state = AppState::default();
-        let response = stream_completion(&state, orphan_test_prepared("model-a.gguf"), true, false);
+        let response = stream_completion(
+            &state,
+            orphan_test_prepared("model-a.gguf"),
+            true,
+            false,
+            false,
+        );
 
         // Drive the SSE body the way a client does. The reader task polls the
         // stream into its first token step; aborting it is the hangup — the
@@ -16193,6 +17127,7 @@ mod tests {
                 delta: ChatCompletionDelta {
                     role: Some("assistant"),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -16497,6 +17432,79 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_calls_handles_qwen_blocks_and_mistral_arrays() {
+        let qwen = parse_tool_calls(
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>
+<tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>"#,
+        )
+        .unwrap();
+        assert_eq!(qwen.len(), 2);
+        assert_eq!(qwen[0].function.name, "read_file");
+        assert_eq!(qwen[0].function.arguments, r#"{"path":"a.txt"}"#);
+        assert_eq!(qwen[1].function.name, "list_dir");
+
+        let mistral = parse_tool_calls(
+            r#"[TOOL_CALLS] [{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}]"#,
+        )
+        .unwrap();
+        assert_eq!(mistral.len(), 1);
+        assert_eq!(mistral[0].function.name, "read_file");
+        assert_eq!(mistral[0].function.arguments, r#"{"path":"b.txt"}"#);
+    }
+
+    #[test]
+    fn chat_message_accepts_tool_call_roundtrip_wire_shape() {
+        let assistant: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "arguments": "{\"city\":\"Paris\"}"
+                }
+            }]
+        }))
+        .unwrap();
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(
+            assistant.content,
+            r#"{"name":"weather","parameters":{"city":"Paris"}}"#
+        );
+
+        let tool: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "{\"temp\":25}"
+        }))
+        .unwrap();
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.content, r#"{"temp":25}"#);
+    }
+
+    #[test]
+    fn chat_tool_call_delta_uses_openai_stream_shape() {
+        let call = parse_tool_calls(r#"{"name":"weather","parameters":{"city":"Paris"}}"#)
+            .unwrap()
+            .remove(0);
+        let delta = ChatCompletionDelta {
+            role: None,
+            content: None,
+            tool_calls: Some(vec![ChatCompletionToolCallDelta::from((0, call))]),
+        };
+        let value = serde_json::to_value(delta).unwrap();
+        assert_eq!(value["tool_calls"][0]["index"], 0);
+        assert_eq!(value["tool_calls"][0]["type"], "function");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "weather");
+        assert_eq!(
+            value["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+        assert!(value.get("content").is_none());
+    }
+
+    #[test]
     fn tool_choice_none_suppresses_calls() {
         assert!(!tool_choice_allows_calls(Some(&serde_json::json!("none"))));
         assert!(tool_choice_allows_calls(Some(&serde_json::json!("auto"))));
@@ -16504,6 +17512,31 @@ mod tests {
             "required"
         ))));
         assert!(tool_choice_allows_calls(None));
+    }
+
+    #[test]
+    fn runnable_request_tools_respects_tool_choice_none() {
+        let with_choice = |tool_choice: Option<&str>| {
+            let mut request = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}}
+                }]
+            });
+            if let Some(choice) = tool_choice {
+                request["tool_choice"] = serde_json::json!(choice);
+            }
+            serde_json::from_value::<ChatCompletionRequest>(request).unwrap()
+        };
+        assert!(
+            runnable_request_tools(&with_choice(Some("none"))).is_empty(),
+            "tool_choice none must disable rendering and envelope holding"
+        );
+        let tools = runnable_request_tools(&with_choice(None));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "weather");
     }
 
     #[test]
@@ -16789,8 +17822,8 @@ mod tests {
             "CPU prefill promotion remains evidence-gated"
         );
         assert!(
-            !projects[&7].default_enabled,
-            "continuous batching remains default-neutral until integrated"
+            projects[&7].default_enabled,
+            "bounded two-slot streaming fairness is part of appliance mode"
         );
         assert!(
             !projects[&3].default_enabled,
@@ -18158,6 +19191,66 @@ mod tests {
         std::env::remove_var("CAMELID_X86_Q4K_DECODE");
     }
 
+    /// Both streaming jobs must seed from the prompt-prefix cache. The
+    /// cooperative one is the DEFAULT path now that
+    /// `DEFAULT_CONTINUOUS_BATCH_SLOTS` is 2, and it originally seeded straight
+    /// from `prepared.token_ids` while still storing into the cache — so every
+    /// turn of a growing chat re-prefilled the whole conversation. Measured on
+    /// an Apple M4 with a 1974-token prompt on the CPU lane: repeat turns went
+    /// 12.68s -> 12.76s -> 13.06s without the lookup and 12.98s -> 0.49s ->
+    /// 0.47s with it.
+    // Plain `#[test]`, not `#[tokio::test]`: the prologue emits its first delta
+    // with `blocking_send`, exactly as it does on the engine thread, and that
+    // panics if it runs on a thread driving a tokio runtime.
+    #[test]
+    fn cooperative_stream_job_seeds_from_the_prompt_prefix_cache() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let cached_next_token = step.next_token_id;
+        let mut warm = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut warm, &step);
+
+        // A second request for the identical prompt, sharing the same pool.
+        let cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let mut repeat = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], cold);
+        repeat.cached_prompt_prefix = Arc::clone(&warm.cached_prompt_prefix);
+
+        // The shared `test_tokenizer` has an empty vocabulary, so it cannot
+        // render the cached token. Give this request one that covers the tiny
+        // model's 3-token vocabulary.
+        repeat.tokenizer = Arc::new(tiny_vocab_tokenizer());
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+        let job = CooperativeStreamDecodeJob::new(repeat, events_tx).expect("job initializes");
+        assert!(
+            job.prepared.timings.prompt_cache_hit,
+            "the cooperative streaming job must consume the prompt-prefix cache, \
+             not re-prefill the prompt it already has"
+        );
+        assert_eq!(
+            job.generated,
+            vec![cached_next_token],
+            "an exact hit carries the already-sampled first token into the job"
+        );
+        assert_eq!(
+            job.input,
+            vec![cached_next_token],
+            "decode resumes from the cached token, not from the whole prompt"
+        );
+    }
+
     #[test]
     fn prompt_prefix_cache_reuses_exact_prompt_and_invalidates_key_changes() {
         let _env_guard = crate::test_support::env_lock();
@@ -18176,10 +19269,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
 
         assert!(lookup_prompt_prefix_cache(&prepared).is_none());
-        store_prompt_prefix_cache(&prepared, &step);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let match_res = lookup_prompt_prefix_cache(&prepared).expect("exact key cache hit");
         assert_eq!(match_res.cached.session.kv_cache.position, 2);
@@ -18206,7 +19299,7 @@ mod tests {
             .unwrap();
         let mut longer = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 0], longer_session);
         longer.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
-        store_prompt_prefix_cache(&longer, &longer_step);
+        store_prompt_prefix_cache(&mut longer, &longer_step);
         let exact = lookup_prompt_prefix_cache(&prepared).expect("exact entry still wins");
         assert!(exact.is_exact_match);
         assert_eq!(exact.cached.token_ids, vec![1, 2]);
@@ -18259,8 +19352,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let mut extended = prepared_for_cache(
             "tiny",
@@ -18351,8 +19444,8 @@ mod tests {
         let mut prep3 = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session3);
         prep3.cached_prompt_prefix = pool_ref.clone();
 
-        store_prompt_prefix_cache(&prep1, &step1);
-        store_prompt_prefix_cache(&prep2, &step2);
+        store_prompt_prefix_cache(&mut prep1, &step1);
+        store_prompt_prefix_cache(&mut prep2, &step2);
         assert!(lookup_prompt_prefix_cache(&prep1).is_some());
         {
             let mut pool = pool_ref.lock().unwrap();
@@ -18366,7 +19459,7 @@ mod tests {
             }
         }
 
-        store_prompt_prefix_cache(&prep3, &step3);
+        store_prompt_prefix_cache(&mut prep3, &step3);
         let remaining = pool_ref
             .lock()
             .unwrap()
@@ -18417,8 +19510,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
         assert!(prepared
             .cached_prompt_prefix
             .lock()
@@ -18446,8 +19539,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&unconstrained, &step);
+        let mut unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut unconstrained, &step);
         assert!(
             lookup_prompt_prefix_cache(&unconstrained).is_some(),
             "control: the unconstrained twin hits the warm cache"
@@ -18490,7 +19583,7 @@ mod tests {
             .unwrap();
         let mut constrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
         constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
-        store_prompt_prefix_cache(&constrained, &step);
+        store_prompt_prefix_cache(&mut constrained, &step);
 
         let mut unconstrained = prepared_for_cache(
             "tiny",
@@ -18519,8 +19612,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let generated = generate_token_ids(prepared).expect("cached generation should succeed");
 
@@ -20045,6 +21138,26 @@ mod tests {
         }
     }
 
+    /// `test_tokenizer` with a vocabulary: three ordinary tokens covering
+    /// `tiny_config`'s `vocab_size`, so a sampled id can actually be decoded.
+    fn tiny_vocab_tokenizer() -> Tokenizer {
+        let mut tokenizer = test_tokenizer();
+        tokenizer.tokens = (0..3)
+            .map(|id| Token {
+                id,
+                text: format!("t{id}"),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            })
+            .collect();
+        tokenizer.token_to_id = tokenizer
+            .tokens
+            .iter()
+            .map(|t| (t.text.clone(), t.id))
+            .collect();
+        tokenizer
+    }
+
     fn test_tokenizer() -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::LlamaSpm,
@@ -21453,6 +22566,181 @@ mod default_model_api_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_default_model");
+    }
+}
+
+/// Every raw completions-style surface must fail closed for runnable-lane-only
+/// archs (qwen35/gemma2/gemma3): the optimized dense engine is mis-bound for
+/// them, so falling through returns fluent-looking garbage instead of an
+/// error. One regression test per surface, over the real router.
+#[cfg(test)]
+mod runnable_completions_gate_api_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::gguf::GgufMetadataValue;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    /// A loaded model whose GGUF reports the given architecture — just enough
+    /// model to resolve through `get_or_load_model`. The gate must fire before
+    /// any tensor or tokenizer access, so the synthetic GGUF stays empty.
+    async fn state_with_loaded_arch(arch: &str) -> AppState {
+        let state = AppState::default();
+        let model = LoadedModel {
+            id: "gate-test".to_string(),
+            path: PathBuf::from("/private/models/Gate-Test.gguf"),
+            gguf: GgufFile {
+                path: PathBuf::from("/private/models/Gate-Test.gguf"),
+                version: 3,
+                tensor_count: 0,
+                metadata_count: 1,
+                alignment: 32,
+                data_start_offset: 0,
+                metadata: BTreeMap::from([(
+                    "general.architecture".to_string(),
+                    GgufMetadataValue::String(arch.to_string()),
+                )]),
+                tensors: Vec::new(),
+            },
+            llama_config: None,
+            llama_tensors: None,
+            unsupported_runtime: None,
+            tokenizer: TokenizerLoadState::Unavailable {
+                code: "tokenizer_unavailable",
+                message: "synthetic gate-test model carries no tokenizer".to_string(),
+            },
+            tokenizer_runtime: None,
+            lane: LaneIdentity {
+                model_id: "gate-test".to_string(),
+                gguf_sha256: "ab".repeat(32),
+                gguf_filename: "Gate-Test.gguf".to_string(),
+                quantization: "unknown".to_string(),
+                architecture: arch.to_string(),
+                tokenizer_kind: "unknown".to_string(),
+                tokenizer_sha256: None,
+                camelid_version: receipt::camelid_version(),
+                camelid_commit: receipt::camelid_commit(),
+            },
+        };
+        state
+            .loaded_models
+            .write()
+            .await
+            .insert("gate-test".to_string(), model);
+        *state.active_model_id.write().await = Some("gate-test".to_string());
+        state
+    }
+
+    async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    fn assert_gate_rejection(status: StatusCode, body: &Value) {
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "unsupported_completions_lane");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("/v1/chat/completions"),
+            "rejection must point callers at the served chat surface: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_server_completion_fails_closed_for_runnable_arch() {
+        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let (status, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
+        assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn generation_preflight_fails_closed_for_runnable_arch() {
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
+        let (status, body) =
+            post_json(app, "/api/generation/preflight", json!({ "prompt": "hi" })).await;
+        assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn generation_session_create_fails_closed_for_runnable_arch() {
+        let state = state_with_loaded_arch("gemma2").await;
+        let app = router_with_state(state.clone());
+        let (status, body) =
+            post_json(app, "/api/generation/sessions", json!({ "prompt": "hi" })).await;
+        assert_gate_rejection(status, &body);
+        assert!(
+            state.generation_sessions.read().await.is_empty(),
+            "a rejected request must not leave a validated session behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn completions_multi_choice_fails_closed_for_runnable_arch() {
+        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let (status, body) =
+            post_json(app, "/v1/completions", json!({ "prompt": "hi", "n": 2 })).await;
+        assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn receipt_replay_fails_closed_for_runnable_arch() {
+        let state = state_with_loaded_arch("gemma3").await;
+        let request = receipt::ReceiptRequest {
+            endpoint: "/v1/completions".to_string(),
+            messages_or_prompt: json!("hello"),
+            max_tokens: 4,
+            temperature: 0.0,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: Vec::new(),
+            response_format: None,
+        };
+        let err = match replay_loaded_receipt_request(&state, "gate-test", &request).await {
+            Ok(_) => panic!("replay must fail closed for a runnable-lane-only arch"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unsupported_completions_lane"), "{err}");
+    }
+
+    /// Chat is the served surface for runnable archs: with no runtime loaded it
+    /// must keep returning its own typed 503, not the completions gate's 422.
+    #[tokio::test]
+    async fn chat_completions_keep_their_runnable_lane_error() {
+        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let (status, body) = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_not_ready");
+    }
+
+    /// The gate is arch-scoped: a dense-lane arch on the same surfaces must
+    /// fail (synthetic model, no tokenizer) with anything BUT the gate's code.
+    #[tokio::test]
+    async fn completion_gate_is_scoped_to_runnable_archs() {
+        let app = router_with_state(state_with_loaded_arch("llama").await);
+        let (_, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
+        assert_ne!(body["error"]["code"], "unsupported_completions_lane");
     }
 }
 

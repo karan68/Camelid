@@ -1,0 +1,62 @@
+{
+  "schema": "camelid.resident-prompt-prefix-cache/v1",
+  "generated_utc": "2026-07-30T14:57:40Z",
+  "status": "measured",
+  "purpose": "The prompt-prefix cache never stored anything when the Metal GPU-resident prefill drove the prompt, because `store_prompt_prefix_cache` requires `cpu_kv_authoritative()` and a resident prefill leaves the CPU KV buffers empty. That is the lane PR #556 makes automatic, so every repeated or growing chat prompt re-prefilled from scratch. This receipt measures mirroring the GPU history back at store time, gated on the round trip being bit-exact.",
+  "host": {
+    "cpu": "Apple M4",
+    "arch": "arm64",
+    "os": "26.5",
+    "note": "Shared desktop, not an isolated bench host; arms run back to back."
+  },
+  "source": {
+    "baseline_commit": "6d1adb36171bbdd66f51640ca3574d805e87c0bc",
+    "changed_commit": "6d1adb36171bbdd66f51640ca3574d805e87c0bc (+ uncommitted working tree at measurement time)",
+    "build": {
+      "cargo_profile": "release",
+      "bin": "camelid"
+    },
+    "environment": "env -i HOME PATH only, except where an arm names a variable."
+  },
+  "model": {
+    "path": "/Volumes/Untitled/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "lane": "metal_resident_kquant_runtime, F16 primary resident KV"
+  },
+  "method": "camelid serve --no-open, wait for generation_ready, then POST the SAME 1974-token chat completion three times with stream=true and max_tokens=1 so prefill dominates; wall time of the complete SSE response, via curl %{time_total}.",
+  "repeated_turn_wall_seconds": {
+    "pr-556-as-merged": [
+      33.228395,
+      33.334901,
+      33.540317
+    ],
+    "with-resident-prompt-cache": [
+      33.353425,
+      0.499064,
+      0.48508
+    ],
+    "with-resident-prompt-cache CAMELID_PREFIX_CACHE_RESIDENT=0": [
+      32.902715,
+      34.236531,
+      33.81167
+    ]
+  },
+  "parity": {
+    "method": "Same prompt, greedy, max_tokens=32, non-streaming, three turns per binary; sha256 of the completion text.",
+    "pr-556-as-merged": [
+      "183a29c4007ee538",
+      "183a29c4007ee538",
+      "183a29c4007ee538"
+    ],
+    "with-resident-prompt-cache": [
+      "183a29c4007ee538",
+      "183a29c4007ee538",
+      "183a29c4007ee538"
+    ],
+    "verdict": "Byte-identical across cold and cached turns and across both binaries. The exactness argument holds in practice: the CPU KV stores f16-rounded values, so an F16 primary resident cache round-trips unchanged."
+  },
+  "scope": {
+    "covered": "Q4_K/Q6_K models, whose resident KV defaults to an F16 primary.",
+    "not_covered": "Q8_0 models keep an F32 primary resident cache; mirroring would f16-round it, so they are refused and still re-prefill. Quantized CPU KV (--kv-quant q8_0|q4_0) is refused for the same reason. The CUDA resident lane is excluded at the call sites, unchanged.",
+    "cost": "This lane's CPU KV goes from zero bytes to full size, and store_prompt_prefix_cache clones it, so a cached entry costs roughly two CPU KV copies of one prompt. The pool holds one entry by default and ensure_position_capacity still enforces the session KV budget; CAMELID_PREFIX_CACHE_RESIDENT=0 opts out."
+  }
+}
