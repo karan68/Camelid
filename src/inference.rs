@@ -2703,6 +2703,24 @@ impl LlamaInferenceSession {
                  layer from a single cos/sin table and cannot express the skip; CPU reference"
             );
         }
+        // TEMPORARY arch-keyed disqualifier — remove in Phase 3 of the gemma3 Metal
+        // campaign (branch feat/gemma3-metal-resident), which lands a resident encode
+        // that applies these tensors. gemma3/gemma2 must never reach the resident
+        // dense kernels today: the dense binder drops their QK-norm and
+        // post-attention/post-FFN ("sandwich") norm tensors (gemma3-1b: 104 of them)
+        // and the dense forward has no GeGLU or dual-RoPE, so the resident lane —
+        // like the CPU dense forward — would decode fluent-looking garbage under a
+        // supported label. Checked before the backend-enabled gate because this is a
+        // property of the model, not of the available backends (same rationale as
+        // the NoPE check above; keeps the regression test causal on CPU-only hosts).
+        if matches!(self.config.architecture.as_str(), "gemma2" | "gemma3") {
+            bail!(format!(
+                "architecture {:?} is runnable-lane-only: the dense binder drops its QK/sandwich \
+                 norm tensors and has no GeGLU, so the resident kernels would run a mis-bound \
+                 forward; serve/chat route it to the runnable bridge instead",
+                self.config.architecture
+            ));
+        }
         // GPU-runnable tier: an uncurated model is admitted to the resident path only after
         // it passes the one-time parity self-check. A recorded FAIL forbids the resident
         // path here — the single choke point — so no `set_resident_paths_disabled` site can

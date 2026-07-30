@@ -88,6 +88,9 @@ impl HfLlamaConfigSummary {
         let explicit_head_dim = self.head_dim.filter(|&h| h > 0);
         let head_dim = explicit_head_dim.unwrap_or(default_head_dim);
         crate::model::LlamaModelConfig {
+            // The summary is validated llama-only upstream (`inspect_model_source`
+            // rejects every non-`llama` `model_type`), so the family is static.
+            architecture: "llama".to_string(),
             context_length: self.max_position_embeddings,
             embedding_length: self.hidden_size,
             block_count: self.num_hidden_layers,

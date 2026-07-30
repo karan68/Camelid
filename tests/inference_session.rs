@@ -695,6 +695,7 @@ fn smollm3_nope_layers_are_every_fourth_zero_based() {
     // For the 36-layer SmolLM3-3B (smollm3.cpp:7-10 maps case 36 => LLM_TYPE_3B)
     // that skips 9 of 36 layers, INCLUDING the final one.
     let config = LlamaModelConfig {
+        architecture: "llama".to_string(),
         block_count: 36,
         no_rope_layer_step: Some(4),
         ..tiny_config()
@@ -715,6 +716,7 @@ fn layer_uses_rope_matches_the_reference_formula() {
     // tuned to reproduce step 4.
     for step in [1u32, 2, 3, 4, 5, 8] {
         let config = LlamaModelConfig {
+            architecture: "llama".to_string(),
             no_rope_layer_step: Some(step),
             ..tiny_config()
         };
@@ -732,6 +734,7 @@ fn layer_uses_rope_matches_the_reference_formula() {
     // models/afmoe.cpp:137).
     for step in [None, Some(0)] {
         let config = LlamaModelConfig {
+            architecture: "llama".to_string(),
             no_rope_layer_step: step,
             ..tiny_config()
         };
@@ -751,6 +754,7 @@ fn nope_layer_is_identity_at_position_zero() {
     let mut roped = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
     let mut nope = LlamaInferenceSession::new(
         LlamaModelConfig {
+            architecture: "llama".to_string(),
             // (0 + 1) % 1 == 0, so the single layer 0 is NoPE.
             no_rope_layer_step: Some(1),
             ..tiny_config()
@@ -773,6 +777,7 @@ fn nope_layer_changes_output_at_nonzero_position() {
     let mut roped = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
     let mut nope = LlamaInferenceSession::new(
         LlamaModelConfig {
+            architecture: "llama".to_string(),
             no_rope_layer_step: Some(1),
             ..tiny_config()
         },
@@ -800,6 +805,7 @@ fn nope_step_two_ropes_layer_zero() {
     let mut baseline = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
     let mut stepped = LlamaInferenceSession::new(
         LlamaModelConfig {
+            architecture: "llama".to_string(),
             no_rope_layer_step: Some(2),
             ..tiny_config()
         },
@@ -825,6 +831,7 @@ fn nope_gate_is_live_on_the_prompt_path() {
     let mut roped = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
     let mut nope = LlamaInferenceSession::new(
         LlamaModelConfig {
+            architecture: "llama".to_string(),
             no_rope_layer_step: Some(1),
             ..tiny_config()
         },
@@ -846,6 +853,7 @@ fn nope_gate_is_live_on_the_prompt_path() {
     // A step that ropes layer 0 must be indistinguishable from the baseline.
     let mut stepped = LlamaInferenceSession::new(
         LlamaModelConfig {
+            architecture: "llama".to_string(),
             no_rope_layer_step: Some(2),
             ..tiny_config()
         },
@@ -990,6 +998,7 @@ fn rejects_out_of_range_typical_p_top_n_sigma_and_min_keep() {
 
 fn tiny_config() -> LlamaModelConfig {
     LlamaModelConfig {
+        architecture: "llama".to_string(),
         context_length: 4,
         embedding_length: 4,
         block_count: 1,

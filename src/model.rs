@@ -9,6 +9,15 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaModelConfig {
+    /// The GGUF `general.architecture` this config was built from (e.g. "llama",
+    /// "qwen3", "gemma3"). Carried so downstream engine gates can key on the
+    /// architecture itself instead of inferring it from config shape — the
+    /// resident-decode eligibility check uses it to fail closed for architectures
+    /// whose only correct forward lives in the runnable lane (see
+    /// [`is_runnable_only_arch`] and `resident_decode_eligible`). Synthetic
+    /// configs (benches, tests, the SafeTensors summary) set the family they
+    /// emulate ("llama").
+    pub architecture: String,
     pub context_length: u32,
     pub embedding_length: u32,
     pub block_count: u32,
@@ -116,6 +125,19 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
     )
 }
 
+/// Architectures whose ONLY correct forward pass lives in the runnable lane
+/// (`crate::runnable`): the optimized dense binder cannot represent them —
+/// for gemma3/gemma2 it silently drops the QK-norm and post-attention/post-FFN
+/// ("sandwich") norm tensors and the dense forward has no GeGLU or dual-RoPE,
+/// and qwen35's hybrid gated-delta-net layers do not fit the dense tensor map
+/// at all. `camelid serve` routes these archs to the runnable serve bridge
+/// (`api::is_runnable_serve_arch` delegates here); every OTHER lane that would
+/// construct a direct dense session for them must fail closed instead of
+/// decoding fluent-looking garbage.
+pub fn is_runnable_only_arch(architecture: &str) -> bool {
+    matches!(architecture, "qwen35" | "gemma2" | "gemma3")
+}
+
 impl LlamaModelConfig {
     /// True when decoder layer `layer_idx` (0-based) applies RoPE to Q and K.
     ///
@@ -218,6 +240,7 @@ impl LlamaModelConfig {
             _ => required_u32(gguf, &architecture_key(architecture, "feed_forward_length"))?,
         };
         Ok(Self {
+            architecture: architecture.to_string(),
             context_length: required_u32(gguf, &architecture_key(architecture, "context_length"))?,
             embedding_length: required_u32(
                 gguf,
@@ -2144,6 +2167,30 @@ mod tests {
             assert!(
                 super::arch_no_rope_layer_step(arch).is_none(),
                 "{arch} must not be treated as a NoPE architecture"
+            );
+        }
+    }
+
+    #[test]
+    fn runnable_only_arch_set_is_exactly_the_serve_bridge_set() {
+        // Must stay in lockstep with the serve router's runnable bridge
+        // (`api::is_runnable_serve_arch` delegates here): these archs have no
+        // correct dense forward — the dense binder drops gemma3/gemma2's
+        // QK/sandwich norms and has no GeGLU, and qwen35's hybrid layers do not
+        // fit the dense tensor map — so every direct dense-session lane fails
+        // closed for them instead of decoding fluent-looking garbage.
+        for arch in ["qwen35", "gemma2", "gemma3"] {
+            assert!(
+                super::is_runnable_only_arch(arch),
+                "{arch} must be classified runnable-lane-only"
+            );
+        }
+        for arch in [
+            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma4", "phi3", "lfm2", "",
+        ] {
+            assert!(
+                !super::is_runnable_only_arch(arch),
+                "{arch:?} must not be classified runnable-lane-only"
             );
         }
     }
