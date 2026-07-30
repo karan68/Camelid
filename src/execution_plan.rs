@@ -307,10 +307,20 @@ pub fn plan_for_model_with_platform(
     let has_tensor = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0_tensors = has_tensor(GgufTensorType::Q8_0);
     let has_kquant_tensors = has_tensor(GgufTensorType::Q4K) || has_tensor(GgufTensorType::Q6K);
-    let metal_kquant_tensor_mix_supported = !gguf.tensors.iter().any(|tensor| {
+    // ALLOW-list, not a deny-list: the Metal resident K-quant lane consumes
+    // Q4_K/Q6_K super-blocks and the unquantized norm/embedding tensors that
+    // sit alongside them. Anything else — including `Unknown(_)`, which is how
+    // types this reader does not model (IQ2_XXS, IQ3_S, ...) parse — must keep
+    // the CPU block-dot route rather than be labelled Metal-resident by
+    // omission from a four-entry deny-list.
+    let metal_kquant_tensor_mix_supported = gguf.tensors.iter().all(|tensor| {
         matches!(
             tensor.tensor_type,
-            GgufTensorType::Q2K | GgufTensorType::Q3K | GgufTensorType::Q5K | GgufTensorType::IQ4XS
+            GgufTensorType::Q4K
+                | GgufTensorType::Q6K
+                | GgufTensorType::F32
+                | GgufTensorType::F16
+                | GgufTensorType::BF16
         )
     });
 
@@ -357,7 +367,12 @@ pub fn plan_for_model_with_platform(
         select_kquant_plan(
             &profile,
             &platform,
-            metal_kquant_tensor_mix_supported,
+            // The runtime's `resident_decode_eligible` rejects architectures the
+            // resident dense kernels cannot express (gemma2/gemma3 sandwich
+            // norms, NoPE, MoE routing). Mirror that here so the plan never
+            // advertises a Metal-resident lane for a model that provably runs on
+            // the CPU block-dot path.
+            metal_kquant_tensor_mix_supported && is_gpu_runnable_arch(gguf),
             &mut reasons,
         )
     } else {
@@ -897,10 +912,10 @@ fn select_kquant_plan(
         && platform.architecture == "aarch64"
         && platform.metal_available
         && metal_tensor_mix_supported
-        && env_flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
-        && env_flag_enabled("CAMELID_METAL_KQUANT")
-        && env_flag_enabled("CAMELID_METAL_F32Y")
-        && env_flag_enabled("CAMELID_METAL_WIRE")
+        && metal_env_flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
+        && metal_env_flag_enabled("CAMELID_METAL_KQUANT")
+        && metal_env_flag_enabled("CAMELID_METAL_F32Y")
+        && metal_env_flag_enabled("CAMELID_METAL_WIRE")
     {
         reasons.push(
             "Metal resident K-quant stack selected automatically; Q4_K/Q6_K weights stay \
@@ -1260,6 +1275,16 @@ fn env_flag_enabled(key: &str) -> bool {
                 || value.eq_ignore_ascii_case("enabled")
         })
         .unwrap_or(false)
+}
+
+/// Exactly the spelling the Metal runtime accepts (`src/metal.rs`:
+/// `f32y_gemv_enabled`, `wire_weights_enabled`, `kquant_resident_enabled`, and
+/// `q8_0_env_flag_enabled_default_off`). The generic [`env_flag_enabled`] also
+/// accepts `on`/`enabled`, so using it here would let `CAMELID_METAL_KQUANT=on`
+/// label a run Metal-resident while the engine actually ran on the CPU.
+#[allow(dead_code)]
+fn metal_env_flag_enabled(key: &str) -> bool {
+    env::var(key).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 #[allow(dead_code)]
@@ -1666,6 +1691,62 @@ mod tests {
         );
         assert_eq!(fallback.plan.selected_backend, "cpu_kquant_block_dot");
         assert_eq!(fallback.plan.decode_path, "kquant_cpu_block_dot_decode");
+
+        // Fail closed on a tensor type this reader does not model. IQ2_XXS /
+        // IQ3_S parse as `Unknown(_)`, so a deny-list of four named K-quants
+        // would have labelled such a file Metal-resident by omission.
+        let unmodelled = quant_fixture(
+            "Llama 3.3 70B Instruct",
+            Some(10),
+            &[
+                GgufTensorType::Q4K,
+                GgufTensorType::Q6K,
+                GgufTensorType::Unknown(19),
+            ],
+        );
+        let unmodelled_plan = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.3-70B-Instruct-IQ2_XXS.gguf"),
+            &unmodelled,
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(
+            unmodelled_plan.plan.selected_backend,
+            "cpu_kquant_block_dot"
+        );
+
+        // Fail closed on an architecture the resident dense kernels cannot
+        // express, even with a clean Q4_K/Q6_K mix: the runtime's
+        // `resident_decode_eligible` rejects gemma2/gemma3 outright, so the plan
+        // must not claim the Metal lane for them.
+        let mut gemma3 = quant_fixture(
+            "Gemma 3 4B Instruct",
+            Some(15),
+            &[GgufTensorType::Q4K, GgufTensorType::Q6K],
+        );
+        gemma3.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("gemma3".into()),
+        );
+        let gemma3_plan = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/gemma-3-4b-it-Q4_K_M.gguf"),
+            &gemma3,
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(gemma3_plan.plan.selected_backend, "cpu_kquant_block_dot");
+
+        // An unrecognised flag spelling must not label the run Metal either: the
+        // Metal runtime accepts only `1`/`true`, so `on` means "off" there and
+        // the plan has to agree.
+        env::set_var("CAMELID_METAL_KQUANT", "on");
+        let loose_flag = plan_for_model_with_platform(
+            &path,
+            &supported,
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(loose_flag.plan.selected_backend, "cpu_kquant_block_dot");
         clear_profile_env();
     }
 

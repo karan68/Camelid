@@ -16,7 +16,6 @@
 //! dropped handler (client disconnect) stops the running job within one step
 //! and queued jobs from dropped handlers return immediately when they run.
 
-use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -109,6 +108,19 @@ struct ActiveTaskGuard {
     active_completed_units: Arc<AtomicU64>,
 }
 
+/// One cooperative job's slice of the shared engine-slot state. Held across
+/// yields so the published `started`/`completed_units` describe the job, not
+/// the current token step.
+struct CooperativeSlotState {
+    started: u64,
+    last_progress: u64,
+    completed_units: u64,
+    /// Held, never read: dropping it clears the shared slot atomics when the
+    /// job completes or panics.
+    #[allow(dead_code)]
+    guard: ActiveTaskGuard,
+}
+
 impl Drop for ActiveTaskGuard {
     fn drop(&mut self) {
         self.active_task_id.store(0, Ordering::SeqCst);
@@ -146,37 +158,69 @@ impl EngineHandle {
             .name("camelid-engine".to_string())
             .spawn(move || {
                 let mut batch = ContinuousBatch::<CooperativeJob>::new(continuous_batch_slots);
-                let mut exclusive = VecDeque::<ExclusiveJob>::new();
+                // At most ONE task is ever held outside the channel: a
+                // cooperative job that arrived with every slot busy. Draining
+                // the channel into an unbounded local queue instead would make
+                // `try_send` never report `Full`, and the typed `QueueFull` ->
+                // 503 backpressure would silently stop existing for as long as
+                // any stream was running.
+                let mut pending: Option<CooperativeJob> = None;
                 let mut disconnected = false;
                 loop {
-                    if batch.is_empty() {
-                        if let Some(job) = exclusive.pop_front() {
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                            worker_depth.fetch_sub(1, Ordering::SeqCst);
-                            continue;
+                    // A held-back stream takes the first freed slot, ahead of
+                    // anything still in the channel.
+                    if let Some(job) = pending.take() {
+                        if batch.has_free_slot() {
+                            batch.admit(job);
+                        } else {
+                            pending = Some(job);
                         }
-                        if disconnected {
-                            break;
-                        }
-                        match rx.blocking_recv() {
-                            Some(EngineTask::Exclusive(job)) => exclusive.push_back(job),
-                            Some(EngineTask::Cooperative(job)) => {
-                                batch.admit(job);
+                    }
+                    // Admit until a stream arrives with no slot for it. Every
+                    // slot is filled before the round starts, so two streams
+                    // posted back to back alternate from their first token.
+                    while pending.is_none() {
+                        let task = if batch.is_empty() {
+                            if disconnected {
+                                break;
                             }
-                            None => {
-                                disconnected = true;
-                                continue;
+                            match rx.blocking_recv() {
+                                Some(task) => task,
+                                None => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            match rx.try_recv() {
+                                Ok(task) => task,
+                                Err(_) => break,
+                            }
+                        };
+                        match task {
+                            // Exclusive work runs as soon as it is picked up.
+                            // Making it wait for `batch.is_empty()` lets
+                            // overlapping streams starve model load/unload,
+                            // non-streaming completions, the parity probe and
+                            // resident-cache resets indefinitely.
+                            EngineTask::Exclusive(job) => {
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                                worker_depth.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            EngineTask::Cooperative(job) => {
+                                if batch.has_free_slot() {
+                                    batch.admit(job);
+                                } else {
+                                    pending = Some(job);
+                                }
                             }
                         }
                     }
-
-                    while let Ok(task) = rx.try_recv() {
-                        match task {
-                            EngineTask::Exclusive(job) => exclusive.push_back(job),
-                            EngineTask::Cooperative(job) => {
-                                batch.admit(job);
-                            }
+                    if batch.is_empty() {
+                        if disconnected && pending.is_none() {
+                            break;
                         }
+                        continue;
                     }
                     let step_context = CooperativeStepContext {
                         active_slots: batch.scheduled_len(),
@@ -282,22 +326,53 @@ impl EngineHandle {
                 };
                 job();
             })),
-            EngineTask::Cooperative(mut job) => EngineTask::Cooperative(Box::new(move |context| {
-                let started = epoch_millis();
-                active_started_epoch_millis.store(started, Ordering::SeqCst);
-                active_last_progress_epoch_millis.store(started, Ordering::SeqCst);
-                active_completed_units.store(0, Ordering::SeqCst);
-                active_task_id.store(task_id, Ordering::SeqCst);
-                let _guard = ActiveTaskGuard {
-                    active_task_id: Arc::clone(&active_task_id),
-                    active_started_epoch_millis: Arc::clone(&active_started_epoch_millis),
-                    active_last_progress_epoch_millis: Arc::clone(
-                        &active_last_progress_epoch_millis,
-                    ),
-                    active_completed_units: Arc::clone(&active_completed_units),
-                };
-                job(context)
-            })),
+            EngineTask::Cooperative(mut job) => {
+                // A cooperative job spans many steps, so its slot state must
+                // span them too: stamping `started` (and zeroing the unit
+                // counter) on every token would pin `active_elapsed_seconds`
+                // and `stalled_seconds` at 0 for the whole generation and blind
+                // the stall watchdog. The guard is created once, on the first
+                // step, and lives inside this closure — the scheduler drops the
+                // closure when the job completes OR panics, so the RAII clear
+                // still happens on every exit path.
+                //
+                // The four atomics describe "the job running right now": with
+                // more than one slot the jobs take turns owning them, so each
+                // step republishes this job's own start time and last observed
+                // progress before handing control to the decode step.
+                let mut slot: Option<CooperativeSlotState> = None;
+                EngineTask::Cooperative(Box::new(move |context| {
+                    let now = epoch_millis();
+                    let state = slot.get_or_insert_with(|| CooperativeSlotState {
+                        started: now,
+                        last_progress: now,
+                        completed_units: 0,
+                        guard: ActiveTaskGuard {
+                            active_task_id: Arc::clone(&active_task_id),
+                            active_started_epoch_millis: Arc::clone(&active_started_epoch_millis),
+                            active_last_progress_epoch_millis: Arc::clone(
+                                &active_last_progress_epoch_millis,
+                            ),
+                            active_completed_units: Arc::clone(&active_completed_units),
+                        },
+                    });
+                    active_started_epoch_millis.store(state.started, Ordering::SeqCst);
+                    active_last_progress_epoch_millis.store(state.last_progress, Ordering::SeqCst);
+                    active_completed_units.store(state.completed_units, Ordering::SeqCst);
+                    // Published last so a reader never sees an active id paired
+                    // with another job's timestamps.
+                    active_task_id.store(task_id, Ordering::SeqCst);
+                    let outcome = job(context);
+                    // Carry this job's progress across the yield: the next slot
+                    // to run overwrites the shared atomics.
+                    state.completed_units = active_completed_units.load(Ordering::SeqCst);
+                    state.last_progress = active_last_progress_epoch_millis.load(Ordering::SeqCst);
+                    if outcome == StepOutcome::Complete {
+                        slot = None;
+                    }
+                    outcome
+                }))
+            }
         };
         self.depth.fetch_add(1, Ordering::SeqCst);
         match self.tx.try_send(task) {
@@ -479,6 +554,193 @@ mod tests {
             vec![('a', 2), ('b', 2), ('a', 1)],
             "after contention clears, the remaining stream regains encode-ahead eligibility"
         );
+    }
+
+    /// A cooperative job owns its slot for its whole life, not for one token.
+    /// Re-stamping the start time (or zeroing the unit counter) at every step
+    /// pins `active_elapsed_seconds`/`stalled_seconds` at 0 and blinds the
+    /// stall watchdog for every streaming request.
+    #[tokio::test]
+    async fn cooperative_slot_state_survives_token_boundaries() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let observed = Arc::clone(&observed);
+            let progress = engine.clone();
+            let mut steps = 0u64;
+            let release_rx = std::sync::Mutex::new(release_rx);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    steps += 1;
+                    progress.record_progress(steps as usize);
+                    // Observe the slot the way /health does, from inside the
+                    // step but after progress was reported.
+                    let slot = progress.slot_snapshot();
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((slot.active_task_id, slot.completed_units));
+                    if steps == 3 {
+                        // Hold the last step open long enough that the wall
+                        // clock crosses a whole second, so elapsed is provable.
+                        release_rx.lock().unwrap().recv().ok();
+                        StepOutcome::Complete
+                    } else {
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+        // Let the job reach its third step, then check the slot from OUTSIDE.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while observed.lock().unwrap().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job never reached step 3"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let mid = engine.slot_snapshot();
+        assert!(mid.is_processing(), "a yielding stream still owns its slot");
+        assert_eq!(mid.completed_units, 3, "token progress survives the yield");
+        assert!(
+            mid.active_elapsed_seconds >= 1,
+            "elapsed must accumulate across token steps, got {}",
+            mid.active_elapsed_seconds
+        );
+        release_tx.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.iter().map(|(_, units)| *units).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "completed units are cumulative, not reset per step"
+        );
+        let ids: Vec<_> = observed.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.iter().all(|id| *id == ids[0] && id.is_some()),
+            "the active task id is stable across yields: {ids:?}"
+        );
+        assert_eq!(engine.slot_snapshot().active_task_id, None, "slot released");
+    }
+
+    /// The bounded channel is the backpressure device. A worker that drains it
+    /// into an unbounded local queue makes `QueueFull` unreachable for as long
+    /// as any stream is running, which is exactly when the server most needs to
+    /// answer 503 instead of parking waiters.
+    #[tokio::test]
+    async fn queue_full_still_fires_while_a_cooperative_job_runs() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "1");
+        std::env::set_var(QUEUE_DEPTH_ENV, "1");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+        std::env::remove_var(QUEUE_DEPTH_ENV);
+
+        // One never-ending cooperative job occupies the single slot.
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let running = Arc::new(AtomicUsize::new(0));
+        {
+            let running = Arc::clone(&running);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    running.fetch_add(1, Ordering::SeqCst);
+                    if stop_rx.try_recv().is_ok() {
+                        StepOutcome::Complete
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        StepOutcome::Continue
+                    }
+                })))
+                .expect("first post fits an idle engine");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while running.load(Ordering::SeqCst) < 2 {
+            assert!(std::time::Instant::now() < deadline, "job never started");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        // Depth-1 channel: one more post fits, the next must be refused rather
+        // than silently absorbed into a local queue.
+        engine
+            .post(EngineTask::Exclusive(Box::new(|| {})))
+            .expect("one queued job fits the depth-1 channel");
+        let mut refusals = 0;
+        for _ in 0..8 {
+            if matches!(
+                engine.post(EngineTask::Exclusive(Box::new(|| {}))),
+                Err(EnginePostError::QueueFull)
+            ) {
+                refusals += 1;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            refusals > 0,
+            "the bounded queue must still refuse posts while a stream is active"
+        );
+        let _ = stop_tx.send(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Exclusive work (model load/unload, non-streaming completions, the parity
+    /// probe, resident-cache resets) must not wait for the streaming batch to
+    /// drain: with overlapping streams that moment may never come.
+    #[tokio::test]
+    async fn exclusive_work_runs_while_cooperative_streams_are_active() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let stop_rx = Arc::new(std::sync::Mutex::new(stop_rx));
+        for _ in 0..2 {
+            let stop_rx = Arc::clone(&stop_rx);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    if stop_rx.lock().unwrap().try_recv().is_ok() {
+                        StepOutcome::Complete
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                let _ = ran_tx.send(());
+            })))
+            .unwrap();
+        ran_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("exclusive job must run without waiting for the streams to finish");
+
+        let _ = stop_tx.send(());
+        let _ = stop_tx.send(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
     }
 
     #[tokio::test]

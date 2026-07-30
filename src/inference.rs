@@ -757,6 +757,16 @@ impl LlamaLoadedWeights {
                     load_linear(&binding.token_embedding.name)?
                 };
                 output.name = "output.weight".to_string();
+                // `token_embedding` carries the lookup-oriented [vocab, embed]
+                // shape (`normalize_token_embedding_shape` swaps GGUF's dims);
+                // as a projection this tensor must present GGUF's [in, out]
+                // like every other linear, because the resident-residency
+                // predicates read dim(0) as the contraction dimension. Taking
+                // the descriptor's dims restores that for the cloned branch and
+                // is a no-op for the freshly-loaded one.
+                output.shape = TensorShape::from_gguf_dims(
+                    &store.descriptor(&binding.token_embedding.name)?.dimensions,
+                )?;
                 Some(output)
             } else {
                 Some(load_linear(&binding.output.name)?)

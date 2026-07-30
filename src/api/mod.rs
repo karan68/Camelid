@@ -3043,11 +3043,16 @@ async fn llama_server_props(
                 stopping_word: "",
             },
         },
-        total_slots: state
-            .engine
-            .continuous_batch_slots()
-            .try_into()
-            .unwrap_or(u32::MAX),
+        // In llama-server semantics `total_slots` is the length of the `/slots`
+        // array, and `GET /slots?fail_on_no_slot=1` arbitrates against those
+        // same slots. Camelid exposes exactly one read-only aggregate slot (see
+        // `llama_server_slots`, whose `unsupported` list already declares
+        // `continuous_batching_metrics`), so reporting the cooperative capacity
+        // here would make the two routes disagree and let a capacity-aware
+        // client compute utilisation against slots it can never observe. The
+        // real streaming capacity is disclosed natively as
+        // `continuous_batch_slots` on `/health`.
+        total_slots: 1,
         model_path: None,
         model_id,
         chat_template,
@@ -14456,6 +14461,139 @@ fn stream_error_parts(response: &Response) -> (String, String) {
 /// between steps and stops within one step. The job is never detached from
 /// the engine's serialization — the next request's job starts only after this
 /// one returns.
+/// Mutable decode state the shared streaming prologue seeds.
+struct StreamPrologueState<'a> {
+    input: &'a mut Vec<u32>,
+    history: &'a mut Vec<u32>,
+    generated: &'a mut Vec<u32>,
+    top_logits: &'a mut Vec<RawLogitDiagnostic>,
+    output_projection: &'a mut Vec<LlamaOutputProjectionDiagnostic>,
+    dense: &'a mut Option<LlamaForwardDiagnostics>,
+    finish_reason: &'a mut &'static str,
+    sample: &'a mut u128,
+    streamed_text: &'a mut String,
+    first_content_ms: &'a mut Option<u128>,
+}
+
+/// Whether the caller should keep decoding after the prologue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPrologue {
+    Ready,
+    /// A terminal event was already sent, or the client hung up. Stop.
+    Stop,
+}
+
+/// Prompt-prefix cache seeding for a streaming generation, shared by the
+/// run-to-completion job and the cooperative one so the two paths cannot drift.
+/// Restores a cached session (exact hit or longest common prefix), emits the
+/// first delta an exact hit already sampled, and reports whether decoding
+/// should continue.
+///
+/// Bypass the prompt-prefix cache when the CUDA-resident engine drives
+/// decode: reusing a cached session reseeds the GPU KV from f16-rounded
+/// host history (a different reduction order than a clean GPU prefill),
+/// which corrupts the resumed decode — mild for greedy (a few near-tie
+/// flips) but catastrophic under temperature sampling, where it produces
+/// garbled, off-topic output. The non-streaming path already gates the
+/// cache this way (see resident_decode_cuda_active); the streaming path
+/// must too. The CPU lane is reduction-order-stable and keeps the cache.
+fn stream_prompt_cache_prologue(
+    prepared: &mut PreparedGeneration,
+    state: StreamPrologueState<'_>,
+    generation_started: Instant,
+    send: &dyn Fn(StreamDecodeEvent) -> bool,
+) -> StreamPrologue {
+    let StreamPrologueState {
+        input,
+        history,
+        generated,
+        top_logits,
+        output_projection,
+        dense,
+        finish_reason,
+        sample,
+        streamed_text,
+        first_content_ms,
+    } = state;
+    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
+        if let Some(match_res) = lookup_prompt_prefix_cache(prepared) {
+            let mut cached_session = match_res.cached.session.clone();
+            cached_session
+                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
+            if match_res.is_exact_match {
+                prepared.session = cached_session;
+                input.clear();
+                match sample_cached_prompt_prefix(&match_res.cached, history) {
+                    Ok(first_step) => {
+                        let cached_next_token = first_step.next_token_id;
+                        prepared.timings.prompt_cache_hit = true;
+                        *sample += first_step.sample;
+                        if let Err(response) = consume_generation_step(
+                            prepared,
+                            first_step,
+                            GenerationStepAccumulator {
+                                generated,
+                                history,
+                                top_logits,
+                                output_projection,
+                                dense,
+                                finish_reason,
+                            },
+                        ) {
+                            let (code, message) = stream_error_parts(&response);
+                            send(StreamDecodeEvent::Failed { code, message });
+                            return StreamPrologue::Stop;
+                        }
+                        if *finish_reason == "length" {
+                            input.push(cached_next_token);
+                        }
+                    }
+                    Err(response) => {
+                        let (code, message) = stream_error_parts(&response);
+                        send(StreamDecodeEvent::Failed { code, message });
+                        return StreamPrologue::Stop;
+                    }
+                }
+            } else {
+                let k = match_res.prefix_len;
+                if cached_session.rollback_to_position(k).is_ok() {
+                    prepared.session = cached_session;
+                    *input = prepared.token_ids[k..].to_vec();
+                    prepared.timings.prompt_cache_hit = true;
+                }
+            }
+        }
+    }
+
+    // An exact prompt-cache hit samples the first token above, before the main
+    // loop. Emit it now; otherwise a one-token cached stream reaches Finished
+    // with correct usage but no content delta. Longer cached streams also must
+    // establish `streamed_text` before subsequent deltas are diffed.
+    if !generated.is_empty() {
+        let mut text = match prepared.tokenizer.decode(generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                return StreamPrologue::Stop;
+            }
+        };
+        if *finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
+        }
+        if !text.is_empty() {
+            *streamed_text = text.clone();
+            *first_content_ms = Some(generation_started.elapsed().as_millis());
+            if !send(StreamDecodeEvent::Delta(text)) {
+                return StreamPrologue::Stop;
+            }
+        }
+    }
+    StreamPrologue::Ready
+}
+
 fn run_stream_decode_job(
     mut prepared: PreparedGeneration,
     events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
@@ -14501,89 +14639,25 @@ fn run_stream_decode_job(
     let mut forward_timings = LlamaForwardTimings::default();
     let mut sample = 0;
 
-    // Bypass the prompt-prefix cache when the CUDA-resident engine drives
-    // decode: reusing a cached session reseeds the GPU KV from f16-rounded
-    // host history (a different reduction order than a clean GPU prefill),
-    // which corrupts the resumed decode â€” mild for greedy (a few near-tie
-    // flips) but catastrophic under temperature sampling, where it produces
-    // garbled, off-topic output. The non-streaming path already gates the
-    // cache this way (see resident_decode_cuda_active); the streaming path
-    // must too. The CPU lane is reduction-order-stable and keeps the cache.
-    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
-        if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
-            let mut cached_session = match_res.cached.session.clone();
-            cached_session
-                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
-            if match_res.is_exact_match {
-                prepared.session = cached_session;
-                input.clear();
-                match sample_cached_prompt_prefix(&match_res.cached, &history) {
-                    Ok(first_step) => {
-                        let cached_next_token = first_step.next_token_id;
-                        prepared.timings.prompt_cache_hit = true;
-                        sample += first_step.sample;
-                        if let Err(response) = consume_generation_step(
-                            &prepared,
-                            first_step,
-                            GenerationStepAccumulator {
-                                generated: &mut generated,
-                                history: &mut history,
-                                top_logits: &mut top_logits,
-                                output_projection: &mut output_projection,
-                                dense: &mut dense,
-                                finish_reason: &mut finish_reason,
-                            },
-                        ) {
-                            let (code, message) = stream_error_parts(&response);
-                            send(StreamDecodeEvent::Failed { code, message });
-                            return;
-                        }
-                        if finish_reason == "length" {
-                            input.push(cached_next_token);
-                        }
-                    }
-                    Err(response) => {
-                        let (code, message) = stream_error_parts(&response);
-                        send(StreamDecodeEvent::Failed { code, message });
-                        return;
-                    }
-                }
-            } else {
-                let k = match_res.prefix_len;
-                if cached_session.rollback_to_position(k).is_ok() {
-                    prepared.session = cached_session;
-                    input = prepared.token_ids[k..].to_vec();
-                    prepared.timings.prompt_cache_hit = true;
-                }
-            }
-        }
-    }
-
-    // An exact prompt-cache hit samples the first token above, before the main
-    // loop. Emit it now; otherwise a one-token cached stream reaches Finished
-    // with correct usage but no content delta. Longer cached streams also must
-    // establish `streamed_text` before subsequent deltas are diffed.
-    if !generated.is_empty() {
-        let mut text = match prepared.tokenizer.decode(&generated, true) {
-            Ok(text) => text,
-            Err(err) => {
-                send(StreamDecodeEvent::Failed {
-                    code: "token_decode_failed".to_string(),
-                    message: err.to_string(),
-                });
-                return;
-            }
-        };
-        if finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
-        if !text.is_empty() {
-            streamed_text = text.clone();
-            first_content_ms = Some(generation_started.elapsed().as_millis());
-            if !send(StreamDecodeEvent::Delta(text)) {
-                return;
-            }
-        }
+    match stream_prompt_cache_prologue(
+        &mut prepared,
+        StreamPrologueState {
+            input: &mut input,
+            history: &mut history,
+            generated: &mut generated,
+            top_logits: &mut top_logits,
+            output_projection: &mut output_projection,
+            dense: &mut dense,
+            finish_reason: &mut finish_reason,
+            sample: &mut sample,
+            streamed_text: &mut streamed_text,
+            first_content_ms: &mut first_content_ms,
+        },
+        generation_started,
+        &send,
+    ) {
+        StreamPrologue::Ready => {}
+        StreamPrologue::Stop => return,
     }
 
     for _ in generated.len() as u32..prepared.max_tokens {
@@ -14795,26 +14869,60 @@ impl CooperativeStreamDecodeJob {
             .telemetry
             .take()
             .map(telemetry::RequestGuard::begin);
-        let input = prepared.token_ids.clone();
-        let history = prepared.token_ids.clone();
+        let generation_started = Instant::now();
+        let mut input = prepared.token_ids.clone();
+        let mut history = prepared.token_ids.clone();
+        let mut generated = Vec::new();
+        let mut top_logits = Vec::new();
+        let mut output_projection = Vec::new();
+        let mut dense = None;
+        let mut finish_reason = "length";
+        let mut streamed_text = String::new();
+        let mut first_content_ms = None;
+        let mut sample = 0;
+        // Same prompt-prefix cache seeding the run-to-completion job does:
+        // without it every turn of a growing chat re-prefills the whole
+        // conversation, which on the now-default cooperative path would be a
+        // large silent regression.
+        let send_event = |event: StreamDecodeEvent| events.blocking_send(event).is_ok();
+        if stream_prompt_cache_prologue(
+            &mut prepared,
+            StreamPrologueState {
+                input: &mut input,
+                history: &mut history,
+                generated: &mut generated,
+                top_logits: &mut top_logits,
+                output_projection: &mut output_projection,
+                dense: &mut dense,
+                finish_reason: &mut finish_reason,
+                sample: &mut sample,
+                streamed_text: &mut streamed_text,
+                first_content_ms: &mut first_content_ms,
+            },
+            generation_started,
+            &send_event,
+        ) == StreamPrologue::Stop
+        {
+            return None;
+        }
         Some(Self {
             prepared,
             events,
             telemetry_guard,
-            generation_started: Instant::now(),
+            generation_started,
             request_timeout,
             collect_q8_schedule,
             input,
             history,
-            generated: Vec::new(),
-            top_logits: Vec::new(),
-            output_projection: Vec::new(),
-            dense: None,
-            finish_reason: "length",
-            streamed_text: String::new(),
-            first_content_ms: None,
+            generated,
+            top_logits,
+            output_projection,
+            dense,
+            finish_reason,
+            streamed_text,
+            first_content_ms,
             forward_timings: LlamaForwardTimings::default(),
-            sample: 0,
+            sample,
             finished: false,
             #[cfg(test)]
             initial_step_delay: generation_step_test_sleep_duration(),
@@ -15077,7 +15185,14 @@ fn stream_completion(
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
     // Post the decode job before returning the SSE response. A full queue is
     // the same typed backpressure non-streaming requests get.
-    let task = if state.engine.continuous_batch_slots() > 1 {
+    // Cooperative round-robin requires each session to own its GPU decode
+    // state. Metal's `ResidentDecodeState` is per-session, but the CUDA
+    // resident engine (and its on-GPU KV cache) is a PROCESS-GLOBAL slot keyed
+    // by model id — two sessions of the same model would share one KV cache and
+    // interleave each other's history. Keep those runs run-to-completion.
+    let task = if state.engine.continuous_batch_slots() > 1
+        && !crate::inference::resident_decode_cuda_active()
+    {
         let job = cooperative_stream_decode_task(prepared, events_tx);
         engine::EngineTask::Cooperative(Box::new(job))
     } else {

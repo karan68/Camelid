@@ -9003,60 +9003,106 @@ fn encode_resident_matmul_f32(
             let n_sb = input_width / 256;
             let scales = pool_get(k, (n_tokens * n_sb * 4) as u64);
             let quants = pool_get(k, (n_tokens * input_width) as u64);
-            unsafe {
-                let p = scalar.contents() as *mut u32;
-                *p = n_sb as u32;
-                *p.add(1) = rows as u32;
-                *p.add(2) = n_tokens as u32;
-            }
-            e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
-            e.set_buffer(0, Some(y), 0);
-            e.set_buffer(1, Some(&scales), 0);
-            e.set_buffer(2, Some(&quants), 0);
-            e.set_buffer(3, Some(scalar), 0);
-            e.set_buffer(4, Some(scalar), 8);
-            dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
-
-            let pipeline = match (weight.format, n_tokens == 1) {
-                (ResidentWeightFormat::Q4K, true) => &k.q4k_linear_simd_pipeline,
-                (ResidentWeightFormat::Q6K, true) => &k.q6k_linear_simd_pipeline,
-                (ResidentWeightFormat::Q4K, false) => &k.q4k_linear_tiled_pipeline,
-                (ResidentWeightFormat::Q6K, false) => &k.q6k_linear_tiled_pipeline,
-                (ResidentWeightFormat::Q8_0, _) => unreachable!(),
-            };
-            e.set_compute_pipeline_state(pipeline);
-            e.set_buffer(0, Some(&scales), 0);
-            e.set_buffer(1, Some(&quants), 0);
-            e.set_buffer(2, Some(&weight.buffer), 0);
-            e.set_buffer(3, Some(out), 0);
-            e.set_buffer(4, Some(scalar), 0);
-            e.set_buffer(5, Some(scalar), 4);
-            e.set_buffer(6, Some(scalar), 8);
-            if n_tokens == 1 {
-                let scratch_ints = n_sb
-                    * match weight.format {
-                        ResidentWeightFormat::Q4K => 9,
-                        ResidentWeightFormat::Q6K => 8,
-                        ResidentWeightFormat::Q8_0 => unreachable!(),
-                    };
-                e.set_threadgroup_memory_length(0, (scratch_ints * 4) as u64);
-                e.dispatch_thread_groups(
-                    metal::MTLSize {
-                        width: rows as u64,
-                        height: 1,
-                        depth: 1,
-                    },
-                    metal::MTLSize {
-                        width: 32,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            } else {
-                dispatch_1d(e, pipeline, rows * n_tokens.div_ceil(4));
-            }
+            encode_resident_kquant_matmul_f32(
+                e,
+                k,
+                y,
+                weight,
+                out,
+                scalar,
+                &scales,
+                &quants,
+                input_width,
+                rows,
+                n_tokens,
+            );
             keep.extend([scales, quants]);
         }
+    }
+}
+
+/// The Q4_K/Q6_K half of [`encode_resident_matmul_f32`] with the activation-quant
+/// scratch supplied by the caller.
+///
+/// Batched callers (prefill) hand in ONE `scales`/`quants` pair per contraction
+/// width and reuse it for every projection in the command buffer: dispatches on a
+/// `MTLComputeCommandEncoder` are serial by default, so the quantize kernel's
+/// output is fully consumed by its GEMM before the next projection overwrites it.
+/// Allocating a fresh pair per dispatch instead makes transient scratch scale with
+/// `n_tokens * sum(input_width) * n_layers` — gigabytes for an 8B model on a long
+/// prompt — where `n_tokens * sum(input_width)` is sufficient.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_resident_kquant_matmul_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    scales: &Buffer,
+    quants: &Buffer,
+    input_width: usize,
+    rows: usize,
+    n_tokens: usize,
+) {
+    let n_sb = input_width / 256;
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = n_sb as u32;
+        *p.add(1) = rows as u32;
+        *p.add(2) = n_tokens as u32;
+    }
+    e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(1, Some(scales), 0);
+    e.set_buffer(2, Some(quants), 0);
+    e.set_buffer(3, Some(scalar), 0);
+    e.set_buffer(4, Some(scalar), 8);
+    dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+
+    let pipeline = match (weight.format, n_tokens == 1) {
+        (ResidentWeightFormat::Q4K, true) => &k.q4k_linear_simd_pipeline,
+        (ResidentWeightFormat::Q6K, true) => &k.q6k_linear_simd_pipeline,
+        (ResidentWeightFormat::Q4K, false) => &k.q4k_linear_tiled_pipeline,
+        (ResidentWeightFormat::Q6K, false) => &k.q6k_linear_tiled_pipeline,
+        (ResidentWeightFormat::Q8_0, _) => unreachable!(),
+    };
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(scales), 0);
+    e.set_buffer(1, Some(quants), 0);
+    e.set_buffer(2, Some(&weight.buffer), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    if n_tokens == 1 {
+        let scratch_ints = n_sb
+            * match weight.format {
+                ResidentWeightFormat::Q4K => 9,
+                ResidentWeightFormat::Q6K => 8,
+                ResidentWeightFormat::Q8_0 => unreachable!(),
+            };
+        // `setThreadgroupMemoryLength:` requires a multiple of 16 bytes
+        // (MTLDebugComputeCommandEncoder hard-asserts otherwise). `n_sb` is odd
+        // or 2 mod 4 for plenty of real shapes — Llama-2-7B ffn_dim 11008 gives
+        // n_sb 43, Qwen3-4B hidden 2560 gives n_sb 10 — so round the allocation
+        // up. The kernel only ever indexes the first `scratch_ints` words.
+        e.set_threadgroup_memory_length(0, (scratch_ints * 4).next_multiple_of(16) as u64);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    } else {
+        dispatch_1d(e, pipeline, rows * n_tokens.div_ceil(4));
     }
 }
 
@@ -10193,30 +10239,69 @@ enum ResidentKvFormat {
     Q8,
 }
 
-/// Resident KV storage format. K-quant's opt-in lane defaults to its
-/// parity-qualified F16 primary cache; other resident lanes keep F32. An
-/// explicit `CAMELID_METAL_KV_DTYPE=f32|f16|q8` always wins, and the original
-/// `CAMELID_METAL_KV16=1` spelling remains an alias for F16.
+/// Explicit KV-format override, or `None` when the format is left to policy.
+/// `CAMELID_METAL_KV_DTYPE=f32|f16|q8` always wins; the original
+/// `CAMELID_METAL_KV16=1` spelling remains an alias for F16. An unrecognised
+/// value is not an override — policy decides, exactly as if it were unset.
 #[cfg(target_os = "macos")]
-fn resident_kv_format() -> ResidentKvFormat {
-    static FORMAT: OnceLock<ResidentKvFormat> = OnceLock::new();
-    *FORMAT.get_or_init(|| {
+fn resident_kv_format_override() -> Option<ResidentKvFormat> {
+    static OVERRIDE: OnceLock<Option<ResidentKvFormat>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
         match std::env::var("CAMELID_METAL_KV_DTYPE")
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str()
         {
-            "f16" | "half" => ResidentKvFormat::F16,
-            "q8" | "q8_0" => ResidentKvFormat::Q8,
+            "f32" | "float32" => Some(ResidentKvFormat::F32),
+            "f16" | "half" => Some(ResidentKvFormat::F16),
+            "q8" | "q8_0" => Some(ResidentKvFormat::Q8),
             _ if std::env::var("CAMELID_METAL_KV16")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) =>
             {
-                ResidentKvFormat::F16
+                Some(ResidentKvFormat::F16)
             }
-            _ if kquant_resident_enabled() => ResidentKvFormat::F16,
-            _ => ResidentKvFormat::F32,
+            _ => None,
         }
     })
+}
+
+/// True once a resident engine has been built over Q4_K/Q6_K weights. The
+/// F16-primary KV default is a property of the K-QUANT MODEL, not of the
+/// `CAMELID_METAL_KQUANT` env gate: keying it off the gate alone moved every
+/// Q8_0 resident model onto a half KV cache the moment the CLI defaulted the
+/// gate on, which silently disabled the split-K decode attention and the
+/// attention-as-matmul prefill (both gated on `!kv16_enabled()`) and cost
+/// ~26% decode and ~2.2x prefill on a 2k-token Q8_0 run.
+#[cfg(target_os = "macos")]
+static KQUANT_LANE_ENGAGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether the resident engine about to be built consumes K-quant
+/// weights. Called by the resident prefill/decode builders before
+/// [`ResidentDecodeState::new`], so a model switch re-decides the KV default.
+#[cfg(target_os = "macos")]
+pub fn set_resident_kquant_lane(engaged: bool) {
+    KQUANT_LANE_ENGAGED.store(engaged, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Non-macOS stub: there is no resident Metal engine to configure.
+#[cfg(not(target_os = "macos"))]
+pub fn set_resident_kquant_lane(_engaged: bool) {}
+
+/// Resident KV storage format. The K-quant lane defaults to its
+/// parity-qualified F16 primary cache; every other resident lane keeps the F32
+/// cache it has always used. See [`resident_kv_format_override`] for the
+/// escape hatches.
+#[cfg(target_os = "macos")]
+fn resident_kv_format() -> ResidentKvFormat {
+    if let Some(explicit) = resident_kv_format_override() {
+        return explicit;
+    }
+    if KQUANT_LANE_ENGAGED.load(std::sync::atomic::Ordering::Relaxed) {
+        ResidentKvFormat::F16
+    } else {
+        ResidentKvFormat::F32
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -13377,6 +13462,13 @@ impl ResidentDecodeState {
             dispatch_1d(e, &k.f32_to_f16_pipeline, count);
         };
         let mut projection_keep = Vec::new();
+        // One activation-quant scratch pair per contraction width, shared by
+        // every K-quant projection of every layer. See
+        // `encode_resident_kquant_matmul_f32`: allocating per dispatch instead
+        // would hold n_layers x 7 live scratch buffers at once, which for an 8B
+        // model on a multi-thousand-token prompt is gigabytes of unified memory
+        // on top of the resident weights.
+        let mut kquant_scratch: HashMap<usize, (Buffer, Buffer)> = HashMap::new();
         let mut gemm = |e: &metal::ComputeCommandEncoderRef,
                         y: &Buffer,
                         w: &ResidentLinearWeight,
@@ -13418,18 +13510,42 @@ impl ResidentDecodeState {
                 return;
             }
             let local_scalar = pool_get(k, 12);
-            encode_resident_matmul_f32(
-                e,
-                k,
-                &mut projection_keep,
-                y,
-                w,
-                out,
-                &local_scalar,
-                input_width,
-                rows,
-                n_tokens,
-            );
+            match w.format {
+                ResidentWeightFormat::Q8_0 => encode_resident_matmul_f32(
+                    e,
+                    k,
+                    &mut projection_keep,
+                    y,
+                    w,
+                    out,
+                    &local_scalar,
+                    input_width,
+                    rows,
+                    n_tokens,
+                ),
+                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K => {
+                    let (scales, quants) = kquant_scratch.entry(input_width).or_insert_with(|| {
+                        let n_sb = input_width / 256;
+                        (
+                            pool_get(k, (n_tokens * n_sb * 4) as u64),
+                            pool_get(k, (n_tokens * input_width) as u64),
+                        )
+                    });
+                    encode_resident_kquant_matmul_f32(
+                        e,
+                        k,
+                        y,
+                        w,
+                        out,
+                        &local_scalar,
+                        scales,
+                        quants,
+                        input_width,
+                        rows,
+                        n_tokens,
+                    );
+                }
+            }
             projection_keep.push(local_scalar);
         };
         // One thread per (unit, token): elementwise grid with token rows on y.
@@ -16091,6 +16207,43 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+
+    /// The F16-primary resident KV cache is qualified for the K-quant lane, so
+    /// it must follow the LOADED MODEL, never the process-wide
+    /// `CAMELID_METAL_KQUANT` admission gate — which the macOS CLI turns on for
+    /// every run. Keying it off the gate put Q8_0 models on a half KV cache and
+    /// so disabled the split-K decode attention and the attention-as-matmul
+    /// prefill (both require an F32 primary), costing ~27% decode and ~2.3x
+    /// prefill on a 2k-token Q8_0 run. Needs no GPU: this is policy, not
+    /// dispatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_kv_format_follows_the_model_not_the_kquant_env_gate() {
+        use super::{
+            resident_kv_format, resident_kv_format_override, set_resident_kquant_lane,
+            ResidentKvFormat,
+        };
+        let _guard = crate::test_support::env_lock();
+        if resident_kv_format_override().is_some() {
+            // An explicit CAMELID_METAL_KV_DTYPE/KV16 in this process wins by
+            // design; the default policy is not observable here.
+            return;
+        }
+        let restore = super::KQUANT_LANE_ENGAGED.load(std::sync::atomic::Ordering::Relaxed);
+        set_resident_kquant_lane(false);
+        assert_eq!(
+            resident_kv_format(),
+            ResidentKvFormat::F32,
+            "a Q8_0 resident model keeps the F32 primary KV cache"
+        );
+        set_resident_kquant_lane(true);
+        assert_eq!(
+            resident_kv_format(),
+            ResidentKvFormat::F16,
+            "a Q4_K/Q6_K resident model gets the qualified F16 primary KV cache"
+        );
+        set_resident_kquant_lane(restore);
+    }
 
     /// Capability gate for the whole macOS Metal test lane.
     ///

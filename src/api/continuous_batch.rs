@@ -58,6 +58,14 @@ impl<T> ContinuousBatch<T> {
         self.active.len()
     }
 
+    /// True while another session can be admitted without exceeding `max_slots`.
+    /// The worker uses this to leave surplus work in the bounded engine channel
+    /// rather than in an unbounded local queue, so queue-full backpressure keeps
+    /// working while streams are running.
+    pub(crate) fn has_free_slot(&self) -> bool {
+        self.active.len() + self.waiting.len() < self.max_slots
+    }
+
     /// Number of active slots the next round will have after waiting work is admitted.
     pub(crate) fn scheduled_len(&self) -> usize {
         self.max_slots

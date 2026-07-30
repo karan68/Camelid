@@ -65,7 +65,9 @@
     "decode_throughput_change_percent": 75.04,
     "baseline_peak_memory_bytes_median": 2781429760,
     "automatic_peak_memory_bytes_median": 623067136,
-    "peak_memory_change_percent": -77.6,
+    "matched_configuration_peak_memory_bytes_median": 971620352,
+    "peak_memory_change_percent": -65.07,
+    "peak_memory_note": "The declared peak-memory reduction is computed against the MATCHED-configuration measurement in the sibling before/after receipt (971,620,352 B), not against this run's 623,067,136 B. The two runs share host, GGUF, prompt and effective configuration and agree on prefill and decode medians to within 1%, so the 36% peak-RSS gap between them is not explained by any declared variable. An independent post-review re-run on the same host under zero configuration (metal-kquant-m4-postfix-three-way-20260730.json) measured 970,410,496 B, corroborating the higher figure. The 623,067,136 B observation is retained as recorded but supports no claim.",
     "parity": "The automatic path has the same 50 generated token IDs as the baseline confident probe."
   },
   "live_server_probe": {

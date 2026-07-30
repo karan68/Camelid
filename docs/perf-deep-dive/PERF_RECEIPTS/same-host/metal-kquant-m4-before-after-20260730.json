@@ -16,11 +16,13 @@
   "source": {
     "before_commit": "1efe1ed29943f615f4516ef3ee50e2d730848bee",
     "after": "uncommitted worktree over before_commit",
+    "after_commit": "670673742ebeb9f181836942796fcaccf3e260df",
     "after_rollout": {
       "CAMELID_METAL_KQUANT": "1",
       "CAMELID_METAL_KV_DTYPE": "f16",
       "CAMELID_METAL_NOCOPY": "CLI default-on"
     },
+    "after_rollout_scope": "This block describes confident_decode_probe.after_f16_primary only. The long_prefill_decode_probe's after arm is named after_f32_primary because it was taken with CAMELID_METAL_KV_DTYPE=f32; its higher peak RSS (median 997,621,760 B vs 971,620,352 B) is consistent with the wider KV cache. Do not attribute the long-prompt medians to the F16-primary configuration.",
     "build": {
       "cargo_profile": "release",
       "lto_override": false,

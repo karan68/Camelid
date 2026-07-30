@@ -3,7 +3,9 @@
 Implementation result for the five-item Windows-to-Metal roadmap. The
 same-host receipt is accepted for Camelid's CLI/server appliance policy:
 qualified Q4_K/Q6_K models use the Metal path automatically on Apple Silicon,
-while library embedders retain conservative defaults.
+while library embedders retain conservative defaults for every *Metal* gate.
+The one appliance default that is NOT library-conservative is the two-slot
+cooperative streaming scheduler — see item 5.
 
 ## What landed
 
@@ -26,7 +28,18 @@ while library embedders retain conservative defaults.
    multiple streaming sessions and rotate them one token step at a time on
    its sole compute thread. A lone session retains single-request encode-ahead;
    contended rounds stop enqueueing future session-local graphs so one stream
-   cannot head-of-line block another on the shared command queue.
+   cannot head-of-line block another on the shared command queue. Unlike the
+   Metal items above, the two-slot default is **not** macOS-scoped: it lives in
+   `runtime_config` and therefore also reaches Linux/Windows embedders that
+   call `EngineHandle::spawn()`. Two invariants keep that safe: exclusive
+   engine work (model load/unload, non-streaming completions, resident-cache
+   resets, the parity probe) is dequeued in post order rather than waiting for
+   the streaming batch to drain, and the bounded engine channel is never
+   drained into an unbounded local queue, so the typed `QueueFull` -> 503 is
+   still reachable while streams are running. Runs driven by the CUDA resident
+   engine stay run-to-completion, because that engine — unlike Metal's
+   per-session `ResidentDecodeState` — is a process-global slot keyed by model
+   id and cannot host two interleaved sequences.
 
 ## Rollout controls
 
@@ -34,7 +47,7 @@ while library embedders retain conservative defaults.
 |---|---|---:|---|
 | `CAMELID_METAL_KQUANT` | `0`, `1` | `1` in the macOS CLI; library default `0` | Admit resident Q4_K/Q6_K weights and native K-quant prefill/decode. Unsupported mixes fall back. |
 | `CAMELID_METAL_NOCOPY` | `0`, `1` | `1` in qualified macOS serve/bench runs | Read Q8_0/Q4_K/Q6_K weights into page-aligned storage which Metal wraps without a second upload. |
-| `CAMELID_METAL_KV_DTYPE` | `f32`, `f16`, `q8` | `f16` for K-quant; `f32` otherwise | Select the resident KV primary representation. |
+| `CAMELID_METAL_KV_DTYPE` | `f32`, `f16`, `q8` | `f16` for K-quant; `f32` otherwise | Select the resident KV primary representation. The default follows the LOADED MODEL's weights, not the `CAMELID_METAL_KQUANT` gate: a Q8_0 model keeps its F32 cache (and with it the split-K decode attention and the attention-as-matmul prefill, both of which require an F32 primary) even with K-quant admission enabled. |
 | `CAMELID_METAL_KV16` | `0`, `1` | `0` | Legacy alias for `CAMELID_METAL_KV_DTYPE=f16`. |
 | `CAMELID_CONTINUOUS_BATCH_SLOTS` | `1..256` | `2` | Maximum active cooperative streaming sessions. Set `1` for legacy run-to-completion scheduling. |
 
@@ -51,9 +64,44 @@ while library embedders retain conservative defaults.
 - Tree verification currently falls back when a compressed primary KV cache
   is selected; linear speculative verification supports compressed KV.
 - Continuous batching applies only to streaming generation. Non-streaming
-  work and management jobs remain exclusive.
+  work and management jobs remain exclusive, and run ahead of the streaming
+  batch in post order rather than behind it.
+- `/props.total_slots` continues to report `1`, matching the single aggregate
+  slot `GET /slots` exposes and the `fail_on_no_slot` arbitration built on it.
+  The cooperative capacity is reported natively as `continuous_batch_slots` on
+  `/health`.
+- The plan only labels a model `metal_resident_kquant_runtime` when its tensor
+  types are an allow-listed Q4_K/Q6_K/F32/F16/BF16 mix AND its architecture is
+  one the resident dense kernels can express. Everything else — including
+  tensor types this GGUF reader does not model — keeps the CPU block-dot
+  label.
 - Q5_K/Q2_K/Q3_K/IQ4_XS mixes are not labeled or admitted as Metal K-quant;
   they keep their existing wire-only CPU/CUDA routes.
+
+## Post-review verification
+
+`PERF_RECEIPTS/same-host/metal-kquant-m4-postfix-three-way-20260730.json` is an
+independent re-measurement on the same M4, with three release binaries built
+from the same toolchain — the merge base, this PR as first submitted, and this
+PR after the review fixes — run back to back with no `CAMELID_*` variables set.
+Median of five after one warmup; the full generated token-ID list is recorded
+for every arm.
+
+| Probe | merge base | PR as submitted | PR after fixes |
+|---|---:|---:|---:|
+| Q4_K_M, 6-token prompt, 50 tokens | 33.77 tok/s / 2.781 GB | 63.62 / 0.970 | **62.75 / 0.971** |
+| Q4_K_M, 1974-token prompt, 64 tokens | 13.89 tok/s / 2.963 GB | 42.69 / 1.002 | **42.79 / 1.002** |
+| Q8_0, 1974-token prompt, 64 tokens | 64.46 tok/s / 1.608 GB | 47.74 / 1.528 | **66.04 / 1.621** |
+
+Generated token IDs are identical across all three arms in all three probes.
+
+The Q8_0 row is why the fix pass exists: keying the F16-primary KV default off
+the `CAMELID_METAL_KQUANT` env gate (which the macOS CLI now sets for every run)
+rather than off the loaded model's weights moved curated Q8_0 rows onto a half
+KV cache, which disables the split-K decode attention and the
+attention-as-matmul prefill — 25.9% slower decode and 2.28x slower prefill at
+2k context. On the K-quant lane itself the fix pass is a wash (-1.4% on the
+short probe, inside this host's run-to-run spread).
 
 ## Merge gate
 
@@ -67,7 +115,11 @@ Run these in a release profile on the same Mac and exact GGUF:
 6. a cold, greedy, median-of-five `bench-generate` before/after comparison
 
 The benchmark receipt must record the commit, host, model path and hash,
-prompt, environment, raw iterations, medians, and generated token IDs.
+prompt, environment, raw iterations, medians, and generated token IDs. Where a
+receipt records a `token_ids_sha256` digest instead of (or alongside) the raw
+IDs, the recipe is `sha256(",".join(str(id) for id in output_token_ids))` over
+the `output_token_ids` array that `bench-generate` emits — verifiable against
+any recorded ID list.
 The merge receipt records the first generated-token divergence, if any.
 F16-primary must pass the predeclared confident probe; Q8-primary is explicitly
 lossy and is compared against the dequantized-Q8 oracle rather than claimed as
