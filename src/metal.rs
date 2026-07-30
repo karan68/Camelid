@@ -23463,29 +23463,19 @@ mod tests {
     // f32 end-to-end, so the only resident-vs-oracle delta is reduction order.
     // The default-latched quantize path is NOT the production lane and its Q8
     // activation noise (~0.5 logit over 26 layers) flips near-ties; like
-    // metal_spec_verify_bit_identical, this test latches the gates ON and
-    // SKIPS if an earlier test in the process latched them off — the targeted
-    // run below is the enforced proof lane.
+    // metal_spec_verify_bit_identical, this test SKIPS unless those gates are
+    // armed — but it arms them from the SHELL, never with an in-test
+    // `set_var` (see the comment on the gate check below). The targeted run
+    // below is the enforced proof lane.
     //
-    // Run: CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
+    // Run: CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    //      CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
     //      cargo test --release --lib gemma3_real_row_resident_forward -- --nocapture
-    // (~5-10 min: the oracle re-runs its stateless f32 forward per step.)
+    // (~10 min: the oracle re-runs its stateless f32 forward per step.)
     #[cfg(target_os = "macos")]
     #[test]
     fn gemma3_real_row_resident_forward_matches_runnable_oracle() {
         if !detect_metal_device().available {
-            return;
-        }
-        std::env::set_var("CAMELID_METAL_F32Y", "1");
-        std::env::set_var("CAMELID_METAL_WIRE", "1");
-        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
-        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
-            eprintln!(
-                "SKIP gemma3_real_row_resident_forward_matches_runnable_oracle: the \
-                 production GEMV gates (f32y/wire/NSG8) latched off earlier in this \
-                 process; run targeted: CAMELID_GEMMA3_GGUF=... cargo test --release \
-                 --lib gemma3_real_row_resident_forward -- --nocapture"
-            );
             return;
         }
         let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
@@ -23495,8 +23485,30 @@ mod tests {
             );
             return;
         };
+        // The production GEMV gates must be armed BY THE CALLER, not here. They are
+        // process-wide OnceLocks read by every other Metal test in this binary, so
+        // setting them from inside a test latches whichever siblings have not read
+        // them yet onto the wire path — where the standalone block helpers' 36-byte
+        // uploads are read as 34-byte wire blocks and come back NaN. Measured: with
+        // an in-test `set_var` here, `cargo test --lib metal::tests` fails
+        // metal_attention_block_resident_matches_standalone,
+        // metal_ffn_block_resident_matches_standalone,
+        // metal_decode_layer_resident_matches_blocks,
+        // metal_decode_forward_resident_matches_per_layer and
+        // metal_resident_decode_state_matches_full_upload; without it the suite is
+        // green and this test simply SKIPs unless it was invoked targeted.
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_resident_forward_matches_runnable_oracle: the \
+                 production GEMV gates (f32y/wire/NSG8) are not armed. Run targeted: \
+                 CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+                 CAMELID_GEMMA3_GGUF=... cargo test --release --lib \
+                 gemma3_real_row_resident_forward -- --nocapture"
+            );
+            return;
+        }
         let path = path.to_string_lossy().to_string();
-        use crate::gguf::{GgufTensorType, read_metadata};
+        use crate::gguf::{read_metadata, GgufTensorType};
         use crate::model::LlamaModelConfig;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -23750,8 +23762,8 @@ mod tests {
         let mut max_abs_diff_overall = 0.0f32;
         for step in 0..gen_tokens {
             let oracle_logits = oracle.forward_logits(&seq).expect("oracle forward");
-            let resident_logits = forward(*seq.last().unwrap(), seq.len() - 1, true)
-                .expect("resident logits");
+            let resident_logits =
+                forward(*seq.last().unwrap(), seq.len() - 1, true).expect("resident logits");
             assert_eq!(resident_logits.len(), oracle_logits.len());
             let o_tok = argmax(&oracle_logits);
             let r_tok = argmax(&resident_logits);
