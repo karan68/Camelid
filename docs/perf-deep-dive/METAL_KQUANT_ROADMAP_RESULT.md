@@ -50,6 +50,7 @@ cooperative streaming scheduler — see item 5.
 | `CAMELID_METAL_KV_DTYPE` | `f32`, `f16`, `q8` | `f16` for K-quant; `f32` otherwise | Select the resident KV primary representation. The default follows the LOADED MODEL's weights, not the `CAMELID_METAL_KQUANT` gate: a Q8_0 model keeps its F32 cache (and with it the split-K decode attention and the attention-as-matmul prefill, both of which require an F32 primary) even with K-quant admission enabled. |
 | `CAMELID_METAL_KV16` | `0`, `1` | `0` | Legacy alias for `CAMELID_METAL_KV_DTYPE=f16`. |
 | `CAMELID_CONTINUOUS_BATCH_SLOTS` | `1..256` | `2` | Maximum active cooperative streaming sessions. Set `1` for legacy run-to-completion scheduling. |
+| `CAMELID_PREFIX_CACHE_RESIDENT` | `0`, `1` | `1` | Let a GPU-resident session mirror its KV back so the prompt-prefix cache can store it. `0` keeps this lane's CPU KV at zero bytes and accepts a full re-prefill on every repeated prompt. Only ever engages when the round trip is bit-exact (F16 resident primary + non-quantized CPU KV). |
 
 `--deterministic` forces `CAMELID_METAL_KQUANT=0` and
 `CAMELID_METAL_KV_DTYPE=f32` along with the rest of the GPU-off policy.
@@ -67,20 +68,40 @@ cooperative streaming scheduler — see item 5.
   work and management jobs remain exclusive, and run ahead of the streaming
   batch in post order rather than behind it.
 - Cooperative streaming jobs seed from the prompt-prefix cache exactly as the
-  run-to-completion job does — both call `stream_prompt_cache_prologue`. Note
-  that the cache itself is inoperative whenever the GPU-resident prefill drives
-  the prompt: `store_prompt_prefix_cache` requires `cpu_kv_authoritative()`,
-  and a resident prefill advances `kv_cache.position` while leaving the CPU
-  buffers empty, so a cloned-and-resumed session would reseed from zeros. The
-  cache therefore pays off on the CPU lane (and on any run with
-  `CAMELID_METAL_RESIDENT_DECODE=0`), not on the resident lane this PR makes
-  automatic. Measured on an Apple M4, 1974-token prompt, identical turns
-  repeated: 12.68s / 12.76s / 13.06s without the lookup, 12.98s / 0.49s / 0.47s
-  with it.
-- `/props.total_slots` continues to report `1`, matching the single aggregate
-  slot `GET /slots` exposes and the `fail_on_no_slot` arbitration built on it.
-  The cooperative capacity is reported natively as `continuous_batch_slots` on
-  `/health`.
+  run-to-completion job does — both call `stream_prompt_cache_prologue`.
+- The prompt-prefix cache now also covers the GPU-resident lane.
+  `store_prompt_prefix_cache` requires `cpu_kv_authoritative()`, and a resident
+  prefill advances `kv_cache.position` while leaving the CPU buffers empty, so
+  this lane used to store nothing at all and every repeated or growing prompt
+  re-prefilled from scratch. `prepare_for_prompt_prefix_cache` mirrors the GPU
+  history back at store time, and a later resume re-seeds a fresh
+  `ResidentDecodeState` from it. Gated on the round trip being BIT-EXACT in both
+  directions: the resident cache must be F16-primary (queried on the session's
+  own engine, not the process-global format) and the CPU cache must be F32/F16
+  rather than `--kv-quant q8_0|q4_0`. That means Q4_K/Q6_K models are covered
+  and **Q8_0 models are not** — their F32-primary resident cache would be
+  silently f16-rounded on the way out, the same hazard that makes the streaming
+  path bypass this cache entirely under the CUDA resident engine.
+  `CAMELID_PREFIX_CACHE_RESIDENT=0` opts out; the mirror takes this lane's CPU
+  KV from zero bytes to full size and `store_prompt_prefix_cache` then clones
+  it, so a cached entry costs roughly two CPU KV copies of one prompt (the pool
+  holds one entry by default and `ensure_position_capacity` still enforces the
+  session's KV budget).
+  Measured on an Apple M4, Llama-3.2-1B-Instruct-Q4_K_M, zero configuration,
+  the same 1974-token turn repeated three times: **33.23s / 33.33s / 33.54s**
+  before, **33.35s / 0.50s / 0.49s** after, with byte-identical greedy
+  completions across cold and cached turns.
+- `/props.total_slots`, the `GET /slots` array length, and `fail_on_no_slot=1`
+  all answer from one number, `EngineHandle::total_slots`. It is the cooperative
+  capacity except on the CUDA resident lane, where `stream_completion` runs every
+  stream exclusive and the honest answer is `1`. `fail_on_no_slot` refuses only
+  when every slot is busy, so a second stream is admissible while the first is
+  mid-generation; an exclusive job (model load/unload, a non-streaming
+  completion, a cache reset) saturates all slots, because it owns the engine
+  while it runs and no slot can produce a token until it returns. Per-slot task
+  identity and per-slot progress are engine-wide values repeated on the busy
+  entries, declared as `per_slot_task_identity` / `per_slot_progress` in the
+  route's `unsupported` list rather than quietly implied.
 - The plan only labels a model `metal_resident_kquant_runtime` when its tensor
   types are an allow-listed Q4_K/Q6_K/F32/F16/BF16 mix AND its architecture is
   one the resident dense kernels can express. Everything else — including

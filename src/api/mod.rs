@@ -3044,15 +3044,11 @@ async fn llama_server_props(
             },
         },
         // In llama-server semantics `total_slots` is the length of the `/slots`
-        // array, and `GET /slots?fail_on_no_slot=1` arbitrates against those
-        // same slots. Camelid exposes exactly one read-only aggregate slot (see
-        // `llama_server_slots`, whose `unsupported` list already declares
-        // `continuous_batching_metrics`), so reporting the cooperative capacity
-        // here would make the two routes disagree and let a capacity-aware
-        // client compute utilisation against slots it can never observe. The
-        // real streaming capacity is disclosed natively as
-        // `continuous_batch_slots` on `/health`.
-        total_slots: 1,
+        // array, and `GET /slots?fail_on_no_slot=1` arbitrates against those same
+        // slots — so all three answer from `EngineHandle::total_slots`, which is
+        // the cooperative capacity except on the CUDA resident lane, where every
+        // stream runs exclusive and the honest answer is 1.
+        total_slots: state.engine.total_slots().try_into().unwrap_or(u32::MAX),
         model_path: None,
         model_id,
         chat_template,
@@ -3143,7 +3139,13 @@ async fn llama_server_slots(
     let generation_ready = model.is_some_and(loaded_model_generation_ready);
     let slot = state.engine.slot_snapshot();
 
-    if query.fail_on_no_slot.as_deref() == Some("1") && (!generation_ready || slot.is_processing())
+    let total_slots = state.engine.total_slots();
+    let busy_slots = state.engine.busy_slots();
+
+    // Refuse only when there is genuinely no room: with cooperative streaming a
+    // second stream is admissible while the first is mid-generation.
+    if query.fail_on_no_slot.as_deref() == Some("1")
+        && (!generation_ready || busy_slots >= total_slots)
     {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3169,57 +3171,75 @@ async fn llama_server_slots(
         .map(|id| id.min(i32::MAX as u64) as i32)
         .unwrap_or(-1);
 
-    (
-        StatusCode::OK,
-        Json(vec![LlamaServerSlotResponse {
-            id: 0,
-            id_task,
-            n_ctx,
-            speculative: false,
-            is_processing: slot.is_processing(),
-            params: LlamaServerDefaultGenerationParams {
-                n_predict: -1,
-                seed: u32::MAX,
-                temperature: 0.0,
-                top_k: 0,
-                top_p: 1.0,
-                presence_penalty: 0.0,
-                frequency_penalty: 0.0,
-                stop: Vec::new(),
-                max_tokens: -1,
-                ignore_eos: false,
-                stream: true,
-                n_probs: 0,
-                samplers: vec!["greedy"],
-            },
-            prompt: "",
-            next_token: LlamaServerNextTokenProps {
-                has_next_token: generation_ready,
-                has_new_line: false,
-                n_remain: -1,
-                n_decoded: 0,
-                stopping_word: "",
-            },
-            camelid: LlamaServerSlotCamelid {
-                compatibility: "partial_llama_server_slots_read_only",
-                generation_ready,
-                status,
-                engine_queue_depth: state.engine.depth(),
-                queued_tasks: slot.queued_tasks,
-                active_generated_tokens: slot.completed_units,
-                active_elapsed_seconds: slot.active_elapsed_seconds,
-                stalled_seconds: slot.stalled_seconds,
-                unsupported: vec![
-                    "post_slots",
-                    "slot_cache_save_restore_erase",
-                    "prompt_cache_metadata",
-                    "cancellation_metadata",
-                    "continuous_batching_metrics",
-                ],
-            },
-        }]),
-    )
-        .into_response()
+    // One entry per admissible slot, so this array's length is `total_slots` on
+    // `/props` and the denominator `fail_on_no_slot` arbitrates against. The
+    // engine tracks WHICH slots are busy but keeps a single set of progress
+    // atomics for whichever job is stepping, so `id_task` and the progress
+    // fields are engine-wide values repeated on the busy entries rather than
+    // per-slot truth — declared as `per_slot_task_identity` /
+    // `per_slot_progress` in `unsupported` rather than quietly implied.
+    let slots: Vec<LlamaServerSlotResponse> = (0..total_slots)
+        .map(|index| {
+            let busy = index < busy_slots;
+            LlamaServerSlotResponse {
+                id: index.try_into().unwrap_or(u32::MAX),
+                id_task: if busy { id_task } else { -1 },
+                n_ctx,
+                speculative: false,
+                is_processing: busy,
+                params: LlamaServerDefaultGenerationParams {
+                    n_predict: -1,
+                    seed: u32::MAX,
+                    temperature: 0.0,
+                    top_k: 0,
+                    top_p: 1.0,
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    stop: Vec::new(),
+                    max_tokens: -1,
+                    ignore_eos: false,
+                    stream: true,
+                    n_probs: 0,
+                    samplers: vec!["greedy"],
+                },
+                prompt: "",
+                next_token: LlamaServerNextTokenProps {
+                    has_next_token: generation_ready,
+                    has_new_line: false,
+                    n_remain: -1,
+                    n_decoded: 0,
+                    stopping_word: "",
+                },
+                camelid: LlamaServerSlotCamelid {
+                    compatibility: "partial_llama_server_slots_read_only",
+                    generation_ready,
+                    status: if busy {
+                        status
+                    } else if generation_ready {
+                        "idle_generation_ready"
+                    } else {
+                        "unavailable"
+                    },
+                    engine_queue_depth: state.engine.depth(),
+                    queued_tasks: slot.queued_tasks,
+                    active_generated_tokens: if busy { slot.completed_units } else { 0 },
+                    active_elapsed_seconds: if busy { slot.active_elapsed_seconds } else { 0 },
+                    stalled_seconds: if busy { slot.stalled_seconds } else { 0 },
+                    unsupported: vec![
+                        "post_slots",
+                        "slot_cache_save_restore_erase",
+                        "prompt_cache_metadata",
+                        "cancellation_metadata",
+                        "continuous_batching_metrics",
+                        "per_slot_task_identity",
+                        "per_slot_progress",
+                    ],
+                },
+            }
+        })
+        .collect();
+
+    (StatusCode::OK, Json(slots)).into_response()
 }
 
 async fn unsupported_llama_server_slots() -> Response {
@@ -13025,12 +13045,19 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(&x, &y)| x == y).count()
 }
 
-fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
+fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGenerationStep) {
     if prepared.constraint.is_some() {
         return;
     }
-    if !prepared.session.cpu_kv_authoritative()
-        || prepared.session.kv_position() != prepared.token_ids.len()
+    // A GPU-resident prefill leaves the CPU KV buffers empty, which used to make
+    // this bail out and so kept the prompt cache off the lane the CLI selects
+    // automatically. `prepare_for_prompt_prefix_cache` mirrors the GPU history
+    // back when that round trip is bit-exact, and refuses otherwise — a cached
+    // entry must never be a differently-answering shortcut.
+    // Position check FIRST: it is free, and mirroring is not — a session that is
+    // about to be rejected must not pay for hundreds of MiB of KV readback.
+    if prepared.session.kv_position() != prepared.token_ids.len()
+        || !prepared.session.prepare_for_prompt_prefix_cache()
     {
         return;
     }
@@ -13554,7 +13581,7 @@ fn generate_token_ids(
             // by a fresh GPU prefill, and the lookup above is skipped while the resident
             // CUDA engine is active anyway. Keeping it out also avoids a CPU request
             // (after a GPU-off toggle) reusing a GPU-built (f16-seeded) session.
-            store_prompt_prefix_cache(&prepared, &step);
+            store_prompt_prefix_cache(&mut prepared, &step);
         }
         if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -14718,7 +14745,7 @@ fn run_stream_decode_job(
         };
         if generated.is_empty() && !prepared.collect_dense_diagnostics && step.diagnostics.is_none()
         {
-            store_prompt_prefix_cache(&prepared, &step);
+            store_prompt_prefix_cache(&mut prepared, &step);
         }
         if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -15070,7 +15097,7 @@ impl CooperativeStreamDecodeJob {
             && !self.prepared.collect_dense_diagnostics
             && step.diagnostics.is_none()
         {
-            store_prompt_prefix_cache(&self.prepared, &step);
+            store_prompt_prefix_cache(&mut self.prepared, &step);
         }
         if self.generated.is_empty() {
             self.prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
@@ -19187,8 +19214,8 @@ mod tests {
             )
             .unwrap();
         let cached_next_token = step.next_token_id;
-        let warm = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&warm, &step);
+        let mut warm = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut warm, &step);
 
         // A second request for the identical prompt, sharing the same pool.
         let cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
@@ -19237,10 +19264,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
 
         assert!(lookup_prompt_prefix_cache(&prepared).is_none());
-        store_prompt_prefix_cache(&prepared, &step);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let match_res = lookup_prompt_prefix_cache(&prepared).expect("exact key cache hit");
         assert_eq!(match_res.cached.session.kv_cache.position, 2);
@@ -19267,7 +19294,7 @@ mod tests {
             .unwrap();
         let mut longer = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 0], longer_session);
         longer.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
-        store_prompt_prefix_cache(&longer, &longer_step);
+        store_prompt_prefix_cache(&mut longer, &longer_step);
         let exact = lookup_prompt_prefix_cache(&prepared).expect("exact entry still wins");
         assert!(exact.is_exact_match);
         assert_eq!(exact.cached.token_ids, vec![1, 2]);
@@ -19320,8 +19347,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let mut extended = prepared_for_cache(
             "tiny",
@@ -19412,8 +19439,8 @@ mod tests {
         let mut prep3 = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session3);
         prep3.cached_prompt_prefix = pool_ref.clone();
 
-        store_prompt_prefix_cache(&prep1, &step1);
-        store_prompt_prefix_cache(&prep2, &step2);
+        store_prompt_prefix_cache(&mut prep1, &step1);
+        store_prompt_prefix_cache(&mut prep2, &step2);
         assert!(lookup_prompt_prefix_cache(&prep1).is_some());
         {
             let mut pool = pool_ref.lock().unwrap();
@@ -19427,7 +19454,7 @@ mod tests {
             }
         }
 
-        store_prompt_prefix_cache(&prep3, &step3);
+        store_prompt_prefix_cache(&mut prep3, &step3);
         let remaining = pool_ref
             .lock()
             .unwrap()
@@ -19478,8 +19505,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
         assert!(prepared
             .cached_prompt_prefix
             .lock()
@@ -19507,8 +19534,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&unconstrained, &step);
+        let mut unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut unconstrained, &step);
         assert!(
             lookup_prompt_prefix_cache(&unconstrained).is_some(),
             "control: the unconstrained twin hits the warm cache"
@@ -19551,7 +19578,7 @@ mod tests {
             .unwrap();
         let mut constrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
         constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
-        store_prompt_prefix_cache(&constrained, &step);
+        store_prompt_prefix_cache(&mut constrained, &step);
 
         let mut unconstrained = prepared_for_cache(
             "tiny",
@@ -19580,8 +19607,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
-        store_prompt_prefix_cache(&prepared, &step);
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
 
         let generated = generate_token_ids(prepared).expect("cached generation should succeed");
 
