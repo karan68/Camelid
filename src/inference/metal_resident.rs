@@ -164,10 +164,17 @@ impl super::LlamaInferenceSession {
 
         let session_us = session_started.elapsed().as_micros();
         let embed_started = Instant::now();
-        let embeddings = self
+        let mut embeddings = self
             .weights
             .token_embedding
             .embedding_lookup(token_ids, "token_embedding_resident_prefill")?;
+        // gemma3 embedding scale (dormant: a gemma3 session carries a layer
+        // schedule, which prefill_tokens declines — wired for Phase 3).
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for v in embeddings.data.iter_mut() {
+                *v *= g.embed_scale;
+            }
+        }
         // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
         let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights
@@ -564,6 +571,16 @@ impl super::LlamaInferenceSession {
                     metal::SampleStage {
                         embedding_blocks,
                         mode: gpu_sample.expect("sample request matched above").mode(),
+                        // gemma3's sqrt(d_model) embedding scale rides the GPU
+                        // gather so the fast lane's self-fed next token matches
+                        // the CPU-written embedding below; exact no-op (1.0)
+                        // for every other arch.
+                        embed_scale: self
+                            .config
+                            .gemma3
+                            .as_ref()
+                            .map(|g| g.embed_scale)
+                            .unwrap_or(1.0),
                     },
                 )
             }
@@ -608,12 +625,23 @@ impl super::LlamaInferenceSession {
                 None,
             )
         };
+        // gemma3 scales token embeddings by sqrt(d_model) before layer 0
+        // (reference src/runnable/model.rs:787-792). Applied here on the
+        // resident lane's input; the GPU sampling gather applies the same
+        // scale for the fast lane's self-fed next token.
+        let scaled_embedding: Vec<f32>;
+        let embedding_data: &[f32] = if let Some(g) = self.config.gemma3.as_ref() {
+            scaled_embedding = embedding.data.iter().map(|v| v * g.embed_scale).collect();
+            &scaled_embedding
+        } else {
+            &embedding.data
+        };
         let session = self
             .resident_decode
             .as_mut()
             .expect("resident session built above");
         let out = match session.forward_token(
-            &embedding.data,
+            embedding_data,
             &layer_views,
             &tables.cos,
             &tables.sin,
@@ -703,10 +731,17 @@ impl super::LlamaInferenceSession {
         let mut inputs = Vec::with_capacity(k);
         inputs.push(last_token);
         inputs.extend_from_slice(drafts);
-        let embeddings = self
+        let mut embeddings = self
             .weights
             .token_embedding
             .embedding_lookup(&inputs, "token_embedding_spec_verify")?;
+        // gemma3 embedding scale (dormant: verify declines schedule-carrying
+        // sessions — wired for consistency).
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for v in embeddings.data.iter_mut() {
+                *v *= g.embed_scale;
+            }
+        }
 
         // Per-position RoPE tables (position `base+i`), flattened position-major.
         let mut cos_all = Vec::with_capacity(k * head_dim);
@@ -843,10 +878,17 @@ impl super::LlamaInferenceSession {
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
 
         // Embeddings in BFS (node) order: node 0 is the anchor, nodes 1.. the drafts.
-        let embeddings = self
+        let mut embeddings = self
             .weights
             .token_embedding
             .embedding_lookup(&tree.tokens, "token_embedding_tree_verify")?;
+        // gemma3 embedding scale (dormant: verify declines schedule-carrying
+        // sessions — wired for consistency).
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for v in embeddings.data.iter_mut() {
+                *v *= g.embed_scale;
+            }
+        }
 
         // Per-node RoPE tables at position `base + node_depth[i]` (flattened node-major).
         let node_depth = tree.node_depth();

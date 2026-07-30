@@ -4071,12 +4071,16 @@ kernel void embed_row_gather_q8_wire(
     device const uint* token_id [[buffer(1)]],
     device float* out [[buffer(2)]],
     constant uint& bpr [[buffer(3)]],
+    // Post-dequant multiplier: 1.0 for Llama-family rows (x * 1.0f is exact,
+    // so this is bit-identical to the pre-scale kernel), sqrt(d_model) for
+    // gemma3's embedding scale (reference src/runnable/model.rs:787-792).
+    constant float& embed_scale [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= bpr * 32) return;
     device const char* wb = emb + ((ulong)token_id[0] * bpr + gid / 32) * 34;
     const float scale = float(*reinterpret_cast<device const half*>(wb));
-    out[gid] = float(wb[2 + (gid % 32)]) * scale;
+    out[gid] = float(wb[2 + (gid % 32)]) * scale * embed_scale;
 }
 
 // ---------------------------------------------------------------------------
@@ -11004,6 +11008,11 @@ pub struct SampleStage<'a> {
     /// cache, or page-aligned wire pages wrapped in place).
     pub embedding_blocks: ResidentWeightBytes<'a>,
     pub mode: SampleMode,
+    /// Post-dequant multiplier applied by the GPU gather: 1.0 for Llama-family
+    /// rows (exact no-op), `Gemma3Metadata::embed_scale` (sqrt(d_model)) for
+    /// gemma3 — the gathered row feeds the NEXT token graph's layer 0, which
+    /// expects the scaled embedding just like the CPU-written one.
+    pub embed_scale: f32,
 }
 
 /// What a resident forward_token call produced: the raw logits/hidden vector (CPU
@@ -11824,10 +11833,13 @@ impl ResidentDecodeState {
                 let nb = |bytes: u64| pool_get(k, bytes);
                 let id_buf = nb(4);
                 let am_scalar = nb(4);
-                let eg_scalar = nb(4);
+                // Gather scalar: bpr (u32) | embed_scale (f32).
+                let eg_scalar = nb(8);
                 unsafe {
                     *(am_scalar.contents() as *mut u32) = s.vocab_size as u32;
-                    *(eg_scalar.contents() as *mut u32) = bpr_hidden as u32;
+                    let p = eg_scalar.contents() as *mut u8;
+                    *(p as *mut u32) = bpr_hidden as u32;
+                    *(p.add(4) as *mut f32) = sample.embed_scale;
                 }
                 match sample.mode {
                     SampleMode::Greedy => {
@@ -11874,6 +11886,7 @@ impl ResidentDecodeState {
                 e.set_buffer(1, Some(&id_buf), 0);
                 e.set_buffer(2, Some(&self.buf_a), 0);
                 e.set_buffer(3, Some(&eg_scalar), 0);
+                e.set_buffer(4, Some(&eg_scalar), 4);
                 dispatch_1d(e, &k.embed_row_gather_q8_wire_pipeline, self.hidden);
                 keep.extend([am_scalar, eg_scalar]);
                 Some(id_buf)
@@ -22265,24 +22278,44 @@ mod tests {
         let ob = k
             .device
             .new_buffer((hidden * 4) as u64, MTLResourceOptions::StorageModeShared);
-        let sc = k
-            .device
-            .new_buffer(4, MTLResourceOptions::StorageModeShared);
-        unsafe { *(sc.contents() as *mut u32) = bpr as u32 };
-        let cb = k.queue.new_command_buffer();
-        let e = cb.new_compute_command_encoder();
-        e.set_compute_pipeline_state(&k.embed_row_gather_q8_wire_pipeline);
-        e.set_buffer(0, Some(&eb), 0);
-        e.set_buffer(1, Some(&ib), 0);
-        e.set_buffer(2, Some(&ob), 0);
-        e.set_buffer(3, Some(&sc), 0);
-        dispatch_1d(e, &k.embed_row_gather_q8_wire_pipeline, hidden);
-        e.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-        let mut got = vec![0.0f32; hidden];
-        read_buffer_f32(&ob, &mut got);
-        assert_eq!(got, expected);
+        let run_gather = |embed_scale: f32| -> Vec<f32> {
+            let sc = k
+                .device
+                .new_buffer(8, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = sc.contents() as *mut u8;
+                *(p as *mut u32) = bpr as u32;
+                *(p.add(4) as *mut f32) = embed_scale;
+            }
+            let cb = k.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&k.embed_row_gather_q8_wire_pipeline);
+            e.set_buffer(0, Some(&eb), 0);
+            e.set_buffer(1, Some(&ib), 0);
+            e.set_buffer(2, Some(&ob), 0);
+            e.set_buffer(3, Some(&sc), 0);
+            e.set_buffer(4, Some(&sc), 4);
+            dispatch_1d(e, &k.embed_row_gather_q8_wire_pipeline, hidden);
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let mut got = vec![0.0f32; hidden];
+            read_buffer_f32(&ob, &mut got);
+            got
+        };
+        // embed_scale = 1.0 is exact (x * 1.0f): bit-identical to the plain
+        // CPU dequant.
+        assert_eq!(run_gather(1.0), expected);
+        // gemma3 embed scale (sqrt(1152)): each element is dequant * scale.
+        let g3 = (1152.0f32).sqrt();
+        let got_scaled = run_gather(g3);
+        for (i, (a, b)) in got_scaled.iter().zip(&expected).enumerate() {
+            let want = b * g3;
+            assert!(
+                (a - want).abs() <= want.abs() * 1.0e-6 + 1.0e-6,
+                "element {i}: {a} != {want}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
