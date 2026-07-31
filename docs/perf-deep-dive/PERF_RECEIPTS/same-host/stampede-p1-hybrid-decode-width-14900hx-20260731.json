@@ -1,0 +1,78 @@
+{
+  "what": "Sizing the Windows decode pool to the performance-core count instead of the raw physical-core count on a hybrid Intel host. A/B of one binary with the policy default-on vs CAMELID_WIN_HYBRID_POLICY=off, plus a width sweep, a placement sweep, and a replication attempt under memory pressure.",
+  "lever": "hybrid decode width (default-on, Intel + multi-EfficiencyClass only); kill switch CAMELID_WIN_HYBRID_POLICY=0|false|off|no",
+  "supersedes": "p1-cpu-thread-sweep-llama3b-20260621T2150Z.json, whose host was an i7-11800H 8C/16T -- a non-hybrid part where physical-core count and performance-core count are the same number.",
+  "camelid_head": "ee3e537df",
+  "host": "win i9-14900HX 8P+16E (24 physical / 32 logical), RTX 4060 Laptop present but CPU decode forced",
+  "model": "<home>/models/Llama-3.2-1B-Instruct-Q8_0.gguf",
+  "method": {
+    "sampling_unit": "one server process (the decode pool is built once per process)",
+    "pairing": "arms randomized within each rep, compared paired",
+    "transport": "/v1/chat/completions, temperature=0",
+    "env": "CAMELID_CUDA_RESIDENT_DECODE=0 throughout (resident CUDA decode is on by default when a device is present and would decide the result instead of the thread policy)"
+  },
+
+  "results": {
+    "note": "Free memory 7.25-7.84 GB, server RSS 1.77 GB. Absolute values on this host move strongly with free memory; the paired randomized arms are what make the comparison survive that.",
+    "n_paired_starts_per_arm": 6,
+    "arms": {
+      "policy_off_24_workers": { "decode_tok_s": 31.754, "sd": 0.378, "wall_s": 2.096, "ttft_s": 0.081, "cpu_s": 52.6 },
+      "policy_on_8_workers":   { "decode_tok_s": 37.050, "sd": 0.245, "wall_s": 1.805, "ttft_s": 0.078, "cpu_s": 23.5 }
+    },
+    "paired_deltas": {
+      "decode_tok_s": { "delta": 5.296, "pct": 16.7, "ci95": [4.992, 5.600], "won": "6/6", "significant": true },
+      "cpu_s":        { "delta": -29.110, "pct": -55.3, "ci95": [-31.093, -27.127], "won": "0/6", "significant": true },
+      "ttft_s":       { "delta": -0.003, "significant": false, "note": "prefill is untouched and keeps its own wider pool" }
+    }
+  },
+
+  "width_sweep": {
+    "note": "Answers 'why EfficiencyClass rather than any number below physical'. Baseline is the shipped default (24).",
+    "n_paired_starts_per_arm": 6,
+    "baseline_24_tok_s": 32.621,
+    "results": {
+      "4":  { "decode_tok_s": 29.645, "delta_vs_24": -2.976, "ci95": [-3.794, -2.158], "won": "0/6", "note": "worse than shipping nothing -- under-selection is a NEGATIVE direction" },
+      "8":  { "decode_tok_s": 37.536, "delta_vs_24": 4.915, "ci95": [4.006, 5.823], "won": "6/6", "note": "= performance-core count" },
+      "12": { "decode_tok_s": 36.285, "delta_vs_24": 3.664, "ci95": [2.842, 4.486], "won": "6/6" },
+      "16": { "decode_tok_s": 34.579, "delta_vs_24": 1.958, "ci95": [0.706, 3.210], "won": "6/6" },
+      "24": { "decode_tok_s": 32.621, "note": "shipped default" }
+    },
+    "against_8_directly": {
+      "4":  { "delta": -7.891 },
+      "12": { "delta": -1.251, "ci95": [-1.488, -1.013] },
+      "16": { "delta": -2.957, "ci95": [-4.650, -1.263] }
+    }
+  },
+
+  "placement_sweep": {
+    "note": "Why this lever ships NO pinning. Compared against the identically-sized pool left unpinned. CAMELID_WIN_PIN is left byte-identical to main.",
+    "unpinned_tok_s": 37.050,
+    "results": {
+      "SetThreadIdealProcessor": { "decode_tok_s": 36.504, "delta": -0.546, "ci95": [-1.149, 0.057], "significant": false },
+      "SetThreadAffinityMask":   { "decode_tok_s": 35.364, "delta": -1.686, "ci95": [-2.267, -1.105], "won": "0/6", "significant": true }
+    }
+  },
+
+  "parity": {
+    "distinct_sha256_over_all_measured_requests": 1,
+    "requests": 54,
+    "why": "decode parallelises over independent output rows with serial per-row reductions, so pool width cannot change the arithmetic"
+  },
+
+  "gpu_host": {
+    "note": "With resident CUDA decode driving decode the pool width is irrelevant.",
+    "n": 8,
+    "this_width_tok_s": 139.843,
+    "default_tok_s": 141.201,
+    "pct": -1.0,
+    "significant": false
+  },
+
+  "verdict": "Ships default-on for GenuineIntel hosts reporting more than one EfficiencyClass: +16.7% decode, -55.3% CPU seconds, byte-identical output, TTFT unmoved. CAMELID_WIN_HYBRID_POLICY=off restores the previous width exactly.",
+
+  "open_questions": [
+    "Whether the performance-core count is the right width on a differently shaped hybrid part (2P+8E, 4P+4E) is unmeasured; the policy would build a 2- or 4-wide pool there and the sweep measures 4 as negative.",
+    "AMD is gated out by a CPUID vendor check rather than measured: Zen 5c compact cores and multi-CCD desktop parts also report more than one EfficiencyClass without being a P/E split. The gate comes off when an AMD host is measured.",
+    "The per-host optimum stays deferred to GAIT; this receipt only replaces a default derived on a non-hybrid part with one derived on a hybrid part."
+  ]
+}
