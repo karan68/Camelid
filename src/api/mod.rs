@@ -4290,33 +4290,45 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the runnable lane is correct but slow vs an optimized SIMD/CUDA kernel).",
                 next_step: "preserve the parity-certified runnable lane + the read/list/write agent capability for this exact row; an optimized-lane qwen35 kernel for production throughput, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
             },
-            // MUSTER M-A1 (2026-07-16): gemma3 1B promoted on the runnable serve lane
-            // (the only lane with a correct gemma3 forward — the optimized dense lane
-            // now BINDS gemma3's norms, gemma3-Metal campaign Phase 1, but still does
-            // not apply the sandwich norms and has no GeGLU, dual-theta RoPE, or
-            // sliding-window mask, so it stays fail-closed for chat via
-            // is_runnable_serve_arch). Filename-anchored id
-            // (`gemma_3_1b_it_q8_0` = normalized GGUF filename) so the frontend
-            // exact-row identity matcher resolves the local file; the catalog entry
-            // `gemma3_1b_it_q8_0` resolves via the filename/name match.
+            // MUSTER M-A1 (2026-07-16), re-anchored onto the Metal GPU-resident
+            // lane by the gemma3→Metal campaign (2026-07-30, Phases 0-5;
+            // GEMMA3_METAL_CONDUCTOR.md). The lane story is the whole row:
+            //   * Metal host with the resident decode lane available (the
+            //     DEFAULT): `metal_resident_q8_runtime` serves this row. It is
+            //     the first gemma3 forward in-tree that applies the 512-token
+            //     sliding-window mask and the 5:1 local/global schedule.
+            //   * Anywhere the resident lane cannot run (non-macOS, no Metal
+            //     device, CAMELID_METAL_RESIDENT_DECODE=0, deterministic mode,
+            //     CUDA-resident) or the file is not this Q8_0 row:
+            //     `model::arch_requires_runnable_bridge` routes back to the
+            //     runnable CPU bridge, which implements NO window mask — so the
+            //     ">512 tokens is wrong by construction" blocker is a RUNNABLE-
+            //     LANE property and stays stated as one below.
+            //   * The CPU dense forward is fail-closed for windowed archs at all
+            //     three dispatch sites (`ensure_windowed_arch_off_cpu_dense`), so
+            //     no routing mistake can silently run gemma3 full-causal.
+            // Filename-anchored id (`gemma_3_1b_it_q8_0` = normalized GGUF
+            // filename) so the frontend exact-row identity matcher resolves the
+            // local file; the download-catalog entry uses the SAME id (Phase 3c)
+            // so `filename_is_supported_exact_row` joins the two.
             ModelCompatibilityTarget {
                 id: "gemma_3_1b_it_q8_0",
                 tool_capable: false,
-                family: "gemma3_runnable_decoder",
+                family: "gemma3_windowed_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
-                support_scope: "exact_row_smoke_only",
+                support_scope: "exact_row_metal_gpu_resident_windowed_chat_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "strict all-leg parity (one documented 50-token near-tie at a 0.3416-nat gap — ABOVE the Ornith 0.33-nat soft-position line, attributed only under the Llama-3.2-3B gaps-stated precedent), context above the 512-token sliding window (the runnable lane implements no window mask, so longer sequences are mathematically wrong by construction), bounded-context packs, perf (observed ~5 s/token on the pure-f32 runnable CPU lane — recorded, not a claim), tool capability (tools fail closed with a typed 422), GPU lane (runnable CUDA is qwen35-gated), portability, and durable repeated current-head bundles remain missing",
+                full_support_blockers: "context above 2,403 prompt tokens (the file's native 32,768 is UNMEASURED, as is everything between ~2.4k and 32k); token-exact raw /v1/completions at depth 50 (three disclosed near-tie flips, one of them a 0.4471-nat stable-oracle near-tie — the clean raw-decode claim stops at DEPTH 5, while the chat lane is clean at 1/5/50); the repo's bounded-context ladder packs (512/1024/2048/4096/8192) were NOT run for this row — the windowed pack is a different artifact; throughput/performance (NOT claimed and NOT measured for release on this lane — a separate measurement phase owes it); the RUNNABLE CPU BRIDGE lane, which serves this row wherever the Metal resident lane cannot run and implements no window mask, so on THAT lane context above the 512-token sliding window remains mathematically wrong by construction (demonstrated: 1.667-nat disagreement with the pinned oracle at the divergence position of a 606-token prompt); tool capability (no gemma3 tools branch and no certified grammar on any lane — tools fail closed with a typed 422); multi-turn, streaming, speculative decode (declined for windowed archs) and the prompt-prefix cache (bypassed for windowed archs); neighbouring gemma3 sizes/quants (a non-Q8_0 gemma3 file is declined by resident admission and falls back to the runnable bridge); frontend load-path promotion; portability; and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
-                tokenizer_works: "validated_cross_engine_prompt_tokenization_identical_5_of_5_spm_llama_262k_vocab",
-                tensors_load: "validated_183_q8_0_plus_157_f32_tied_embedding_runnable_resident",
-                generation_runs: "runnable_serve_cpu_chat_greedy_with_eog_stop",
-                parity_audited: "gemma3_marker_chat_token_and_text_parity_1_5_50_four_of_five_prompts_all_depths_fifth_identical_at_1_5_single_flip_at_50_index_16_gap_stated_vs_llamacpp_acd79d6",
-                performance_measured: "observed_about_5_s_per_token_cpu_runnable_recorded_not_a_perf_claim",
+                tokenizer_works: "validated_cross_engine_prompt_tokenization_identical_5_of_5_sub512_plus_3_of_3_windowed_606_1205_2403_spm_llama_262k_vocab",
+                tensors_load: "validated_183_q8_0_plus_157_f32_tied_embedding_metal_gpu_resident",
+                generation_runs: "metal_gpu_resident_serve_chat_greedy_with_eog_stop_default_lane_on_metal_hosts_runnable_bridge_fallback_elsewhere",
+                parity_audited: "gemma3_metal_resident_chat_token_and_text_identical_15_of_15_legs_at_1_5_50_sub512_plus_9_of_9_legs_at_606_1205_2403_prompt_tokens_zero_flips_vs_llamacpp_acd79d603_raw_completions_clean_through_depth_5_only",
+                performance_measured: "not_claimed_resident_lane_throughput_is_a_separate_unshipped_measurement_phase",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
-                tested_context: "gemma3_marker_chat_1_5_50_smoke_total_sequence_well_under_the_512_token_sliding_window",
+                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, and served on the Metal GPU-resident lane (selected_backend=metal_resident_q8_runtime, decode_path=q8_0_metal_resident_decode) — on by default on a Metal host, opt-out CAMELID_METAL_RESIDENT_DECODE=0. Off that lane the runnable CPU bridge serves the row and only the sub-512 envelope is green; the windowed claim below does not travel to it",
+                tested_context: "gemma3_chat_greedy_1_5_50_at_606_1205_and_2403_prompt_tokens_plus_50_generated_all_above_the_512_token_sliding_window_metal_resident_lane_only",
                 chat_template_renderer: "gemma3_marker_native_byte_locked_by_shapes_pack",
                 chat_template_shape_pack: "validated_in_src_pack_lock_test",
                 chat_template_shape_pack_id: "gemma3-chat-template-shapes-v1",
@@ -4335,11 +4347,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "runnable_serve_gemma3_chat_parity",
+                latest_checked_bucket: "metal_gpu_resident_windowed_chat_parity_606_1205_2403_prompt_tokens",
                 latest_checked_result: "pass",
-                latest_checked_output: "qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb/README.md",
-                evidence: "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding, served via the runnable lane (CAMELID_RUNNABLE_SERVE=1, CPU) with the new gemma3 marker renderer — byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test — and EOG-stopping dense decode. Greedy chat parity vs pinned llama.cpp acd79d603 (build 9632, CPU llama-server /completion -ngl 0), committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at 1/5/50: 4/5 prompts token-AND-text identical at every depth (incl. a natural early-stop leg proving stop semantics); the fifth is identical at 1/5 and diverges at position 16 of the 50-token leg — probed in solo oracle sessions: camelid's token is the oracle's immediate #2 at a 0.3416-nat top-2 gap, with the oracle BIT-STABLE across thread-count (default/4/2) and runtime-repack kernel controls. DISCLOSED PLAINLY: that gap exceeds the Ornith <=0.33-nat soft-position precedent and no oracle-side backend flip exists, so the flip rests on the Llama-3.2-3B 'documented near-ties with gaps stated' precedent — the weakest single attribution in the MUSTER campaign to date. Cross-engine prompt tokenization identical on 5/5 prompts (llama /tokenize vs camelid encode, incl. BOS placement); determinism sanity byte-identical across two independent serve sessions; the pre-existing HF-reference receipt qa/runnable/gemma3-parity.json (all_greedy_match=true, SHA-anchored to this exact file) anchors the engine math independently. Sequences are scoped well under the 512-token sliding window the runnable lane does not mask. Observed decode ~5 s/token on the pure-f32 CPU lane (recorded, NOT a perf claim). Bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb. NOT claimed: strict all-leg parity, any context at or beyond the 512-token window, bounded-context packs, tools (fail closed, typed 422), throughput, GPU residency, neighboring gemma3 sizes/quants, or the gemma4 family.",
-                next_step: "a runnable-lane sliding-window mask (or an optimized-lane gemma3 forward) before any context claim at or beyond 512 tokens; per-row perf work if the ~5 s/token CPU lane matters; agent-eval battery before any tool_capable claim",
+                latest_checked_output: "qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053/README.md",
+                evidence: "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding. LANE: on a Metal host the row is served by DEFAULT on the GPU-resident Q8_0 lane (selected_backend metal_resident_q8_runtime, decode_path q8_0_metal_resident_decode, prefill_path q8_0_metal_resident_prefill), the first gemma3 forward in-tree carrying the 5:1 local/global schedule and the 512-token sliding-window mask; the gemma3 marker renderer (byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test) is shared with the dense lane, and decode stops on EOG. ORACLE: pinned llama.cpp acd79d603 (llama-server build 9632, CPU backend, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096, binary sha256 prefix 382096b1), two-phase throughout — the two engines were never resident together. SUB-512 CHAT: committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at greedy depths 1/5/50 — 15/15 generation legs token-AND-text IDENTICAL, zero flips, with cross-engine prompt tokenization identical 5/5. ABOVE THE WINDOW (the claim this lane exists for): committed pack qa/prompt-packs/gemma3-windowed-context-pack-v1.json, three prompts rendering to 606 / 1205 / 2403 tokens (1.18x / 2.35x / 4.69x the file's own gemma3.attention.sliding_window=512), each answerable only from its first sentence — 3/3 prompt tokenization identical and 9/9 generation legs at 1/5/50 token-AND-text IDENTICAL, ZERO flips. That the window is REAL and not decorative is shown by the contrast leg: on the same 606-token prompt and the same oracle capture, the runnable CPU bridge (no window mask) diverges at generated index 2 and never resynchronises, and re-fed the identical prefix the oracle ranks the runnable lane's token 1.667 nats behind its own — four times the largest disclosed near-tie in the bundle, so not a near-tie. That leg is ONE prompt at ONE depth: a demonstration, not a runnable-lane receipt. DETERMINISM: two fresh camelid serve processes with a full stop/start between them produce byte-identical receipt files (6 chat legs incl. the 2403-token prompt plus 5 raw-completion legs carrying actual emitted ids; sha256 prefix 632992c6). RAW /v1/completions is committed as-is with all_pass=false and is DISCLOSED, not hidden: depths 1 and 5 are clean 4/4, and at depth 50 three legs flip — camelid's token is the oracle's rank 1 on two of them when the oracle decodes continuously rather than from a re-fed prefix, while the third ('Once upon a time,') has a rank-1-stable oracle and camelid's token at 0.4471 nat, ABOVE both the Ornith 0.33-nat line and the frozen runnable bundle's 0.3416; a separate harness artifact (SPM whitespace re-encode) is identified and excluded from that count rather than tuned away. Bundle qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053 (README + manifest + SHA256SUMS, 20 artifacts). The frozen runnable-lane bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb stands as history for that other lane and is NOT re-adjudicated here. NOT claimed: any throughput or speed number on this lane, any comparison against another engine's speed, token-exact raw completions at depth 50, any context above 2,403 prompt tokens, the bounded-context ladder packs, multi-turn, streaming, tools (fail closed, typed 422), speculative decode or the prompt-prefix cache (both fail closed for windowed archs), neighbouring gemma3 sizes/quants, or the gemma4 family.",
+                next_step: "measure and publish the resident lane's throughput as its own receipt before any perf wording appears on this row; extend the windowed pack past 2,403 prompt tokens toward the file's native 32,768 before widening tested_context; adjudicate the three depth-50 raw-completion near-ties with a chat-shaped raw pack or an oracle-side reduction-order study before any raw token-exactness claim past depth 5; run the bounded-context ladder packs; a runnable-lane sliding-window mask (or removing that fallback) before any >512 claim travels to non-Metal hosts; agent-eval battery before any tool_capable claim",
             },
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
@@ -18636,13 +18648,16 @@ mod tests {
                 // cross-backend control); prompt tokenization 8/8. LOCAL file,
                 // upstream provenance unresolved (SHA-anchored). Raw-decode smoke only.
                 "llama_3_2_1b_instruct_q4_k_m",
-                // gemma3 1B Q8_0 (MUSTER M-A1, filename-anchored id): runnable serve
-                // lane chat parity vs llama.cpp acd79d603 — 4/5 gate-pack prompts
-                // token+text identical at every 1/5/50 depth, fifth identical at 1/5
-                // with a single documented 50-token flip (oracle-#2, 0.3416-nat gap
-                // stated; above the Ornith soft line, disclosed in the evidence);
-                // prompt tokenization 5/5 cross-engine; renderer byte-locked by the
-                // shapes pack. Chat smoke only, <512-token sliding-window scope.
+                // gemma3 1B Q8_0 (MUSTER M-A1, filename-anchored id; re-anchored by
+                // the gemma3→Metal campaign 2026-07-30): Metal GPU-resident serve
+                // lane by default on Metal hosts, chat parity vs llama.cpp acd79d603
+                // — 15/15 gate-pack legs token+text identical at 1/5/50 below the
+                // window, and 9/9 legs identical at 606/1205/2403 prompt tokens
+                // ABOVE the 512-token sliding window, zero flips; prompt
+                // tokenization 5/5 + 3/3 cross-engine. Chat smoke only, bounded at
+                // 2,403 prompt + 50 generated tokens; raw completions are clean
+                // through depth 5 only. Off Metal the runnable CPU bridge serves
+                // this row and the >512 claim does NOT travel with it.
                 "gemma_3_1b_it_q8_0",
                 // Llama-3.2-1B-Instruct IQ4_XS (i-quant, llama BPE): GPU-resident
                 // iq4xs_gemv raw-decode greedy parity vs llama.cpp acd79d6 — 2/4

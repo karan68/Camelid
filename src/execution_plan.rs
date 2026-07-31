@@ -1150,11 +1150,17 @@ fn recognized_row_level(row: &str) -> &'static str {
         // sizes — neither validated for qwen3.)
         "supported_exact_row_smoke_chatml"
     } else if normalized.contains("gemma_3_1b_it") {
-        // gemma-3-1b-it Q8_0 (gemma3→Metal Phase 3b): the Metal-resident lane
-        // carries the full windowed forward, token-identical to the runnable
-        // oracle at depths 1/5/50 under the <512-token Phase 2/3a gates
-        // (GEMMA3_METAL_CONDUCTOR.md §9b/§10b/§10d). The ≥512-token windowed
-        // receipt is Phase 4; this level string stays sub-512 until it lands.
+        // gemma-3-1b-it Q8_0 (gemma3→Metal Phases 3b-5). The ≥512-token
+        // windowed receipt LANDED in Phase 4 — 9/9 legs token-and-text
+        // identical to the pinned external oracle at 606/1205/2403 prompt
+        // tokens — but this string deliberately STAYS `sub512`, because this
+        // table is platform-blind: the same level string is reported on hosts
+        // where the resident lane cannot run and the runnable CPU bridge (no
+        // window mask) serves the row instead. `sub512` is the envelope that
+        // holds on EVERY host that recognizes this row; widening it here would
+        // over-claim on the fallback host. The lane-aware 2,403-prompt-token
+        // claim lives in `/api/capabilities` (row `gemma_3_1b_it_q8_0`), which
+        // is the support source of truth and states the lane it applies to.
         // Non-Q8_0 quants of the same name report unknown via `support_level`
         // and are declined by the resident admission (hazard H5).
         "supported_exact_row_smoke_sub512"

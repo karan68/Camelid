@@ -69,6 +69,7 @@
         "exact_row_distributed_serve_smoke_only",
         "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
         "exact_row_gpu_resident_raw_decode_parity_smoke_only",
+        "exact_row_metal_gpu_resident_windowed_chat_smoke_only",
         "exact_row_single_node_cpu_smoke_only",
         "exact_row_smoke_only",
         "exact_row_validation_only",
