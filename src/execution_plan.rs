@@ -432,6 +432,29 @@ pub fn plan_for_model_with_platform(
     ExecutionPlanOutcome { plan, env_updates }
 }
 
+/// Whether the macOS Q8 Metal-resident PLAN selection can fire in this process
+/// at all, independent of the model and of Metal device presence: not the Safe
+/// profile, and neither `CAMELID_MAC_Q8_REPACK` nor `CAMELID_MAC_Q8_METAL_PLAN`
+/// opted out. These are exactly the three early returns in
+/// [`select_macos_q8_plan`] that precede its Metal-resident arm.
+///
+/// Phase 3c: `inference::windowed_arch_resident_host_available` consults this
+/// so gemma3's ROUTING and the disclosed execution plan agree. Before, an
+/// operator running `CAMELID_PROFILE=safe` or `CAMELID_MAC_Q8_METAL_PLAN=0` got
+/// a plan advertising `cpu_reference` / `safe_cpu_decode` (with the windowed
+/// arm's reason string literally saying "serve chats via the runnable bridge")
+/// while serve ran the Metal-resident lane anyway — the plan is pure disclosure
+/// and cannot disarm the runtime gate, so the disclosure was simply wrong.
+///
+/// Non-windowed archs are unaffected: for them the plan opting out of the Metal
+/// selection genuinely does leave a correct CPU lane, which is the point of the
+/// opt-out.
+pub fn macos_q8_metal_plan_selectable() -> bool {
+    !matches!(requested_profile().0, ExecutionProfile::Safe)
+        && !env_flag_disabled("CAMELID_MAC_Q8_REPACK")
+        && !env_flag_disabled("CAMELID_MAC_Q8_METAL_PLAN")
+}
+
 fn select_macos_q8_plan(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,
@@ -446,14 +469,32 @@ fn select_macos_q8_plan(
     &'static str,
     &'static str,
 ) {
+    // The windowed-arch reason is pushed alongside every early return below,
+    // not only the one after the Metal arm: `safe_q8_plan()` names CPU dense
+    // paths that a windowed arch can never run (H4), so the disclosure must
+    // say where those chats actually go. Phase 3c — under `CAMELID_PROFILE=
+    // safe` this previously disclosed a bare "safe profile" reason and the
+    // reader had no way to tell gemma3 was being served by the bridge.
+    let windowed_bridge_reason = || {
+        "windowed-attention row (gemma3) without an active Metal-resident selection: no CPU \
+         dense plan exists for this arch — serve chats via the runnable bridge; failing \
+         closed to safe path"
+            .to_string()
+    };
     if matches!(profile, ExecutionProfile::Safe) {
         reasons.push("safe profile selected; optimized Mac Q8 paths disabled".into());
+        if windowed_attention_arch {
+            reasons.push(windowed_bridge_reason());
+        }
         return safe_q8_plan();
     }
     if env_flag_disabled("CAMELID_MAC_Q8_REPACK") {
         reasons
             .push("CAMELID_MAC_Q8_REPACK disables Mac repack; failing closed to safe path".into());
         env_updates.insert("CAMELID_MAC_Q8_REPACK", Some("off"));
+        if windowed_attention_arch {
+            reasons.push(windowed_bridge_reason());
+        }
         return safe_q8_plan();
     }
 
@@ -494,12 +535,7 @@ fn select_macos_q8_plan(
     // runnable bridge — advertise the safe fail-closed plan, not a CPU repack
     // lane the arch can never run.
     if windowed_attention_arch {
-        reasons.push(
-            "windowed-attention row (gemma3) without an active Metal-resident selection: no CPU \
-             dense plan exists for this arch — serve chats via the runnable bridge; failing \
-             closed to safe path"
-                .into(),
-        );
+        reasons.push(windowed_bridge_reason());
         return safe_q8_plan();
     }
 
@@ -1696,6 +1732,71 @@ mod tests {
         assert_eq!(
             outcome.plan.support_level,
             "supported_exact_row_smoke_sub512"
+        );
+    }
+
+    /// Phase 3c triage: the disclosed execution plan and the live serve
+    /// routing must agree. `windowed_arch_resident_host_available` consults
+    /// `macos_q8_metal_plan_selectable`, so an operator opting out of the Metal
+    /// plan gets the runnable bridge rather than a plan that says
+    /// `cpu_reference` while serve quietly runs the Metal-resident lane.
+    /// Deleting any clause of the predicate makes this fail.
+    #[test]
+    fn macos_q8_metal_plan_selectability_tracks_every_early_return() {
+        let _guard = env_lock();
+        clear_profile_env();
+        assert!(
+            macos_q8_metal_plan_selectable(),
+            "the default (auto profile, no opt-outs) must allow the Metal plan"
+        );
+
+        for (key, value) in [
+            ("CAMELID_PROFILE", "safe"),
+            // An unrecognized profile fails closed to Safe — same outcome.
+            ("CAMELID_PROFILE", "nonsense"),
+            ("CAMELID_MAC_Q8_REPACK", "0"),
+            ("CAMELID_MAC_Q8_METAL_PLAN", "0"),
+        ] {
+            clear_profile_env();
+            env::remove_var("CAMELID_MAC_Q8_METAL_PLAN");
+            env::set_var(key, value);
+            assert!(
+                !macos_q8_metal_plan_selectable(),
+                "{key}={value} must make the Metal plan unselectable, so routing sends a \
+                 windowed arch to the runnable bridge"
+            );
+            env::remove_var(key);
+        }
+        clear_profile_env();
+        env::remove_var("CAMELID_MAC_Q8_METAL_PLAN");
+    }
+
+    /// Phase 3c triage: under the Safe profile the windowed plan used to
+    /// disclose a bare "safe profile" reason, leaving no way to tell that
+    /// gemma3 chats were being served by the bridge rather than by the
+    /// `cpu_reference` / `safe_cpu_decode` labels the plan named — labels that
+    /// for this arch fail closed at every per-layer dispatch (H4).
+    #[test]
+    fn windowed_safe_profile_plan_discloses_the_runnable_bridge() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_PROFILE", "safe");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/models/gemma-3-1b-it-Q8_0.gguf"),
+            &gemma3_fixture("gemma-3-1b-it"),
+            Some(8),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        clear_profile_env();
+        assert_eq!(outcome.plan.selected_backend, "cpu_reference");
+        assert!(
+            outcome
+                .plan
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("runnable bridge")),
+            "the safe-profile windowed plan must disclose where chats actually go: {:?}",
+            outcome.plan.reasons
         );
     }
 
