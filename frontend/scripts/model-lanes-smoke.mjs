@@ -114,7 +114,7 @@ check(
   'not_anchored',
 )
 
-// gemma3 1B Q8_0: the promoted Metal GPU-resident row. Its contract id is the
+// gemma3 1B Q8_0: the promoted GPU-resident row (Metal and CUDA lanes). Its contract id is the
 // normalized filename, so the identity match must resolve it from the local
 // file with NO backend lane_class hint — this is the exact join that was broken
 // while the catalog id and the row id disagreed.

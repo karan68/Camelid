@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, env, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::gguf::{GgufFile, GgufTensorType};
+use crate::gguf::{GgufFile, GgufTensorDescriptor, GgufTensorType};
 
 const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_PARALLEL_LINEAR",
@@ -453,7 +453,34 @@ pub fn plan_for_model_with_platform_and_env(
         prefill_runtime_policy,
         decode_path,
         fallback_path,
-    ) = if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
+    ) = if gguf.architecture() == Some("gemma4") {
+        // gemma4 rows are served by their OWN runtime (`Gemma4ServeRuntime`), not
+        // by the generic dense engine, so the generic Q8/K-quant arms below would
+        // describe a lane this row never takes. Phase 0 of the gemma3→CUDA
+        // campaign measured exactly that: the plan disclosed
+        // `cuda_resident_kquant_runtime` / `kquant_cuda_resident_decode` while
+        // serve ran the CPU `Gemma4Runtime` — 107 MiB of VRAM in use while a
+        // 2.83 GB model generated. Keyed on the same predicate the load site
+        // uses, so the disclosure follows the lane.
+        //
+        // The FULL admission decision — policy, quant AND fit — because the load
+        // site calls this same function. Disclosing policy alone here would say
+        // "CUDA" for a row that then falls back on quant or fit, which is the
+        // Phase 0 defect wearing different clothes.
+        let admitted = gemma4_cuda_lane_admitted(gguf);
+        match &admitted {
+            Ok(()) => reasons.push(
+                "gemma4 row on a CUDA-resident host: the gemma4 CUDA-resident engine drives \
+                 decode (Q8_0/Q4_0/Q4_1 layer projections, and the row fits VRAM with headroom)"
+                    .into(),
+            ),
+            Err(why) => reasons.push(format!(
+                "gemma4 row: the gemma4 CPU runtime drives decode — CUDA-resident lane declined: \
+                 {why}"
+            )),
+        }
+        gemma4_plan(admitted.is_ok())
+    } else if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(
                 &profile,
@@ -463,17 +490,35 @@ pub fn plan_for_model_with_platform_and_env(
                 &mut env_updates,
                 &mut reasons,
             )
-        } else if is_windowed_attention_arch(gguf) {
-            // gemma3 (windowed attention): the ONLY validated dense lane is the
-            // Metal-resident forward — the CPU dense paths (x86 repack included)
-            // have no sliding-window mask and fail closed at forward dispatch
-            // (hazard H4). On non-Metal hosts `camelid serve` routes gemma3
-            // chat through the runnable bridge; the plan must not advertise a
-            // CPU dense lane it can never run.
+        } else if is_windowed_attention_arch(gguf)
+            && platform.cuda_resident_active
+            && windowed_arch_cuda_resident_plan_selectable()
+        {
+            // gemma3 on a CUDA host: the CUDA resident engine now carries the
+            // windowed forward (per-layer dual-theta RoPE, `attention_decode_sw`,
+            // sandwich post-norms, GeGLU, embed scale), so this row has a second
+            // validated GPU lane alongside Metal. The CPU dense paths still have
+            // no window mask and still fail closed at forward dispatch (H4) —
+            // that has not changed and must not.
             reasons.push(
-                "windowed-attention row (gemma3): the only validated dense lane is Metal-resident; \
-                 no CPU dense plan exists for this arch — serve chats via the runnable bridge on \
-                 this host; failing closed to safe path"
+                "windowed-attention row (gemma3) on a CUDA-resident host: the GPU-resident \
+                 windowed forward drives decode; prefill is token-by-token (the batched and \
+                 flash kernels carry no window)"
+                    .into(),
+            );
+            cuda_resident_windowed_plan()
+        } else if is_windowed_attention_arch(gguf) {
+            // gemma3 (windowed attention) with NO resident GPU lane available on
+            // this host: the CPU dense paths (x86 repack included) have no
+            // sliding-window mask and fail closed at forward dispatch (hazard
+            // H4), so `camelid serve` routes gemma3 chat through the runnable
+            // bridge; the plan must not advertise a CPU dense lane it can never
+            // run.
+            reasons.push(
+                "windowed-attention row (gemma3): no resident GPU lane is active on this host \
+                 (Metal-resident on macOS, CUDA-resident on a CUDA host); no CPU dense plan \
+                 exists for this arch — serve chats via the runnable bridge on this host; \
+                 failing closed to safe path"
                     .into(),
             );
             safe_q8_plan()
@@ -594,6 +639,293 @@ pub fn plan_for_model_with_platform_and_env(
 pub fn macos_q8_metal_plan_selectable() -> bool {
     !matches!(requested_profile().0, ExecutionProfile::Safe)
         && !env_flag_disabled("CAMELID_MAC_Q8_METAL_PLAN")
+}
+
+/// The CUDA-resident twin of [`macos_q8_metal_plan_selectable`]: whether a
+/// windowed-attention row's CUDA-resident PLAN selection can fire in this
+/// process, considering only operator INPUTS.
+///
+/// `inference::windowed_arch_resident_host_available` consults this so gemma3's
+/// routing and its disclosed plan agree on a CUDA host, exactly as Phase 3c of
+/// the Metal campaign made them agree on a Metal host. The D20 invariant that
+/// motivated it applies verbatim here: an operator who asks for the safe profile
+/// must get the runnable bridge, not a plan saying "bridge" while serve silently
+/// runs the GPU.
+///
+/// Deliberately consults NO plan output. `CAMELID_MAC_Q8_REPACK` is the recorded
+/// counter-example on the Metal side — a variable that is both an operator
+/// opt-out and something the plan writes, and therefore unusable as a routing
+/// input. Nothing in this predicate is written by `PlannerEnv::apply`.
+pub fn windowed_arch_cuda_resident_plan_selectable() -> bool {
+    !matches!(requested_profile().0, ExecutionProfile::Safe)
+        && !env_flag_disabled("CAMELID_GEMMA3_CUDA_RESIDENT")
+}
+
+/// Whether the gemma4 serve lane should run on the CUDA-resident engine.
+///
+/// **Default ON** where a CUDA device is actually driving this process; opt out
+/// with `CAMELID_GEMMA4_CUDA=0` (0/off/false/no/disabled). It used to be
+/// opt-IN (`CAMELID_GEMMA4_CUDA=1`), which meant every gemma4 row decoded on the
+/// CPU out of the box on a Windows/Linux CUDA host even though the resident
+/// engine was present and working.
+///
+/// This is the POLICY half only. It says nothing about whether a given file
+/// FITS — that is a separate, per-file check at the load site
+/// (`gemma4_cuda_fit_check`), because policy is host-wide while fit is not.
+///
+/// Single source of truth: `api::gemma4_cuda_enabled` delegates here rather than
+/// reading the env itself, so the disclosed execution plan and the lane serve
+/// actually loads cannot disagree. That split is what produced the Phase 0
+/// finding — the plan advertised `cuda_resident_kquant_runtime` while serve ran
+/// the CPU runtime, because the two consulted different things.
+pub fn gemma4_cuda_lane_selectable() -> bool {
+    if matches!(requested_profile().0, ExecutionProfile::Safe) {
+        return false;
+    }
+    if env_flag_disabled("CAMELID_GEMMA4_CUDA") {
+        return false;
+    }
+    cuda_resident_decode_will_run()
+}
+
+/// Everything the gemma4 CUDA-resident lane puts in VRAM BESIDES the per-layer
+/// projections: the small per-layer norms, the f16 KV cache at the load site's
+/// 4096-position window, the GPU tied head, the GPU PLE context projection, and
+/// the per-token scratch.
+///
+/// Calibrated against a measurement rather than guessed. On an RTX 3060,
+/// `gemma-4-E2B-it-Q8_0` uploads 1879 MiB of layer projections and settles at
+/// 2635 MiB of device memory including the ~107 MiB CUDA context — so the
+/// non-projection residency is ~649 MiB. 1024 MiB keeps the projection an
+/// over-estimate (~15% for E2B) without being so loose that it stops predicting.
+const GEMMA4_RESIDENT_OVERHEAD_MIB: u64 = 1024;
+
+/// The tensors the gemma4 CUDA-resident lane actually uploads per block. The
+/// per-layer EMBEDDING tables (`per_layer_token_embd`, `per_layer_model_proj`)
+/// and the token embedding / tied head stay on the host or are handled
+/// separately, which is why a whole-file byte count is the wrong basis for the
+/// fit decision — see `gemma4_cuda_resident_bytes`.
+fn is_gemma4_layer_projection(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return false;
+    };
+    let Some((_, tail)) = rest.split_once('.') else {
+        return false;
+    };
+    matches!(
+        tail,
+        "attn_q.weight"
+            | "attn_k.weight"
+            | "attn_v.weight"
+            | "attn_output.weight"
+            | "ffn_gate.weight"
+            | "ffn_up.weight"
+            | "ffn_down.weight"
+            | "proj.weight"
+            | "inp_gate.weight"
+    )
+}
+
+/// The gemma4 per-block tensors the CUDA-resident lane runs a QUANTIZED GEMV over —
+/// the set `gemma4_runtime::nvfp4_cuda_lane_check` format-checks at load.
+///
+/// **Deliberately NOT `is_gemma4_layer_projection`, and the two must not be merged.**
+/// That one answers "what occupies VRAM" and so counts `proj.weight` / `inp_gate.weight`
+/// — the per-layer PLE matrices, which the CPU runtime DEQUANTIZES to f32 before upload.
+/// Their wire format is therefore irrelevant to lane coverage, and folding them in here
+/// would decline the E2B Q4_0 row on its F32 PLE tensors while admitting nothing extra.
+/// Conversely this set carries the MoE arms (`ffn_gate_up_exps` / `ffn_down_exps`, the
+/// A4B/26B rows), which the lane GEMVs through the same `GemmaLayerQuant` dispatch but
+/// which the VRAM projection accounts for separately.
+///
+/// Selected by name rather than by scanning every tensor's type: a whole-file type scan
+/// sweeps in the F32 norms, the `token_embd` head (own lane, own CPU fallback) and the
+/// PLE tables. Judging admission on those is precisely what let an E4B Q4_K_M row
+/// through on the strength of its Q8_0 `token_embd` while every projection it decodes
+/// is Q4_K.
+fn gemma4_projection_tensors(gguf: &GgufFile) -> impl Iterator<Item = &GgufTensorDescriptor> {
+    const PROJECTION_SUFFIXES: [&str; 9] = [
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_output.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+        "ffn_gate_up_exps.weight",
+        "ffn_down_exps.weight",
+    ];
+    gguf.tensors.iter().filter(|t| {
+        t.name.starts_with("blk.")
+            && PROJECTION_SUFFIXES
+                .iter()
+                .any(|suffix| t.name.ends_with(suffix))
+    })
+}
+
+/// Projected device bytes for a gemma4 row on the CUDA-resident lane.
+///
+/// Sums only the per-layer projections and adds
+/// [`GEMMA4_RESIDENT_OVERHEAD_MIB`]. It deliberately does NOT sum the whole
+/// file: gemma4 is a PLE matformer whose per-layer embedding tables dwarf its
+/// projections, and counting them made the fit check reject rows that fit
+/// comfortably. Measured on an RTX 3060 with `gemma-4-E2B-it-Q8_0`: whole-file
+/// accounting projected 5055 MiB and DECLINED the row, while the lane actually
+/// used 2635 MiB and served it in 794 ms. Over-conservative fit checks are not
+/// "safe" — they silently keep working hardware on the CPU.
+fn gemma4_cuda_resident_bytes(gguf: &GgufFile) -> u64 {
+    let projections: u64 = gguf
+        .tensors
+        .iter()
+        .filter(|t| is_gemma4_layer_projection(&t.name))
+        .map(|t| t.n_bytes)
+        .sum();
+    projections + GEMMA4_RESIDENT_OVERHEAD_MIB * 1024 * 1024
+}
+
+/// FULL admission decision for the gemma4 CUDA-resident lane: host policy, then
+/// the per-file quant check, then the per-file VRAM fit. `Ok(())` means the lane
+/// will actually load; `Err(reason)` is the operator-facing reason it will not.
+///
+/// **This is the single predicate.** Both the disclosed execution plan and the
+/// serve load site call it, so `/v1/health` cannot advertise a lane that serve
+/// then declines. An earlier revision of this campaign split them — policy in the
+/// plan, quant+fit at the load site — and immediately reproduced the Phase 0
+/// defect it was written to fix: the plan said `gemma4_cuda_resident_runtime`
+/// while a declined row served on the CPU. DECISIONS D20, restated: a disclosure
+/// that is not derived from the same decision the runtime makes is not a
+/// disclosure.
+pub fn gemma4_cuda_lane_admitted(gguf: &GgufFile) -> Result<(), String> {
+    if !gemma4_cuda_lane_selectable() {
+        return Err(
+            "no CUDA-resident host for the gemma4 lane (CAMELID_GEMMA4_CUDA=0, safe profile, \
+             deterministic mode, or no usable device)"
+                .into(),
+        );
+    }
+    gemma4_projection_quant_admitted(gguf)?;
+    // FIT. Projected from the per-layer projections plus a calibrated overhead,
+    // NOT from the whole file — see `gemma4_cuda_resident_bytes`. A row that
+    // genuinely does not fit falls back rather than allocating into a mid-load
+    // OOM; a row that does fit must not be talked out of the GPU by a pessimistic
+    // estimate, which is the failure this projection was rewritten to avoid.
+    //
+    // This check is advisory, not the last line of defence: the load site also
+    // falls back to the CPU runtime if `Gemma4CudaResident::load` returns an
+    // error, so an under-estimate here degrades to a slower lane rather than a
+    // failed request.
+    let Some(free) = crate::cuda_vram::free_vram_bytes() else {
+        return Ok(());
+    };
+    let projected = gemma4_cuda_resident_bytes(gguf);
+    crate::cuda_vram::evaluate(free, projected, crate::cuda_vram::min_headroom_mib())
+        .map(|_| ())
+        .map_err(|short| short.to_string())
+}
+
+/// The QUANT half of gemma4 CUDA admission: every layer projection the lane GEMVs
+/// must be in a format that carries an end-to-end greedy-parity receipt against the
+/// CPU gemma4 runtime. Split out from [`gemma4_cuda_lane_admitted`] so it is testable
+/// without a CUDA host (that function's first act is a host-policy probe).
+///
+/// This gate has been wrong in BOTH directions, so the reasoning is recorded here.
+/// It used to pin to "any Q8_0 tensor", after `gemma-4-E2B-it-Q4_0` was measured
+/// decoding "passe dép oficialmenteynam shalthapp lenghtynam" where the CPU runtime
+/// said "Paris". The Q4_0 projections were never the defect: the lane's tied HEAD
+/// uploaded raw GGUF wire into `q4k_gemv` / `q6k_gemv`, which read a swizzled /
+/// 224 B-padded layout (see `gemma4_runtime::gemma4_head_upload`). A Q4_0 export
+/// carries a Q4_K `token_embd`, so that row's logits were formed from wrongly-paired
+/// nibbles. Fixed and re-measured — 5/5 prompts token-identical, CUDA vs CPU,
+/// `qa/gemma3-cuda/phase5/` — which is what admits Q4_0/Q4_1 here.
+///
+/// Still declined, deliberately:
+/// - **NVFP4.** `nvfp4_cuda_lane_check` covers it and `nvfp4_gemv` has a KERNEL
+///   parity test, but no gemma4 ROW has an end-to-end receipt on this lane. Kernel
+///   parity is not row parity — that gap is exactly what the Q4_0 mis-decode was
+///   (`q4_0_gemv` had a passing kernel parity test the whole time it shipped garbage).
+/// - **K-quant projections (Q4_K/Q5_K/Q6_K).** The CPU wire lane serves them and
+///   `nvfp4_cuda_lane_check` refuses them at load. Declining HERE too is what makes
+///   the disclosure honest: an E4B Q4_K_M row has a Q8_0 `token_embd`, so the old
+///   any-Q8_0-tensor test admitted it, the plan printed `gemma4_cuda_resident_runtime`,
+///   and the load site then refused and served on the CPU — the D20 defect this
+///   predicate exists to prevent.
+fn gemma4_projection_quant_admitted(gguf: &GgufFile) -> Result<(), String> {
+    const RECEIPTED_PROJECTION_FORMATS: [GgufTensorType; 3] = [
+        GgufTensorType::Q8_0,
+        GgufTensorType::Q4_0,
+        GgufTensorType::Q4_1,
+    ];
+    match gemma4_projection_tensors(gguf)
+        .find(|t| !RECEIPTED_PROJECTION_FORMATS.contains(&t.tensor_type))
+    {
+        Some(t) => Err(format!(
+            "gemma4 CUDA-resident decode has a greedy-parity receipt for Q8_0/Q4_0/Q4_1 layer \
+             projections; this row is {} and carries {} as {:?}, which has no parity receipt on \
+             this lane (the CPU gemma4 runtime serves it correctly)",
+            quant_type(gguf),
+            t.name,
+            t.tensor_type
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Plan labels for a gemma4 row and the lane that will actually serve it.
+/// `cuda` distinguishes the CUDA-resident gemma4 engine from the CPU runtime;
+/// neither is the generic dense CUDA lane, so neither reuses its labels.
+fn gemma4_plan(
+    cuda: bool,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    if cuda {
+        (
+            "gemma4_cuda_resident_runtime",
+            "gemma4_resident_wire",
+            "gemma4_cuda_resident_prefill",
+            "resident_prefix_cached_prefill",
+            "gemma4_cuda_resident_decode",
+            "gemma4_cpu_runtime_fallback_path",
+        )
+    } else {
+        (
+            "gemma4_cpu_runtime",
+            "gemma4_cpu_wire",
+            "gemma4_cpu_prefill",
+            "always_retained_reference_path",
+            "gemma4_cpu_decode",
+            "gemma4_cpu_runtime_fallback_path",
+        )
+    }
+}
+
+/// Plan labels for a windowed-attention (gemma3) row served by the CUDA-resident
+/// engine. Distinct strings from the Llama-family CUDA labels so a receipt or a
+/// `/v1/health` reader can tell the windowed lane apart from the dense one —
+/// they are different forwards (per-layer dual-theta RoPE, a sliding-window
+/// attention kernel, sandwich post-norms, GeGLU) and conflating them in the
+/// disclosure would hide which code actually ran.
+fn cuda_resident_windowed_plan() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    (
+        "cuda_resident_windowed_runtime",
+        "cuda_resident_q8_0_wire",
+        "windowed_token_by_token_resident_prefill",
+        "resident_token_by_token_prefill",
+        "q8_0_cuda_resident_windowed_decode",
+        "runnable_bridge_fallback_path",
+    )
 }
 
 fn select_macos_q8_plan(
@@ -1091,13 +1423,21 @@ fn cuda_resident_q8_runnable_plan() -> (
 /// never route a model the resident dense kernel cannot run under a GPU label. The
 /// runtime `resident_decode_eligible` check + the parity self-check are the backstops.
 ///
-/// gemma3 stays EXCLUDED here even though its Metal-resident lane shipped (Phase 3b):
+/// gemma3 stays EXCLUDED here even though it now has resident lanes on BOTH GPU
+/// backends (Metal, Phase 3b of the Metal campaign; CUDA, Phase 2 of the CUDA one).
+/// The reason is no longer "no CUDA windowed forward exists" — one does — it is that
 /// both consumers of this predicate are non-Q8-exact tiers that hazard H5 forbids for
-/// windowed archs — the Q8 GPU-runnable tier is CUDA-resident (the CUDA engine has no
-/// sliding-window/dual-theta forward), and the K-quant plan selection would advertise a
-/// Metal-resident K-quant lane whose gather drops the gemma3 embed scale and has no
-/// windowed parity receipt. gemma3's dense lane is selected via its curated exact row
-/// (`is_supported_exact_q8_row` → the macOS Metal-resident Q8 plan) instead.
+/// windowed archs:
+///
+/// - The GPU-runnable tier admits UNCURATED models on architecture alone. A windowed
+///   row admitted that way would carry no windowed parity receipt and would bypass the
+///   Q8_0 pin, which is the whole point of H5.
+/// - The K-quant plan selection would advertise a resident K-quant lane whose gather
+///   drops the gemma3 embed scale, again with no windowed receipt behind it.
+///
+/// gemma3's dense lane is selected via its curated exact row instead
+/// (`is_supported_exact_q8_row` → the macOS Metal-resident Q8 plan, or the
+/// CUDA-resident windowed plan on a CUDA host).
 fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
     let arch = gguf.architecture().unwrap_or("");
     if !matches!(arch, "llama" | "qwen2" | "qwen3" | "mistral") {
@@ -1662,6 +2002,137 @@ mod tests {
         gguf
     }
 
+    /// A gemma4 row shaped like the real exports: one block of layer projections at
+    /// `proj_type`, the F32 PLE per-layer matrices, and a tied head at `head_type`.
+    fn gemma4_row(name: &str, proj_type: GgufTensorType, head_type: GgufTensorType) -> GgufFile {
+        let mut gguf = fixture(name);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("gemma4".into()),
+        );
+        let mut tensors: Vec<GgufTensorDescriptor> = [
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        ]
+        .iter()
+        .map(|suffix| GgufTensorDescriptor {
+            name: format!("blk.0.{suffix}"),
+            dimensions: vec![32, 32],
+            tensor_type: proj_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 34,
+        })
+        .collect();
+        // The PLE per-layer matrices and norms: uploaded as f32 after a CPU dequant,
+        // so their wire format says nothing about lane coverage.
+        for suffix in ["proj.weight", "inp_gate.weight", "attn_norm.weight"] {
+            tensors.push(GgufTensorDescriptor {
+                name: format!("blk.0.{suffix}"),
+                dimensions: vec![32, 32],
+                tensor_type: GgufTensorType::F32,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 4096,
+            });
+        }
+        for name in ["token_embd.weight", "per_layer_token_embd.weight"] {
+            tensors.push(GgufTensorDescriptor {
+                name: name.into(),
+                dimensions: vec![32, 32],
+                tensor_type: head_type,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 4096,
+            });
+        }
+        gguf.tensor_count = tensors.len() as i64;
+        gguf.tensors = tensors;
+        gguf
+    }
+
+    #[test]
+    fn gemma4_quant_admission_follows_the_projections_not_the_head() {
+        // The row that regressed: Q4_0 projections under a Q4_K tied head. It must be
+        // ADMITTED — the mis-decode was the head upload skipping its lane's repack
+        // (`gemma4_runtime::gemma4_head_upload`), not the Q4_0 GEMV, and the fix has a
+        // 5/5 token-identical receipt in qa/gemma3-cuda/phase5/.
+        gemma4_projection_quant_admitted(&gemma4_row(
+            "e2b-q4_0",
+            GgufTensorType::Q4_0,
+            GgufTensorType::Q4K,
+        ))
+        .expect("Q4_0 projections carry a greedy-parity receipt");
+
+        // The Q8_0 bring-up row keeps its admission.
+        gemma4_projection_quant_admitted(&gemma4_row(
+            "e4b-q8_0",
+            GgufTensorType::Q8_0,
+            GgufTensorType::Q8_0,
+        ))
+        .expect("the Q8_0 bring-up row stays admitted");
+
+        // The mirror of the regressed row, and the reason admission reads projections
+        // rather than "does any tensor say Q8_0": a Q4_K_M row has a Q8_0 tied head, so
+        // the old test admitted it, the plan disclosed the CUDA lane, and the load site
+        // then refused it (`nvfp4_cuda_lane_check`) and served on the CPU.
+        let err = gemma4_projection_quant_admitted(&gemma4_row(
+            "e4b-q4_k_m",
+            GgufTensorType::Q4K,
+            GgufTensorType::Q8_0,
+        ))
+        .expect_err("K-quant projections have no receipt on this lane");
+        assert!(
+            err.contains("attn_q.weight") && err.contains("Q4K"),
+            "the decline must name the tensor and its format: {err}"
+        );
+
+        // NVFP4 is lane-COVERED but has no gemma4 row receipt. Kernel parity is not
+        // row parity — that distinction is exactly what the Q4_0 mis-decode was.
+        gemma4_projection_quant_admitted(&gemma4_row(
+            "e4b-nvfp4",
+            GgufTensorType::NVFP4,
+            GgufTensorType::Q6K,
+        ))
+        .expect_err("NVFP4 has kernel parity but no gemma4 end-to-end receipt");
+    }
+
+    #[test]
+    fn gemma4_quant_admission_ignores_f32_ple_and_norm_tensors() {
+        // Regression guard for merging this set with `is_gemma4_layer_projection` (the
+        // VRAM-accounting set, which counts `proj`/`inp_gate`). Those are F32 on the
+        // wire, so folding them in would decline every real gemma4 row — including the
+        // Q8_0 one that has always worked.
+        let row = gemma4_row("e2b-q4_0", GgufTensorType::Q4_0, GgufTensorType::Q4K);
+        assert!(
+            row.tensors
+                .iter()
+                .any(|t| t.name == "blk.0.proj.weight" && t.tensor_type == GgufTensorType::F32),
+            "fixture must carry the F32 PLE tensors this test is about"
+        );
+        let names: Vec<&str> = gemma4_projection_tensors(&row)
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 7, "only the 7 GEMV'd projections: {names:?}");
+        for excluded in [
+            "blk.0.proj.weight",
+            "blk.0.inp_gate.weight",
+            "blk.0.attn_norm.weight",
+            "token_embd.weight",
+            "per_layer_token_embd.weight",
+        ] {
+            assert!(
+                !names.contains(&excluded),
+                "{excluded} is not a GEMV'd projection: {names:?}"
+            );
+        }
+    }
+
     fn clear_profile_env() {
         for key in [
             "CAMELID_PROFILE",
@@ -1866,6 +2337,143 @@ mod tests {
             GgufMetadataValue::String("gemma3".into()),
         );
         gguf
+    }
+
+    /// gemma3→CUDA Phase 2: the curated row must reach the CUDA-resident
+    /// WINDOWED plan on a CUDA host — distinct labels from the Llama-family
+    /// CUDA plan, because it is a different forward (dual-θ RoPE, a
+    /// sliding-window kernel, sandwich post-norms, GeGLU) and conflating them in
+    /// the disclosure would hide which code ran.
+    #[test]
+    fn gemma3_q8_row_selects_the_cuda_resident_windowed_plan_on_a_cuda_host() {
+        let _guard = env_lock();
+        clear_profile_env();
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/models/gemma-3-1b-it-Q8_0.gguf"),
+            &gemma3_fixture("gemma-3-1b-it"),
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        clear_profile_env();
+        assert_eq!(
+            outcome.plan.selected_backend, "cuda_resident_windowed_runtime",
+            "a windowed row on a CUDA host must disclose the windowed CUDA lane"
+        );
+        assert_eq!(
+            outcome.plan.decode_path,
+            "q8_0_cuda_resident_windowed_decode"
+        );
+        assert_eq!(
+            outcome.plan.prefill_path, "windowed_token_by_token_resident_prefill",
+            "the batched/flash prefill kernels carry no window, so the plan must \
+             not advertise them for a windowed row"
+        );
+    }
+
+    /// The D20 invariant on the CUDA side: routing consults
+    /// `windowed_arch_cuda_resident_plan_selectable`, so an operator opt-out must
+    /// move the PLAN too. Without this the plan would say "CUDA windowed" while
+    /// serve ran the runnable bridge — the exact disagreement Phase 3c of the
+    /// Metal campaign existed to kill. Deleting either clause fails this.
+    #[test]
+    fn windowed_cuda_plan_selectability_tracks_its_opt_outs() {
+        let _guard = env_lock();
+        clear_profile_env();
+        assert!(
+            windowed_arch_cuda_resident_plan_selectable(),
+            "auto profile with no opt-out must allow the windowed CUDA plan"
+        );
+        env::set_var("CAMELID_GEMMA3_CUDA_RESIDENT", "0");
+        assert!(
+            !windowed_arch_cuda_resident_plan_selectable(),
+            "CAMELID_GEMMA3_CUDA_RESIDENT=0 must disarm the plan, not just routing"
+        );
+        env::remove_var("CAMELID_GEMMA3_CUDA_RESIDENT");
+        env::set_var("CAMELID_PROFILE", "safe");
+        assert!(
+            !windowed_arch_cuda_resident_plan_selectable(),
+            "the safe profile must disarm the windowed CUDA plan"
+        );
+        clear_profile_env();
+    }
+
+    /// With the CUDA windowed plan opted out, a windowed row must fail CLOSED to
+    /// the safe plan and say the bridge serves it — never advertise a CPU dense
+    /// lane, which for this arch is fail-closed at every per-layer dispatch (H4).
+    #[test]
+    fn gemma3_falls_closed_to_the_bridge_when_the_cuda_windowed_plan_is_opted_out() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_GEMMA3_CUDA_RESIDENT", "0");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/models/gemma-3-1b-it-Q8_0.gguf"),
+            &gemma3_fixture("gemma-3-1b-it"),
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        env::remove_var("CAMELID_GEMMA3_CUDA_RESIDENT");
+        clear_profile_env();
+        assert_ne!(
+            outcome.plan.selected_backend,
+            "cuda_resident_windowed_runtime"
+        );
+        assert!(
+            outcome
+                .plan
+                .reasons
+                .iter()
+                .any(|r| r.contains("runnable bridge")),
+            "the opted-out plan must name the bridge as the serving lane: {:?}",
+            outcome.plan.reasons
+        );
+    }
+
+    /// The fit projection must be based on what the gemma4 CUDA lane actually
+    /// uploads, not the whole file. REGRESSION TEST for a real defect: the first
+    /// version summed every tensor, projected 5055 MiB for `gemma-4-E2B-it-Q8_0`
+    /// and DECLINED it — while the lane actually uses 2635 MiB and serves the row
+    /// in 794 ms on a 6 GB card. gemma4 is a PLE matformer whose per-layer
+    /// embedding tables are LARGER than its projections and never reach VRAM.
+    #[test]
+    fn gemma4_fit_projection_counts_only_what_reaches_vram() {
+        assert!(is_gemma4_layer_projection("blk.0.attn_q.weight"));
+        assert!(is_gemma4_layer_projection("blk.17.ffn_down.weight"));
+        assert!(is_gemma4_layer_projection("blk.3.proj.weight"));
+        // The PLE tables and the token embedding are the whole point: they are
+        // the bulk of the file and they do NOT go to VRAM.
+        assert!(!is_gemma4_layer_projection("per_layer_token_embd.weight"));
+        assert!(!is_gemma4_layer_projection("per_layer_model_proj.weight"));
+        assert!(!is_gemma4_layer_projection("token_embd.weight"));
+        assert!(!is_gemma4_layer_projection("output_norm.weight"));
+        // Norms are small and counted in the overhead constant, not per-tensor.
+        assert!(!is_gemma4_layer_projection("blk.0.attn_norm.weight"));
+        assert!(!is_gemma4_layer_projection("blk.0.post_ffw_norm.weight"));
+    }
+
+    /// The projection must admit a row that measurably fits. Built from the real
+    /// E2B Q8_0 shape: 1879 MiB of layer projections against the 5122 MiB free
+    /// that an RTX 3060 reports at load. Whole-file accounting projected 5055 MiB
+    /// here and refused; this asserts the corrected basis admits it.
+    #[test]
+    fn gemma4_e2b_q8_shape_fits_a_six_gigabyte_card() {
+        const MIB: u64 = 1024 * 1024;
+        let projections_mib: u64 = 1879;
+        let projected = projections_mib * MIB + GEMMA4_RESIDENT_OVERHEAD_MIB * MIB;
+        let free = 5122 * MIB;
+        assert!(
+            crate::cuda_vram::evaluate(free, projected, 512).is_ok(),
+            "the measured E2B Q8_0 shape must be admitted on a 6 GB card: \
+             projected {} MiB against {} MiB free",
+            projected / MIB,
+            free / MIB
+        );
+        // And a genuinely oversized row must still be refused: E4B Q8_0 is
+        // 3998 MiB of projections, which does not fit with headroom.
+        let e4b = 3998 * MIB + GEMMA4_RESIDENT_OVERHEAD_MIB * MIB;
+        assert!(
+            crate::cuda_vram::evaluate(free, e4b, 512).is_err(),
+            "E4B Q8_0 must still be refused on a 6 GB card"
+        );
     }
 
     #[test]

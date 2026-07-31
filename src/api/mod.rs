@@ -4480,18 +4480,18 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 family: "gemma3_windowed_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
-                support_scope: "exact_row_metal_gpu_resident_windowed_chat_smoke_only",
+                support_scope: "exact_row_gpu_resident_windowed_chat_smoke_only_metal_or_cuda",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "context above 2,403 prompt tokens (the file's native 32,768 is UNMEASURED, as is everything between ~2.4k and 32k); token-exact raw /v1/completions at depth 50 (three disclosed near-tie flips, one of them a 0.4471-nat stable-oracle near-tie — the clean raw-decode claim stops at DEPTH 5, while the chat lane is clean at 1/5/50); the repo's bounded-context ladder packs (512/1024/2048/4096/8192) were NOT run for this row — the windowed pack is a different artifact; throughput/performance (NOT claimed and NOT measured for release on this lane — a separate measurement phase owes it); the RUNNABLE CPU BRIDGE lane, which serves this row wherever the Metal resident lane cannot run and implements no window mask, so on THAT lane context above the 512-token sliding window remains mathematically wrong by construction (demonstrated: 1.667-nat disagreement with the pinned oracle at the divergence position of a 606-token prompt); tool capability (no gemma3 tools branch and no certified grammar on any lane — tools fail closed with a typed 422); multi-turn, streaming, speculative decode (declined for windowed archs) and the prompt-prefix cache (bypassed for windowed archs); neighbouring gemma3 sizes/quants (a non-Q8_0 gemma3 file is declined by resident admission and falls back to the runnable bridge); frontend load-path promotion; portability; and durable repeated current-head bundles remain missing",
+                full_support_blockers: "the CUDA-resident windowed lane is NOT token-exact below the window — it is 10/15 on the sub-512 gate pack where the Metal lane is 15/15, with five disclosed divergences across three prompts (one from the FIRST generated token) attributed to lane numerics rather than structure by a per-layer hidden-state trace showing no step change at any layer and 1.89% worst relative L2; that attribution is one-sided, since confirming the flips as genuine near-ties from the ORACLE's side needs a live llama.cpp re-score which was NOT run, so the CUDA lane's sub-512 envelope is DISCLOSED, not adjudicated; context above 2,403 prompt tokens (the file's native 32,768 is UNMEASURED, as is everything between ~2.4k and 32k); token-exact raw /v1/completions at depth 50 (three disclosed near-tie flips, one of them a 0.4471-nat stable-oracle near-tie — the clean raw-decode claim stops at DEPTH 5, while the chat lane is clean at 1/5/50); the repo's bounded-context ladder packs (512/1024/2048/4096/8192) were NOT run for this row — the windowed pack is a different artifact; throughput/performance (NOT claimed and NOT measured for release on this lane — a separate measurement phase owes it); the RUNNABLE CPU BRIDGE lane, which serves this row wherever NEITHER GPU-resident lane can run and implements no window mask, so on THAT lane context above the 512-token sliding window remains mathematically wrong by construction (demonstrated: 1.667-nat disagreement with the pinned oracle at the divergence position of a 606-token prompt); tool capability (no gemma3 tools branch and no certified grammar on any lane — tools fail closed with a typed 422); multi-turn, streaming, speculative decode (declined for windowed archs) and the prompt-prefix cache (bypassed for windowed archs); neighbouring gemma3 sizes/quants (a non-Q8_0 gemma3 file is declined by resident admission and falls back to the runnable bridge); frontend load-path promotion; portability; and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated_cross_engine_prompt_tokenization_identical_5_of_5_sub512_plus_3_of_3_windowed_606_1205_2403_spm_llama_262k_vocab",
-                tensors_load: "validated_183_q8_0_plus_157_f32_tied_embedding_metal_gpu_resident",
-                generation_runs: "metal_gpu_resident_serve_chat_greedy_with_eog_stop_default_lane_on_metal_hosts_runnable_bridge_fallback_elsewhere",
-                parity_audited: "gemma3_metal_resident_chat_token_and_text_identical_15_of_15_legs_at_1_5_50_sub512_plus_9_of_9_legs_at_606_1205_2403_prompt_tokens_zero_flips_vs_llamacpp_acd79d603_raw_completions_clean_through_depth_5_only",
+                tensors_load: "validated_183_q8_0_plus_157_f32_tied_embedding_gpu_resident_on_metal_and_cuda",
+                generation_runs: "gpu_resident_serve_chat_greedy_with_eog_stop_default_lane_on_metal_and_cuda_hosts_runnable_bridge_fallback_elsewhere",
+                parity_audited: "METAL lane: token_and_text_identical_15_of_15_legs_at_1_5_50_sub512_plus_9_of_9_legs_at_606_1205_2403_prompt_tokens_zero_flips. CUDA lane: 9_of_9_legs_at_606_1205_2403_prompt_tokens_token_and_text_identical_zero_flips_above_the_window_but_only_10_of_15_sub512_legs_five_disclosed_divergences_across_three_prompts_attributed_to_lane_numerics_by_a_per_layer_hidden_state_trace_no_step_change_worst_relative_l2_1_89_percent. Both vs llamacpp_acd79d603",
                 performance_measured: "not_claimed_resident_lane_throughput_is_a_separate_unshipped_measurement_phase",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, and served on the Metal GPU-resident lane (selected_backend=metal_resident_q8_runtime, decode_path=q8_0_metal_resident_decode) — on by default on a Metal host, opt-out CAMELID_METAL_RESIDENT_DECODE=0. Off that lane the runnable CPU bridge serves the row and only the sub-512 envelope is green; the windowed claim below does not travel to it",
-                tested_context: "gemma3_chat_greedy_1_5_50_at_606_1205_and_2403_prompt_tokens_plus_50_generated_all_above_the_512_token_sliding_window_metal_resident_lane_only",
+                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, and served on EITHER GPU-resident windowed lane: Metal (selected_backend=metal_resident_q8_runtime, decode_path=q8_0_metal_resident_decode; default on a Metal host, opt-out CAMELID_METAL_RESIDENT_DECODE=0) or CUDA (selected_backend=cuda_resident_windowed_runtime, decode_path=q8_0_cuda_resident_windowed_decode; default on a CUDA host, opt-out CAMELID_GEMMA3_CUDA_RESIDENT=0). Off both lanes the runnable CPU bridge serves the row and only the sub-512 envelope is green; the windowed claim does not travel to it. NOTE the two GPU lanes do not carry the same claim below the window — see parity_audited",
+                tested_context: "gemma3_chat_greedy_1_5_50_at_606_1205_and_2403_prompt_tokens_plus_50_generated_all_above_the_512_token_sliding_window_metal_resident_lane_and_cuda_resident_windowed_lane_independently",
                 chat_template_renderer: "gemma3_marker_native_byte_locked_by_shapes_pack",
                 chat_template_shape_pack: "validated_in_src_pack_lock_test",
                 chat_template_shape_pack_id: "gemma3-chat-template-shapes-v1",
@@ -4513,8 +4513,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "metal_gpu_resident_windowed_chat_parity_606_1205_2403_prompt_tokens",
                 latest_checked_result: "pass",
                 latest_checked_output: "qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053/README.md",
-                evidence: "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding. LANE: on a Metal host the row is served by DEFAULT on the GPU-resident Q8_0 lane (selected_backend metal_resident_q8_runtime, decode_path q8_0_metal_resident_decode, prefill_path q8_0_metal_resident_prefill), the first gemma3 forward in-tree carrying the 5:1 local/global schedule and the 512-token sliding-window mask; the gemma3 marker renderer (byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test) is shared with the dense lane, and decode stops on EOG. ORACLE: pinned llama.cpp acd79d603 (llama-server build 9632, CPU backend, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096, binary sha256 prefix 382096b1), two-phase throughout — the two engines were never resident together. SUB-512 CHAT: committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at greedy depths 1/5/50 — 15/15 generation legs token-AND-text IDENTICAL, zero flips, with cross-engine prompt tokenization identical 5/5. ABOVE THE WINDOW (the claim this lane exists for): committed pack qa/prompt-packs/gemma3-windowed-context-pack-v1.json, three prompts rendering to 606 / 1205 / 2403 tokens (1.18x / 2.35x / 4.69x the file's own gemma3.attention.sliding_window=512), each answerable only from its first sentence — 3/3 prompt tokenization identical and 9/9 generation legs at 1/5/50 token-AND-text IDENTICAL, ZERO flips. That the window is REAL and not decorative is shown by the contrast leg: on the same 606-token prompt and the same oracle capture, the runnable CPU bridge (no window mask) diverges at generated index 2 and never resynchronises, and re-fed the identical prefix the oracle ranks the runnable lane's token 1.667 nats behind its own — four times the largest disclosed near-tie in the bundle, so not a near-tie. That leg is ONE prompt at ONE depth: a demonstration, not a runnable-lane receipt. DETERMINISM: two fresh camelid serve processes with a full stop/start between them produce byte-identical receipt files (6 chat legs incl. the 2403-token prompt plus 5 raw-completion legs carrying actual emitted ids; sha256 prefix 632992c6). RAW /v1/completions is a SEPARATE harness over its own 4-prompt set (not the 5-prompt chat pack above), committed as-is with all_pass=false and DISCLOSED rather than hidden: depths 1 and 5 are clean 4/4, and at depth 50 three legs flip — camelid's token is the oracle's rank 1 on two of them when the oracle decodes continuously rather than from a re-fed prefix, while the third ('Once upon a time,') has a rank-1-stable oracle and camelid's token at 0.4471 nat, ABOVE both the Ornith 0.33-nat line and the frozen runnable bundle's 0.3416; a separate harness artifact (SPM whitespace re-encode) is identified and excluded from that count rather than tuned away. Bundle qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053 (README + manifest + SHA256SUMS, 20 artifacts). The frozen runnable-lane bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb stands as history for that other lane and is NOT re-adjudicated here. NOT claimed: any throughput or speed number on this lane, any comparison against another engine's speed, token-exact raw completions at depth 50, any context above 2,403 prompt tokens, the bounded-context ladder packs, multi-turn, streaming, tools (fail closed, typed 422), speculative decode or the prompt-prefix cache (both fail closed for windowed archs), neighbouring gemma3 sizes/quants, or the gemma4 family.",
-                next_step: "measure and publish the resident lane's throughput as its own receipt before any perf wording appears on this row; extend the windowed pack past 2,403 prompt tokens toward the file's native 32,768 before widening tested_context; adjudicate the three depth-50 raw-completion near-ties with a chat-shaped raw pack or an oracle-side reduction-order study before any raw token-exactness claim past depth 5; run the bounded-context ladder packs; a runnable-lane sliding-window mask (or removing that fallback) before any >512 claim travels to non-Metal hosts; agent-eval battery before any tool_capable claim",
+                evidence: "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding. LANE: the row is served by DEFAULT on a GPU-resident windowed lane on BOTH GPU backends — Metal (selected_backend metal_resident_q8_runtime, decode_path q8_0_metal_resident_decode, prefill_path q8_0_metal_resident_prefill) and CUDA (selected_backend cuda_resident_windowed_runtime, decode_path q8_0_cuda_resident_windowed_decode, prefill windowed_token_by_token_resident_prefill; opt-out CAMELID_GEMMA3_CUDA_RESIDENT=0) — each carrying the 5:1 local/global schedule and the 512-token sliding-window mask. The CUDA lane reuses kernels the gemma4 port had already landed in the generic resident kernel set (attention_decode_sw, geglu_mul) and declines batched prefill, batched and tree speculative verify, and CUDA graph capture, none of which carry a window; the gemma3 marker renderer (byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test) is shared with the dense lane, and decode stops on EOG. ORACLE: pinned llama.cpp acd79d603 (llama-server build 9632, CPU backend, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096, binary sha256 prefix 382096b1), two-phase throughout — the two engines were never resident together. SUB-512 CHAT: committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at greedy depths 1/5/50 — 15/15 generation legs token-AND-text IDENTICAL, zero flips, with cross-engine prompt tokenization identical 5/5. ABOVE THE WINDOW (the claim this lane exists for): committed pack qa/prompt-packs/gemma3-windowed-context-pack-v1.json, three prompts rendering to 606 / 1205 / 2403 tokens (1.18x / 2.35x / 4.69x the file's own gemma3.attention.sliding_window=512), each answerable only from its first sentence — 3/3 prompt tokenization identical and 9/9 generation legs at 1/5/50 token-AND-text IDENTICAL, ZERO flips. That the window is REAL and not decorative is shown by the contrast leg: on the same 606-token prompt and the same oracle capture, the runnable CPU bridge (no window mask) diverges at generated index 2 and never resynchronises, and re-fed the identical prefix the oracle ranks the runnable lane's token 1.667 nats behind its own — four times the largest disclosed near-tie in the bundle, so not a near-tie. That leg is ONE prompt at ONE depth: a demonstration, not a runnable-lane receipt. DETERMINISM: two fresh camelid serve processes with a full stop/start between them produce byte-identical receipt files (6 chat legs incl. the 2403-token prompt plus 5 raw-completion legs carrying actual emitted ids; sha256 prefix 632992c6). RAW /v1/completions is a SEPARATE harness over its own 4-prompt set (not the 5-prompt chat pack above), committed as-is with all_pass=false and DISCLOSED rather than hidden: depths 1 and 5 are clean 4/4, and at depth 50 three legs flip — camelid's token is the oracle's rank 1 on two of them when the oracle decodes continuously rather than from a re-fed prefix, while the third ('Once upon a time,') has a rank-1-stable oracle and camelid's token at 0.4471 nat, ABOVE both the Ornith 0.33-nat line and the frozen runnable bundle's 0.3416; a separate harness artifact (SPM whitespace re-encode) is identified and excluded from that count rather than tuned away. Bundle qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053 (README + manifest + SHA256SUMS, 20 artifacts). CUDA LANE (RTX 3060 Laptop, Windows), compared against the SAME pinned captures REPLAYED from that bundle rather than a fresh llama.cpp run: above the window 9/9 legs at 606/1205/2403 prompt tokens token-AND-text identical with tokenization 3/3, all_pass; below the window 10/15, with five divergent legs across three prompts enumerated in qa/gemma3-cuda/phase4/RESULT.md. A control run pins the attribution — the runnable CPU bridge on the SAME host against the SAME replayed capture is 10/10 at depths 1 and 5, so the capture travels and the in-tree CPU reference reproduces it exactly. The divergence is numerical, not structural: a per-layer hidden-state trace of both lanes on the failing prompt shows worst relative L2 1.89% across all 494 (position, layer) pairs and smooth 0.15%->0.67% growth with depth, with NO step change at any layer. The CUDA engine quantizes activations to Q8_0 per GEMV and stores KV as f16 while the oracle is f32 throughout, which is true of every CUDA row here. Replaying a committed capture is NOT a re-run: the prompts and depths are frozen and the oracle cannot be probed from its own side, so the CUDA lane's sub-512 flips are disclosed rather than adjudicated. The frozen runnable-lane bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb stands as history for that other lane and is NOT re-adjudicated here. NOT claimed: any throughput or speed number on this lane, any comparison against another engine's speed, token-exact raw completions at depth 50, any context above 2,403 prompt tokens, the bounded-context ladder packs, multi-turn, streaming, tools (fail closed, typed 422), speculative decode or the prompt-prefix cache (both fail closed for windowed archs), neighbouring gemma3 sizes/quants, token-exactness below the window ON THE CUDA LANE (10/15, disclosed above), or the gemma4 family.",
+                next_step: "adjudicate the CUDA lane's five sub-512 divergences against a LIVE llama.cpp (re-score the divergent positions from the oracle's side) before that lane's sub-512 envelope is claimed rather than merely disclosed; measure and publish each resident lane's throughput as its own receipt before any perf wording appears on this row; extend the windowed pack past 2,403 prompt tokens toward the file's native 32,768 before widening tested_context; adjudicate the three depth-50 raw-completion near-ties with a chat-shaped raw pack or an oracle-side reduction-order study before any raw token-exactness claim past depth 5; run the bounded-context ladder packs; a runnable-lane sliding-window mask (or removing that fallback) before any >512 claim travels to non-Metal hosts; agent-eval battery before any tool_capable claim",
             },
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
@@ -6329,15 +6329,40 @@ fn gemma4_serve_flag(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// Additionally route the gemma4 serve lane through the CUDA decode engine when
-/// `CAMELID_GEMMA4_CUDA` is set (and the build has the `cuda` feature). Off by
-/// default; with it off the gemma4 serve lane stays the CPU runtime, unchanged.
+/// Route the gemma4 serve lane through the CUDA-resident decode engine.
+///
+/// **Default ON** on a host where CUDA is actually driving decode; opt out with
+/// `CAMELID_GEMMA4_CUDA=0`. Previously opt-IN, which left every gemma4 row on the
+/// CPU out of the box on a CUDA host with a working resident engine.
+///
+/// Delegates to `execution_plan::gemma4_cuda_lane_selectable` rather than reading
+/// the env here, so the disclosed plan and the loaded lane read ONE predicate.
+/// Policy only — the per-file VRAM fit check lives at the load site.
 #[cfg(feature = "cuda")]
 fn gemma4_cuda_enabled() -> bool {
-    matches!(
-        std::env::var("CAMELID_GEMMA4_CUDA").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    crate::execution_plan::gemma4_cuda_lane_selectable()
+}
+
+/// Per-file VRAM fit check for the gemma4 CUDA-resident lane.
+///
+/// Policy says the lane is wanted; this says whether THIS file can have it. The
+/// resident engine uploads the model's tensor bytes and allocates an f16 KV cache
+/// on top, so a row larger than free VRAM must fall back to the CPU runtime
+/// rather than allocate into a mid-load OOM. On the 6 GB development card this is
+/// the difference between gemma-4-E2B Q4_0 (2.83 GB, fits) and E4B Q8_0 (7.63 GB,
+/// does not) — without it, default-on would turn a working CPU lane into a crash
+/// for the larger rows.
+///
+/// Deliberately conservative and deliberately crude: the GGUF file length
+/// over-estimates the tensor bytes (it includes metadata), which errs toward the
+/// CPU lane, and `GEMMA4_KV_RESERVE_MIB` covers the f16 KV at the 4096-position
+/// window the load site requests. Returns `Ok(())` when CUDA cannot be probed at
+/// all, leaving the decision to the existing load-time failure path.
+#[cfg(feature = "cuda")]
+fn gemma4_cuda_fit_check(model_path: &std::path::Path) -> std::result::Result<(), String> {
+    let gguf = crate::gguf::read_metadata(model_path)
+        .map_err(|e| format!("could not read GGUF metadata for the CUDA admission check: {e}"))?;
+    crate::execution_plan::gemma4_cuda_lane_admitted(&gguf)
 }
 
 /// Model family from the GGUF `general.architecture`.
@@ -9042,12 +9067,49 @@ async fn load_gemma4_serve_runtime(
             #[cfg(feature = "cuda")]
             {
                 if gemma4_cuda_enabled() {
-                    // KV-cache context window. 4096 fits the 6 GB card (the attention
-                    // kernel's shared memory is (2*head_dim + max_positions)*4 bytes, well
-                    // under 48 KB, and the f16 KV adds only ~100-200 MB) and gives real
-                    // multi-turn headroom; overflow past it is guarded in the runtime.
-                    return crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 4096)
-                        .map(|r| Gemma4ServeRuntime::Cuda(std::sync::Mutex::new(r)));
+                    // Policy wants the GPU lane; check that THIS file fits before
+                    // allocating. A refusal here is a named shortfall and a fall
+                    // through to the CPU runtime — never a mid-load OOM.
+                    match gemma4_cuda_fit_check(&load_path) {
+                        Ok(()) => {
+                            // KV-cache context window. 4096 fits the 6 GB card (the attention
+                            // kernel's shared memory is (2*head_dim + max_positions)*4 bytes, well
+                            // under 48 KB, and the f16 KV adds only ~100-200 MB) and gives real
+                            // multi-turn headroom; overflow past it is guarded in the runtime.
+                            match crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 4096) {
+                                Ok(r) => {
+                                    return Ok(Gemma4ServeRuntime::Cuda(std::sync::Mutex::new(r)))
+                                }
+                                // FALL BACK, do not propagate. The admission check
+                                // above is a projection, and a projection that is
+                                // slightly optimistic must cost the user a slower
+                                // lane, never a failed request. Before this arm the
+                                // error propagated and the row 503'd — which is a
+                                // strictly worse outcome than the CPU runtime that
+                                // was serving it perfectly well beforehand.
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "gemma4 CUDA-resident load failed; \
+                                         serving on the gemma4 CPU runtime instead"
+                                    );
+                                    eprintln!(
+                                        "[gemma4] CUDA-resident load failed: {e}; using the CPU runtime"
+                                    );
+                                }
+                            }
+                        }
+                        Err(shortfall) => {
+                            tracing::warn!(
+                                shortfall = %shortfall,
+                                "gemma4 CUDA-resident lane does not fit this device; \
+                                 serving on the gemma4 CPU runtime instead"
+                            );
+                            eprintln!(
+                                "[gemma4] CUDA-resident lane declined: {shortfall}; using the CPU runtime"
+                            );
+                        }
+                    }
                 }
             }
             crate::gemma4_runtime::Gemma4Runtime::load(&load_path).map(Gemma4ServeRuntime::Local)
@@ -23823,28 +23885,40 @@ mod runnable_completions_gate_api_tests {
     }
 
     /// gemma3→Metal Phase 3b: the completions gate is CAPABILITY-AWARE for
-    /// gemma3. On a host where the resident lane cannot serve
-    /// (`CAMELID_METAL_RESIDENT_DECODE=0` — the runnable-fallback
-    /// configuration, and the state of every non-macOS CI leg regardless of
-    /// env), the raw surfaces stay 422-gated exactly as before the flip.
+    /// gemma3. On a host where NO resident lane can serve, the raw surfaces
+    /// stay 422-gated exactly as before the flip.
+    ///
+    /// gemma3→CUDA Phase 2 amended what "fallback host" means. Disabling Metal
+    /// alone used to be sufficient, because "non-macOS" implied "no resident
+    /// gemma3 lane". It no longer does — a Windows or Linux CUDA host now has
+    /// one — so this test disables BOTH GPU lanes to construct the host it is
+    /// actually about. Left as it was, it passed on CI's CPU-only legs and
+    /// failed on any CUDA developer box, which is the worst kind of test.
+    ///
     /// Plain `#[test]` + a local runtime so the env mutation happens strictly
     /// under `env_lock` with no guard held across an await point.
     #[test]
     fn completions_gate_stays_closed_for_gemma3_on_a_runnable_fallback_host() {
         let _guard = crate::test_support::env_lock();
-        // Restore the caller's value on exit: a shell-armed targeted battery
+        // Restore the caller's values on exit: a shell-armed targeted battery
         // (CAMELID_METAL_RESIDENT_DECODE=1, §9d discipline) must not be
         // disarmed mid-run by this test — the resident gates read env LIVE.
-        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        let prior_metal = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        let prior_cuda = std::env::var("CAMELID_GEMMA3_CUDA_RESIDENT").ok();
         std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_GEMMA3_CUDA_RESIDENT", "0");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (status, body) = runtime.block_on(async {
             let app = router_with_state(state_with_loaded_arch("gemma3").await);
             post_json(app, "/completion", json!({ "prompt": "hi" })).await
         });
-        match prior {
+        match prior_metal {
             Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
             None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        match prior_cuda {
+            Some(value) => std::env::set_var("CAMELID_GEMMA3_CUDA_RESIDENT", value),
+            None => std::env::remove_var("CAMELID_GEMMA3_CUDA_RESIDENT"),
         }
         assert_gate_rejection(status, &body);
     }
@@ -23912,17 +23986,22 @@ mod runnable_completions_gate_api_tests {
 
     /// Phase 3c triage: gemma3 chat had NO HTTP-level test on ANY host — the
     /// only gemma3 HTTP tests hit `/completion`. This pins the leg that
-    /// matters most (the runnable-fallback host: every non-macOS CI leg, and
-    /// any Mac with resident decode opted out), where gemma3 chat must be
-    /// served BY THE BRIDGE. With no runnable runtime loaded, the honest
-    /// outcome is the typed 503 that names the lane — never a fall-through to
-    /// the dense engine, which for this arch fails closed at every per-layer
-    /// dispatch (H4).
+    /// matters most (a host where no resident GPU lane can serve), where
+    /// gemma3 chat must be served BY THE BRIDGE. With no runnable runtime
+    /// loaded, the honest outcome is the typed 503 that names the lane — never
+    /// a fall-through to the dense engine, which for this arch fails closed at
+    /// every per-layer dispatch (H4).
+    ///
+    /// gemma3→CUDA Phase 2: disables BOTH GPU lanes, for the reason spelled out
+    /// on `completions_gate_stays_closed_for_gemma3_on_a_runnable_fallback_host`
+    /// — "non-macOS" is no longer a synonym for "no resident gemma3 lane".
     #[test]
     fn gemma3_chat_routes_to_the_runnable_bridge_on_a_fallback_host() {
         let _guard = crate::test_support::env_lock();
-        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        let prior_metal = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        let prior_cuda = std::env::var("CAMELID_GEMMA3_CUDA_RESIDENT").ok();
         std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_GEMMA3_CUDA_RESIDENT", "0");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (status, body) = runtime.block_on(async {
             let app = router_with_state(state_with_loaded_arch("gemma3").await);
@@ -23933,9 +24012,13 @@ mod runnable_completions_gate_api_tests {
             )
             .await
         });
-        match prior {
+        match prior_metal {
             Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
             None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        match prior_cuda {
+            Some(value) => std::env::set_var("CAMELID_GEMMA3_CUDA_RESIDENT", value),
+            None => std::env::remove_var("CAMELID_GEMMA3_CUDA_RESIDENT"),
         }
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["error"]["code"], "model_not_ready", "{body}");
