@@ -310,15 +310,23 @@ jobs:
   # release camelid.exe as a loopback sidecar, signs its artifacts with the same Azure
   # Trusted Signing identity as build-windows, and attaches them to the release itself.
   #
-  # Signing layout (azure/artifact-signing-action is folder-based / post-build; Tauri
-  # PATCHES camelid-desktop.exe during bundling so it can only be signed after the bundle):
+  # Signing layout (azure/artifact-signing-action is folder-based, so every pass signs a
+  # staged folder rather than a named file):
   #   - sidecar camelid.exe  -> signed BEFORE bundling (so it is signed inside the installer
   #                             and the portable zip)
-  #   - camelid-desktop.exe  -> signed AFTER bundling (portable copy)
-  #   - NSIS installer       -> signed AFTER bundling
-  # Accepted v1 limitation: the camelid-desktop.exe baked INSIDE the installer is unsigned
-  # (the installer itself, the portable exe, and the sidecar are signed).
-  # See camelid-desktop/README.md, DECISIONS.md D11.
+  #   - camelid-desktop.exe  -> signed BEFORE bundling, for the same reason
+  #   - NSIS installer       -> signed AFTER bundling (it does not exist before)
+  #
+  # Through v0.4.6 the desktop exe was signed only AFTER bundling, which was recorded as an
+  # accepted v1 limitation: the copy sealed inside the installer went out unsigned, so the
+  # documented one-command install ran an unsigned app while the portable zip's identical
+  # binary was signed. The premise behind accepting it -- that Tauri patches the exe during
+  # bundling, so it could only be signed afterwards -- does not hold. Authenticode is a pure
+  # append: on the published v0.4.6 artifacts the signed copy's PE certificate table begins
+  # at offset 10513920, exactly the unsigned copy's length. The bundler embeds the same
+  # payload either way, so the exe is now signed before the bundler reads it, with a
+  # fail-closed assertion between the two steps.
+  # See DECISIONS.md D11 for the desktop app's design record.
   desktop-windows:
     if: ${{ github.event.inputs.skip_desktop != 'true' }}
     runs-on: windows-latest
