@@ -859,7 +859,10 @@ impl Gemma4DistributedRuntime {
     }
 }
 
-#[cfg(test)]
+// Gated as a whole, not per-test: the only test here is platform-specific, so
+// on other targets the module would be empty and `use super::*` an unused
+// import — a hard error under this repo's `-D warnings`.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
 
@@ -869,7 +872,6 @@ mod tests {
     /// landed — silently unarmed keepalive would leave a hung dial blocking a
     /// serve request for the full ten minutes, which is the exact regression
     /// this pairing exists to prevent.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn keepalive_is_actually_armed_on_the_socket() {
         use std::net::TcpListener;
