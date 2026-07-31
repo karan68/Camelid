@@ -10,10 +10,12 @@
 //!       CAMELID_GEMMA4_SPLIT=8 \
 //!       cargo test --release --test gemma4_distributed_parity -- --nocapture`
 
+use std::net::TcpListener;
+use std::ops::Range;
 use std::path::PathBuf;
 
 use camelid::gemma4_distributed::{
-    run_master, run_worker, Gemma4Handshake, Gemma4WorkerClient, GEMMA4_WIRE_VERSION,
+    run_master, run_worker_on_listener, Gemma4Handshake, Gemma4WorkerClient, GEMMA4_WIRE_VERSION,
 };
 use camelid::gemma4_runtime::Gemma4Runtime;
 
@@ -31,6 +33,29 @@ struct OracleResult {
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+/// Bind loopback on an OS-assigned free port, serve the worker shard on it, and
+/// return the address the master should dial.
+///
+/// These tests used to hard-code ports 39411-39413. On a box that also runs
+/// `camelid serve` the bind loses the race, the worker thread dies silently
+/// inside `let _ = run_worker(..)`, and the master then connects to whatever
+/// else holds the port — producing an opaque `ConnectionReset`/`UnexpectedEof`
+/// on the *master's* read with no hint that the worker never started. Binding
+/// here rather than inside the thread also means the socket is listening before
+/// the master dials, so no readiness poll is needed.
+fn spawn_worker(model: PathBuf, range: Range<usize>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback ephemeral port");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = run_worker_on_listener(&model, listener, range) {
+            // Surface the worker's own failure. Without this the only symptom
+            // is an unexplained EOF on the master's read.
+            eprintln!("gemma4 worker exited with error: {e:#}");
+        }
+    });
+    addr
 }
 
 #[test]
@@ -101,20 +126,7 @@ fn distributed_greedy_matches_single_node_and_oracle() {
     eprintln!("row {row}: {block_count} layers, split at {split}");
 
     // Worker thread on an ephemeral localhost port (real TCP, real protocol).
-    let port = 39411;
-    let addr = format!("127.0.0.1:{port}");
-    let worker_model = model.clone();
-    let worker_addr = addr.clone();
-    std::thread::spawn(move || {
-        run_worker(&worker_model, &worker_addr, split..block_count).expect("worker run");
-    });
-    // Wait for the listener.
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(&addr).is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let addr = spawn_worker(model.clone(), split..block_count);
 
     // One prompt is enough for wire parity (the full pack runs in the
     // generation-parity test); use the first oracle prompt.
@@ -157,19 +169,7 @@ fn distributed_wire_version_mismatch_fails_closed() {
         block_count / 2
     };
 
-    let port = 39412;
-    let addr = format!("127.0.0.1:{port}");
-    let worker_model = model.clone();
-    let worker_addr = addr.clone();
-    std::thread::spawn(move || {
-        let _ = run_worker(&worker_model, &worker_addr, split..block_count);
-    });
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(&addr).is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let addr = spawn_worker(model.clone(), split..block_count);
 
     let handshake = Gemma4Handshake {
         wire_version: GEMMA4_WIRE_VERSION + 1, // deliberately wrong
@@ -226,19 +226,7 @@ fn distributed_serve_runtime_streaming_matches_oracle() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_split.max(1));
 
-    let port = 39413;
-    let addr = format!("127.0.0.1:{port}");
-    let worker_model = model.clone();
-    let worker_addr = addr.clone();
-    std::thread::spawn(move || {
-        let _ = run_worker(&worker_model, &worker_addr, split..block_count);
-    });
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(&addr).is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let addr = spawn_worker(model.clone(), split..block_count);
 
     let runtime =
         camelid::gemma4_distributed::Gemma4DistributedRuntime::connect(&model, &addr, split)

@@ -155,6 +155,22 @@ pub fn run_worker(model: &Path, addr: &str, range: Range<usize>) -> Result<()> {
     // Bind BEFORE the (slow) shard load so a master can connect immediately;
     // its handshake waits in the accept backlog until the weights are ready.
     let listener = TcpListener::bind(addr).map_err(|e| io_err("bind", e))?;
+    run_worker_on_listener(model, listener, range)
+}
+
+/// Serve the worker protocol on an already-bound listener.
+///
+/// Callers that must know the port before the worker starts — tests binding
+/// `127.0.0.1:0` for an ephemeral port — bind themselves and hand the listener
+/// over. That removes both the hard-coded port that can collide with whatever
+/// else is on the box and the window in which the address is unbound, so no
+/// readiness poll is needed: the socket is listening before this is called.
+pub fn run_worker_on_listener(
+    model: &Path,
+    listener: TcpListener,
+    range: Range<usize>,
+) -> Result<()> {
+    let addr = listener.local_addr().map_err(|e| io_err("local_addr", e))?;
     let runtime = Gemma4Runtime::load_layer_range(model, Some(range.clone()))?;
     if runtime.local_layer_range().end != runtime.block_count() {
         return Err(BackendError::InvalidModelMetadata(format!(

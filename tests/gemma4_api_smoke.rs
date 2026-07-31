@@ -276,22 +276,26 @@ async fn live_gemma4_distributed_chat_serve_smoke() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_split.max(1));
 
-    let addr = "127.0.0.1:39414".to_string();
+    // Bind an OS-assigned free port here rather than hard-coding one: this box
+    // may already be running `camelid serve`, and a lost bind race inside the
+    // worker thread would surface only as an opaque ConnectionReset on the
+    // master's first read. Binding before the spawn also means the socket is
+    // listening by the time we connect, so no readiness poll is needed.
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback ephemeral port");
+    let addr = listener.local_addr().unwrap().to_string();
     let worker_model = model_path.clone();
-    let worker_addr = addr.clone();
     std::thread::spawn(move || {
-        let _ = camelid::gemma4_distributed::run_worker(
+        if let Err(e) = camelid::gemma4_distributed::run_worker_on_listener(
             &worker_model,
-            &worker_addr,
+            listener,
             split..block_count,
-        );
-    });
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(&addr).is_ok() {
-            break;
+        ) {
+            // Surface the worker's own failure; without this the only symptom
+            // is an unexplained EOF on the master's read.
+            eprintln!("gemma4 worker exited with error: {e:#}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    });
 
     let runtime = tokio::task::spawn_blocking({
         let p = model_path.clone();
@@ -334,9 +338,17 @@ async fn live_gemma4_distributed_chat_serve_smoke() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    // Read the body before asserting the status: on a 5xx the error payload is
+    // the only thing that says *why*, and asserting first throws it away.
+    let status = response.status();
+    let raw = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "distributed chat completion failed: {}",
+        String::from_utf8_lossy(&raw)
+    );
+    let body: Value = serde_json::from_slice(&raw).unwrap();
     let content = body["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default();
