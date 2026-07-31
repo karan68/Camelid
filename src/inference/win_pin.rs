@@ -1,16 +1,35 @@
 //! STAMPEDE Phase 1 — Windows core topology and optional worker pinning for
 //! the dedicated decode/prefill rayon pools.
 //!
-//! **Hybrid decode sizing (default on, hybrid hosts only).** Intel hybrid parts
-//! expose performance and efficiency cores that the pre-hybrid
+//! **Hybrid decode sizing (default on, Intel hybrid hosts only).** Intel hybrid
+//! parts expose performance and efficiency cores that the pre-hybrid
 //! `GetLogicalProcessorInformation` cannot tell apart, so the raw physical-core
 //! count it returns silently mixes both classes and the decode pool is sized
 //! for cores that decode ~2.4x slower. `GetLogicalProcessorInformationEx`
-//! reports a per-core `EfficiencyClass`; when a host reports more than one
-//! class, [`hybrid_decode_core_count`] returns the number of top-class cores
-//! and the decode pool is sized to that instead. Hosts reporting a single class
-//! (pre-hybrid Intel, AMD, VMs, servers) get `None` and keep their existing
-//! width exactly. `CAMELID_WIN_HYBRID_POLICY=0|false|off|no` restores it.
+//! reports a per-core `EfficiencyClass`; on a `GenuineIntel` host reporting
+//! more than one class, [`hybrid_decode_core_count`] returns the number of
+//! top-class cores and the decode pool is sized to that instead. Every other
+//! host — any other vendor, and any host reporting a single class — gets `None`
+//! and keeps its existing width exactly.
+//! `CAMELID_WIN_HYBRID_POLICY=0|false|off|no` restores it.
+//!
+//! **Why the vendor gate.** More than one `EfficiencyClass` does not imply a
+//! P/E split. Windows also reports several on AMD parts where every core
+//! decodes at a similar rate: Zen 5c compact cores are the same
+//! microarchitecture at a lower clock, and multi-CCD desktop parts are
+//! distinguished by differing CPPC preferred-performance values. Sizing to the
+//! top class there would build a 4-of-12 or an 8-of-16 pool for no reason, and
+//! the sweep below measures under-selection as a *negative* direction — four
+//! workers scored -2.976 tok/s against the shipped default, worse than shipping
+//! nothing. The measured evidence is one Intel hybrid part, so the gate keeps
+//! the policy where the evidence is; it comes off when an AMD host is measured.
+//!
+//! **Group 0 only.** The record walk keeps group-0 cores, and
+//! `GetProcessAffinityMask` fails outright for a process spanning processor
+//! groups (falling back to unrestricted here), so above 64 logical CPUs the
+//! width is decided from group 0 regardless of where the process actually runs.
+//! No client hybrid part is that large today, and a server part that is reports
+//! a single class and takes the `None` path anyway.
 //!
 //! This changes a thread *count*, not the arithmetic, so it is bit-identical by
 //! construction — and it deliberately does not pin. Measured on an i9-14900HX,
@@ -134,6 +153,34 @@ fn hybrid_policy_enabled_from(value: Option<&str>) -> bool {
         }
         None => true,
     }
+}
+
+/// `true` when a CPUID leaf-0 vendor string reads `GenuineIntel`.
+///
+/// Split from the CPUID call so the decode is testable off-hardware. The vendor
+/// string arrives as EBX, EDX, ECX in that order, each little-endian.
+#[cfg_attr(
+    not(all(target_os = "windows", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn vendor_is_intel(ebx: u32, edx: u32, ecx: u32) -> bool {
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&edx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&ecx.to_le_bytes());
+    &vendor == b"GenuineIntel"
+}
+
+/// Whether this host is the vendor the sizing policy was actually measured on.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+// `__cpuid` is a safe fn on the pinned toolchain and an `unsafe` one on the
+// older versions CI and release still build with; the block compiles on both.
+#[allow(unused_unsafe)]
+fn host_is_intel() -> bool {
+    // SAFETY: leaf 0 is architecturally defined on every x86-64 part and writes
+    // only the four registers returned here.
+    let leaf = unsafe { std::arch::x86_64::__cpuid(0) };
+    vendor_is_intel(leaf.ebx, leaf.edx, leaf.ecx)
 }
 
 /// `GROUP_AFFINITY` (winnt.h). Mirrored locally because the record walk needs
@@ -289,36 +336,29 @@ fn windows_core_masks() -> Option<&'static Vec<usize>> {
         .as_ref()
 }
 
-/// Top-efficiency-class core masks for this host, or `None` when the policy is
-/// disabled, the host is not hybrid, or detection failed.
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-fn hybrid_performance_masks() -> Option<&'static Vec<usize>> {
-    static MASKS: OnceLock<Option<Vec<usize>>> = OnceLock::new();
-    MASKS
-        .get_or_init(|| {
-            if !hybrid_policy_enabled() {
-                return None;
-            }
-            let (masks, classes) = core_topology()?;
-            let selected = performance_core_masks(masks, classes, process_affinity_mask());
-            if let Some(selected) = selected.as_ref() {
-                tracing::info!(
-                    performance_cores = selected.len(),
-                    physical_cores = masks.len(),
-                    "hybrid CPU detected: sizing the decode pool to the performance cores"
-                );
-            }
-            selected
-        })
-        .as_ref()
-}
-
-/// Decode-pool width for a hybrid host: one worker per performance core, or
-/// `None` when the host is not hybrid so callers keep their existing sizing.
-/// Only defined where the caller is, which is why there is no stub arm.
+/// Decode-pool width for a hybrid Intel host: one worker per performance core.
+///
+/// `None` — caller keeps its existing sizing — when the policy is switched off,
+/// the vendor is not Intel, the host reports a single `EfficiencyClass`, a
+/// process affinity restriction leaves no performance core, or detection
+/// failed. Only defined where the caller is, which is why there is no stub arm.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub(super) fn hybrid_decode_core_count() -> Option<usize> {
-    hybrid_performance_masks().map(Vec::len)
+    static COUNT: OnceLock<Option<usize>> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        if !hybrid_policy_enabled() || !host_is_intel() {
+            return None;
+        }
+        let (masks, classes) = core_topology()?;
+        let selected = performance_core_masks(masks, classes, process_affinity_mask())?;
+        tracing::info!(
+            performance_cores = selected.len(),
+            // Both counts come from the group-0 walk, so they share a denominator.
+            group0_physical_cores = masks.len(),
+            "hybrid Intel CPU detected: sizing the decode pool to the performance cores"
+        );
+        Some(selected.len())
+    })
 }
 
 /// Pin the calling pool worker (index `worker`) per the selected mode.
@@ -371,17 +411,30 @@ pub(super) fn pin_pool_worker(_pool: &'static str, _worker: usize) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{hybrid_policy_enabled_from, performance_core_masks};
+    use super::{hybrid_policy_enabled_from, performance_core_masks, vendor_is_intel};
 
     const UNRESTRICTED: usize = usize::MAX;
 
     #[test]
     fn a_single_efficiency_class_disables_the_policy() {
-        // Pre-hybrid Intel, every AMD part, VMs and servers report one class.
-        // They must keep their existing decode pool width exactly.
+        // A host reporting one class keeps its existing decode pool width. This
+        // is a property of the selection, not a claim about any vendor's
+        // silicon: which hosts report one class is not asserted here, and the
+        // vendor question is gated separately by `vendor_is_intel`.
         let masks = vec![0b0011, 0b1100, 0b0011_0000, 0b1100_0000];
         let classes = vec![0, 0, 0, 0];
         assert_eq!(performance_core_masks(&masks, &classes, UNRESTRICTED), None);
+    }
+
+    #[test]
+    fn only_genuine_intel_takes_the_hybrid_path() {
+        // CPUID leaf 0 returns the vendor string as EBX, EDX, ECX.
+        assert!(vendor_is_intel(0x756e_6547, 0x4965_6e69, 0x6c65_746e));
+        // AuthenticAMD reports more than one EfficiencyClass on Zen 5c and on
+        // multi-CCD parts, where the classes are not a P/E split.
+        assert!(!vendor_is_intel(0x6874_7541, 0x6974_6e65, 0x444d_4163));
+        // A failed or emulated leaf must not be read as Intel.
+        assert!(!vendor_is_intel(0, 0, 0));
     }
 
     #[test]

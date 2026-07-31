@@ -5667,8 +5667,8 @@ fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
     let global = rayon::current_num_threads();
     // Promoted default policy (Windows x86_64): decode runs on a dedicated
     // pool at the DETECTED PHYSICAL core count, never the SMT logical count,
-    // and on a hybrid part at the PERFORMANCE-core count rather than the raw
-    // physical count (see `win_pin`). Fail-closed: no detection → no pool
+    // and on a hybrid Intel part at the PERFORMANCE-core count rather than the
+    // raw physical count (see `win_pin`). Fail-closed: no detection → no pool
     // (pre-promotion behavior); an operator-pinned global (CAMELID_THREADS,
     // mirroring the prefill pool's pinning contract) or a global already
     // narrower than physical is never silently overridden. The per-host
