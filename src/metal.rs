@@ -61,6 +61,9 @@ struct MetalLinearKernel {
     scale_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
+    attention_decode_scores_pipeline: ComputePipelineState,
+    attention_decode_softmax_pipeline: ComputePipelineState,
+    attention_decode_context_pipeline: ComputePipelineState,
     attention_decode_kv16_pipeline: ComputePipelineState,
     attention_decode_v2_pipeline: ComputePipelineState,
     attention_decode_v2_kv16_pipeline: ComputePipelineState,
@@ -2385,6 +2388,153 @@ kernel void attention_decode_f32(
     // Phase 3: out[d] = sum_p prob_p * v_p[d], lanes striding over the output dimensions so
     // each lane owns a disjoint set of dims and writes them directly (no cross-lane reduce).
     for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            acc += scores[score_base + p] * inv * values[kv_base + p * position_stride + d];
+        }
+        output[q_base + d] = acc;
+    }
+}
+
+// ---- SPLIT-3 decode attention (bit-identical twin of attention_decode_f32) ------
+//
+// Why this exists. `attention_decode_f32` runs a whole layer's attention on exactly
+// `n_heads` threadgroups of ONE 32-lane simdgroup. On the gemma3-1b geometry that is
+// FOUR threadgroups / 128 threads for the entire device, so most of the GPU is idle and
+// nothing hides the K/V load latency. The three kernels below do the same arithmetic in
+// the same order, but expose the work as `n_heads * position_count` independent score
+// threads and `n_heads * head_dim` independent context threads.
+//
+// Why it is bit-identical, not merely close (this is the load-bearing property — every
+// perf change on this lane must reproduce the pinned parity receipts exactly):
+//   * each score is an INDEPENDENT sequential dot product over `head_dim`; moving it to
+//     its own thread does not touch the accumulation order inside the d-loop;
+//   * the softmax kernel keeps the ORIGINAL lane->position striding, so `simd_max` sees
+//     the same values and `simd_sum` adds the same partials in the same order (scores are
+//     round-tripped through f32 device memory, which is exact);
+//   * each context output element is an INDEPENDENT sequential sum over positions in
+//     ascending order; the inner expression is kept textually identical to v1's so the
+//     compiler makes the same FMA-contraction choices.
+// Consequence: split-3 and v1 must agree BIT-FOR-BIT, and a test asserts exactly that
+// (`metal_attention_decode_split3_is_bit_identical_to_v1`). If they ever disagree, the
+// split is wrong — do not widen the tolerance.
+
+// Phase 1: scaled q.k scores. `n_blocks` threadgroups per head, each one 32-lane
+// simdgroup, so the grid is n_heads * n_blocks threadgroups instead of n_heads.
+//
+// The loop NEST is a verbatim copy of v1's phase 1 — a strided outer loop over
+// positions containing a scalar accumulation over head_dim — with only the stride
+// widened from 32 to 32*n_blocks and the start offset shifted by the block. That is
+// deliberate and load-bearing: Metal compiles with fast-math on, so it is free to
+// re-associate a reduction, and it makes that choice from the shape of the loop nest.
+// Flattening this to one thread per (head, position) — the obvious way to write it —
+// produced outputs that differed from v1 in the last ulp (measured: 829/1024 elements,
+// max 3.05e-8). Keeping the nest identical keeps the codegen identical. Do not
+// "simplify" this loop.
+kernel void attention_decode_scores_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device float* scores [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_blocks [[buffer(14)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint head = tg.x;
+    if (head >= n_heads) return;
+    uint kv_head = head / group;
+    uint q_base = head * head_dim;
+    uint kv_base = kv_base_offset + kv_head * kv_head_stride;
+    uint score_base = head * position_count;
+    uint stride = 32u * n_blocks;
+
+    for (uint p = lane + tg.y * 32u; p < position_count; p += stride) {
+        uint k_base = kv_base + p * position_stride;
+        float s = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * keys[k_base + d];
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+    }
+}
+
+// Phase 2: row max, exp in place, denominator. One threadgroup (one 32-lane simdgroup)
+// per head — the SAME shape and the SAME lane->position striding as v1, which is what
+// keeps the reduction order identical.
+//
+// It publishes the DENOMINATOR, not its reciprocal, and phase 3 does the `1.0 / denom`
+// itself. That looks redundant and is not: Metal's fast-math lowers `1.0 / x` to a fast
+// reciprocal, and in the fused v1 kernel the `* inv` in phase 3 is folded against that
+// reciprocal's definition. Handing phase 3 an already-reciprocated value hides the
+// definition and produces a DIFFERENT last ulp (measured: 829/1024 outputs, max abs diff
+// 3.05e-8 — the only reason the first cut of this split failed its bit-identity test).
+kernel void attention_decode_softmax_f32(
+    device float* scores [[buffer(3)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& position_count [[buffer(7)]],
+    device float* denom_out [[buffer(13)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    if (head >= n_heads) return;
+    uint score_base = head * position_count;
+
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32) {
+        local_max = max(local_max, scores[score_base + p]);
+    }
+    float max_score = simd_max(local_max);
+
+    float local_sum = 0.0;
+    for (uint p = lane; p < position_count; p += 32) {
+        float e = exp(scores[score_base + p] - max_score);
+        scores[score_base + p] = e;
+        local_sum += e;
+    }
+    float denom = simd_sum(local_sum);
+    if (lane == 0) {
+        denom_out[head] = denom;
+    }
+}
+
+// Phase 3: out[d] = sum_p prob_p * v_p[d]. Same loop nest as v1's phase 3 (see the
+// codegen note on attention_decode_scores_f32), with `n_blocks` threadgroups per head
+// splitting the output dimensions instead of one.
+kernel void attention_decode_context_f32(
+    device const float* values [[buffer(2)]],
+    device const float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const float* denom_in [[buffer(13)]],
+    constant uint& n_blocks [[buffer(14)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    uint head = tg.x;
+    if (head >= n_heads) return;
+    uint kv_head = head / group;
+    uint q_base = head * head_dim;
+    uint kv_base = kv_base_offset + kv_head * kv_head_stride;
+    uint score_base = head * position_count;
+    // Reciprocal taken HERE, from the denominator — see attention_decode_softmax_f32.
+    float inv = 1.0 / denom_in[head];
+    uint stride = 32u * n_blocks;
+
+    for (uint d = lane + tg.y * 32u; d < head_dim; d += stride) {
         float acc = 0.0;
         for (uint p = 0; p < position_count; ++p) {
             acc += scores[score_base + p] * inv * values[kv_base + p * position_stride + d];
@@ -5388,6 +5538,24 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_decode_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_function)
                 .ok()?;
+            let attention_decode_scores_function = elementwise_library
+                .get_function("attention_decode_scores_f32", None)
+                .ok()?;
+            let attention_decode_scores_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_scores_function)
+                .ok()?;
+            let attention_decode_softmax_function = elementwise_library
+                .get_function("attention_decode_softmax_f32", None)
+                .ok()?;
+            let attention_decode_softmax_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_softmax_function)
+                .ok()?;
+            let attention_decode_context_function = elementwise_library
+                .get_function("attention_decode_context_f32", None)
+                .ok()?;
+            let attention_decode_context_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_context_function)
+                .ok()?;
             let attention_decode_kv16_function = elementwise_library
                 .get_function("attention_decode_kv16", None)
                 .ok()?;
@@ -5818,6 +5986,9 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 scale_pipeline,
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
+                attention_decode_scores_pipeline,
+                attention_decode_softmax_pipeline,
+                attention_decode_context_pipeline,
                 attention_decode_kv16_pipeline,
                 attention_decode_v2_pipeline,
                 attention_decode_v2_kv16_pipeline,
@@ -8355,6 +8526,72 @@ pub fn try_attention_decode_strided_f32(
     kv_head_stride: usize,
     kv_base_offset: usize,
 ) -> Option<Vec<f32>> {
+    attention_decode_strided_f32_variant(
+        query,
+        keys,
+        values,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        position_count,
+        scale,
+        position_stride,
+        kv_head_stride,
+        kv_base_offset,
+        false,
+    )
+}
+
+/// Same computation as [`try_attention_decode_strided_f32`], forced through the
+/// three-dispatch `encode_attention_split3` encode. Test-only: production picks the
+/// encode via `attn_split3_enabled()`, and the two must agree bit-for-bit.
+#[cfg(all(target_os = "macos", test))]
+#[allow(clippy::too_many_arguments)]
+fn try_attention_decode_strided_split3_f32(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    scale: f32,
+    position_stride: usize,
+    kv_head_stride: usize,
+    kv_base_offset: usize,
+) -> Option<Vec<f32>> {
+    attention_decode_strided_f32_variant(
+        query,
+        keys,
+        values,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        position_count,
+        scale,
+        position_stride,
+        kv_head_stride,
+        kv_base_offset,
+        true,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn attention_decode_strided_f32_variant(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    scale: f32,
+    position_stride: usize,
+    kv_head_stride: usize,
+    kv_base_offset: usize,
+    split3: bool,
+) -> Option<Vec<f32>> {
     // Largest float index the kernel will touch in keys/values (last head, last position).
     // saturating_sub keeps this panic-free for zero inputs, which the checks below reject.
     let max_index = kv_base_offset
@@ -8401,6 +8638,33 @@ pub fn try_attention_decode_strided_f32(
     }
     let command_buffer = kernel.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
+    if split3 {
+        let denom_buf = new((n_heads * 4).max(4) as u64);
+        let blocks_buf = new(8);
+        encode_attention_split3(
+            encoder,
+            kernel,
+            &query_buf,
+            &keys_buf,
+            &values_buf,
+            &scores_buf,
+            &denom_buf,
+            &output_buf,
+            &scalar_buf,
+            &blocks_buf,
+            n_heads,
+            head_dim,
+            position_count,
+            0,
+            0,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        read_buffer_f32(&output_buf, &mut out);
+        return Some(out);
+    }
     encoder.set_compute_pipeline_state(&kernel.attention_decode_pipeline);
     encoder.set_buffer(0, Some(&query_buf), 0);
     encoder.set_buffer(1, Some(&keys_buf), 0);
@@ -10330,6 +10594,25 @@ fn splitk_attention_enabled() -> bool {
     })
 }
 
+/// Split the f32 fallback decode attention into three dispatches
+/// (scores / softmax / context) instead of one. Default ON;
+/// `CAMELID_METAL_ATTN_SPLIT3=0` restores the single-kernel encode.
+///
+/// This is a pure parallelism change: the split kernels reproduce
+/// `attention_decode_f32` bit-for-bit (see the MSL comment above
+/// `attention_decode_scores_f32` for the argument, and
+/// `metal_attention_decode_split3_is_bit_identical_to_v1` for the proof), so the
+/// gate exists for A/B measurement and rollback, NOT to select between two
+/// numerically different lanes.
+#[cfg(target_os = "macos")]
+fn attn_split3_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_ATTN_SPLIT3")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn attn2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -10642,6 +10925,110 @@ fn encode_rope(
     dispatch_1d(e, &k.rope_rotate_pipeline, head_count * half_rope);
 }
 
+/// Encode the three-dispatch form of `attention_decode_f32`: scores -> softmax ->
+/// context. `scalar` carries the same 32-byte layout the single-kernel path uses
+/// (n_heads | head_dim | position_count | group | scale | position_stride |
+/// kv_head_stride | kv_base_offset); `denom` is scratch for one f32 per head (the
+/// softmax denominator, NOT its reciprocal — see the kernel comment).
+///
+/// Dispatches on a compute encoder are serial with automatic hazard tracking, so the
+/// scores buffer written by phase 1 is fully visible to phase 2, and phase 2's in-place
+/// exp is visible to phase 3, without any explicit barrier.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_attention_split3(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    scores: &Buffer,
+    denom: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    blocks: &Buffer,
+    n_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    query_off: u64,
+    out_off: u64,
+) {
+    // `blocks` carries the two per-head threadgroup counts the kernels need to widen
+    // their loop strides: score blocks at byte 0, context blocks at byte 4.
+    let score_blocks = position_count.div_ceil(32).max(1);
+    let dim_blocks = head_dim.div_ceil(32).max(1);
+    unsafe {
+        let p = blocks.contents() as *mut u32;
+        *p = score_blocks as u32;
+        *p.add(1) = dim_blocks as u32;
+    }
+    let tg32 = metal::MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+
+    e.set_compute_pipeline_state(&k.attention_decode_scores_pipeline);
+    e.set_buffer(0, Some(query), query_off);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_buffer(5, Some(scalar), 0); // n_heads
+    e.set_buffer(6, Some(scalar), 4); // head_dim
+    e.set_buffer(7, Some(scalar), 8); // position_count
+    e.set_buffer(8, Some(scalar), 12); // group
+    e.set_buffer(9, Some(scalar), 16); // scale (f32)
+    e.set_buffer(10, Some(scalar), 20); // position_stride
+    e.set_buffer(11, Some(scalar), 24); // kv_head_stride
+    e.set_buffer(12, Some(scalar), 28); // kv_base_offset
+    e.set_buffer(14, Some(blocks), 0); // score blocks per head
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: score_blocks as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+
+    e.set_compute_pipeline_state(&k.attention_decode_softmax_pipeline);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_buffer(5, Some(scalar), 0); // n_heads
+    e.set_buffer(7, Some(scalar), 8); // position_count
+    e.set_buffer(13, Some(denom), 0);
+    // One threadgroup per head, one 32-lane SIMD group inside it — the same shape the
+    // single-kernel path uses, so `simd_max`/`simd_sum` see the same partials.
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        tg32,
+    );
+
+    e.set_compute_pipeline_state(&k.attention_decode_context_pipeline);
+    e.set_buffer(2, Some(values), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_buffer(4, Some(out), out_off);
+    e.set_buffer(5, Some(scalar), 0); // n_heads
+    e.set_buffer(6, Some(scalar), 4); // head_dim
+    e.set_buffer(7, Some(scalar), 8); // position_count
+    e.set_buffer(8, Some(scalar), 12); // group
+    e.set_buffer(10, Some(scalar), 20); // position_stride
+    e.set_buffer(11, Some(scalar), 24); // kv_head_stride
+    e.set_buffer(12, Some(scalar), 28); // kv_base_offset
+    e.set_buffer(13, Some(denom), 0);
+    e.set_buffer(14, Some(blocks), 4); // context blocks per head
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: dim_blocks as u64,
+            depth: 1,
+        },
+        tg32,
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention(
@@ -10754,6 +11141,33 @@ fn encode_attention(
         );
         keep.push(partials);
         keep.push(splits_scalar);
+        return;
+    }
+    // Bit-identical three-dispatch encode of the f32 fallback kernel. Same arithmetic,
+    // same order; the only difference is that the score and context phases are exposed
+    // as independent threads instead of being folded onto n_heads simdgroups.
+    if !v2 && !kv16_enabled() && !kvq8_enabled() && attn_split3_enabled() {
+        let denom = pool_get(k, (n_heads * 4).max(4) as u64);
+        let blocks = pool_get(k, 8);
+        encode_attention_split3(
+            e,
+            k,
+            query,
+            keys,
+            values,
+            scores,
+            &denom,
+            out,
+            scalar,
+            &blocks,
+            n_heads,
+            head_dim,
+            position_count,
+            query_off,
+            out_off,
+        );
+        keep.push(denom);
+        keep.push(blocks);
         return;
     }
     let attn_pipeline = match (v2, kv16_enabled(), kvq8_enabled()) {
@@ -21465,6 +21879,108 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, got2);
+    }
+
+    /// The three-dispatch decode attention must reproduce the single-kernel one
+    /// BIT-FOR-BIT, not approximately. `assert_eq!` on the raw f32s is the whole point:
+    /// the split only changes how threads are laid out, so any difference at all means
+    /// an accumulation order moved and the pinned gemma3 parity receipts would shift.
+    ///
+    /// Geometries cover the production gemma3-1b row (4 query heads / 1 KV head /
+    /// head_dim 256 — the shape that cannot reach the v2 or split-K kernels), a
+    /// windowed read range (non-zero `kv_base_offset` with `position_count` shorter than
+    /// the cache), the 1:1 non-GQA case, and a position count that is not a multiple of
+    /// the 32-lane stride (so the softmax kernel's ragged tail is exercised).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_split3_is_bit_identical_to_v1() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // (n_heads, n_kv_heads, head_dim, cache_positions, window_start, position_count)
+        let cases: [(usize, usize, usize, usize, usize, usize); 6] = [
+            (4, 1, 256, 1, 0, 1),
+            (4, 1, 256, 37, 0, 37),
+            (4, 1, 256, 600, 88, 512),
+            (4, 1, 256, 512, 0, 512),
+            (2, 2, 64, 100, 0, 100),
+            (8, 2, 128, 130, 7, 123),
+        ];
+        for (n_heads, n_kv, head_dim, cache_positions, window_start, position_count) in cases {
+            let q_dim = n_heads * head_dim;
+            let query: Vec<f32> = (0..q_dim)
+                .map(|i| (((i * 37) % 211) as f32 - 105.0) * 0.017)
+                .collect();
+            let cache_len = n_kv * cache_positions * head_dim;
+            let keys: Vec<f32> = (0..cache_len)
+                .map(|i| (((i * 53) % 197) as f32 - 98.0) * 0.011)
+                .collect();
+            let values: Vec<f32> = (0..cache_len)
+                .map(|i| (((i * 71) % 179) as f32 - 89.0) * 0.013)
+                .collect();
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            // Contiguous [kv_head][position][head_dim]: the window shifts the read range
+            // by `window_start` positions, exactly as the resident encode does.
+            let position_stride = head_dim;
+            let kv_head_stride = cache_positions * head_dim;
+            let kv_base_offset = window_start * head_dim;
+            let single = try_attention_decode_strided_f32(
+                &query,
+                &keys,
+                &values,
+                n_heads,
+                n_kv,
+                head_dim,
+                position_count,
+                scale,
+                position_stride,
+                kv_head_stride,
+                kv_base_offset,
+            )
+            .expect("single-kernel attention");
+            let split = try_attention_decode_strided_split3_f32(
+                &query,
+                &keys,
+                &values,
+                n_heads,
+                n_kv,
+                head_dim,
+                position_count,
+                scale,
+                position_stride,
+                kv_head_stride,
+                kv_base_offset,
+            )
+            .expect("split-3 attention");
+            assert_eq!(
+                single.len(),
+                q_dim,
+                "geometry {n_heads}x{n_kv}x{head_dim} pc={position_count}"
+            );
+            let mismatches = single
+                .iter()
+                .zip(&split)
+                .enumerate()
+                .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+                .collect::<Vec<_>>();
+            let worst = mismatches
+                .iter()
+                .map(|(_, (a, b))| (*a - *b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                mismatches.is_empty(),
+                "split-3 decode attention diverged from the single-kernel encode at \
+                 n_heads={n_heads} n_kv={n_kv} head_dim={head_dim} \
+                 position_count={position_count} window_start={window_start}: \
+                 {} / {} elements differ, max abs diff {worst:e}, first at index {} \
+                 ({} vs {})",
+                mismatches.len(),
+                single.len(),
+                mismatches[0].0,
+                mismatches[0].1 .0,
+                mismatches[0].1 .1,
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
