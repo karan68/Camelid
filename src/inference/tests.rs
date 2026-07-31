@@ -3951,6 +3951,59 @@ fn q4_k_repack8_budget_zero_degrades_bit_identically() {
     }
 }
 
+/// The 256-bit AVX-VNNI inner must be bit-identical to the non-owner path.
+/// Guarded to the hosts that actually reach it — a part with AVX-512 takes the
+/// zmm sibling and a part without `vpdpbusd` takes the AVX2 inner, so on those
+/// the assertion would prove nothing about this kernel. The engaged counter is
+/// asserted first so the comparison can never pass vacuously.
+#[test]
+fn q4_k_owner_avxvnni_inner_is_bit_identical() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !std::arch::is_x86_feature_detected!("avxvnni") || q8_owner_avx512vnni_available() {
+            return;
+        }
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let in_dim = 512usize;
+        let out_dim = 32usize;
+        let row_bytes = (in_dim / 256) * 144;
+        let wire: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let input_data: Vec<f32> = (0..8 * in_dim).map(|i| ((i as f32) * 0.3).cos()).collect();
+        let input = CpuTensor::from_f32("avxvnni-in", vec![8usize, in_dim], input_data).unwrap();
+        let mut weight = CpuTensor::from_f32(
+            "avxvnni-w",
+            vec![out_dim, in_dim],
+            vec![0f32; out_dim * in_dim],
+        )
+        .unwrap();
+        weight.source_type = Some(GgufTensorType::Q4K);
+        weight.q4_k_wire_bytes = Some(std::sync::Arc::new(wire.clone()));
+
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+        let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI", "1");
+        reset_q8_schedule_telemetry();
+        let owned = matmul_rhs_transposed_q4_k_block_dot(&input, &weight, "avxvnni").unwrap();
+        let telemetry = snapshot_q8_schedule_telemetry();
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
+
+        assert!(
+            telemetry.kquant_owner_avxvnni_taken > 0,
+            "the 256-bit inner never dispatched; the comparison below would be vacuous"
+        );
+        assert_eq!(telemetry.kquant_owner_vnni_taken, 0);
+        for (a, b) in owned.data.iter().zip(base.data.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+}
+
 /// STAMPEDE Phase 3 Lane B sibling: the batched Q6_K prefill owner must be
 /// bitwise identical to the per-cell block-dot path — its f32 shape (8 lane
 /// accumulators, final left-fold) is the bits-sensitive part KQUANT_RECON
