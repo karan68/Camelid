@@ -1,0 +1,44 @@
+{
+  "campaign": "gemma3-cuda-windows",
+  "phase": "0 — baseline (gemma4 arm)",
+  "purpose": "Record which lane the gemma4 rows actually get on Windows by default, and what the execution plan says they get.",
+  "host": "RTX 3060 Laptop GPU 6143 MiB / Windows 11 / 16 logical cores",
+  "binary": "target/release/camelid.exe @ 05984826 (origin/main)",
+  "row": {
+    "id": "Gemma-4-E2B-It",
+    "path": "models/gemma-4-E2B-it-Q4_0.gguf",
+    "size_gib": 2.83,
+    "note": "Chosen over E4B Q8_0 (7.63 GB) deliberately: it is the largest gemma4 row that fits the 6 GB card, so it is the row Phase 3 can actually put resident."
+  },
+  "observed": {
+    "env": "CAMELID_GEMMA4_CUDA unset (default configuration — no env overrides of any kind)",
+    "served_backend": "gemma4-runtime",
+    "gemma4_available": true,
+    "vram_used_during_generation_mib": 107,
+    "model_bytes_on_gpu": "none — 2.83 GB of weights stayed in host RAM",
+    "cadence": {
+      "prompt": "Name the capital of France in one word.",
+      "completion_tokens": 1,
+      "text": "Paris",
+      "forward_total_ms": 2903.1
+    }
+  },
+  "finding_plan_routing_disagreement": {
+    "severity": "disclosure bug, pre-existing on main",
+    "execution_plan_said": {
+      "selected_backend": "cuda_resident_kquant_runtime",
+      "decode_path": "kquant_cuda_resident_decode",
+      "cuda_resident_active": true
+    },
+    "what_actually_ran": "the CPU Gemma4Runtime (Gemma4ServeRuntime::Local)",
+    "why": "The generic execution plan is computed from platform + quant and reports the CUDA K-quant resident lane whenever CUDA is active. The gemma4 serve path does not consult that plan: resolve_gemma4_runtime picks Gemma4ServeRuntime::Cuda only when gemma4_cuda_enabled() is true, which requires CAMELID_GEMMA4_CUDA=1. Unset, it loads the CPU runtime while the plan keeps advertising the GPU lane.",
+    "proof": "107 MiB of VRAM in use while a 2.83 GB model generates. A resident lane cannot decode from 107 MiB.",
+    "relation_to_D20": "This is the same class of defect DECISIONS D20 was written for in the Metal campaign — a plan that advertises a lane serve is not running. It is recorded here because Phase 3 changes exactly this gate, and the fix must make the plan and the routing agree rather than merely flipping the default.",
+    "scope": "Observed for gemma4 on Windows/CUDA. Not investigated on other hosts or families in this phase."
+  },
+  "not_claimed": [
+    "No throughput claim. The single-token timing is an observation with no isolation discipline behind it.",
+    "No parity claim of any kind.",
+    "No claim about gemma4 E4B, 12B, or 26B rows."
+  ]
+}
