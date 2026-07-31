@@ -448,7 +448,7 @@ and evidence envelope for a selection of those rows:
 | Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
 | Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
 | Qwen3 4B | Q8_0 | single-node | Exact-row ChatML parity (thinking-disabled) |
-| Gemma 3 1B-It | Q8_0 | single-node (Metal GPU-resident) | Exact-row chat parity 15/15 below the window + 9/9 above it, to 2,403 prompt tokens |
+| Gemma 3 1B-It | Q8_0 | single-node (Metal GPU-resident) | Exact-row chat parity 15/15 below the sliding window + 9/9 above it, to 2,403 prompt tokens — the above-window half is the resident lane only; off Metal this row falls back to the unmasked CPU bridge |
 | Gemma 4 E2B-It | Q8_0 | single-node | 5/5 greedy parity (CPU + Metal) |
 
 ## Build from source

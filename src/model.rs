@@ -451,9 +451,11 @@ impl LlamaModelConfig {
             // phi3. Qwen2/Qwen2.5 uses the same unpermuted split-half layout;
             // this is exercised by the real Qwen2.5 Q3_K_M mini2 smoke lane.
             // Other unpermuted archs (gemma3/…) stay out of this path until their
-            // own rows prove it (gemma3 serves via the runnable lane; its
-            // resident-lane pairing fact lives on `Gemma3Metadata.rope_neox_pairing`
-            // so this dense-path flag stays untouched while the lane is guarded off).
+            // own rows prove it. gemma3's resident-lane pairing fact lives on
+            // `Gemma3Metadata.rope_neox_pairing`, so this dense-path flag stays
+            // untouched even though the Metal resident lane is now gemma3's
+            // DEFAULT serve lane (Phase 3b) — the CPU dense path it guards is
+            // exactly the path gemma3 fails closed on (D20.2).
             // qwen35 full-attention layers are also unpermuted (NEOX split-half),
             // with partial RoPE over the first `rope.dimension_count` (64) of the
             // 256-wide head — handled in the runnable qwen35 path.

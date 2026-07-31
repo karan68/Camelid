@@ -1228,29 +1228,45 @@ disagree about which lane a file gets. The reason this matters is not tidiness:
 the window mask is the difference between correct and wrong above 512 tokens,
 and "which lane" is therefore a correctness decision, not a performance one.
 
-### D20.2 — The fail-closed lives at the choke point, and the choke point is complete
+### D20.2 — The fail-closed is a CHOKE POINT, never a list of entry-point guards
 
 The CPU dense forward has no window mask. It must therefore refuse windowed
-architectures, and the refusal must sit where the compute actually happens —
-not at the routing layer that decides who calls it. A guard on the router
-protects only the paths the router knows about; a guard at the dispatch site
-protects every path, including ones added later by someone who never read this
-file. `LlamaInferenceSession::ensure_windowed_arch_off_cpu_dense` returns a
-typed `BackendError::UnsupportedModelArchitecture` naming both correct lanes,
-and it is armed at **all three** CPU dense forward dispatches:
+architectures, and *where* the refusal lives is the whole decision. The first
+implementation guarded the three CPU dense entry points that were reachable at
+the time. Phase 3c's review then found that the routing flip had made four MORE
+reachable — `forward_greedy_verify_chunk`, `forward_layer_range_from_hidden`,
+`forward_worker_layers`, `ghost_forward_one_layer` — and that guarding those
+four would simply leave the fifth. **Entry-point enumeration is not an
+invariant; it is a list that goes stale on someone else's commit.**
 
-| Dispatch site | When it runs |
+So the guard moved to the narrowest point every CPU dense layer walk must pass
+through. `ensure_windowed_arch_off_cpu_dense_layer` (a free function keyed on
+`model::arch_has_windowed_attention`, i.e. parsed metadata rather than the arch
+string, so a future windowed arch inherits it with no edit) returns a typed
+`BackendError::UnsupportedModelArchitecture` naming both correct lanes, and it
+is called from the only two per-layer dense forwards that exist:
+
+| Choke point | Covers |
 |---|---|
-| single-token decode fallback | after `try_resident_decode_forward` declines |
-| `forward_prefill_chunk_timed_fast` | chunked prefill |
-| `forward_prefill_layer_major_timed_fast_inner` | layer-major prefill |
+| `forward_layer_timed` | every decode-side CPU dense layer walk |
+| `forward_prefill_layer_chunk_timed` | every prefill-side CPU dense layer walk |
 
-The completeness of that table is the invariant, not the existence of the
-function. A new CPU dense dispatch site added without a fourth row here is a
-silent full-causal forward on a windowed model — which produces fluent,
-plausible, wrong text rather than an error. `windowed_arch_cpu_dense_forward_
-fails_closed` pins it, with a non-windowed control proving the guard is what
-causes the refusal.
+The three session-level guards that remain (`batch prefill`, `layer-major
+prefill`, `decode forward`) are **courtesy legs only**: they delegate to the
+same function so the operator sees the lane that failed instead of the generic
+per-layer message. Deleting one degrades an error string; deleting a choke-point
+call is the actual regression.
+
+The invariant is therefore "two per-layer forwards, both guarded", and it is
+pinned as a completeness proof AND a revert detector in `src/inference/tests.rs`:
+two choke-point tests (fail if either call is deleted), one non-windowed control
+(proves the guard is what causes the refusal rather than the fixture), three
+lane-name tests (fail if a courtesy leg is deleted — the message's lane changes),
+and four entry-point tests asserting the inherited callers above are covered
+*through* the choke point rather than by their own guards.
+
+Why this matters more than most fail-closeds: a full-causal forward on a windowed
+model does not crash. It returns fluent, plausible, wrong text.
 
 ### D20.3 — A plan OUTPUT can never be a routing INPUT
 

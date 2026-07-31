@@ -101,10 +101,14 @@ runnable lane (`RUNNABLE_LANE_SPEC.md`). Each entry: what's needed, why, blockin
   interaction of NoPE layers with SmolLM3's long-context rope scaling, and every GPU
   lane (deliberately refused). **No ledger row claims `smollm3`, and none should be
   added until a receipt exists.**
-- **Follow-ups found during the same audit (NOT fixed here):** (a) `gemma3` is accepted
-  by the dense `from_gguf` path but its per-layer dual rope base is only modelled in the
-  runnable lane (`src/runnable/model.rs`), so a gemma3 file reaching the dense path
-  would use one base for all layers; (b) `lfm2` is claimed implemented but its recurrent
+- **Follow-ups found during the same audit:** (a) `gemma3` was accepted by the dense
+  `from_gguf` path while its per-layer dual rope base was modelled only in the runnable
+  lane, so a gemma3 file reaching the dense path would have used one base for all layers
+  — **CLOSED 2026-07-30 by the gemma3→Metal campaign**: dual-theta RoPE now lives in
+  `src/inference/rope.rs::gemma3_rope_tables` and drives the Metal resident lane, and a
+  gemma3 file reaching the CPU *dense* path fails closed at the per-layer choke point
+  (`ensure_windowed_arch_off_cpu_dense_layer`, DECISIONS D20.2) rather than decoding with
+  the wrong schedule; (b) NOT fixed here — `lfm2` is claimed implemented but its recurrent
   layers carry `shortconv.in_proj/out_proj` and no `attn_q/k/v`, so the dense binding
   fails to bind — a load-time error rather than silent wrongness, but still a claim
   with no path that can run it.

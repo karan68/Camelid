@@ -43,10 +43,14 @@ const modelId = args.get('model-id') || 'Gemma 3 1B It'
 // explicit --row-id used to carry an id that resolved to nothing.
 const rowId = args.get('row-id') || 'gemma_3_1b_it_q8_0'
 const displayName = args.get('display-name') || 'Gemma 3 1B-It Q8_0'
-// Which served lane produced the camelid side. Defaults to the runnable serve lane
-// this harness was written for; pass --lane-label when driving another served lane
-// so the emitted receipt does not mislabel the lane it actually certified.
-const laneLabel = args.get('lane-label') || 'gemma3_marker_chat_greedy_runnable_serve'
+// Which served lane produced the camelid side. The harness CANNOT observe this —
+// it only speaks HTTP — so the default must not name a lane. It used to default to
+// `..._runnable_serve`, which was correct only while that was gemma3's only lane;
+// since the Metal resident lane became the default on a Metal host, that default
+// would stamp a resident run with a runnable label. Fails to "unspecified" instead:
+// a receipt that declines to name its lane is auditable, one that names the wrong
+// lane is not. Pass --lane-label to record the lane you actually drove.
+const laneLabel = args.get('lane-label') || 'gemma3_marker_chat_greedy_serve_lane_unspecified'
 const comparatorLabel =
   args.get('comparator') || 'llama.cpp /completion (gemma3 turn markers parsed, BOS via add_special), -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack'
 const oraclePath = args.get('oracle')

@@ -2819,8 +2819,10 @@ impl LlamaInferenceSession {
         // QK-norm (Qwen3, and gemma3 since Phase 2a of the gemma3 Metal campaign)
         // is applied in the resident path (decode: encode_attention_block,
         // prefill: prefill_tokens) via the per-head RMSNorm kernel, so it no
-        // longer disqualifies the resident path. (gemma3 itself remains behind
-        // the arch disqualifier above until its full correctness encodes land.)
+        // longer disqualifies the resident path. (Since Phase 3b gemma3 is NOT
+        // behind the arch disqualifier above either — that disqualifier is
+        // gemma2-only, and gemma3 Q8_0 rides this resident path by default on
+        // a Metal host.)
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
             || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
             || diagnostic_ffn_gate_up_order()? != FfnGateUpOrder::GateUp
