@@ -40,8 +40,11 @@ mod q8_telemetry;
 mod rope;
 /// Test-only re-export: the gemma3 self-parity/full-forward tests in
 /// `crate::metal::tests` build their RoPE tables with the SAME oracle-form
-/// builder the production wiring uses, so the two can never drift.
-#[cfg(test)]
+/// builder the production wiring uses, so the two can never drift. Those are
+/// the ONLY consumers, and `src/metal.rs` is macOS-gated — so the re-export
+/// must carry the same gate or every non-macOS test build fails
+/// `-D unused-imports`.
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) use rope::gemma3_rope_tables;
 pub mod spec_tree;
 #[cfg(test)]

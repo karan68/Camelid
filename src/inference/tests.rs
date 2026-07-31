@@ -13243,6 +13243,12 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
             attention_biases: None,
             attention_q_norm: q_norm,
             attention_k_norm: k_norm,
+            // gemma3's sandwich norms (Phase 1). This fixture is a plain Llama
+            // row, so both are absent — but they must be NAMED, or this
+            // `cuda`-gated constructor stops compiling on the only CI leg that
+            // builds it (ubuntu --all-features; macOS has no cuda feature).
+            post_attention_norm: None,
+            post_ffw_norm: None,
             ffn_norm: t("blk.0.ffn_norm.weight", vec![2], 2),
             ffn_gate: t("blk.0.ffn_gate.weight", vec![2, 2], 4),
             ffn_up: t("blk.0.ffn_up.weight", vec![2, 2], 4),
