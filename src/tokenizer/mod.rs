@@ -1,7 +1,8 @@
 use std::{
-    collections::{BTreeSet, BinaryHeap, HashMap},
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
     fs::File,
     io::Read,
+    sync::OnceLock,
 };
 
 use sha2::Digest;
@@ -291,6 +292,144 @@ pub struct TokenizerConfig {
     pub remove_extra_whitespaces: bool,
 }
 
+/// One special-token pattern the raw-text scanner can match: a `UserDefined`
+/// ("added") or `Control` token with non-empty text.
+#[derive(Debug, Clone)]
+struct SpecialPattern {
+    text: Box<str>,
+    /// `Control` tokens participate only under `include_control`
+    /// (= llama.cpp's `parse_special`); `UserDefined` always does.
+    is_control: bool,
+}
+
+/// First-byte-bucketed index over the special-token set, so matching a special
+/// at a position costs O(1) plus a scan of one tiny bucket instead of a scan of
+/// the whole vocabulary.
+///
+/// The naive form of [`Tokenizer::longest_control_token_at`] filtered
+/// `self.tokens` — 262,144 entries on a gemma-3 SPM row — on every call, and
+/// [`Tokenizer::next_control_token_start`] calls it once per character. That is
+/// O(chars x vocab): measured at 0.525 ms per output token on gemma-3-1b-it-Q8_0,
+/// about 500x the `parse_special = false` path, and on the critical path of
+/// every `/v1/chat/completions` request (the chat renderer sets
+/// `parse_special = true` for the `<start_of_turn>` markers).
+///
+/// This index changes only the SEARCH, never the answer: the same kind filter,
+/// the same `starts_with` test and the same longest-match rule decide every
+/// position, so the token ids are byte-identical to the scan it replaces. That
+/// identity is load-bearing — every parity receipt in this repo is keyed on
+/// exact token sequences.
+#[derive(Debug, Clone)]
+pub struct SpecialsIndex {
+    /// Vocabulary size this index was built from. `tokens` is a `pub` field, so
+    /// a caller can replace it after the index was forced; the accessor
+    /// `debug_assert`s on this to catch that in test builds.
+    vocab_len: usize,
+    /// Patterns bucketed by first byte, each bucket ordered longest-first so the
+    /// first kind-eligible hit IS the longest match (mirroring the `max_by_key`
+    /// the scan used). Boxed to keep the 256-entry array cheap when empty.
+    buckets: Box<[Vec<SpecialPattern>; 256]>,
+    /// Bitset of bytes that can begin an eligible pattern, indexed by
+    /// `include_control` — `[0]` is `UserDefined` only, `[1]` adds `Control`.
+    /// A byte with its bit clear cannot start a special, which is the whole of
+    /// the per-character fast path.
+    first_byte: [[u64; 4]; 2],
+    /// Texts of tokens that are `<|...|>` chat-control markers, for the rstrip
+    /// decision in `encode_piece`. Replaces another full-vocabulary scan, run
+    /// once per special token matched.
+    chat_control_marker_texts: HashSet<Box<str>>,
+}
+
+impl SpecialsIndex {
+    fn build(tokens: &[Token]) -> Self {
+        let mut buckets: Box<[Vec<SpecialPattern>; 256]> =
+            Box::new(std::array::from_fn(|_| Vec::new()));
+        let mut first_byte = [[0u64; 4]; 2];
+        let mut chat_control_marker_texts = HashSet::new();
+
+        for token in tokens {
+            if is_chat_control_marker(token) {
+                chat_control_marker_texts.insert(Box::from(token.text.as_str()));
+            }
+
+            let is_control = match token.kind {
+                TokenKind::UserDefined => false,
+                TokenKind::Control => true,
+                _ => continue,
+            };
+            let Some(&first) = token.text.as_bytes().first() else {
+                // Empty text never matches; the scan filtered these out too.
+                continue;
+            };
+            buckets[first as usize].push(SpecialPattern {
+                text: Box::from(token.text.as_str()),
+                is_control,
+            });
+            set_byte_bit(&mut first_byte[1], first);
+            if !is_control {
+                set_byte_bit(&mut first_byte[0], first);
+            }
+        }
+
+        for bucket in buckets.iter_mut() {
+            // Longest-first. Ties are only reachable between patterns with
+            // IDENTICAL text (two matches at one position of equal length are
+            // the same bytes), and callers use the matched text — never the
+            // vocab slot it came from — so tie order cannot change an id.
+            bucket.sort_by_key(|pattern| std::cmp::Reverse(pattern.text.len()));
+            bucket.shrink_to_fit();
+        }
+
+        Self {
+            vocab_len: tokens.len(),
+            buckets,
+            first_byte,
+            chat_control_marker_texts,
+        }
+    }
+
+    /// True when `byte` can begin some eligible pattern. Pure filter: a false
+    /// positive costs one bucket scan, a false negative is impossible because
+    /// every pattern sets its own first byte at build time.
+    #[inline]
+    fn may_start(&self, include_control: bool, byte: u8) -> bool {
+        let set = &self.first_byte[usize::from(include_control)];
+        set[usize::from(byte >> 6)] & (1u64 << (byte & 63)) != 0
+    }
+
+    /// Longest eligible pattern starting exactly at `byte_start`, or `None`.
+    fn longest_at<'a>(
+        &'a self,
+        text: &str,
+        byte_start: usize,
+        include_control: bool,
+    ) -> Option<(&'a str, usize)> {
+        if !text.is_char_boundary(byte_start) {
+            return None;
+        }
+        let rest = &text[byte_start..];
+        let &first = rest.as_bytes().first()?;
+        if !self.may_start(include_control, first) {
+            return None;
+        }
+        self.buckets[first as usize]
+            .iter()
+            .find(|pattern| {
+                (include_control || !pattern.is_control) && rest.starts_with(&*pattern.text)
+            })
+            .map(|pattern| (&*pattern.text, pattern.text.len()))
+    }
+
+    fn is_chat_control_marker_text(&self, token_text: &str) -> bool {
+        self.chat_control_marker_texts.contains(token_text)
+    }
+}
+
+#[inline]
+fn set_byte_bit(set: &mut [u64; 4], byte: u8) {
+    set[usize::from(byte >> 6)] |= 1u64 << (byte & 63);
+}
+
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     pub model: TokenizerModel,
@@ -305,6 +444,12 @@ pub struct Tokenizer {
     pub special: SpecialTokens,
     pub config: TokenizerConfig,
     pub chat_template: Option<String>,
+    /// Special-token search index, derived entirely from `tokens`. Left empty by
+    /// struct-literal construction and built on first use, so a tokenizer
+    /// assembled by hand (tests) or mutated after construction is still correct;
+    /// [`Tokenizer::from_gguf`] seeds it eagerly so real rows pay the build at
+    /// load time rather than on the first request.
+    pub specials_index: OnceLock<SpecialsIndex>,
 }
 
 /// The Llama-3 tiktoken tokenizer's special-token signature. Llama 3 / 3.1 / 3.2 all
@@ -563,6 +708,11 @@ impl Tokenizer {
         validate_token_id("pad", pad, tokens.len())?;
         validate_token_id("mask", mask, tokens.len())?;
 
+        // Seed the special-token index at load time so the first request does not
+        // pay for building it. Real rows carry up to 262k vocabulary entries.
+        let specials_index = OnceLock::new();
+        let _ = specials_index.set(SpecialsIndex::build(&tokens));
+
         Ok(Self {
             model,
             bpe_pre_tokenizer,
@@ -613,6 +763,7 @@ impl Tokenizer {
             chat_template: file
                 .metadata_string("tokenizer.chat_template")
                 .map(str::to_owned),
+            specials_index,
         })
     }
 
@@ -1109,9 +1260,8 @@ impl Tokenizer {
     /// `<|…|>` shape, and BPE families (Qwen3, Llama 3) never reach this SPM path,
     /// so their committed tokenizations are untouched.
     fn chat_control_marker_rstrips(&self, token_text: &str) -> bool {
-        self.tokens
-            .iter()
-            .any(|token| token.text == token_text && is_chat_control_marker(token))
+        self.specials_index()
+            .is_chat_control_marker_text(token_text)
     }
 
     fn should_insert_dummy_after_control(
@@ -1144,36 +1294,41 @@ impl Tokenizer {
         !rest.starts_with(SPM_SPACE)
     }
 
+    /// The special-token search index, built on first use from `tokens`.
+    fn specials_index(&self) -> &SpecialsIndex {
+        let index = self
+            .specials_index
+            .get_or_init(|| SpecialsIndex::build(&self.tokens));
+        debug_assert_eq!(
+            index.vocab_len,
+            self.tokens.len(),
+            "specials index is stale: `tokens` was replaced after the index was built"
+        );
+        index
+    }
+
     /// Longest special token whose text starts at `byte_start`. USER_DEFINED
     /// ("added") tokens always participate; CONTROL tokens only when
     /// `include_control` (llama.cpp's `parse_special` partition rule).
+    ///
+    /// USER_DEFINED ("added") tokens always match, mirroring llama.cpp's
+    /// special-token partition. Qwen3/qwen35 mark <think>/</think>
+    /// (and many <|...|> markers) as USER_DEFINED (type 4) rather than CONTROL
+    /// (type 3); without matching USER_DEFINED, a rendered ChatML template's
+    /// literal "</think>" tokenizes as text instead of the single special
+    /// token, and chat generation diverges from the reference. CONTROL tokens
+    /// participate only under `include_control` (= `parse_special`).
+    ///
+    /// Served by [`SpecialsIndex`]; `specials_index_reference_scan` in this
+    /// module's tests pins it against the vocabulary scan this replaced.
     fn longest_control_token_at<'a>(
         &'a self,
         text: &str,
         byte_start: usize,
         include_control: bool,
     ) -> Option<(&'a str, usize)> {
-        if !text.is_char_boundary(byte_start) {
-            return None;
-        }
-
-        // USER_DEFINED ("added") tokens always match, mirroring llama.cpp's
-        // special-token partition. Qwen3/qwen35 mark <think>/</think>
-        // (and many <|...|> markers) as USER_DEFINED (type 4) rather than CONTROL
-        // (type 3); without matching USER_DEFINED, a rendered ChatML template's
-        // literal "</think>" tokenizes as text instead of the single special
-        // token, and chat generation diverges from the reference. CONTROL tokens
-        // participate only under `include_control` (= `parse_special`).
-        self.tokens
-            .iter()
-            .filter(|token| {
-                matches!(token.kind, TokenKind::UserDefined)
-                    || (include_control && matches!(token.kind, TokenKind::Control))
-            })
-            .filter(|token| !token.text.is_empty())
-            .filter(|token| text[byte_start..].starts_with(&token.text))
-            .max_by_key(|token| token.text.len())
-            .map(|token| (token.text.as_str(), token.text.len()))
+        self.specials_index()
+            .longest_at(text, byte_start, include_control)
     }
 
     fn encode_piece(&self, piece: &str, parse_special: bool) -> Result<Vec<TokenId>> {
@@ -1251,19 +1406,26 @@ impl Tokenizer {
         Ok(out)
     }
 
+    /// First byte offset at or after `byte_start` where a special token begins.
+    ///
+    /// Scans raw bytes rather than `char_indices`, which is equivalent: a
+    /// pattern's text is a `&str`, so its first byte is never a UTF-8
+    /// continuation byte, so the first-byte filter can never fire at a
+    /// non-boundary offset — and `longest_at` re-checks `is_char_boundary`
+    /// before slicing regardless. The filter is what makes this O(bytes)
+    /// instead of O(bytes x vocab).
     fn next_control_token_start(
         &self,
         text: &str,
         byte_start: usize,
         include_control: bool,
     ) -> Option<usize> {
-        text[byte_start..]
-            .char_indices()
-            .map(|(offset, _)| byte_start + offset)
-            .find(|idx| {
-                self.longest_control_token_at(text, *idx, include_control)
-                    .is_some()
-            })
+        let index = self.specials_index();
+        let bytes = text.as_bytes();
+        (byte_start..bytes.len()).find(|&idx| {
+            index.may_start(include_control, bytes[idx])
+                && index.longest_at(text, idx, include_control).is_some()
+        })
     }
 
     fn encode_spm_segment(&self, segment: &str, out: &mut Vec<TokenId>) -> Result<()> {
@@ -2111,6 +2273,339 @@ mod tests {
         SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig, TokenizerModel, SPM_SPACE,
     };
     use std::collections::{BTreeSet, HashMap};
+    use std::sync::OnceLock;
+
+    /// The vocabulary scan `SpecialsIndex` replaced, kept verbatim as the
+    /// reference the index is pinned against. Any divergence between this and
+    /// `Tokenizer::longest_control_token_at` is a tokenization change, and
+    /// tokenization identity is load-bearing for every parity receipt here.
+    fn reference_longest_control_token_at<'a>(
+        tokenizer: &'a Tokenizer,
+        text: &str,
+        byte_start: usize,
+        include_control: bool,
+    ) -> Option<(&'a str, usize)> {
+        if !text.is_char_boundary(byte_start) {
+            return None;
+        }
+        tokenizer
+            .tokens
+            .iter()
+            .filter(|token| {
+                matches!(token.kind, TokenKind::UserDefined)
+                    || (include_control && matches!(token.kind, TokenKind::Control))
+            })
+            .filter(|token| !token.text.is_empty())
+            .filter(|token| text[byte_start..].starts_with(&token.text))
+            .max_by_key(|token| token.text.len())
+            .map(|token| (token.text.as_str(), token.text.len()))
+    }
+
+    /// The `char_indices` scan `next_control_token_start` replaced.
+    fn reference_next_control_token_start(
+        tokenizer: &Tokenizer,
+        text: &str,
+        byte_start: usize,
+        include_control: bool,
+    ) -> Option<usize> {
+        text[byte_start..]
+            .char_indices()
+            .map(|(offset, _)| byte_start + offset)
+            .find(|idx| {
+                reference_longest_control_token_at(tokenizer, text, *idx, include_control).is_some()
+            })
+    }
+
+    /// The full-vocabulary scan `chat_control_marker_rstrips` replaced.
+    fn reference_chat_control_marker_rstrips(tokenizer: &Tokenizer, token_text: &str) -> bool {
+        tokenizer
+            .tokens
+            .iter()
+            .any(|token| token.text == token_text && is_chat_control_marker(token))
+    }
+
+    /// Assert the index and the reference scan agree at EVERY byte offset of
+    /// `text`, in both `include_control` modes.
+    ///
+    /// Costs O(len x vocab) because the reference side is the vocabulary scan;
+    /// keep `text` short when the vocabulary is a real 262k-entry row.
+    fn assert_index_matches_reference(tokenizer: &Tokenizer, text: &str) {
+        for include_control in [false, true] {
+            for byte_start in 0..=text.len() {
+                let fast = tokenizer.longest_control_token_at(text, byte_start, include_control);
+                let slow = reference_longest_control_token_at(
+                    tokenizer,
+                    text,
+                    byte_start,
+                    include_control,
+                );
+                assert_eq!(
+                    fast, slow,
+                    "longest_control_token_at diverged at byte {byte_start} \
+                     (include_control={include_control}) of {text:?}"
+                );
+
+                if text.is_char_boundary(byte_start) {
+                    assert_eq!(
+                        tokenizer.next_control_token_start(text, byte_start, include_control),
+                        reference_next_control_token_start(
+                            tokenizer,
+                            text,
+                            byte_start,
+                            include_control
+                        ),
+                        "next_control_token_start diverged from byte {byte_start} \
+                         (include_control={include_control}) of {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Assert the rstrip set agrees with the vocabulary scan it replaced, over
+    /// `sample`. Separate from the positional check because the reference is
+    /// O(vocab) per query — running it over a whole real vocabulary would be
+    /// O(vocab^2).
+    fn assert_marker_rstrips_match<'a>(
+        tokenizer: &Tokenizer,
+        sample: impl IntoIterator<Item = &'a str>,
+    ) {
+        for text in sample {
+            assert_eq!(
+                tokenizer.chat_control_marker_rstrips(text),
+                reference_chat_control_marker_rstrips(tokenizer, text),
+                "chat_control_marker_rstrips diverged for {text:?}"
+            );
+        }
+    }
+
+    /// A vocabulary built to hit every branch the matcher has: overlapping
+    /// patterns where one is a strict prefix of another, the same shape carried
+    /// as USER_DEFINED in one case and CONTROL in another (so `include_control`
+    /// changes the answer), multi-byte patterns, patterns sharing a first byte
+    /// with an ordinary token, and an empty-text token the scan skipped.
+    fn overlap_vocab() -> Vec<Token> {
+        let entries: [(&str, TokenKind); 20] = [
+            ("<s>", TokenKind::Control),
+            ("</s>", TokenKind::Control),
+            ("<start_of_turn>", TokenKind::Control),
+            ("<start_of>", TokenKind::UserDefined),
+            ("<start", TokenKind::Control),
+            ("<end_of_turn>", TokenKind::Control),
+            ("<think>", TokenKind::UserDefined),
+            ("</think>", TokenKind::UserDefined),
+            ("<|im_start|>", TokenKind::Control),
+            ("<|im_end|>", TokenKind::UserDefined),
+            ("<|user|>", TokenKind::UserDefined),
+            ("[INST]", TokenKind::UserDefined),
+            ("[/INST]", TokenKind::Control),
+            ("→", TokenKind::UserDefined),
+            ("→→", TokenKind::Control),
+            ("中文", TokenKind::UserDefined),
+            ("", TokenKind::Control),
+            ("<normal>", TokenKind::Normal),
+            ("<byte>", TokenKind::Byte),
+            ("<unused>", TokenKind::Unused),
+        ];
+        entries
+            .iter()
+            .enumerate()
+            .map(|(id, (text, kind))| Token {
+                id: id as u32,
+                text: (*text).to_string(),
+                score: 0.0,
+                kind: *kind,
+            })
+            .collect()
+    }
+
+    fn overlap_tokenizer() -> Tokenizer {
+        tokenizer_with(
+            TokenizerModel::LlamaSpm,
+            overlap_vocab(),
+            SpecialTokens::default(),
+        )
+    }
+
+    #[test]
+    fn specials_index_reference_scan() {
+        let tokenizer = overlap_tokenizer();
+        let corpus = [
+            "",
+            "<",
+            "<s>",
+            "<start_of_turn>",
+            "<start_of>x",
+            "<start>",
+            "<startle",
+            "<start_of_turnip>",
+            "<s></s><s>",
+            "<|im_start|>user\nhi<|im_end|>",
+            "<think>reason</think>done",
+            "[INST] hello [/INST] hi",
+            "→→→ arrows → here",
+            "中文<start_of_turn>中文",
+            "plain text with no specials at all",
+            "<normal><byte><unused>",
+            "a<b<c<|d|>e<start_of_turn>f",
+            "éé<think>中文\u{1F600}</think>ß",
+            "<<<<>>>><s><s",
+            "trailing<",
+            "\u{1F600}<s>\u{1F600}",
+        ];
+        for text in corpus {
+            assert_index_matches_reference(&tokenizer, text);
+        }
+        assert_marker_rstrips_match(
+            &tokenizer,
+            tokenizer
+                .tokens
+                .iter()
+                .map(|token| token.text.as_str())
+                .chain(["", "<absent|>", "<|absent|>"]),
+        );
+    }
+
+    #[test]
+    fn specials_index_longest_match_respects_include_control() {
+        let tokenizer = overlap_tokenizer();
+        // "<start_of_turn>" (CONTROL, 15 bytes) beats "<start_of>" (USER_DEFINED)
+        // and "<start" (CONTROL) only when control tokens participate; without
+        // them the longest ELIGIBLE match is the USER_DEFINED "<start_of>".
+        assert_eq!(
+            tokenizer.longest_control_token_at("<start_of_turn>x", 0, true),
+            Some(("<start_of_turn>", 15))
+        );
+        assert_eq!(
+            tokenizer.longest_control_token_at("<start_of_turn>x", 0, false),
+            None,
+            "\"<start_of_turn>\" does not start with the USER_DEFINED \"<start_of>\""
+        );
+        assert_eq!(
+            tokenizer.longest_control_token_at("<start_of>x", 0, false),
+            Some(("<start_of>", 10))
+        );
+        // An empty-text vocabulary entry never matches.
+        assert_eq!(tokenizer.longest_control_token_at("zzz", 0, true), None);
+        // Non-special kinds never match, whatever the mode.
+        assert_eq!(
+            tokenizer.longest_control_token_at("<normal>", 0, true),
+            None
+        );
+    }
+
+    #[test]
+    fn specials_index_ignores_non_char_boundaries() {
+        let tokenizer = overlap_tokenizer();
+        // 'é' is two bytes and is NOT in the vocabulary, so bytes 1 and 3 are
+        // continuation bytes with no special starting anywhere before byte 4.
+        let text = "éé<s>";
+        assert_eq!(text.len(), 7);
+        assert_eq!(tokenizer.longest_control_token_at(text, 1, true), None);
+        assert_eq!(tokenizer.longest_control_token_at(text, 3, true), None);
+        assert_eq!(
+            tokenizer.longest_control_token_at(text, 4, true),
+            Some(("<s>", 3))
+        );
+        assert_eq!(tokenizer.next_control_token_start(text, 0, true), Some(4));
+
+        // A multi-byte pattern IS matched at its own boundary: "中文" is a
+        // USER_DEFINED entry in this fixture, so it wins at byte 0.
+        let cjk = "中文<s>";
+        assert_eq!(
+            tokenizer.longest_control_token_at(cjk, 0, false),
+            Some(("中文", 6))
+        );
+        assert_eq!(tokenizer.longest_control_token_at(cjk, 1, true), None);
+        assert_eq!(tokenizer.next_control_token_start(cjk, 1, true), Some(6));
+    }
+
+    #[test]
+    fn specials_index_is_built_lazily_from_current_tokens() {
+        // Struct-literal construction leaves the cell empty; replacing `tokens`
+        // before first use must still be seen. `orphan_test_prepared` and
+        // `tiny_vocab_tokenizer` in src/api/mod.rs do exactly this.
+        let mut tokenizer = tokenizer_with(
+            TokenizerModel::LlamaSpm,
+            Vec::new(),
+            SpecialTokens::default(),
+        );
+        assert!(tokenizer.specials_index.get().is_none());
+        tokenizer.tokens = overlap_vocab();
+        assert_eq!(
+            tokenizer.longest_control_token_at("<s>", 0, true),
+            Some(("<s>", 3))
+        );
+        assert!(tokenizer.specials_index.get().is_some());
+    }
+
+    #[test]
+    fn specials_index_survives_clone() {
+        let tokenizer = overlap_tokenizer();
+        assert_eq!(
+            tokenizer.longest_control_token_at("<think>", 0, false),
+            Some(("<think>", 7))
+        );
+        let cloned = tokenizer.clone();
+        assert_eq!(
+            cloned.longest_control_token_at("<think>", 0, false),
+            Some(("<think>", 7))
+        );
+        assert_index_matches_reference(&cloned, "<think>x</think><s>");
+    }
+
+    /// Real-vocabulary pin. Runs when a row GGUF is reachable (`GEMMA3_GGUF`,
+    /// or any of the other family env vars the tests/ suite already uses) and
+    /// replays the index against the reference scan over the committed prompt
+    /// packs' own marker strings. Skipped, loudly, when no artifact is present.
+    #[test]
+    fn specials_index_matches_reference_on_real_vocab_when_available() {
+        let candidates = [
+            ("GEMMA3_GGUF", "models/gemma-3-1b-it-Q8_0.gguf"),
+            ("LLAMA3_GGUF", "models/Meta-Llama-3-8B-Instruct-Q8_0.gguf"),
+            ("QWEN3_GGUF", "models/Qwen3-0.6B-Q8_0.gguf"),
+            ("MISTRAL_GGUF", "models/Mistral-7B-Instruct-v0.3.Q8_0.gguf"),
+            ("GEMMA4_GGUF", "models/gemma-4-E2B-it-Q8_0.gguf"),
+        ];
+        let mut ran = 0usize;
+        for (var, default) in candidates {
+            let path = std::env::var(var)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from(default));
+            if !path.exists() {
+                continue;
+            }
+            let gguf = crate::gguf::read_metadata(&path).expect("read gguf metadata");
+            let tokenizer = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+            // Deliberately short: the reference side is the O(vocab) scan, so
+            // each byte offset costs a pass over up to 262k entries.
+            for text in [
+                "<start_of_turn>user\nhi<end_of_turn>\n",
+                "<|im_start|>a<|im_end|><s>[INST]x[/INST]</s><think>y</think>",
+                "plain, no markers: éé 中文 \u{1F600}",
+            ] {
+                assert_index_matches_reference(&tokenizer, text);
+            }
+            // Bounded rstrip sample: `<|...|>`-shaped tokens from the row (the
+            // shape the rstrip rule keys on), capped, plus near-misses.
+            let markers: Vec<&str> = tokenizer
+                .tokens
+                .iter()
+                .filter(|token| token.text.starts_with("<|"))
+                .map(|token| token.text.as_str())
+                .take(64)
+                .chain(["", "<|absent|>", "<start_of_turn>", "not a marker"])
+                .collect();
+            assert_marker_rstrips_match(&tokenizer, markers);
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!(
+                "skipping real-vocab specials-index pin; set one of \
+                 GEMMA3_GGUF/LLAMA3_GGUF/QWEN3_GGUF/MISTRAL_GGUF/GEMMA4_GGUF"
+            );
+        }
+    }
 
     fn tok(text: &str, kind: TokenKind) -> Token {
         Token {
@@ -2146,6 +2641,7 @@ mod tests {
                 remove_extra_whitespaces: false,
             },
             chat_template: None,
+            specials_index: OnceLock::new(),
         }
     }
 
