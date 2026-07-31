@@ -1078,7 +1078,7 @@ env-mutating gate tests never run alongside):
 Phase 3b (`ba6de7f7`) was put through an adversarial review. Four findings were confirmed
 blocking/major before this phase started; eight more were reported by the review's lenses but
 its verification pass died on infrastructure, so each was re-verified here against the code
-before being fixed or dismissed. **Every one of the twelve turned out to be real.** Three
+before being fixed or dismissed. **Every one of the twelve turned out to be real.** Four
 commits, each gated by fmt / clippy --all-targets -D warnings / cargo test --all-targets.
 
 The stakes framing that shaped every fix: on these paths a routing mistake is SILENT WRONG
@@ -1288,3 +1288,85 @@ is §12e-4 (the review said two of three guard sites were revert-invisible; all 
 §12e-2/3, where the confirmed defect is larger than described. F4's two suggested remedies were
 both rejected in favour of a third, for the reason in 12d.
 
+### 12g. Gates
+
+Per commit: cargo fmt clean; `clippy --all-targets -D warnings` clean; `cargo test --all-targets`
+exit 0 under pipefail. Final battery at `34bf672e`: **lib 1398 passed / 0 failed / 23 ignored**
+(against 1376/0/23 at the flip commit `ba6de7f7` — +22 lib tests), 60 green integration tallies,
+every suite green. `check-public-scrub.sh` clean. `scripts/check-ledger-drift.mjs` passed
+(ledger == code contract; the `catalog_id` fix in 12e-5 touches neither the capabilities literal
+nor API_CONFORMANCE_CASES, so no regen was needed — confirmed by the check, not assumed).
+
+One pre-existing test needed a mechanical update: `tests/invariant_matrix_binding.rs`'s
+I-cache-quant na anchor `"fn is_runnable_serve_arch"` became `"fn is_runnable_serve_file"`. The
+anchor did its job — it caught the rename rather than letting the na verdict go stale.
+
+Env-keyed battery (release, production GEMV configuration + resident decode armed FROM THE SHELL
+per §9d, targeted names so the env-mutating gate tests never run alongside):
+
+- **Phase 2 real-row final gate** (`gemma3_real_row_resident_forward_matches_runnable_oracle`),
+  no SKIP, 585.18 s: depth 1 argmax 108 = oracle, max abs logit diff 6.247e-5; depth 5 argmax
+  1077 = oracle, 7.820e-5; depth 50 argmax 578 = oracle, 9.584e-5 — **50/50 greedy tokens
+  identical, overall max abs logit diff 2.122e-4**. Bit-for-bit the §9b / §10d / §11h record.
+- **3a session-level prefill gate**
+  (`gemma3_session_level_token_by_token_prefill_matches_runnable_oracle`), 22.20 s: depths 1-5
+  argmax 108 / 584 / 568 / 2364 / 1077, all = oracle; **5/5 identical, overall max abs logit
+  diff 7.820e-5**. Bit-for-bit the §10b / §11h record.
+
+The whole Phase 2/3a stack is therefore proven UNCHANGED under the Phase 3c fixes.
+
+### 12h. Serve smokes (release, this M4 mini 16 GB, no special env vars)
+
+Resident (`camelid serve --model gemma-3-1b-it-Q8_0.gguf --no-open`):
+
+- `/v1/health`: `generation_ready:true`, backend `"llama"` (dense serve lane, no runnable
+  runtime), plan `metal_resident_q8_runtime` / `q8_0_metal_resident_decode` /
+  `supported_exact_row_smoke_sub512`.
+- Greedy chat, 20 prompt tok: coherent Rayleigh-scattering sentence, finish `stop`, 26 tokens.
+  Wall 795.3 ms cold-ish / **684.0 ms warm** (§11g: 825 / 788 ms), token ids byte-identical
+  across runs.
+- Long greedy (26 prompt / 240 completion, two runs, byte-identical): wall 5486.7 / 5445.5 ms =
+  43.7 / 44.1 tok/s end-to-end INCLUDING prefill; netting the ~26-token prefill leaves
+  **≈46-47 tok/s decode** at depth ~266 — the §11g band (45.0 / 46.0 tok/s at depth ~289) with
+  no regression.
+- First 8 greedy token ids `[818, 7217, 7412, 3730, 1547, 529, 496, 20284]` — **IDENTICAL to
+  the §11g oracle-verified head**, and identical to the fallback server's below.
+- Tools: 422 **`unsupported_tools`, param absent** — the 12e-8 fix, verified live. §11g recorded
+  `unsupported_chat_template` here; the two lanes now return the same object.
+- `lane` field: **ABSENT** — the 12e-5 catalog_id fix, verified live. §11g recorded
+  `lane:"experimental"`, which also meant the generated text was whitespace-trimmed; it is now
+  served byte-identical, as a parity-claimed row must be.
+- Raw `/v1/completions`: 200, `"The capital of France is"` → `" Paris.\n\nThe largest city in
+  France is Paris.\n\n"` (the §11g continuation).
+
+Fallback (`CAMELID_METAL_RESIDENT_DECODE=0`, same command):
+
+- `/v1/health`: backend `"runnable-runtime"`; plan `cpu_reference` / `safe_cpu_decode` carrying
+  the windowed-arch reason verbatim.
+- Greedy chat 8 tok: 27.54 s (§11g: 27.07 s — the known ~0.2-0.3 tok/s runnable lane), token ids
+  `[818, 7217, 7412, 3730, 1547, 529, 496, 20284]` — byte-identical to the resident lane's head,
+  which is the cross-lane identity claim this campaign exists to hold.
+- Tools: 422 `unsupported_tools`, param absent (unchanged; the dense lane moved TO this, not the
+  other way).
+- `/v1/completions`: 422 `unsupported_completions_lane` (gate intact verbatim).
+
+Both servers killed by saved PID only.
+
+### 12i. Still open after Phase 3c
+
+- **Operator-set `CAMELID_MAC_Q8_REPACK=0`** still yields a safe plan with resident routing
+  (12e-7). Needs the plan to stop overloading one variable for both operator opt-out and plan
+  output.
+- **`encode_attention` carries no `window_start`** (§9a residual). It is why speculation is
+  declined for windowed archs (12d) rather than supported; threading it is the prerequisite for
+  ever pointing spec decode at this row.
+- **`scripts/chat-parity-gemma3.mjs` defaults `--row-id` to the old `gemma3_1b_it_q8_0`
+  spelling**, so a receipt generated without an explicit flag carries a row id that matches no
+  compatibility row. One line, deliberately left to Phase 5's docs/scripts sweep rather than
+  widened into here.
+- **`camelid pull` alias changed** as a consequence of 12e-5: the catalog id is now
+  `gemma_3_1b_it_q8_0`. `README.md:227` already advertised a third spelling (`gemma3_1b`) that
+  resolved to neither, so the README row is no more wrong than before — but it is wrong, and it
+  belongs to the Phase 5 docs sweep.
+- Phase 5's own inheritance from §11i is unchanged: the capabilities-row rewrite + ledger regen,
+  frontend fixtures, docs sweep. The `lane`/trim half of that list is now CLOSED by 12e-5.
