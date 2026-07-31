@@ -12870,6 +12870,59 @@ impl ResidentLayerSchedule {
     }
 }
 
+/// `(window_start, position_count)` for one layer's attention read range — the
+/// NORMATIVE expression, written once and shared by the token-by-token decode
+/// encode (`prepare_token`) and the batched windowed prefill
+/// (`prefill_tokens_windowed`). Two callers computing the same arithmetic
+/// separately is exactly how a batched path drifts from the lane it must be
+/// bit-identical to.
+///
+/// `filled` is `position + 1` (the window INCLUDES the current position). The
+/// expression is `filled.saturating_sub(w)` VERBATIM rather than a call to
+/// [`crate::window_ref::window_bounds`], because the two disagree on the
+/// degenerate `Some(0)`: `window_bounds` treats it as full causal, this treats it
+/// as an empty read range. Bit-identity with the shipped decode lane is the gate,
+/// so the shipped expression wins; `schedule_window_bounds_matches_window_ref`
+/// pins the agreement for every `w > 0`, which is the only case any real schedule
+/// produces.
+#[cfg(target_os = "macos")]
+fn schedule_window_bounds(window: Option<usize>, filled: usize) -> (usize, usize) {
+    let window_start = window.map_or(0, |w| filled.saturating_sub(w));
+    (window_start, filled - window_start)
+}
+
+/// Gate for the gemma3 batched windowed prefill (long-prompt TTFT campaign,
+/// Tier A). Default OFF for Phase 2: the path is opt-in until its receipts are
+/// published, then Phase 3 flips the default and keeps `=0` as the opt-out (the
+/// convention the serve lanes already use).
+///
+/// Arming this alone is enough — it does NOT require
+/// `CAMELID_METAL_RESIDENT_PREFILL`, which arms the *other* (non-windowed)
+/// batched prefill that gemma3 fails closed on.
+pub fn gemma3_batch_prefill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA3_BATCH_PREFILL")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Rows per batched-prefill command buffer. Overridable with
+/// `CAMELID_GEMMA3_BATCH_PREFILL_ROWS` for measurement; clamped to `[1, 1024]`.
+/// The chunk width sets how many activation columns one weight streaming pass
+/// serves — the whole point of Tier A — against the transient activation
+/// scratch, which is linear in it (~32 MB at 256 rows on the 1B row).
+pub fn gemma3_batch_prefill_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA3_BATCH_PREFILL_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(1, 1024))
+            .unwrap_or(256)
+    })
+}
+
 /// A resident decode session that owns the on-GPU KV cache (per layer, sized to
 /// `max_positions`) and the reused hidden ping-pong buffers. A multi-token greedy decode runs
 /// each token in ONE command buffer with the KV cache persisting on the GPU across tokens --
@@ -13569,12 +13622,8 @@ impl ResidentDecodeState {
             // (window INCLUDES the current position — gemma4 math verbatim:
             // window_start = filled.saturating_sub(window), position_count =
             // filled - window_start). Full-causal layers keep window_start = 0.
-            let window_start = self
-                .schedule
-                .as_ref()
-                .and_then(|s| s.window[i])
-                .map_or(0, |w| filled.saturating_sub(w));
-            let position_count = filled - window_start;
+            let (window_start, position_count) =
+                schedule_window_bounds(self.schedule.as_ref().and_then(|s| s.window[i]), filled);
             encode_attention_block(
                 e,
                 k,
@@ -14937,6 +14986,692 @@ impl ResidentDecodeState {
         }
         self.filled = n_tokens;
         Some(())
+    }
+
+    /// Long-prompt TTFT campaign, Tier A — **batched weight streaming, BIT-IDENTICAL
+    /// to `n_tokens` sequential `forward_token` prefill decodes.**
+    ///
+    /// Shaped like `verify_batch_inner`, not like `prefill_tokens`: the prompt is walked
+    /// in chunks of `chunk_rows`, and inside a chunk every stage whose output depends on a
+    /// single row runs the EXACT single-token kernel at a row byte offset, while every
+    /// stage that streams a weight matrix runs the proven byte-exact batched twin.
+    ///
+    /// - batched (one weight stream per chunk instead of one per token): `rms_norm_batch_f32`
+    ///   for the input / FFN / both sandwich norms, and the C0 batched-column GEMV
+    ///   `encode_q8_matmul_f32y_batched` for Q/K/V/O/gate/up/down (each output column is
+    ///   bit-identical to the single-token dispatch — `metal_verify_gemv_batched_bit_identical`);
+    /// - elementwise with a wider `n`: `residual_add_f32`, and `gelu_mul_f32` / `silu_mul_f32`
+    ///   (`if (gid >= n) return;` guards, so a wider grid is the same arithmetic);
+    /// - per row, at a byte offset: per-head QK-norm, RoPE, K/V scatter and attention —
+    ///   so cos/sin pairing, the scatter slot, the attention routing and the window read
+    ///   range are reproduced verbatim.
+    ///
+    /// The three gemma3 features `prefill_tokens` fails closed on
+    /// (its gate at the top of that function) are all carried here:
+    ///
+    /// 1. **per-layer dual-theta RoPE** — `alt_rope` is selected per layer by
+    ///    `schedule.use_alt_rope[l]`, mirroring `prepare_token`;
+    /// 2. **sandwich norms** — `post_attn_norm` / `post_ffw_norm` as two extra
+    ///    `rms_norm_batch_f32` dispatches per layer, applied BEFORE their residual adds,
+    ///    exactly as `encode_attention_block` / `encode_ffn_block` do;
+    /// 3. **GeGLU** — the same `gelu_mul_f32` kernel the decode encode uses, dispatched
+    ///    with `n = rows * ffn_dim`.
+    ///
+    /// The sliding-window mask needs no new kernel: row `i`'s `(window_start,
+    /// position_count)` come from the shared [`schedule_window_bounds`] at
+    /// `filled = base + i + 1` and ride into the unchanged `encode_attention` through the
+    /// attention scalar's `kv_base_offset` word — the same mechanism the token-by-token
+    /// lane uses. At head_dim 256 that routes to `encode_attention_split3`, the exact
+    /// kernel the shipped lane already runs.
+    ///
+    /// `head_dim > 128` is NOT gated here (this is a separate admission path; the ≤128
+    /// gates on `prefill_tokens`, `verify_batch` and the `MAX_DPL`/`MAX_DOCT` kernels are
+    /// untouched), and `use_attn_mm` — which requires `!has_qk_norm` — is not on this path
+    /// at all: attention-as-matmul is Tier B.
+    ///
+    /// Sets `filled = n_tokens` on success (the caller's `filled() == position` invariant;
+    /// getting it wrong re-seeds from a CPU KV cache this lane leaves hollow). Returns
+    /// `None` — losslessly, having written nothing — on any unsupported config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_windowed(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        layers: &[ResidentLayerWeights],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        alt_rope_all: Option<(&[f32], &[f32])>,
+        scale: f32,
+        chunk_rows: usize,
+    ) -> Option<()> {
+        self.prefill_tokens_windowed_inner(
+            embeddings,
+            n_tokens,
+            layers,
+            cos_all,
+            sin_all,
+            alt_rope_all,
+            scale,
+            chunk_rows,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// `prefill_tokens_windowed` that also reads back every row's post-final-layer hidden
+    /// state (`n_tokens * hidden`, row-major). Test-only: gate G1 compares the final hidden
+    /// alongside the KV caches, because a defect confined to the LAST layer's attention
+    /// moves ZERO cache bits (conductor §16e) and is visible only there. The production
+    /// lane never pays the readback.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_tokens_windowed_hidden(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        layers: &[ResidentLayerWeights],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        alt_rope_all: Option<(&[f32], &[f32])>,
+        scale: f32,
+        chunk_rows: usize,
+    ) -> Option<Vec<f32>> {
+        self.prefill_tokens_windowed_inner(
+            embeddings,
+            n_tokens,
+            layers,
+            cos_all,
+            sin_all,
+            alt_rope_all,
+            scale,
+            chunk_rows,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_tokens_windowed_inner(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        layers: &[ResidentLayerWeights],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        alt_rope_all: Option<(&[f32], &[f32])>,
+        scale: f32,
+        chunk_rows: usize,
+        read_hidden: bool,
+    ) -> Option<Vec<f32>> {
+        // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
+        // Mirrors verify_batch_inner's gate, MINUS the head_dim <= 128 clause: nothing on
+        // this path carries a per-lane fixed-size array, so head_dim 256 is admissible here
+        // while `prefill_tokens` / `verify_batch` / the MAX_DPL kernels keep their ≤128
+        // memory-safety gates exactly as they are.
+        if n_tokens == 0 || chunk_rows == 0 {
+            return None;
+        }
+        // The batched GEMV mirrors exactly the f32y + wire + NSG=8 production GEMV; any
+        // other GEMV path would not match the token-by-token lane bit-for-bit.
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            return None;
+        }
+        if !self.head_dim.is_multiple_of(32) {
+            return None;
+        }
+        if self.filled != 0 || embeddings.len() != n_tokens * self.hidden {
+            return None;
+        }
+        if layers.len() != self.n_layers || n_tokens > self.cap {
+            return None;
+        }
+        if cos_all.len() != sin_all.len()
+            || cos_all.is_empty()
+            || !cos_all.len().is_multiple_of(n_tokens)
+        {
+            return None;
+        }
+        let half_rope = cos_all.len() / n_tokens;
+        if half_rope == 0 || half_rope * 2 > self.head_dim {
+            return None;
+        }
+        // Dual-theta schedule: when any layer selects the ALT table the caller MUST supply
+        // it for every position — fail closed, never rope with the wrong theta (the same
+        // contract `forward_token` enforces).
+        let needs_alt = self.schedule.as_ref().is_some_and(|s| s.needs_alt_rope());
+        let alt_rope_all = match alt_rope_all {
+            Some((ac, as_)) if ac.len() == cos_all.len() && as_.len() == sin_all.len() => {
+                Some((ac, as_))
+            }
+            Some(_) => return None,
+            None if needs_alt => return None,
+            None => None,
+        };
+        if let Some(s) = &self.schedule {
+            if s.use_alt_rope.len() != self.n_layers || s.window.len() != self.n_layers {
+                return None;
+            }
+        }
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        for l in layers {
+            if l.attn_norm.len() != self.hidden
+                || l.ffn_norm.len() != self.hidden
+                || l.post_attn_norm.is_some_and(|n| n.len() != self.hidden)
+                || l.post_ffw_norm.is_some_and(|n| n.len() != self.hidden)
+                || l.q_norm.is_some() != l.k_norm.is_some()
+                || l.q_norm.is_some_and(|n| n.len() != self.head_dim)
+                || l.k_norm.is_some_and(|n| n.len() != self.head_dim)
+                || !l.q_weight_blocks.matches_shape(self.hidden, q_dim)
+                || !l.k_weight_blocks.matches_shape(self.hidden, kv_dim)
+                || !l.v_weight_blocks.matches_shape(self.hidden, kv_dim)
+                || !l.o_weight_blocks.matches_shape(q_dim, self.hidden)
+                || !l
+                    .gate_weight_blocks
+                    .matches_shape(self.hidden, self.ffn_dim)
+                || !l.up_weight_blocks.matches_shape(self.hidden, self.ffn_dim)
+                || !l
+                    .down_weight_blocks
+                    .matches_shape(self.ffn_dim, self.hidden)
+            {
+                return None;
+            }
+        }
+
+        // A pre-committed pending graph (from forward_token's encode-ahead) sits gated on
+        // the serial queue; release it so these command buffers are not ordered behind a
+        // graph that never gets signaled.
+        if let Some(stale) = self.pending.take() {
+            self.release_stale(stale);
+        }
+        self.pending_signaled = false;
+        self.last_sampled = None;
+        // Grow ONCE, for the whole prompt: growth reallocates the cache buffers, and every
+        // chunk's encoded graph holds raw references to them.
+        if !self.ensure_capacity(n_tokens) {
+            return None;
+        }
+
+        let kern = metal_linear_kernel()?;
+        let max_positions = self.max_positions;
+        let n_heads = self.n_heads;
+        let n_kv_heads = self.n_kv_heads;
+        let head_dim = self.head_dim;
+        let hidden = self.hidden;
+        let ffn_dim = self.ffn_dim;
+        let eps = self.eps;
+        let pairing = u32::from(self.split_half_pairing);
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn_dim / 32;
+        let chunk = chunk_rows.min(n_tokens);
+        let kv_position_stride = if self.kvq8 {
+            (head_dim / 32) * 34
+        } else {
+            head_dim
+        };
+
+        // ---- Resolve resident weights (wire format; gated on f32y+wire above) ------------
+        let resident: Vec<[ResidentLinearWeight; 7]>;
+        let attn_norm_bufs: Vec<Buffer>;
+        let ffn_norm_bufs: Vec<Buffer>;
+        let qk_norm_bufs: Vec<Option<(Buffer, Buffer)>>;
+        let post_attn_norm_bufs: Vec<Option<Buffer>>;
+        let post_ffw_norm_bufs: Vec<Option<Buffer>>;
+        {
+            let mut cache = metal_linear_cache().lock().ok()?;
+            let mut wb = |w: &ResidentWeightBytes| {
+                resolve_resident_weight(&mut cache, &kern.device, w, true)
+            };
+            resident = layers
+                .iter()
+                .map(|l| {
+                    Some([
+                        wb(&l.q_weight_blocks)?,
+                        wb(&l.k_weight_blocks)?,
+                        wb(&l.v_weight_blocks)?,
+                        wb(&l.o_weight_blocks)?,
+                        wb(&l.gate_weight_blocks)?,
+                        wb(&l.up_weight_blocks)?,
+                        wb(&l.down_weight_blocks)?,
+                    ])
+                })
+                .collect::<Option<Vec<_>>>()?;
+            attn_norm_bufs = layers
+                .iter()
+                .map(|l| cache.weight_buffer(&kern.device, l.attn_norm))
+                .collect();
+            ffn_norm_bufs = layers
+                .iter()
+                .map(|l| cache.weight_buffer(&kern.device, l.ffn_norm))
+                .collect();
+            qk_norm_bufs = layers
+                .iter()
+                .map(|l| match (l.q_norm, l.k_norm) {
+                    (Some(qn), Some(kn)) => Some((
+                        cache.weight_buffer(&kern.device, qn),
+                        cache.weight_buffer(&kern.device, kn),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            post_attn_norm_bufs = layers
+                .iter()
+                .map(|l| {
+                    l.post_attn_norm
+                        .map(|n| cache.weight_buffer(&kern.device, n))
+                })
+                .collect();
+            post_ffw_norm_bufs = layers
+                .iter()
+                .map(|l| {
+                    l.post_ffw_norm
+                        .map(|n| cache.weight_buffer(&kern.device, n))
+                })
+                .collect();
+        }
+
+        // ---- Chunk-sized activation scratch, allocated ONCE and reused ------------------
+        // Row-major [row][dim] throughout, matching the batched GEMV's `[token][dim]`
+        // contract. ~32 MB total at chunk = 256 on the 1B row.
+        let nb = |bytes: usize| {
+            kern.device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let act_a = nb(chunk * hidden * 4);
+        let act_b = nb(chunk * hidden * 4);
+        let mid = nb(chunk * hidden * 4);
+        let norm_buf = nb(chunk * hidden * 4);
+        let q_buf = nb(chunk * q_dim * 4);
+        let k_buf = nb(chunk * kv_dim * 4);
+        let v_buf = nb(chunk * kv_dim * 4);
+        let ctx_buf = nb(chunk * q_dim * 4);
+        let o_buf = nb(chunk * hidden * 4);
+        let post_buf = nb(chunk * hidden * 4);
+        let gate_buf = nb(chunk * ffn_dim * 4);
+        let up_buf = nb(chunk * ffn_dim * 4);
+        let act_buf = nb(chunk * ffn_dim * 4);
+        let down_buf = nb(chunk * hidden * 4);
+        let cos_buf = nb(cos_all.len() * 4);
+        let sin_buf = nb(sin_all.len() * 4);
+        write_buffer_f32(&cos_buf, cos_all);
+        write_buffer_f32(&sin_buf, sin_all);
+        let alt_bufs = alt_rope_all.map(|(ac, as_)| {
+            let cb = nb(ac.len() * 4);
+            let sb = nb(as_.len() * 4);
+            write_buffer_f32(&cb, ac);
+            write_buffer_f32(&sb, as_);
+            (cb, sb)
+        });
+        // One shared scores buffer, sized to the deepest read range any row can take
+        // (a global layer at the last position). Sharing it serializes the per-row
+        // attention dispatches — which is exactly what the token-by-token lane already
+        // does, one command buffer per token, so it costs nothing relative to today.
+        let scores_buf = nb(n_heads * n_tokens * 4);
+
+        // ---- Scalars --------------------------------------------------------------------
+        let rms_scalar = nb(8);
+        let q_gemv = nb(12);
+        let kv_gemv = nb(12);
+        let o_gemv = nb(12);
+        let gateup_gemv = nb(12);
+        let down_gemv = nb(12);
+        let rope_q_scalar = nb(16);
+        let rope_k_scalar = nb(16);
+        let act_n = nb(4);
+        let resid_n = nb(4);
+        let kv16_write = nb(4);
+        let perhead_qk_scalar = nb(12);
+        let scatter_scalars = nb(16 * chunk);
+        unsafe {
+            let p = rms_scalar.contents() as *mut u8;
+            *(p as *mut u32) = hidden as u32;
+            *(p.add(4) as *mut f32) = eps;
+            let set_gemv = |buf: &Buffer, bpr: usize, rows: usize| {
+                let q = buf.contents() as *mut u32;
+                *q = bpr as u32;
+                *q.add(1) = rows as u32;
+            };
+            set_gemv(&q_gemv, bpr_hidden, q_dim);
+            set_gemv(&kv_gemv, bpr_hidden, kv_dim);
+            set_gemv(&o_gemv, bpr_q, hidden);
+            set_gemv(&gateup_gemv, bpr_hidden, ffn_dim);
+            set_gemv(&down_gemv, bpr_ffn, hidden);
+            let set_rope = |buf: &Buffer, hc: usize| {
+                let r = buf.contents() as *mut u32;
+                *r = hc as u32;
+                *r.add(1) = head_dim as u32;
+                *r.add(2) = half_rope as u32;
+                *r.add(3) = pairing;
+            };
+            set_rope(&rope_q_scalar, n_heads);
+            set_rope(&rope_k_scalar, n_kv_heads);
+            *(kv16_write.contents() as *mut u32) = u32::from(!self.kv16 && !self.kvq8);
+            let p = perhead_qk_scalar.contents() as *mut u8;
+            *(p as *mut u32) = head_dim as u32;
+            *(p.add(4) as *mut f32) = eps;
+            *(p.add(8) as *mut u32) = 1; // use_weight
+        }
+
+        // Distinct window values across the schedule (2 for gemma3: the 512-position
+        // sliding layers and the full-causal globals) — one 32-byte attention scalar per
+        // (window class, row), rewritten per chunk. Every layer with the same window
+        // shares its class, so the scalar count is `classes * chunk`, not `layers * chunk`.
+        let layer_windows: Vec<Option<usize>> = (0..self.n_layers)
+            .map(|l| self.schedule.as_ref().and_then(|s| s.window[l]))
+            .collect();
+        let mut classes: Vec<Option<usize>> = Vec::new();
+        for w in &layer_windows {
+            if !classes.contains(w) {
+                classes.push(*w);
+            }
+        }
+        let layer_class: Vec<usize> = layer_windows
+            .iter()
+            .map(|w| {
+                classes
+                    .iter()
+                    .position(|c| c == w)
+                    .expect("every layer window was collected into a class above")
+            })
+            .collect();
+        let attn_scalars: Vec<Buffer> = (0..classes.len() * chunk).map(|_| nb(32)).collect();
+
+        let mut hidden_out: Vec<f32> = if read_hidden {
+            Vec::with_capacity(n_tokens * hidden)
+        } else {
+            Vec::new()
+        };
+
+        // ---- One command buffer per chunk ------------------------------------------------
+        let mut base = 0usize;
+        while base < n_tokens {
+            let k = chunk.min(n_tokens - base);
+            // Per-chunk scalars: the last chunk is narrower, and every previous chunk's
+            // command buffer has already completed (waited on below), so rewriting the
+            // shared scalar buffers here is safe.
+            unsafe {
+                *(act_n.contents() as *mut u32) = (k * ffn_dim) as u32;
+                *(resid_n.contents() as *mut u32) = (k * hidden) as u32;
+                for i in 0..k {
+                    let s = (scatter_scalars.contents() as *mut u8).add(i * 16) as *mut u32;
+                    *s = head_dim as u32;
+                    *s.add(1) = max_positions as u32;
+                    *s.add(2) = (base + i) as u32;
+                    *s.add(3) = if self.kvq8 {
+                        (n_kv_heads * (head_dim / 32)) as u32
+                    } else {
+                        kv_dim as u32
+                    };
+                }
+                for (c, window) in classes.iter().enumerate() {
+                    for i in 0..k {
+                        // `filled = base + i + 1` — the window INCLUDES the current
+                        // position, and this is the SAME expression the decode encode runs.
+                        let (window_start, position_count) =
+                            schedule_window_bounds(*window, base + i + 1);
+                        let p = attn_scalars[c * chunk + i].contents() as *mut u8;
+                        *(p as *mut u32) = n_heads as u32;
+                        *(p.add(4) as *mut u32) = head_dim as u32;
+                        *(p.add(8) as *mut u32) = position_count as u32;
+                        *(p.add(12) as *mut u32) = (n_heads / n_kv_heads) as u32;
+                        *(p.add(16) as *mut f32) = scale;
+                        *(p.add(20) as *mut u32) = kv_position_stride as u32;
+                        *(p.add(24) as *mut u32) = (max_positions * kv_position_stride) as u32;
+                        // Shares `position_stride`'s units (BYTES on a Q8 primary,
+                        // elements on f32/f16) — scale with the stride, NOT with head_dim.
+                        *(p.add(28) as *mut u32) = (window_start * kv_position_stride) as u32;
+                    }
+                }
+            }
+            write_buffer_f32(&act_a, &embeddings[base * hidden..(base + k) * hidden]);
+
+            let mut keep: Vec<Buffer> = Vec::new();
+            let cb = kern.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            let mut from_a = true;
+            for l in 0..self.n_layers {
+                let (cur, nxt) = if from_a {
+                    (&act_a, &act_b)
+                } else {
+                    (&act_b, &act_a)
+                };
+                let w = &resident[l];
+                // Dual-theta: sliding layers rope with the ALT (local-theta) tables,
+                // globals with the primary — `prepare_token`'s selection verbatim.
+                let (l_cos, l_sin) = match (&self.schedule, &alt_bufs) {
+                    (Some(sched), Some((ac, as_))) if sched.use_alt_rope[l] => (ac, as_),
+                    _ => (&cos_buf, &sin_buf),
+                };
+                // --- Attention block ---
+                encode_rms_norm_batch(kern, e, cur, &attn_norm_bufs[l], &norm_buf, &rms_scalar, k);
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &norm_buf, &w[0], &q_buf, &q_gemv, hidden, q_dim, k,
+                );
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &norm_buf, &w[1], &k_buf, &kv_gemv, hidden, kv_dim, k,
+                );
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &norm_buf, &w[2], &v_buf, &kv_gemv, hidden, kv_dim, k,
+                );
+                // Per-head QK-norm (Qwen3/gemma3), per row, in place, before RoPE.
+                if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
+                    for i in 0..k {
+                        encode_rms_norm_per_head(
+                            e,
+                            kern,
+                            &q_buf,
+                            qn_buf,
+                            &q_buf,
+                            &perhead_qk_scalar,
+                            n_heads,
+                            (i * q_dim * 4) as u64,
+                        );
+                        encode_rms_norm_per_head(
+                            e,
+                            kern,
+                            &k_buf,
+                            kn_buf,
+                            &k_buf,
+                            &perhead_qk_scalar,
+                            n_kv_heads,
+                            (i * kv_dim * 4) as u64,
+                        );
+                    }
+                }
+                // RoPE — per row at position base+i (cos/sin position-major, stride half_rope).
+                for i in 0..k {
+                    let table_off = ((base + i) * half_rope * 4) as u64;
+                    encode_rope(
+                        e,
+                        kern,
+                        &q_buf,
+                        l_cos,
+                        l_sin,
+                        &rope_q_scalar,
+                        n_heads,
+                        half_rope,
+                        (i * q_dim * 4) as u64,
+                        table_off,
+                    );
+                    encode_rope(
+                        e,
+                        kern,
+                        &k_buf,
+                        l_cos,
+                        l_sin,
+                        &rope_k_scalar,
+                        n_kv_heads,
+                        half_rope,
+                        (i * kv_dim * 4) as u64,
+                        table_off,
+                    );
+                }
+                // K/V scatter — every row into slot base+i BEFORE any attention reads, so
+                // row i sees its own slot and every earlier row exactly as a standalone
+                // decode at that position would.
+                for i in 0..k {
+                    let scatter_pipeline = if self.kvq8 {
+                        &kern.kv_scatter_kvq8_pipeline
+                    } else if self.kv16 {
+                        &kern.kv_scatter_kv16_pipeline
+                    } else {
+                        &kern.kv_scatter_pipeline
+                    };
+                    e.set_compute_pipeline_state(scatter_pipeline);
+                    e.set_buffer(0, Some(&k_buf), (i * kv_dim * 4) as u64);
+                    e.set_buffer(1, Some(&v_buf), (i * kv_dim * 4) as u64);
+                    e.set_buffer(2, Some(&self.cache_k[l]), 0);
+                    e.set_buffer(3, Some(&self.cache_v[l]), 0);
+                    e.set_buffer(4, Some(&scatter_scalars), (i * 16) as u64);
+                    e.set_buffer(5, Some(&scatter_scalars), (i * 16 + 4) as u64);
+                    e.set_buffer(6, Some(&scatter_scalars), (i * 16 + 8) as u64);
+                    e.set_buffer(7, Some(&scatter_scalars), (i * 16 + 12) as u64);
+                    if !self.kv16 && !self.kvq8 {
+                        e.set_buffer(8, Some(&self.cache_k16[l]), 0);
+                        e.set_buffer(9, Some(&self.cache_v16[l]), 0);
+                        e.set_buffer(10, Some(&kv16_write), 0);
+                    }
+                    let scatter_units = if self.kvq8 {
+                        n_kv_heads * (head_dim / 32)
+                    } else {
+                        kv_dim
+                    };
+                    dispatch_1d(e, scatter_pipeline, scatter_units);
+                }
+                // Attention — per row, through the UNCHANGED encode_attention, so the
+                // v2 / split-K / split3 routing at that position_count is whatever the
+                // token-by-token lane would pick.
+                let class_base = layer_class[l] * chunk;
+                for i in 0..k {
+                    let (_, position_count) =
+                        schedule_window_bounds(layer_windows[l], base + i + 1);
+                    encode_attention(
+                        e,
+                        kern,
+                        &mut keep,
+                        &q_buf,
+                        &self.cache_k[l],
+                        &self.cache_v[l],
+                        if self.kv16 || self.kvq8 {
+                            None
+                        } else {
+                            Some((&self.cache_k16[l], &self.cache_v16[l]))
+                        },
+                        &scores_buf,
+                        &ctx_buf,
+                        &attn_scalars[class_base + i],
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        position_count,
+                        (i * q_dim * 4) as u64,
+                        (i * q_dim * 4) as u64,
+                    );
+                }
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &ctx_buf, &w[3], &o_buf, &o_gemv, q_dim, hidden, k,
+                );
+                // gemma3 sandwich norm: RMSNorm on the attention output BEFORE the residual.
+                let attn_resid_src = match &post_attn_norm_bufs[l] {
+                    Some(pn) => {
+                        encode_rms_norm_batch(kern, e, &o_buf, pn, &post_buf, &rms_scalar, k);
+                        &post_buf
+                    }
+                    None => &o_buf,
+                };
+                encode_binary(
+                    e,
+                    &kern.residual_add_pipeline,
+                    cur,
+                    attn_resid_src,
+                    &mid,
+                    &resid_n,
+                    k * hidden,
+                );
+                // --- FFN block ---
+                encode_rms_norm_batch(kern, e, &mid, &ffn_norm_bufs[l], &norm_buf, &rms_scalar, k);
+                encode_resident_matmul_f32(
+                    e,
+                    kern,
+                    &mut keep,
+                    &norm_buf,
+                    &w[4],
+                    &gate_buf,
+                    &gateup_gemv,
+                    hidden,
+                    ffn_dim,
+                    k,
+                );
+                encode_resident_matmul_f32(
+                    e,
+                    kern,
+                    &mut keep,
+                    &norm_buf,
+                    &w[5],
+                    &up_buf,
+                    &gateup_gemv,
+                    hidden,
+                    ffn_dim,
+                    k,
+                );
+                // gemma3 GeGLU (gelu_tanh(gate) * up) vs the Llama-family SiLU — the SAME
+                // elementwise kernels the decode encode dispatches, with a wider `n`.
+                let act_pipeline = if layers[l].ffn_geglu {
+                    &kern.gelu_mul_pipeline
+                } else {
+                    &kern.silu_mul_pipeline
+                };
+                encode_binary(
+                    e,
+                    act_pipeline,
+                    &gate_buf,
+                    &up_buf,
+                    &act_buf,
+                    &act_n,
+                    k * ffn_dim,
+                );
+                encode_resident_matmul_f32(
+                    e, kern, &mut keep, &act_buf, &w[6], &down_buf, &down_gemv, ffn_dim, hidden, k,
+                );
+                let ffn_resid_src = match &post_ffw_norm_bufs[l] {
+                    Some(pn) => {
+                        encode_rms_norm_batch(kern, e, &down_buf, pn, &post_buf, &rms_scalar, k);
+                        &post_buf
+                    }
+                    None => &down_buf,
+                };
+                encode_binary(
+                    e,
+                    &kern.residual_add_pipeline,
+                    &mid,
+                    ffn_resid_src,
+                    nxt,
+                    &resid_n,
+                    k * hidden,
+                );
+                from_a = !from_a;
+            }
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            if read_hidden {
+                let final_buf = if from_a { &act_a } else { &act_b };
+                let mut out = vec![0.0f32; k * hidden];
+                read_buffer_f32(final_buf, &mut out);
+                hidden_out.extend_from_slice(&out);
+            }
+            // Every entry came from `pool_get` (the per-row attention scratch and the
+            // K-quant activation staging); returning them lets the NEXT chunk reuse the
+            // same allocations instead of re-creating thousands of small MTLBuffers.
+            pool_recycle(kern, keep);
+            base += k;
+        }
+        // G11: the caller's rebuild predicate is `filled() != position`. Leaving this
+        // short re-seeds from a CPU KV cache the resident lane leaves hollow, which then
+        // declines at `history_materialized` and drops the whole prompt onto a CPU path
+        // that fails closed for windowed archs.
+        self.filled = n_tokens;
+        Some(hidden_out)
     }
 
     /// WIN2METAL Phase 3: speculative-verify forward over `k` rows at sequence positions
@@ -16536,6 +17271,21 @@ impl ResidentDecodeState {
         _cos_all: &[f32],
         _sin_all: &[f32],
         _scale: f32,
+    ) -> Option<()> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens_windowed(
+        &mut self,
+        _embeddings: &[f32],
+        _n_tokens: usize,
+        _layers: &[ResidentLayerWeights],
+        _cos_all: &[f32],
+        _sin_all: &[f32],
+        _alt_rope_all: Option<(&[f32], &[f32])>,
+        _scale: f32,
+        _chunk_rows: usize,
     ) -> Option<()> {
         None
     }
@@ -24746,6 +25496,296 @@ mod tests {
         );
     }
 
+    // gemma3 long-prompt TTFT campaign, Phase 2 — the window expression is written
+    // ONCE (`schedule_window_bounds`) and shared by the token-by-token decode encode
+    // and the batched windowed prefill. This pins it against the campaign's own
+    // reference (`crate::window_ref::window_bounds`) so the two cannot drift, and
+    // records the ONE input on which they deliberately disagree.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_window_bounds_matches_window_ref() {
+        for position in 0..2600usize {
+            for window in [1usize, 2, 63, 64, 65, 511, 512, 513, 1024, 4096] {
+                let filled = position + 1;
+                assert_eq!(
+                    schedule_window_bounds(Some(window), filled),
+                    crate::window_ref::window_bounds(position, Some(window)),
+                    "window {window} at position {position}"
+                );
+            }
+            assert_eq!(
+                schedule_window_bounds(None, position + 1),
+                crate::window_ref::window_bounds(position, None),
+                "full-causal layer at position {position}"
+            );
+        }
+        // The one deliberate disagreement, recorded rather than discovered: the
+        // degenerate `Some(0)`. `window_bounds` treats it as "disabled" (full
+        // causal); the SHIPPED encode expression reads it literally as an empty
+        // read range. Bit-identity with the shipped lane is the Tier A gate, so
+        // the shipped expression is the one both callers run. No real schedule
+        // produces 0 — `Gemma3Metadata::layer_window` yields `None` or a positive
+        // window — so this is a documentation assert, not a behaviour claim.
+        assert_eq!(schedule_window_bounds(Some(0), 7), (7, 0));
+        assert_eq!(crate::window_ref::window_bounds(6, Some(0)), (0, 7));
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 2 — GATE G1 on a SYNTHETIC fixture.
+    //
+    // The claim: `prefill_tokens_windowed` over `n` rows leaves the KV cache and
+    // every row's final hidden BIT-IDENTICAL to `n` sequential `forward_token`
+    // prefill decodes. Not "within a tolerance" — batching over the token dimension
+    // re-associates no floating-point reduction (each output element's reduction
+    // stays serial), so a differing bit is a bug, and the campaign's stopping rule
+    // says fix it rather than lower the bar.
+    //
+    // The fixture carries all four features `prefill_tokens` fails closed on, so
+    // this is not a degenerate pass: head_dim 256, a per-layer dual-theta schedule
+    // with a mixed sliding/global cadence, both sandwich norms, GeGLU, and per-head
+    // QK-norm. The final hidden is compared as well as the caches, because the LAST
+    // layer's attention reaches no KV cache at all (§16e found a mutant that moves
+    // zero cache bits).
+    //
+    // The length sweep straddles the chunk boundary (rows per command buffer = 4),
+    // the window boundary (window = 6, so runs at 5/6/7 sit either side of
+    // saturation), and single-row / exact-multiple / one-past cases.
+    //
+    // Run targeted, gates armed from the SHELL (they are process-latched OnceLocks):
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    //   cargo test --release --lib metal_batched_windowed_prefill -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_batched_windowed_prefill_is_bit_identical_to_token_by_token() {
+        use crate::kv_equivalence::compare;
+        if !detect_metal_device().available {
+            return;
+        }
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP metal_batched_windowed_prefill_is_bit_identical_to_token_by_token: the \
+                 production GEMV gates (f32y/wire/NSG8) are not armed; arm them from the shell \
+                 (never from inside a test — they are process-wide OnceLocks)"
+            );
+            return;
+        }
+        let n_layers = 4usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let window = 6usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+        const CHUNK: usize = 4;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    post_attn_norm: (0..hidden)
+                        .map(|i| 0.9 + ((i + li) as f32 % 3.0) * 0.03)
+                        .collect(),
+                    post_ffw_norm: (0..hidden)
+                        .map(|i| 0.95 + ((i + li) as f32 % 6.0) * 0.02)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        // Two arch shapes through the SAME batched entry point:
+        //   * "gemma3": sandwich norms + GeGLU + QK-norm + a dual-theta windowed
+        //     schedule — everything `prefill_tokens` fails closed on;
+        //   * "llama": no sandwich norms, SiLU, no QK-norm, no schedule — the
+        //     regression that proves the added machinery is inert for every other
+        //     arch (each `Option` is `None`, so the extra dispatches are not encoded
+        //     at all and the residual sources are the un-normed buffers).
+        let mk_views = |gemma3: bool| -> Vec<ResidentLayerWeights<'_>> {
+            data.iter()
+                .map(|d| ResidentLayerWeights {
+                    attn_norm: &d.attn_norm,
+                    ffn_norm: &d.ffn_norm,
+                    q_norm: gemma3.then_some(d.q_norm.as_slice()),
+                    k_norm: gemma3.then_some(d.k_norm.as_slice()),
+                    post_attn_norm: gemma3.then_some(d.post_attn_norm.as_slice()),
+                    post_ffw_norm: gemma3.then_some(d.post_ffw_norm.as_slice()),
+                    ffn_geglu: gemma3,
+                    q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                    k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                    v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                    o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                    gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                    up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                    down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                })
+                .collect()
+        };
+        let emb_row = |t: usize| -> Vec<f32> {
+            (0..hidden)
+                .map(|i| ((((i * 7 + t * 13) % 23) as f32) - 11.0) * 0.13)
+                .collect()
+        };
+
+        // Lengths: 1 (single row), 3 (partial chunk), 4/8 (exact chunk multiples),
+        // 5/9 (one past a chunk edge), 6/7 (the window edge: filled == window and
+        // the first clipped position), 13 (three chunks + a ragged tail), 17.
+        for &n in &[1usize, 3, 4, 5, 6, 7, 8, 9, 13, 17] {
+            for &gemma3 in &[true, false] {
+                let weights = mk_views(gemma3);
+                let schedule = gemma3.then(|| ResidentLayerSchedule {
+                    // The 1B row's cadence in miniature: three sliding layers on the
+                    // local theta, one global on the primary.
+                    use_alt_rope: vec![true, true, true, false],
+                    window: vec![Some(window), Some(window), Some(window), None],
+                });
+                let mk_session = || {
+                    ResidentDecodeState::new(
+                        n_layers,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        hidden,
+                        ffn,
+                        n,
+                        n,
+                        eps,
+                        true,
+                        schedule.clone(),
+                    )
+                    .expect("resident session")
+                };
+
+                // --- the shipped lane: n sequential forward_token prefill decodes ---
+                let mut token_session = mk_session();
+                let mut token_hidden: Vec<f32> = Vec::with_capacity(n * hidden);
+                for t in 0..n {
+                    let (cos_g, sin_g) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e6);
+                    let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+                    match token_session
+                        .forward_token(
+                            &emb_row(t),
+                            &weights,
+                            &cos_g,
+                            &sin_g,
+                            Some((&cos_l, &sin_l)),
+                            t,
+                            scale,
+                            None,
+                            None,
+                            0,
+                            None,
+                            None,
+                        )
+                        .expect("resident forward")
+                    {
+                        ResidentTokenOut::Data(v) => token_hidden.extend_from_slice(&v),
+                        ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                    }
+                }
+                assert_eq!(token_session.filled(), n);
+
+                // --- Tier A: one command buffer per chunk of CHUNK rows ---
+                let mut embeddings: Vec<f32> = Vec::with_capacity(n * hidden);
+                let mut cos_all: Vec<f32> = Vec::new();
+                let mut sin_all: Vec<f32> = Vec::new();
+                let mut alt_cos: Vec<f32> = Vec::new();
+                let mut alt_sin: Vec<f32> = Vec::new();
+                for t in 0..n {
+                    embeddings.extend_from_slice(&emb_row(t));
+                    let (c, s) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e6);
+                    cos_all.extend_from_slice(&c);
+                    sin_all.extend_from_slice(&s);
+                    let (c, s) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+                    alt_cos.extend_from_slice(&c);
+                    alt_sin.extend_from_slice(&s);
+                }
+                let mut batch_session = mk_session();
+                let batch_hidden = batch_session
+                    .prefill_tokens_windowed_hidden(
+                        &embeddings,
+                        n,
+                        &weights,
+                        &cos_all,
+                        &sin_all,
+                        Some((&alt_cos, &alt_sin)),
+                        scale,
+                        CHUNK,
+                    )
+                    .expect("batched windowed prefill must be admitted for this fixture");
+                // G11: `filled` must land on n exactly, or the caller's rebuild
+                // predicate re-seeds from a hollow CPU KV cache.
+                assert_eq!(
+                    batch_session.filled(),
+                    n,
+                    "n={n} gemma3={gemma3}: batched prefill must leave filled == n"
+                );
+
+                let arch = if gemma3 { "gemma3" } else { "llama" };
+                let eq = compare(
+                    &token_session
+                        .kv_snapshot(n)
+                        .with_final_hidden(token_hidden.clone()),
+                    &batch_session.kv_snapshot(n).with_final_hidden(batch_hidden),
+                )
+                .expect("same geometry");
+                eq.assert_bit_identical(&format!(
+                    "G1 (synthetic, {arch}): batched windowed prefill of {n} rows vs {n} \
+                     token-by-token forwards, chunk {CHUNK}"
+                ));
+                assert_eq!(
+                    eq.compared_elements(),
+                    n_layers * 2 * n_kv * head_dim * n + n * hidden,
+                    "n={n} {arch}: the comparison denominator must cover every cached K/V \
+                     element AND every row's final hidden"
+                );
+            }
+        }
+        eprintln!(
+            "[G1-synthetic] PASS: batched windowed prefill BIT-IDENTICAL to token-by-token \
+             at n = 1/3/4/5/6/7/8/9/13/17 (chunk {CHUNK}, window {window}), for both the \
+             gemma3 shape (dual-theta + sandwich norms + GeGLU + QK-norm) and the plain \
+             llama shape"
+        );
+    }
+
     /// One decoder layer of the real gemma3-1B row, loaded from the GGUF into the
     /// 36-byte block layout the resident kernels take.
     #[cfg(target_os = "macos")]
@@ -24959,6 +25999,183 @@ mod tests {
             }
             row
         }
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 2 — GATE G1 ON THE REAL ROW.
+    //
+    // The synthetic twin above proves the batched encode on a 4-layer fixture; this
+    // proves it on the shipped weights, the shipped 22-sliding/4-global schedule and
+    // the shipped head_dim 256, at prompt lengths that straddle the 512-position
+    // window and the 256-row chunk boundary. Bit-identity is the gate: batching over
+    // the token dimension moves no floating-point reduction, so there is no tolerance
+    // to negotiate.
+    //
+    // Both sides are fed the SAME embedding array, so an embedding-lookup difference
+    // cannot mask or manufacture a result — the claim is about the encode.
+    //
+    // Cost note (machine constraint): one process, one model load, no server. The
+    // token-by-token side is the expensive half (n sequential command buffers), which
+    // is why the sweep tops out at 1 024 rather than 2 400.
+    //
+    // Run targeted, gates armed from the SHELL:
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
+    //   cargo test --release --lib gemma3_real_row_batched_prefill -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_batched_prefill_kv_bit_identical() {
+        use crate::kv_equivalence::compare;
+        if !detect_metal_device().available {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_batched_prefill_kv_bit_identical: set CAMELID_GEMMA3_GGUF \
+                 to the gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_batched_prefill_kv_bit_identical: the production GEMV \
+                 gates (f32y/wire/NSG8) are not armed; arm them from the shell."
+            );
+            return;
+        }
+        let row = load_gemma3_real_row(&path.to_string_lossy());
+        let weights = row.weights();
+        let schedule = row.schedule();
+        assert_eq!(
+            schedule.window.iter().filter(|w| w.is_some()).count(),
+            22,
+            "expected the 1B row's 22 sliding / 4 global cadence"
+        );
+        assert_eq!(row.head_dim, 256, "expected the 1B row's head_dim");
+
+        // A deterministic pseudo-prompt over real vocab ids: content does not matter
+        // for a bit-identity gate, coverage of the window and chunk edges does.
+        let token_at = |i: usize| -> u32 { (2 + (i * 7919) % (row.vocab - 3)) as u32 };
+        // 5   — inside one chunk, window not yet saturated;
+        // 256 — exactly one chunk;
+        // 257 — one row past a chunk edge (a two-chunk run with a 1-row tail);
+        // 513 — two chunks past the 512 window AND one past 512;
+        // 1024 — four chunks, deep window clipping on all 22 sliding layers.
+        for &n in &[5usize, 256, 257, 513, 1024] {
+            let prompt: Vec<u32> = (0..n).map(token_at).collect();
+            let mut embeddings: Vec<f32> = Vec::with_capacity(n * row.hidden);
+            let mut cos_all: Vec<f32> = Vec::new();
+            let mut sin_all: Vec<f32> = Vec::new();
+            let mut alt_cos: Vec<f32> = Vec::new();
+            let mut alt_sin: Vec<f32> = Vec::new();
+            for (t, &tok) in prompt.iter().enumerate() {
+                embeddings.extend_from_slice(&row.embed(tok));
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_global,
+                );
+                cos_all.extend_from_slice(&c);
+                sin_all.extend_from_slice(&s);
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_local,
+                );
+                alt_cos.extend_from_slice(&c);
+                alt_sin.extend_from_slice(&s);
+            }
+            let mk_session = || {
+                ResidentDecodeState::new(
+                    row.n_layers,
+                    row.n_heads,
+                    row.n_kv,
+                    row.head_dim,
+                    row.hidden,
+                    row.ffn,
+                    n,
+                    n,
+                    row.eps,
+                    row.split_half_pairing,
+                    Some(schedule.clone()),
+                )
+                .expect("resident session")
+            };
+
+            let started = std::time::Instant::now();
+            let mut token_session = mk_session();
+            let mut token_hidden: Vec<f32> = Vec::with_capacity(n * row.hidden);
+            for t in 0..n {
+                let half = row.rope_dim / 2;
+                match token_session
+                    .forward_token(
+                        &embeddings[t * row.hidden..(t + 1) * row.hidden],
+                        &weights,
+                        &cos_all[t * half..(t + 1) * half],
+                        &sin_all[t * half..(t + 1) * half],
+                        Some((
+                            &alt_cos[t * half..(t + 1) * half],
+                            &alt_sin[t * half..(t + 1) * half],
+                        )),
+                        t,
+                        row.scale,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .expect("resident forward")
+                {
+                    ResidentTokenOut::Data(v) => token_hidden.extend_from_slice(&v),
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            }
+            assert_eq!(token_session.filled(), n);
+            let token_s = started.elapsed().as_secs_f64();
+
+            let started = std::time::Instant::now();
+            let mut batch_session = mk_session();
+            let batch_hidden = batch_session
+                .prefill_tokens_windowed_hidden(
+                    &embeddings,
+                    n,
+                    &weights,
+                    &cos_all,
+                    &sin_all,
+                    Some((&alt_cos, &alt_sin)),
+                    row.scale,
+                    256,
+                )
+                .expect("batched windowed prefill must be admitted for the real row");
+            assert_eq!(
+                batch_session.filled(),
+                n,
+                "n={n}: batched prefill must leave filled == n (G11)"
+            );
+            let batch_s = started.elapsed().as_secs_f64();
+
+            let eq = compare(
+                &token_session
+                    .kv_snapshot(n)
+                    .with_final_hidden(token_hidden.clone()),
+                &batch_session.kv_snapshot(n).with_final_hidden(batch_hidden),
+            )
+            .expect("same geometry");
+            eprintln!(
+                "[G1-real-row] n={n}: token-by-token {token_s:.2}s, batched {batch_s:.2}s \
+                 ({:.2}x), compared {} elements, bit_identical={}",
+                token_s / batch_s.max(1.0e-9),
+                eq.compared_elements(),
+                eq.bit_identical
+            );
+            eq.assert_bit_identical(&format!(
+                "G1 (real row): batched windowed prefill of {n} rows vs {n} token-by-token \
+                 forwards, chunk 256"
+            ));
+        }
+        eprintln!(
+            "[G1-real-row] PASS: bit-identical KV AND final hidden at n = 5/256/257/513/1024"
+        );
     }
 
     // gemma3 long-prompt TTFT campaign, Phase 1 — THE MUTATION HARNESS (gate G7).
