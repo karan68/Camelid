@@ -196,6 +196,19 @@ pub fn run_worker_on_listener(
 
 fn serve_session(runtime: &Gemma4Runtime, file_len: u64, stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true).ok();
+    // Symmetric to the master: a worker blocked reading the next step must not
+    // hold the session (and the serial accept loop behind it) open forever when
+    // the master's host disappears.
+    arm_keepalive(&stream);
+    // Keepalive covers a master that vanishes; this covers one that stays up but
+    // stops sending. `run_worker_on_listener` accepts strictly one session at a
+    // time, so without a bound here a single wedged master makes the worker
+    // unreachable to every future master until the process is restarted. The
+    // budget is generous because an idle gap between steps is legitimate — a
+    // master mid-generation but slow is not an error.
+    stream
+        .set_read_timeout(Some(WORKER_SESSION_IDLE_TIMEOUT))
+        .ok();
     let peer = stream.peer_addr().map_err(|e| io_err("peer_addr", e))?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| io_err("clone", e))?);
     let mut writer = BufWriter::new(stream);
@@ -235,6 +248,21 @@ fn serve_session(runtime: &Gemma4Runtime, file_len: u64, stream: TcpStream) -> R
         let magic = match read_u32(&mut reader) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            // Idle timeout: drop this session so the accept loop is free again.
+            // Not a failure of the worker, so return Ok — the master gets an
+            // EOF on its next step and reports it from its own side.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                eprintln!(
+                    "[gemma4-worker] session from {peer} idle for \
+                     {WORKER_SESSION_IDLE_TIMEOUT:?}; closing so the next master can connect"
+                );
+                return Ok(());
+            }
             Err(e) => return Err(io_err("step read", e)),
         };
         if magic != STEP_MAGIC {
@@ -306,18 +334,121 @@ pub struct WorkerStep {
     pub logits: Option<Vec<f32>>,
 }
 
+/// Steady-state per-step read budget. A healthy loopback step is ~40ms and a
+/// LAN step is a few hundred; this is the "the peer is gone" backstop, not a
+/// performance bound.
+const STEP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Arm TCP keepalive so a *dead* peer is detected in ~35s by the kernel, even
+/// while a read is inside the long [`FIRST_STEP_READ_TIMEOUT`] budget.
+///
+/// This is what makes that budget safe to grant. A read timeout alone cannot
+/// tell "the worker is slowly paging in its shard" from "the worker's host fell
+/// off the network" — both surface as EAGAIN, so the only way to stay
+/// responsive to the second was to be intolerant of the first. Keepalive splits
+/// them at the right layer: probes are answered by the peer's TCP stack, not by
+/// its blocked application thread, so a busy-but-alive worker holds the
+/// connection while a black-holed one fails `PROBE_COUNT` probes and errors the
+/// socket out promptly instead of waiting out the full budget.
+///
+/// There is no serve-side request timeout above this (the router mounts only
+/// tower-http `trace`/`cors`), so this is the only bound on a hung dial.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn arm_keepalive(stream: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    /// Quiet time before the first probe.
+    const IDLE_SECS: libc::c_int = 15;
+    /// Gap between probes once they start.
+    const INTERVAL_SECS: libc::c_int = 5;
+    /// Unanswered probes before the kernel kills the connection.
+    const PROBE_COUNT: libc::c_int = 4;
+
+    let fd = stream.as_raw_fd();
+    let set = |level: libc::c_int, name: libc::c_int, value: libc::c_int| {
+        // SAFETY: `fd` is a live socket owned by `stream` for this call, and
+        // every option below takes a c_int of exactly this size.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::addr_of!(value).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    #[cfg(target_os = "macos")]
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, IDLE_SECS);
+    #[cfg(target_os = "linux")]
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, IDLE_SECS);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, INTERVAL_SECS);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, PROBE_COUNT);
+}
+
+/// Keepalive tuning is platform-specific; elsewhere the read timeouts stand
+/// alone (the supported distributed deployment is macOS-to-macOS).
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn arm_keepalive(_stream: &TcpStream) {}
+
+/// Budget for the FIRST step of a session.
+///
+/// The worker binds and answers the handshake before its shard is resident:
+/// `load_layer_range` maps the GGUF lazily and warms it on a background thread
+/// (that advisory blocks for minutes on macOS over USB, so it cannot run on the
+/// load path). The whole cold-fault cost therefore lands on the first
+/// `step_range` — measured at 171s for a 1.9GB tail shard off a 38MB/s USB
+/// volume, against the 30s steady-state budget. Charging cold I/O to a
+/// steady-state timeout turned a slow-but-correct run into a hard abort, so the
+/// first step gets its own budget — bounded in practice by [`arm_keepalive`],
+/// which drops a genuinely dead peer in ~35s rather than letting it sit here for
+/// the full budget — and later steps tighten back to [`STEP_READ_TIMEOUT`].
+///
+/// Sized from measurement, not guessed: worst observed first token was 171s
+/// before the warm-up was range-scoped and 57s after, so this is ~5x the
+/// realistic worst case. It is deliberately NOT larger — the residual exposure
+/// is a worker that handshakes and then goes mute (still ACKing, so keepalive
+/// cannot see it), which costs one budget per request.
+const FIRST_STEP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a worker waits for the next step before abandoning the session.
+///
+/// The accept loop is serial — one session at a time — so an abandoned-but-open
+/// session locks out every future master. Generous enough that a legitimately
+/// slow master is never dropped mid-generation; the master's own first step is
+/// bounded by [`FIRST_STEP_READ_TIMEOUT`], so a healthy pair never idles here.
+const WORKER_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Master-side connection to a gemma4 worker (one generation session).
 pub struct Gemma4WorkerClient {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
+    /// Cleared once a step response has arrived, at which point the read
+    /// timeout drops from [`FIRST_STEP_READ_TIMEOUT`] to [`STEP_READ_TIMEOUT`].
+    cold: bool,
+}
+
+/// Why a connect attempt failed — permanent errors must not be retried.
+enum ConnectFailure {
+    /// The worker answered and refused: version/shape/model mismatch. Retrying
+    /// a deterministic fail-closed rejection just burns the retry budget in
+    /// `sleep` (10 attempts x 3s = 30s) and buries the real message.
+    Permanent(BackendError),
+    /// Dial or IO error — the LAN flap case the retry loop exists for.
+    Transient(BackendError),
 }
 
 impl Gemma4WorkerClient {
     /// Connect with bounded retries and IO timeouts. The two-Mac hosts are
     /// dual-homed (ethernet + wifi) and outbound sessions can flap mid-
     /// handshake — a blocked read on a black-holed connection would otherwise
-    /// hang a serve request forever. 30s covers worker shard-load pauses and
-    /// the slowest observed wire step by two orders of magnitude.
+    /// hang a serve request forever.
+    ///
+    /// Worst-case wall time is bounded by the handshake running on
+    /// [`STEP_READ_TIMEOUT`], not [`FIRST_STEP_READ_TIMEOUT`]: 10 attempts x
+    /// (30s read + 3s backoff) ~= 5.5 minutes. Only a permanent rejection short-
+    /// circuits earlier; the cold budget is armed after this returns and so is
+    /// never multiplied by the retry count.
     pub fn connect(addr: &str, handshake: &Gemma4Handshake) -> Result<Self> {
         // The recorded flap windows last seconds, not milliseconds — spread
         // the attempts over ~30s so one bad window cannot fail a model load.
@@ -326,61 +457,95 @@ impl Gemma4WorkerClient {
         for attempt in 0..ATTEMPTS {
             match Self::connect_once(addr, handshake) {
                 Ok(client) => return Ok(client),
-                Err(e) => {
+                // A handshake rejection is the worker's considered answer, not a
+                // flap: fail immediately with its message.
+                Err(ConnectFailure::Permanent(e)) => return Err(e),
+                Err(ConnectFailure::Transient(e)) => {
                     eprintln!(
                         "[gemma4-master] worker connect attempt {}/{ATTEMPTS} failed: {e}",
                         attempt + 1
                     );
                     last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                    }
                 }
             }
         }
         Err(last_err.expect("at least one attempt"))
     }
 
-    fn connect_once(addr: &str, handshake: &Gemma4Handshake) -> Result<Self> {
+    fn connect_once(
+        addr: &str,
+        handshake: &Gemma4Handshake,
+    ) -> std::result::Result<Self, ConnectFailure> {
+        use ConnectFailure::{Permanent, Transient};
+        let transient = |ctx: &'static str| move |e| Transient(io_err(ctx, e));
+
         let sock_addr = addr
             .to_socket_addrs()
-            .map_err(|e| io_err("resolve", e))?
+            // A malformed `host:port` is an operator typo, not a flap — the
+            // most likely resolve failure here, and retrying it 10x buries the
+            // message behind 30s of sleep.
+            .map_err(|e| Permanent(io_err("resolve", e)))?
             .next()
             .ok_or_else(|| {
-                BackendError::InvalidModelMetadata(format!(
+                Permanent(BackendError::InvalidModelMetadata(format!(
                     "gemma4 distributed: worker address {addr} resolved to nothing"
-                ))
+                )))
             })?;
         let stream = TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(10))
-            .map_err(|e| io_err("connect", e))?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
-        stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
+            .map_err(transient("connect"))?;
+        // The handshake gets the STEADY budget, not the cold one: the worker
+        // answers it straight off the accept without touching a weight byte, so
+        // a slow ack means something is wrong, not that a shard is paging in.
+        // Granting the cold budget here would be retried ATTEMPTS times by
+        // `connect` (a hello-ack timeout is Transient), stacking to ~100
+        // minutes against a worker that accepts and then never answers —
+        // keepalive cannot bound that one, because such a peer is still ACKing.
+        // The cold budget is armed below, once the handshake has succeeded.
+        stream.set_read_timeout(Some(STEP_READ_TIMEOUT)).ok();
+        stream.set_write_timeout(Some(STEP_READ_TIMEOUT)).ok();
         stream.set_nodelay(true).ok();
-        let mut reader = BufReader::new(stream.try_clone().map_err(|e| io_err("clone", e))?);
+        arm_keepalive(&stream);
+        let mut reader = BufReader::new(stream.try_clone().map_err(transient("clone"))?);
         let mut writer = BufWriter::new(stream);
-        handshake
-            .write(&mut writer)
-            .map_err(|e| io_err("hello", e))?;
-        let magic = read_u32(&mut reader).map_err(|e| io_err("hello ack", e))?;
-        let status = read_u32(&mut reader).map_err(|e| io_err("hello ack", e))?;
+        handshake.write(&mut writer).map_err(transient("hello"))?;
+        let magic = read_u32(&mut reader).map_err(transient("hello ack"))?;
+        let status = read_u32(&mut reader).map_err(transient("hello ack"))?;
         if magic != RESP_MAGIC {
-            return Err(BackendError::InvalidModelMetadata(format!(
+            // Not our protocol — a retry cannot turn this into a gemma4 worker.
+            return Err(Permanent(BackendError::InvalidModelMetadata(format!(
                 "gemma4 distributed: bad hello ack magic {magic:#x}"
-            )));
+            ))));
         }
         if status != 0 {
-            let len = read_u32(&mut reader).map_err(|e| io_err("hello reject", e))? as usize;
+            // Cap the peer-controlled length: the reject body is a diagnostic
+            // string, and an unbounded u32 would let a hostile or confused peer
+            // make us allocate 4GB before we even read it.
+            const MAX_REJECT_MSG: usize = 64 * 1024;
+            let len = (read_u32(&mut reader).map_err(transient("hello reject"))? as usize)
+                .min(MAX_REJECT_MSG);
             let mut msg = vec![0u8; len];
             reader
                 .read_exact(&mut msg)
-                .map_err(|e| io_err("hello reject", e))?;
-            return Err(BackendError::InvalidModelMetadata(
+                .map_err(transient("hello reject"))?;
+            return Err(Permanent(BackendError::InvalidModelMetadata(
                 String::from_utf8_lossy(&msg).into_owned(),
-            ));
+            )));
         }
-        Ok(Self { reader, writer })
+        // Handshake done — now grant the first step its cold budget. This is
+        // reached exactly once per session and is never retried, so the worst
+        // case is one FIRST_STEP_READ_TIMEOUT, not ATTEMPTS of them.
+        reader
+            .get_ref()
+            .set_read_timeout(Some(FIRST_STEP_READ_TIMEOUT))
+            .ok();
+        Ok(Self {
+            reader,
+            writer,
+            cold: true,
+        })
     }
 
     /// Send one (token, position, hidden) step and receive the worker's result.
@@ -393,7 +558,35 @@ impl Gemma4WorkerClient {
         write_u64(&mut self.writer, f32s_checksum(h)).map_err(|e| io_err("step", e))?;
         self.writer.flush().map_err(|e| io_err("step flush", e))?;
 
-        let magic = read_u32(&mut self.reader).map_err(|e| io_err("resp", e))?;
+        let magic = read_u32(&mut self.reader).map_err(|e| {
+            // Only a TIMEOUT on the first step means "still paging in". A reset
+            // or EOF is the worker dying, and blaming a cold shard for it would
+            // send the reader looking at disk speed instead of the worker log.
+            let timed_out = matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            );
+            if self.cold && timed_out {
+                // Name the budget that was exceeded — "Resource temporarily
+                // unavailable" alone points nowhere near a cold shard.
+                return BackendError::InvalidModelMetadata(format!(
+                    "gemma4 distributed: no response to the first step (budget \
+                     {FIRST_STEP_READ_TIMEOUT:?}; keepalive may have dropped a dead peer \
+                     sooner) — either the worker is still paging in its shard from a slow or \
+                     remote model volume, or it is unreachable; check the worker log: {e}"
+                ));
+            }
+            io_err("resp", e)
+        })?;
+        if self.cold {
+            // The worker is answering, so its shard is resident: drop to the
+            // steady-state budget for the rest of the session.
+            self.reader
+                .get_ref()
+                .set_read_timeout(Some(STEP_READ_TIMEOUT))
+                .ok();
+            self.cold = false;
+        }
         if magic != RESP_MAGIC {
             return Err(BackendError::InvalidModelMetadata(format!(
                 "gemma4 distributed: bad resp magic {magic:#x}"
@@ -663,5 +856,59 @@ impl Gemma4DistributedRuntime {
             last_next = feed(last_next, pos, &mut kc, &mut vc, &mut client)?;
         }
         Ok((emitted, generated))
+    }
+}
+
+// Gated as a whole, not per-test: the only test here is platform-specific, so
+// on other targets the module would be empty and `use super::*` an unused
+// import — a hard error under this repo's `-D warnings`.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    /// The long [`FIRST_STEP_READ_TIMEOUT`] is only defensible because keepalive
+    /// bounds a dead peer. `setsockopt` reports failure only through a return
+    /// code this code deliberately ignores, so assert the options actually
+    /// landed — silently unarmed keepalive would leave a hung dial blocking a
+    /// serve request for the full ten minutes, which is the exact regression
+    /// this pairing exists to prevent.
+    #[test]
+    fn keepalive_is_actually_armed_on_the_socket() {
+        use std::net::TcpListener;
+        use std::os::unix::io::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let stream = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        arm_keepalive(&stream);
+
+        let get = |level: libc::c_int, name: libc::c_int| -> libc::c_int {
+            let mut value: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: `value`/`len` match the c_int the options return.
+            let rc = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    level,
+                    name,
+                    std::ptr::addr_of_mut!(value).cast::<libc::c_void>(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt({level}, {name}) failed");
+            value
+        };
+
+        assert_ne!(
+            get(libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "SO_KEEPALIVE never armed: a black-holed worker would hang the first \
+             step for FIRST_STEP_READ_TIMEOUT"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE), 15, "idle secs");
+        #[cfg(target_os = "linux")]
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 15, "idle secs");
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 5, "probe gap");
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPCNT), 4, "probe count");
     }
 }

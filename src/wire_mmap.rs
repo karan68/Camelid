@@ -153,6 +153,43 @@ impl GgufWireMmap {
         }
     }
 
+    /// Warm only `[offset, offset + len)` of the mapping.
+    ///
+    /// Prefer this over [`Self::advise_willneed`] when the caller owns a slice
+    /// of the file: readahead is bounded by device bandwidth, so advising the
+    /// whole mapping makes the kernel stream bytes the caller does not need
+    /// before the ones it does. A gemma4 tail shard is the motivating case —
+    /// the GGUF's data section opens with a 2.5GB `per_layer_token_embd` table
+    /// that a layer-range worker never reads, and pulling it first both delays
+    /// the shard's own pages and evicts them again under memory pressure.
+    ///
+    /// The range is clamped to the mapping and the start is rounded DOWN to a
+    /// page boundary (`madvise` requires page-aligned addresses); a zero-length
+    /// or out-of-bounds request is a no-op.
+    pub fn advise_willneed_range(&self, offset: usize, len: usize) {
+        if len == 0 || offset >= self.mapped_len {
+            return;
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
+        let start = offset - (offset % page);
+        // Clamp against the mapping, not the requested end: `offset + len` can
+        // overflow past `mapped_len` for a caller-computed tensor extent.
+        let end = offset.saturating_add(len).min(self.mapped_len);
+        let Some(span) = end.checked_sub(start).filter(|s| *s > 0) else {
+            return;
+        };
+        // SAFETY: `start` is page-aligned and `start + span <= mapped_len`, so
+        // the range lies entirely within this mapping.
+        unsafe {
+            libc::madvise(
+                self.ptr.add(start) as *mut libc::c_void,
+                span,
+                libc::MADV_WILLNEED,
+            );
+        }
+    }
+
     pub fn file_len(&self) -> u64 {
         self.file_len
     }
@@ -248,6 +285,9 @@ impl GgufWireMmap {
 
     /// Population hint; a no-op on Windows (see `advise_sequential`).
     pub fn advise_willneed(&self) {}
+
+    /// Ranged population hint; a no-op on Windows (see `advise_sequential`).
+    pub fn advise_willneed_range(&self, _offset: usize, _len: usize) {}
 
     pub fn file_len(&self) -> u64 {
         self.file_len
