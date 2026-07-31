@@ -1722,3 +1722,249 @@ Chrome or Edge, which is not installed. CI's frontend job supplies a browser.
   rather than a row-wide one, but it is the reason the windowed claim cannot travel off Metal.
 - `encode_attention` still carries no `window_start` (§12i), which is why speculation stays
   declined for windowed archs.
+
+---
+
+## 15. Phase 6 record — performance (2026-07-31)
+
+Phase 6 is the throughput phase, and it runs under one hard rule inherited from §13e:
+**every perf commit must leave decode byte-identical to the Phase 4 receipts.** Section
+15c explains why that rule, not the kernel catalogue, is what actually determined the
+shape of this phase.
+
+Branch `feat/gemma3-metal-perf`, based on the PR #560 head `1f5430f0`. Host: this M4 Mac
+mini, 16 GB, 10 GPU cores. No GPU profiler exists here (Apple perf counters are
+entitlement-gated; the headless route is a confirmed dead end), so everything below is
+wall-clock through the serve path, the engine's own `CAMELID_RESIDENT_TRACE` per-token
+timers (which read the command buffer's GPU-side timestamps), and A/B env toggles.
+
+### 15a. Measured baseline
+
+One `camelid serve` alive at a time, started and killed by saved PID. Prompts supplied as
+EXACT token ids via `camelid_prompt_token_ids`, streamed `/v1/completions`, `temperature:0`,
+every row run at least twice and reported warm. `depth` is the mean context over the
+generated span. `/v1/health` confirmed `metal_resident_q8_runtime` /
+`q8_0_metal_resident_decode` for every run rather than assuming it.
+
+| depth | ms/token | decode tok/s | % of the ~110 tok/s roofline |
+|---|---|---|---|
+| ~64 | 16.19 | 61.8 | 56% |
+| ~262 | 28.63 | 34.9 | 32% |
+| ~510 | 45.42 | 22.0 | 20% |
+| ~1020 | 49.20 | 20.3 | 18% |
+| ~2030 | 57.87 | 17.3 | 16% |
+
+Prefill (token-by-token through the decode path — no batched GPU prefill exists at
+head_dim 256): 64 tokens 0.85 s / 74.9 tok/s; 512 13.98 s / 36.6; 1200 45.80 s / 26.2;
+2400 112.68 s / 21.3. Load with a warm page cache is 2.6-3.1 s (`CAMELID_METAL_NOCOPY` is
+active, so the weights are mmap'd wire pages and the first generation pays the fault-in);
+a genuinely cold load was NOT measured — dropping the page cache needs sudo on this box.
+
+The five decode points obey one law, fitted against the per-layer attention work
+`sum_l position_count_l = 22*min(d,512) + 4*d`:
+
+> **ms/token = 12.9 + 2.372e-3 * sum_l position_count_l**
+
+Residuals 0-4% across all five depths. Note the layer split is **22 windowed / 4 global**,
+not the 20/6 the campaign scoping assumed: with a `sliding_window_pattern` of 6 the globals
+are layers 5/11/17/23. A 20/6 model over-predicts the d=2030 point by 14%; 22/4 lands
+within 1.7%. Cross-check: the "~46-47 tok/s at depth ~266" figure this phase started from
+is reproduced by the law at a mean depth of ~140, i.e. it was a FINAL depth of 266 behind a
+short prompt, not a mean depth of 266.
+
+### 15b. Attribution
+
+**CPU vs GPU, measured not inferred.** `CAMELID_RESIDENT_TRACE=1`, decode phase:
+
+| position | encode (CPU) | commit_wait | gpu_busy |
+|---|---|---|---|
+| 70 | 1.2-2.1 ms | 16.8 ms | 17.0-18.3 ms |
+| 490 | 1.2-2.1 ms | 42.8 ms | 43.1 ms |
+| 2004 | 1.1-2.4 ms | 57.5 ms | 57.8 ms |
+
+The GPU is >=97% of the token at every depth, and CPU encode is flat at ~1.5 ms and fully
+overlapped (encode-ahead is live — `next_encode` is non-zero). **Every CPU-side lever is
+therefore worth zero**, including the one that looks most attractive on inspection: the
+per-layer `write_buffer_f32` re-upload of the norm and RoPE tables, ~560 KB of memcpy plus
+~800 `pool_get` calls per token. Recorded so nobody spends a day on it.
+
+The GPU timestamps also confirm the law independently of the fit: the gpu_busy slope is
+2.37e-3 and 2.33e-3 ms per layer-position over the two intervals.
+
+**Inside the 12.9 ms fixed term.** Prefill runs the same graph without the logits stage,
+which is a free A/B: prefill gpu_busy is 15.5 ms at position 100 against a decode
+prediction of 19.0, and 34.3 ms at position 400 against 37.5. So the tied 262,144-row LM
+head plus sampling tail is **3.2-3.5 ms/token** (~80% of its own 2.68 ms roofline), leaving
+~9.6 ms for 26 layers of GEMVs, norms, RoPE and dispatch (~64% of their 6.18 ms roofline).
+Stated with its uncertainty: that split assumes prefill and decode differ ONLY by the
+logits stage. Nothing in the tree proves that directly and individual dispatches cannot be
+timed here; the +/-0.3 ms between the two probes is the visible error bar, and a systematic
+error would move the split but not the 12.9 ms total, which is measured. The 9.6 ms was NOT
+decomposed further — a ~470-dispatch graph at a plausible 3-8 us per dispatch would account
+for the 3.4 ms gap to roofline, but that is dispatch counting, not measurement.
+
+**The bottleneck.** At 4 query heads / 1 KV head / head_dim 256 the lane falls to the v1
+`attention_decode_f32` kernel, and that kernel dispatches ONE threadgroup per query head of
+ONE 32-lane simdgroup — **4 threadgroups, 128 threads, for a whole layer's attention on a
+10-core GPU**, with each lane streaming a full 1 KB K row so consecutive lanes touch
+addresses 1 KB apart. Measured 2.372 us per layer-position = 0.86 GB/s counting unique K+V
+bytes, 3.5 GB/s counting the 4x GQA re-read: **0.7-3% of this machine's bandwidth**. Share
+of the token: 24% at d=64, 70% at d=510, 80% at d=2030.
+
+**Not missing anything the other resident rows get:** weight residency, NOCOPY wire-page
+fast load, encode-ahead, the GPU sampling tail, and the production
+`q8_0_block_linear_row_ksplit_f32y_wire_nsg8` GEMV (256 threads/TG, `rows/2` threadgroups —
+131,072 threadgroups on the 262k head, so not launch-starved, consistent with its measured
+~80% of roofline) are all live, and `apply_default_fast_stack` arms the same F32Y/WIRE/NSG8
+configuration the parity receipts were taken in. Two genuine exclusions, both pre-existing
+and both correctness-scoped rather than perf bugs: no prompt-prefix reuse on this row
+(§9e-5 — `prepare_for_prompt_prefix_cache` requires the F16-primary flag, and gemma3 Q8_0 is
+F32-primary), and no batched GPU prefill at head_dim > 128. Any throughput statement about
+multi-turn chat must carry the first.
+
+Measured aside worth keeping: sending `logit_bias` takes a request OFF the GPU sampling
+fast lane and costs ~13% decode (61.8 -> 52.4 tok/s at d=64). It is not a neutral benchmark
+knob, and the harness does not use it.
+
+### 15c. The parity rule is what decided this phase
+
+Metal compiles with fast-math ON, so it is free to re-associate reductions. Byte-identical
+decode therefore excludes **every** restructuring that moves a floating-point reduction
+order: flash / online-softmax rewrites, split-K over positions, reading the f16 KV mirrors
+(which the split-K path already does for head_dim <= 128 and which would halve KV traffic),
+and float4 vectorised dot products. What survives is only work whose individual arithmetic
+chains are ALREADY independent and can be spread over more threads without touching any
+order. That is a much smaller design space than the kernel catalogue suggests, and it is
+the reason this phase shipped one change rather than five.
+
+### 15d. What shipped
+
+**`gemma3-metal: Phase 6 — split decode attention into scores/softmax/context`**
+(`15d0b039`). The v1 kernel becomes three dispatches — `attention_decode_scores_f32`
+(n_blocks threadgroups per head; each score an independent sequential dot over head_dim),
+`attention_decode_softmax_f32` (unchanged shape and unchanged lane->position striding, so
+`simd_max`/`simd_sum` see the same partials in the same order), and
+`attention_decode_context_f32` (n_blocks threadgroups per head; each output dim an
+independent sequential sum over positions, consecutive threads owning consecutive dims so
+the V reads coalesce). Default on, `CAMELID_METAL_ATTN_SPLIT3=0` restores the single-kernel
+encode. Nothing in it is gemma3-specific: any f32-KV row that lands on the v1 fallback gets
+the same, bit-identically.
+
+**Two codegen traps, found by the test and not by reasoning.** Both are documented at the
+kernels because both look like noise and are not:
+
+1. Written the obvious way — one thread per (head, position) — the outputs differed in the
+   last ulp: 829/1024 elements, max abs diff 3.05e-8. Fast-math picks its reassociation
+   from the shape of the loop nest, so the kernels keep v1's nest verbatim (strided outer
+   loop, scalar inner accumulation) and only widen the stride.
+2. The softmax kernel publishes the DENOMINATOR and the context kernel takes `1.0 / denom`
+   itself. Publishing the reciprocal instead hides the `1.0/x` from the phase-3 multiply
+   that fast-math folds it against, and reproduced the identical 3.05e-8 divergence — which
+   is how it was diagnosed: three structurally different rewrites all produced byte-identical
+   "wrong" output, so the cause could not be the part being rewritten.
+
+### 15e. Result
+
+Decode, warm, two runs each; the table shows the FIRST (slower) run, confirmation run in
+brackets:
+
+| depth | before | after | speedup |
+|---|---|---|---|
+| ~64 | 61.8 | 73.9 [77.0] | 1.20x |
+| ~262 | 34.9 | 68.1 [70.9] | 1.95x |
+| ~510 | 22.0 | 60.3 [63.0] | 2.74x |
+| ~1020 | 20.3 | 58.8 [58.7] | 2.90x |
+| ~2030 | 17.3 | 55.7 [56.1] | 3.22x |
+
+Prefill: 64 tokens 0.85 s -> 0.73 s (74.9 -> 87.3 tok/s); 512 13.98 -> 6.37 s (36.6 -> 80.4);
+1200 45.80 -> 16.18 s (26.2 -> 74.2); **2400 112.68 -> 34.77 s (21.3 -> 69.0 tok/s, 3.24x)**.
+
+A same-binary control with `CAMELID_METAL_ATTN_SPLIT3=0` in its own server process returns
+55.1 / 32.7 / 22.2 / 20.4 / 16.6 tok/s, reproducing the pre-change binary — so the gain is
+attributable to this change rather than to drift between builds.
+
+Refitted law: **ms/token = 13.2 + 2.25e-4 * sum_l position_count_l**. Attention per
+layer-position fell **10.5x** (2.372 us -> 0.225 us) and is now 3% of the token at d=64 and
+8% at d=2030; the +0.3 ms constant is exactly the two extra dispatches per layer.
+
+### 15f. Gates
+
+- `metal_attention_decode_split3_is_bit_identical_to_v1`: raw f32 BIT equality (not a
+  tolerance) across six geometries — the production 4x1x256, a windowed read with non-zero
+  `kv_base_offset` (600-position cache, `window_start` 88, `position_count` 512), a
+  single-position cache, a non-GQA 2x2x64, an 8x2x128, and a position count that is not a
+  multiple of the 32-lane stride.
+- `gemma3_real_row_resident_forward_matches_runnable_oracle` (release, F32Y+WIRE+NSG8 armed
+  from the shell, 567.73 s): depth 1 argmax 108, 6.247e-5; depth 5 argmax 1077, 7.820e-5;
+  depth 50 argmax 578, 9.584e-5 — **50/50 greedy tokens identical, overall max |logit diff|
+  2.122e-4. Bit-for-bit the §9b / §11h / §13e / §14g record.**
+- `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle` (same gates plus
+  `CAMELID_METAL_RESIDENT_DECODE=1`, 21.58 s): 108 / 584 / 568 / 2364 / 1077, **5/5
+  identical, overall max |logit diff| 7.820e-5. Bit-for-bit the §10b record.**
+- `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean;
+  `cargo test --all-targets` **exit 0 under pipefail, 1775 passed / 0 failed** (debug — the
+  configuration CI runs); `scripts/check-public-scrub.sh` exit 0.
+
+### 15g. Stopping rule, and the honest envelope
+
+The rule this phase stopped on, stated before the work: stop when the remaining gap is
+either smaller than this box's run-to-run spread, or reachable only by changing decode
+output. After the split both are true.
+
+- Attention is now 3-8% of the token. A *perfect* attention kernel is worth at most 8% from
+  here, and it could not be bit-identical anyway.
+- The fixed 13.2 ms is 67% of the 8.85 ms weight-traffic roofline. The remaining 4.3 ms is
+  per-dispatch overhead and GEMV efficiency spread across ~470 dispatches per token; no
+  single bit-identical lever addresses more than ~1% of it, and there is no profiler here to
+  find one.
+- Run-to-run spread on this host is 2-10%. Below ~10% nothing here is distinguishable from
+  thermal drift.
+
+**The envelope.** Decode on this row is weight-bandwidth-bound: 1.06 GB of Q8_0 weight
+traffic per token against ~120 GB/s of unified memory is ~110 tok/s, and no software change
+moves that number. This lane now delivers 74-77 tok/s short (67-70% of roofline) and
+56 tok/s at 2k context (51%). The residual is per-dispatch overhead over a 26-layer graph
+and imperfect GEMV bandwidth utilisation, both of which need GPU performance counters to
+attack, and those are entitlement-gated on this machine with a confirmed-dead headless
+route. **This row is done at the envelope this machine can see. Reopening it needs a
+profiler, not more patience.**
+
+### 15h. GO/NO-GO on the batched windowed prefill kernel: NO-GO
+
+The campaign's one big kernel item (§3 Phase 6, §5.2) is declined, for four independent
+reasons any one of which is sufficient:
+
+1. **It cannot pass this phase's gate.** Batched attention plus batched GEMM changes
+   reduction order versus the token-by-token GEMV path. Byte-identical decode is the stated
+   pass condition, so this item is unsatisfiable under it; it would need its own parity
+   envelope and a fresh external-oracle receipt (a re-run of the >=512 windowed pack), i.e.
+   a Phase 4 repeat, not a Phase 6 commit.
+2. **Its addressable share collapsed when the split landed.** Batching amortises the fixed
+   ~13 ms/token of weight streaming. At 2400 prompt tokens that ceiling is now 2400 x 13 ms
+   ~= 31 s of a **34.8 s** prefill, where before the split it was 31 s of 113 s.
+3. **Cost.** 200-400 lines of new MSL needing a per-query-row LOWER mask bound that exists
+   in no batched prefill kernel in the tree (the causal masks are upper-bound only), plus
+   host plumbing, tuning, and new self-parity tests — the largest single item in the
+   campaign against the smallest remaining multiple.
+4. **It cannot be tuned here.** Tiling and occupancy work without GPU counters is guesswork,
+   and the <=128 host gates it must relax are memory-safety gates over fixed per-lane arrays
+   (§5.1). Relaxing those on an unprofilable kernel is precisely the risk §5.1 warns about.
+
+### 15i. Deliberately NOT done
+
+- **No throughput claim was published anywhere.** The row's `performance_measured` stays
+  `not_claimed_...`; no README, COMPATIBILITY, STATUS, BENCHMARKS or LANE_STATUS_LEDGER
+  edit was made, and no evidence bundle was cut. These numbers are a serving measurement
+  taken on one host, not a receipt: promoting them is a separate deliberate act with its own
+  surfaces and its own ledger regeneration, and it should be decided on rather than
+  inherited from a perf commit. §14a's side effect (the frontend's
+  `hasExactRowBoundedPerformanceEvidence` rejecting any value containing `not_`) is left
+  intact on purpose.
+- **No llama.cpp speed comparison** appears in any commit, doc or comment.
+- The f16-mirror KV read, a genuine 256-dim v2/split-K attention kernel, and K/V projection
+  dispatch fusion were all evaluated and declined in §15c / the plan doc, on the gate or on
+  yield. The fused gate+up remains forbidden (implemented, proven bit-correct, measured to
+  regress on register spill, reverted).
+- The prompt-prefix-cache exclusion (§9e-5) is a real multi-turn cost and was NOT addressed:
+  it is a KV-format and correctness change, not a perf commit, and the Phase 4 gates cannot
+  validate it.
