@@ -161,10 +161,28 @@ impl super::LlamaInferenceSession {
             })
     }
 
+    /// Whether THIS session may take the campaign's Tier A batched windowed prefill.
+    ///
+    /// A conjunction with the arch, deliberately: `CAMELID_GEMMA3_BATCH_PREFILL` in any
+    /// state is a NO-OP for every non-gemma3 row, which is the phase's zero-behaviour-
+    /// change claim. Named (rather than inlined) so that claim is directly testable —
+    /// see `batched_windowed_prefill_never_arms_for_a_non_gemma3_arch`.
+    pub(super) fn gemma3_batched_prefill_armed(&self) -> bool {
+        self.config.gemma3.is_some() && crate::metal::gemma3_batch_prefill_enabled()
+    }
+
     pub(super) fn try_metal_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
-        if std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
-            .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true)
+        // Two independent arming gates for two different batched prefills:
+        //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
+        //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
+        //     head_dim > 128;
+        //   * CAMELID_GEMMA3_BATCH_PREFILL — the long-prompt TTFT campaign's Tier A
+        //     `prefill_tokens_windowed`, gemma3-only, default OFF this phase.
+        let gemma3_batched = self.gemma3_batched_prefill_armed();
+        let resident_prefill_armed = std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if (!resident_prefill_armed && !gemma3_batched)
             || token_ids.len() < 2
             || token_ids.len() > 16384
             || self.kv_cache.position != 0
@@ -202,6 +220,35 @@ impl super::LlamaInferenceSession {
         };
         let (cos_all, sin_all, split_half_pairing) =
             (tables.cos, tables.sin, tables.split_half_pairing);
+        // gemma3 dual-theta: replace the generic tables with the VERBATIM runnable-oracle
+        // frequency form for BOTH thetas, per position, exactly as the decode path does
+        // (`rope::gemma3_rope_tables`; the generic negated-exponent form drifts in the last
+        // ULP, which is enough to flip a near-tie greedy token). Flattened position-major,
+        // stride `rope_dim / 2`, so the batched prefill can offset into them per row.
+        let (cos_all, sin_all, gemma3_alt_all) = match self.config.gemma3.as_ref() {
+            Some(g) if gemma3_batched => {
+                let rope_dim = self
+                    .config
+                    .rope_dimension_count
+                    .map(|v| v as usize)
+                    .unwrap_or(head_dim);
+                let half = rope_dim / 2;
+                let mut cos_g = Vec::with_capacity(n * half);
+                let mut sin_g = Vec::with_capacity(n * half);
+                let mut cos_l = Vec::with_capacity(n * half);
+                let mut sin_l = Vec::with_capacity(n * half);
+                for pos in 0..n {
+                    let (c, s) = rope::gemma3_rope_tables(pos, rope_dim, g.rope_freq_base_global);
+                    cos_g.extend_from_slice(&c);
+                    sin_g.extend_from_slice(&s);
+                    let (c, s) = rope::gemma3_rope_tables(pos, rope_dim, g.rope_freq_base_local);
+                    cos_l.extend_from_slice(&c);
+                    sin_l.extend_from_slice(&s);
+                }
+                (cos_g, sin_g, Some((cos_l, sin_l)))
+            }
+            _ => (cos_all, sin_all, None),
+        };
 
         let rope_us = edge_started.elapsed().as_micros();
         let session_started = Instant::now();
@@ -277,10 +324,37 @@ impl super::LlamaInferenceSession {
 
         let embed_us = embed_started.elapsed().as_micros();
         let gpu_started = Instant::now();
-        if session
-            .prefill_tokens(&embeddings.data, n, &layer_views, &cos_all, &sin_all, scale)
-            .is_none()
-        {
+        let prefilled = if gemma3_batched {
+            // Tier A: batched weight streaming, bit-identical to `n` token-by-token
+            // resident forwards (gate G1). Attention stays per row — the windowed
+            // attention-as-matmul kernel is Tier B.
+            session
+                .prefill_tokens_windowed(
+                    &embeddings.data,
+                    n,
+                    &layer_views,
+                    &cos_all,
+                    &sin_all,
+                    gemma3_alt_all
+                        .as_ref()
+                        .map(|(c, s)| (c.as_slice(), s.as_slice())),
+                    scale,
+                    metal::gemma3_batch_prefill_rows(),
+                )
+                .is_some()
+        } else {
+            session
+                .prefill_tokens(&embeddings.data, n, &layer_views, &cos_all, &sin_all, scale)
+                .is_some()
+        };
+        if !prefilled {
+            return Ok(false);
+        }
+        // G11, asserted rather than assumed: the resident decode's rebuild predicate is
+        // `filled() != position`, and a short `filled` re-seeds from a CPU KV cache this
+        // lane leaves hollow — which then declines at `history_materialized` and silently
+        // drops the whole prompt onto a CPU path that fails closed for windowed archs.
+        if session.filled() != n {
             return Ok(false);
         }
         if time_edges {
