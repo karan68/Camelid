@@ -2373,10 +2373,42 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .with_state(state)
 }
 
+/// The model `serve` loads at startup, and where that choice came from.
+///
+/// The origin decides what a load failure means. A path the user named on the
+/// command line is a request, so failing it loudly with a non-zero exit is the
+/// honest answer. A path Camelid picked out of the models directory for itself
+/// is a convenience, and one unreadable file there must not cost the user the
+/// whole server — the UI they would use to pick another model is served by the
+/// very process that failure would take down.
+pub struct StartupModel {
+    pub path: PathBuf,
+    /// `true` when the path came from `--model`.
+    pub explicit: bool,
+}
+
+impl StartupModel {
+    /// A model the user named; a load failure is fatal.
+    pub fn explicit(path: PathBuf) -> Self {
+        Self {
+            path,
+            explicit: true,
+        }
+    }
+
+    /// A model Camelid chose from the models directory; a load failure is not.
+    pub fn auto_selected(path: PathBuf) -> Self {
+        Self {
+            path,
+            explicit: false,
+        }
+    }
+}
+
 pub async fn serve(
     addr: SocketAddr,
     configured_threads: Option<usize>,
-    initial_model: Option<PathBuf>,
+    initial_model: Option<StartupModel>,
     open_ui: bool,
     default_enable_thinking: bool,
     models_dir: Option<PathBuf>,
@@ -2471,16 +2503,33 @@ pub async fn serve(
     // kills the sidecar when its health poll goes unanswered for 40s, and a
     // large startup model (auto-selected whenever the models dir is populated)
     // used to keep the port closed for the entire load — a healthy engine
-    // looked dead exactly when it had the most work to do. Failure still exits
-    // `serve` with the same message and non-zero status as before.
-    if let Some(model_path) = initial_model {
-        if let Err(err) = load_model_from_path(&startup_state, model_path, None, true).await {
+    // looked dead exactly when it had the most work to do.
+    //
+    // A model the user NAMED still exits with the same message and non-zero
+    // status. A model Camelid auto-selected does not: the pick is made by
+    // filename order over whatever sits in the models directory, so a single
+    // unreadable file there (an interrupted `pull` leaves a short .gguf under
+    // the final name, and `curl -C -` needs it to stay there to resume) would
+    // otherwise take down the server on every launch, including the UI the
+    // user needs to choose a different model. Reinstalling does not help —
+    // the models directory outlives the app — so the failure is permanent.
+    if let Some(StartupModel { path, explicit }) = initial_model {
+        if let Err(err) = load_model_from_path(&startup_state, path.clone(), None, true).await {
             tracing::error!(error=%err, "failed to load startup model");
-            eprintln!("\n  Could not load that model: {err}");
-            eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
-            eprintln!("      camelid pull            # list supported models");
-            eprintln!("      camelid pull <id>       # download one into ./models\n");
-            return Err(std::io::Error::other(err.to_string()));
+            if explicit {
+                eprintln!("\n  Could not load that model: {err}");
+                eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
+                eprintln!("      camelid pull            # list supported models");
+                eprintln!("      camelid pull <id>       # download one into ./models\n");
+                return Err(std::io::Error::other(err.to_string()));
+            }
+            eprintln!("\n  Could not load {}: {err}", path.display());
+            eprintln!(
+                "  Camelid picked that file automatically from {}.",
+                startup_state.models_dir.display()
+            );
+            eprintln!("  The server is still running. Open the UI to choose another model,");
+            eprintln!("  or delete that file if it is a broken download and fetch it again.\n");
         }
     }
     // Warm the generation path BEFORE telling the user we're ready. The GPU resident
@@ -2516,6 +2565,112 @@ pub async fn serve(
         crate::web_ui::open_in_browser(&url);
     }
     server.await.map_err(std::io::Error::other)?
+}
+
+#[cfg(test)]
+mod startup_model_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    /// A GGUF by file extension only — what an interrupted download leaves
+    /// behind, and what any corrupt or unsupported file looks like to the
+    /// loader. Every load path rejects it.
+    fn unloadable_gguf(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("broken.gguf");
+        std::fs::write(&path, b"not a gguf").expect("write broken gguf");
+        path
+    }
+
+    /// Reserve a loopback port and return its address; the listener is dropped
+    /// so `serve` can bind it.
+    fn reserved_loopback_addr() -> SocketAddr {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback ephemeral port");
+        listener.local_addr().expect("read reserved port")
+    }
+
+    /// The desktop supervisor's own gate, byte for byte: a loopback GET of
+    /// `/v1/health` that counts only a 200.
+    fn health_ok(addr: SocketAddr) -> bool {
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let request =
+            format!("GET /v1/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        matches!(stream.read(&mut buf), Ok(read) if read > 0
+            && String::from_utf8_lossy(&buf[..read]).starts_with("HTTP/1.1 200"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_auto_selected_startup_model_that_cannot_load_keeps_the_server_up() {
+        let dir = tempfile::tempdir().expect("temp models dir");
+        let broken = unloadable_gguf(dir.path());
+        let addr = reserved_loopback_addr();
+
+        let server = tokio::spawn(serve(
+            addr,
+            None,
+            Some(StartupModel::auto_selected(broken)),
+            false,
+            false,
+            Some(dir.path().to_path_buf()),
+            ServeOptions::default(),
+        ));
+
+        // Camelid picked the file itself, so it owes the user a running server
+        // and the UI to choose again — not an exit that reinstalling can't fix,
+        // because the models directory outlives the app.
+        let mut healthy = false;
+        for _ in 0..100 {
+            if server.is_finished() {
+                break;
+            }
+            if tokio::task::spawn_blocking(move || health_ok(addr))
+                .await
+                .unwrap_or(false)
+            {
+                healthy = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        server.abort();
+
+        assert!(
+            healthy,
+            "an auto-selected startup model that cannot load must not take the server down"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_explicitly_named_startup_model_that_cannot_load_still_fails_the_run() {
+        let dir = tempfile::tempdir().expect("temp models dir");
+        let broken = unloadable_gguf(dir.path());
+        let addr = reserved_loopback_addr();
+
+        // `--model` is a request, not a guess, so it keeps failing loudly.
+        let result = serve(
+            addr,
+            None,
+            Some(StartupModel::explicit(broken)),
+            false,
+            false,
+            Some(dir.path().to_path_buf()),
+            ServeOptions::default(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an explicitly named model that cannot load must fail the run"
+        );
+    }
 }
 
 /// One-shot self-request to build/warm the generation engine, awaited so startup
