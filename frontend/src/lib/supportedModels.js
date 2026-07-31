@@ -86,6 +86,20 @@ export const SUPPORTED_MODELS = [
     blurb: 'Top-tier Qwen3 quality — strong reasoning, math, coding, and multilingual chat.',
   },
   {
+    /* Must equal the /api/capabilities contract row id AND the backend catalog
+       id (src/api/mod.rs) — `filename_is_supported_exact_row` joins catalog to
+       row by EXACT id, and check-ledger-drift.mjs Check C fails a catalog entry
+       with no contract row. The historical `gemma3_1b_it_q8_0` spelling matched
+       neither and demoted this promoted row to Experimental. */
+    catalog_id: 'gemma_3_1b_it_q8_0',
+    name: 'Gemma 3 1B-It',
+    repo_id: 'ggml-org/gemma-3-1b-it-GGUF',
+    filename: 'gemma-3-1b-it-Q8_0.gguf',
+    size_bytes: 1069306368,
+    quant: 'Q8_0',
+    blurb: 'A small Gemma for quick chat — runs on the Metal GPU-resident lane on Apple Silicon.',
+  },
+  {
     catalog_id: 'gemma4_e4b_it_q8_0',
     name: 'Gemma 4 E4B-It',
     repo_id: 'unsloth/gemma-4-E4B-it-GGUF',

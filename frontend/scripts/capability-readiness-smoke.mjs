@@ -31,6 +31,21 @@ check(
   classifyCapabilityRow({ id: 'mixtral_8x7b_instruct_v0_1_q8_0', status: 'active_validation_partial_runtime' }),
   READINESS.ACTIVE_VALIDATION,
 )
+// Real shipped row (gemma3 -> Metal campaign): the Metal GPU-resident lane is
+// the default serve lane for this row, and the row carries NO throughput claim.
+// `performance_measured` must therefore never read as measured evidence — a row
+// that declines to claim perf must not be classified as GPU-experimental or
+// promoted to a throughput-ready lane. Field values copied from the shipped
+// /api/capabilities contract, not paraphrased.
+check(
+  'supported exact row: gemma3 1B Q8_0 on the Metal resident lane',
+  classifyCapabilityRow({
+    id: 'gemma_3_1b_it_q8_0',
+    status: 'supported_exact_row_smoke',
+    performance_measured: 'not_claimed_resident_lane_throughput_is_a_separate_unshipped_measurement_phase',
+  }),
+  READINESS.SUPPORTED_EXACT_ROW,
+)
 check(
   'planned candidate',
   classifyCapabilityRow({ id: 'gemma2_9b', status: 'planned_exact_row_candidate' }),
@@ -55,15 +70,25 @@ const capabilities = {
   model_compatibility: [
     { id: 'gemma4_e4b_it_q8_0', status: 'supported_exact_row_smoke' },
     { id: 'gemma4_e2b_it_q8_0', status: 'supported_exact_row_smoke' },
+    { id: 'gemma_3_1b_it_q8_0', status: 'supported_exact_row_smoke' },
   ],
 }
 check('exact row id supported', isExactRowSupported(capabilities, 'gemma4_e2b_it_q8_0'), true)
+// The shipped gemma3 row id, verbatim. The near-miss spelling below is the one
+// that actually shipped in the download catalog for a while and joined nothing.
+check('exact row id supported: gemma3', isExactRowSupported(capabilities, 'gemma_3_1b_it_q8_0'), true)
+check(
+  'the historical gemma3 id spelling must NOT resolve',
+  isExactRowSupported(capabilities, 'gemma3_1b_it_q8_0'),
+  false,
+)
 check(
   'family-name prefix must NOT count as supported',
   isExactRowSupported(capabilities, 'gemma4_12b_it_q8_0'),
   false,
 )
 check('family string never matches', isExactRowSupported(capabilities, 'gemma4'), false)
+check('gemma3 family string never matches', isExactRowSupported(capabilities, 'gemma3'), false)
 check('label text', readinessLabel(READINESS.UNSUPPORTED_MULTIMODAL), 'Unsupported: multimodal input')
 
 if (failures > 0) {

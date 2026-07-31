@@ -40,6 +40,20 @@ const CAPABILITIES = {
       quantization: 'Q8_0',
       status: 'tracked_not_supported',
     },
+    // Real /api/capabilities row id — the id IS the normalized GGUF filename
+    // (`gemma-3-1b-it-Q8_0.gguf` -> `gemma_3_1b_it_q8_0`), which is what lets
+    // the identity matcher resolve this row from the local file alone, with no
+    // backend `lane_class` hint. Promoted onto the Metal GPU-resident lane by
+    // the gemma3->Metal campaign. Copying the id from the shipped contract is
+    // the point: the lane-gate fixture-drift incident came from a fixture id
+    // that production never emitted, so the smoke passed while the UI demoted
+    // a supported row.
+    {
+      id: 'gemma_3_1b_it_q8_0',
+      family: 'gemma3_windowed_decoder',
+      quantization: 'Q8_0',
+      status: 'supported_exact_row_smoke',
+    },
   ],
 }
 
@@ -97,6 +111,25 @@ check(
 check(
   'not_anchored: tracked (unsupported) row never promotes',
   laneOf(entry('gemma-2-9b-it-Q8_0.gguf'), CAPABILITIES),
+  'not_anchored',
+)
+
+// gemma3 1B Q8_0: the promoted Metal GPU-resident row. Its contract id is the
+// normalized filename, so the identity match must resolve it from the local
+// file with NO backend lane_class hint — this is the exact join that was broken
+// while the catalog id and the row id disagreed.
+check(
+  'supported: gemma3 1B Q8_0 resolves from the filename alone',
+  laneOf(entry('gemma-3-1b-it-Q8_0.gguf'), CAPABILITIES),
+  'supported',
+)
+
+// The row is pinned to Q8_0 (resident admission declines any other quant and
+// serve falls back to the runnable CPU bridge). A K-quant gemma3 file must NOT
+// inherit the supported lane from the Q8_0 row.
+check(
+  'not_anchored: a non-Q8_0 gemma3 file never inherits the Q8_0 row',
+  laneOf(entry('gemma-3-1b-it-Q4_K_M.gguf'), CAPABILITIES),
   'not_anchored',
 )
 
