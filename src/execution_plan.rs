@@ -434,9 +434,21 @@ pub fn plan_for_model_with_platform(
 
 /// Whether the macOS Q8 Metal-resident PLAN selection can fire in this process
 /// at all, independent of the model and of Metal device presence: not the Safe
-/// profile, and neither `CAMELID_MAC_Q8_REPACK` nor `CAMELID_MAC_Q8_METAL_PLAN`
-/// opted out. These are exactly the three early returns in
-/// [`select_macos_q8_plan`] that precede its Metal-resident arm.
+/// profile (including the fail-closed-to-Safe parse of an unrecognized
+/// `CAMELID_PROFILE`), and `CAMELID_MAC_Q8_METAL_PLAN` not opted out. These are
+/// the OPERATOR opt-outs among [`select_macos_q8_plan`]'s early returns.
+///
+/// `CAMELID_MAC_Q8_REPACK` is deliberately NOT consulted even though it is a
+/// third early return, because it is a MANAGED_ENV_KEY that the plan itself
+/// WRITES: a successful Metal-resident selection sets it to "off", which
+/// `env_flag_disabled` reads as disabled. Feeding it back into routing would be
+/// a self-defeating latch — the moment `PlannerEnv::apply` ran, routing would
+/// decide the Metal plan was unselectable and send gemma3 to the bridge,
+/// killing the very lane the plan had just selected. Residual, recorded rather
+/// than fixed here: an operator who PRE-sets `CAMELID_MAC_Q8_REPACK=0` still
+/// gets a safe plan with resident routing. Closing that needs the plan to stop
+/// overloading one variable for both "operator opt-out" and "plan output",
+/// which is a wider change than this review.
 ///
 /// Phase 3c: `inference::windowed_arch_resident_host_available` consults this
 /// so gemma3's ROUTING and the disclosed execution plan agree. Before, an
@@ -451,7 +463,6 @@ pub fn plan_for_model_with_platform(
 /// opt-out.
 pub fn macos_q8_metal_plan_selectable() -> bool {
     !matches!(requested_profile().0, ExecutionProfile::Safe)
-        && !env_flag_disabled("CAMELID_MAC_Q8_REPACK")
         && !env_flag_disabled("CAMELID_MAC_Q8_METAL_PLAN")
 }
 
@@ -1750,11 +1761,23 @@ mod tests {
             "the default (auto profile, no opt-outs) must allow the Metal plan"
         );
 
+        // CAMELID_MAC_Q8_REPACK is NOT an input: the plan WRITES it to "off"
+        // on a successful Metal selection, so consulting it would be a
+        // self-defeating latch that disarmed resident routing the instant
+        // PlannerEnv::apply ran. Pinned explicitly so it is not "helpfully"
+        // added back.
+        clear_profile_env();
+        env::set_var("CAMELID_MAC_Q8_REPACK", "off");
+        assert!(
+            macos_q8_metal_plan_selectable(),
+            "the plan's own CAMELID_MAC_Q8_REPACK=off output must not disarm routing"
+        );
+        env::remove_var("CAMELID_MAC_Q8_REPACK");
+
         for (key, value) in [
             ("CAMELID_PROFILE", "safe"),
             // An unrecognized profile fails closed to Safe — same outcome.
             ("CAMELID_PROFILE", "nonsense"),
-            ("CAMELID_MAC_Q8_REPACK", "0"),
             ("CAMELID_MAC_Q8_METAL_PLAN", "0"),
         ] {
             clear_profile_env();

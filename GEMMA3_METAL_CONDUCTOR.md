@@ -1072,3 +1072,219 @@ env-mutating gate tests never run alongside):
 - Speculative decode: opt-in env only; on gemma3 the CPU verify path now H4-errors (typed)
   and no explicit spec gate was added — flagged for Phase 5/6 if spec decode is ever pointed
   at this row.
+
+## 12. Phase 3c record — adversarial review of the Phase 3b flip (2026-07-30)
+
+Phase 3b (`ba6de7f7`) was put through an adversarial review. Four findings were confirmed
+blocking/major before this phase started; eight more were reported by the review's lenses but
+its verification pass died on infrastructure, so each was re-verified here against the code
+before being fixed or dismissed. **Every one of the twelve turned out to be real.** Three
+commits, each gated by fmt / clippy --all-targets -D warnings / cargo test --all-targets.
+
+The stakes framing that shaped every fix: on these paths a routing mistake is SILENT WRONG
+OUTPUT, not a crash. The CPU dense forward has no sliding window, no sandwich norms, no GeGLU
+and no dual-theta RoPE, so gemma3 on it decodes fluent-looking garbage under a supported label.
+
+### 12a. F1 (BLOCKER) — the fail-closed moved to a choke point
+
+H4 guarded three CPU dense entry points. The flip made four more reachable for gemma3, all
+unguarded: `forward_greedy_verify_chunk` (the spec-decode CPU verify walk, live from
+`src/api/mod.rs`), `forward_layer_range_from_hidden` (distribute master / activation replay),
+`forward_worker_layers` (`src/distributed.rs`), `ghost_forward_one_layer` (`src/main.rs`).
+
+Guarding those four would have left the fifth. **The choke point:
+`ensure_windowed_arch_off_cpu_dense_layer` (src/inference.rs), called from
+`forward_layer_timed` and `forward_prefill_layer_chunk_timed`** — the only two per-layer dense
+forwards in the file. A dense walk cannot be written that skips it, because it cannot compute a
+layer without one of them.
+
+**Completeness enumeration.** Every CPU dense layer loop in src/inference.rs, and the choke
+point each now hits:
+
+Line numbers are at `b156e92c`; `ensure_windowed_arch_off_cpu_dense_layer` is
+src/inference.rs:7114, called from `forward_layer_timed` (:7130) and
+`forward_prefill_layer_chunk_timed` (:7898).
+
+| # | entry point (src/inference.rs) | layer loop | per-layer forward | guard reached |
+|---|---|---|---|---|
+| 1 | `forward_worker_layers` :4076 (prefill arm) | :4114 | `forward_prefill_layer_chunk_timed` | choke point |
+| 2 | `forward_worker_layers` :4076 (decode arm) | :4165 | `forward_layer_timed` | choke point |
+| 3 | `forward_layer_range_from_hidden` :4218 | :4250 | `forward_prefill_layer_chunk_timed` | choke point |
+| 4 | `ghost_forward_one_layer` :4284 | (single layer) | `forward_prefill_layer_chunk_timed` | choke point |
+| 5 | `forward_prefill_chunk_timed_fast` :4353 | :4401 | `forward_prefill_layer_chunk_timed` | early guard "batch prefill", then choke point |
+| 6 | `forward_greedy_verify_chunk` :4461 | :4521 | `forward_prefill_layer_chunk_timed` | choke point |
+| 7 | `forward_prefill_layer_major_timed_fast_inner` :4591 | :4648 | `forward_prefill_layer_chunk_timed` | early guard "layer-major prefill", then choke point |
+| 8 | `forward_single_token_timed_internal` :4786 | :4903 | `forward_layer_timed` | early guard "decode forward", then choke point |
+
+There is no ninth: the only other `layers.iter()` sites in the file are binding/merge code, not
+forwards. The three session-level guards are KEPT, demoted to an early leg that names the lane
+before the walk starts; they delegate to the same free function so the message cannot drift.
+
+The review also found all three existing guard sites were **revert-invisible** — the single H4
+test asserts two substrings the choke point also emits, so deleting any guard failed nothing.
+Ten tests now cover this (src/inference/tests.rs), each named for what it catches:
+
+| test | fails when |
+|---|---|
+| `windowed_arch_choke_point_refuses_the_per_layer_decode_forward` | the `forward_layer_timed` choke-point call is deleted |
+| `windowed_arch_choke_point_refuses_the_per_layer_prefill_chunk` | the `forward_prefill_layer_chunk_timed` choke-point call is deleted |
+| `non_windowed_arch_still_computes_a_cpu_dense_layer` | the choke point starts refusing everything (causality control) |
+| `windowed_arch_batch_prefill_names_its_lane_before_the_layer_walk` | the `"batch prefill"` early guard is deleted |
+| `windowed_arch_layer_major_prefill_names_its_lane_before_the_layer_walk` | the `"layer-major prefill"` early guard is deleted |
+| `windowed_arch_decode_fallback_names_its_lane_before_the_layer_walk` | the `"decode forward"` early guard is deleted |
+| `windowed_arch_speculative_verify_chunk_inherits_the_choke_point` | entry point 6 stops being covered |
+| `windowed_arch_worker_layer_shard_inherits_the_choke_point` | entry point 1/2 stops being covered |
+| `windowed_arch_layer_range_replay_inherits_the_choke_point` | entry point 3 stops being covered |
+| `windowed_arch_ghost_layer_probe_inherits_the_choke_point` | entry point 4 stops being covered |
+
+### 12b. F2 (BLOCKER) — CLI lane admission is honest again
+
+`ensure_arch_has_direct_dense_session` (src/main.rs) went capability-aware for gemma3, which
+admitted it to all ten lanes it guards. Five of them walk the CPU dense layer loop directly and
+can never run a windowed forward on ANY host. They now refuse before weights load, with an
+actionable error naming `camelid serve`, via a `DenseLaneWindowedForward` lane class:
+
+- `CpuDenseOnly` (refuse windowed on every host): distribute worker role in `main`,
+  `run_ghost`, `load_model_drafter`, `run_bench_speculative`, `run_distribute_worker`,
+  `run_distribute_master`.
+- `ViaSessionDecode` (capability-aware, unchanged): `BenchAllocGate`, `gait_profile_trial`,
+  `run_bench_owner_sweep`, `run_bench_generate` — all of which generate through
+  `generate_next_token_with_history_diagnostics` and therefore inherit the resident lane (H2).
+
+Tests: `cpu_dense_only_cli_lanes_refuse_a_windowed_arch_on_every_host` (with a llama control on
+the same lane class, so the refusal is caused by the window schedule and not the lane),
+`a_kquant_windowed_row_is_refused_even_on_a_session_decode_lane`,
+`runnable_only_archs_stay_refused_on_both_lane_classes`.
+
+### 12c. F3 (MAJOR) — routing is keyed on the FILE, not the arch string
+
+`arch_requires_runnable_bridge_given` keyed on (arch, host) while resident admission is Q8_0-
+pinned (H5). A gemma3 Q4_K_M on a resident-capable Mac routed to the dense lane, loaded no
+runnable runtime, was declined by H5, and died on the H4 error for every request — a hard
+regression (the bridge served every gemma3 quant pre-flip), and both the H5 decline text and
+the flip's commit message promised a fallback no code implemented.
+
+- `model::file_requires_runnable_bridge(gguf)` is the live predicate. The arch-only entry point
+  is REMOVED, not defaulted: every live caller has the `GgufFile` and must pass it, so
+  quant-blindness is structurally impossible rather than merely fixed.
+- `model::windowed_arch_resident_quant_admissible(gguf)` decides the quant half from GGUF
+  metadata pre-load, mirroring the engine pin exactly (all seven per-layer linears Q8_0; a file
+  with no recognizable layer linears fails closed to the bridge).
+- `arch_requires_runnable_bridge_given(arch, host_available, quant_admissible)` is the pure
+  core; a windowed arch needs BOTH to take the resident lane.
+- Consumers renamed in lockstep: `api::is_runnable_serve_file`,
+  `api::completions_unsupported_for_file`.
+
+**Verification method, stated because it is not a live-file proof:** no non-Q8_0 gemma3 GGUF
+exists under `/Volumes/Untitled/models` (or the desktop model dir) — only
+`gemma-3-1b-it-Q8_0.gguf`. F3 is therefore proven by unit tests on the predicate
+(`a_non_q8_windowed_row_requires_the_runnable_bridge_on_every_host`,
+`windowed_quant_admission_requires_every_layer_linear_to_be_q8_0`) plus an HTTP-level test with
+a synthetic Q4_K fixture (`a_kquant_gemma3_keeps_the_runnable_bridge_on_a_resident_capable_host`,
+identical to the reopen test but for the tensor type, so quantization is provably what decides
+it), and the CLI test above.
+
+### 12d. F4 (MINOR) — speculation is declined for the arch, not gated per mode
+
+`serve --spec-decode` with the resident lane armed made every gemma3 request H4-error: CPU
+speculation pins the target off the resident paths so chunk-verify rollback has
+CPU-authoritative KV. Of the two options offered, neither was taken as written. Teaching
+routing about spec mode couples two unrelated decisions and leaves routing env-order-sensitive;
+exempting windowed archs from the spec pin is worse, because the CPU verify walk is itself the
+window-less dense forward. **Decision: a windowed arch never speculates, on either verify
+lane.** The GPU batched verify is no better than the CPU one here — `encode_attention`
+(src/metal.rs) takes no `window_start` at all and reads `[0, position_count)` full-causal; it
+is shared with the gemma4 lane and was never threaded with the window (§9a records this as an
+open residual). Since lossless speculation only ever adds throughput, declining it costs
+correctness nothing, and `--spec-decode` now SERVES gemma3 on the plain resident lane instead
+of failing. The disqualifier set moved into `api::speculation_admissible`, which also gives the
+four pre-existing disqualifiers their first test
+(`speculation_is_declined_for_a_windowed_arch_on_both_verify_lanes`). This supersedes §11i's
+"no explicit spec gate was added" flag.
+
+### 12e. Triage of the eight unverified leads — all eight CONFIRMED, none dismissed
+
+1. **Dense-lane renderer keyed on TEMPLATE SHAPE while routing admits by ARCH.** CONFIRMED.
+   `is_gemma3_chat_template` tests three substrings of the template text; routing keys on
+   `config.architecture`. A gemma3 GGUF whose template lacks them fell through
+   `render_chat_prompt_for_tokenization_fallback` to `render_role_colon_prompt` — a `"user: …"`
+   prompt the model was never trained on, served silently under a supported-row label — while
+   the runnable bridge, which keys the same decision on `runtime.architecture`, rendered it
+   correctly. The two lanes disagreed for exactly the files most likely to be mis-converted.
+   FIXED: `reject_windowed_arch_with_unrecognized_template` fails the arch/template mismatch
+   closed with a typed 422 naming the missing markers. Test
+   `gemma3_arch_with_an_unrecognized_template_fails_closed_on_the_dense_lane` covers the
+   near-miss (turn markers present, `first_user_prefix` absent), the role-colon template, and
+   a missing template, with a recognized-template control and non-windowed controls.
+2. **H5's Q8_0 admission has ZERO CI coverage.** CONFIRMED, and the mechanism is worse than
+   reported: the test claiming to pin it does not short-circuit, it is *vacuous* — its own doc
+   comment says the refusal may come from the backend-enabled gate instead, and its fixture's
+   f32 weights are rejected by the generic layer loop first, so deleting both H5 lines fails
+   nothing on any host, armed or not. The blocker is ordering: the backend-enabled bail sits
+   ~120 lines earlier and fires on every ordinary `cargo test` (the flag is default-off), and
+   arming it from inside a test is forbidden by §9d. FIXED by extraction:
+   `windowed_arch_layers_violate_q8_pin` is the pure decision, pinned per-linear by
+   `windowed_arch_q8_pin_rejects_any_non_q8_layer_linear` with an all-Q8_0 control.
+3. **No gemma3 chat test on a runnable-FALLBACK host.** CONFIRMED and worse: there was no
+   HTTP-level gemma3 *chat* test on ANY host — the only gemma3 HTTP tests hit `/completion`.
+   FIXED: `gemma3_chat_routes_to_the_runnable_bridge_on_a_fallback_host` (plain `#[test]`, no
+   cfg gate, so it runs on every non-macOS leg — the legs where it matters).
+4. **Two of three H4 guard sites revert-invisible.** CONFIRMED and worse — all three were, and
+   so was the choke point once it absorbed them. FIXED by the ten tests in 12a; the three early
+   guards are now pinned BY LANE NAME, which is what makes their removal visible rather than
+   silently absorbed.
+5. **catalog_id/row_id mismatch.** CONFIRMED. `catalog_id: "gemma3_1b_it_q8_0"` vs row id
+   `"gemma_3_1b_it_q8_0"` made `filename_is_supported_exact_row` false for the one promoted
+   gemma3 row, so `classify_model_lane` returned `ExperimentalImplemented` — which both emitted
+   `lane:"experimental"` AND whitespace-trimmed the generated text. For a supported exact row
+   that text is the parity-claimed artifact and must stay byte-identical, so this was a live
+   wrongness on the served surface, not only a label. FIXED here (one line, matching the rule
+   the neighbouring qwen3 entry states verbatim). It needs NO ledger regen: the ledger is
+   derived from the capabilities literal + API_CONFORMANCE_CASES, and `catalog_id` appears in
+   neither; `check-ledger-drift.mjs` passes. The capabilities-ROW rewrite stays Phase 5's.
+6. **`completions_fail_closed_for_runnable_serve_archs` reads the live predicate twice.**
+   CONFIRMED: tautological (it asserted the gate equals itself) and genuinely racy on a Metal
+   host, where seven sibling tests mutate `CAMELID_METAL_RESIDENT_DECODE` under a lock this
+   test did not hold. FIXED by driving the pure core with explicit capability booleans — no
+   env, no device, no lock needed, and it now pins behaviour instead of restating the
+   implementation.
+7. **Plan-vs-routing disagreement.** CONFIRMED for `CAMELID_MAC_Q8_METAL_PLAN=0`; CONFIRMED but
+   differently-worded for the Safe profile (there the plan disclosed a bare "safe profile"
+   reason next to CPU dense labels that for this arch fail closed at every dispatch — arguably
+   a worse disclosure). FIXED: `execution_plan::macos_q8_metal_plan_selectable()` is now
+   consulted by `inference::windowed_arch_resident_host_available()`, so the two agree, and the
+   windowed "serve chats via the runnable bridge" reason is pushed alongside every early return
+   that yields `safe_q8_plan()` rather than only the one after the Metal arm.
+   **Landmine found while writing this fix, worth the record:** the first cut also consulted
+   `CAMELID_MAC_Q8_REPACK`, which is a genuine third early return in `select_macos_q8_plan` —
+   and a self-defeating latch. `CAMELID_MAC_Q8_REPACK` is a MANAGED_ENV_KEY that a successful
+   Metal-resident selection WRITES to `"off"`, and `env_flag_disabled` reads `"off"` as
+   disabled. Routing would therefore have decided the Metal plan was unselectable the instant
+   `PlannerEnv::apply` ran, sending gemma3 to the bridge and killing the lane the plan had just
+   selected — the whole Phase 3b result, undone by a "consistency" fix. The rule this yields:
+   **a plan OUTPUT can never be a routing INPUT.** Only the two operator opt-outs
+   (`CAMELID_PROFILE`, `CAMELID_MAC_Q8_METAL_PLAN`, neither plan-managed) are consulted, and
+   `macos_q8_metal_plan_selectability_tracks_every_early_return` now pins that
+   `CAMELID_MAC_Q8_REPACK=off` does NOT disarm routing, so it is not helpfully added back.
+   Residual, OPEN: an operator who PRE-sets `CAMELID_MAC_Q8_REPACK=0` still gets a safe plan
+   with resident routing. Closing it needs the plan to stop overloading one variable for both
+   "operator opt-out" and "plan output".
+8. **gemma3 tool refusal returns a different code/param across hosts.** CONFIRMED. Bridge: 422
+   `unsupported_tools`, no param. Dense lane: raised inside template rendering and surfaced
+   wrapped as `unsupported_chat_template` / param `"messages"`. Same status, different
+   machine-readable identity, decided purely by host capability — a client switching on
+   `error.code` degraded correctly on Linux and fell into a generic branch on the M4 mini.
+   FIXED: one shared constructor (`gemma_runnable_lane_tools_rejection`), raised arch-keyed at
+   the dense chokepoint ahead of tokenizer/template work.
+   **§11f correction:** its claim that the dense-lane refusal is "behavior-IDENTICAL to pre-flip
+   from the API user's perspective" was an overclaim — the refusal SEMANTICS were identical
+   (422 class, tools never silently dropped, row stays `tool_capable: false`), the IDENTIFIERS
+   were not. They are now.
+
+### 12f. Nothing dismissed
+
+No finding was dismissed. The one place a reported framing was corrected rather than accepted
+is §12e-4 (the review said two of three guard sites were revert-invisible; all three were), and
+§12e-2/3, where the confirmed defect is larger than described. F4's two suggested remedies were
+both rejected in favour of a third, for the reason in 12d.
+
