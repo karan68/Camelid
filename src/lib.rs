@@ -26,6 +26,7 @@ pub mod ghost;
 pub mod grammar;
 pub mod hf_browse;
 pub mod inference;
+pub mod kv_equivalence;
 pub mod metal;
 pub mod model;
 pub mod model_default;
@@ -42,6 +43,7 @@ pub mod tensor;
 pub mod tokenizer;
 pub mod verify;
 pub mod web_ui;
+pub mod window_ref;
 pub mod wire_mmap;
 pub(crate) mod workspace_auth;
 

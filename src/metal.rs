@@ -12856,7 +12856,8 @@ pub struct ResidentLayerSchedule {
     /// Per-layer sliding window in positions, INCLUDING the current one: a
     /// local layer at position `pos` attends `[pos + 1 - w ..= pos]` (same
     /// convention as `Gemma3Metadata::layer_window` / `Gemma4LayerPlan::window`
-    /// — reference src/model.rs `is_position_visible`). `None` = full causal
+    /// — the pinned reference is [`crate::window_ref::window_bounds`], whose unit
+    /// tests assert it against the encode expression below). `None` = full causal
     /// attention (global layers, and every non-gemma3 arch).
     pub window: Vec<Option<usize>>,
 }
@@ -16112,6 +16113,48 @@ impl ResidentDecodeState {
                 ResidentKvFormat::F32
             },
         )
+    }
+
+    /// **KV-equivalence capture hook (campaign gates G1 / G6).**
+    ///
+    /// Snapshot every layer's first `positions` cached K and V rows into the
+    /// canonical `[kv_head][position][head_dim]` layout of
+    /// [`crate::kv_equivalence::KvSnapshot`], with the per-head `max_positions`
+    /// stride removed — so a session sized for 2 600 positions and one sized for
+    /// 600 compare cleanly at the 600 they share.
+    ///
+    /// This is the direct invariant a batched prefill is held to: `n` batched rows
+    /// must leave the cache in the same state as `n` token-by-token forwards. Tier A
+    /// asserts bit equality on the result
+    /// ([`crate::kv_equivalence::KvEquivalence::assert_bit_identical`]); Tier B
+    /// asserts a published bound plus the per-position outlier test
+    /// ([`crate::kv_equivalence::KvEquivalence::meets_bound`]).
+    ///
+    /// Test-only: it maps the shared-storage cache buffers on the CPU and widens
+    /// f16/Q8 KV to f32, which no production path wants to pay for.
+    #[cfg(test)]
+    pub(crate) fn kv_snapshot(&self, positions: usize) -> crate::kv_equivalence::KvSnapshot {
+        assert!(
+            positions <= self.max_positions,
+            "kv_snapshot: {positions} positions requested, session holds {}",
+            self.max_positions
+        );
+        let geometry = crate::kv_equivalence::KvGeometry {
+            n_layers: self.n_layers,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            positions,
+        };
+        let layers: Vec<(Vec<f32>, Vec<f32>)> = (0..self.n_layers)
+            .map(|l| {
+                (
+                    self.cache_k_contiguous(l, positions),
+                    self.cache_v_contiguous(l, positions),
+                )
+            })
+            .collect();
+        crate::kv_equivalence::KvSnapshot::from_layers(geometry, layers)
+            .expect("kv_snapshot builds from this session's own geometry")
     }
 }
 
@@ -23545,7 +23588,7 @@ mod tests {
 
     // gemma3→Metal Phase 2e: the sliding-window decode mask. A schedule layer
     // with `window: Some(w)` attends only `[pos + 1 - w ..= pos]` — the window
-    // INCLUDES the current position (src/model.rs `is_position_visible`
+    // INCLUDES the current position (`crate::window_ref::window_bounds`
     // convention) — via the gemma4 math (window_start = filled - w,
     // position_count = filled - window_start, kv_base_offset = window_start *
     // head_dim) on the UNCHANGED v1 decode-attention kernel.
@@ -23990,6 +24033,366 @@ mod tests {
         // oracle above and the per-token rms bound (a mis-indexed window
         // produces rms ~2e-1+ at clipped depths, over the 1e-1 bound).
         eprintln!("[2e-selfparity] {noisy_tokens}/10 tokens above rms 5e-3 (quantize flips)");
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 1: the KV-EQUIVALENCE INVARIANT and
+    // its power against the window-mutation class, proven on a synthetic fixture so
+    // it runs in the default suite with no GGUF and no model load.
+    //
+    // The claim under test is the one Tier A/B will be gated on: two sessions that
+    // ran the same tokens must hold the same KV. `kv_snapshot` + `kv_equivalence`
+    // is the direct check; this test establishes (a) the positive control — two
+    // independent sessions with the SAME schedule are bit-identical, so the gate is
+    // not vacuously red — and (b) that six deliberate schedule mutations each make
+    // it red, so the gate is not vacuously green.
+    //
+    // Two properties of the invariant that the assertions below pin down, because
+    // they decide where a defect becomes visible:
+    //
+    //  * Layer 0's K/V is computed from the token embedding and never from
+    //    attention, so a mask defect is INVISIBLE in layer 0's cache and first
+    //    appears in layer 1's. An n-layer model's LAST layer's attention appears in
+    //    no cache at all — which is why the snapshot carries `final_hidden`, and why
+    //    the mutants are also asserted to move it.
+    //  * A window mutation is a no-op while `filled <= window`. The fixture runs
+    //    past the window on purpose; the real-row pack has to do the same, which is
+    //    exactly why prompts below 512 tokens have no power over the window bound.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kv_snapshot_equivalence_catches_window_and_rope_mutations() {
+        use crate::kv_equivalence::compare;
+        if !detect_metal_device().available {
+            return;
+        }
+        let n_layers = 3usize;
+        let n_heads = 4usize;
+        let n_kv = 1usize;
+        let head_dim = 256usize;
+        let hidden = 1152usize;
+        let ffn = 288usize;
+        let tokens = 9usize;
+        let window = 4usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q_norm: Vec<f32>,
+            k_norm: Vec<f32>,
+            post_attn_norm: Vec<f32>,
+            post_ffw_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q_norm: (0..head_dim)
+                        .map(|i| 0.7 + ((i + li) as f32 % 11.0) * 0.02)
+                        .collect(),
+                    k_norm: (0..head_dim)
+                        .map(|i| 0.6 + ((i + li) as f32 % 7.0) * 0.03)
+                        .collect(),
+                    post_attn_norm: (0..hidden)
+                        .map(|i| 0.9 + ((i + li) as f32 % 3.0) * 0.03)
+                        .collect(),
+                    post_ffw_norm: (0..hidden)
+                        .map(|i| 0.95 + ((i + li) as f32 % 6.0) * 0.02)
+                        .collect(),
+                    q: mk_w36(q_dim, bpr_hidden, s + 1),
+                    k: mk_w36(kv_dim, bpr_hidden, s + 2),
+                    v: mk_w36(kv_dim, bpr_hidden, s + 3),
+                    o: mk_w36(hidden, bpr_q, s + 4),
+                    gate: mk_w36(ffn, bpr_hidden, s + 5),
+                    up: mk_w36(ffn, bpr_hidden, s + 6),
+                    down: mk_w36(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let weights: Vec<ResidentLayerWeights<'_>> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_norm: Some(&d.q_norm),
+                k_norm: Some(&d.k_norm),
+                post_attn_norm: Some(&d.post_attn_norm),
+                post_ffw_norm: Some(&d.post_ffw_norm),
+                ffn_geglu: false,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+            })
+            .collect();
+
+        // Production-shaped schedule: layers 0 and 1 slide (ALT/local theta),
+        // layer 2 is global (primary theta) — the 1B row's cadence in miniature.
+        let base_alt = vec![true, true, false];
+        let base_window = vec![Some(window), Some(window), None];
+
+        // Run `tokens` forwards under one schedule and return (KV snapshot with the
+        // final hidden attached). Every run sees byte-identical inputs, so the ONLY
+        // difference between two runs is the schedule.
+        let run = |alt: &[bool], win: &[Option<usize>]| -> crate::kv_equivalence::KvSnapshot {
+            let mut session = ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                tokens,
+                tokens,
+                eps,
+                true,
+                Some(ResidentLayerSchedule {
+                    use_alt_rope: alt.to_vec(),
+                    window: win.to_vec(),
+                }),
+            )
+            .expect("resident session");
+            let mut last = Vec::new();
+            for t in 0..tokens {
+                let emb: Vec<f32> = (0..hidden)
+                    .map(|i| ((((i * 7 + t * 13) % 23) as f32) - 11.0) * 0.13)
+                    .collect();
+                let (cos_g, sin_g) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e6);
+                let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+                last = match session
+                    .forward_token(
+                        &emb,
+                        &weights,
+                        &cos_g,
+                        &sin_g,
+                        Some((&cos_l, &sin_l)),
+                        t,
+                        scale,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .expect("resident forward")
+                {
+                    ResidentTokenOut::Data(v) => v,
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                };
+            }
+            session.kv_snapshot(tokens).with_final_hidden(last)
+        };
+
+        // (a) POSITIVE CONTROL — two independent sessions, same schedule, same
+        //     inputs: bit-identical KV and a matching digest. Without this the
+        //     mutant assertions below prove nothing.
+        let baseline = run(&base_alt, &base_window);
+        let baseline2 = run(&base_alt, &base_window);
+        let v = compare(&baseline, &baseline2).expect("compare");
+        v.assert_bit_identical("positive control (same schedule, same inputs)");
+        assert_eq!(
+            baseline.digest(),
+            baseline2.digest(),
+            "same-schedule digests must match"
+        );
+        assert!(v.meets_bound(0.0, 10.0).is_ok());
+        eprintln!(
+            "[kv-equiv] positive control: {} | digest {}",
+            v.summary(),
+            &baseline.digest()[..16]
+        );
+
+        // (b) MUTANTS — each must make the invariant red. The names mirror the
+        //     campaign's mutation harness so a failure here names the same defect.
+        // `mask_only` marks the mutations that change ONLY the attention mask. Those
+        // cannot reach layer 0's cache; the RoPE mutant can and does (K is rotated
+        // before it is written), so it is excluded from that assertion rather than
+        // the assertion being weakened for everyone.
+        struct Mutant {
+            name: &'static str,
+            alt: Vec<bool>,
+            window: Vec<Option<usize>>,
+            mask_only: bool,
+        }
+        let mutants = vec![
+            Mutant {
+                name: "window_minus_one (window_start off by +1 once saturated)",
+                alt: base_alt.clone(),
+                window: vec![Some(window - 1), Some(window - 1), None],
+                mask_only: true,
+            },
+            Mutant {
+                name: "window_plus_one (one position too wide)",
+                alt: base_alt.clone(),
+                window: vec![Some(window + 1), Some(window + 1), None],
+                mask_only: true,
+            },
+            Mutant {
+                name: "no_lower_bound (full causal — the lower bound dropped)",
+                alt: base_alt.clone(),
+                window: vec![None, None, None],
+                mask_only: true,
+            },
+            Mutant {
+                name: "window_on_all_layers (the global layer slides too)",
+                alt: base_alt.clone(),
+                window: vec![Some(window), Some(window), Some(window)],
+                mask_only: true,
+            },
+            Mutant {
+                name: "window_on_the_wrong_layers (schedule inverted)",
+                alt: base_alt.clone(),
+                window: vec![None, None, Some(window)],
+                mask_only: true,
+            },
+            Mutant {
+                name: "rope_tables_swapped (ALT/primary inverted)",
+                alt: vec![false, false, true],
+                window: base_window.clone(),
+                mask_only: false,
+            },
+        ];
+        for Mutant {
+            name,
+            alt,
+            window: win,
+            mask_only,
+        } in &mutants
+        {
+            let mutant = run(alt, win);
+            let v = compare(&baseline, &mutant).expect("compare");
+            assert!(
+                !v.bit_identical,
+                "MUTANT SURVIVED the KV-equivalence invariant: {name}. A mutation the \
+                 invariant cannot see is a hole in the Tier A/B gate."
+            );
+            assert!(
+                v.meets_bound(1.0e-6, 10.0).is_err(),
+                "MUTANT SURVIVED the Tier B bound+outlier check: {name} ({})",
+                v.summary()
+            );
+            assert_ne!(baseline.digest(), mutant.digest(), "digest blind to {name}");
+            eprintln!(
+                "[kv-equiv] CAUGHT {name}: {} first_diff={}",
+                v.summary(),
+                v.first_difference
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "<none>".into())
+            );
+            // Where the defect first shows is a documented property of the
+            // invariant, not an accident: a MASK mutation cannot reach layer 0's
+            // cache, because K/V there come from the token embedding and never from
+            // attention. A ROPE mutation can and does — it rotates K before the
+            // cache write — which is why only mask mutants carry this assertion.
+            if *mask_only {
+                if let Some(site) = v.first_difference {
+                    assert!(
+                        site.layer > 0
+                            || site.tensor == crate::kv_equivalence::KvTensor::FinalHidden,
+                        "{name}: layer 0's cache must be mask-independent, got {site}"
+                    );
+                }
+                assert_eq!(
+                    v.per_layer_max_abs[0], 0.0,
+                    "{name}: layer 0's KV must be untouched by a mask-only mutation"
+                );
+            } else {
+                assert!(
+                    v.per_layer_max_abs[0] > 0.0,
+                    "{name}: a RoPE mutation rotates K before the cache write, so layer 0 \
+                     MUST move — if it does not, the ALT/primary selection is not wired"
+                );
+            }
+        }
+
+        // (c) The blind spot, asserted so it stays documented: below the window a
+        //     window mutation is a genuine no-op — the invariant is GREEN and must
+        //     be. This is why the prompt pack needs prompts past 512 tokens.
+        let short = 3usize; // < window (4)
+        let run_short = |win: &[Option<usize>]| -> crate::kv_equivalence::KvSnapshot {
+            let mut session = ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn,
+                short,
+                short,
+                eps,
+                true,
+                Some(ResidentLayerSchedule {
+                    use_alt_rope: base_alt.clone(),
+                    window: win.to_vec(),
+                }),
+            )
+            .expect("resident session");
+            let mut last = Vec::new();
+            for t in 0..short {
+                let emb: Vec<f32> = (0..hidden)
+                    .map(|i| ((((i * 7 + t * 13) % 23) as f32) - 11.0) * 0.13)
+                    .collect();
+                let (cos_g, sin_g) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e6);
+                let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(t, head_dim, 1.0e4);
+                last = match session
+                    .forward_token(
+                        &emb,
+                        &weights,
+                        &cos_g,
+                        &sin_g,
+                        Some((&cos_l, &sin_l)),
+                        t,
+                        scale,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .expect("resident forward")
+                {
+                    ResidentTokenOut::Data(v) => v,
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                };
+            }
+            session.kv_snapshot(short).with_final_hidden(last)
+        };
+        let short_base = run_short(&base_window);
+        for win in [
+            vec![Some(window + 1), Some(window + 1), None],
+            vec![Some(window + 5), Some(window + 5), None],
+            vec![None, None, None],
+        ] {
+            let v = compare(&short_base, &run_short(&win)).expect("compare");
+            v.assert_bit_identical(
+                "below the window, a WIDER window (or none at all) must be a bit-exact no-op",
+            );
+        }
+        eprintln!(
+            "[kv-equiv] blind spot confirmed: with filled <= window, widening the window is a \
+             bit-exact no-op — prompts must exceed the window to have power over its bound"
+        );
     }
 
     // gemma3→Metal Phase 2 FINAL GATE: full-forward parity on the REAL row.
