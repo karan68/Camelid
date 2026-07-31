@@ -1,0 +1,13 @@
+<!-- Camelid Desktop app icon - full-bleed square variant.
+     Vector master for the Windows Store tiles (Square*Logo.png, StoreLogo.png).
+     Regenerate rasters:  rsvg-convert -w N -h N icon-source-square.svg -o out.png
+     Full set:            tauri icon icon-source.png  (after re-exporting the 1024 PNG)
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><defs><linearGradient id="bg" x1="0" y1="0" x2=".45" y2="1"><stop offset="0" stop-color="#FFD08C"/><stop offset=".5" stop-color="#F09150"/><stop offset="1" stop-color="#BE4E2D"/></linearGradient><radialGradient id="gl" cx=".26" cy=".16" r=".72"><stop offset="0" stop-color="#FFFFFF" stop-opacity=".16"/><stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/></radialGradient></defs><g><rect width="1024" height="1024" fill="url(#bg)"/><rect width="1024" height="1024" fill="url(#gl)"/><path fill-rule="evenodd" fill="#150F1A" transform="translate(-60.5 27) scale(0.94)" d="M 400 890 C 400 690 398 560 434 476 C 456 420 492 380 528 352
+ C 512 292 502 220 516 156 C 542 214 560 288 572 336
+ C 582 328 590 324 598 320
+ C 598 262 606 196 630 142 C 648 200 652 268 646 326
+ C 700 342 750 366 770 402 C 784 430 778 460 756 474
+ C 738 488 712 488 698 478 C 658 490 626 508 606 542
+ C 588 576 584 626 584 890 Z
+ M 626 402 a20 23 0 1 0 .1 0 Z"/></g></svg>
