@@ -1746,7 +1746,12 @@ async fn main() -> anyhow::Result<()> {
             // Open-and-use launch: if no model was named, load the user's saved
             // default from the configured model library. With no saved choice,
             // the first local GGUF is the zero-configuration default.
-            let model = model.or_else(|| auto_select_model(models_dir.as_deref()));
+            let model = match model {
+                Some(path) => Some(api::StartupModel::explicit(path)),
+                None => {
+                    auto_select_model(models_dir.as_deref()).map(api::StartupModel::auto_selected)
+                }
+            };
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
             // Journal the run. A `session_start` with no matching `session_exit`
@@ -1930,7 +1935,7 @@ async fn main() -> anyhow::Result<()> {
                 api::serve(
                     addr,
                     threads,
-                    Some(model),
+                    Some(api::StartupModel::explicit(model)),
                     false,
                     false,
                     None,
