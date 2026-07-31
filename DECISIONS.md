@@ -1284,6 +1284,33 @@ The corollary is that where the resident plan selection cannot fire, the plan
 advertising a CPU dense lane D20.2 forbids. A plan that names a lane the engine
 would refuse to run is worse than no plan.
 
+### D20.4 — A plan OUTPUT can never be a PLANNING input either (2026-07-31)
+
+D20.3 removed the plan's own output from the *routing* probe. The same variable
+was still an input to the *next plan*. `plan_for_model` read
+`CAMELID_MAC_Q8_REPACK` live; a successful Metal-resident selection writes it to
+`off`; `PlannerEnv::apply` sets it. So the second and every later plan in a
+process read the first plan's output as an operator opt-out and failed closed to
+`safe_q8_plan`. Serve plans once per model load, so from the second load onward
+`/v1/health`, `/api/capabilities` and `/execution-plan` reported `cpu_reference`
+/ `safe_cpu_decode` for a row the engine was decoding on the Metal resident lane
+— reproduced 2026-07-31 at `56ff2eb3`: `gemma-3-1b-it-Q8_0.gguf` loaded through
+`POST /api/models/load` disclosed `cpu_reference` at 51 tok/s measured (its CPU
+bridge does ~0.2), and the *same* Llama 3.2 1B file disclosed
+`metal_resident_q8_runtime` when loaded at startup and `cpu_reference` when
+re-loaded. It reached every desktop user, because the desktop always loads its
+model at runtime.
+
+The decision: the planner reads operator opt-outs from a `PlannerEnv` snapshot
+captured before any plan applied its `env_updates`, never from live environment.
+`AppState` captures one at construction and every load plans against it. Keys the
+planner does not write are deliberately NOT snapshotted — they are genuine
+runtime inputs, and a stale copy of those would be its own disclosure bug.
+
+This is a disclosure fix only. The plan cannot disarm the runtime gates, so no
+lane, no routing decision and no output token changed; what changed is that the
+disclosure now matches the lane that was already running.
+
 ### What this does not decide
 
 Nothing here is a performance decision, and none of it constitutes a throughput
