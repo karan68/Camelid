@@ -10,7 +10,7 @@
 //! 16GB box); matmuls dequantize on the fly via [`q8_matvec`]. Cross-layer KV
 //! sharing: layers >= `first_kv_shared` reuse the last same-type layer's cache.
 
-use crate::gguf::{read_metadata, GgufTensorType};
+use crate::gguf::{read_metadata, GgufFile, GgufTensorType};
 use crate::inference::gemma4::{gelu_tanh, soft_cap_in_place};
 use crate::inference::{
     nvfp4_wire_block_dequant, nvfp4_wire_row_dot, q4_0_wire_block_dequant, q4_0_wire_row_dot,
@@ -1196,6 +1196,48 @@ pub(crate) fn drive_forced_steps<P, E>(
 }
 
 impl Gemma4Runtime {
+    /// Merged byte spans of the wire tensors a `range` shard actually streams,
+    /// for scoping the background `MADV_WILLNEED` warm-up.
+    ///
+    /// Readahead is bounded by device bandwidth, so advising the whole mapping
+    /// spends it on bytes this shard never streams. A gemma4 GGUF's data section
+    /// opens with `per_layer_token_embd` (2.5GB on E2B) — a *gather-only* table,
+    /// one row per layer per token — so warming all of it front-loads the wrong
+    /// bytes and, under memory pressure, evicts the layer weights the first step
+    /// is actually blocked on. Every other non-layer tensor is either small or
+    /// streamed whole each step (the tied head), so only the gather table is
+    /// excluded.
+    fn shard_warm_spans(gguf: &GgufFile, range: &std::ops::Range<usize>) -> Vec<(usize, usize)> {
+        let wanted = |name: &str| -> bool {
+            match name.strip_prefix("blk.") {
+                Some(rest) => rest
+                    .split_once('.')
+                    .and_then(|(idx, _)| idx.parse::<usize>().ok())
+                    .is_some_and(|layer| range.contains(&layer)),
+                None => name != "per_layer_token_embd.weight",
+            }
+        };
+        let mut spans: Vec<(usize, usize)> = gguf
+            .tensors
+            .iter()
+            .filter(|t| t.n_bytes > 0 && wanted(&t.name))
+            .map(|t| (t.absolute_offset as usize, t.n_bytes as usize))
+            .collect();
+        spans.sort_unstable();
+        // Coalesce touching/overlapping spans so the kernel sees a few long
+        // sequential runs rather than hundreds of small ones.
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (offset, len) in spans {
+            match merged.last_mut() {
+                Some((m_off, m_len)) if offset <= m_off.saturating_add(*m_len) => {
+                    *m_len = (offset + len).saturating_sub(*m_off).max(*m_len);
+                }
+                _ => merged.push((offset, len)),
+            }
+        }
+        merged
+    }
+
     /// Load only the given contiguous global layer range (None = all layers).
     /// Fails closed if the range would separate a KV-sharing layer from the
     /// cache it reads (the split must keep every shared layer on the same shard
@@ -1255,7 +1297,15 @@ impl Gemma4Runtime {
         let mmap = GgufWireMmap::map(path)?;
         {
             let mmap = mmap.clone();
-            std::thread::spawn(move || mmap.advise_willneed());
+            // Warm only the spans this shard streams, not all 5GB — see
+            // `shard_warm_spans`. Still off the loading thread: the advisory
+            // blocks on macOS over USB until the range is resident.
+            let spans = Self::shard_warm_spans(&gguf, &range);
+            std::thread::spawn(move || {
+                for (offset, len) in spans {
+                    mmap.advise_willneed_range(offset, len);
+                }
+            });
         }
         let q8 = |name: &str| WireQuant::new(&store, &mmap, name);
         // Matvec-role loads (projections, expert bands, the tied head) refuse
