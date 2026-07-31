@@ -40,7 +40,7 @@ pub use server::ServeOptions;
 
 use crate::{
     embedding::{cosine_similarity, EncoderConfig, NomicBertRuntime},
-    execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
+    execution_plan::{plan_for_model_with_env, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
         diagnostic_attention_score_scale, diagnostic_ffn_gate_up_order,
@@ -172,6 +172,12 @@ pub struct AppState {
     /// decoupled from the compute it guarded (the orphan-decode hazard;
     /// docs/recon/ENGINE_INVERSION_CONDUCTOR.md).
     engine: engine::EngineHandle,
+    /// The operator environment as it stood when this server was constructed —
+    /// i.e. BEFORE any model load applied a plan's `env_updates`. Every load
+    /// plans against this snapshot and then applies its updates through it, so
+    /// the Nth load's disclosed plan is the plan the operator asked for rather
+    /// than a reading of load N-1's output. Captured once and never refreshed;
+    /// that is the point.
     planner_env: PlannerEnv,
     configured_threads: Option<usize>,
     /// Server-wide default for opt-in thinking mode (`serve --enable-thinking`).
@@ -8712,11 +8718,25 @@ async fn load_model_from_path_with_activation(
     // Phase 1: GGUF metadata read + execution planning (file I/O + hardware
     // probing). env_updates are applied between the phases, preserving the
     // ordering the old inline pipeline had.
+    //
+    // Plan against `state.planner_env` — the operator environment captured at
+    // AppState construction, before any load applied a plan's `env_updates` —
+    // rather than the live environment. Serve plans once per model load, and
+    // several MANAGED_ENV_KEYS are both planner inputs (operator opt-outs) and
+    // planner outputs. Reading them live made the SECOND and every later load
+    // in the process consult the FIRST load's output: a Metal-resident
+    // selection writes `CAMELID_MAC_Q8_REPACK=off`, which the next plan read as
+    // an operator opt-out and failed closed to `cpu_reference` /
+    // `safe_cpu_decode` while serve went on running the Metal-resident lane.
+    // The desktop always loads at runtime on top of the startup auto-select, so
+    // every desktop user saw the wrong backend disclosed. See `PlannerEnv`.
     let metadata_path = path.clone();
     let configured_threads = state.configured_threads;
+    let planner_env = state.planner_env.clone();
     let (gguf, outcome) = tokio::task::spawn_blocking(move || {
         let gguf = read_metadata(&metadata_path)?;
-        let outcome = plan_for_model(&metadata_path, &gguf, configured_threads);
+        let outcome =
+            plan_for_model_with_env(&metadata_path, &gguf, configured_threads, &planner_env);
         Ok::<_, BackendError>((gguf, outcome))
     })
     .await
@@ -18052,6 +18072,154 @@ mod tests {
         let response = capabilities_response_with_plan(Some(plan.clone()));
 
         assert_eq!(response.execution_plan, Some(plan));
+    }
+
+    /// Minimal on-disk GGUF that the PLANNER can classify: a recognized
+    /// supported Q8_0 row name plus one Q8_0 tensor. Config binding and
+    /// tokenizer construction both fail on it (there are no `llama.*` keys),
+    /// which the load pipeline tolerates — the model lands non-generative but
+    /// fully planned, which is exactly the surface under test.
+    fn write_supported_q8_row_gguf(path: &std::path::Path) {
+        fn push_string(b: &mut Vec<u8>, s: &str) {
+            b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        }
+        fn push_kv_string(b: &mut Vec<u8>, key: &str, value: &str) {
+            push_string(b, key);
+            b.extend_from_slice(&8u32.to_le_bytes()); // GGUF string type
+            push_string(b, value);
+        }
+
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&1i64.to_le_bytes()); // tensor_count
+        b.extend_from_slice(&2i64.to_le_bytes()); // metadata_count
+        push_kv_string(&mut b, "general.architecture", "llama");
+        // A recognized exact row, so the planner takes a real Q8_0 branch
+        // instead of the "non-validated row" fail-closed arm.
+        push_kv_string(&mut b, "general.name", "Llama 3.2 1B Instruct");
+
+        push_string(&mut b, "blk.0.attn_q.weight");
+        b.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        b.extend_from_slice(&32i64.to_le_bytes()); // must be a multiple of the Q8_0 block
+        b.extend_from_slice(&1i64.to_le_bytes());
+        b.extend_from_slice(&8i32.to_le_bytes()); // GgufTensorType::Q8_0
+        b.extend_from_slice(&0u64.to_le_bytes()); // relative offset
+
+        // Align the data section, then reserve the tensor's declared bytes
+        // (32 elements / 32 per block * 34 bytes per block).
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        b.extend(std::iter::repeat_n(0u8, 34));
+        std::fs::write(path, b).expect("write fixture gguf");
+    }
+
+    /// `POST /api/models/load` then `GET /v1/health`, returning the disclosed
+    /// `execution_plan` — the exact pair of calls the desktop app makes.
+    async fn loaded_plan_via_http(
+        app: axum::Router,
+        path: &std::path::Path,
+        id: &str,
+    ) -> serde_json::Value {
+        use tower::ServiceExt;
+
+        let body = serde_json::json!({ "path": path, "id": id }).to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/models/load")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "fixture load must succeed"
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(health["active_model_id"], id);
+        health["execution_plan"].clone()
+    }
+
+    /// The load-at-runtime path must disclose the plan the operator asked for,
+    /// not a reading of the previous load's plan output.
+    ///
+    /// Several `MANAGED_ENV_KEYS` are both planner INPUTS (operator opt-outs)
+    /// and planner OUTPUTS (written by `PlannerEnv::apply` after each load).
+    /// While the load pipeline planned against the LIVE environment, the second
+    /// and every later `POST /api/models/load` in a process re-read the first
+    /// load's output as an opt-out and fell closed to `cpu_reference` /
+    /// `safe_cpu_decode` — while serve went on serving from the lane it had
+    /// actually selected. Reproduced on macOS 2026-07-31 against main
+    /// `56ff2eb3`: `gemma-3-1b-it-Q8_0.gguf` loaded at runtime disclosed
+    /// `cpu_reference` while decoding at 51 tok/s on the Metal resident lane
+    /// (its CPU bridge does ~0.2), and the *same* Llama 3.2 1B file disclosed
+    /// `metal_resident_q8_runtime` at startup but `cpu_reference` when
+    /// re-loaded. The desktop app always loads at runtime, so every desktop
+    /// user saw it.
+    ///
+    /// This poisons the environment directly rather than relying on a Metal
+    /// device, so it is decisive on every CI leg: the repack key is whichever
+    /// one this target's planner consults.
+    #[tokio::test]
+    async fn runtime_load_plans_against_the_operator_env_not_the_previous_plans_output() {
+        let _env_guard = crate::test_support::env_lock();
+        let repack_key = if cfg!(target_arch = "aarch64") {
+            "CAMELID_MAC_Q8_REPACK"
+        } else {
+            "CAMELID_X86_Q8_REPACK"
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Llama-3.2-1B-Instruct-Q8_0.gguf");
+        write_supported_q8_row_gguf(&path);
+
+        // Both routers capture their PlannerEnv baseline here, while the
+        // environment is still pristine — as `camelid serve` does at startup.
+        std::env::remove_var(repack_key);
+        let poisoned_app = router();
+        let clean_app = router();
+
+        let expected = loaded_plan_via_http(clean_app, &path, "clean").await;
+
+        // Exactly what a previous load's Metal/CPU selection leaves behind.
+        std::env::set_var(repack_key, "off");
+        let actual = loaded_plan_via_http(poisoned_app, &path, "poisoned").await;
+        std::env::remove_var(repack_key);
+
+        assert_eq!(
+            actual["selected_backend"], expected["selected_backend"],
+            "the plan for a model must not depend on how many loads preceded it"
+        );
+        assert_eq!(actual["decode_path"], expected["decode_path"]);
+        let reasons = actual["reasons"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !reasons.iter().any(|reason| reason
+                .as_str()
+                .is_some_and(|reason| reason.contains("disables Mac repack")
+                    || reason.contains("x86 Q8 override disables optimized kernel/repack"))),
+            "the plan must not blame an opt-out the operator never set: {reasons:?}"
+        );
     }
 
     #[test]

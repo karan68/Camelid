@@ -128,9 +128,40 @@ pub struct ExecutionPlanOutcome {
     pub env_updates: BTreeMap<&'static str, Option<&'static str>>,
 }
 
+/// The operator-supplied environment the planner reads, captured BEFORE any
+/// plan has applied its `env_updates`.
+///
+/// `MANAGED_ENV_KEYS` are both planner INPUTS (operator opt-outs) and planner
+/// OUTPUTS (written by [`PlannerEnv::apply`]). Reading them live makes the
+/// planner consult its own previous output: the macOS Metal-resident selection
+/// writes `CAMELID_MAC_Q8_REPACK=off`, and the NEXT `plan_for_model` in the same
+/// process reads that "off" as an operator opt-out and fails closed to the safe
+/// plan. That is a pure disclosure bug — the plan cannot disarm the
+/// runtime gates, so serve kept running the Metal-resident lane while
+/// `/v1/health`, `/api/capabilities` and `/execution-plan` reported
+/// `cpu_reference` / `safe_cpu_decode` from the second load onward (a ~235x
+/// misstatement for a gemma3 row, whose CPU bridge decodes at ~0.2 tok/s
+/// against the resident lane's ~47). Every desktop user hit it, because the
+/// desktop always loads its model at runtime on top of the startup auto-select.
+///
+/// So this snapshot is the planner's view of what the OPERATOR asked for. Keys
+/// the planner never writes are not snapshotted and keep reading live — they
+/// are genuine runtime inputs (`CAMELID_METAL_RESIDENT_DECODE`,
+/// `CAMELID_PROFILE`, `CAMELID_MAC_Q8_METAL_PLAN`, …) and a stale copy of those
+/// would be its own disclosure bug.
+///
+/// This is the fix `macos_q8_metal_plan_selectable`'s doc comment describes as
+/// "the plan to stop overloading one variable for both operator opt-out and
+/// plan output"; that function's residual — an operator who PRE-sets
+/// `CAMELID_MAC_Q8_REPACK=0` getting a safe plan with resident routing — is
+/// deliberately preserved, because a pre-set value IS in the baseline.
 #[derive(Clone, Debug, Default)]
 pub struct PlannerEnv {
     passthrough_env: BTreeMap<&'static str, Option<String>>,
+    /// One entry per [`MANAGED_ENV_KEYS`] key; `None` means the operator left it
+    /// unset. An EMPTY map (i.e. `PlannerEnv::default()`) means "no baseline
+    /// captured" and every key falls back to reading live.
+    managed_env: BTreeMap<&'static str, Option<String>>,
 }
 
 impl PlannerEnv {
@@ -146,7 +177,57 @@ impl PlannerEnv {
                 )
             })
             .collect();
-        Self { passthrough_env }
+        let managed_env = MANAGED_ENV_KEYS
+            .iter()
+            .map(|key| (*key, env::var(key).ok()))
+            .collect();
+        Self {
+            passthrough_env,
+            managed_env,
+        }
+    }
+
+    /// The value the OPERATOR supplied for `key`, ignoring whatever a
+    /// previously applied plan wrote over it. Non-managed keys are never
+    /// written by a plan, so they read live.
+    fn operator_var(&self, key: &str) -> Option<String> {
+        match self.managed_env.get(key) {
+            Some(baseline) => baseline.clone(),
+            None => env::var(key).ok(),
+        }
+    }
+
+    fn flag_disabled(&self, key: &str) -> bool {
+        self.operator_var(key)
+            .is_some_and(|value| flag_value_disabled(&value))
+    }
+
+    fn flag_enabled(&self, key: &str) -> bool {
+        self.operator_var(key)
+            .is_some_and(|value| flag_value_enabled(&value))
+    }
+
+    /// [`metal_flag_value_enabled`] against the operator baseline.
+    fn metal_flag_enabled(&self, key: &str) -> bool {
+        self.operator_var(key)
+            .is_some_and(|value| metal_flag_value_enabled(&value))
+    }
+
+    /// Whether the operator named the AVX2 kernel explicitly. Currently unused,
+    /// retained from the free function it replaces. It reads through the
+    /// baseline for the reason this whole type exists: the planner WRITES
+    /// `CAMELID_X86_Q8_KERNEL=avx2`, so a live read would make every later plan
+    /// in the process believe the operator had asked for AVX2 by name.
+    #[allow(dead_code)]
+    fn x86_kernel_avx2_explicitly_requested(&self) -> bool {
+        self.operator_var("CAMELID_X86_Q8_KERNEL")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("avx2"))
+    }
+
+    /// [`invalid_x86_kernel_value`] against the operator baseline.
+    fn invalid_x86_kernel_override(&self) -> Option<String> {
+        let value = self.operator_var("CAMELID_X86_Q8_KERNEL")?;
+        invalid_x86_kernel_value(&value).map(ToOwned::to_owned)
     }
 
     pub fn apply(&self, updates: &BTreeMap<&'static str, Option<&'static str>>) {
@@ -249,12 +330,37 @@ fn cuda_resident_decode_will_run() -> bool {
     crate::cuda::is_available() && crate::cuda::gpu_accel_enabled()
 }
 
+/// Plan for a model, reading operator opt-outs from the CURRENT environment.
+///
+/// Correct only for a process that plans ONCE (every one-shot CLI subcommand).
+/// A long-lived process that plans per model load — `camelid serve` — must
+/// capture a [`PlannerEnv`] before its first load and use
+/// [`plan_for_model_with_env`], or the second plan reads the first plan's
+/// `env_updates` as operator opt-outs and fails closed to the safe plan.
 pub fn plan_for_model(
     model_path: &Path,
     gguf: &GgufFile,
     threads: Option<usize>,
 ) -> ExecutionPlanOutcome {
-    plan_for_model_with_platform(model_path, gguf, threads, PlanPlatform::current())
+    plan_for_model_with_env(model_path, gguf, threads, &PlannerEnv::capture())
+}
+
+/// Plan for a model against an operator-environment baseline captured before
+/// any plan applied its `env_updates`. This is the entry point every repeated
+/// planner (serve's model-load pipeline) must use — see [`PlannerEnv`].
+pub fn plan_for_model_with_env(
+    model_path: &Path,
+    gguf: &GgufFile,
+    threads: Option<usize>,
+    planner_env: &PlannerEnv,
+) -> ExecutionPlanOutcome {
+    plan_for_model_with_platform_and_env(
+        model_path,
+        gguf,
+        threads,
+        PlanPlatform::current(),
+        planner_env,
+    )
 }
 
 pub fn plan_for_model_with_platform(
@@ -262,6 +368,22 @@ pub fn plan_for_model_with_platform(
     gguf: &GgufFile,
     threads: Option<usize>,
     platform: PlanPlatform,
+) -> ExecutionPlanOutcome {
+    plan_for_model_with_platform_and_env(
+        model_path,
+        gguf,
+        threads,
+        platform,
+        &PlannerEnv::capture(),
+    )
+}
+
+pub fn plan_for_model_with_platform_and_env(
+    model_path: &Path,
+    gguf: &GgufFile,
+    threads: Option<usize>,
+    platform: PlanPlatform,
+    planner_env: &PlannerEnv,
 ) -> ExecutionPlanOutcome {
     // GAIT selector (bring-up gate `CAMELID_GAIT`, default off): consult the
     // per-(model × machine) gait store for a cached gait. With the gate off, or
@@ -336,6 +458,7 @@ pub fn plan_for_model_with_platform(
             select_macos_q8_plan(
                 &profile,
                 &platform,
+                planner_env,
                 is_windowed_attention_arch(gguf),
                 &mut env_updates,
                 &mut reasons,
@@ -360,7 +483,13 @@ pub fn plan_for_model_with_platform(
             // The x86_64 Q8 runtime-repack + AVX2 packed-rows4 path is platform-agnostic
             // Rust (no OS-specific kernels) and is parity-validated bit-identical to the
             // scalar reference on Windows as well as Linux, so both share this plan.
-            select_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+            select_x86_q8_plan(
+                &profile,
+                &platform,
+                planner_env,
+                &mut env_updates,
+                &mut reasons,
+            )
         } else {
             reasons.push(
                     "no validated platform-specific Q8_0 plan for this OS/arch; failing closed to safe path"
@@ -371,7 +500,7 @@ pub fn plan_for_model_with_platform(
     } else if has_q8_0_tensors
         && platform.cuda_resident_active
         && is_gpu_runnable_arch(gguf)
-        && !env_flag_disabled("CAMELID_GPU_RUNNABLE_TIER")
+        && !planner_env.flag_disabled("CAMELID_GPU_RUNNABLE_TIER")
     {
         // On by DEFAULT: an uncurated but architecturally-compatible Q8_0 model should just run
         // on the GPU without the user having to opt in. This is safe because admission is gated
@@ -387,6 +516,7 @@ pub fn plan_for_model_with_platform(
         select_kquant_plan(
             &profile,
             &platform,
+            planner_env,
             // The runtime's `resident_decode_eligible` rejects architectures the
             // resident dense kernels cannot express (gemma2/gemma3 sandwich
             // norms, NoPE, MoE routing). Mirror that here so the plan never
@@ -469,6 +599,7 @@ pub fn macos_q8_metal_plan_selectable() -> bool {
 fn select_macos_q8_plan(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,
+    planner_env: &PlannerEnv,
     windowed_attention_arch: bool,
     env_updates: &mut BTreeMap<&'static str, Option<&'static str>>,
     reasons: &mut Vec<String>,
@@ -499,7 +630,10 @@ fn select_macos_q8_plan(
         }
         return safe_q8_plan();
     }
-    if env_flag_disabled("CAMELID_MAC_Q8_REPACK") {
+    // Baseline, not live env: a previous load's Metal-resident selection wrote
+    // `CAMELID_MAC_Q8_REPACK=off` as its OUTPUT, and reading that back here is
+    // what made every model loaded after the first disclose `cpu_reference`.
+    if planner_env.flag_disabled("CAMELID_MAC_Q8_REPACK") {
         reasons
             .push("CAMELID_MAC_Q8_REPACK disables Mac repack; failing closed to safe path".into());
         env_updates.insert("CAMELID_MAC_Q8_REPACK", Some("off"));
@@ -517,8 +651,12 @@ fn select_macos_q8_plan(
     // the resident-decode gate (on by default in the CLI entry; absent for embedders
     // and test suites, which keep the validated CPU plans) plus an actual Metal
     // device; CAMELID_MAC_Q8_METAL_PLAN=0 opts back into the CPU repack plan.
-    if env_flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
-        && !env_flag_disabled("CAMELID_MAC_Q8_METAL_PLAN")
+    // Both of these are runtime inputs the plan never writes, so the baseline
+    // passes them straight through to live env — deliberately, so the disclosed
+    // plan tracks an operator flipping them, and so this stays in lockstep with
+    // `macos_q8_metal_plan_selectable`, which routing consults live.
+    if planner_env.flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
+        && !planner_env.flag_disabled("CAMELID_MAC_Q8_METAL_PLAN")
         && platform.metal_available
     {
         env_updates.insert("CAMELID_MAC_Q8_REPACK", Some("off"));
@@ -562,7 +700,7 @@ fn select_macos_q8_plan(
     reasons.push("validated macOS Apple Silicon Q8_0 runtime repack enabled".into());
     reasons.push("parallel linear enabled by execution plan".into());
 
-    if env_flag_disabled("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER") {
+    if planner_env.flag_disabled("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER") {
         env_updates.insert("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER", Some("off"));
         reasons.push("Mac FFN-down decode consumer disabled".into());
     } else {
@@ -570,7 +708,7 @@ fn select_macos_q8_plan(
         reasons.push("Mac FFN-down decode consumer gate enabled by default".into());
     }
 
-    if env_flag_disabled("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER") {
+    if planner_env.flag_disabled("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER") {
         env_updates.insert("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER", Some("off"));
         reasons.push("Mac FFN gate/up decode consumer disabled".into());
     } else {
@@ -578,7 +716,7 @@ fn select_macos_q8_plan(
         reasons.push("Mac FFN gate/up decode consumer gate enabled by default".into());
     }
 
-    let prefill_i8mm_requested = !env_flag_disabled("CAMELID_MAC_Q8_PREFILL_I8MM");
+    let prefill_i8mm_requested = !planner_env.flag_disabled("CAMELID_MAC_Q8_PREFILL_I8MM");
     let prefill_path = if i8mm && prefill_i8mm_requested {
         env_updates.insert("CAMELID_MAC_Q8_PREFILL_I8MM", Some("on"));
         reasons.push("direct-pack prefill I8MM gate enabled by default".into());
@@ -604,7 +742,7 @@ fn select_macos_q8_plan(
     } else {
         env_updates.insert("CAMELID_MAC_Q8_PREFILL_I8MM", Some("off"));
         env_updates.insert("CAMELID_MAC_Q8_SCHED", Some("off"));
-        if env_flag_disabled("CAMELID_MAC_Q8_PREFILL_I8MM") {
+        if planner_env.flag_disabled("CAMELID_MAC_Q8_PREFILL_I8MM") {
             reasons.push("CAMELID_MAC_Q8_PREFILL_I8MM disables I8MM prefill".into());
         } else {
             reasons
@@ -635,6 +773,7 @@ fn select_macos_q8_plan(
 fn select_x86_q8_plan(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,
+    planner_env: &PlannerEnv,
     env_updates: &mut BTreeMap<&'static str, Option<&'static str>>,
     reasons: &mut Vec<String>,
 ) -> (
@@ -660,19 +799,21 @@ fn select_x86_q8_plan(
         );
         return cuda_resident_q8_plan();
     }
-    if env_flag_disabled("CAMELID_X86_Q8_REPACK") || env_flag_disabled("CAMELID_X86_Q8_KERNEL") {
+    if planner_env.flag_disabled("CAMELID_X86_Q8_REPACK")
+        || planner_env.flag_disabled("CAMELID_X86_Q8_KERNEL")
+    {
         reasons.push(
             "x86 Q8 override disables optimized kernel/repack; failing closed to safe path".into(),
         );
-        if env_flag_disabled("CAMELID_X86_Q8_REPACK") {
+        if planner_env.flag_disabled("CAMELID_X86_Q8_REPACK") {
             env_updates.insert("CAMELID_X86_Q8_REPACK", Some("off"));
         }
-        if env_flag_disabled("CAMELID_X86_Q8_KERNEL") {
+        if planner_env.flag_disabled("CAMELID_X86_Q8_KERNEL") {
             env_updates.insert("CAMELID_X86_Q8_KERNEL", Some("off"));
         }
         return safe_q8_plan();
     }
-    if let Some(invalid) = invalid_x86_kernel_override() {
+    if let Some(invalid) = planner_env.invalid_x86_kernel_override() {
         reasons.push(format!(
             "invalid CAMELID_X86_Q8_KERNEL={invalid}; failing closed to safe path"
         ));
@@ -690,7 +831,7 @@ fn select_x86_q8_plan(
     env_updates.insert("CAMELID_X86_Q8_REPACK", Some("on"));
     env_updates.insert("CAMELID_X86_Q8_KERNEL", Some("avx2"));
     let optional_x86_q8_gate = |name| {
-        if env_flag_disabled(name) {
+        if planner_env.flag_disabled(name) {
             Some("off")
         } else {
             Some("on")
@@ -734,7 +875,7 @@ fn select_x86_q8_plan(
     // parallelizing across rows does not change any reduction order). Windows therefore
     // defaults serial-decode OFF; an explicit env opt-in still forces it on.
     let serial_packed_decode = if platform.operating_system == "windows" {
-        if env_flag_enabled("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE") {
+        if planner_env.flag_enabled("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE") {
             Some("on")
         } else {
             Some("off")
@@ -750,9 +891,9 @@ fn select_x86_q8_plan(
         "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
         optional_x86_q8_gate("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE"),
     );
-    let ffn_decode_chain_enabled = env_flag_enabled("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
-    let ffn_gate_up_decode_consumer_enabled =
-        ffn_decode_chain_enabled || env_flag_enabled("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
+    let ffn_decode_chain_enabled = planner_env.flag_enabled("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
+    let ffn_gate_up_decode_consumer_enabled = ffn_decode_chain_enabled
+        || planner_env.flag_enabled("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     env_updates.insert(
         "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
         if ffn_gate_up_decode_consumer_enabled {
@@ -785,8 +926,8 @@ fn select_x86_q8_plan(
         "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL"),
     );
-    let ffn_down_decode_consumer_enabled =
-        ffn_decode_chain_enabled || env_flag_enabled("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
+    let ffn_down_decode_consumer_enabled = ffn_decode_chain_enabled
+        || planner_env.flag_enabled("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
     env_updates.insert(
         "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
         if ffn_down_decode_consumer_enabled {
@@ -841,13 +982,17 @@ fn select_x86_q8_plan(
         optional_x86_q8_gate("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER"),
     );
 
-    if ffn_decode_chain_enabled && !env_flag_enabled("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER") {
+    if ffn_decode_chain_enabled
+        && !planner_env.flag_enabled("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER")
+    {
         reasons.push(
             "FFN decode-chain opt-in also enables the required FFN gate/up decode consumer gate"
                 .into(),
         );
     }
-    if ffn_decode_chain_enabled && !env_flag_enabled("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER") {
+    if ffn_decode_chain_enabled
+        && !planner_env.flag_enabled("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER")
+    {
         reasons.push(
             "FFN decode-chain opt-in also enables the required FFN-down decode consumer gate"
                 .into(),
@@ -977,6 +1122,7 @@ fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
 fn select_kquant_plan(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,
+    planner_env: &PlannerEnv,
     metal_tensor_mix_supported: bool,
     reasons: &mut Vec<String>,
 ) -> (
@@ -1005,10 +1151,10 @@ fn select_kquant_plan(
         && platform.architecture == "aarch64"
         && platform.metal_available
         && metal_tensor_mix_supported
-        && metal_env_flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
-        && metal_env_flag_enabled("CAMELID_METAL_KQUANT")
-        && metal_env_flag_enabled("CAMELID_METAL_F32Y")
-        && metal_env_flag_enabled("CAMELID_METAL_WIRE")
+        && planner_env.metal_flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
+        && planner_env.metal_flag_enabled("CAMELID_METAL_KQUANT")
+        && planner_env.metal_flag_enabled("CAMELID_METAL_F32Y")
+        && planner_env.metal_flag_enabled("CAMELID_METAL_WIRE")
     {
         reasons.push(
             "Metal resident K-quant stack selected automatically; Q4_K/Q6_K weights stay \
@@ -1368,51 +1514,36 @@ fn default_thread_count() -> usize {
         .unwrap_or(1)
 }
 
-fn env_flag_disabled(key: &str) -> bool {
-    env::var(key)
-        .map(|value| {
-            let value = value.trim();
-            value.eq_ignore_ascii_case("0")
-                || value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("false")
-                || value.eq_ignore_ascii_case("disabled")
-                || value.eq_ignore_ascii_case("cpu")
-        })
-        .unwrap_or(false)
+fn flag_value_disabled(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("0")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("disabled")
+        || value.eq_ignore_ascii_case("cpu")
 }
 
-#[allow(dead_code)]
-fn env_flag_enabled(key: &str) -> bool {
-    env::var(key)
-        .map(|value| {
-            let value = value.trim();
-            value.eq_ignore_ascii_case("1")
-                || value.eq_ignore_ascii_case("on")
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("enabled")
-        })
-        .unwrap_or(false)
+fn flag_value_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("1")
+        || value.eq_ignore_ascii_case("on")
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("enabled")
 }
 
 /// Exactly the spelling the Metal runtime accepts (`src/metal.rs`:
 /// `f32y_gemv_enabled`, `wire_weights_enabled`, `kquant_resident_enabled`, and
-/// `q8_0_env_flag_enabled_default_off`). The generic [`env_flag_enabled`] also
+/// `q8_0_env_flag_enabled_default_off`). The generic [`flag_value_enabled`] also
 /// accepts `on`/`enabled`, so using it here would let `CAMELID_METAL_KQUANT=on`
 /// label a run Metal-resident while the engine actually ran on the CPU.
-#[allow(dead_code)]
-fn metal_env_flag_enabled(key: &str) -> bool {
-    env::var(key).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+fn metal_flag_value_enabled(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true")
 }
 
-#[allow(dead_code)]
-fn x86_kernel_avx2_explicitly_requested() -> bool {
-    env::var("CAMELID_X86_Q8_KERNEL")
-        .map(|value| value.trim().eq_ignore_ascii_case("avx2"))
-        .unwrap_or(false)
-}
-
-fn invalid_x86_kernel_override() -> Option<String> {
-    let value = env::var("CAMELID_X86_Q8_KERNEL").ok()?;
+/// The offending value when `CAMELID_X86_Q8_KERNEL` names a kernel this build
+/// does not have, else `None` (unset, a disable spelling, or a valid AVX2 opt-in
+/// all count as "no invalid override").
+fn invalid_x86_kernel_value(value: &str) -> Option<&str> {
     let trimmed = value.trim();
     if trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("0")
@@ -1428,6 +1559,15 @@ fn invalid_x86_kernel_override() -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+fn env_flag_disabled(key: &str) -> bool {
+    env::var(key).is_ok_and(|value| flag_value_disabled(&value))
+}
+
+#[allow(dead_code)]
+fn env_flag_enabled(key: &str) -> bool {
+    env::var(key).is_ok_and(|value| flag_value_enabled(&value))
 }
 
 #[cfg(test)]
@@ -1750,6 +1890,111 @@ mod tests {
             outcome.plan.support_level,
             "supported_exact_row_smoke_sub512"
         );
+    }
+
+    /// The planner must not read its own output back as an operator opt-out.
+    ///
+    /// A successful Metal-resident selection WRITES `CAMELID_MAC_Q8_REPACK=off`
+    /// (the GPU consumes plain blocks, so the CPU rows4 repack is disabled).
+    /// While the planner read that key live, the SECOND `plan_for_model` in a
+    /// process saw "off" as an operator opt-out and fell through to
+    /// `safe_q8_plan` — so serve's second model load disclosed `cpu_reference` /
+    /// `safe_cpu_decode` on `/v1/health`, `/api/capabilities` and
+    /// `/execution-plan` while it went on decoding at ~47 tok/s on the Metal
+    /// resident lane. Reproduced 2026-07-31 on main `56ff2eb3`: the same
+    /// Llama 3.2 1B file planned `metal_resident_q8_runtime` when loaded at
+    /// startup and `cpu_reference` when re-loaded through
+    /// `POST /api/models/load`.
+    ///
+    /// This drives the real sequence — plan, apply, plan again against the SAME
+    /// baseline — because that is what serve does per model load.
+    #[test]
+    fn planning_twice_in_one_process_does_not_read_the_first_plans_output() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        // Captured before any plan applied its env_updates, exactly as
+        // `AppState::new` captures it before serve's first load.
+        let planner_env = PlannerEnv::capture();
+        let platform = || metal_platform("macos", "aarch64", &["dotprod", "i8mm"]);
+
+        let first = plan_for_model_with_platform_and_env(
+            &PathBuf::from("/models/Llama-3.2-1B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 1B Instruct"),
+            Some(8),
+            platform(),
+            &planner_env,
+        );
+        assert_eq!(first.plan.selected_backend, "metal_resident_q8_runtime");
+        // The load pipeline applies the plan's env before the next load plans.
+        planner_env.apply(&first.env_updates);
+        assert_eq!(
+            env::var("CAMELID_MAC_Q8_REPACK").as_deref(),
+            Ok("off"),
+            "precondition: the Metal selection writes the key this test is about"
+        );
+
+        let second = plan_for_model_with_platform_and_env(
+            &PathBuf::from("/models/gemma-3-1b-it-Q8_0.gguf"),
+            &gemma3_fixture("gemma-3-1b-it"),
+            Some(8),
+            platform(),
+            &planner_env,
+        );
+        // A third, to catch a fix that only survives one round trip.
+        planner_env.apply(&second.env_updates);
+        let third = plan_for_model_with_platform_and_env(
+            &PathBuf::from("/models/Llama-3.2-1B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 1B Instruct"),
+            Some(8),
+            platform(),
+            &planner_env,
+        );
+        clear_profile_env();
+
+        assert_eq!(
+            second.plan.selected_backend, "metal_resident_q8_runtime",
+            "the second load must disclose the lane it actually runs on, not the \
+             first load's CAMELID_MAC_Q8_REPACK=off output"
+        );
+        assert_eq!(second.plan.decode_path, "q8_0_metal_resident_decode");
+        assert!(
+            !second
+                .plan
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("CAMELID_MAC_Q8_REPACK disables Mac repack")),
+            "the second plan must not blame an operator opt-out the operator never set: {:?}",
+            second.plan.reasons
+        );
+        assert_eq!(third.plan.selected_backend, "metal_resident_q8_runtime");
+        assert_eq!(third.plan.decode_path, "q8_0_metal_resident_decode");
+    }
+
+    /// The other direction: pinning the planner to an operator baseline must not
+    /// deafen it to a REAL opt-out. `CAMELID_MAC_Q8_REPACK=0` set before the
+    /// baseline is captured still fails the plan closed to the safe path.
+    #[test]
+    fn operator_set_repack_opt_out_survives_the_planner_env_baseline() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        env::set_var("CAMELID_MAC_Q8_REPACK", "0");
+        let planner_env = PlannerEnv::capture();
+        let outcome = plan_for_model_with_platform_and_env(
+            &PathBuf::from("/models/Llama-3.2-1B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 1B Instruct"),
+            Some(8),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+            &planner_env,
+        );
+        clear_profile_env();
+        assert_eq!(outcome.plan.selected_backend, "cpu_reference");
+        assert!(outcome
+            .plan
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("CAMELID_MAC_Q8_REPACK disables Mac repack")));
     }
 
     /// Phase 3c triage: the disclosed execution plan and the live serve
