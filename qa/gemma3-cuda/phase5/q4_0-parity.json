@@ -1,5 +1,5 @@
 {
-  "model": "C:/Users/timto/models/gemma-4-E2B-it-Q4_0.gguf",
+  "model": "<SCRUBBED>/models/gemma-4-E2B-it-Q4_0.gguf",
   "max_tokens": 32,
   "legs": [
     {"prompt": "Name the capital of France in one word.", "cuda_ids": "[50429, 236820, 643, 236779, 1340, 236779, 887, 236813]", "cpu_ids": "[50429, 236820, 643, 236779, 1340, 236779, 887, 236813]", "token_identical": true},
