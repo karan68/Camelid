@@ -224,7 +224,7 @@ the full `llama32_3b_instruct_q8_0`.
 | **Llama 3.2 3B Instruct** | `Q8_0` | `llama` | 3.4 GB | `llama32_3b` | `Llama-3.2-3B-Instruct-Q8_0.gguf` |
 | **Llama 3 8B Instruct** | `Q8_0` | `llama` | 8.5 GB | `llama3_8b` | `Meta-Llama-3-8B-Instruct.Q8_0.gguf` |
 | **Llama 3.1 8B Instruct** | `Q8_0` | `llama` | 8.5 GB | `llama31_8b` | `Meta-Llama-3.1-8B-Instruct-Q8_0.gguf` |
-| **Gemma 3 1B-It** | `Q8_0` | `gemma3` | 1.1 GB | `gemma3_1b` | `gemma-3-1b-it-Q8_0.gguf` |
+| **Gemma 3 1B-It** | `Q8_0` | `gemma3` | 1.1 GB | `gemma_3_1b` | `gemma-3-1b-it-Q8_0.gguf` |
 | **Gemma 4 E2B-It** | `Q8_0` | `gemma4` | 5.0 GB | `gemma4_e2b` | `gemma-4-E2B-it-Q8_0.gguf` |
 | **Gemma 4 E4B-It** | `Q8_0` | `gemma4` | 8.2 GB | `gemma4_e4b` | `gemma-4-E4B-it-Q8_0.gguf` |
 | **Gemma 4 12B-It** — two-Mac distributed | `Q8_0` | `gemma4` | 12.7 GB | `gemma4_12b` | `gemma-4-12b-it-Q8_0.gguf` |
@@ -448,6 +448,7 @@ and evidence envelope for a selection of those rows:
 | Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
 | Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
 | Qwen3 4B | Q8_0 | single-node | Exact-row ChatML parity (thinking-disabled) |
+| Gemma 3 1B-It | Q8_0 | single-node (Metal GPU-resident) | Exact-row chat parity 15/15 below the window + 9/9 above it, to 2,403 prompt tokens |
 | Gemma 4 E2B-It | Q8_0 | single-node | 5/5 greedy parity (CPU + Metal) |
 
 ## Build from source
