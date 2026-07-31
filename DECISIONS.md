@@ -1196,3 +1196,99 @@ cross-platform fix, W1, is a strict improvement there). Follow-ups on the
 amendment log: `win_uia.rs` shares W3(a)'s output leg (A11/W10); the real-TUI
 CERT rows of `qa/hardpan/MANUAL_CHECKLIST.md` are owed post-merge
 (merge-ahead authorized 2026-07-23).
+
+## D20 — Windowed-attention architectures: routing invariants (2026-07-30)
+
+Binding for every architecture whose attention is windowed (`gemma3` today;
+`model::arch_has_windowed_attention` is the predicate). Adopted during the
+gemma3→Metal campaign (`GEMMA3_METAL_CONDUCTOR.md` §§10-13), where each of the
+three rules below was written *after* an adversarial review found the code
+without it. All three survived two review passes.
+
+### D20.1 — Routing is capability- and quant-aware, never a bare arch list
+
+A windowed architecture is not "runnable-only" or "resident-capable" as a
+property of its name. It is one or the other **per host and per file**:
+
+- `model::arch_requires_runnable_bridge(arch)` is the live predicate; its pure
+  half `..._given(arch, capable)` makes the split unit-testable with no env and
+  no device.
+- `inference::windowed_arch_resident_host_available()` is the capability probe:
+  macOS build **and** resident Metal decode enabled (live env; deterministic
+  mode forces it off) **and not** CUDA-resident (the CUDA engine has no windowed
+  forward) **and** a real Metal device.
+- Admission is additionally pinned to the quant the receipt covers. For windowed
+  archs `is_resident_quant` returns true only for Q8_0, with an explicit typed
+  decline when any layer linear is not Q8_0. A gemma3 Q4_K_M would otherwise
+  ride the Metal K-quant admission onto an F16-primary lane whose gather drops
+  `embed_scale`, with no windowed receipt behind it.
+
+Serve and the CLI direct lanes consult the *same* predicate, so they cannot
+disagree about which lane a file gets. The reason this matters is not tidiness:
+the window mask is the difference between correct and wrong above 512 tokens,
+and "which lane" is therefore a correctness decision, not a performance one.
+
+### D20.2 — The fail-closed is a CHOKE POINT, never a list of entry-point guards
+
+The CPU dense forward has no window mask. It must therefore refuse windowed
+architectures, and *where* the refusal lives is the whole decision. The first
+implementation guarded the three CPU dense entry points that were reachable at
+the time. Phase 3c's review then found that the routing flip had made four MORE
+reachable — `forward_greedy_verify_chunk`, `forward_layer_range_from_hidden`,
+`forward_worker_layers`, `ghost_forward_one_layer` — and that guarding those
+four would simply leave the fifth. **Entry-point enumeration is not an
+invariant; it is a list that goes stale on someone else's commit.**
+
+So the guard moved to the narrowest point every CPU dense layer walk must pass
+through. `ensure_windowed_arch_off_cpu_dense_layer` (a free function keyed on
+`model::arch_has_windowed_attention`, i.e. parsed metadata rather than the arch
+string, so a future windowed arch inherits it with no edit) returns a typed
+`BackendError::UnsupportedModelArchitecture` naming both correct lanes, and it
+is called from the only two per-layer dense forwards that exist:
+
+| Choke point | Covers |
+|---|---|
+| `forward_layer_timed` | every decode-side CPU dense layer walk |
+| `forward_prefill_layer_chunk_timed` | every prefill-side CPU dense layer walk |
+
+The three session-level guards that remain (`batch prefill`, `layer-major
+prefill`, `decode forward`) are **courtesy legs only**: they delegate to the
+same function so the operator sees the lane that failed instead of the generic
+per-layer message. Deleting one degrades an error string; deleting a choke-point
+call is the actual regression.
+
+The invariant is therefore "two per-layer forwards, both guarded", and it is
+pinned as a completeness proof AND a revert detector in `src/inference/tests.rs`:
+two choke-point tests (fail if either call is deleted), one non-windowed control
+(proves the guard is what causes the refusal rather than the fixture), three
+lane-name tests (fail if a courtesy leg is deleted — the message's lane changes),
+and four entry-point tests asserting the inherited callers above are covered
+*through* the choke point rather than by their own guards.
+
+Why this matters more than most fail-closeds: a full-causal forward on a windowed
+model does not crash. It returns fluent, plausible, wrong text.
+
+### D20.3 — A plan OUTPUT can never be a routing INPUT
+
+The execution plan describes what the engine decided. Feeding any part of that
+description back into the decision makes the two circular and lets a single env
+var mean two different things at once. Concretely: the resident-host probe once
+consulted `CAMELID_MAC_Q8_REPACK`, a variable that is simultaneously an operator
+opt-out and a plan-output label — so an operator disabling repack silently
+changed which *lane* served the model, while the plan kept reporting a lane it
+was no longer on. The probe now consults only inputs (platform, env gates,
+device presence).
+
+The corollary is that where the resident plan selection cannot fire, the plan
+**fails closed** to `safe_q8_plan` with a windowed-arch reason rather than
+advertising a CPU dense lane D20.2 forbids. A plan that names a lane the engine
+would refuse to run is worse than no plan.
+
+### What this does not decide
+
+Nothing here is a performance decision, and none of it constitutes a throughput
+claim for any lane. `support_level` in the execution plan stays deliberately
+platform-blind (`supported_exact_row_smoke_sub512` for the gemma3 row) because
+that table is keyed on the row name alone and is reported on fallback hosts too;
+the lane-aware context claim lives in `/api/capabilities`, which is the support
+source of truth and states the lane it applies to.

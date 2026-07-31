@@ -51,17 +51,34 @@ impl MetalSampleRequest {
 #[allow(dead_code)]
 pub(super) const MAX_VERIFY_K: usize = 8;
 
-/// Whether a GPU-resident session may mirror its KV back so the prompt-prefix
-/// cache can store it. Default ON: the alternative is re-prefilling every
-/// repeated or growing chat prompt, which on this lane costs seconds. Set
-/// `CAMELID_PREFIX_CACHE_RESIDENT=0` to keep the CPU KV at zero bytes on the
-/// resident lane and accept the re-prefill.
+/// Whether `prepare_for_prompt_prefix_cache` may vouch for ANY session — the
+/// prompt-prefix-cache kill switch. Default ON: the alternative is
+/// re-prefilling every repeated or growing chat prompt, which on the resident
+/// lane costs seconds. Set `CAMELID_PREFIX_CACHE_RESIDENT=0` to refuse every
+/// preparation: no session is stored, the CPU KV stays at zero bytes on the
+/// resident lane, and every turn pays the re-prefill. (Historically this gate
+/// sat AFTER the CPU-authoritative early accept, so it only ever suppressed
+/// the resident mirror and did nothing at all for CPU-authoritative sessions
+/// — see `prepare_for_prompt_prefix_cache_gated`.)
 pub(super) fn resident_prefix_cache_mirror_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        !std::env::var("CAMELID_PREFIX_CACHE_RESIDENT")
-            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        prefix_cache_setting_enables(
+            std::env::var("CAMELID_PREFIX_CACHE_RESIDENT")
+                .ok()
+                .as_deref(),
+        )
     })
+}
+
+/// Pure parse of the `CAMELID_PREFIX_CACHE_RESIDENT` value. Split from the
+/// latched gate above so the documented opt-out can be tested without an
+/// in-test `set_var` — the gate is a process-wide OnceLock, and latching it
+/// from inside a test flips every sibling test in the binary
+/// (GEMMA3_METAL_CONDUCTOR.md §9d: arm gates from the shell, never from a
+/// test).
+pub(super) fn prefix_cache_setting_enables(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
 /// True when any dense projection this resident engine will consume is a
@@ -121,6 +138,29 @@ pub(super) fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeight
 }
 
 impl super::LlamaInferenceSession {
+    /// gemma3 per-layer dual-theta RoPE schedule for a resident session built
+    /// over the node's OWNED layer range (absolute layer ids — pipeline-sharded
+    /// nodes hold a subrange). Sliding layers select the ALT (local-theta)
+    /// tables; globals the primary. `None` for every non-gemma3 arch — the
+    /// session then behaves byte-identically to before the schedule existed.
+    fn gemma3_resident_schedule(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Option<metal::ResidentLayerSchedule> {
+        self.config
+            .gemma3
+            .as_ref()
+            .map(|g| metal::ResidentLayerSchedule {
+                use_alt_rope: range.clone().map(|l| g.is_sliding_layer(l)).collect(),
+                // Window INCLUDES the current position (attend
+                // [pos+1-window ..= pos]) — Gemma3Metadata::layer_window keeps
+                // the same convention, so this is a straight copy.
+                window: range
+                    .map(|l| g.layer_window(l).map(|w| w as usize))
+                    .collect(),
+            })
+    }
+
     pub(super) fn try_metal_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
         if std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
             .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
@@ -166,7 +206,22 @@ impl super::LlamaInferenceSession {
         let rope_us = edge_started.elapsed().as_micros();
         let session_started = Instant::now();
         let initial_positions = (n + 1).next_multiple_of(512).min(kv_cap);
+        // Must precede `ResidentDecodeState::new`, which reads the lane flag
+        // through `resident_kv_format()` to pick the primary KV format.
         metal::set_resident_kquant_lane(weights_use_kquant(&weights));
+        // gemma3: force split-half (NEOX) pairing host-side from the parsed
+        // metadata (NOT `LlamaModelConfig::rope_neox_pairing`, which stays false
+        // for gemma3 — Phase 1b design note), and attach the per-layer
+        // dual-theta schedule. The schedule makes `prefill_tokens` decline
+        // (single table set), so a gemma3 session built here would fall back —
+        // today gemma3 never reaches this path at all (arch disqualifier).
+        let split_half_pairing = split_half_pairing
+            || self
+                .config
+                .gemma3
+                .as_ref()
+                .is_some_and(|g| g.rope_neox_pairing);
+        let schedule = self.gemma3_resident_schedule(0..n_layers);
         let mut session = match metal::ResidentDecodeState::new(
             n_layers,
             n_heads,
@@ -178,6 +233,7 @@ impl super::LlamaInferenceSession {
             kv_cap,
             rms_eps,
             split_half_pairing,
+            schedule,
         ) {
             Some(s) => s,
             None => return Ok(false),
@@ -185,10 +241,19 @@ impl super::LlamaInferenceSession {
 
         let session_us = session_started.elapsed().as_micros();
         let embed_started = Instant::now();
-        let embeddings = self
+        let mut embeddings = self
             .weights
             .token_embedding
             .embedding_lookup(token_ids, "token_embedding_resident_prefill")?;
+        // gemma3 embedding scale (dormant: a gemma3 session carries a layer
+        // schedule, which prefill_tokens declines — wired for Phase 3).
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for v in embeddings.data.iter_mut() {
+                *v *= g.embed_scale;
+            }
+        }
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights
             .layers
             .iter()
@@ -197,6 +262,9 @@ impl super::LlamaInferenceSession {
                 ffn_norm: &l.ffn_norm.data,
                 q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
+                post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -353,14 +421,29 @@ impl super::LlamaInferenceSession {
     /// Returns whether the session is safe to cache now. Never fails the
     /// caller's request: a refusal just means no cache entry.
     pub fn prepare_for_prompt_prefix_cache(&mut self) -> bool {
+        self.prepare_for_prompt_prefix_cache_gated(resident_prefix_cache_mirror_enabled())
+    }
+
+    /// `cache_enabled` is `resident_prefix_cache_mirror_enabled()` in
+    /// production; parameterized so tests can prove the kill-switch ordering
+    /// without touching the process-latched env gate (§9d).
+    pub(super) fn prepare_for_prompt_prefix_cache_gated(&mut self, cache_enabled: bool) -> bool {
+        // KILL SWITCH FIRST. `CAMELID_PREFIX_CACHE_RESIDENT=0` must refuse
+        // every session, including a CPU-authoritative one. The early accept
+        // below used to run first, so on any session whose forward stayed on
+        // the CPU the variable did nothing at all: on windowed archs (whose
+        // sessions are all CPU-authoritative until the gemma3 Phase 3b flip)
+        // it was not a kill switch, and on the ordinary CPU lane it never was
+        // one either. Arch-independent live-main bug, fixed as gemma3 Phase
+        // 3a-H3 (GEMMA3_METAL_CONDUCTOR.md §9e-2).
+        if !cache_enabled {
+            return false;
+        }
         if self.cpu_kv_authoritative() {
             return true;
         }
         let position = self.kv_cache.position;
         if position == 0 {
-            return false;
-        }
-        if !resident_prefix_cache_mirror_enabled() {
             return false;
         }
         // BOTH halves of the round trip must be lossless.
@@ -520,7 +603,7 @@ impl super::LlamaInferenceSession {
             return Ok(None);
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
-        let tables = match rope::resident_decode_rope_tables(
+        let mut tables = match rope::resident_decode_rope_tables(
             position,
             head_dim,
             &self.config,
@@ -528,6 +611,31 @@ impl super::LlamaInferenceSession {
         )? {
             Some(t) => t,
             None => return Ok(None),
+        };
+        // gemma3 dual-theta RoPE: replace the generic single-table build with
+        // the VERBATIM runnable-oracle frequency form for BOTH thetas (global
+        // primary + local ALT; see `rope::gemma3_rope_tables` on why the
+        // negated-exponent generic form is not used), and force split-half
+        // pairing from the parsed metadata (`Gemma3Metadata.rope_neox_pairing`
+        // — NOT `LlamaModelConfig::rope_neox_pairing`, which stays false for
+        // gemma3 per the Phase 1b design note).
+        let rope_dim = self
+            .config
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+        let gemma3_alt = if let Some(g) = self.config.gemma3.as_ref() {
+            let (cos, sin) = rope::gemma3_rope_tables(position, rope_dim, g.rope_freq_base_global);
+            tables.cos = cos;
+            tables.sin = sin;
+            tables.split_half_pairing = g.rope_neox_pairing || tables.split_half_pairing;
+            Some(rope::gemma3_rope_tables(
+                position,
+                rope_dim,
+                g.rope_freq_base_local,
+            ))
+        } else {
+            None
         };
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
 
@@ -551,6 +659,9 @@ impl super::LlamaInferenceSession {
                 kv_cap,
                 rms_eps,
                 tables.split_half_pairing,
+                // gemma3: per-layer dual-theta schedule over the OWNED layer
+                // range (pipeline-sharded nodes hold a subrange).
+                self.gemma3_resident_schedule(range.clone()),
             ) {
                 Some(s) => s,
                 None => return Ok(None),
@@ -601,6 +712,8 @@ impl super::LlamaInferenceSession {
             self.resident_decode = Some(session);
         }
 
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights.layers[range.clone()]
             .iter()
             .map(|l| metal::ResidentLayerWeights {
@@ -608,6 +721,9 @@ impl super::LlamaInferenceSession {
                 ffn_norm: &l.ffn_norm.data,
                 q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
+                post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -644,6 +760,16 @@ impl super::LlamaInferenceSession {
                     metal::SampleStage {
                         embedding_blocks,
                         mode: gpu_sample.expect("sample request matched above").mode(),
+                        // gemma3's sqrt(d_model) embedding scale rides the GPU
+                        // gather so the fast lane's self-fed next token matches
+                        // the CPU-written embedding below; exact no-op (1.0)
+                        // for every other arch.
+                        embed_scale: self
+                            .config
+                            .gemma3
+                            .as_ref()
+                            .map(|g| g.embed_scale)
+                            .unwrap_or(1.0),
                     },
                 )
             }
@@ -660,25 +786,65 @@ impl super::LlamaInferenceSession {
 
         // Rope tables for position+1 feed the encode-ahead pipeline: the session encodes
         // the NEXT token's command buffer while this token executes on the GPU.
-        let next_tables = if self.resident_encode_ahead_enabled {
-            rope::resident_decode_rope_tables(
-                position + 1,
-                head_dim,
-                &self.config,
-                weights.rope_freqs.as_ref(),
-            )?
+        // Appliance mode (2+ active slots) suppresses encode-ahead entirely:
+        // `next_rope: None` is the only thing that stops `forward_token` from
+        // pre-encoding the next command buffer. gemma3 rebuilds BOTH theta
+        // tables with the oracle-form builder, same as the current token's;
+        // `forward_token` skips the pre-encode when a gemma3 session's ALT
+        // tables are absent, so `(None, None)` is safe rather than encoding a
+        // wrong-theta graph.
+        let (next_tables, next_gemma3_alt) = if !self.resident_encode_ahead_enabled {
+            (None, None)
+        } else if let Some(g) = self.config.gemma3.as_ref() {
+            let (cos, sin) =
+                rope::gemma3_rope_tables(position + 1, rope_dim, g.rope_freq_base_global);
+            (
+                Some(rope::ResidentRopeTables {
+                    cos,
+                    sin,
+                    split_half_pairing: tables.split_half_pairing,
+                }),
+                Some(rope::gemma3_rope_tables(
+                    position + 1,
+                    rope_dim,
+                    g.rope_freq_base_local,
+                )),
+            )
         } else {
-            None
+            (
+                rope::resident_decode_rope_tables(
+                    position + 1,
+                    head_dim,
+                    &self.config,
+                    weights.rope_freqs.as_ref(),
+                )?,
+                None,
+            )
+        };
+        // gemma3 scales token embeddings by sqrt(d_model) before layer 0
+        // (reference src/runnable/model.rs:787-792). Applied here on the
+        // resident lane's input; the GPU sampling gather applies the same
+        // scale for the fast lane's self-fed next token. Ungated: the CPU-side
+        // scale is what every token uses when encode-ahead is off.
+        let scaled_embedding: Vec<f32>;
+        let embedding_data: &[f32] = if let Some(g) = self.config.gemma3.as_ref() {
+            scaled_embedding = embedding.data.iter().map(|v| v * g.embed_scale).collect();
+            &scaled_embedding
+        } else {
+            &embedding.data
         };
         let session = self
             .resident_decode
             .as_mut()
             .expect("resident session built above");
         let out = match session.forward_token(
-            &embedding.data,
+            embedding_data,
             &layer_views,
             &tables.cos,
             &tables.sin,
+            gemma3_alt
+                .as_ref()
+                .map(|(c, s)| (c.as_slice(), s.as_slice())),
             position,
             scale,
             logits_stage,
@@ -689,6 +855,9 @@ impl super::LlamaInferenceSession {
             next_tables
                 .as_ref()
                 .map(|t| (t.cos.as_slice(), t.sin.as_slice())),
+            next_gemma3_alt
+                .as_ref()
+                .map(|(c, s)| (c.as_slice(), s.as_slice())),
         ) {
             Some(o) => o,
             None => return Ok(None),
@@ -759,10 +928,17 @@ impl super::LlamaInferenceSession {
         let mut inputs = Vec::with_capacity(k);
         inputs.push(last_token);
         inputs.extend_from_slice(drafts);
-        let embeddings = self
+        let mut embeddings = self
             .weights
             .token_embedding
             .embedding_lookup(&inputs, "token_embedding_spec_verify")?;
+        // gemma3 embedding scale (dormant: verify declines schedule-carrying
+        // sessions — wired for consistency).
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for v in embeddings.data.iter_mut() {
+                *v *= g.embed_scale;
+            }
+        }
 
         // Per-position RoPE tables (position `base+i`), flattened position-major.
         let mut cos_all = Vec::with_capacity(k * head_dim);
@@ -782,6 +958,8 @@ impl super::LlamaInferenceSession {
             }
         }
 
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights
             .layers
             .iter()
@@ -790,6 +968,9 @@ impl super::LlamaInferenceSession {
                 ffn_norm: &l.ffn_norm.data,
                 q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
+                post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -894,10 +1075,17 @@ impl super::LlamaInferenceSession {
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
 
         // Embeddings in BFS (node) order: node 0 is the anchor, nodes 1.. the drafts.
-        let embeddings = self
+        let mut embeddings = self
             .weights
             .token_embedding
             .embedding_lookup(&tree.tokens, "token_embedding_tree_verify")?;
+        // gemma3 embedding scale (dormant: verify declines schedule-carrying
+        // sessions — wired for consistency).
+        if let Some(g) = self.config.gemma3.as_ref() {
+            for v in embeddings.data.iter_mut() {
+                *v *= g.embed_scale;
+            }
+        }
 
         // Per-node RoPE tables at position `base + node_depth[i]` (flattened node-major).
         let node_depth = tree.node_depth();
@@ -920,6 +1108,8 @@ impl super::LlamaInferenceSession {
         let node_kvslot = tree.node_kvslot(position);
         let (ancestor_bits, words) = tree.ancestor_bitset();
 
+        // gemma3 FFN activation is GeGLU; every other arch on this lane is SiLU.
+        let ffn_geglu = self.config.gemma3.as_ref().is_some_and(|g| g.ffn_geglu);
         let layer_views: Vec<metal::ResidentLayerWeights> = weights
             .layers
             .iter()
@@ -928,6 +1118,9 @@ impl super::LlamaInferenceSession {
                 ffn_norm: &l.ffn_norm.data,
                 q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
                 k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                post_attn_norm: l.post_attention_norm.as_ref().map(|t| t.data.as_slice()),
+                post_ffw_norm: l.post_ffw_norm.as_ref().map(|t| t.data.as_slice()),
+                ffn_geglu,
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),

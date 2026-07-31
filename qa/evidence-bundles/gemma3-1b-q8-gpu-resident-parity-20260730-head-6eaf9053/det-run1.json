@@ -1,0 +1,231 @@
+{
+  "schema": "camelid.gemma3.resident_determinism_leg.v1",
+  "model_id": "Gemma 3 1b It",
+  "depth": 24,
+  "lane": "metal_resident_q8_runtime / q8_0_metal_resident_decode",
+  "sampling": "greedy (temperature 0, top_k 1, seed 0)",
+  "chat_legs": [
+    {
+      "i": 0,
+      "kind": "gate_chat",
+      "text": "The capital of France is **Paris**. \n\nIt’s a common misconception that Paris is the *only* capital",
+      "prompt_tokens": 16
+    },
+    {
+      "i": 1,
+      "kind": "gate_chat",
+      "text": "Hello there!",
+      "prompt_tokens": 16
+    },
+    {
+      "i": 2,
+      "kind": "gate_chat",
+      "text": "The largest ocean on Earth is the **Pacific Ocean**. \n\nIt covers approximately 63 million square miles (1",
+      "prompt_tokens": 16
+    },
+    {
+      "i": 3,
+      "kind": "gate_chat",
+      "text": "This is a classic question! The color of the sky on a clear day is often described as **blue**. \n\n",
+      "prompt_tokens": 19
+    },
+    {
+      "i": 4,
+      "kind": "gate_chat",
+      "text": "Okay, here we go!\n\nOne, two, three, four, five!",
+      "prompt_tokens": 17
+    },
+    {
+      "i": 5,
+      "kind": "windowed_chat",
+      "text": "The name of the river is the Willow.",
+      "prompt_tokens": 2403
+    }
+  ],
+  "token_id_legs": [
+    {
+      "i": 0,
+      "kind": "raw_completion",
+      "prompt": "The capital of France is",
+      "prompt_token_ids": [
+        2,
+        818,
+        5279,
+        529,
+        7001,
+        563
+      ],
+      "generated_token_ids": [
+        9079,
+        236761,
+        108,
+        818,
+        7488,
+        3207,
+        528,
+        7001,
+        563,
+        9079,
+        236761,
+        108,
+        818,
+        1346,
+        4913,
+        3207,
+        528,
+        7001,
+        563,
+        9079,
+        236761,
+        108,
+        818,
+        1346
+      ],
+      "text": " Paris.\n\nThe largest city in France is Paris.\n\nThe most popular city in France is Paris.\n\nThe most"
+    },
+    {
+      "i": 1,
+      "kind": "raw_completion",
+      "prompt": "Q: What is 2+2? A:",
+      "prompt_token_ids": [
+        2,
+        236935,
+        236787,
+        2900,
+        563,
+        236743,
+        236778,
+        236862,
+        236778,
+        236881,
+        562,
+        236787
+      ],
+      "generated_token_ids": [
+        107,
+        138,
+        107,
+        138,
+        236799,
+        236787,
+        236743,
+        236812,
+        107,
+        138,
+        107,
+        138,
+        236780,
+        236787,
+        236743,
+        236810,
+        107,
+        138,
+        107,
+        138,
+        236796,
+        236787,
+        236743,
+        236825
+      ],
+      "text": "\n  \n  B: 4\n  \n  C: 5\n  \n  D: 6"
+    },
+    {
+      "i": 2,
+      "kind": "raw_completion",
+      "prompt": "Once upon a time,",
+      "prompt_token_ids": [
+        2,
+        14946,
+        3324,
+        496,
+        990,
+        236764
+      ],
+      "generated_token_ids": [
+        528,
+        496,
+        1944,
+        9744,
+        92956,
+        28383,
+        496,
+        52160,
+        3730,
+        8858,
+        236764,
+        11742,
+        496,
+        3184,
+        3875,
+        7489,
+        2876,
+        2032,
+        236761,
+        2625,
+        691,
+        3224,
+        573,
+        1116
+      ],
+      "text": " in a small village nestled beside a sparkling blue river, lived a young woman named Elara. She was known for her"
+    },
+    {
+      "i": 3,
+      "kind": "raw_completion",
+      "prompt": "def fibonacci(n):",
+      "prompt_token_ids": [
+        2,
+        2063,
+        10779,
+        78113,
+        236769,
+        236749,
+        1473
+      ],
+      "generated_token_ids": [
+        107,
+        140,
+        12234,
+        107,
+        140,
+        22304,
+        1090,
+        506,
+        112782,
+        123466,
+        1548,
+        236761,
+        108,
+        140,
+        13432,
+        236787,
+        107,
+        144,
+        236749,
+        236787,
+        669,
+        3546,
+        529,
+        506
+      ],
+      "text": "\n    \"\"\"\n    Calculates the nth Fibonacci number.\n\n    Args:\n        n: The index of the"
+    },
+    {
+      "i": 4,
+      "kind": "raw_completion_windowed",
+      "prompt": "<windowed pack prompt index 2>",
+      "prompt_token_count": 2395,
+      "generated_token_ids": [
+        107,
+        818,
+        3890,
+        563,
+        103708,
+        236761,
+        107,
+        106
+      ],
+      "text": "\nThe answer is Willow.\n"
+    }
+  ]
+}

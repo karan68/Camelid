@@ -454,7 +454,9 @@ fn na_cells_carry_live_structural_anchors() {
     // rather than silently going stale.
     let api = bound("src/api/mod.rs");
     for anchor in [
-        "fn is_runnable_serve_arch",
+        // Phase 3c renamed this to the file-keyed form (routing is quant-aware
+        // now: arch alone cannot decide a windowed row's lane).
+        "fn is_runnable_serve_file",
         "fn resolve_gemma4_runtime_for_model",
         "fn lookup_prompt_prefix_cache",
         "fn store_prompt_prefix_cache",

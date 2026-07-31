@@ -178,7 +178,7 @@
       },
       "I-cache-quant": {
         "status": "na",
-        "reason": "Structural — no warm state exists on this lane to key: the runnable serve bridge routes only qwen35/gemma3 (src/api/mod.rs fn is_runnable_serve_arch), so a gemma4+NVFP4 pilot file never gets a RunnableServeRuntime; RunnableServeRuntime generation is &self-immutable with no cross-request decode cache (src/api/mod.rs struct RunnableServeRuntime); runnable smoke is one-shot and stays oracle-refused for the pilot until G3 (src/runnable/smoke.rs); the Llama-path prompt-prefix cache is unreachable from this lane (its payload is a LlamaInferenceSession). The meta-test asserts these structural anchors still exist in the bound sources."
+        "reason": "Structural — no warm state exists on this lane to key: the runnable serve bridge routes qwen35/gemma2 always and gemma3 only where the Metal resident lane cannot serve it (src/api/mod.rs fn is_runnable_serve_file, delegating to src/model.rs fn arch_requires_runnable_bridge), so a gemma4+NVFP4 pilot file never gets a RunnableServeRuntime; RunnableServeRuntime generation is &self-immutable with no cross-request decode cache (src/api/mod.rs struct RunnableServeRuntime); runnable smoke is one-shot and stays oracle-refused for the pilot until G3 (src/runnable/smoke.rs); the Llama-path prompt-prefix cache is unreachable from this lane (its payload is a LlamaInferenceSession). The meta-test asserts these structural anchors still exist in the bound sources."
       },
       "I-plat": {
         "status": "enforced",

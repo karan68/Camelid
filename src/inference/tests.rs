@@ -1034,6 +1034,8 @@ fn tiny_prefill_schedule_weights(attention_q: CpuTensor) -> LlamaLoadedWeights {
             attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
+            post_attention_norm: None,
+            post_ffw_norm: None,
             moe_router: None,
             mla_q_a_proj: None,
             mla_q_a_layernorm: None,
@@ -1433,6 +1435,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -1466,6 +1469,8 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
             attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
+            post_attention_norm: None,
+            post_ffw_norm: None,
             ffn_norm: dense_vector("blk.0.ffn_norm.weight"),
             ffn_gate: dense_matrix("blk.0.ffn_gate.weight"),
             ffn_up: dense_matrix("blk.0.ffn_up.weight"),
@@ -1545,6 +1550,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -1578,6 +1584,8 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
             attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
+            post_attention_norm: None,
+            post_ffw_norm: None,
             ffn_norm: dense_vector("blk.0.ffn_norm.weight"),
             ffn_gate: dense_matrix("blk.0.ffn_gate.weight"),
             ffn_up: dense_matrix("blk.0.ffn_up.weight"),
@@ -1628,35 +1636,60 @@ fn nope_config_disqualifies_the_resident_gpu_path() {
     );
 }
 
-/// gemma3/gemma2 must never reach the resident GPU engines: the dense binder
-/// silently drops their QK-norm and post-attention/post-FFN ("sandwich") norm
-/// tensors and the dense forward has no GeGLU, so the resident lane would decode
-/// fluent-looking garbage under a supported label. TEMPORARY until the gemma3
-/// Metal campaign (feat/gemma3-metal-resident) lands its resident encode in
-/// Phase 3 — this test then flips alongside the disqualifier's removal.
+/// gemma2 must never reach the resident GPU engines: its sandwich norms are
+/// still silently dropped at bind, so the lane would decode fluent-looking
+/// garbage under a supported label. Like the NoPE test above, the arch check
+/// sits before the backend-enabled gate in `resident_decode_eligible`, so the
+/// assertion is causal on a CPU-only host too.
 ///
-/// Like the NoPE test above, the arch check sits before the backend-enabled
-/// gate in `resident_decode_eligible`, so the assertion is causal on a
-/// CPU-only host too.
+/// gemma3 left the arch disqualifier in Phase 3b of the Metal campaign (the
+/// resident encode carries its full structure). Its remaining resident-
+/// eligibility pins are asserted here too: a windowed session over non-Q8_0
+/// weights must be refused — by the H5 Q8_0-exact-row pin / weight admission
+/// when a resident backend is armed, and by the backend-enabled gate when
+/// none is (either way, never admitted). The positive admission is proven by
+/// the env-keyed real-row gates in `src/metal.rs`.
 #[test]
-fn runnable_only_arch_disqualifies_the_resident_gpu_path() {
+fn arch_disqualifiers_refuse_the_resident_gpu_path() {
     let (mut session, _temp) = tiny_kv_budget_session(64);
 
-    for arch in ["gemma3", "gemma2"] {
-        session.config.architecture = arch.to_string();
-        assert!(
-            !session
-                .resident_decode_eligible(false)
-                .expect("eligibility check should not error"),
-            "a {arch} config must be refused by the resident GPU gate"
-        );
-        assert!(
-            !session
-                .resident_decode_eligible(true)
-                .expect("eligibility check should not error"),
-            "a {arch} config must be refused for the want-logits path too"
-        );
-    }
+    session.config.architecture = "gemma2".to_string();
+    assert!(
+        !session
+            .resident_decode_eligible(false)
+            .expect("eligibility check should not error"),
+        "a gemma2 config must be refused by the resident GPU gate"
+    );
+    assert!(
+        !session
+            .resident_decode_eligible(true)
+            .expect("eligibility check should not error"),
+        "a gemma2 config must be refused for the want-logits path too"
+    );
+
+    session.config.architecture = "gemma3".to_string();
+    session.config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 2,
+        sliding_window_pattern: 2,
+        rope_freq_base_global: 10_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 2.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    assert!(
+        !session
+            .resident_decode_eligible(false)
+            .expect("eligibility check should not error"),
+        "a windowed gemma3 session over non-Q8_0 weights must be refused"
+    );
+    assert!(
+        !session
+            .resident_decode_eligible(true)
+            .expect("eligibility check should not error"),
+        "a windowed gemma3 session over non-Q8_0 weights must be refused (want-logits too)"
+    );
 }
 
 /// End-to-end proof that the KV predict-and-abort budget guard fires through the
@@ -8674,6 +8707,7 @@ fn applies_rope_to_each_attention_head() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -8719,6 +8753,7 @@ fn apply_rope_uses_configured_frequency_base() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -8774,6 +8809,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -8833,6 +8869,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -8899,6 +8936,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -8970,6 +9008,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -9055,6 +9094,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -9139,6 +9179,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -10759,6 +10800,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -10837,6 +10879,8 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
             attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
+            post_attention_norm: None,
+            post_ffw_norm: None,
             moe_router: None,
             mla_q_a_proj: None,
             mla_q_a_layernorm: None,
@@ -11051,6 +11095,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -11122,6 +11167,8 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
             attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
+            post_attention_norm: None,
+            post_ffw_norm: None,
             moe_router: None,
             mla_q_a_proj: None,
             mla_q_a_layernorm: None,
@@ -11283,6 +11330,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -11332,6 +11380,8 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         attention_biases: None,
         attention_q_norm: None,
         attention_k_norm: None,
+        post_attention_norm: None,
+        post_ffw_norm: None,
         moe_router: None,
         mla_q_a_proj: None,
         mla_q_a_layernorm: None,
@@ -11399,6 +11449,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -11554,6 +11605,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -11625,6 +11677,8 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
             attention_biases: None,
             attention_q_norm: None,
             attention_k_norm: None,
+            post_attention_norm: None,
+            post_ffw_norm: None,
             moe_router: None,
             mla_q_a_proj: None,
             mla_q_a_layernorm: None,
@@ -12441,6 +12495,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         attention_key_length: None,
         logit_scale: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         mla: None,
@@ -13188,6 +13243,12 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
             attention_biases: None,
             attention_q_norm: q_norm,
             attention_k_norm: k_norm,
+            // gemma3's sandwich norms (Phase 1). This fixture is a plain Llama
+            // row, so both are absent — but they must be NAMED, or this
+            // `cuda`-gated constructor stops compiling on the only CI leg that
+            // builds it (ubuntu --all-features; macOS has no cuda feature).
+            post_attention_norm: None,
+            post_ffw_norm: None,
             ffn_norm: t("blk.0.ffn_norm.weight", vec![2], 2),
             ffn_gate: t("blk.0.ffn_gate.weight", vec![2, 2], 4),
             ffn_up: t("blk.0.ffn_up.weight", vec![2, 2], 4),
@@ -14149,6 +14210,47 @@ fn prompt_prefix_cache_preparation_is_a_no_op_for_a_cpu_authoritative_session() 
     assert_eq!(session.kv_cache.materialized_through, 0);
 }
 
+/// gemma3→Metal Phase 3a hazard H3 (arch-independent live-main bug):
+/// `CAMELID_PREFIX_CACHE_RESIDENT=0` is the prompt-prefix-cache kill switch,
+/// and it must be consulted BEFORE the CPU-authoritative early accept —
+/// historically the accept ran first, so the variable did nothing for any
+/// session whose forward stayed on the CPU (today: every windowed-arch
+/// session, and the whole ordinary CPU lane). Drives the parameterized seam
+/// rather than `set_var`: the production gate is a process-wide OnceLock, and
+/// latching it from inside a test flips sibling tests
+/// (GEMMA3_METAL_CONDUCTOR.md §9d — arm gates from the shell). The
+/// env-value-to-bool half is covered separately by the pure parse test below,
+/// so the chain var=0 -> enabled=false -> refusal is closed without touching
+/// process env.
+#[test]
+fn prompt_prefix_cache_preparation_env_opt_out_is_a_kill_switch() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(64);
+    assert!(session.cpu_kv_authoritative());
+    assert!(
+        session.prepare_for_prompt_prefix_cache_gated(true),
+        "this session caches when the switch is on (the control)"
+    );
+    assert!(
+        !session.prepare_for_prompt_prefix_cache_gated(false),
+        "with CAMELID_PREFIX_CACHE_RESIDENT=0 the SAME session must refuse — the kill \
+         switch beats the CPU-authoritative early accept"
+    );
+}
+
+/// The pure parse half of the H3 chain: the documented opt-out values (`0`,
+/// `false` case-insensitive) disable, everything else keeps the default ON.
+#[test]
+fn prefix_cache_env_setting_parses_the_documented_opt_out() {
+    use super::metal_resident::prefix_cache_setting_enables;
+    assert!(prefix_cache_setting_enables(None));
+    assert!(prefix_cache_setting_enables(Some("1")));
+    assert!(prefix_cache_setting_enables(Some("true")));
+    assert!(prefix_cache_setting_enables(Some("yes")));
+    assert!(!prefix_cache_setting_enables(Some("0")));
+    assert!(!prefix_cache_setting_enables(Some("false")));
+    assert!(!prefix_cache_setting_enables(Some("FALSE")));
+}
+
 /// BOTH halves of the mirror must be lossless. An F16 resident cache round-trips
 /// through an F32/F16 CPU cache exactly, but `--kv-quant q8_0|q4_0` re-quantizes
 /// on the way in — so a quantized CPU KV must refuse regardless of what the GPU
@@ -14168,13 +14270,60 @@ fn prompt_prefix_cache_preparation_refuses_a_quantized_cpu_kv() {
     }
 }
 
+/// gemma3→Metal Phase 3a hazard H2: a windowed-attention arch must prefill
+/// token-by-token through the single-token decode lane — the only lane whose
+/// forward reaches `try_resident_decode_forward` and with it the per-layer
+/// sliding-window / dual-theta schedule. The batched CPU prefill lanes have no
+/// window mask. `session_prefill_chunk_tokens` is the routing decision
+/// `generate_next_token_with_history_diagnostics` consumes.
+#[test]
+fn windowed_arch_prefill_forces_the_single_token_lane() {
+    let (session, _temp_file) = tiny_kv_budget_session(64);
+    let mut config = session.config.clone();
+    config.architecture = "gemma3".to_string();
+    config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 4,
+        sliding_window_pattern: 2,
+        rope_freq_base_global: 10_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 2.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    for prefill_count in [0usize, 1, 2, 3, 8, 64, 255, 256, 257, 511, 512, 513, 4096] {
+        assert_eq!(
+            super::session_prefill_chunk_tokens(&config, prefill_count),
+            1,
+            "a windowed arch must take the single-token prefill lane at count {prefill_count}"
+        );
+    }
+}
+
+/// The other half of H2's contract: every non-windowed arch keeps its prefill
+/// chunking BYTE-IDENTICAL to the pre-H2 decision (`prefill_chunk_token_count`
+/// verbatim), so existing resident archs see zero behavior change from the
+/// windowed-arch routing.
+#[test]
+fn non_windowed_arch_prefill_chunking_is_byte_identical() {
+    let (session, _temp_file) = tiny_kv_budget_session(64);
+    assert!(session.config.gemma3.is_none());
+    for prefill_count in [0usize, 1, 2, 3, 8, 64, 255, 256, 257, 511, 512, 513, 4096] {
+        assert_eq!(
+            super::session_prefill_chunk_tokens(&session.config, prefill_count),
+            super::prefill_chunk_token_count(prefill_count),
+            "non-windowed chunking must be unchanged at count {prefill_count}"
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn metal_resident_rollback_moves_filled_with_the_kv_position() {
     let (mut session, _temp_file) = tiny_kv_budget_session(64);
     // tiny_kv_budget_session: 1 layer, 1 head, 1 kv head, head_dim 32, hidden 32, ffn 32.
     let Some(mut state) =
-        crate::metal::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false)
+        crate::metal::ResidentDecodeState::new(1, 1, 1, 32, 32, 32, 16, 64, 1.0e-5, false, None)
     else {
         // No usable Metal lane. This is the ONLY guard for the draft-rollback regression that
         // needs no model file, so a silent skip here means the regression is unguarded — and
@@ -14216,4 +14365,344 @@ fn metal_resident_rollback_moves_filled_with_the_kv_position() {
     assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 4);
     session.rollback_resident_to_position(0).unwrap();
     assert_eq!(session.resident_decode.as_ref().unwrap().filled(), 0);
+}
+
+// gemma3→Metal merge gate MR1 (recorded in GEMMA3_METAL_CONDUCTOR.md §9c). `ResidentDecodeState::new` reads
+// the process-global K-quant lane flag through `resident_kv_format()` to pick
+// the primary KV format, so `set_resident_kquant_lane` must run immediately
+// before EVERY resident session construction: the prefill builder and the
+// decode rebuild branch. Dropping either one is silent — the session just gets
+// an F32 primary where it should have had F16, with no failing assertion
+// anywhere — and both sites sit in hunks that conflict on every rebase onto a
+// branch that touches session construction. A source-level count is crude but
+// it is the only thing that fails when a merge quietly deletes one.
+#[test]
+fn resident_session_construction_sets_the_kquant_lane_at_both_sites() {
+    let src = include_str!("metal_resident.rs");
+    let calls: Vec<usize> = src
+        .match_indices("metal::set_resident_kquant_lane(weights_use_kquant(")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected the K-quant lane to be recorded at both resident construction \
+         sites (prefill + decode rebuild), found {}",
+        calls.len()
+    );
+    for at in calls {
+        assert!(
+            src[at..].contains("metal::ResidentDecodeState::new("),
+            "a set_resident_kquant_lane call must precede the session construction \
+             it configures"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gemma3→Metal Phase 3c, finding F1: the windowed-arch CPU dense fail-closed
+// is carried by a CHOKE POINT, not by a list of entry-point guards.
+//
+// The review found H4 guarded only 3 of the CPU dense entry points while the
+// Phase 3b routing flip made four more reachable for gemma3
+// (`forward_greedy_verify_chunk`, `forward_layer_range_from_hidden`,
+// `forward_worker_layers`, `ghost_forward_one_layer`). Whack-a-mole would
+// leave the next entry point unguarded, so the invariant moved to
+// `ensure_windowed_arch_off_cpu_dense_layer`, called from the only two
+// per-layer dense forwards there are.
+//
+// These tests are the completeness proof AND the revert detector: the two
+// choke-point tests fail if either choke-point call is deleted, the three
+// lane-name tests fail if the corresponding early session guard is deleted
+// (the message's lane changes to the per-layer one), and the four
+// entry-point tests fail if the choke point stops covering an inherited
+// caller.
+// ---------------------------------------------------------------------------
+
+/// A synthetic single-layer session whose config carries gemma3's windowed
+/// metadata. The weights are the KV-budget fixture's — shape-valid and
+/// numerically trivial — because every test below asserts a REFUSAL: none of
+/// them may reach any arithmetic.
+fn tiny_windowed_session(context_length: u32) -> (LlamaInferenceSession, tempfile::NamedTempFile) {
+    let (mut session, temp_file) = tiny_kv_budget_session(context_length);
+    session.config.architecture = "gemma3".to_string();
+    session.config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 2,
+        sliding_window_pattern: 2,
+        rope_freq_base_global: 10_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 1.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    (session, temp_file)
+}
+
+fn assert_windowed_fail_closed(message: &str, expected_lane: &str) {
+    assert!(
+        message.contains("sliding-window attention"),
+        "the H4 error must name the windowed-attention hazard: {message}"
+    );
+    assert!(
+        message.contains("fails closed"),
+        "the H4 error must be explicit about failing closed: {message}"
+    );
+    assert!(
+        message.contains("camelid serve"),
+        "the H4 error must name the lane that can serve this arch: {message}"
+    );
+    assert!(
+        message.contains(expected_lane),
+        "expected the {expected_lane:?} lane in the H4 error, got: {message}"
+    );
+}
+
+/// CHOKE POINT 1. `forward_layer_timed` is the per-layer dense forward every
+/// single-row CPU walk uses. Deleting its guard call makes this fail.
+#[test]
+fn windowed_arch_choke_point_refuses_the_per_layer_decode_forward() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap();
+    let layer = session.weights.layers[0].clone();
+    let err = forward_layer_timed(
+        &hidden,
+        &layer,
+        ForwardLayerParams {
+            config: &session.config,
+            rope_freqs: None,
+            rms_norm_epsilon: session.config.rms_norm_epsilon,
+            layer_idx: 0,
+            collect_diagnostics: false,
+            runtime_plan: &runtime_plan,
+        },
+        &mut session.kv_cache,
+    )
+    .expect_err("the per-layer decode forward must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer decode forward");
+}
+
+/// CHOKE POINT 2. `forward_prefill_layer_chunk_timed` is the per-layer dense
+/// forward every multi-row CPU walk uses. Deleting its guard call makes this
+/// fail — and note it fires BEFORE the base-position check, so no legitimate
+/// caller can order its way around it.
+#[test]
+fn windowed_arch_choke_point_refuses_the_per_layer_prefill_chunk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![2, 32], vec![0.1; 64]).unwrap();
+    let layer = session.weights.layers[0].clone();
+    let err = forward_prefill_layer_chunk_timed(
+        &hidden,
+        &layer,
+        PrefillLayerChunkParams {
+            config: &session.config,
+            rope_freqs: None,
+            rms_norm_epsilon: session.config.rms_norm_epsilon,
+            layer_idx: 0,
+            base_position: 0,
+            chunk_start: 0,
+            chunk_rows: 2,
+        },
+        &mut session.kv_cache,
+    )
+    .expect_err("the per-layer prefill chunk must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
+
+/// The non-windowed control: the identical fixture without the window schedule
+/// computes a layer. Without this, every test above would still pass if the
+/// choke point refused EVERYTHING.
+#[test]
+fn non_windowed_arch_still_computes_a_cpu_dense_layer() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap();
+    let layer = session.weights.layers[0].clone();
+    forward_layer_timed(
+        &hidden,
+        &layer,
+        ForwardLayerParams {
+            config: &session.config,
+            rope_freqs: None,
+            rms_norm_epsilon: session.config.rms_norm_epsilon,
+            layer_idx: 0,
+            collect_diagnostics: false,
+            runtime_plan: &runtime_plan,
+        },
+        &mut session.kv_cache,
+    )
+    .expect("the non-windowed control must still compute a CPU dense layer");
+}
+
+/// EARLY GUARD 1 — `forward_prefill_chunk_timed_fast` (the "batch prefill"
+/// lane). Session-level chunking keeps a windowed arch off this entry point,
+/// so nothing reaches it in production; the guard exists so a future routing
+/// change surfaces the lane by name. Deleting `ensure_windowed_arch_off_cpu_
+/// dense("batch prefill")` makes this fail (the choke point then reports
+/// "per-layer prefill chunk" instead).
+#[test]
+fn windowed_arch_batch_prefill_names_its_lane_before_the_layer_walk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_prefill_chunk_timed_fast(&[0, 1])
+        .expect_err("batch prefill must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "batch prefill");
+}
+
+/// EARLY GUARD 2 — `forward_prefill_layer_major_timed_fast_inner` (the
+/// "layer-major prefill" lane). Same contract as above.
+#[test]
+fn windowed_arch_layer_major_prefill_names_its_lane_before_the_layer_walk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_prefill_layer_major_timed_fast_inner(&[0, 1], 2)
+        .expect_err("layer-major prefill must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "layer-major prefill");
+}
+
+/// EARLY GUARD 3 — the single-token decode fallback ("decode forward" lane),
+/// reached once the resident forward declines. This is the guard the H4 test
+/// in `api` exercises; it is pinned BY LANE NAME here so deleting it is
+/// visible rather than absorbed by the choke point.
+#[test]
+fn windowed_arch_decode_fallback_names_its_lane_before_the_layer_walk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_single_token_timed_internal(0, false, true)
+        .expect_err("the decode fallback must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "decode forward");
+}
+
+/// F1 ENTRY POINT A — the speculative-decode CPU verify walk. Reachable from
+/// `camelid serve --spec-decode` (src/api/mod.rs) and the bench lanes; it had
+/// NO guard before Phase 3c and ran the full dense layer loop.
+#[test]
+fn windowed_arch_speculative_verify_chunk_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_greedy_verify_chunk(&[0, 1])
+        .expect_err("the speculative verify walk must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
+
+/// F1 ENTRY POINT B — the distributed worker shard
+/// (`crate::distributed`, src/distributed.rs). Had no guard before Phase 3c.
+#[test]
+fn windowed_arch_worker_layer_shard_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let err = session
+        .forward_worker_layers(hidden, false, 1, 0)
+        .expect_err("the distributed worker shard must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer decode forward");
+}
+
+/// F1 ENTRY POINT C — the activation-range replay used by the distribute
+/// master and the ghost lanes. Had no guard before Phase 3c; its `seq_len > 1`
+/// arm is a full CPU dense chunk loop.
+#[test]
+fn windowed_arch_layer_range_replay_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![2, 32], vec![0.1; 64]).unwrap();
+    let err = session
+        .forward_layer_range_from_hidden(&hidden, 0, 2)
+        .expect_err("the activation-range replay must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
+
+/// F1 ENTRY POINT D — the ghost single-layer probe (`camelid ghost`,
+/// src/main.rs). Had no guard before Phase 3c.
+#[test]
+fn windowed_arch_ghost_layer_probe_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let err = session
+        .ghost_forward_one_layer(&hidden, 0, 0, 1)
+        .expect_err("the ghost layer probe must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
+
+// ---------------------------------------------------------------------------
+// gemma3→Metal Phase 3c, hazard H5: the windowed-arch Q8_0 admission pin.
+//
+// The review found the pin had ZERO causal coverage: it sits ~120 lines past
+// the backend-enabled bail in `resident_decode_eligible`, so on any host with
+// no resident backend armed — every ordinary `cargo test` run — deleting the
+// pin failed nothing. Arming the backend from inside a test is forbidden
+// (§9d), so the decision was extracted into
+// `windowed_arch_layers_violate_q8_pin` and is pinned here directly.
+// ---------------------------------------------------------------------------
+
+fn q8_linear(name: &str) -> CpuTensor {
+    CpuTensor::from_q8_0_blocks(
+        name,
+        TensorShape { dims: vec![1, 32] },
+        vec![Q8_0Block {
+            scale: 0.25,
+            quants: [1; 32],
+        }],
+    )
+    .unwrap()
+}
+
+fn q4k_linear(name: &str) -> CpuTensor {
+    let mut tensor = CpuTensor::from_f32(name, vec![1, 256], vec![0.0; 256]).unwrap();
+    tensor.source_type = Some(GgufTensorType::Q4K);
+    tensor.q4_k_wire_bytes = Some(Arc::new(vec![0; crate::tensor::Q4_K_BLOCK_BYTES]));
+    tensor.data.clear();
+    tensor
+}
+
+fn all_q8_layer() -> LlamaLayerWeights {
+    let (session, _temp_file) = tiny_kv_budget_session(8);
+    let mut layer = session.weights.layers[0].clone();
+    layer.attention_q = q8_linear("blk.0.attn_q.weight");
+    layer.attention_k = q8_linear("blk.0.attn_k.weight");
+    layer.attention_v = q8_linear("blk.0.attn_v.weight");
+    layer.attention_output = q8_linear("blk.0.attn_output.weight");
+    layer.ffn_gate = q8_linear("blk.0.ffn_gate.weight");
+    layer.ffn_up = q8_linear("blk.0.ffn_up.weight");
+    layer.ffn_down = q8_linear("blk.0.ffn_down.weight");
+    layer
+}
+
+/// H5: an all-Q8_0 windowed layer range satisfies the pin (the control — a pin
+/// that refused everything would pass the negative cases below for free), and
+/// swapping ANY ONE of the seven per-layer linears to Q4_K violates it. This
+/// fails if the pin is deleted or narrowed to a subset of the linears.
+#[test]
+fn windowed_arch_q8_pin_rejects_any_non_q8_layer_linear() {
+    let base = all_q8_layer();
+    assert!(
+        !windowed_arch_layers_violate_q8_pin(std::slice::from_ref(&base), false),
+        "an all-Q8_0 windowed layer must satisfy the H5 pin"
+    );
+
+    type LayerSwap = (&'static str, fn(&mut LlamaLayerWeights));
+    let swaps: [LayerSwap; 7] = [
+        ("attn_q", |l| l.attention_q = q4k_linear("q")),
+        ("attn_k", |l| l.attention_k = q4k_linear("k")),
+        ("attn_v", |l| l.attention_v = q4k_linear("v")),
+        ("attn_output", |l| l.attention_output = q4k_linear("o")),
+        ("ffn_gate", |l| l.ffn_gate = q4k_linear("gate")),
+        ("ffn_up", |l| l.ffn_up = q4k_linear("up")),
+        ("ffn_down", |l| l.ffn_down = q4k_linear("down")),
+    ];
+    for (label, swap) in swaps {
+        let mut layer = base.clone();
+        swap(&mut layer);
+        assert!(
+            windowed_arch_layers_violate_q8_pin(std::slice::from_ref(&layer), false),
+            "a Q4_K {label} must violate the H5 Q8_0 pin"
+        );
+    }
+
+    // One bad layer anywhere in the range disqualifies the whole range.
+    let mut bad = base.clone();
+    bad.ffn_down = q4k_linear("down");
+    assert!(windowed_arch_layers_violate_q8_pin(
+        &[base.clone(), base, bad],
+        false
+    ));
 }

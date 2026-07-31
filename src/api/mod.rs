@@ -4290,31 +4290,47 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the runnable lane is correct but slow vs an optimized SIMD/CUDA kernel).",
                 next_step: "preserve the parity-certified runnable lane + the read/list/write agent capability for this exact row; an optimized-lane qwen35 kernel for production throughput, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
             },
-            // MUSTER M-A1 (2026-07-16): gemma3 1B promoted on the runnable serve lane
-            // (the only lane with a correct gemma3 forward — the optimized dense binder
-            // silently drops gemma3's norms and has no GeGLU, so it stays fail-closed
-            // for chat via is_runnable_serve_arch). Filename-anchored id
-            // (`gemma_3_1b_it_q8_0` = normalized GGUF filename) so the frontend
-            // exact-row identity matcher resolves the local file; the catalog entry
-            // `gemma3_1b_it_q8_0` resolves via the filename/name match.
+            // MUSTER M-A1 (2026-07-16), re-anchored onto the Metal GPU-resident
+            // lane by the gemma3→Metal campaign (2026-07-30, Phases 0-5;
+            // GEMMA3_METAL_CONDUCTOR.md). The lane story is the whole row:
+            //   * Metal host with the resident decode lane available (the
+            //     DEFAULT): `metal_resident_q8_runtime` serves this row. It is
+            //     the first gemma3 forward in-tree that applies the 512-token
+            //     sliding-window mask and the 5:1 local/global schedule.
+            //   * Anywhere the resident lane cannot run (non-macOS, no Metal
+            //     device, CAMELID_METAL_RESIDENT_DECODE=0, deterministic mode,
+            //     CUDA-resident) or the file is not this Q8_0 row:
+            //     `model::arch_requires_runnable_bridge` routes back to the
+            //     runnable CPU bridge, which implements NO window mask — so the
+            //     ">512 tokens is wrong by construction" blocker is a RUNNABLE-
+            //     LANE property and stays stated as one below.
+            //   * The CPU dense forward is fail-closed for windowed archs at the
+            //     per-layer CHOKE POINT every dense layer walk bottoms out in
+            //     (`ensure_windowed_arch_off_cpu_dense_layer`, Phase 3c F1 —
+            //     entry-point guards were tried first and went stale), so no
+            //     routing mistake can silently run gemma3 full-causal.
+            // Filename-anchored id (`gemma_3_1b_it_q8_0` = normalized GGUF
+            // filename) so the frontend exact-row identity matcher resolves the
+            // local file; the download-catalog entry uses the SAME id (Phase 3c)
+            // so `filename_is_supported_exact_row` joins the two.
             ModelCompatibilityTarget {
                 id: "gemma_3_1b_it_q8_0",
                 tool_capable: false,
-                family: "gemma3_runnable_decoder",
+                family: "gemma3_windowed_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
-                support_scope: "exact_row_smoke_only",
+                support_scope: "exact_row_metal_gpu_resident_windowed_chat_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "strict all-leg parity (one documented 50-token near-tie at a 0.3416-nat gap — ABOVE the Ornith 0.33-nat soft-position line, attributed only under the Llama-3.2-3B gaps-stated precedent), context above the 512-token sliding window (the runnable lane implements no window mask, so longer sequences are mathematically wrong by construction), bounded-context packs, perf (observed ~5 s/token on the pure-f32 runnable CPU lane — recorded, not a claim), tool capability (tools fail closed with a typed 422), GPU lane (runnable CUDA is qwen35-gated), portability, and durable repeated current-head bundles remain missing",
+                full_support_blockers: "context above 2,403 prompt tokens (the file's native 32,768 is UNMEASURED, as is everything between ~2.4k and 32k); token-exact raw /v1/completions at depth 50 (three disclosed near-tie flips, one of them a 0.4471-nat stable-oracle near-tie — the clean raw-decode claim stops at DEPTH 5, while the chat lane is clean at 1/5/50); the repo's bounded-context ladder packs (512/1024/2048/4096/8192) were NOT run for this row — the windowed pack is a different artifact; throughput/performance (NOT claimed and NOT measured for release on this lane — a separate measurement phase owes it); the RUNNABLE CPU BRIDGE lane, which serves this row wherever the Metal resident lane cannot run and implements no window mask, so on THAT lane context above the 512-token sliding window remains mathematically wrong by construction (demonstrated: 1.667-nat disagreement with the pinned oracle at the divergence position of a 606-token prompt); tool capability (no gemma3 tools branch and no certified grammar on any lane — tools fail closed with a typed 422); multi-turn, streaming, speculative decode (declined for windowed archs) and the prompt-prefix cache (bypassed for windowed archs); neighbouring gemma3 sizes/quants (a non-Q8_0 gemma3 file is declined by resident admission and falls back to the runnable bridge); frontend load-path promotion; portability; and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
-                tokenizer_works: "validated_cross_engine_prompt_tokenization_identical_5_of_5_spm_llama_262k_vocab",
-                tensors_load: "validated_183_q8_0_plus_157_f32_tied_embedding_runnable_resident",
-                generation_runs: "runnable_serve_cpu_chat_greedy_with_eog_stop",
-                parity_audited: "gemma3_marker_chat_token_and_text_parity_1_5_50_four_of_five_prompts_all_depths_fifth_identical_at_1_5_single_flip_at_50_index_16_gap_stated_vs_llamacpp_acd79d6",
-                performance_measured: "observed_about_5_s_per_token_cpu_runnable_recorded_not_a_perf_claim",
+                tokenizer_works: "validated_cross_engine_prompt_tokenization_identical_5_of_5_sub512_plus_3_of_3_windowed_606_1205_2403_spm_llama_262k_vocab",
+                tensors_load: "validated_183_q8_0_plus_157_f32_tied_embedding_metal_gpu_resident",
+                generation_runs: "metal_gpu_resident_serve_chat_greedy_with_eog_stop_default_lane_on_metal_hosts_runnable_bridge_fallback_elsewhere",
+                parity_audited: "gemma3_metal_resident_chat_token_and_text_identical_15_of_15_legs_at_1_5_50_sub512_plus_9_of_9_legs_at_606_1205_2403_prompt_tokens_zero_flips_vs_llamacpp_acd79d603_raw_completions_clean_through_depth_5_only",
+                performance_measured: "not_claimed_resident_lane_throughput_is_a_separate_unshipped_measurement_phase",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
-                tested_context: "gemma3_marker_chat_1_5_50_smoke_total_sequence_well_under_the_512_token_sliding_window",
+                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, and served on the Metal GPU-resident lane (selected_backend=metal_resident_q8_runtime, decode_path=q8_0_metal_resident_decode) — on by default on a Metal host, opt-out CAMELID_METAL_RESIDENT_DECODE=0. Off that lane the runnable CPU bridge serves the row and only the sub-512 envelope is green; the windowed claim below does not travel to it",
+                tested_context: "gemma3_chat_greedy_1_5_50_at_606_1205_and_2403_prompt_tokens_plus_50_generated_all_above_the_512_token_sliding_window_metal_resident_lane_only",
                 chat_template_renderer: "gemma3_marker_native_byte_locked_by_shapes_pack",
                 chat_template_shape_pack: "validated_in_src_pack_lock_test",
                 chat_template_shape_pack_id: "gemma3-chat-template-shapes-v1",
@@ -4333,11 +4349,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "runnable_serve_gemma3_chat_parity",
+                latest_checked_bucket: "metal_gpu_resident_windowed_chat_parity_606_1205_2403_prompt_tokens",
                 latest_checked_result: "pass",
-                latest_checked_output: "qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb/README.md",
-                evidence: "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding, served via the runnable lane (CAMELID_RUNNABLE_SERVE=1, CPU) with the new gemma3 marker renderer — byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test — and EOG-stopping dense decode. Greedy chat parity vs pinned llama.cpp acd79d603 (build 9632, CPU llama-server /completion -ngl 0), committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at 1/5/50: 4/5 prompts token-AND-text identical at every depth (incl. a natural early-stop leg proving stop semantics); the fifth is identical at 1/5 and diverges at position 16 of the 50-token leg — probed in solo oracle sessions: camelid's token is the oracle's immediate #2 at a 0.3416-nat top-2 gap, with the oracle BIT-STABLE across thread-count (default/4/2) and runtime-repack kernel controls. DISCLOSED PLAINLY: that gap exceeds the Ornith <=0.33-nat soft-position precedent and no oracle-side backend flip exists, so the flip rests on the Llama-3.2-3B 'documented near-ties with gaps stated' precedent — the weakest single attribution in the MUSTER campaign to date. Cross-engine prompt tokenization identical on 5/5 prompts (llama /tokenize vs camelid encode, incl. BOS placement); determinism sanity byte-identical across two independent serve sessions; the pre-existing HF-reference receipt qa/runnable/gemma3-parity.json (all_greedy_match=true, SHA-anchored to this exact file) anchors the engine math independently. Sequences are scoped well under the 512-token sliding window the runnable lane does not mask. Observed decode ~5 s/token on the pure-f32 CPU lane (recorded, NOT a perf claim). Bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb. NOT claimed: strict all-leg parity, any context at or beyond the 512-token window, bounded-context packs, tools (fail closed, typed 422), throughput, GPU residency, neighboring gemma3 sizes/quants, or the gemma4 family.",
-                next_step: "a runnable-lane sliding-window mask (or an optimized-lane gemma3 forward) before any context claim at or beyond 512 tokens; per-row perf work if the ~5 s/token CPU lane matters; agent-eval battery before any tool_capable claim",
+                latest_checked_output: "qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053/README.md",
+                evidence: "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding. LANE: on a Metal host the row is served by DEFAULT on the GPU-resident Q8_0 lane (selected_backend metal_resident_q8_runtime, decode_path q8_0_metal_resident_decode, prefill_path q8_0_metal_resident_prefill), the first gemma3 forward in-tree carrying the 5:1 local/global schedule and the 512-token sliding-window mask; the gemma3 marker renderer (byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test) is shared with the dense lane, and decode stops on EOG. ORACLE: pinned llama.cpp acd79d603 (llama-server build 9632, CPU backend, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096, binary sha256 prefix 382096b1), two-phase throughout — the two engines were never resident together. SUB-512 CHAT: committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at greedy depths 1/5/50 — 15/15 generation legs token-AND-text IDENTICAL, zero flips, with cross-engine prompt tokenization identical 5/5. ABOVE THE WINDOW (the claim this lane exists for): committed pack qa/prompt-packs/gemma3-windowed-context-pack-v1.json, three prompts rendering to 606 / 1205 / 2403 tokens (1.18x / 2.35x / 4.69x the file's own gemma3.attention.sliding_window=512), each answerable only from its first sentence — 3/3 prompt tokenization identical and 9/9 generation legs at 1/5/50 token-AND-text IDENTICAL, ZERO flips. That the window is REAL and not decorative is shown by the contrast leg: on the same 606-token prompt and the same oracle capture, the runnable CPU bridge (no window mask) diverges at generated index 2 and never resynchronises, and re-fed the identical prefix the oracle ranks the runnable lane's token 1.667 nats behind its own — four times the largest disclosed near-tie in the bundle, so not a near-tie. That leg is ONE prompt at ONE depth: a demonstration, not a runnable-lane receipt. DETERMINISM: two fresh camelid serve processes with a full stop/start between them produce byte-identical receipt files (6 chat legs incl. the 2403-token prompt plus 5 raw-completion legs carrying actual emitted ids; sha256 prefix 632992c6). RAW /v1/completions is a SEPARATE harness over its own 4-prompt set (not the 5-prompt chat pack above), committed as-is with all_pass=false and DISCLOSED rather than hidden: depths 1 and 5 are clean 4/4, and at depth 50 three legs flip — camelid's token is the oracle's rank 1 on two of them when the oracle decodes continuously rather than from a re-fed prefix, while the third ('Once upon a time,') has a rank-1-stable oracle and camelid's token at 0.4471 nat, ABOVE both the Ornith 0.33-nat line and the frozen runnable bundle's 0.3416; a separate harness artifact (SPM whitespace re-encode) is identified and excluded from that count rather than tuned away. Bundle qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053 (README + manifest + SHA256SUMS, 20 artifacts). The frozen runnable-lane bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb stands as history for that other lane and is NOT re-adjudicated here. NOT claimed: any throughput or speed number on this lane, any comparison against another engine's speed, token-exact raw completions at depth 50, any context above 2,403 prompt tokens, the bounded-context ladder packs, multi-turn, streaming, tools (fail closed, typed 422), speculative decode or the prompt-prefix cache (both fail closed for windowed archs), neighbouring gemma3 sizes/quants, or the gemma4 family.",
+                next_step: "measure and publish the resident lane's throughput as its own receipt before any perf wording appears on this row; extend the windowed pack past 2,403 prompt tokens toward the file's native 32,768 before widening tested_context; adjudicate the three depth-50 raw-completion near-ties with a chat-shaped raw pack or an oracle-side reduction-order study before any raw token-exactness claim past depth 5; run the bounded-context ladder packs; a runnable-lane sliding-window mask (or removing that fallback) before any >512 claim travels to non-Metal hosts; agent-eval battery before any tool_capable claim",
             },
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
@@ -6457,16 +6473,35 @@ mod gemma4_template_tests {
     #[test]
     fn completions_fail_closed_for_runnable_serve_archs() {
         // Runnable-served archs have no raw-completions bridge: the gate must
-        // reject them (falling through would reach the optimized engine, which
-        // mis-binds gemma3), and must NOT touch the optimized-lane archs.
-        assert!(completions_unsupported_for_arch("qwen35"));
-        assert!(completions_unsupported_for_arch("gemma2"));
-        assert!(completions_unsupported_for_arch("gemma3"));
-        assert!(!completions_unsupported_for_arch("llama"));
-        assert!(!completions_unsupported_for_arch("qwen3"));
-        assert!(!completions_unsupported_for_arch("mistral"));
-        assert!(!completions_unsupported_for_arch("gemma4"));
-        assert!(!completions_unsupported_for_arch(""));
+        // reject them, and must NOT touch the optimized-lane archs. qwen35 and
+        // gemma2 are bridge-only on every host; gemma3 is capability-aware
+        // since the Phase 3b flip — the gate follows the live routing
+        // predicate exactly (reopen where the resident lane serves, closed on
+        // the runnable fallback), pinned host-independently here and at the
+        // HTTP level in `runnable_completions_gate_api_tests`.
+        // Phase 3c: this used to compare two independent LIVE reads of the
+        // env-dependent predicate, which was both tautological (it asserted
+        // the gate equals itself) and racy (any sibling test flipping
+        // CAMELID_METAL_RESIDENT_DECODE between the two reads failed it on a
+        // Metal host). It now drives the PURE decision core with explicit
+        // capability booleans: no env, no device, no lock, and it actually
+        // pins the behaviour rather than restating the implementation.
+        use crate::model::arch_requires_runnable_bridge_given as bridge;
+        for capable in [false, true] {
+            for q8 in [false, true] {
+                assert!(bridge("qwen35", capable, q8));
+                assert!(bridge("gemma2", capable, q8));
+                for arch in ["llama", "qwen3", "mistral", "gemma4", ""] {
+                    assert!(!bridge(arch, capable, q8), "{arch:?} must stay open");
+                }
+            }
+        }
+        // gemma3: closed on a runnable-fallback host and for any non-Q8_0
+        // file; reopened only where the resident lane actually serves it.
+        assert!(bridge("gemma3", false, true));
+        assert!(bridge("gemma3", true, false));
+        assert!(bridge("gemma3", false, false));
+        assert!(!bridge("gemma3", true, true));
     }
 
     #[test]
@@ -7295,7 +7330,7 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 /// was trained on). Rendering anything else makes the model emit the wrong format.
 const ORNITH_TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
-/// The runnable serve lane is ON by default: the archs in [`is_runnable_serve_arch`]
+/// The runnable serve lane is ON by default: the archs in [`is_runnable_serve_file`]
 /// have no other correct serve path, so a supported row (e.g. the promoted
 /// gemma-3-1b-it Q8_0, MUSTER M-A1) must chat out of the box instead of demanding
 /// an env var the desktop never sets. Opt out with `CAMELID_RUNNABLE_SERVE=0`
@@ -7321,17 +7356,23 @@ fn runnable_serve_flag(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// True for architectures served through the runnable bridge (qwen35, and — since
-/// MUSTER M-A1 — gemma3, whose only correct forward lives in the runnable lane; the
-/// optimized dense binder silently drops gemma3's QK/post norms and has no GeGLU).
-/// Deliberate side effect of listing an arch here: when the lane is opted out
-/// (`CAMELID_RUNNABLE_SERVE=0`) its chat requests get a typed 503 instead of
-/// falling through to the mis-bound optimized engine — fail-closed by design.
-/// Delegates to [`crate::model::is_runnable_only_arch`] — the single source of
-/// truth shared with the CLI direct-session guard — so the serve router and the
-/// direct lanes can never disagree about which archs must fail closed.
-fn is_runnable_serve_arch(arch: &str) -> bool {
-    crate::model::is_runnable_only_arch(arch)
+/// True for architectures served through the runnable bridge ON THIS HOST:
+/// qwen35 and gemma2 always, and gemma3 only where the Metal-resident lane
+/// cannot serve it (gemma3→Metal Phase 3b made gemma3's routing
+/// CAPABILITY-AWARE — on a resident-capable macOS host its chat runs the
+/// dense/resident lane, and the raw-completions surfaces reopen with it; on
+/// non-Metal hosts, with `CAMELID_METAL_RESIDENT_DECODE=0`, or in a
+/// CUDA-resident process it falls back to the runnable bridge exactly as
+/// before the flip, never to the CPU dense forward, which fails closed for
+/// windowed archs at forward dispatch — hazard H4).
+/// Deliberate side effect of an arch classifying runnable here: when the lane
+/// is opted out (`CAMELID_RUNNABLE_SERVE=0`) its chat requests get a typed 503
+/// instead of falling through to an engine that cannot run it — fail-closed by
+/// design. Delegates to [`crate::model::arch_requires_runnable_bridge`] — the
+/// single source of truth shared with the CLI direct-session guard — so the
+/// serve router and the direct lanes can never disagree about routing.
+fn is_runnable_serve_file(gguf: &GgufFile) -> bool {
+    crate::model::file_requires_runnable_bridge(gguf)
 }
 
 /// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
@@ -7621,7 +7662,7 @@ async fn resolve_runnable_runtime(
         .read()
         .await
         .get(&id)
-        .map(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()))
+        .map(|m| is_runnable_serve_file(&m.gguf))
         .unwrap_or(false);
     if needs_runnable {
         return Err(api_error(
@@ -7639,20 +7680,23 @@ async fn resolve_runnable_runtime(
 }
 
 /// True when raw `/v1/completions` must fail closed for this architecture: the
-/// runnable-served archs have no completions bridge, and falling through would
-/// reach the optimized engine — which for gemma3 is numerically mis-bound (its
-/// norms are silently dropped and the forward has no GeGLU/dual-RoPE). Their
-/// only served surface is `/v1/chat/completions`. Pure decision half of
-/// [`reject_completions_for_runnable_arch`] so the gate itself is unit-testable.
-fn completions_unsupported_for_arch(arch: &str) -> bool {
-    is_runnable_serve_arch(arch)
+/// runnable-served archs have no completions bridge, and their only served
+/// surface is `/v1/chat/completions`. Capability-aware since the gemma3 Phase
+/// 3b flip: on a resident-capable host gemma3 leaves the runnable set, so its
+/// raw-completions surfaces REOPEN onto the dense/resident lane in the same
+/// motion (deliberate — the resident forward is the correct engine there),
+/// while on runnable-fallback hosts they stay 422-gated exactly as before.
+/// Pure decision half of [`reject_completions_for_runnable_arch`] so the gate
+/// itself is unit-testable.
+fn completions_unsupported_for_file(gguf: &GgufFile) -> bool {
+    is_runnable_serve_file(gguf)
 }
 
 /// The typed rejection every raw completions-style surface returns for a
 /// runnable-lane-only model: these archs are served only via
 /// `/v1/chat/completions`, and no raw-completions surface may fall through to
 /// the optimized dense engine (mis-bound for them — see
-/// [`completions_unsupported_for_arch`]).
+/// [`completions_unsupported_for_file`]).
 fn runnable_completions_rejection(model_id: &str) -> Response {
     api_error(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -7689,7 +7733,7 @@ async fn reject_completions_for_runnable_arch(
         .read()
         .await
         .get(&id)
-        .map(|m| completions_unsupported_for_arch(m.gguf.architecture().unwrap_or_default()))
+        .map(|m| completions_unsupported_for_file(&m.gguf))
         .unwrap_or(false);
     if unsupported {
         return Some(runnable_completions_rejection(&id));
@@ -7733,12 +7777,7 @@ async fn runnable_chat_nonstreaming(
     let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
-            return api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_tools",
-                "the gemma runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
-                None,
-            );
+            return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
     } else if tools.is_empty() {
@@ -7856,12 +7895,7 @@ async fn runnable_chat_streaming(
     let tools = runnable_request_tools(req);
     let prompt_text = if runtime.architecture == "gemma2" || runtime.architecture == "gemma3" {
         if !tools.is_empty() {
-            return api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_tools",
-                "the gemma runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
-                None,
-            );
+            return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
     } else if tools.is_empty() {
@@ -8733,9 +8767,7 @@ async fn load_model_from_path_with_activation(
 
     // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
     // load a runnable-lane runtime (qwen35/Ornith, gemma3) so /v1/chat can route to it.
-    if runnable_serve_enabled()
-        && is_runnable_serve_arch(loaded.gguf.architecture().unwrap_or_default())
-    {
+    if runnable_serve_enabled() && is_runnable_serve_file(&loaded.gguf) {
         load_runnable_serve_runtime(state, &id, &loaded.path).await?;
     }
 
@@ -10054,9 +10086,11 @@ async fn completions(
         Ok(None) => {}
         Err(resp) => return resp,
     }
-    // Runnable-served architectures (qwen35, gemma3) fail closed on raw
-    // completions — chat is their only served surface. This also covers the
-    // multi-choice fan-out below, which is reached only through this handler.
+    // Runnable-served architectures (qwen35, gemma2, and gemma3 where the
+    // resident lane cannot serve it — the predicate is capability-aware since
+    // the gemma3 Phase 3b flip) fail closed on raw completions — chat is
+    // their only served surface. This also covers the multi-choice fan-out
+    // below, which is reached only through this handler.
     if let Some(resp) = reject_completions_for_runnable_arch(&state, &req.model).await {
         return resp;
     }
@@ -11515,6 +11549,41 @@ fn mixtral_long_generation_is_blocked(
         && !explicitly_enabled
 }
 
+/// Whether lossless greedy speculation may engage for this request.
+///
+/// The first four disqualifiers are the long-standing ones: speculation is a
+/// plain-greedy optimization, it cannot service per-step logit consumers, and
+/// it has no pipeline-sharded verify.
+///
+/// The windowed-arch disqualifier is Phase 3c finding F4. `serve --spec-decode`
+/// (CPU speculation) pins the target off the resident paths so the chunk-verify
+/// rollback has CPU-authoritative KV — which for gemma3 means every request
+/// lands on the CPU dense forward and H4-errors. GPU speculation is no better:
+/// `encode_attention`, the attention the batched verify encodes, takes no
+/// `window_start` at all and reads `[0, position_count)` full-causal (it is
+/// shared with the gemma4 lane and was never threaded with the window; §9a
+/// records this as an open residual). Neither verify lane can express the
+/// sliding window, so speculation is declined for the ARCH rather than gated
+/// per speculation mode.
+///
+/// Declining here — rather than teaching routing about spec mode — keeps
+/// routing spec-blind and leaves `serve --spec-decode` SERVING gemma3 on the
+/// plain resident lane, instead of failing every request. Lossless speculation
+/// only ever adds throughput, so dropping it costs correctness nothing.
+fn speculation_admissible(
+    sampling: &SamplingConfig,
+    collect_dense_diagnostics: bool,
+    has_logit_diagnostics: bool,
+    pipeline_sharded: bool,
+    config: &LlamaModelConfig,
+) -> bool {
+    *sampling == SamplingConfig::default()
+        && !collect_dense_diagnostics
+        && !has_logit_diagnostics
+        && !pipeline_sharded
+        && !crate::model::arch_has_windowed_attention(config)
+}
+
 async fn prepare_generation(
     state: &AppState,
     req: GenerationSessionRequest,
@@ -11570,17 +11639,35 @@ async fn prepare_generation(
         Ok(m) => m,
         Err(res) => return Err(res),
     };
-    // Fail closed for runnable-lane-only archs at the dense chokepoint. Every
+    // Fail closed for runnable-served archs at the dense chokepoint. Every
     // raw completions-style surface funnels through here (`/completion`,
     // `/v1/completions` and its n>1 fan-out, `/api/generation/preflight`,
-    // `/api/generation/sessions`, receipt replay), and the dense engine is
-    // mis-bound for these archs — it drops their QK/sandwich norm tensors and
-    // has no GeGLU/dual-RoPE — so falling through produces fluent-looking
-    // garbage, not an error. Chat requests never reach this: the runnable
-    // short-circuit in `chat_completions` serves them or returns a typed 503
-    // before prepare_generation.
-    if completions_unsupported_for_arch(model.gguf.architecture().unwrap_or_default()) {
+    // `/api/generation/sessions`, receipt replay), and no engine this function
+    // can reach runs those archs correctly — falling through would produce
+    // fluent-looking garbage (qwen35/gemma2) or a windowed-arch H4 error
+    // (gemma3 on a fallback host), not a useful completion. Chat requests for
+    // runnable-served archs never reach this: the runnable short-circuit in
+    // `chat_completions` serves them or returns a typed 503 first. gemma3 on a
+    // resident-capable host is NOT runnable-served (capability-aware Phase 3b
+    // predicate): its chat AND raw completions flow through here onto the
+    // dense/resident lane deliberately.
+    if completions_unsupported_for_file(&model.gguf) {
         return Err(runnable_completions_rejection(&model.id));
+    }
+    // Phase 3c triage: the gemma3 tool refusal is an ARCH-level contract
+    // (`tool_capable: false`, no tools branch in the template, no certified
+    // tool-call grammar), so it must not depend on which lane serves the
+    // request. The dense lane used to raise it from inside template rendering,
+    // where it surfaced wrapped as `unsupported_chat_template` / param
+    // "messages" — a different machine-readable identity from the bridge's
+    // `unsupported_tools` / no param, for the same request against the same
+    // file. Raised here, ahead of tokenizer and template work, both lanes
+    // return the same typed error on every host.
+    if let Some(rejection) = reject_tools_for_windowed_arch(
+        model.gguf.architecture().unwrap_or_default(),
+        request_tools.as_deref(),
+    ) {
+        return Err(rejection);
     }
     let draft_may_be_used = speculative_mode == Some(SpecDecodeMode::DraftModel)
         && sampling == SamplingConfig::default()
@@ -11649,6 +11736,22 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
+            // Phase 3c triage: the dense-lane gemma3 renderer is keyed on
+            // TEMPLATE SHAPE (`is_gemma3_chat_template`) while routing admits
+            // by ARCH. A gemma3 GGUF whose embedded template does not carry
+            // all three markers therefore fell through to the role-colon
+            // renderer — a prompt the model was never trained on, served under
+            // a supported-row label with no error anywhere. The runnable
+            // bridge keys the same decision on `runtime.architecture`, so the
+            // two lanes disagreed for exactly the files most likely to be
+            // mis-converted. Fail closed on the arch/template mismatch.
+            if let Some(rejection) = reject_windowed_arch_with_unrecognized_template(
+                model.gguf.architecture().unwrap_or_default(),
+                &tokenizer,
+                &model.id,
+            ) {
+                return Err(rejection);
+            }
             let rendered_prompt = match request_tools.as_deref() {
                 Some(tools) if !tools.is_empty() => {
                     render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
@@ -11910,16 +12013,20 @@ async fn prepare_generation(
         }
     }
 
-    // Lossless greedy speculation is a server-level opt-in and only engages
     // for plain greedy requests with no per-step logit consumers; anything
     // else keeps the unchanged vanilla decode loop.
+    // Lossless greedy speculation is a server-level opt-in; see
+    // `speculation_admissible` for the disqualifiers.
     let speculative = match speculative_mode {
         None => None,
         Some(_)
-            if sampling != SamplingConfig::default()
-                || collect_dense_diagnostics
-                || !logit_diagnostic_token_ids.is_empty()
-                || session.weights.layer_range.is_some() =>
+            if !speculation_admissible(
+                &sampling,
+                collect_dense_diagnostics,
+                !logit_diagnostic_token_ids.is_empty(),
+                session.weights.layer_range.is_some(),
+                &session.config,
+            ) =>
         {
             None
         }
@@ -13049,6 +13156,17 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
     if prepared.constraint.is_some() {
         return;
     }
+    // Windowed-attention archs (gemma3): NEVER store a prefix entry. Any later
+    // partial hit would resume the cached session at `kv_position = k > 0` and
+    // re-prefill the divergent suffix on the CPU dense forward — which has no
+    // sliding-window mask and none of the arch's structure, so ordinary
+    // multi-turn chat would silently attend full-causal over the whole cached
+    // history (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1). Refused at the
+    // store site AND at both partial-resume sites (`resume_partial_prefix_hit`)
+    // so the bypass holds even against a stale pool.
+    if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return;
+    }
     // A GPU-resident prefill leaves the CPU KV buffers empty, which used to make
     // this bail out and so kept the prompt cache off the lane the CLI selects
     // automatically. `prepare_for_prompt_prefix_cache` mirrors the GPU history
@@ -13078,6 +13196,38 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
 
     if let Ok(mut pool) = prepared.cached_prompt_prefix.lock() {
         pool.insert(cached);
+    }
+}
+
+/// Resume a PARTIAL prompt-prefix-cache hit: roll the cached session back to
+/// the common prefix and hand the divergent suffix to the caller's prefill.
+/// Shared by the non-streaming handler and `stream_prompt_cache_prologue` so
+/// the two resume sites cannot drift.
+///
+/// Windowed-attention archs (gemma3) must never take this path: the suffix
+/// would be re-prefilled at `kv_position > 0`, which the resident prefill
+/// hook refuses, so the CPU dense forward — no sliding-window mask, none of
+/// the arch's structure — would evaluate it full-causal over the whole cached
+/// history (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1). Declining costs one
+/// cold full prefill: slower, never wrong. The store site refuses windowed
+/// entries too; this guard keeps the resume safe even against a stale pool.
+///
+/// A malformed/stale cache entry must never make generation fail: when
+/// rollback cannot establish the requested prefix position the caller retains
+/// the fresh session and performs a cold prefill.
+fn resume_partial_prefix_hit(
+    prepared: &mut PreparedGeneration,
+    mut cached_session: LlamaInferenceSession,
+    prefix_len: usize,
+    input: &mut Vec<u32>,
+) {
+    if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return;
+    }
+    if cached_session.rollback_to_position(prefix_len).is_ok() {
+        prepared.session = cached_session;
+        *input = prepared.token_ids[prefix_len..].to_vec();
+        prepared.timings.prompt_cache_hit = true;
     }
 }
 
@@ -13280,15 +13430,12 @@ fn generate_token_ids(
                     input.push(cached_next_token);
                 }
             } else {
-                let k = match_res.prefix_len;
-                // A malformed/stale cache entry must never make generation fail:
-                // retain the fresh session and perform a cold prefill if rollback
-                // cannot establish the requested prefix position.
-                if cached_session.rollback_to_position(k).is_ok() {
-                    prepared.session = cached_session;
-                    input = prepared.token_ids[k..].to_vec();
-                    prepared.timings.prompt_cache_hit = true;
-                }
+                resume_partial_prefix_hit(
+                    &mut prepared,
+                    cached_session,
+                    match_res.prefix_len,
+                    &mut input,
+                );
             }
         }
     }
@@ -14582,12 +14729,7 @@ fn stream_prompt_cache_prologue(
                     }
                 }
             } else {
-                let k = match_res.prefix_len;
-                if cached_session.rollback_to_position(k).is_ok() {
-                    prepared.session = cached_session;
-                    *input = prepared.token_ids[k..].to_vec();
-                    prepared.timings.prompt_cache_hit = true;
-                }
+                resume_partial_prefix_hit(prepared, cached_session, match_res.prefix_len, input);
             }
         }
     }
@@ -15639,6 +15781,21 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        // gemma3: the template has no tools branch and no tool-call grammar is
+        // certified for this row, so tool requests fail closed on the dense
+        // lane with the SAME contract the runnable bridge enforces (its typed
+        // `unsupported_tools` refusal) — the Phase 3b routing flip must not
+        // silently degrade an explicit refusal into tools being dropped from
+        // the prompt. The generic no-`tools`-in-template check below would
+        // also fail it; this branch keeps the message row-accurate.
+        if is_gemma3_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the gemma3 chat template has no tools branch and no tool-call grammar is \
+                 certified for this row; tool requests fail closed on the dense lane exactly \
+                 as on the runnable bridge",
+            ));
+        }
         if is_phi4_compact_template(template) {
             return Err(MiniJinjaError::new(
                 MiniJinjaErrorKind::InvalidOperation,
@@ -15731,6 +15888,23 @@ fn render_chat_prompt_for_tokenization_fallback(
                 add_special: true,
                 // Parse specials so <|user|>/<|assistant|>/<|end|> become the control
                 // token ids â€” in particular <|end|> as the end-of-turn stop token.
+                parse_special: true,
+            };
+        }
+        // gemma3 (gemma3→Metal Phase 3b): once the capability-aware serve
+        // routing lets gemma3 chat fall through to the dense/resident lane,
+        // this fallback is its prompt renderer. Reuse the byte-faithful
+        // gemma3 renderer the runnable bridge already ships (oracle
+        // /apply-template parity, MUSTER M-A1) with the identical encode
+        // contract: the rendered string carries NO BOS — BOS lands at token
+        // level (add_special=true, the GGUF declares add_bos_token=true) —
+        // and specials parse so <start_of_turn>/<end_of_turn> become their
+        // control ids. Without this branch gemma3 fell to the role-colon
+        // renderer, which the model was never trained on.
+        if is_gemma3_chat_template(template) {
+            return RenderedPrompt {
+                text: render_gemma3_prompt(messages),
+                add_special: true,
                 parse_special: true,
             };
         }
@@ -15939,6 +16113,92 @@ fn is_tinyllama_marker_template(template: &str) -> bool {
     template.contains("<|user|>")
         && template.contains("<|assistant|>")
         && template.contains("<|system|>")
+}
+
+/// Phase 3c triage: reconcile the ARCH the router admits with the TEMPLATE
+/// SHAPE the dense renderer keys on.
+///
+/// The dense chat lane picks `render_gemma3_prompt` via
+/// [`is_gemma3_chat_template`]; routing admits gemma3 by architecture. When the
+/// two disagree — a gemma3 GGUF whose embedded `chat_template` is absent or
+/// lacks the markers — the fallback chain reaches `render_role_colon_prompt`
+/// and serves a `"user: …"` prompt the model was never trained on, silently,
+/// under a supported-row label. There is no other renderer for this arch, so
+/// the honest outcome is a typed refusal naming the missing markers.
+fn reject_windowed_arch_with_unrecognized_template(
+    arch: &str,
+    tokenizer: &Tokenizer,
+    model_id: &str,
+) -> Option<Response> {
+    if !crate::model::arch_string_has_windowed_attention(arch) {
+        return None;
+    }
+    if tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_gemma3_chat_template)
+    {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture '{arch}', whose only correct chat \
+             rendering is the gemma3 turn-marker template (<start_of_turn>, <end_of_turn>, \
+             first_user_prefix), but its embedded tokenizer.chat_template does not carry \
+             those markers. Rendering would fall back to a generic role-prefixed prompt \
+             this model was never trained on, so chat fails closed. Re-convert the GGUF \
+             with the model's own chat template."
+        ),
+        Some("messages"),
+    ))
+}
+
+/// Phase 3c triage: gemma3 tool refusal must be byte-identical across lanes.
+///
+/// gemma3 tool calling is unsupported on EVERY lane (`tool_capable: false`; the
+/// template has no tools branch and no tool-call grammar is certified for the
+/// row). The runnable bridge refuses with 422 `unsupported_tools` and no
+/// `param`; the dense lane's refusal was raised inside the template renderer
+/// and surfaced wrapped as `unsupported_chat_template` / param "messages", so
+/// the machine-readable identity of the same refusal for the same file changed
+/// with the host. This raises the bridge's exact error on the dense lane, ahead
+/// of rendering.
+fn reject_tools_for_windowed_arch(
+    arch: &str,
+    tools: Option<&[serde_json::Value]>,
+) -> Option<Response> {
+    if !crate::model::arch_string_has_windowed_attention(arch) {
+        return None;
+    }
+    if tools.is_none_or(<[serde_json::Value]>::is_empty) {
+        return None;
+    }
+    Some(gemma_runnable_lane_tools_rejection())
+}
+
+/// The single construction of the gemma runnable/dense tool refusal, shared by
+/// `runnable_chat_nonstreaming`, `runnable_chat_streaming` and the dense
+/// chokepoint so the three cannot drift.
+fn gemma_runnable_lane_tools_rejection() -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_tools",
+        "the gemma runnable serve lane does not support tools: the model's chat template has no tools branch and no tool-call grammar is certified for this row".to_string(),
+        None,
+    )
+}
+
+/// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
+/// `<end_of_turn>` turn markers plus the `first_user_prefix` system-folding
+/// variable (which distinguishes it from other turn-marker templates). Chat
+/// for a matching model renders through [`render_gemma3_prompt`], the
+/// byte-faithful renderer shared with the runnable bridge.
+fn is_gemma3_chat_template(template: &str) -> bool {
+    template.contains("<start_of_turn>")
+        && template.contains("<end_of_turn>")
+        && template.contains("first_user_prefix")
 }
 
 fn is_llama3_instruct_template(template: &str) -> bool {
@@ -18390,13 +18650,16 @@ mod tests {
                 // cross-backend control); prompt tokenization 8/8. LOCAL file,
                 // upstream provenance unresolved (SHA-anchored). Raw-decode smoke only.
                 "llama_3_2_1b_instruct_q4_k_m",
-                // gemma3 1B Q8_0 (MUSTER M-A1, filename-anchored id): runnable serve
-                // lane chat parity vs llama.cpp acd79d603 — 4/5 gate-pack prompts
-                // token+text identical at every 1/5/50 depth, fifth identical at 1/5
-                // with a single documented 50-token flip (oracle-#2, 0.3416-nat gap
-                // stated; above the Ornith soft line, disclosed in the evidence);
-                // prompt tokenization 5/5 cross-engine; renderer byte-locked by the
-                // shapes pack. Chat smoke only, <512-token sliding-window scope.
+                // gemma3 1B Q8_0 (MUSTER M-A1, filename-anchored id; re-anchored by
+                // the gemma3→Metal campaign 2026-07-30): Metal GPU-resident serve
+                // lane by default on Metal hosts, chat parity vs llama.cpp acd79d603
+                // — 15/15 gate-pack legs token+text identical at 1/5/50 below the
+                // window, and 9/9 legs identical at 606/1205/2403 prompt tokens
+                // ABOVE the 512-token sliding window, zero flips; prompt
+                // tokenization 5/5 + 3/3 cross-engine. Chat smoke only, bounded at
+                // 2,403 prompt + 50 generated tokens; raw completions are clean
+                // through depth 5 only. Off Metal the runnable CPU bridge serves
+                // this row and the >512 claim does NOT travel with it.
                 "gemma_3_1b_it_q8_0",
                 // Llama-3.2-1B-Instruct IQ4_XS (i-quant, llama BPE): GPU-resident
                 // iq4xs_gemv raw-decode greedy parity vs llama.cpp acd79d6 — 2/4
@@ -19593,6 +19856,237 @@ mod tests {
         );
     }
 
+    /// gemma3→Metal Phase 3a hazard H1, store site: a windowed-attention arch
+    /// must NEVER store a prompt-prefix entry. The fixture satisfies every
+    /// other store precondition (no constraint, kv position == prompt length,
+    /// CPU-authoritative session), so the ONLY thing that can refuse the store
+    /// is the windowed-arch bypass — proven by the control run, which strips
+    /// the window schedule from the identical fixture and stores fine.
+    #[test]
+    fn windowed_arch_never_stores_a_prompt_prefix_entry() {
+        let _env_guard = crate::test_support::env_lock();
+        let _admit = admit_windowed_cpu_dense_for_test();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(session.kv_position(), 2, "store preconditions must hold");
+        let mut prepared = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert!(
+            lookup_prompt_prefix_cache(&prepared).is_none(),
+            "a windowed-attention arch must never populate the prompt-prefix cache"
+        );
+
+        // Control: the identical fixture minus the window schedule stores.
+        let mut control_session =
+            LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let control_step = control_session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut control = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], control_session);
+        store_prompt_prefix_cache(&mut control, &control_step);
+        assert!(
+            lookup_prompt_prefix_cache(&control).is_some(),
+            "the control fixture must store — otherwise this test is not \
+             exercising the windowed-arch bypass"
+        );
+    }
+
+    /// gemma3→Metal Phase 3a hazard H1, resume sites: a windowed-attention
+    /// arch must never take a PARTIAL prefix-cache resume. Drives
+    /// `resume_partial_prefix_hit` — the single decision point both the
+    /// non-streaming handler and `stream_prompt_cache_prologue` delegate to —
+    /// with a cached session that would resume cleanly, and requires the
+    /// request to keep its fresh session for a cold full prefill. The control
+    /// run proves the identical fixture resumes once the schedule is absent.
+    #[test]
+    fn windowed_arch_never_takes_a_partial_prefix_resume() {
+        let _env_guard = crate::test_support::env_lock();
+        let _admit = admit_windowed_cpu_dense_for_test();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        // Cached session: the two-token prefix already evaluated.
+        let mut warm = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        warm.generate_next_token_with_history_diagnostics(
+            &[1, 2],
+            crate::inference::LlamaSampler::Greedy,
+            &[1, 2],
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(warm.kv_position(), 2);
+
+        // Fresh request: the same prefix plus a divergent suffix token.
+        let cold = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let mut prepared = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2, 1], cold);
+        let mut input = prepared.token_ids.clone();
+        resume_partial_prefix_hit(&mut prepared, warm, 2, &mut input);
+        assert!(
+            !prepared.timings.prompt_cache_hit,
+            "a windowed arch must not report a prompt-cache hit on a partial match"
+        );
+        assert_eq!(
+            input,
+            vec![1, 2, 1],
+            "the input must stay the FULL prompt: the caller performs a cold prefill"
+        );
+        assert_eq!(
+            prepared.session.kv_position(),
+            0,
+            "the fresh session must be retained, not swapped for the cached one"
+        );
+
+        // Control: identical shapes without the window schedule resume fine.
+        let mut control_warm = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        control_warm
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let control_cold = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let mut control = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 1], control_cold);
+        let mut control_input = control.token_ids.clone();
+        resume_partial_prefix_hit(&mut control, control_warm, 2, &mut control_input);
+        assert!(control.timings.prompt_cache_hit);
+        assert_eq!(
+            control_input,
+            vec![1],
+            "the control resumes from the suffix"
+        );
+        assert_eq!(control.session.kv_position(), 2);
+    }
+
+    /// gemma3→Metal Phase 3a hazard H1, streaming resume site end-to-end: even
+    /// against a STALE pool that already holds a windowed-arch entry (the store
+    /// site refuses to create one, so this is hand-inserted), a partial hit in
+    /// `stream_prompt_cache_prologue` must fall back to a cold full prefill.
+    // Plain `#[test]`, not `#[tokio::test]`: the prologue emits deltas with
+    // `blocking_send`, which panics on a thread driving a tokio runtime.
+    #[test]
+    fn stream_prologue_windowed_arch_partial_hit_falls_back_to_cold_prefill() {
+        let _env_guard = crate::test_support::env_lock();
+        let _admit = admit_windowed_cpu_dense_for_test();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+        // The tiny two-token prefix must qualify as a partial hit (default
+        // admission floor is 16 tokens). Read live per lookup, not latched.
+        std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "2");
+
+        let mut warm_session =
+            LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let step = warm_session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let warm = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2], warm_session);
+        // Hand-insert the entry the store site rightly refuses to create.
+        warm.cached_prompt_prefix
+            .lock()
+            .unwrap()
+            .insert(CachedPromptPrefix {
+                model_id: warm.model_id.clone(),
+                model_path: warm.model_path.clone(),
+                token_ids: warm.token_ids.clone(),
+                sampling: warm.sampling.clone(),
+                session: warm.session.clone(),
+                logits: step.logits.clone(),
+                hidden_state: step.hidden_state.clone(),
+                output_norm_state: step.output_norm_state.clone(),
+            });
+
+        // A longer prompt sharing the pool: a partial hit (the shared
+        // `test_tokenizer` is fine here — the partial path never decodes).
+        let cold = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let mut repeat = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2, 1], cold);
+        repeat.cached_prompt_prefix = Arc::clone(&warm.cached_prompt_prefix);
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+        let job = CooperativeStreamDecodeJob::new(repeat, events_tx).expect("job initializes");
+        assert!(
+            !job.prepared.timings.prompt_cache_hit,
+            "the streaming prologue must not take a partial resume on a windowed arch"
+        );
+        assert_eq!(
+            job.input,
+            vec![1, 2, 1],
+            "decode must start from the FULL prompt (cold prefill), not the suffix"
+        );
+        assert!(job.generated.is_empty());
+        assert_eq!(job.prepared.session.kv_position(), 0);
+        std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+    }
+
+    /// gemma3→Metal Phase 3b hazard H4: the CPU dense forward must fail
+    /// closed for a windowed-attention arch at forward dispatch — a typed,
+    /// actionable error, never a silent full-causal decode. The control run
+    /// proves the identical fixture minus the window schedule still runs, so
+    /// the guard (not some other failure) is what fired.
+    #[test]
+    fn windowed_arch_cpu_dense_forward_fails_closed() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_gemma3_config(), tiny_weights()).unwrap();
+        let err = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .expect_err("a windowed arch must not run the CPU dense forward");
+        let message = err.to_string();
+        assert!(
+            message.contains("sliding-window"),
+            "the H4 error must name the windowed-attention hazard: {message}"
+        );
+        assert!(
+            message.contains("fails closed"),
+            "the H4 error must be explicit about failing closed: {message}"
+        );
+
+        // Control: identical fixture without the window schedule runs fine.
+        let mut control = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        control
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .expect("the non-windowed control must keep running on the CPU dense forward");
+    }
+
     #[test]
     fn cached_prompt_prefix_followed_by_longer_completion_keeps_generating() {
         let config = tiny_config();
@@ -19674,6 +20168,187 @@ mod tests {
             "<|user|>\nhello</s>\n<|assistant|>\n"
         );
     }
+    /// gemma3→Metal Phase 3b: once the capability-aware routing lets gemma3
+    /// chat fall through to the dense lane, the fallback renderer must route
+    /// its template to `render_gemma3_prompt` (byte-faithful, shared with the
+    /// runnable bridge) with the runnable bridge's exact encode contract —
+    /// BOS at token level (add_special) and specials parsed — and NOT to the
+    /// role-colon fallback the model was never trained on.
+    #[test]
+    fn gemma3_template_renders_through_the_shared_gemma3_renderer_on_the_dense_lane() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let mut tokenizer = test_tokenizer();
+        // The load-bearing shape of the real gemma-3-1b-it template: turn
+        // markers + the first_user_prefix system-folding variable.
+        tokenizer.chat_template = Some(
+            "{{ bos_token }}{%- set first_user_prefix = \"\" -%}\
+             {{ '<start_of_turn>' + role }}{{ '<end_of_turn>\n' }}"
+                .to_string(),
+        );
+        assert!(is_gemma3_chat_template(
+            tokenizer.chat_template.as_deref().unwrap()
+        ));
+
+        let rendered = render_chat_prompt_for_tokenization(
+            &[
+                ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: "system".to_string(),
+                    content: "Be terse.".to_string(),
+                },
+                ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                },
+            ],
+            &tokenizer,
+        );
+        assert_eq!(
+            rendered.text,
+            "<start_of_turn>user\nBe terse.\n\nhello<end_of_turn>\n<start_of_turn>model\n",
+            "must byte-match the runnable bridge's render (system folded into the first turn)"
+        );
+        assert!(
+            rendered.add_special,
+            "BOS lands at token level, exactly like the runnable bridge encode"
+        );
+        assert!(rendered.parse_special);
+
+        // Tools on the dense lane fail closed with the same contract as the
+        // runnable bridge's typed refusal — never silently dropped from the
+        // prompt (gemma3's template has no tools branch and no certified
+        // grammar).
+        let err = render_chat_prompt_for_tokenization_with_tools(
+            &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            &tokenizer,
+            &[serde_json::json!({"name": "get_weather", "parameters": {}})],
+        )
+        .expect_err("gemma3 tools must fail closed on the dense lane");
+        assert!(
+            err.to_string().contains("no tools branch"),
+            "the refusal must state the reason: {err}"
+        );
+    }
+
+    /// Phase 3c triage: routing admits gemma3 by ARCH while the dense renderer
+    /// selects `render_gemma3_prompt` by TEMPLATE SHAPE. When the two
+    /// disagree, the fallback chain reaches `render_role_colon_prompt` — a
+    /// "user: …" prompt the model was never trained on, served silently under
+    /// a supported-row label. The mismatch must fail closed instead.
+    #[test]
+    fn gemma3_arch_with_an_unrecognized_template_fails_closed_on_the_dense_lane() {
+        let mut tokenizer = test_tokenizer();
+
+        // Control: the recognized template is admitted (no rejection), which
+        // proves the guard keys on the mismatch and not merely on the arch.
+        tokenizer.chat_template = Some(
+            "{{ bos_token }}{%- set first_user_prefix = \"\" -%}\
+             {{ '<start_of_turn>' + role }}{{ '<end_of_turn>\n' }}"
+                .to_string(),
+        );
+        assert!(
+            reject_windowed_arch_with_unrecognized_template("gemma3", &tokenizer, "m").is_none()
+        );
+
+        // A turn-marker template MISSING `first_user_prefix` is exactly the
+        // near-miss that used to slip through to the role-colon renderer.
+        for template in [
+            Some("{{ '<start_of_turn>' + role }}{{ '<end_of_turn>\n' }}".to_string()),
+            Some("{{ role }}: {{ content }}".to_string()),
+            None,
+        ] {
+            tokenizer.chat_template = template.clone();
+            let rejection =
+                reject_windowed_arch_with_unrecognized_template("gemma3", &tokenizer, "m")
+                    .unwrap_or_else(|| {
+                        panic!("a gemma3 arch with template {template:?} must fail closed")
+                    });
+            assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        // Scoped to windowed archs: a llama model with any template is fine.
+        tokenizer.chat_template = Some("{{ role }}: {{ content }}".to_string());
+        assert!(
+            reject_windowed_arch_with_unrecognized_template("llama", &tokenizer, "m").is_none()
+        );
+        assert!(reject_windowed_arch_with_unrecognized_template("", &tokenizer, "m").is_none());
+    }
+
+    /// Phase 3c finding F4: `serve --spec-decode` (CPU speculation) pins the
+    /// target session off the resident paths so the chunk-verify rollback has
+    /// CPU-authoritative KV. Routing is spec-blind, so with the resident lane
+    /// armed that combination made EVERY gemma3 request H4-error instead of
+    /// serving. Speculation is therefore declined for windowed archs — on both
+    /// verify lanes, since the GPU batched verify's `encode_attention` carries
+    /// no window either. Deleting the windowed clause makes this fail.
+    #[test]
+    fn speculation_is_declined_for_a_windowed_arch_on_both_verify_lanes() {
+        let greedy = SamplingConfig::default();
+        assert!(
+            speculation_admissible(&greedy, false, false, false, &tiny_config()),
+            "a plain greedy dense request must still speculate"
+        );
+        assert!(
+            !speculation_admissible(&greedy, false, false, false, &tiny_gemma3_config()),
+            "a windowed arch must never speculate: neither verify lane has a window"
+        );
+        // The pre-existing disqualifiers keep biting (they had no test either).
+        assert!(!speculation_admissible(
+            &greedy,
+            true,
+            false,
+            false,
+            &tiny_config()
+        ));
+        assert!(!speculation_admissible(
+            &greedy,
+            false,
+            true,
+            false,
+            &tiny_config()
+        ));
+        assert!(!speculation_admissible(
+            &greedy,
+            false,
+            false,
+            true,
+            &tiny_config()
+        ));
+        assert!(!speculation_admissible(
+            &SamplingConfig {
+                temperature: 0.7,
+                ..SamplingConfig::default()
+            },
+            false,
+            false,
+            false,
+            &tiny_config()
+        ));
+    }
+
+    /// Phase 3c triage: the gemma3 tool refusal is arch-keyed and lane-shared,
+    /// so the dense chokepoint raises the bridge's exact error object.
+    #[test]
+    fn gemma3_tool_refusal_is_arch_keyed_and_shared_with_the_bridge() {
+        let tool = serde_json::json!({"type": "function", "function": {"name": "f"}});
+        let rejection = reject_tools_for_windowed_arch("gemma3", Some(std::slice::from_ref(&tool)))
+            .expect("gemma3 tool requests must fail closed");
+        assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // No tools, empty tools (which is what `tool_choice:"none"` renders
+        // down to), and non-windowed archs all pass through untouched.
+        assert!(reject_tools_for_windowed_arch("gemma3", None).is_none());
+        assert!(reject_tools_for_windowed_arch("gemma3", Some(&[])).is_none());
+        assert!(
+            reject_tools_for_windowed_arch("llama", Some(std::slice::from_ref(&tool))).is_none()
+        );
+    }
+
     #[test]
     fn renders_llama3_instruct_prompt_with_header_tokens_and_special_parsing() {
         let _guard = crate::test_support::env_lock();
@@ -21016,7 +21691,9 @@ mod tests {
                     k_norm: None,
                 },
                 attention_output: desc("blk.0.attn_output.weight"),
+                post_attention_norm: None,
                 ffn_norm: desc("blk.0.ffn_norm.weight"),
+                post_ffw_norm: None,
                 ffn: LlamaFfnTensors::Dense {
                     gate: desc("blk.0.ffn_gate.weight"),
                     up: desc("blk.0.ffn_up.weight"),
@@ -21382,10 +22059,53 @@ mod tests {
             attention_key_length: None,
             logit_scale: None,
             moe: None,
+            gemma3: None,
             gemma4: None,
             qwen35: None,
             mla: None,
         }
+    }
+
+    /// Admit a windowed arch onto the CPU dense forward for the duration of
+    /// one test (drop guard restores fail-closed). Since the Phase 3b flip the
+    /// CPU dense forward errors for windowed archs at dispatch (hazard H4);
+    /// the cache-decision tests below drive tiny synthetic gemma3 configs
+    /// through it mechanically because all they assert is the store/resume
+    /// DECISION. The seam is process-global — arm it only while holding
+    /// `crate::test_support::env_lock()` (every user below already does).
+    struct AdmitWindowedCpuDenseGuard;
+    impl Drop for AdmitWindowedCpuDenseGuard {
+        fn drop(&mut self) {
+            crate::inference::TEST_ADMIT_WINDOWED_ARCH_CPU_DENSE
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn admit_windowed_cpu_dense_for_test() -> AdmitWindowedCpuDenseGuard {
+        crate::inference::TEST_ADMIT_WINDOWED_ARCH_CPU_DENSE
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        AdmitWindowedCpuDenseGuard
+    }
+
+    /// `tiny_config` with a gemma3 sliding-window schedule attached: the
+    /// smallest config for which `arch_has_windowed_attention` is true. The
+    /// CPU dense forward runs it mechanically (structure-less — exactly the
+    /// hazard the windowed-arch cache bypasses exist to contain), which is all
+    /// the store/resume decision tests need (they hold the H4 test admit
+    /// guard, `admit_windowed_cpu_dense_for_test`).
+    fn tiny_gemma3_config() -> LlamaModelConfig {
+        let mut config = tiny_config();
+        config.architecture = "gemma3".to_string();
+        config.gemma3 = Some(crate::model::Gemma3Metadata {
+            sliding_window: 2,
+            sliding_window_pattern: 2,
+            rope_freq_base_global: 10_000.0,
+            rope_freq_base_local: 10_000.0,
+            layer_is_sliding: vec![true],
+            embed_scale: 2.0,
+            ffn_geglu: true,
+            rope_neox_pairing: true,
+        });
+        config
     }
 
     fn tiny_weights() -> LlamaLoadedWeights {
@@ -21422,6 +22142,8 @@ mod tests {
                 ffn_down: select_rows("blk.0.ffn_down.weight", hidden, ffn, &[0, 1, 2, 3]),
                 attention_q_norm: None,
                 attention_k_norm: None,
+                post_attention_norm: None,
+                post_ffw_norm: None,
                 moe_router: None,
                 mla_q_a_proj: None,
                 mla_q_a_layernorm: None,
@@ -21928,7 +22650,16 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["reasoning"],
         },
         CatalogItem {
-            catalog_id: "gemma3_1b_it_q8_0",
+            // MUST equal the compatibility row id `gemma_3_1b_it_q8_0` (same
+            // rule as the qwen3 entry above): `filename_is_supported_exact_row`
+            // joins the catalog to the row set by EXACT id, and the frontend
+            // picker does the same. The old `gemma3_1b_it_q8_0` spelling made
+            // that join fail, so the one promoted gemma3 row classified as
+            // ExperimentalImplemented — served responses disclosed
+            // `lane:"experimental"` and had their generated text whitespace-
+            // trimmed, which for a supported exact row is the parity-claimed
+            // artifact and must stay byte-identical. Phase 3c.
+            catalog_id: "gemma_3_1b_it_q8_0",
             name: "Gemma 3 1B-It Q8_0",
             repo_id: "ggml-org/gemma-3-1b-it-GGUF",
             filename: "gemma-3-1b-it-Q8_0.gguf",
@@ -22568,7 +23299,7 @@ mod runnable_completions_gate_api_tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::gguf::GgufMetadataValue;
+    use crate::gguf::{GgufMetadataValue, GgufTensorDescriptor};
     use axum::{
         body::{to_bytes, Body},
         http::Request,
@@ -22576,10 +23307,45 @@ mod runnable_completions_gate_api_tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
+    /// The seven per-layer linears the Phase 3c routing predicate inspects
+    /// (`model::windowed_arch_resident_quant_admissible`, the routing mirror of
+    /// the engine H5 pin). Emitted at `quant` so a fixture can be a Q8_0 row or
+    /// a K-quant row.
+    fn layer_linear_descriptors(quant: crate::gguf::GgufTensorType) -> Vec<GgufTensorDescriptor> {
+        [
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+        ]
+        .into_iter()
+        .map(|name| GgufTensorDescriptor {
+            name: name.to_string(),
+            dimensions: vec![32, 32],
+            tensor_type: quant,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 0,
+        })
+        .collect()
+    }
+
     /// A loaded model whose GGUF reports the given architecture — just enough
-    /// model to resolve through `get_or_load_model`. The gate must fire before
-    /// any tensor or tokenizer access, so the synthetic GGUF stays empty.
+    /// model to resolve through `get_or_load_model`. Carries Q8_0 per-layer
+    /// linear descriptors because routing is quant-aware since Phase 3c: an
+    /// empty tensor list reads as "not a Q8_0 exact row" and would send every
+    /// windowed fixture to the bridge, masking the capability split under test.
     async fn state_with_loaded_arch(arch: &str) -> AppState {
+        state_with_loaded_arch_quant(arch, crate::gguf::GgufTensorType::Q8_0).await
+    }
+
+    async fn state_with_loaded_arch_quant(
+        arch: &str,
+        quant: crate::gguf::GgufTensorType,
+    ) -> AppState {
         let state = AppState::default();
         let model = LoadedModel {
             id: "gate-test".to_string(),
@@ -22595,7 +23361,7 @@ mod runnable_completions_gate_api_tests {
                     "general.architecture".to_string(),
                     GgufMetadataValue::String(arch.to_string()),
                 )]),
-                tensors: Vec::new(),
+                tensors: layer_linear_descriptors(quant),
             },
             llama_config: None,
             llama_tensors: None,
@@ -22654,7 +23420,7 @@ mod runnable_completions_gate_api_tests {
 
     #[tokio::test]
     async fn llama_server_completion_fails_closed_for_runnable_arch() {
-        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
         let (status, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
         assert_gate_rejection(status, &body);
     }
@@ -22682,7 +23448,7 @@ mod runnable_completions_gate_api_tests {
 
     #[tokio::test]
     async fn completions_multi_choice_fails_closed_for_runnable_arch() {
-        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let app = router_with_state(state_with_loaded_arch("gemma2").await);
         let (status, body) =
             post_json(app, "/v1/completions", json!({ "prompt": "hi", "n": 2 })).await;
         assert_gate_rejection(status, &body);
@@ -22690,7 +23456,7 @@ mod runnable_completions_gate_api_tests {
 
     #[tokio::test]
     async fn receipt_replay_fails_closed_for_runnable_arch() {
-        let state = state_with_loaded_arch("gemma3").await;
+        let state = state_with_loaded_arch("qwen35").await;
         let request = receipt::ReceiptRequest {
             endpoint: "/v1/completions".to_string(),
             messages_or_prompt: json!("hello"),
@@ -22713,7 +23479,7 @@ mod runnable_completions_gate_api_tests {
     /// must keep returning its own typed 503, not the completions gate's 422.
     #[tokio::test]
     async fn chat_completions_keep_their_runnable_lane_error() {
-        let app = router_with_state(state_with_loaded_arch("gemma3").await);
+        let app = router_with_state(state_with_loaded_arch("qwen35").await);
         let (status, body) = post_json(
             app,
             "/v1/chat/completions",
@@ -22731,6 +23497,169 @@ mod runnable_completions_gate_api_tests {
         let app = router_with_state(state_with_loaded_arch("llama").await);
         let (_, body) = post_json(app, "/completion", json!({ "prompt": "hi" })).await;
         assert_ne!(body["error"]["code"], "unsupported_completions_lane");
+    }
+
+    /// gemma3→Metal Phase 3b: the completions gate is CAPABILITY-AWARE for
+    /// gemma3. On a host where the resident lane cannot serve
+    /// (`CAMELID_METAL_RESIDENT_DECODE=0` — the runnable-fallback
+    /// configuration, and the state of every non-macOS CI leg regardless of
+    /// env), the raw surfaces stay 422-gated exactly as before the flip.
+    /// Plain `#[test]` + a local runtime so the env mutation happens strictly
+    /// under `env_lock` with no guard held across an await point.
+    #[test]
+    fn completions_gate_stays_closed_for_gemma3_on_a_runnable_fallback_host() {
+        let _guard = crate::test_support::env_lock();
+        // Restore the caller's value on exit: a shell-armed targeted battery
+        // (CAMELID_METAL_RESIDENT_DECODE=1, §9d discipline) must not be
+        // disarmed mid-run by this test — the resident gates read env LIVE.
+        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (status, body) = runtime.block_on(async {
+            let app = router_with_state(state_with_loaded_arch("gemma3").await);
+            post_json(app, "/completion", json!({ "prompt": "hi" })).await
+        });
+        match prior {
+            Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
+            None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        assert_gate_rejection(status, &body);
+    }
+
+    /// gemma3→Metal Phase 3b, the other half of the split: where the resident
+    /// lane CAN serve (macOS, Metal device, resident decode armed — the
+    /// `camelid serve` default fast stack), the raw-completions surfaces
+    /// REOPEN for gemma3 onto the dense lane: the request must proceed past
+    /// the gate (this synthetic model then fails on its missing tokenizer —
+    /// any code but the gate's proves the routing).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn completions_gate_reopens_for_gemma3_where_the_resident_lane_serves() {
+        if !crate::metal::detect_metal_device().available {
+            return;
+        }
+        let _guard = crate::test_support::env_lock();
+        // Restore the caller's value on exit (see the fallback-host test).
+        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_, body) = runtime.block_on(async {
+            let app = router_with_state(state_with_loaded_arch("gemma3").await);
+            post_json(app, "/completion", json!({ "prompt": "hi" })).await
+        });
+        match prior {
+            Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
+            None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        assert_ne!(
+            body["error"]["code"], "unsupported_completions_lane",
+            "on a resident-capable host the gemma3 completions gate must reopen: {body}"
+        );
+    }
+
+    /// Phase 3c finding F3 at the HTTP level: a NON-Q8_0 gemma3 must stay on
+    /// the runnable bridge even on a fully resident-capable host. Before, the
+    /// routing predicate was quant-blind, so this file was routed to the dense
+    /// lane, declined by the engine's H5 Q8_0 pin, and then H4-errored on every
+    /// request — a hard regression against the pre-flip bridge, which served
+    /// every gemma3 quant. Same fixture as the reopen test above, one field
+    /// different, so the quantization is provably what decides it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_kquant_gemma3_keeps_the_runnable_bridge_on_a_resident_capable_host() {
+        if !crate::metal::detect_metal_device().available {
+            return;
+        }
+        let _guard = crate::test_support::env_lock();
+        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (status, body) = runtime.block_on(async {
+            let app = router_with_state(
+                state_with_loaded_arch_quant("gemma3", crate::gguf::GgufTensorType::Q4K).await,
+            );
+            post_json(app, "/completion", json!({ "prompt": "hi" })).await
+        });
+        match prior {
+            Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
+            None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        assert_gate_rejection(status, &body);
+    }
+
+    /// Phase 3c triage: gemma3 chat had NO HTTP-level test on ANY host — the
+    /// only gemma3 HTTP tests hit `/completion`. This pins the leg that
+    /// matters most (the runnable-fallback host: every non-macOS CI leg, and
+    /// any Mac with resident decode opted out), where gemma3 chat must be
+    /// served BY THE BRIDGE. With no runnable runtime loaded, the honest
+    /// outcome is the typed 503 that names the lane — never a fall-through to
+    /// the dense engine, which for this arch fails closed at every per-layer
+    /// dispatch (H4).
+    #[test]
+    fn gemma3_chat_routes_to_the_runnable_bridge_on_a_fallback_host() {
+        let _guard = crate::test_support::env_lock();
+        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (status, body) = runtime.block_on(async {
+            let app = router_with_state(state_with_loaded_arch("gemma3").await);
+            post_json(
+                app,
+                "/v1/chat/completions",
+                json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await
+        });
+        match prior {
+            Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
+            None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "model_not_ready", "{body}");
+    }
+
+    /// Phase 3c triage: the gemma3 tool refusal must carry the SAME
+    /// machine-readable identity on both lanes. It used to be
+    /// `unsupported_tools` (no param) on the bridge and
+    /// `unsupported_chat_template` (param "messages") on the dense lane, so a
+    /// client switching on `error.code` degraded correctly on Linux and fell
+    /// into a generic branch on a resident-capable Mac. Runs on every host:
+    /// the dense-lane refusal now fires ahead of routing-dependent work.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_tool_refusal_uses_the_same_code_on_the_dense_lane() {
+        if !crate::metal::detect_metal_device().available {
+            return;
+        }
+        let _guard = crate::test_support::env_lock();
+        let prior = std::env::var("CAMELID_METAL_RESIDENT_DECODE").ok();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (status, body) = runtime.block_on(async {
+            let app = router_with_state(state_with_loaded_arch("gemma3").await);
+            post_json(
+                app,
+                "/v1/chat/completions",
+                json!({
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "tools": [{
+                        "type": "function",
+                        "function": { "name": "read_file", "parameters": {} }
+                    }]
+                }),
+            )
+            .await
+        });
+        match prior {
+            Some(value) => std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", value),
+            None => std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE"),
+        }
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "unsupported_tools", "{body}");
+        assert!(
+            body["error"]["param"].is_null(),
+            "the bridge sets no param; the dense lane must not either: {body}"
+        );
     }
 }
 

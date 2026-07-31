@@ -1,11 +1,12 @@
 use std::{fs, path::Path};
 
 use camelid::{
+    error::BackendError,
     gguf::read_metadata,
     inference::LlamaKvCachePlan,
     model::{
-        LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig, LlamaMoeExpertTensors,
-        LlamaTensorBinding,
+        is_runnable_only_arch, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig,
+        LlamaMoeExpertTensors, LlamaTensorBinding,
     },
 };
 
@@ -1003,4 +1004,705 @@ fn qwen3_explicit_head_dim_binds_wide_q_projection() {
     );
     assert_eq!(binding.layers[0].attention_output.dimensions, vec![32, 16]);
     assert!(binding.layers[0].attention_q_norm().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// gemma3 full-norm-set binder coverage (feat/gemma3-metal-resident, Phase 1).
+//
+// gemma3 carries FOUR norm tensors per layer beyond the Llama pair: per-head
+// `attn_q_norm`/`attn_k_norm` (shape `[head_dim]`, applied before RoPE) and the
+// full-width sandwich norms `post_attention_norm`/`post_ffw_norm` (shape
+// `[embedding_length]`, applied before each residual add). Before Phase 1 the
+// dense binder classified gemma3 neither expects- nor forbids-QK-norm, so all
+// of them silently bound `(None, None)` — the disclosed mis-binding behind the
+// serve router's fail-closed divert. The binder must now carry all four and
+// fail closed when any is missing, and `LlamaModelConfig::from_gguf` must
+// parse the window/rope schedule metadata fail-closed (no silent defaults for
+// required keys). Since the campaign's Phase 3b flip, the Metal-resident lane
+// consumes these tensors on resident-capable hosts; everywhere else gemma3
+// still routes to the runnable bridge (capability-aware predicate) and the
+// CPU dense forward fails closed at forward dispatch (hazard H4).
+// ---------------------------------------------------------------------------
+
+struct Gemma3FixtureOptions {
+    include_qk_norm: bool,
+    include_post_norms: bool,
+    /// Decoder depth: `gemma3.block_count` AND the per-block tensor set both
+    /// follow this, so schedule-derivation tests can run `from_gguf` at the
+    /// real row's 26-layer depth (not just the CI-default single block).
+    block_count: u32,
+    /// `Some(w)` writes `gemma3.attention.sliding_window = w` (including a
+    /// fail-closed `0`); `None` omits the key entirely.
+    sliding_window: Option<u32>,
+    /// `Some(b)` writes `gemma3.rope.freq_base = b` (including fail-closed
+    /// non-positive values); `None` omits the key entirely.
+    global_base: Option<f32>,
+    /// `Some` writes an explicit scalar `gemma3.attention.sliding_window_pattern`.
+    pattern_key: Option<u32>,
+    /// Writes the pattern key as an f32 (malformed: the key must be an integer).
+    pattern_key_malformed: bool,
+    /// `Some` writes an explicit `gemma3.rope.freq_base_swa`.
+    local_base_key: Option<f32>,
+    /// Writes `gemma3.rope.freq_base_swa` as a u32 (malformed: must be a float).
+    local_base_key_malformed: bool,
+}
+
+impl Default for Gemma3FixtureOptions {
+    fn default() -> Self {
+        Self {
+            include_qk_norm: true,
+            include_post_norms: true,
+            block_count: 1,
+            sliding_window: Some(512),
+            global_base: Some(1_000_000.0),
+            pattern_key: None,
+            pattern_key_malformed: false,
+            local_base_key: None,
+            local_base_key_malformed: false,
+        }
+    }
+}
+
+/// Build a tiny gemma3 GGUF (`block_count` blocks, embedding 16, 2 heads, 1 KV
+/// head, head_dim 8, tied embeddings) mirroring the real row's key/tensor
+/// layout: `attention.sliding_window` + `rope.freq_base` are the only
+/// window/rope keys the real gemma-3-1b-it-Q8_0 file carries.
+fn write_gemma3_gguf(path: &Path, options: &Gemma3FixtureOptions) {
+    let mut tensors: Vec<(String, Vec<i64>)> = vec![
+        ("token_embd.weight".to_string(), vec![4, 16]),
+        ("output_norm.weight".to_string(), vec![16]),
+    ];
+    for blk in 0..options.block_count {
+        let name = |t: &str| format!("blk.{blk}.{t}.weight");
+        tensors.push((name("attn_norm"), vec![16]));
+        tensors.push((name("attn_q"), vec![16, 16]));
+        tensors.push((name("attn_k"), vec![16, 8]));
+        tensors.push((name("attn_v"), vec![16, 8]));
+        tensors.push((name("attn_output"), vec![16, 16]));
+        tensors.push((name("ffn_norm"), vec![16]));
+        tensors.push((name("ffn_gate"), vec![16, 32]));
+        tensors.push((name("ffn_up"), vec![16, 32]));
+        tensors.push((name("ffn_down"), vec![32, 16]));
+        if options.include_qk_norm {
+            // head_dim = attention.key_length = 8.
+            tensors.push((name("attn_q_norm"), vec![8]));
+            tensors.push((name("attn_k_norm"), vec![8]));
+        }
+        if options.include_post_norms {
+            // Sandwich norms are full-width [embedding_length].
+            tensors.push((name("post_attention_norm"), vec![16]));
+            tensors.push((name("post_ffw_norm"), vec![16]));
+        }
+    }
+
+    let mut metadata_count = 12i64;
+    if options.sliding_window.is_some() {
+        metadata_count += 1;
+    }
+    if options.global_base.is_some() {
+        metadata_count += 1;
+    }
+    if options.pattern_key.is_some() || options.pattern_key_malformed {
+        metadata_count += 1;
+    }
+    if options.local_base_key.is_some() || options.local_base_key_malformed {
+        metadata_count += 1;
+    }
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    push_u32(&mut b, 3);
+    push_i64(&mut b, tensors.len() as i64);
+    push_i64(&mut b, metadata_count);
+
+    push_kv_string(&mut b, "general.architecture", "gemma3");
+    push_kv_string(&mut b, "general.name", "Gemma3 Norm Fixture");
+    push_kv_u32(&mut b, "general.file_type", 0);
+    push_kv_u32(&mut b, "gemma3.context_length", 128);
+    push_kv_u32(&mut b, "gemma3.embedding_length", 16);
+    push_kv_u32(&mut b, "gemma3.block_count", options.block_count);
+    push_kv_u32(&mut b, "gemma3.feed_forward_length", 32);
+    push_kv_u32(&mut b, "gemma3.attention.head_count", 2);
+    push_kv_u32(&mut b, "gemma3.attention.head_count_kv", 1);
+    push_kv_u32(&mut b, "gemma3.attention.key_length", 8);
+    push_kv_u32(&mut b, "gemma3.attention.value_length", 8);
+    if let Some(base) = options.global_base {
+        push_kv_f32(&mut b, "gemma3.rope.freq_base", base);
+    }
+    push_kv_f32(&mut b, "gemma3.attention.layer_norm_rms_epsilon", 1e-6);
+    if let Some(window) = options.sliding_window {
+        push_kv_u32(&mut b, "gemma3.attention.sliding_window", window);
+    }
+    if let Some(period) = options.pattern_key {
+        push_kv_u32(&mut b, "gemma3.attention.sliding_window_pattern", period);
+    } else if options.pattern_key_malformed {
+        push_kv_f32(&mut b, "gemma3.attention.sliding_window_pattern", 6.0);
+    }
+    if let Some(base) = options.local_base_key {
+        push_kv_f32(&mut b, "gemma3.rope.freq_base_swa", base);
+    } else if options.local_base_key_malformed {
+        push_kv_u32(&mut b, "gemma3.rope.freq_base_swa", 10_000);
+    }
+
+    let mut relative_offset = 0u64;
+    for (name, dims) in &tensors {
+        push_string(&mut b, name);
+        push_u32(&mut b, dims.len() as u32);
+        for dim in dims {
+            push_i64(&mut b, *dim);
+        }
+        push_i32(&mut b, 0);
+        push_u64(&mut b, relative_offset);
+        relative_offset += dims.iter().product::<i64>() as u64 * 4;
+    }
+    while !b.len().is_multiple_of(32) {
+        b.push(0);
+    }
+    b.extend(vec![0u8; relative_offset as usize]);
+    fs::write(path, b).unwrap();
+
+    // NOTE: no vocab_size key — from_gguf infers it from token_embd (4), like
+    // the real row would if trimmed; keeps the fixture at 13 base keys.
+}
+
+#[test]
+fn gemma3_binds_qk_and_sandwich_norms_with_window_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3.gguf");
+    write_gemma3_gguf(&path, &Gemma3FixtureOptions::default());
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
+
+    let layer = &binding.layers[0];
+    // NAME-pinned bindings: the two QK norms share shape [8] and the two
+    // sandwich norms share shape [16], so `.dimensions` alone cannot tell a
+    // transposed `find_tensor` lookup from a correct one — asserting the bound
+    // descriptor's `.name` on the specific field makes a swap fail loudly.
+    let q_norm = layer
+        .attention_q_norm()
+        .expect("gemma3 must bind attn_q_norm");
+    assert_eq!(q_norm.name, "blk.0.attn_q_norm.weight");
+    assert_eq!(q_norm.dimensions, vec![8]);
+    let k_norm = layer
+        .attention_k_norm()
+        .expect("gemma3 must bind attn_k_norm");
+    assert_eq!(k_norm.name, "blk.0.attn_k_norm.weight");
+    assert_eq!(k_norm.dimensions, vec![8]);
+    let post_attn = layer
+        .post_attention_norm
+        .as_ref()
+        .expect("gemma3 must bind post_attention_norm");
+    assert_eq!(post_attn.name, "blk.0.post_attention_norm.weight");
+    assert_eq!(post_attn.dimensions, vec![16]);
+    let post_ffw = layer
+        .post_ffw_norm
+        .as_ref()
+        .expect("gemma3 must bind post_ffw_norm");
+    assert_eq!(post_ffw.name, "blk.0.post_ffw_norm.weight");
+    assert_eq!(post_ffw.dimensions, vec![16]);
+
+    // Window/rope metadata parses from the same keys the real row carries,
+    // with the reference-pinned constants for the keys no conversion writes.
+    let meta = config.gemma3.as_ref().expect("gemma3 metadata must parse");
+    assert_eq!(meta.sliding_window, 512);
+    assert_eq!(meta.sliding_window_pattern, 6);
+    assert_eq!(meta.rope_freq_base_global, 1_000_000.0);
+    assert_eq!(meta.rope_freq_base_local, 10_000.0);
+    assert_eq!(meta.layer_is_sliding, vec![true]);
+    assert_eq!(meta.embed_scale, 4.0); // sqrt(embedding_length 16)
+    assert!(meta.ffn_geglu);
+    assert!(meta.rope_neox_pairing);
+    // The dense-path pairing flag stays false (the CPU dense forward is
+    // fail-closed for gemma3; the resident lane forces pairing host-side from
+    // the metadata flag above).
+    assert!(!config.rope_neox_pairing);
+
+    // CRITICAL invariant, updated for the Phase 3b flip: gemma3 is no longer
+    // UNCONDITIONALLY runnable-only (on a resident-capable host the Metal
+    // lane serves it), but on every host where the resident lane cannot serve
+    // it must still classify for the runnable bridge — never the CPU dense
+    // forward, whose forward dispatch fails closed for windowed archs (H4).
+    assert!(!is_runnable_only_arch(&config.architecture));
+    // Both capability legs false => bridge; Phase 3c added the quantization
+    // leg (a non-Q8_0 gemma3 has no resident lane on ANY host).
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        false,
+        true
+    ));
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        true,
+        false
+    ));
+    assert!(camelid::model::arch_has_windowed_attention(&config));
+}
+
+#[test]
+fn gemma3_without_qk_norm_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-no-qknorm.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            include_qk_norm: false,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let err = LlamaTensorBinding::bind(&gguf, &config)
+        .expect_err("gemma3 missing attn_q_norm/attn_k_norm must fail closed");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("QK-norm") && msg.contains("gemma3"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_without_sandwich_norms_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-no-postnorms.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            include_post_norms: false,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let err = LlamaTensorBinding::bind(&gguf, &config)
+        .expect_err("gemma3 missing post_attention_norm/post_ffw_norm must fail closed");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("sandwich") && msg.contains("gemma3"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_without_sliding_window_key_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-no-window.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            sliding_window: None,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf)
+        .expect_err("gemma3 missing attention.sliding_window must fail closed at config parse");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("gemma3.attention.sliding_window") && msg.contains("fails closed"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_explicit_pattern_and_local_base_keys_override_reference_constants() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-explicit-keys.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            pattern_key: Some(4),
+            local_base_key: Some(50_000.0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let meta = config.gemma3.as_ref().unwrap();
+    assert_eq!(meta.sliding_window_pattern, 4);
+    assert_eq!(meta.rope_freq_base_local, 50_000.0);
+}
+
+#[test]
+fn gemma3_malformed_pattern_key_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-bad-pattern.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            pattern_key_malformed: true,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf).expect_err(
+        "an explicit but non-integer sliding_window_pattern must fail closed, not fall back",
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("sliding_window_pattern"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Schedule derivation exercised THROUGH `from_gguf` at the real row's depth
+/// (the unit test hand-builds the struct; this one proves the parse itself
+/// derives the schedule from the resolved pattern). Expectations are literal
+/// lists — NOT the production `(i + 1) % pattern` expression — so a regression
+/// in the derivation (e.g. deriving from `REFERENCE_SLIDING_WINDOW_PATTERN`
+/// instead of the resolved pattern) cannot be mirrored into the expectation.
+#[test]
+fn gemma3_from_gguf_derives_the_26_layer_reference_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-26-layers.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            block_count: 26,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let meta = config.gemma3.as_ref().expect("gemma3 metadata must parse");
+
+    assert_eq!(meta.layer_is_sliding.len(), 26);
+    let globals: Vec<usize> = meta
+        .layer_is_sliding
+        .iter()
+        .enumerate()
+        .filter(|(_, sliding)| !**sliding)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(globals, vec![5, 11, 17, 23]);
+    assert!(
+        meta.is_sliding_layer(25),
+        "layer 25 must be local (no forced-global final layer)"
+    );
+    for idx in 0..26 {
+        let expect_global = matches!(idx, 5 | 11 | 17 | 23);
+        assert_eq!(!meta.is_sliding_layer(idx), expect_global, "layer {idx}");
+        assert_eq!(
+            meta.rope_freq_base_at(idx),
+            if expect_global { 1_000_000.0 } else { 10_000.0 },
+            "layer {idx} rope base"
+        );
+        assert_eq!(
+            meta.layer_window(idx),
+            if expect_global { None } else { Some(512) },
+            "layer {idx} window"
+        );
+    }
+}
+
+/// The explicit `gemma3.attention.sliding_window_pattern` override must reach
+/// the schedule DERIVATION through `from_gguf` (not merely the stored field):
+/// 12 layers at pattern 4 puts the globals at 3/7/11 (literal list), and the
+/// `gemma3.rope.freq_base_swa` override must reach the per-layer accessor.
+#[test]
+fn gemma3_from_gguf_pattern_override_drives_the_schedule_derivation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-12-layers-pattern-4.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            block_count: 12,
+            pattern_key: Some(4),
+            local_base_key: Some(50_000.0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let meta = config.gemma3.as_ref().expect("gemma3 metadata must parse");
+
+    assert_eq!(meta.sliding_window_pattern, 4);
+    assert_eq!(meta.layer_is_sliding.len(), 12);
+    let globals: Vec<usize> = meta
+        .layer_is_sliding
+        .iter()
+        .enumerate()
+        .filter(|(_, sliding)| !**sliding)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(globals, vec![3, 7, 11]);
+    for idx in 0..12 {
+        let expect_global = matches!(idx, 3 | 7 | 11);
+        assert_eq!(!meta.is_sliding_layer(idx), expect_global, "layer {idx}");
+        assert_eq!(
+            meta.rope_freq_base_at(idx),
+            if expect_global { 1_000_000.0 } else { 50_000.0 },
+            "layer {idx} rope base"
+        );
+    }
+}
+
+#[test]
+fn gemma3_zero_sliding_window_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-zero-window.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            sliding_window: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf)
+        .expect_err("a zero-width sliding window must fail closed at config parse");
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("gemma3.attention.sliding_window") && msg.contains("greater than zero"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_missing_global_rope_base_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-no-global-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            global_base: None,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf)
+        .expect_err("gemma3 missing rope.freq_base must fail closed at config parse");
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("gemma3.rope.freq_base") && msg.contains("fails closed"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_non_positive_global_rope_base_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-zero-global-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            global_base: Some(0.0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf)
+        .expect_err("gemma3 non-positive rope.freq_base must fail closed at config parse");
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("gemma3.rope.freq_base") && msg.contains("greater than zero"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn gemma3_malformed_local_base_key_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-bad-local-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            local_base_key_malformed: true,
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf).expect_err(
+        "an explicit but non-float rope.freq_base_swa must fail closed, not fall back to \
+         the reference local base",
+    );
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(msg.contains("freq_base_swa"), "unexpected error: {msg}");
+}
+
+#[test]
+fn gemma3_non_positive_local_base_key_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gemma3-zero-local-base.gguf");
+    write_gemma3_gguf(
+        &path,
+        &Gemma3FixtureOptions {
+            local_base_key: Some(0.0),
+            ..Default::default()
+        },
+    );
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf).expect_err(
+        "an explicit but non-positive rope.freq_base_swa must fail closed, not fall back to \
+         the reference local base",
+    );
+    assert!(
+        matches!(err, BackendError::InvalidModelMetadata(_)),
+        "expected InvalidModelMetadata, got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(msg.contains("freq_base_swa"), "unexpected error: {msg}");
+}
+
+/// Real-row gate (campaign Phase 1 parity gate): every one of the 1B row's
+/// 26x4 = 104 norm tensors binds non-None from the actual GGUF, the window/
+/// pattern/rope-base metadata round-trips exactly, the structural flags are
+/// set, and the runnable-only guard still fires after binding succeeds.
+/// Skipped unless `CAMELID_GEMMA3_GGUF` points at the real
+/// gemma-3-1b-it-Q8_0 file (same convention as `CAMELID_GEMMA4_GGUF` in
+/// tests/gemma4_metadata.rs).
+#[test]
+fn gemma3_real_row_binds_all_104_norm_tensors_and_window_schedule() {
+    let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+        eprintln!(
+            "SKIP gemma3_real_row_binds_all_104_norm_tensors_and_window_schedule: \
+             set CAMELID_GEMMA3_GGUF to the gemma-3-1b-it-Q8_0 GGUF"
+        );
+        return;
+    };
+    let gguf = read_metadata(Path::new(&path)).unwrap();
+    assert_eq!(gguf.architecture(), Some("gemma3"));
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
+
+    // (a) All 104 norm tensors bind non-None with the real shapes.
+    assert_eq!(binding.layers.len(), 26);
+    let mut bound_norms = 0usize;
+    for (idx, layer) in binding.layers.iter().enumerate() {
+        let q_norm = layer
+            .attention_q_norm()
+            .unwrap_or_else(|| panic!("layer {idx} attn_q_norm must bind"));
+        let k_norm = layer
+            .attention_k_norm()
+            .unwrap_or_else(|| panic!("layer {idx} attn_k_norm must bind"));
+        let post_attn = layer
+            .post_attention_norm
+            .as_ref()
+            .unwrap_or_else(|| panic!("layer {idx} post_attention_norm must bind"));
+        let post_ffw = layer
+            .post_ffw_norm
+            .as_ref()
+            .unwrap_or_else(|| panic!("layer {idx} post_ffw_norm must bind"));
+        // NAME-pinned per layer: both QK norms are [256] and both sandwich
+        // norms are [1152], so shape assertions alone would pass with the
+        // lookups transposed — pin each field to its exact tensor name.
+        assert_eq!(
+            q_norm.name,
+            format!("blk.{idx}.attn_q_norm.weight"),
+            "layer {idx} q_norm name"
+        );
+        assert_eq!(
+            k_norm.name,
+            format!("blk.{idx}.attn_k_norm.weight"),
+            "layer {idx} k_norm name"
+        );
+        assert_eq!(
+            post_attn.name,
+            format!("blk.{idx}.post_attention_norm.weight"),
+            "layer {idx} post_attention_norm name"
+        );
+        assert_eq!(
+            post_ffw.name,
+            format!("blk.{idx}.post_ffw_norm.weight"),
+            "layer {idx} post_ffw_norm name"
+        );
+        assert_eq!(q_norm.dimensions, vec![256], "layer {idx} q_norm shape");
+        assert_eq!(k_norm.dimensions, vec![256], "layer {idx} k_norm shape");
+        assert_eq!(
+            post_attn.dimensions,
+            vec![1152],
+            "layer {idx} post_attention_norm shape"
+        );
+        assert_eq!(
+            post_ffw.dimensions,
+            vec![1152],
+            "layer {idx} post_ffw_norm shape"
+        );
+        bound_norms += 4;
+    }
+    assert_eq!(bound_norms, 104);
+
+    // (b) Window/pattern/rope-base metadata round-trips exactly: window 512
+    // (includes the current position), pattern 6 with globals at 5/11/17/23
+    // (and NO forced-global final layer), local base 10000, global base 1e6.
+    let meta = config.gemma3.as_ref().expect("gemma3 metadata must parse");
+    assert_eq!(meta.sliding_window, 512);
+    assert_eq!(meta.sliding_window_pattern, 6);
+    assert_eq!(meta.rope_freq_base_local, 10_000.0);
+    assert_eq!(meta.rope_freq_base_global, 1_000_000.0);
+    let globals: Vec<usize> = meta
+        .layer_is_sliding
+        .iter()
+        .enumerate()
+        .filter(|(_, sliding)| !**sliding)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(globals, vec![5, 11, 17, 23]);
+    assert!(meta.is_sliding_layer(25), "layer 25 must stay local");
+    for idx in 0..26 {
+        if globals.contains(&idx) {
+            assert_eq!(meta.rope_freq_base_at(idx), 1_000_000.0, "layer {idx}");
+            assert_eq!(meta.layer_window(idx), None, "layer {idx}");
+        } else {
+            assert_eq!(meta.rope_freq_base_at(idx), 10_000.0, "layer {idx}");
+            assert_eq!(meta.layer_window(idx), Some(512), "layer {idx}");
+        }
+    }
+
+    // (c) Structural flags: GeGLU, sqrt(1152) embed scale, forced split-half
+    // pairing on the metadata (dense-path flag deliberately unchanged).
+    assert!(meta.ffn_geglu);
+    assert_eq!(meta.embed_scale, (1152.0f32).sqrt());
+    assert!(meta.rope_neox_pairing);
+    assert!(!config.rope_neox_pairing);
+
+    // CRITICAL invariant, updated for the Phase 3b flip: binding succeeded
+    // and the resident encodes are in hand, so gemma3 left the unconditional
+    // runnable-only set — but the routing stays capability-aware: on a host
+    // where the Metal-resident lane cannot serve, the runnable bridge is
+    // still the only correct serve path, and the CPU dense forward fails
+    // closed at forward dispatch (H4) via `arch_has_windowed_attention`.
+    assert!(!is_runnable_only_arch(&config.architecture));
+    // Both capability legs false => bridge; Phase 3c added the quantization
+    // leg (a non-Q8_0 gemma3 has no resident lane on ANY host).
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        false,
+        true
+    ));
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        true,
+        false
+    ));
+    assert!(camelid::model::arch_has_windowed_attention(&config));
 }

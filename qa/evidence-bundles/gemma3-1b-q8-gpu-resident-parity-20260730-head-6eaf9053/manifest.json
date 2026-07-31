@@ -1,0 +1,125 @@
+{
+ "schema": "camelid.gemma3.metal_resident_parity_bundle.v1",
+ "bundle": "gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053",
+ "row_id": "gemma_3_1b_it_q8_0",
+ "campaign": "GEMMA3_METAL_CONDUCTOR.md Phase 4",
+ "date_utc": "2026-07-30",
+ "source_head": "6eaf9053",
+ "model": {
+  "filename": "gemma-3-1b-it-Q8_0.gguf",
+  "sha256": "b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5",
+  "size_bytes": 1069306368,
+  "provenance": "ggml-org/gemma-3-1b-it-GGUF (upstream-verified exact, license gemma)",
+  "arch": "gemma3",
+  "sliding_window_tokens": 512,
+  "native_context_length": 32768
+ },
+ "comparator": {
+  "name": "llama.cpp llama-server",
+  "version": "9632 (acd79d603)",
+  "binary_sha256": "382096b1dc10da68c2bf0a97e1f0dd36db90531cdea1434760d8c1a70fea1310",
+  "backend": "CPU",
+  "flags": "-ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096",
+  "sampling": "temperature 0, top_k 1, seed 0, cache_prompt false, samplers [top_k]",
+  "discipline": "two-phase; camelid and llama.cpp never co-resident for any capture or probe"
+ },
+ "camelid_lane": {
+  "selected_backend": "metal_resident_q8_runtime",
+  "selected_q8_path": "metal_resident_q8_0_wire",
+  "decode_path": "q8_0_metal_resident_decode",
+  "prefill_path": "q8_0_metal_resident_prefill",
+  "serve_backend": "llama (dense serve lane; no runnable runtime loaded)",
+  "support_level_at_capture": "supported_exact_row_smoke_sub512",
+  "env": "none — the resident lane is the default selection for this row on macOS/Metal"
+ },
+ "host": {
+  "machine": "Apple M4 Mac mini",
+  "cores": 10,
+  "ram_gib": 16,
+  "os": "macOS 26.5 (build 25F5058e)"
+ },
+ "legs": {
+  "sub512_chat": {
+   "harness": "scripts/chat-parity-gemma3.mjs",
+   "pack": "qa/prompt-packs/gemma3-chat-gate-pack-v1.json",
+   "depths": [
+    1,
+    5,
+    50
+   ],
+   "prompt_token_parity": "5/5",
+   "legs_token_and_text_identical": "15/15",
+   "all_pass": true
+  },
+  "sub512_raw_decode": {
+   "harness": "scripts/raw-decode-parity.mjs",
+   "depths": [
+    1,
+    5,
+    50
+   ],
+   "legs_token_and_text_identical": "6/12",
+   "all_pass": false,
+   "note": "committed as-is; see near-tie-analysis.json — one reported mismatch is a tokenizer re-encode artifact on whitespace runs (text identical), three are disclosed near-tie flips"
+  },
+  "windowed_ge512_chat": {
+   "harness": "scripts/chat-parity-gemma3.mjs",
+   "pack": "qa/prompt-packs/gemma3-windowed-context-pack-v1.json",
+   "prompt_tokens": [
+    606,
+    1205,
+    2403
+   ],
+   "depths": [
+    1,
+    5,
+    50
+   ],
+   "prompt_token_parity": "3/3",
+   "legs_token_and_text_identical": "9/9",
+   "all_pass": true
+  },
+  "windowed_ge512_runnable_control": {
+   "harness": "scripts/chat-parity-gemma3.mjs",
+   "lane": "runnable CPU fallback (CAMELID_METAL_RESIDENT_DECODE=0), cpu_reference / safe_cpu_decode",
+   "prompt_tokens": [
+    606
+   ],
+   "depths": [
+    50
+   ],
+   "legs_token_and_text_identical": "0/1",
+   "all_pass": false
+  },
+  "determinism": {
+   "sessions": 2,
+   "process_restart_between_sessions": true,
+   "files_byte_identical": true
+  },
+  "disclosed_flips": 3
+ },
+ "verdict": "Sub-512 chat 15/15 legs token-AND-text identical to the pinned llama.cpp oracle plus 5/5 cross-engine prompt tokenization (all_pass true); >=512 windowed pack 9/9 legs identical at 606/1205/2403 prompt tokens with 3/3 prompt tokenization identical and ZERO flips (all_pass true); raw-decode committed as-is with all_pass false — depths 1 and 5 clean on 4/4, one reported mismatch is a tokenizer re-encode artifact on whitespace runs (true token streams identical), three depth-50 flips disclosed with measured gaps of which two are demonstrated ORACLE-side flips; the runnable CPU lane on the same 606-token prompt and the same oracle diverges at generated index 2 with the oracle scoring its token 1.667 nats below the token the resident lane and the oracle both emit; determinism byte-identical across two fresh serve processes including a 2403-token windowed leg",
+ "deviations": "The runnable-lane divergence leg covers one windowed prompt at one depth only (that lane prefills 606 tokens in ~10.8 min). No perf claim and no speed comparison with llama.cpp is made or implied. Host paths redacted from the health snapshots. scripts/chat-parity-gemma3.mjs carries three Phase 4 receipt fixes in the same commit series (row-id default, --lane-label, node:http instead of the global fetch); none touches engine behaviour. The frozen runnable-lane bundle's sub-512 near-tie was not re-adjudicated on this host.",
+ "files": {
+  "README.md": "863de184b1f5745e103be698ced266dc35d50df0e0cab5f1416c24dd0aa8964b",
+  "camelid-raw-probe.json": "5a8b53d7414c0951fd112c16db91aa09f0886c5719ea8af7b3457398e31902b0",
+  "det-run1.json": "632992c609941494905650a186ec255bf7d545950f4490aedc6a3c7158bf64d3",
+  "det-run2.json": "632992c609941494905650a186ec255bf7d545950f4490aedc6a3c7158bf64d3",
+  "gemma3-gpu-resident-chat-parity.json": "144dc539f4e01d6e838b8b47151e88b3f6ef7b097909d79034fcd6522aa04184",
+  "gemma3-gpu-resident-raw-decode-parity.json": "2d057994cb2c36720a0003f38b1e2347b01af124f1901ba8c4b9a2dd87a691a3",
+  "gemma3-gpu-resident-windowed-parity.json": "7f0c22a0321b1af861d62916e8a684695ea014e78176bcfddf6b69377e0a045c",
+  "gemma3-runnable-windowed-parity.json": "4dae49a7a52762fb32ac63cfe29527b68bbee5288898727563c15c508793d0d5",
+  "health-resident.json": "1578d214aa7ee4a67da4b16fb809e86b2c1dd353e513c3a461df9fa45b55e5c9",
+  "health-runnable.json": "2295572e9de3f957664c1ef6752f262d99579e02432ec822ff3e9f71c195b274",
+  "near-tie-analysis.json": "108bbd1e604270533eda39cb98d0acf936c57fdfe5918c7fdc032e42c47112cb",
+  "oracle-short.json": "04fcd596293db8c089c29d3c876a185fe0be3099fd6a28a407d8a50b2e274b2e",
+  "oracle-windowed.json": "415047432c826829291e837c4aec9201a5cbe80fd62fddb437d5f70af856c9c4",
+  "probe-oracle-continuous.json": "cfcdd4af2dc674ab32cd00f7ad02370e3616ea81e21c7630f5ad31c05d188e97",
+  "probe-oracle-default.json": "811403a25764f14d28a4d9f412587a87da6a254d496375159cb782856df31f11",
+  "probe-oracle-repack.json": "f2890d3f536f4edd63c51a6852be9abd84f397268f44ee6698bbce7ff9caeca7",
+  "probe-oracle-t2.json": "3ecac5d796ce6517b8603afcfea464b5bab9399932c71dfa1b4eb4c660b13e86",
+  "probe-oracle-t4.json": "3e8c86354f0ddf4df047323fdd53f3ef8507e6480362b4e6843809cd60b9d4f4",
+  "probe-window-divergence.json": "4424274c46b611530576d7b4cce7a976f1c6064bc58c434b50baad0bca55ea83",
+  "raw-reference.json": "7e3960ddabaeab96ede57027fa15be6367f17fecba8af8cf5a041de3104f538b"
+ }
+}

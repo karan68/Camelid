@@ -439,6 +439,8 @@ impl GhostFile {
                 // not a supported configuration.
                 attention_q_norm: None,
                 attention_k_norm: None,
+                post_attention_norm: None,
+                post_ffw_norm: None,
                 mla_q_a_proj: None,
                 mla_q_a_layernorm: None,
                 mla_q_b_proj: None,

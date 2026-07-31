@@ -72,6 +72,16 @@ pub struct LlamaModelConfig {
     /// Logit scale — applied before softmax, commonly in Command R models.
     pub logit_scale: Option<f32>,
     pub moe: Option<MixtralMoeMetadata>,
+    /// Gemma 3 (`general.architecture = "gemma3"`) specific metadata. `None` for
+    /// every other architecture. Holds the sliding-window size, the local:global
+    /// layer cadence, the dual RoPE bases, and the structural forward-pass facts
+    /// (GeGLU, sqrt(d_model) embed scale, forced split-half RoPE pairing) that a
+    /// Llama-shaped config cannot express. Parsed fail-closed — see
+    /// [`Gemma3Metadata::from_gguf`]. Consumed by the Metal-resident lane
+    /// (Phase 2/3b of the gemma3 Metal campaign) and by
+    /// [`arch_has_windowed_attention`], which keys every windowed-arch guard
+    /// (prefix-cache bypass, single-token prefill, the CPU dense fail-closed).
+    pub gemma3: Option<Gemma3Metadata>,
     /// Gemma 4 (`general.architecture = "gemma4"`) specific metadata. `None` for
     /// every other architecture. Holds the per-layer-type attention dims, dual
     /// RoPE bases, sliding-window pattern, KV-sharing depth, Per-Layer-Embedding
@@ -126,16 +136,146 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 }
 
 /// Architectures whose ONLY correct forward pass lives in the runnable lane
-/// (`crate::runnable`): the optimized dense binder cannot represent them —
-/// for gemma3/gemma2 it silently drops the QK-norm and post-attention/post-FFN
-/// ("sandwich") norm tensors and the dense forward has no GeGLU or dual-RoPE,
-/// and qwen35's hybrid gated-delta-net layers do not fit the dense tensor map
-/// at all. `camelid serve` routes these archs to the runnable serve bridge
-/// (`api::is_runnable_serve_arch` delegates here); every OTHER lane that would
-/// construct a direct dense session for them must fail closed instead of
-/// decoding fluent-looking garbage.
+/// (`crate::runnable`), on EVERY host, because no optimized lane can run them
+/// correctly. gemma2: the binder still silently drops its sandwich norms, and
+/// the dense forward lacks its soft-caps and alternating-attention schedule.
+/// qwen35: the hybrid gated-delta-net layers do not fit the dense tensor map
+/// at all. Every lane that would construct a direct dense session for these
+/// archs must fail closed instead of decoding fluent-looking garbage.
+///
+/// gemma3 LEFT this set in Phase 3b of the Metal campaign: the Metal-resident
+/// forward carries its full structure (QK + sandwich norms, GeGLU, dual-theta
+/// RoPE, sliding-window mask — Phase 2, real-row parity §9b/§10b), so on a
+/// host where that lane can serve, gemma3 chat runs dense/resident. Routing
+/// for gemma3 is therefore CAPABILITY-AWARE — see
+/// [`arch_requires_runnable_bridge`], the predicate serve and the CLI direct
+/// lanes now key on. The CPU dense forward remains WRONG for gemma3 (no
+/// window mask; hazard H4) and fails closed at forward dispatch.
 pub fn is_runnable_only_arch(architecture: &str) -> bool {
-    matches!(architecture, "qwen35" | "gemma2" | "gemma3")
+    matches!(architecture, "qwen35" | "gemma2")
+}
+
+/// Capability-aware serve/direct-session routing predicate (gemma3→Metal
+/// Phase 3b, quant-aware since Phase 3c): true when this MODEL FILE, ON THIS
+/// HOST, must be served through the runnable bridge because no optimized lane
+/// can run it correctly here.
+///
+/// The fallback is the runnable bridge, NEVER the CPU dense forward: the CPU
+/// dense forward has no sliding-window mask and fails closed for windowed
+/// archs at every per-layer dispatch (hazard H4), so a routing mistake
+/// surfaces as a typed error instead of fluent-looking full-causal garbage.
+///
+/// - qwen35 / gemma2: always true ([`is_runnable_only_arch`]).
+/// - a Q8_0 gemma3: true only where the Metal-resident lane cannot serve it
+///   (non-macOS hosts, `CAMELID_METAL_RESIDENT_DECODE=0` / deterministic
+///   mode, no Metal device, or a CUDA-resident process — the CUDA engine has
+///   no windowed forward). On a resident-capable host it routes to the
+///   dense/resident path and this returns false.
+/// - a non-Q8_0 gemma3 (Q4_K_M, Q5_K, …): true on EVERY host. Resident
+///   admission is pinned to the Q8_0 exact row in the mechanism (hazard H5 —
+///   the K-quant resident gather drops gemma3's embed scale and no windowed
+///   K-quant lane has a parity receipt), so a K-quant gemma3 has no resident
+///   lane to fall onto anywhere and must take the bridge that served it
+///   before the flip.
+///
+/// This is keyed on the FILE, not the arch string, precisely because the
+/// quantization is half the decision (Phase 3c finding F3: an arch-only
+/// predicate stranded every non-Q8_0 gemma3 — routed to the dense lane,
+/// declined by H5, then H4-errored on every request).
+pub fn file_requires_runnable_bridge(gguf: &GgufFile) -> bool {
+    let architecture = gguf.architecture().unwrap_or_default();
+    arch_requires_runnable_bridge_given(
+        architecture,
+        crate::inference::windowed_arch_resident_host_available(),
+        windowed_arch_resident_quant_admissible(gguf),
+    )
+}
+
+/// Pure decision core of [`file_requires_runnable_bridge`], split so the
+/// routing split is unit-testable without touching process env, a Metal
+/// device, or a GGUF on disk.
+///
+/// - `windowed_resident_host_available`: the host-capability probe result
+///   ([`crate::inference::windowed_arch_resident_host_available`]).
+/// - `windowed_resident_quant_admissible`: whether the FILE's weights satisfy
+///   the H5 Q8_0 pin ([`windowed_arch_resident_quant_admissible`]).
+///
+/// A windowed arch needs BOTH to take the resident lane; failing either sends
+/// it to the runnable bridge, which is correct (slow) for every gemma3 quant.
+pub fn arch_requires_runnable_bridge_given(
+    architecture: &str,
+    windowed_resident_host_available: bool,
+    windowed_resident_quant_admissible: bool,
+) -> bool {
+    is_runnable_only_arch(architecture)
+        || (arch_string_has_windowed_attention(architecture)
+            && !(windowed_resident_host_available && windowed_resident_quant_admissible))
+}
+
+/// Arch-string mirror of [`arch_has_windowed_attention`] for the surfaces that
+/// run BEFORE the config is parsed (routing, the planner, the CLI admission
+/// guards). gemma3 is the only windowed arch today; a future one must be added
+/// here in lockstep with the parsed-metadata predicate.
+pub fn arch_string_has_windowed_attention(architecture: &str) -> bool {
+    architecture == "gemma3"
+}
+
+/// Whether this file's weights satisfy the windowed-arch resident admission
+/// pin (hazard H5), decided from GGUF metadata BEFORE any weights load.
+///
+/// Mirrors the engine-level pin in `inference::resident_decode_eligible`
+/// exactly: every per-layer linear (Q/K/V/O + FFN gate/up/down) must be Q8_0.
+/// The engine remains authoritative — this is the routing-time predicate that
+/// keeps a file the engine will decline from being routed onto the dense lane
+/// in the first place. Non-windowed archs are unaffected (always `true`); the
+/// caller pairs this with an arch check.
+pub fn windowed_arch_resident_quant_admissible(gguf: &GgufFile) -> bool {
+    use crate::gguf::GgufTensorType;
+    const LAYER_LINEAR_SUFFIXES: [&str; 7] = [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ];
+    let mut saw_layer_linear = false;
+    for tensor in &gguf.tensors {
+        if !tensor.name.starts_with("blk.") {
+            continue;
+        }
+        if !LAYER_LINEAR_SUFFIXES
+            .iter()
+            .any(|suffix| tensor.name.ends_with(suffix))
+        {
+            continue;
+        }
+        saw_layer_linear = true;
+        if tensor.tensor_type != GgufTensorType::Q8_0 {
+            return false;
+        }
+    }
+    // A file with no recognizable per-layer linears is not something the
+    // resident lane can admit either; fail closed to the bridge.
+    saw_layer_linear
+}
+
+/// Whether this model's attention carries a per-layer sliding-window schedule
+/// (gemma3 today). Keyed on the PARSED metadata (`config.gemma3`), not the
+/// arch string, so a future windowed arch that binds the same schedule
+/// inherits every guard that consults this.
+///
+/// Why the guards exist (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1/H2): the
+/// CPU dense prefill lanes and the prompt-prefix-cache resume path have no
+/// sliding-window mask at all. A windowed arch must therefore never store a
+/// prompt-prefix-cache entry, never take a partial-hit resume (the divergent
+/// suffix would be re-prefilled at `kv_position > 0`, which the resident
+/// prefill hook refuses, landing it on the window-less CPU dense forward),
+/// and must prefill token-by-token through the single-token decode path — the
+/// only lane whose resident forward carries the schedule.
+pub fn arch_has_windowed_attention(config: &LlamaModelConfig) -> bool {
+    config.gemma3.is_some()
 }
 
 impl LlamaModelConfig {
@@ -219,6 +359,7 @@ impl LlamaModelConfig {
         };
 
         let moe = MixtralMoeMetadata::from_gguf(gguf, architecture);
+        let gemma3 = Gemma3Metadata::from_gguf(gguf, architecture)?;
         let gemma4 = Gemma4Metadata::from_gguf(gguf, architecture);
         let qwen35 = Qwen35Metadata::from_gguf(gguf, architecture);
 
@@ -310,7 +451,11 @@ impl LlamaModelConfig {
             // phi3. Qwen2/Qwen2.5 uses the same unpermuted split-half layout;
             // this is exercised by the real Qwen2.5 Q3_K_M mini2 smoke lane.
             // Other unpermuted archs (gemma3/…) stay out of this path until their
-            // own rows prove it (gemma3 serves via the runnable lane).
+            // own rows prove it. gemma3's resident-lane pairing fact lives on
+            // `Gemma3Metadata.rope_neox_pairing`, so this dense-path flag stays
+            // untouched even though the Metal resident lane is now gemma3's
+            // DEFAULT serve lane (Phase 3b) — the CPU dense path it guards is
+            // exactly the path gemma3 fails closed on (D20.2).
             // qwen35 full-attention layers are also unpermuted (NEOX split-half),
             // with partial RoPE over the first `rope.dimension_count` (64) of the
             // 256-wide head — handled in the runnable qwen35 path.
@@ -318,6 +463,7 @@ impl LlamaModelConfig {
             no_rope_layer_step: arch_no_rope_layer_step(architecture),
             logit_scale: gguf.metadata_f32(&architecture_key(architecture, "logit_scale")),
             moe,
+            gemma3,
             gemma4,
             qwen35,
             mla: MlaMetadata::from_gguf(gguf, architecture),
@@ -761,6 +907,267 @@ mod gemma4_tests {
     }
 }
 
+/// Gemma 3 (`general.architecture = "gemma3"`) window/RoPE metadata plus the
+/// structural forward-pass facts a Llama-shaped config cannot express.
+///
+/// Gemma 3 alternates local (sliding-window) and global (full) attention on a
+/// local:global cadence — every `sliding_window_pattern`-th layer is global
+/// (layer `i` is global iff `(i + 1) % pattern == 0`; for the 1B's 26 layers and
+/// pattern 6 the global layers are 5/11/17/23) — and the two layer types use
+/// different RoPE bases. Unlike Gemma 4, the FINAL layer is NOT forced global
+/// (layer 25 of the 1B is local), the head geometry is uniform across layers,
+/// and there is no cross-layer KV sharing, PLE stream, or logit soft-cap.
+///
+/// Key sourcing (verified against the supported gemma-3-1b-it-Q8_0 row, whose
+/// ONLY window/rope keys are `gemma3.attention.sliding_window=512` and
+/// `gemma3.rope.freq_base=1e6`):
+/// - `sliding_window` and the global RoPE base are REQUIRED GGUF keys — absent
+///   keys fail closed with a typed error instead of assuming a value.
+/// - The cadence (6) and the local-layer RoPE base (10000.0) have NO GGUF key in
+///   any known gemma3 conversion — the converter never writes one and the
+///   pinned reference hardcodes both (the same disclosed-constant situation as
+///   smollm3's `no_rope_layer_step`, see [`arch_no_rope_layer_step`]). They are
+///   reference-pinned constants here; an explicit
+///   `gemma3.attention.sliding_window_pattern` (scalar period) or
+///   `gemma3.rope.freq_base_swa` key is honored if a future conversion writes
+///   one, and a malformed value for either is a hard error, never a silent
+///   fallback.
+///
+/// This struct records the parsed values the Metal-resident lane consumes.
+/// Since Phase 3b of the gemma3 Metal campaign that lane is REACHABLE on a
+/// resident-capable host (Q8_0 exact row only, hazard H5); everywhere else
+/// gemma3 serves via the runnable bridge ([`arch_requires_runnable_bridge`])
+/// and the CPU dense forward stays fail-closed (hazard H4).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Gemma3Metadata {
+    /// Local attention window in positions — GGUF `attention.sliding_window`
+    /// (REQUIRED). The window INCLUDES the current position: a local layer at
+    /// position `pos` attends `[pos + 1 - window ..= pos]` (identical
+    /// convention to [`Gemma4LayerPlan::window`] and the runnable reference).
+    pub sliding_window: u32,
+    /// Local:global cadence — every `pattern`-th layer is global. GGUF
+    /// `attention.sliding_window_pattern` (scalar) when present; otherwise the
+    /// reference-pinned 6.
+    pub sliding_window_pattern: u32,
+    /// RoPE base for global (full-attention) layers — GGUF `rope.freq_base`
+    /// (REQUIRED; 1e6 on the 1B row).
+    pub rope_freq_base_global: f32,
+    /// RoPE base for local (sliding-window) layers — GGUF `rope.freq_base_swa`
+    /// when present; otherwise the reference-pinned 10000.0 (no gemma3
+    /// conversion writes this key).
+    pub rope_freq_base_local: f32,
+    /// Per-layer attention type derived from the cadence: `true` = local
+    /// (sliding), `false` = global (full). Length = `block_count`.
+    pub layer_is_sliding: Vec<bool>,
+    /// Token-embedding scale sqrt(d_model) (sqrt(1152) for the 1B). The
+    /// resident embed gather must multiply by this before layer 0.
+    pub embed_scale: f32,
+    /// Gemma's FFN activation is GeGLU — `gelu_tanh(gate) * up` — not the
+    /// Llama-family SiLU. The resident FFN encode must select the GeGLU kernel.
+    pub ffn_geglu: bool,
+    /// gemma3 Q/K projection weights are NOT permuted for adjacent even/odd
+    /// RoPE, so the resident lane must force NEOX split-half pairing host-side
+    /// (gemma4-encode precedent). Deliberately NOT surfaced through
+    /// [`LlamaModelConfig::rope_neox_pairing`] / `arch_uses_neox_rope_pairing`:
+    /// that flag drives the dense CPU path, whose gemma3 forward stays
+    /// fail-closed — flipping it there would perturb a guarded-off path for no
+    /// benefit. The runnable lane independently asserts NEOX for gemma
+    /// (`is_gemma` in `runnable::model`).
+    pub rope_neox_pairing: bool,
+}
+
+impl Gemma3Metadata {
+    /// Reference-pinned local:global cadence (every 6th layer global). No gemma3
+    /// GGUF key carries this; see the struct docs for the disclosure.
+    pub const REFERENCE_SLIDING_WINDOW_PATTERN: u32 = 6;
+    /// Reference-pinned RoPE base for local (sliding-window) layers. No gemma3
+    /// GGUF key carries this; see the struct docs for the disclosure.
+    pub const REFERENCE_LOCAL_ROPE_FREQ_BASE: f32 = 10_000.0;
+
+    /// Returns `Ok(Some)` for `gemma3`, `Ok(None)` for every other
+    /// architecture, and `Err` for a gemma3 file whose required window/rope
+    /// keys are missing or malformed — fail closed, no silent defaults.
+    pub fn from_gguf(gguf: &GgufFile, architecture: &str) -> Result<Option<Self>> {
+        if architecture != "gemma3" {
+            return Ok(None);
+        }
+        let key = |suffix: &str| architecture_key(architecture, suffix);
+        let block_count = required_u32(gguf, &key("block_count"))?;
+        let embedding_length = required_u32(gguf, &key("embedding_length"))?;
+
+        let window_key = key("attention.sliding_window");
+        let sliding_window = match gguf.metadata_u32(&window_key) {
+            Some(window) if window > 0 => window,
+            Some(_) => {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "metadata {window_key} must be greater than zero; a zero-width sliding \
+                     window cannot mask anything, so Camelid fails closed"
+                )))
+            }
+            None => {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "required metadata {window_key} is missing or not an integer; the gemma3 \
+                     sliding-window mask cannot be sized without it, so Camelid fails closed \
+                     instead of assuming a window"
+                )))
+            }
+        };
+
+        let global_base_key = key("rope.freq_base");
+        let rope_freq_base_global = match gguf.metadata_f32(&global_base_key) {
+            Some(base) if base > 0.0 => base,
+            Some(_) => {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "metadata {global_base_key} must be greater than zero"
+                )))
+            }
+            None => {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "required metadata {global_base_key} is missing or not a float; the gemma3 \
+                     global-layer RoPE base cannot be derived, so Camelid fails closed instead \
+                     of assuming one"
+                )))
+            }
+        };
+
+        // Optional override keys: honored when present, hard error when present
+        // but malformed, reference-pinned constant when absent. Presence is
+        // checked on the raw metadata map so a wrong-typed value cannot be
+        // confused with an absent key (the typed accessors return None for both).
+        let pattern_key = key("attention.sliding_window_pattern");
+        let sliding_window_pattern = if gguf.metadata.contains_key(&pattern_key) {
+            match gguf.metadata_u32(&pattern_key) {
+                Some(period) if period > 0 => period,
+                _ => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "metadata {pattern_key} must be a positive integer period (gemma3 \
+                         declares a scalar local:global cadence); Camelid fails closed rather \
+                         than falling back to the reference cadence over an explicit key"
+                    )))
+                }
+            }
+        } else {
+            Self::REFERENCE_SLIDING_WINDOW_PATTERN
+        };
+
+        let local_base_key = key("rope.freq_base_swa");
+        let rope_freq_base_local = if gguf.metadata.contains_key(&local_base_key) {
+            match gguf.metadata_f32(&local_base_key) {
+                Some(base) if base > 0.0 => base,
+                _ => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "metadata {local_base_key} must be a positive float; Camelid fails \
+                         closed rather than falling back to the reference local base over an \
+                         explicit key"
+                    )))
+                }
+            }
+        } else {
+            Self::REFERENCE_LOCAL_ROPE_FREQ_BASE
+        };
+
+        // Layer `i` is global iff `(i + 1) % pattern == 0`; everything else is
+        // local. NO forced-global final layer (that is a Gemma 4 rule): for 26
+        // layers at pattern 6 the globals are 5/11/17/23 and layer 25 is local,
+        // matching the runnable reference schedule.
+        let layer_is_sliding = (0..block_count)
+            .map(|i| !(i + 1).is_multiple_of(sliding_window_pattern))
+            .collect();
+
+        Ok(Some(Self {
+            sliding_window,
+            sliding_window_pattern,
+            rope_freq_base_global,
+            rope_freq_base_local,
+            layer_is_sliding,
+            embed_scale: (embedding_length as f32).sqrt(),
+            ffn_geglu: true,
+            rope_neox_pairing: true,
+        }))
+    }
+
+    /// True if decoder layer `idx` uses local (sliding-window) attention.
+    pub fn is_sliding_layer(&self, idx: usize) -> bool {
+        self.layer_is_sliding.get(idx).copied().unwrap_or(false)
+    }
+
+    /// RoPE base (θ) for layer `idx` (local θ vs global θ).
+    pub fn rope_freq_base_at(&self, idx: usize) -> f32 {
+        if self.is_sliding_layer(idx) {
+            self.rope_freq_base_local
+        } else {
+            self.rope_freq_base_global
+        }
+    }
+
+    /// `Some(window)` for local layers, `None` for global layers. The window
+    /// INCLUDES the current position: attend `[pos + 1 - window ..= pos]`
+    /// (identical convention to [`Gemma4LayerPlan::window`]).
+    pub fn layer_window(&self, idx: usize) -> Option<u32> {
+        if self.is_sliding_layer(idx) {
+            Some(self.sliding_window)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemma3_tests {
+    use super::Gemma3Metadata;
+
+    fn one_b_meta() -> Gemma3Metadata {
+        // The schedule is a LITERAL list (false = global at 5/11/17/23), not
+        // the production `(i + 1) % pattern` expression — duplicating the
+        // formula here would make the test a tautology that passes even if the
+        // derivation regressed. The `from_gguf`-driven fixture tests
+        // (tests/model_binding.rs) cover the derivation itself; this unit test
+        // covers the accessors over a known schedule.
+        #[rustfmt::skip]
+        let layer_is_sliding = vec![
+            true, true, true, true, true, false, // layers 0-5
+            true, true, true, true, true, false, // layers 6-11
+            true, true, true, true, true, false, // layers 12-17
+            true, true, true, true, true, false, // layers 18-23
+            true, true, // layers 24-25 (no forced-global final layer)
+        ];
+        Gemma3Metadata {
+            sliding_window: 512,
+            sliding_window_pattern: 6,
+            rope_freq_base_global: 1_000_000.0,
+            rope_freq_base_local: 10_000.0,
+            layer_is_sliding,
+            embed_scale: (1152.0f32).sqrt(),
+            ffn_geglu: true,
+            rope_neox_pairing: true,
+        }
+    }
+
+    #[test]
+    fn one_b_schedule_globals_at_5_11_17_23_and_no_forced_global_final_layer() {
+        let meta = one_b_meta();
+        let globals: Vec<usize> = meta
+            .layer_is_sliding
+            .iter()
+            .enumerate()
+            .filter(|(_, sliding)| !**sliding)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(globals, vec![5, 11, 17, 23]);
+        // Unlike gemma4, the final layer is NOT forced global: layer 25 is local.
+        assert!(meta.is_sliding_layer(25));
+        for idx in 0..26 {
+            if globals.contains(&idx) {
+                assert_eq!(meta.rope_freq_base_at(idx), 1_000_000.0, "layer {idx}");
+                assert_eq!(meta.layer_window(idx), None, "layer {idx}");
+            } else {
+                assert_eq!(meta.rope_freq_base_at(idx), 10_000.0, "layer {idx}");
+                assert_eq!(meta.layer_window(idx), Some(512), "layer {idx}");
+            }
+        }
+    }
+}
+
 /// Qwen3.5 (`general.architecture = "qwen35"`) hybrid linear-attention metadata.
 ///
 /// Qwen3.5 alternates **gated-delta-net (SSM / linear-attention)** layers with
@@ -875,7 +1282,19 @@ pub struct LlamaLayerTensors {
     pub attention_norm: GgufTensorDescriptor,
     pub attention: LlamaAttentionTensors,
     pub attention_output: GgufTensorDescriptor,
+    /// gemma3 sandwich norm: RMSNorm applied to the attention block's output
+    /// BEFORE its residual add (`post_attention_norm`, shape
+    /// `[embedding_length]`). `Some` only for architectures with the 4-norm
+    /// sandwich structure (gemma3); `None` for the Llama 2-norm structure.
+    /// Bound in lockstep with [`Self::post_ffw_norm`] (both `Some` or both
+    /// `None`). See [`LlamaTensorBinding::bind`] for the per-architecture
+    /// presence invariant.
+    pub post_attention_norm: Option<GgufTensorDescriptor>,
     pub ffn_norm: GgufTensorDescriptor,
+    /// gemma3 sandwich norm: RMSNorm applied to the FFN block's output BEFORE
+    /// its residual add (`post_ffw_norm`, shape `[embedding_length]`),
+    /// mirroring [`Self::post_attention_norm`].
+    pub post_ffw_norm: Option<GgufTensorDescriptor>,
     pub ffn: LlamaFfnTensors,
 }
 
@@ -1020,23 +1439,37 @@ impl LlamaTensorBinding {
         };
         let rope_freqs = find_tensor(gguf, "rope_freqs.weight").cloned();
 
-        // Per-architecture QK-norm classification. Qwen3 applies a per-head
-        // RMSNorm to Q and K after the projections and before RoPE
+        // Per-architecture QK-norm classification. Qwen3 and gemma3 apply a
+        // per-head RMSNorm to Q and K after the projections and before RoPE
         // (`attn_q_norm`/`attn_k_norm`, shape `[head_dim]`); the plain
         // Llama-family rows do not. We classify every architecture that reaches
         // this dense binder so a model can never be silently mis-bound in either
         // direction (carrying QK-norm weights that the forward path would drop,
-        // or fabricating them where none exist).
+        // or fabricating them where none exist). gemma3 moved from unclassified
+        // (which silently bound `(None, None)` and dropped all 104 of the 1B's
+        // norm tensors — the mis-binding disclosed by the serve router's
+        // fail-closed divert) to EXPECTED in Phase 1 of the gemma3 Metal
+        // campaign; since Phase 3b the Metal-resident forward APPLIES them on
+        // resident-capable hosts, while the CPU dense forward stays fail-closed
+        // for windowed archs (hazard H4).
         let architecture = gguf.architecture().unwrap_or_default();
-        let expects_qk_norm = architecture == "qwen3" || architecture == "command-r";
+        let expects_qk_norm = matches!(architecture, "qwen3" | "command-r" | "gemma3");
         let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
+        // gemma3's 4-norm "sandwich" structure: an extra RMSNorm on the attention
+        // output and on the FFN output, each applied BEFORE its residual add
+        // (`post_attention_norm`/`post_ffw_norm`, shape `[embedding_length]`).
+        // Required in lockstep with the QK-norm pair — a gemma3 row missing any
+        // of the four cannot be run correctly and fails closed.
+        let expects_post_norms = architecture == "gemma3";
 
-        // Qwen3 sets the per-head dim explicitly via `attention.key_length` /
-        // `attention.value_length` and it is NOT guaranteed to equal
-        // `embedding_length / head_count` (0.6B/4B/32B differ). The dense path
-        // carries the explicit head_dim through `LlamaModelConfig.attention_key_length`
-        // / `DenseLlamaDims`. The engine assumes a single head_dim for K and V, so
-        // require key_length == value_length and fail closed otherwise.
+        // Qwen3 (and gemma3) set the per-head dim explicitly via
+        // `attention.key_length` / `attention.value_length` and it is NOT
+        // guaranteed to equal `embedding_length / head_count` (Qwen3
+        // 0.6B/4B/32B and gemma3-1B — 1152/4 = 288 vs head_dim 256 — differ).
+        // The dense path carries the explicit head_dim through
+        // `LlamaModelConfig.attention_key_length` / `DenseLlamaDims`. The engine
+        // assumes a single head_dim for K and V, so require
+        // key_length == value_length and fail closed otherwise.
         if expects_qk_norm {
             let key_length =
                 gguf.metadata_u32(&architecture_key(architecture, "attention.key_length"));
@@ -1045,8 +1478,8 @@ impl LlamaTensorBinding {
             if let (Some(k), Some(v)) = (key_length, value_length) {
                 if k != v {
                     return Err(BackendError::UnsupportedModelArchitecture(format!(
-                        "qwen3 attention.key_length={k} != value_length={v}; the engine assumes a \
-                         single per-head dimension for K and V, so this row fails closed"
+                        "{architecture} attention.key_length={k} != value_length={v}; the engine \
+                         assumes a single per-head dimension for K and V, so this row fails closed"
                     )));
                 }
             }
@@ -1062,7 +1495,7 @@ impl LlamaTensorBinding {
                 let k = find_tensor(gguf, &k_norm_name).cloned();
                 if q.is_none() || k.is_none() {
                     return Err(BackendError::UnsupportedModelArchitecture(format!(
-                        "qwen3/command-r layer {layer_idx} is missing QK-norm tensors \
+                        "{architecture} layer {layer_idx} is missing QK-norm tensors \
                          (attn_q_norm present: {}, attn_k_norm present: {}); this architecture applies \
                          per-head norm to Q and K and cannot be run correctly without them",
                         q.is_some(),
@@ -1085,6 +1518,26 @@ impl LlamaTensorBinding {
                          a model whose weights it would silently ignore"
                     )));
                 }
+                (None, None)
+            };
+            let post_attention_norm_name = format!("blk.{layer_idx}.post_attention_norm.weight");
+            let post_ffw_norm_name = format!("blk.{layer_idx}.post_ffw_norm.weight");
+            let (post_attention_norm, post_ffw_norm) = if expects_post_norms {
+                // Required for gemma3: both must be present, or fail closed.
+                let post_attn = find_tensor(gguf, &post_attention_norm_name).cloned();
+                let post_ffw = find_tensor(gguf, &post_ffw_norm_name).cloned();
+                if post_attn.is_none() || post_ffw.is_none() {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "{architecture} layer {layer_idx} is missing sandwich norm tensors \
+                         (post_attention_norm present: {}, post_ffw_norm present: {}); this \
+                         architecture norms the attention and FFN outputs before each residual \
+                         add and cannot be run correctly without them",
+                        post_attn.is_some(),
+                        post_ffw.is_some()
+                    )));
+                }
+                (post_attn, post_ffw)
+            } else {
                 (None, None)
             };
             let q_bias = find_tensor(gguf, &format!("blk.{layer_idx}.attn_q.bias")).cloned();
@@ -1156,7 +1609,9 @@ impl LlamaTensorBinding {
                     gguf,
                     &format!("blk.{layer_idx}.attn_output.weight"),
                 )?,
+                post_attention_norm,
                 ffn_norm: required_tensor(gguf, &format!("blk.{layer_idx}.ffn_norm.weight"))?,
+                post_ffw_norm,
                 ffn: if let Some(moe) = config.moe.as_ref() {
                     LlamaFfnTensors::MoE {
                         router: required_tensor(
@@ -1352,6 +1807,27 @@ impl LlamaTensorBinding {
                 &[dims.embedding_length],
                 &format!("layer {idx} ffn norm"),
             )?;
+            match (&layer.post_attention_norm, &layer.post_ffw_norm) {
+                (Some(post_attn), Some(post_ffw)) => {
+                    require_descriptor_shape(
+                        post_attn,
+                        &[dims.embedding_length],
+                        &format!("layer {idx} post attention norm"),
+                    )?;
+                    require_descriptor_shape(
+                        post_ffw,
+                        &[dims.embedding_length],
+                        &format!("layer {idx} post ffn norm"),
+                    )?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "layer {idx} has exactly one of post_attention_norm/post_ffw_norm bound; \
+                         the sandwich norms must be present as a pair"
+                    )));
+                }
+            }
             match &layer.ffn {
                 LlamaFfnTensors::Dense { gate, up, down } => {
                     require_descriptor_matrix_shape(
@@ -2172,27 +2648,149 @@ mod tests {
     }
 
     #[test]
-    fn runnable_only_arch_set_is_exactly_the_serve_bridge_set() {
-        // Must stay in lockstep with the serve router's runnable bridge
-        // (`api::is_runnable_serve_arch` delegates here): these archs have no
-        // correct dense forward — the dense binder drops gemma3/gemma2's
-        // QK/sandwich norms and has no GeGLU, and qwen35's hybrid layers do not
-        // fit the dense tensor map — so every direct dense-session lane fails
-        // closed for them instead of decoding fluent-looking garbage.
-        for arch in ["qwen35", "gemma2", "gemma3"] {
+    fn runnable_only_arch_set_is_exactly_the_unconditional_bridge_set() {
+        // These archs have no correct optimized forward on ANY host: gemma2's
+        // sandwich norms are still dropped at bind, and qwen35's hybrid layers
+        // do not fit the dense tensor map — so every direct dense-session lane
+        // fails closed for them instead of decoding fluent-looking garbage.
+        // gemma3 left this set in Phase 3b of the Metal campaign (its routing
+        // is capability-aware — pinned by the split test below).
+        for arch in ["qwen35", "gemma2"] {
             assert!(
                 super::is_runnable_only_arch(arch),
                 "{arch} must be classified runnable-lane-only"
             );
         }
         for arch in [
-            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma4", "phi3", "lfm2", "",
+            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "lfm2", "",
         ] {
             assert!(
                 !super::is_runnable_only_arch(arch),
                 "{arch:?} must not be classified runnable-lane-only"
             );
         }
+    }
+
+    #[test]
+    fn runnable_bridge_predicate_splits_gemma3_by_host_capability() {
+        // gemma3→Metal Phase 3b: the serve router and the CLI direct-session
+        // guard key on `arch_requires_runnable_bridge`. The split under test:
+        // gemma3 rides the dense/resident lane ONLY where the Metal-resident
+        // host capability holds, and falls back to the runnable bridge —
+        // never the CPU dense forward — everywhere else. qwen35/gemma2 are
+        // bridge-only regardless of capability; dense archs never bridge.
+        for capable in [false, true] {
+            for q8 in [false, true] {
+                for arch in ["qwen35", "gemma2"] {
+                    assert!(
+                        super::arch_requires_runnable_bridge_given(arch, capable, q8),
+                        "{arch} must require the runnable bridge on every host"
+                    );
+                }
+                for arch in ["llama", "mistral", "qwen2", "qwen3", "gemma4", "phi3", ""] {
+                    assert!(
+                        !super::arch_requires_runnable_bridge_given(arch, capable, q8),
+                        "{arch:?} must never require the runnable bridge"
+                    );
+                }
+            }
+        }
+        assert!(
+            super::arch_requires_runnable_bridge_given("gemma3", false, true),
+            "gemma3 must fall back to the runnable bridge where the resident lane cannot serve"
+        );
+        assert!(
+            !super::arch_requires_runnable_bridge_given("gemma3", true, true),
+            "gemma3 must route to the dense/resident lane on a resident-capable host"
+        );
+    }
+
+    /// Phase 3c finding F3: routing was quant-blind, so a gemma3 Q4_K_M on a
+    /// resident-capable Mac was routed onto the dense lane, declined by the
+    /// H5 Q8_0 pin, and then H4-errored on every request — a hard regression
+    /// against the pre-flip bridge, which served every gemma3 quant. The
+    /// quantization is now half the decision.
+    #[test]
+    fn a_non_q8_windowed_row_requires_the_runnable_bridge_on_every_host() {
+        for capable in [false, true] {
+            assert!(
+                super::arch_requires_runnable_bridge_given("gemma3", capable, false),
+                "a non-Q8_0 gemma3 has no resident lane on any host \
+                 (windowed_resident_host_available={capable}); it must take the bridge"
+            );
+        }
+        // The Q8_0 row on a capable host is the ONLY combination that routes
+        // to the dense/resident lane — the causality control for the above.
+        assert!(!super::arch_requires_runnable_bridge_given(
+            "gemma3", true, true
+        ));
+    }
+
+    /// The routing-time Q8_0 pin must mirror the engine-level H5 pin in
+    /// `inference::resident_decode_eligible`: EVERY per-layer linear Q8_0.
+    /// One non-Q8_0 layer linear anywhere is enough to send the file to the
+    /// bridge, and a file with no recognizable layer linears fails closed too.
+    #[test]
+    fn windowed_quant_admission_requires_every_layer_linear_to_be_q8_0() {
+        use crate::gguf::{GgufFile, GgufTensorDescriptor, GgufTensorType};
+        let tensor = |name: &str, tensor_type: GgufTensorType| GgufTensorDescriptor {
+            name: name.to_string(),
+            dimensions: vec![32, 32],
+            tensor_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 0,
+        };
+        let names = [
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+        ];
+        let empty = || GgufFile {
+            path: std::path::PathBuf::new(),
+            version: 3,
+            tensor_count: 0,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: Default::default(),
+            tensors: Vec::new(),
+        };
+        let file = |types: &[GgufTensorType]| {
+            let mut gguf = empty();
+            gguf.tensors = names
+                .iter()
+                .zip(types)
+                .map(|(name, t)| tensor(name, *t))
+                .collect();
+            // A non-layer tensor at a different quant must not affect the
+            // decision (token_embd is Q8_0 on this row, output is tied).
+            gguf.tensors
+                .push(tensor("token_embd.weight", GgufTensorType::Q8_0));
+            gguf
+        };
+        let all_q8 = [GgufTensorType::Q8_0; 7];
+        assert!(super::windowed_arch_resident_quant_admissible(&file(
+            &all_q8
+        )));
+        // Each single non-Q8_0 layer linear must disqualify on its own.
+        for idx in 0..names.len() {
+            let mut types = all_q8;
+            types[idx] = GgufTensorType::Q4K;
+            assert!(
+                !super::windowed_arch_resident_quant_admissible(&file(&types)),
+                "a Q4_K {} must disqualify the resident lane",
+                names[idx]
+            );
+        }
+        assert!(
+            !super::windowed_arch_resident_quant_admissible(&empty()),
+            "a file with no per-layer linears must fail closed to the bridge"
+        );
     }
 
     #[test]

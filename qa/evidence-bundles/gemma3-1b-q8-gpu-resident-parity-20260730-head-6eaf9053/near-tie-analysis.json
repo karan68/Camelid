@@ -1,0 +1,463 @@
+{
+  "schema": "camelid.chat_parity_analysis.v1",
+  "row_id": "gemma_3_1b_it_q8_0",
+  "lane": "metal_resident_q8_runtime / q8_0_metal_resident_decode (GPU-resident Metal Q8_0)",
+  "policy": "GEMMA3_METAL_CONDUCTOR.md 7d — token-exact vs the pinned external oracle is the target; near-tie flips are permitted only when disclosed here and in the bundle README with their measured nat gap, and the >=512-token windowed pack must be clean. Probes were captured in solo oracle sessions AFTER the divergences were observed; the harness reports are committed as-is.",
+  "summary": "Four raw prompts at greedy 1/5/50 on the resident lane. Depths 1 and 5 are text-identical on 4/4. At depth 50 one prompt (\"Q: What is 2+2? A:\") is token-identical for all 43 generated tokens plus the stop token once camelid's ACTUAL emitted ids are read instead of a re-encode of its text (the harness re-encode splits llama.cpp's merged whitespace tokens), and three prompts flip once each. Every flip is probed here from BOTH sides: camelid's own top-5 at the position, and the pinned oracle re-fed the identical prefix under four kernel/thread controls plus a continuous-decode control. Two of the three positions produce an ORACLE-SIDE flip — the same pinned binary emits camelid's token when the position is scored from a re-fed prefix and the reference token when it decodes continuously — and the third is a stable-oracle near-tie disclosed with its gap.",
+  "windowed_pack_flips": 0,
+  "near_ties": [
+    {
+      "harness": "scripts/raw-decode-parity.mjs",
+      "prompt_index": 0,
+      "prompt": "The capital of France is",
+      "depth": 50,
+      "index": 44,
+      "identical_prefix_tokens": 44,
+      "reference": {
+        "id": 9639
+      },
+      "camelid": {
+        "id": 32219,
+        "text": " charming"
+      },
+      "camelid_top5_at_flip": {
+        " challenging": -3.1213164,
+        " charming": -2.3399043,
+        " famous": -2.3431468,
+        " historic": -2.8116546,
+        " interesting": -2.6236053
+      },
+      "camelid_top2_gap_nat": 0.003242,
+      "camelid_gap_to_reference_token_nat": 0.003242,
+      "oracle_top10_at_flip": [
+        {
+          "rank": 1,
+          "id": 32219,
+          "token": " charming",
+          "logprob": -2.299121856689453
+        },
+        {
+          "rank": 2,
+          "id": 9639,
+          "token": " famous",
+          "logprob": -2.3421993255615234
+        },
+        {
+          "rank": 3,
+          "id": 6121,
+          "token": " interesting",
+          "logprob": -2.6036415100097656
+        },
+        {
+          "rank": 4,
+          "id": 17110,
+          "token": " historic",
+          "logprob": -2.8947677612304688
+        },
+        {
+          "rank": 5,
+          "id": 13588,
+          "token": " dangerous",
+          "logprob": -3.0492630004882812
+        },
+        {
+          "rank": 6,
+          "id": 14798,
+          "token": " challenging",
+          "logprob": -3.145658493041992
+        },
+        {
+          "rank": 7,
+          "id": 13896,
+          "token": " visited",
+          "logprob": -3.185596466064453
+        },
+        {
+          "rank": 8,
+          "id": 4913,
+          "token": " popular",
+          "logprob": -3.236553192138672
+        },
+        {
+          "rank": 9,
+          "id": 28006,
+          "token": " relaxed",
+          "logprob": -3.368380546569824
+        },
+        {
+          "rank": 10,
+          "id": 2132,
+          "token": " important",
+          "logprob": -3.3910140991210938
+        }
+      ],
+      "oracle_top2_gap_nat": 0.043077,
+      "oracle_rank_of_camelid_token": 1,
+      "oracle_reference_minus_camelid_nat": -0.043077,
+      "oracle_side_controls": {
+        "default": {
+          "oracle_next_token": 32219,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 32219,
+            "token": " charming",
+            "logprob": -2.299121856689453
+          },
+          "oracle_top2_gap_nat": 0.043077,
+          "camelid_token_rank": 1,
+          "camelid_token_logprob": -2.299121856689453,
+          "reference_token_logprob": -2.3421993255615234
+        },
+        "t4": {
+          "oracle_next_token": 32219,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 32219,
+            "token": " charming",
+            "logprob": -2.299121856689453
+          },
+          "oracle_top2_gap_nat": 0.043077,
+          "camelid_token_rank": 1,
+          "camelid_token_logprob": -2.299121856689453,
+          "reference_token_logprob": -2.3421993255615234
+        },
+        "t2": {
+          "oracle_next_token": 32219,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 32219,
+            "token": " charming",
+            "logprob": -2.299121856689453
+          },
+          "oracle_top2_gap_nat": 0.043077,
+          "camelid_token_rank": 1,
+          "camelid_token_logprob": -2.299121856689453,
+          "reference_token_logprob": -2.3421993255615234
+        },
+        "repack": {
+          "oracle_next_token": 9639,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 9639,
+            "token": " famous",
+            "logprob": -2.3669564723968506
+          },
+          "oracle_top2_gap_nat": 0.028532,
+          "camelid_token_rank": 2,
+          "camelid_token_logprob": -2.395488739013672,
+          "reference_token_logprob": -2.3669564723968506
+        }
+      },
+      "oracle_continuous_vs_prefix_fed": {
+        "capture_reference_token": 9639,
+        "continuous_rerun_token": 9639,
+        "prefix_fed_token": 32219,
+        "camelid_token": 32219,
+        "oracle_self_consistent": false,
+        "prefix_fed_oracle_agrees_with_camelid": true
+      }
+    },
+    {
+      "harness": "scripts/raw-decode-parity.mjs",
+      "prompt_index": 2,
+      "prompt": "Once upon a time,",
+      "depth": 50,
+      "index": 37,
+      "identical_prefix_tokens": 37,
+      "reference": {
+        "id": 4658
+      },
+      "camelid": {
+        "id": 11207,
+        "text": " broken"
+      },
+      "camelid_top5_at_flip": {
+        " any": -4.4663,
+        " anything": -0.7462436,
+        " broken": -0.72897255,
+        " everything": -6.9066973,
+        " things": -3.5568457
+      },
+      "camelid_top2_gap_nat": 0.017271,
+      "camelid_gap_to_reference_token_nat": 0.017271,
+      "oracle_top10_at_flip": [
+        {
+          "rank": 1,
+          "id": 4658,
+          "token": " anything",
+          "logprob": -0.5351385474205017
+        },
+        {
+          "rank": 2,
+          "id": 11207,
+          "token": " broken",
+          "logprob": -0.9822611808776855
+        },
+        {
+          "rank": 3,
+          "id": 2432,
+          "token": " things",
+          "logprob": -3.7170424461364746
+        },
+        {
+          "rank": 4,
+          "id": 1027,
+          "token": " any",
+          "logprob": -4.37678861618042
+        },
+        {
+          "rank": 5,
+          "id": 4326,
+          "token": " everything",
+          "logprob": -6.857734203338623
+        },
+        {
+          "rank": 6,
+          "id": 1581,
+          "token": " even",
+          "logprob": -7.276505947113037
+        },
+        {
+          "rank": 7,
+          "id": 1144,
+          "token": " what",
+          "logprob": -8.03950023651123
+        },
+        {
+          "rank": 8,
+          "id": 506,
+          "token": " the",
+          "logprob": -8.463334083557129
+        },
+        {
+          "rank": 9,
+          "id": 4180,
+          "token": " almost",
+          "logprob": -8.977213859558105
+        },
+        {
+          "rank": 10,
+          "id": 18716,
+          "token": " torn",
+          "logprob": -9.167588233947754
+        }
+      ],
+      "oracle_top2_gap_nat": 0.447123,
+      "oracle_rank_of_camelid_token": 2,
+      "oracle_reference_minus_camelid_nat": 0.447123,
+      "oracle_side_controls": {
+        "default": {
+          "oracle_next_token": 4658,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 4658,
+            "token": " anything",
+            "logprob": -0.5351385474205017
+          },
+          "oracle_top2_gap_nat": 0.447123,
+          "camelid_token_rank": 2,
+          "camelid_token_logprob": -0.9822611808776855,
+          "reference_token_logprob": -0.5351385474205017
+        },
+        "t4": {
+          "oracle_next_token": 4658,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 4658,
+            "token": " anything",
+            "logprob": -0.5351385474205017
+          },
+          "oracle_top2_gap_nat": 0.447123,
+          "camelid_token_rank": 2,
+          "camelid_token_logprob": -0.9822611808776855,
+          "reference_token_logprob": -0.5351385474205017
+        },
+        "t2": {
+          "oracle_next_token": 4658,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 4658,
+            "token": " anything",
+            "logprob": -0.5351385474205017
+          },
+          "oracle_top2_gap_nat": 0.447123,
+          "camelid_token_rank": 2,
+          "camelid_token_logprob": -0.9822611808776855,
+          "reference_token_logprob": -0.5351385474205017
+        },
+        "repack": {
+          "oracle_next_token": 4658,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 4658,
+            "token": " anything",
+            "logprob": -0.6650477647781372
+          },
+          "oracle_top2_gap_nat": 0.139793,
+          "camelid_token_rank": 2,
+          "camelid_token_logprob": -0.8048410415649414,
+          "reference_token_logprob": -0.6650477647781372
+        }
+      },
+      "oracle_continuous_vs_prefix_fed": {
+        "capture_reference_token": 4658,
+        "continuous_rerun_token": 4658,
+        "prefix_fed_token": 4658,
+        "camelid_token": 11207,
+        "oracle_self_consistent": true,
+        "prefix_fed_oracle_agrees_with_camelid": false
+      }
+    },
+    {
+      "harness": "scripts/raw-decode-parity.mjs",
+      "prompt_index": 3,
+      "prompt": "def fibonacci(n):",
+      "depth": 50,
+      "index": 5,
+      "identical_prefix_tokens": 5,
+      "reference": {
+        "id": 2094
+      },
+      "camelid": {
+        "id": 22304,
+        "text": "Calcul"
+      },
+      "camelid_top5_at_flip": {
+        "Calcul": -0.9252399,
+        "Calculate": -2.3197236,
+        "Return": -3.4599843,
+        "Returns": -3.2273088,
+        "This": -0.96057355
+      },
+      "camelid_top2_gap_nat": 0.035334,
+      "camelid_gap_to_reference_token_nat": 0.035334,
+      "oracle_top10_at_flip": [
+        {
+          "rank": 1,
+          "id": 22304,
+          "token": "Calcul",
+          "logprob": -0.751211941242218
+        },
+        {
+          "rank": 2,
+          "id": 2094,
+          "token": "This",
+          "logprob": -1.1913783550262451
+        },
+        {
+          "rank": 3,
+          "id": 50702,
+          "token": "Calculate",
+          "logprob": -2.324761152267456
+        },
+        {
+          "rank": 4,
+          "id": 42652,
+          "token": "Returns",
+          "logprob": -3.1051032543182373
+        },
+        {
+          "rank": 5,
+          "id": 5991,
+          "token": "Gener",
+          "logprob": -3.486496686935425
+        },
+        {
+          "rank": 6,
+          "id": 13293,
+          "token": "Return",
+          "logprob": -3.7147719860076904
+        },
+        {
+          "rank": 7,
+          "id": 818,
+          "token": "The",
+          "logprob": -5.133471488952637
+        },
+        {
+          "rank": 8,
+          "id": 150052,
+          "token": "Prints",
+          "logprob": -5.374360084533691
+        },
+        {
+          "rank": 9,
+          "id": 20291,
+          "token": "Comput",
+          "logprob": -5.5251946449279785
+        },
+        {
+          "rank": 10,
+          "id": 236776,
+          "token": "A",
+          "logprob": -5.767008304595947
+        }
+      ],
+      "oracle_top2_gap_nat": 0.440166,
+      "oracle_rank_of_camelid_token": 1,
+      "oracle_reference_minus_camelid_nat": -0.440166,
+      "oracle_side_controls": {
+        "default": {
+          "oracle_next_token": 22304,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 22304,
+            "token": "Calcul",
+            "logprob": -0.751211941242218
+          },
+          "oracle_top2_gap_nat": 0.440166,
+          "camelid_token_rank": 1,
+          "camelid_token_logprob": -0.751211941242218,
+          "reference_token_logprob": -1.1913783550262451
+        },
+        "t4": {
+          "oracle_next_token": 22304,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 22304,
+            "token": "Calcul",
+            "logprob": -0.751211941242218
+          },
+          "oracle_top2_gap_nat": 0.440166,
+          "camelid_token_rank": 1,
+          "camelid_token_logprob": -0.751211941242218,
+          "reference_token_logprob": -1.1913783550262451
+        },
+        "t2": {
+          "oracle_next_token": 22304,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 22304,
+            "token": "Calcul",
+            "logprob": -0.751211941242218
+          },
+          "oracle_top2_gap_nat": 0.440166,
+          "camelid_token_rank": 1,
+          "camelid_token_logprob": -0.751211941242218,
+          "reference_token_logprob": -1.1913783550262451
+        },
+        "repack": {
+          "oracle_next_token": 22304,
+          "oracle_top1": {
+            "rank": 1,
+            "id": 22304,
+            "token": "Calcul",
+            "logprob": -0.751211404800415
+          },
+          "oracle_top2_gap_nat": 0.440166,
+          "camelid_token_rank": 1,
+          "camelid_token_logprob": -0.751211404800415,
+          "reference_token_logprob": -1.191377878189087
+        }
+      },
+      "oracle_continuous_vs_prefix_fed": {
+        "capture_reference_token": 2094,
+        "continuous_rerun_token": 2094,
+        "prefix_fed_token": 22304,
+        "camelid_token": 22304,
+        "oracle_self_consistent": false,
+        "prefix_fed_oracle_agrees_with_camelid": true
+      }
+    }
+  ]
+}

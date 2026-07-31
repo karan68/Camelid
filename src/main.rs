@@ -1939,7 +1939,10 @@ async fn main() -> anyhow::Result<()> {
                 .await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
-                ensure_arch_has_direct_dense_session(&gguf)?;
+                ensure_arch_has_direct_dense_session(
+                    &gguf,
+                    DenseLaneWindowedForward::CpuDenseOnly,
+                )?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
                 let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
                 let store = camelid::tensor::TensorStore::open(&model, &gguf);
@@ -2629,7 +2632,10 @@ async fn main() -> anyhow::Result<()> {
         } => {
             // The alloc gate runs a real dense decode; refuse runnable-lane-only
             // archs before the library loads weights (metadata read is cheap).
-            ensure_arch_has_direct_dense_session(&read_metadata(&model)?)?;
+            ensure_arch_has_direct_dense_session(
+                &read_metadata(&model)?,
+                DenseLaneWindowedForward::ViaSessionDecode,
+            )?;
             let report = camelid::alloc_gate::run_decode_alloc_gate(
                 &model,
                 warmup,
@@ -3385,7 +3391,7 @@ fn run_ghost(
 
     println!("[ghost] loading GGUF metadata from {:?}...", model);
     let gguf = read_metadata(&model)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
     let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&model, &gguf);
@@ -3820,7 +3826,7 @@ fn gait_profile_trial(
     }
 
     let gguf = read_metadata(model)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::ViaSessionDecode)?;
     // Apply this candidate's plan before loading weights, exactly as bench-generate does.
     let plan = camelid::execution_plan::plan_for_model(model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan.env_updates);
@@ -4506,6 +4512,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         rope_neox_pairing: false,
         no_rope_layer_step: None,
         moe: None,
+        gemma3: None,
         gemma4: None,
         qwen35: None,
         logit_scale: None,
@@ -4545,7 +4552,7 @@ fn run_bench_owner_sweep(
     // Load once. The owner is selected at runtime (env read per linear call), so a single load
     // serves every config; the PackedRows4 repack the owner consumes is built at load regardless.
     let gguf = read_metadata(&model)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::ViaSessionDecode)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
     let config = LlamaModelConfig::from_gguf(&gguf)?;
@@ -4701,7 +4708,7 @@ fn run_bench_generate(
     // Load the model once; this cost is measured separately from generation.
     let load_start = Instant::now();
     let gguf = read_metadata(&model)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::ViaSessionDecode)?;
     // Apply the model's execution plan (as serve/chat do) BEFORE loading weights so the
     // CPU Q8 runtime repack + packed-rows4 fast path is selected at load time. Without
     // this, bench-generate measures the unplanned safe (scalar) path.
@@ -5371,7 +5378,7 @@ fn load_model_drafter(
     threads: Option<usize>,
 ) -> anyhow::Result<SpeculativeDrafter> {
     let gguf = read_metadata(path)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(path, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
     let config = LlamaModelConfig::from_gguf(&gguf)?;
@@ -5426,7 +5433,7 @@ fn run_bench_speculative(
 
     // Load the target exactly as bench-generate does (execution plan applied before weights).
     let gguf = read_metadata(&model)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
     let config = LlamaModelConfig::from_gguf(&gguf)?;
@@ -5724,27 +5731,84 @@ fn infer_quantization(path: &std::path::Path) -> String {
 }
 
 /// Fail closed BEFORE weights load on every CLI lane that would construct a
-/// direct dense `LlamaInferenceSession` for a runnable-lane-only architecture
-/// (qwen35 / gemma2 / gemma3). The dense binder silently drops gemma3's
-/// QK-norm and post-attention/post-FFN norm tensors and the dense forward has
-/// no GeGLU, so BOTH the CPU dense forward and the GPU resident lane decode
-/// fluent-looking garbage for these archs; qwen35's hybrid layers do not fit
-/// the dense tensor map at all. `camelid serve` (and `camelid chat`, which
-/// drives serve over HTTP) route these archs to the correct runnable bridge —
-/// point the user there instead of running a mis-bound forward. Mirrors
-/// serve's `is_runnable_serve_arch` via the shared
-/// `camelid::model::is_runnable_only_arch` predicate.
-fn ensure_arch_has_direct_dense_session(gguf: &camelid::gguf::GgufFile) -> anyhow::Result<()> {
+/// direct dense `LlamaInferenceSession` for an architecture the runnable
+/// bridge must serve ON THIS HOST. qwen35 / gemma2: always (qwen35's hybrid
+/// layers do not fit the dense tensor map; gemma2's sandwich norms are still
+/// silently dropped at bind). gemma3: capability-aware since the Metal
+/// campaign's Phase 3b flip — on a resident-capable macOS host the direct
+/// dense session runs the Metal-resident windowed forward correctly, so it is
+/// allowed through; where the resident lane cannot serve (no Metal device,
+/// `CAMELID_METAL_RESIDENT_DECODE=0` / `--deterministic`, CUDA-resident), the
+/// CPU dense forward would be the only engine left and it has no
+/// sliding-window mask, so fail here and point the user at `camelid serve`
+/// (whose router falls back to the runnable bridge). The forward-dispatch
+/// guard (hazard H4) backstops this with a typed error either way. Mirrors
+/// serve's `is_runnable_serve_file` via the shared
+/// `camelid::model::file_requires_runnable_bridge` predicate — which is
+/// quant-aware since Phase 3c, so a non-Q8_0 gemma3 is refused here on every
+/// host (it has no resident lane anywhere; hazard H5).
+///
+/// `lane` says whether THIS command's forward can reach the windowed resident
+/// lane at all — see [`DenseLaneWindowedForward`]. A `CpuDenseOnly` lane
+/// refuses a windowed arch regardless of host capability (Phase 3c finding
+/// F2): accepting it would only defer the failure to the H4 choke point,
+/// after a multi-gigabyte weight load, with an error naming a per-layer
+/// dispatch instead of the command the user ran.
+fn ensure_arch_has_direct_dense_session(
+    gguf: &camelid::gguf::GgufFile,
+    lane: DenseLaneWindowedForward,
+) -> anyhow::Result<()> {
     let arch = gguf.architecture().unwrap_or_default();
-    if camelid::model::is_runnable_only_arch(arch) {
+    // Phase 3c finding F2: the Phase 3b flip made this guard capability-aware
+    // for gemma3, which opened EVERY lane it protects — including the ones
+    // that walk the CPU dense layer loop directly and can therefore never run
+    // a windowed forward, on any host. Those lanes must refuse before weights
+    // load, with a lane-accurate error, rather than accepting the model and
+    // dying at the H4 choke point 26 layers into the first token.
+    if lane == DenseLaneWindowedForward::CpuDenseOnly
+        && camelid::model::arch_string_has_windowed_attention(arch)
+    {
         anyhow::bail!(
-            "architecture '{arch}' is served only through the runnable lane; this command's \
-             direct dense-session path would run a mis-bound forward and emit wrong output, \
-             so it fails closed. Use `camelid serve` (or `camelid chat`), which routes this \
+            "architecture '{arch}' has per-layer sliding-window attention, and this command's \
+             forward walks the CPU dense layer loop directly (distributed shards, ghost \
+             probes, activation replay, speculative verify, alloc probes). There is no \
+             windowed CPU dense forward on any host — the sliding-window mask, GeGLU, \
+             dual-theta RoPE and sandwich norms exist only in the Metal-resident forward, \
+             which this lane cannot reach — so it fails closed instead of emitting wrong \
+             output. Serve this architecture with `camelid serve` (Metal-resident on macOS \
+             with a Q8_0 row, otherwise the runnable bridge)."
+        );
+    }
+    if camelid::model::file_requires_runnable_bridge(gguf) {
+        anyhow::bail!(
+            "architecture '{arch}' is served only through the runnable lane for this file on \
+             this host; this command's direct dense-session path would run an incomplete \
+             forward (missing norm/rope/window application) and emit wrong output, so it \
+             fails closed. Use `camelid serve` (or `camelid chat`), which routes this \
              architecture to its correct runtime."
         );
     }
     Ok(())
+}
+
+/// Whether a CLI lane's forward can reach the Metal-resident windowed lane —
+/// the ONLY engine in this repo with a correct gemma3 forward (Phase 2/3a
+/// parity receipts, GEMMA3_METAL_CONDUCTOR.md §9b/§10b).
+///
+/// Phase 3c finding F2. Before the Phase 3b flip, `is_runnable_only_arch`
+/// closed every lane below to gemma3 unconditionally. The flip replaced that
+/// with a host-capability predicate, which is right for the lanes that decode
+/// through the session (they inherit the resident lane on a capable host) and
+/// wrong for the lanes that don't (they gained an admission they cannot honor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DenseLaneWindowedForward {
+    /// The lane generates through `generate_next_token_with_history_diagnostics`,
+    /// which routes a windowed arch onto the single-token resident decode
+    /// (hazard H2). Capability-aware admission is correct here.
+    ViaSessionDecode,
+    /// The lane walks the CPU dense layer loop directly. No windowed forward
+    /// is reachable, so a windowed arch is refused on every host.
+    CpuDenseOnly,
 }
 
 /// The measured-fastest Metal configuration is on by default for the CLI: Q8_0/Q4_K/Q6_K
@@ -6022,7 +6086,7 @@ async fn run_distribute_worker(
 
     println!("Loading GGUF metadata from {:?}...", path);
     let gguf = read_metadata(&path)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
     let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&path, &gguf);
@@ -6154,7 +6218,7 @@ async fn run_distribute_master(
 
     println!("Loading GGUF metadata from {:?}...", path);
     let gguf = read_metadata(&path)?;
-    ensure_arch_has_direct_dense_session(&gguf)?;
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
     let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&path, &gguf);
@@ -7912,6 +7976,117 @@ fn write_step_logits(dir: &std::path::Path, step: usize, logits: &[f32]) -> std:
         buf.extend_from_slice(&v.to_le_bytes());
     }
     std::fs::write(dir.join(format!("step_{step}.bin")), buf)
+}
+
+#[cfg(test)]
+mod windowed_arch_cli_lane_tests {
+    use super::*;
+    use camelid::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+
+    fn gguf_for(arch: &str, quant: GgufTensorType) -> GgufFile {
+        GgufFile {
+            path: std::path::PathBuf::from("/models/synthetic.gguf"),
+            version: 3,
+            tensor_count: 0,
+            metadata_count: 1,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: std::collections::BTreeMap::from([(
+                "general.architecture".to_string(),
+                GgufMetadataValue::String(arch.to_string()),
+            )]),
+            tensors: [
+                "blk.0.attn_q.weight",
+                "blk.0.attn_k.weight",
+                "blk.0.attn_v.weight",
+                "blk.0.attn_output.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_up.weight",
+                "blk.0.ffn_down.weight",
+            ]
+            .into_iter()
+            .map(|name| GgufTensorDescriptor {
+                name: name.to_string(),
+                dimensions: vec![32, 32],
+                tensor_type: quant,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 0,
+            })
+            .collect(),
+        }
+    }
+
+    /// Phase 3c finding F2: the Phase 3b flip made this guard capability-aware
+    /// for gemma3, which opened EVERY CLI lane it protects — including
+    /// distribute master/worker, ghost and the speculative benches, whose
+    /// forwards walk the CPU dense layer loop directly and can therefore never
+    /// run a windowed arch on any host. Those lanes must refuse before weights
+    /// load, naming `camelid serve`, rather than accepting the model and dying
+    /// at the H4 choke point after a multi-gigabyte load.
+    ///
+    /// Host-independent: `CpuDenseOnly` never consults the capability probe.
+    #[test]
+    fn cpu_dense_only_cli_lanes_refuse_a_windowed_arch_on_every_host() {
+        let gguf = gguf_for("gemma3", GgufTensorType::Q8_0);
+        let err =
+            ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)
+                .expect_err("a CPU-dense-only lane must refuse a windowed arch");
+        let message = err.to_string();
+        assert!(
+            message.contains("sliding-window attention"),
+            "the refusal must name the hazard: {message}"
+        );
+        assert!(
+            message.contains("camelid serve"),
+            "the refusal must be actionable — name the lane that serves it: {message}"
+        );
+
+        // Control: a dense arch stays admitted on the very same lane, so the
+        // refusal is caused by the window schedule and not by the lane class.
+        ensure_arch_has_direct_dense_session(
+            &gguf_for("llama", GgufTensorType::Q8_0),
+            DenseLaneWindowedForward::CpuDenseOnly,
+        )
+        .expect("a dense arch must still be admitted on a CPU-dense-only lane");
+    }
+
+    /// Phase 3c finding F3 at the CLI: a non-Q8_0 gemma3 has no resident lane
+    /// on ANY host (hazard H5), so even a session-decode lane must refuse it
+    /// and point at `camelid serve`, whose router falls back to the bridge.
+    #[test]
+    fn a_kquant_windowed_row_is_refused_even_on_a_session_decode_lane() {
+        let err = ensure_arch_has_direct_dense_session(
+            &gguf_for("gemma3", GgufTensorType::Q4K),
+            DenseLaneWindowedForward::ViaSessionDecode,
+        )
+        .expect_err("a non-Q8_0 windowed row has no direct dense session anywhere");
+        assert!(
+            err.to_string().contains("camelid serve"),
+            "the refusal must point at the lane that serves it: {err}"
+        );
+    }
+
+    /// qwen35 / gemma2 stay refused on every lane class — the flip did not
+    /// touch them, and this is the causality control for the lane split.
+    #[test]
+    fn runnable_only_archs_stay_refused_on_both_lane_classes() {
+        for arch in ["qwen35", "gemma2"] {
+            for lane in [
+                DenseLaneWindowedForward::CpuDenseOnly,
+                DenseLaneWindowedForward::ViaSessionDecode,
+            ] {
+                assert!(
+                    ensure_arch_has_direct_dense_session(
+                        &gguf_for(arch, GgufTensorType::Q8_0),
+                        lane
+                    )
+                    .is_err(),
+                    "{arch} must be refused on every CLI lane class"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

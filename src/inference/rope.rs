@@ -571,6 +571,32 @@ pub(super) struct ResidentRopeTables {
     pub(super) split_half_pairing: bool,
 }
 
+/// gemma3 dual-theta RoPE tables for one position: the VERBATIM runnable-lane
+/// frequency form `1.0 / base.powf(2*i/rope_dim)` (`RunnableModel::apply_rope`,
+/// src/runnable/model.rs) — deliberately NOT `rope_pair_frequency`'s
+/// negated-exponent form, whose last-ULP drift against the CPU oracle can flip
+/// a near-tie greedy token (same lesson as `qwen35_rope_tables`,
+/// src/runnable/model.rs). gemma3 carries no rope scaling (the loader rejects
+/// it) and no rope_freqs tensor, so the plain form is exact. Returns
+/// `(cos, sin)`, each `rope_dim / 2` long. The caller picks `base` per layer
+/// type (`Gemma3Metadata::rope_freq_base_at`).
+pub(crate) fn gemma3_rope_tables(
+    position: usize,
+    rope_dim: usize,
+    base: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = rope_dim / 2;
+    let mut cos_t = vec![0.0f32; half];
+    let mut sin_t = vec![0.0f32; half];
+    for i in 0..half {
+        let freq = 1.0f32 / base.powf(2.0 * i as f32 / rope_dim as f32);
+        let (s, c) = (position as f32 * freq).sin_cos();
+        cos_t[i] = c;
+        sin_t[i] = s;
+    }
+    (cos_t, sin_t)
+}
+
 pub(super) fn resident_decode_rope_tables(
     position: usize,
     head_dim: usize,

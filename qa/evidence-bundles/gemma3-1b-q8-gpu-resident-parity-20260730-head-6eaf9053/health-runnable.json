@@ -1,0 +1,37 @@
+{
+  "captured_lane": "runnable CPU fallback (CAMELID_METAL_RESIDENT_DECODE=0)",
+  "generation_ready": true,
+  "active_model_id": "Gemma 3 1b It",
+  "backend": "runnable-runtime",
+  "execution_plan": {
+    "profile": "auto",
+    "operating_system": "macos",
+    "architecture": "aarch64",
+    "platform_label": "macOS arm64 Apple Silicon",
+    "cpu_model": "Apple M4",
+    "cpu_features": [
+      "dotprod",
+      "i8mm"
+    ],
+    "model_family": "gemma3",
+    "quant_type": "Q8_0",
+    "exact_model_row": "Gemma 3 1b It",
+    "support_level": "supported_exact_row_smoke_sub512",
+    "selected_backend": "cpu_reference",
+    "selected_q8_path": "safe_q8_0_block_dot",
+    "prefill_path": "safe_cpu_prefill",
+    "prefill_runtime_policy": "always_retained_reference_path",
+    "decode_path": "safe_cpu_decode",
+    "thread_count": 10,
+    "diagnostics_status": "standard diagnostics; RSS timings disabled by default",
+    "fallback_path": "retained_q8_reference_path",
+    "cuda_resident_active": false,
+    "reasons": [
+      "profile=auto default",
+      "exact_model_row=Gemma 3 1b It",
+      "support_level=supported_exact_row_smoke_sub512",
+      "quant_type=Q8_0",
+      "windowed-attention row (gemma3) without an active Metal-resident selection: no CPU dense plan exists for this arch — serve chats via the runnable bridge; failing closed to safe path"
+    ]
+  }
+}

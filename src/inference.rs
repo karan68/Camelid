@@ -38,6 +38,14 @@ mod q8_block_reader;
 mod q8_runtime;
 mod q8_telemetry;
 mod rope;
+/// Test-only re-export: the gemma3 self-parity/full-forward tests in
+/// `crate::metal::tests` build their RoPE tables with the SAME oracle-form
+/// builder the production wiring uses, so the two can never drift. Those are
+/// the ONLY consumers, and `src/metal.rs` is macOS-gated — so the re-export
+/// must carry the same gate or every non-macOS test build fails
+/// `-D unused-imports`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use rope::gemma3_rope_tables;
 pub mod spec_tree;
 #[cfg(test)]
 mod spec_tree_lossless;
@@ -294,6 +302,17 @@ pub struct LlamaLayerWeights {
     /// Per-head RMSNorm weight for the K projection; bound in lockstep with
     /// [`Self::attention_q_norm`].
     pub attention_k_norm: Option<CpuTensor>,
+    /// gemma3 sandwich norms (`[embedding_length]`, F32): RMSNorm applied to
+    /// the attention block's output BEFORE its residual add
+    /// (`post_attention_norm`) and to the FFN block's output BEFORE its
+    /// residual add (`post_ffw_norm`). Loaded in lockstep from the gemma3
+    /// binder's descriptor pair (Phase 1); `None` for the Llama 2-norm
+    /// structure. Applied only by the Metal resident decode encodes (Phase 2
+    /// of the gemma3 Metal campaign) — the CPU dense forward does not apply
+    /// them, which is one reason it fails closed for windowed archs (H4).
+    pub post_attention_norm: Option<CpuTensor>,
+    /// See [`Self::post_attention_norm`].
+    pub post_ffw_norm: Option<CpuTensor>,
     /// Qwen2/Qwen2.5 projection biases, applied before RoPE.
     pub attention_biases: Option<LlamaAttentionBiasWeights>,
     pub ffn_norm: CpuTensor,
@@ -1028,6 +1047,20 @@ impl LlamaLoadedWeights {
                     mla_kv_b_proj_opt = None;
                 }
 
+                // gemma3 sandwich norms: the binder produces the descriptor pair
+                // in lockstep (both present or a typed bind error), so loading
+                // them independently here cannot produce a half-loaded pair.
+                let post_attention_norm = layer
+                    .post_attention_norm
+                    .as_ref()
+                    .map(|desc| store.load_cpu_f32(&desc.name))
+                    .transpose()?;
+                let post_ffw_norm = layer
+                    .post_ffw_norm
+                    .as_ref()
+                    .map(|desc| store.load_cpu_f32(&desc.name))
+                    .transpose()?;
+
                 layers.push(LlamaLayerWeights {
                     attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
                     attention_q,
@@ -1036,6 +1069,8 @@ impl LlamaLoadedWeights {
                     attention_output,
                     attention_q_norm,
                     attention_k_norm,
+                    post_attention_norm,
+                    post_ffw_norm,
                     attention_biases,
                     mla_q_a_proj,
                     mla_q_a_layernorm,
@@ -1179,6 +1214,8 @@ impl LlamaLoadedWeights {
                     )?,
                     attention_q_norm: None,
                     attention_k_norm: None,
+                    post_attention_norm: None,
+                    post_ffw_norm: None,
                     attention_biases: None,
                     mla_q_a_proj,
                     mla_q_a_layernorm,
@@ -2730,23 +2767,38 @@ impl LlamaInferenceSession {
                  layer from a single cos/sin table and cannot express the skip; CPU reference"
             );
         }
-        // TEMPORARY arch-keyed disqualifier — remove in Phase 3 of the gemma3 Metal
-        // campaign (branch feat/gemma3-metal-resident), which lands a resident encode
-        // that applies these tensors. gemma3/gemma2 must never reach the resident
-        // dense kernels today: the dense binder drops their QK-norm and
-        // post-attention/post-FFN ("sandwich") norm tensors (gemma3-1b: 104 of them)
-        // and the dense forward has no GeGLU or dual-RoPE, so the resident lane —
-        // like the CPU dense forward — would decode fluent-looking garbage under a
-        // supported label. Checked before the backend-enabled gate because this is a
-        // property of the model, not of the available backends (same rationale as
-        // the NoPE check above; keeps the regression test causal on CPU-only hosts).
-        if matches!(self.config.architecture.as_str(), "gemma2" | "gemma3") {
+        // Arch-keyed disqualifier: gemma2 only, since Phase 3b of the gemma3
+        // Metal campaign flipped gemma3 onto the resident lane (the resident
+        // encode applies its QK + sandwich norms, GeGLU, dual-theta RoPE, and
+        // sliding-window mask — Phases 2/3a, real-row parity §9b/§10b).
+        // gemma2 must never reach the resident dense kernels: its sandwich
+        // norms are still silently dropped at bind, so the lane would decode
+        // fluent-looking garbage under a supported label. Checked before the
+        // backend-enabled gate because this is a property of the model, not of
+        // the available backends (same rationale as the NoPE check above;
+        // keeps the regression test causal on CPU-only hosts).
+        if self.config.architecture == "gemma2" && !windowed_arch_resident_admitted_for_tests() {
             bail!(format!(
-                "architecture {:?} is runnable-lane-only: the dense binder drops its QK/sandwich \
-                 norm tensors and has no GeGLU, so the resident kernels would run a mis-bound \
-                 forward; serve/chat route it to the runnable bridge instead",
+                "architecture {:?} is runnable-lane-only: the dense forward does not apply its \
+                 full norm/activation structure (sandwich norms, soft-caps, per-layer \
+                 attention schedule), so the resident kernels would run an incomplete forward; \
+                 serve/chat route it to the runnable bridge instead",
                 self.config.architecture
             ));
+        }
+        // Windowed-attention archs (gemma3) are Metal-resident ONLY: the CUDA
+        // resident engine builds one theta table and has no sliding-window
+        // mask, so a CUDA-resident process would run gemma3 full-causal.
+        // Serve keeps gemma3 on the runnable bridge in that configuration
+        // (`windowed_arch_resident_host_available`); this bail is the engine-
+        // level backstop for any other caller.
+        let windowed_arch = crate::model::arch_has_windowed_attention(&self.config);
+        if windowed_arch && resident_decode_cuda_enabled() {
+            bail!(
+                "windowed-attention arch: only the Metal resident engine carries the \
+                 sliding-window/dual-theta forward; the CUDA resident engine would run it \
+                 full-causal, so it is not admitted"
+            );
         }
         // GPU-runnable tier: an uncurated model is admitted to the resident path only after
         // it passes the one-time parity self-check. A recorded FAIL forbids the resident
@@ -2767,9 +2819,13 @@ impl LlamaInferenceSession {
         if want_logits && self.config.logit_scale.is_some() {
             bail!("logit_scale is not supported in the GPU logit kernel yet");
         }
-        // QK-norm (Qwen3) is applied in the resident path (decode:
-        // encode_attention_block, prefill: prefill_tokens) via the per-head
-        // RMSNorm kernel, so it no longer disqualifies the resident path.
+        // QK-norm (Qwen3, and gemma3 since Phase 2a of the gemma3 Metal campaign)
+        // is applied in the resident path (decode: encode_attention_block,
+        // prefill: prefill_tokens) via the per-head RMSNorm kernel, so it no
+        // longer disqualifies the resident path. (Since Phase 3b gemma3 is NOT
+        // behind the arch disqualifier above either — that disqualifier is
+        // gemma2-only, and gemma3 Q8_0 rides this resident path by default on
+        // a Metal host.)
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
             || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
             || diagnostic_ffn_gate_up_order()? != FfnGateUpOrder::GateUp
@@ -2852,6 +2908,13 @@ impl LlamaInferenceSession {
         // `resident_weight_bytes` with no Q8 backing and panicking.
         let metal_only = resident_decode_metal_enabled() && !resident_decode_cuda_enabled();
         let is_resident_quant = |t: &CpuTensor| {
+            // H5 (gemma3→Metal Phase 3b): windowed-arch resident admission is
+            // pinned to Q8_0 in the MECHANISM — the K-quant arms below must
+            // never admit a windowed arch (see the explicit decline ahead of
+            // the layer walk for the reason).
+            if windowed_arch {
+                return is_q8(t);
+            }
             is_q8(t)
                 || (if metal_only {
                     metal_seam::kquant_resident_enabled() && (is_q4k(t) || is_q6k(t))
@@ -2867,6 +2930,23 @@ impl LlamaInferenceSession {
             .unwrap_or(0..self.weights.layers.len());
         if range.end > self.weights.layers.len() || range.is_empty() {
             bail!("layer range invalid/empty");
+        }
+        // H5 (gemma3→Metal Phase 3b): windowed-arch admission is pinned to the
+        // Q8_0 exact row. A non-Q8_0 gemma3 (Q4_K_M etc.) would otherwise ride
+        // the Metal K-quant admission onto an F16-primary resident lane whose
+        // K-quant gather drops the gemma3 embed scale, and no windowed K-quant
+        // lane has a parity receipt. Declined here with the reason, so serve
+        // falls back to the runnable bridge for such a file (slow, correct)
+        // instead of decoding unverified output under a resident label.
+        if windowed_arch
+            && windowed_arch_layers_violate_q8_pin(&self.weights.layers[range.clone()], wire_ok)
+        {
+            bail!(
+                "windowed-attention arch resident admission is pinned to the Q8_0 exact row \
+                 (gemma3 Metal campaign, hazard H5): non-Q8_0 weights would take the K-quant \
+                 resident lane, which has no windowed parity receipt and whose gather path \
+                 drops the gemma3 embed scale; serve falls back to the runnable bridge"
+            );
         }
         for (idx, layer) in self.weights.layers[range].iter().enumerate() {
             if layer.attention_biases.is_some()
@@ -4282,6 +4362,10 @@ impl LlamaInferenceSession {
         if token_ids.is_empty() {
             return Ok(LlamaForwardTimings::default());
         }
+        // H4: batch prefill is a CPU dense full-causal walk; the session-level
+        // chunking (`session_prefill_chunk_tokens`) keeps windowed archs off
+        // it, and this guard makes that unroutable-around.
+        self.ensure_windowed_arch_off_cpu_dense("batch prefill")?;
         if token_ids.len() > self.kv_cache.plan.max_sequence_length - self.kv_cache.position {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "prefill chunk of {} token(s) exceeds remaining context capacity {}",
@@ -4518,6 +4602,8 @@ impl LlamaInferenceSession {
         if token_ids.is_empty() {
             return Ok(LlamaForwardTimings::default());
         }
+        // H4: the layer-major prefill is a CPU dense full-causal walk too.
+        self.ensure_windowed_arch_off_cpu_dense("layer-major prefill")?;
         if token_ids.len() > self.kv_cache.plan.max_sequence_length - self.kv_cache.position {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "layer-major prefill of {} token(s) exceeds remaining context capacity {}",
@@ -4692,6 +4778,16 @@ impl LlamaInferenceSession {
         Ok(timings)
     }
 
+    /// Hazard H4 (gemma3→Metal Phase 3b): session-level EARLY leg of the
+    /// windowed-arch CPU dense fail-closed. Names the lane before the layer
+    /// walk starts, so the operator sees "batch prefill" rather than the
+    /// generic per-layer message. This is a courtesy guard, NOT the
+    /// invariant — the invariant is the choke point every dense layer walk
+    /// bottoms out in, [`ensure_windowed_arch_off_cpu_dense_layer`].
+    fn ensure_windowed_arch_off_cpu_dense(&self, lane: &str) -> Result<()> {
+        ensure_windowed_arch_off_cpu_dense_layer(&self.config, lane)
+    }
+
     fn forward_single_token_timed_internal(
         &mut self,
         token_id: u32,
@@ -4801,6 +4897,10 @@ impl LlamaInferenceSession {
                 }
             }
         } else {
+            // H4: a windowed arch must never fall through to the CPU dense
+            // layer loop below (full-causal, structure-less for it) — typed
+            // error instead of silent wrong tokens.
+            self.ensure_windowed_arch_off_cpu_dense("decode forward")?;
             // The CPU layer loop below attends over `kv_cache` positions [0, position]. If a
             // GPU-resident lane produced any of those positions, the CPU buffers do not hold
             // them — recover them from the resident engine before reading (no-op otherwise).
@@ -5030,7 +5130,7 @@ impl LlamaInferenceSession {
         let mut prefill_timings = LlamaForwardTimings::default();
         let mut first_token_timings = LlamaForwardTimings::default();
         let prefill_count = token_ids.len().saturating_sub(1);
-        let prefill_chunk_tokens = prefill_chunk_token_count(prefill_count);
+        let prefill_chunk_tokens = session_prefill_chunk_tokens(&self.config, prefill_count);
         let telemetry_layers_total = self.weights.layers.len();
         if prefill_count > 0 {
             telemetry::emit(telemetry::Event::PrefillStarted {
@@ -5452,6 +5552,26 @@ fn prefill_chunk_token_count(prefill_count: usize) -> usize {
         prefill_count,
         DEFAULT_PREFILL_CHUNK_TOKENS,
     )
+}
+
+/// Prefill chunking for THIS session's model. Windowed-attention archs
+/// (gemma3) force the single-token lane: every prompt token must flow through
+/// `forward_single_token_timed_internal` → `try_resident_decode_forward` — the
+/// only lane whose forward carries the per-layer sliding-window / dual-theta
+/// schedule once the arch is admitted to the resident path (the gemma4
+/// runtime's token-by-token prefill is the semantic precedent). The batched
+/// CPU prefill lanes (layer-major and chunked) have no window mask, so a
+/// chunked prefill would silently evaluate the prompt full-causal and the
+/// prompt-prefix cache would then persist that wrong history
+/// (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H2). Not an env override —
+/// `CAMELID_PREFILL_CHUNK_TOKENS` still applies to every other arch, which
+/// keeps the existing chunking byte-identically.
+fn session_prefill_chunk_tokens(config: &LlamaModelConfig, prefill_count: usize) -> usize {
+    if crate::model::arch_has_windowed_attention(config) {
+        1
+    } else {
+        prefill_chunk_token_count(prefill_count)
+    }
 }
 
 fn prefill_layer_major_chunk_token_count(prefill_count: usize) -> usize {
@@ -6977,6 +7097,43 @@ fn pooled_add(lhs: &CpuTensor, rhs: &CpuTensor, name: &str) -> Result<CpuTensor>
     decode_scratch::tensor_from_pooled(name, &lhs.shape.dims, out)
 }
 
+/// Hazard H4 (gemma3→Metal Phase 3b) — THE CHOKE POINT for the windowed-arch
+/// CPU dense fail-closed.
+///
+/// Every CPU dense layer walk in this file bottoms out in exactly one of two
+/// per-layer forwards: [`forward_layer_timed`] (single-row decode geometry)
+/// and [`forward_prefill_layer_chunk_timed`] (multi-row prefill geometry).
+/// There is no third. Putting the guard HERE — at the innermost point rather
+/// than at the entry points — means every caller inherits it: the session
+/// decode fallback, batch prefill, layer-major prefill, the speculative
+/// greedy verify walk, the distributed worker shard, the ghost-layer probe,
+/// the activation-range replay, and any entry point added later. A new dense
+/// walk cannot be written that skips it, because it cannot compute a layer
+/// without calling one of these two.
+///
+/// Why it must fail closed rather than degrade: the CPU dense forward has no
+/// sliding-window mask, no GeGLU, no dual-theta RoPE schedule and does not
+/// apply the sandwich norms. For a windowed-attention arch it attends
+/// full-causal over the whole history and returns fluent-looking WRONG
+/// tokens — silent corruption, not a crash. Keyed on
+/// `arch_has_windowed_attention` (parsed metadata, not the arch string), so a
+/// future windowed arch inherits it without an edit here.
+fn ensure_windowed_arch_off_cpu_dense_layer(config: &LlamaModelConfig, lane: &str) -> Result<()> {
+    if crate::model::arch_has_windowed_attention(config)
+        && !windowed_arch_cpu_dense_admitted_for_tests()
+    {
+        return Err(BackendError::UnsupportedModelArchitecture(format!(
+            "architecture {:?} has per-layer sliding-window attention, which the CPU dense \
+             {lane} cannot express (it would run full-causal with no GeGLU/dual-theta \
+             RoPE/sandwich norms and decode wrong tokens), so it fails closed. This arch is \
+             served by the Metal resident lane (macOS, CAMELID_METAL_RESIDENT_DECODE=1, \
+             Q8_0 row) or by the runnable bridge via `camelid serve`.",
+            config.architecture
+        )));
+    }
+    Ok(())
+}
+
 fn forward_layer_timed(
     hidden: &CpuTensor,
     layer: &LlamaLayerWeights,
@@ -6984,6 +7141,9 @@ fn forward_layer_timed(
     kv_cache: &mut LlamaKvCache,
 ) -> Result<LlamaTimedLayerOutput> {
     let config = params.config;
+    // H4 choke point: no windowed arch computes a CPU dense layer. See
+    // `ensure_windowed_arch_off_cpu_dense_layer`.
+    ensure_windowed_arch_off_cpu_dense_layer(config, "per-layer decode forward")?;
     let rope_freqs = params.rope_freqs;
     let rms_norm_epsilon = params.rms_norm_epsilon;
     let layer_idx = params.layer_idx;
@@ -7750,6 +7910,9 @@ fn forward_prefill_layer_chunk_timed(
 ) -> Result<LlamaTimedLayerOutput> {
     let config = params.config;
     let layer_idx = params.layer_idx;
+    // H4 choke point: no windowed arch computes a CPU dense layer. See
+    // `ensure_windowed_arch_off_cpu_dense_layer`.
+    ensure_windowed_arch_off_cpu_dense_layer(config, "per-layer prefill chunk")?;
     if params.base_position != kv_cache.position {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "prefill chunk base position {} does not match KV cache cursor {}",
@@ -12228,6 +12391,125 @@ fn q8_0_metal_enabled() -> bool {
 fn resident_decode_metal_enabled() -> bool {
     !deterministic_mode_enabled()
         && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+}
+
+/// Host-capability probe for the windowed-arch (gemma3) Metal-resident serve
+/// lane (gemma3→Metal Phase 3b). True only when the Metal-resident decode lane
+/// can actually serve a windowed arch in THIS process: a macOS build, a real
+/// Metal device, `CAMELID_METAL_RESIDENT_DECODE` armed (the CLI default fast
+/// stack arms it; deterministic mode force-disables it), and no CUDA resident
+/// engine driving decode — the CUDA engine has no sliding-window/dual-theta
+/// forward, so a CUDA-resident process must keep gemma3 on the runnable
+/// bridge. Consumed by `crate::model::file_requires_runnable_bridge`, the
+/// capability-aware routing predicate serve and the CLI direct lanes key on.
+///
+/// It ALSO requires that the macOS Q8 Metal-resident PLAN selection can fire
+/// (`execution_plan::macos_q8_metal_plan_selectable`). Phase 3c finding: the
+/// plan and routing were reading different gate sets, so `CAMELID_PROFILE=safe`
+/// or `CAMELID_MAC_Q8_METAL_PLAN=0` produced a plan that disclosed a CPU
+/// reference lane (or, in the windowed arm, "serve chats via the runnable
+/// bridge") on `/v1/health` and `/api/capabilities` while serve actually ran
+/// the Metal-resident lane. The plan is the user-visible disclosure; routing
+/// now honors the same opt-outs, so the two can no longer disagree, and an
+/// operator who asks for the safe profile gets the bridge rather than a
+/// silently-still-accelerated lane.
+///
+/// The env half is read LIVE (the underlying flags are not latched); only the
+/// device probe is cached — device presence cannot change within a process,
+/// and `detect_metal_device` constructs a Metal device per call.
+pub(crate) fn windowed_arch_resident_host_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        static METAL_DEVICE_PRESENT: OnceLock<bool> = OnceLock::new();
+        resident_decode_metal_enabled()
+            && !resident_decode_cuda_enabled()
+            && crate::execution_plan::macos_q8_metal_plan_selectable()
+            && *METAL_DEVICE_PRESENT.get_or_init(|| crate::metal::detect_metal_device().available)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// TEST-ONLY seam for the arch-keyed resident disqualifier in
+/// `resident_decode_eligible`. Introduced in Phase 3a so the session-level
+/// gate could prove the token-by-token prefill routing against the real row
+/// BEFORE the Phase 3b flip; since the flip removed gemma3 from the
+/// disqualifier (gemma2 remains) the seam is a no-op for gemma3 in production
+/// routing terms, and the gate test keeps arming it harmlessly. Compiled out
+/// of production builds entirely (`cfg(test)`). A process global rather than
+/// a thread-local because the prefill loop hops threads
+/// (`run_on_prefill_pool`); the armed window is bounded by the test's drop
+/// guard, and the env-keyed gate test only ever runs targeted.
+#[cfg(test)]
+pub(crate) static TEST_ADMIT_WINDOWED_ARCH_RESIDENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn windowed_arch_resident_admitted_for_tests() -> bool {
+    #[cfg(test)]
+    {
+        TEST_ADMIT_WINDOWED_ARCH_RESIDENT.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// TEST-ONLY seam for the windowed-arch CPU dense fail-closed (hazard H4,
+/// gemma3→Metal Phase 3b): the prompt-prefix-cache decision tests drive tiny
+/// synthetic gemma3 configs through the CPU dense forward mechanically —
+/// structure-less, which is exactly what H4 forbids in production — because
+/// all they assert is the store/resume DECISION, not the forward's output.
+/// Compiled out of production builds entirely (`cfg(test)`), so the dispatch
+/// guard is unconditional there. Process-global (the forward hops onto the
+/// decode/prefill pools); arm it ONLY while holding
+/// `crate::test_support::env_lock()` and restore via a drop guard, so tests
+/// asserting the fail-closed can serialize against tests that admit.
+#[cfg(test)]
+pub(crate) static TEST_ADMIT_WINDOWED_ARCH_CPU_DENSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn windowed_arch_cpu_dense_admitted_for_tests() -> bool {
+    #[cfg(test)]
+    {
+        TEST_ADMIT_WINDOWED_ARCH_CPU_DENSE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Hazard H5 (gemma3→Metal Phase 3b) — pure decision half of the windowed-arch
+/// Q8_0 admission pin, so it can be tested WITHOUT arming a resident backend.
+///
+/// Phase 3c finding: the pin lived inline in `resident_decode_eligible`, which
+/// bails at the backend-enabled gate ~120 lines earlier on any host with no
+/// `CAMELID_*_RESIDENT_DECODE` armed — i.e. every ordinary `cargo test` run —
+/// so deleting the pin failed nothing anywhere. Arming the gate from inside a
+/// test is forbidden here (§9d: process-wide OnceLocks latch sibling tests onto
+/// different kernels), so the decision is extracted instead.
+///
+/// True when this windowed arch's layer range contains ANY non-Q8_0 per-layer
+/// linear — the condition that must send the file to the runnable bridge,
+/// because the K-quant resident lane's gather drops gemma3's embed scale and
+/// no windowed K-quant lane has a parity receipt.
+fn windowed_arch_layers_violate_q8_pin(layers: &[LlamaLayerWeights], wire_ok: bool) -> bool {
+    layers.iter().any(|layer| {
+        [
+            &layer.attention_q,
+            &layer.attention_k,
+            &layer.attention_v,
+            &layer.attention_output,
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &layer.ffn_down,
+        ]
+        .into_iter()
+        .any(|t| !metal_resident_weight_eligible(t, wire_ok))
+    })
 }
 
 fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) -> bool {
