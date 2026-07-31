@@ -24746,6 +24746,629 @@ mod tests {
         );
     }
 
+    /// One decoder layer of the real gemma3-1B row, loaded from the GGUF into the
+    /// 36-byte block layout the resident kernels take.
+    #[cfg(target_os = "macos")]
+    struct RealRowLayer {
+        attn_norm: Vec<f32>,
+        ffn_norm: Vec<f32>,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+        post_attn_norm: Vec<f32>,
+        post_ffw_norm: Vec<f32>,
+        q: Vec<u8>,
+        k: Vec<u8>,
+        v: Vec<u8>,
+        o: Vec<u8>,
+        gate: Vec<u8>,
+        up: Vec<u8>,
+        down: Vec<u8>,
+    }
+
+    /// The real row, loaded once. Shared by the window mutation harness; the Phase 2
+    /// final gate above keeps its own inline loader (it is a frozen receipt and is
+    /// deliberately not refactored under a campaign that is changing prefill).
+    #[cfg(target_os = "macos")]
+    struct RealRow {
+        g3: crate::model::Gemma3Metadata,
+        layers: Vec<RealRowLayer>,
+        output_norm: Vec<f32>,
+        token_embd: Vec<u8>,
+        vocab: usize,
+        n_layers: usize,
+        n_heads: usize,
+        n_kv: usize,
+        hidden: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        ffn: usize,
+        eps: f32,
+        scale: f32,
+        split_half_pairing: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_gemma3_real_row(path: &str) -> RealRow {
+        use crate::gguf::{read_metadata, GgufTensorType};
+        use crate::model::LlamaModelConfig;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let gguf = read_metadata(path).expect("gguf metadata");
+        let cfg = LlamaModelConfig::from_gguf(&gguf).expect("config");
+        let g3 = cfg.gemma3.clone().expect("gemma3 metadata");
+        let n_layers = cfg.block_count as usize;
+        let n_heads = cfg.attention_head_count as usize;
+        let n_kv = cfg.attention_head_count_kv as usize;
+        let hidden = cfg.embedding_length as usize;
+        let head_dim = cfg
+            .attention_key_length
+            .map(|v| v as usize)
+            .unwrap_or(hidden / n_heads);
+        let rope_dim = cfg
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+
+        let f = std::cell::RefCell::new(std::fs::File::open(path).expect("open gguf"));
+        let desc = |name: &str| {
+            gguf.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("tensor {name} missing"))
+        };
+        let read_bytes = |name: &str| -> Vec<u8> {
+            let d = desc(name);
+            let mut bytes = vec![0u8; d.n_bytes as usize];
+            let mut f = f.borrow_mut();
+            f.seek(SeekFrom::Start(d.absolute_offset)).expect("seek");
+            f.read_exact(&mut bytes).expect("read");
+            bytes
+        };
+        fn f16_bits_to_f32(h: u16) -> f32 {
+            let h = h as u32;
+            let sign = (h & 0x8000) << 16;
+            let exp = (h >> 10) & 0x1f;
+            let man = h & 0x3ff;
+            f32::from_bits(if exp == 0 && man == 0 {
+                sign
+            } else if exp == 0 {
+                let mut e = 127 - 15 + 1;
+                let mut m = man;
+                while m & 0x400 == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                sign | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+            } else {
+                sign | ((exp + 127 - 15) << 23) | (man << 13)
+            })
+        }
+        let load_q8 = |name: &str| -> Vec<u8> {
+            assert_eq!(desc(name).tensor_type, GgufTensorType::Q8_0, "{name}");
+            let wire = read_bytes(name);
+            assert_eq!(wire.len() % 34, 0);
+            let mut out = Vec::with_capacity(wire.len() / 34 * 36);
+            for b in wire.chunks_exact(34) {
+                let s = f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                out.extend_from_slice(&s.to_le_bytes());
+                out.extend_from_slice(&b[2..34]);
+            }
+            out
+        };
+        let load_f32 = |name: &str| -> Vec<f32> {
+            assert_eq!(desc(name).tensor_type, GgufTensorType::F32, "{name}");
+            read_bytes(name)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let layers: Vec<RealRowLayer> = (0..n_layers)
+            .map(|li| {
+                let p = |t: &str| format!("blk.{li}.{t}.weight");
+                RealRowLayer {
+                    attn_norm: load_f32(&p("attn_norm")),
+                    ffn_norm: load_f32(&p("ffn_norm")),
+                    q_norm: load_f32(&p("attn_q_norm")),
+                    k_norm: load_f32(&p("attn_k_norm")),
+                    post_attn_norm: load_f32(&p("post_attention_norm")),
+                    post_ffw_norm: load_f32(&p("post_ffw_norm")),
+                    q: load_q8(&p("attn_q")),
+                    k: load_q8(&p("attn_k")),
+                    v: load_q8(&p("attn_v")),
+                    o: load_q8(&p("attn_output")),
+                    gate: load_q8(&p("ffn_gate")),
+                    up: load_q8(&p("ffn_up")),
+                    down: load_q8(&p("ffn_down")),
+                }
+            })
+            .collect();
+        let output_norm = load_f32("output_norm.weight");
+        assert!(
+            !gguf.tensors.iter().any(|t| t.name == "output.weight"),
+            "expected a tied LM head on the 1B row"
+        );
+        let token_embd = load_q8("token_embd.weight");
+        let vocab = token_embd.len() / 36 / (hidden / 32);
+        RealRow {
+            split_half_pairing: g3.rope_neox_pairing,
+            g3,
+            layers,
+            output_norm,
+            token_embd,
+            vocab,
+            n_layers,
+            n_heads,
+            n_kv,
+            hidden,
+            head_dim,
+            rope_dim,
+            ffn: cfg.feed_forward_length as usize,
+            eps: cfg.rms_norm_epsilon,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RealRow {
+        fn weights(&self) -> Vec<ResidentLayerWeights<'_>> {
+            self.layers
+                .iter()
+                .map(|d| ResidentLayerWeights {
+                    attn_norm: &d.attn_norm,
+                    ffn_norm: &d.ffn_norm,
+                    q_norm: Some(&d.q_norm),
+                    k_norm: Some(&d.k_norm),
+                    post_attn_norm: Some(&d.post_attn_norm),
+                    post_ffw_norm: Some(&d.post_ffw_norm),
+                    ffn_geglu: self.g3.ffn_geglu,
+                    q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                    k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                    v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                    o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                    gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                    up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                    down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                })
+                .collect()
+        }
+
+        /// The PRODUCTION schedule, straight from the parsed metadata — the same
+        /// source the serve wiring reads. Every mutant below is a perturbation of
+        /// exactly this object.
+        fn schedule(&self) -> ResidentLayerSchedule {
+            ResidentLayerSchedule {
+                use_alt_rope: (0..self.n_layers)
+                    .map(|l| self.g3.is_sliding_layer(l))
+                    .collect(),
+                window: (0..self.n_layers)
+                    .map(|l| self.g3.layer_window(l).map(|w| w as usize))
+                    .collect(),
+            }
+        }
+
+        fn embed(&self, tok: u32) -> Vec<f32> {
+            let bpr = self.hidden / 32;
+            let base = tok as usize * bpr * 36;
+            let mut row = Vec::with_capacity(self.hidden);
+            for b in 0..bpr {
+                let blk = &self.token_embd[base + b * 36..base + (b + 1) * 36];
+                let s = f32::from_le_bytes(blk[..4].try_into().unwrap());
+                for &q in &blk[4..36] {
+                    row.push(q as i8 as f32 * s * self.g3.embed_scale);
+                }
+            }
+            row
+        }
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 1 — THE MUTATION HARNESS (gate G7).
+    //
+    // The campaign's recon found that the existing windowed evidence has near-zero
+    // power against window-edge errors, and that nothing downstream is trustworthy
+    // until that is fixed. This is the fix's proof: the new pack
+    // (qa/prompt-packs/gemma3-window-edge-pack-v1.json) is run on the REAL row
+    // under the production schedule and under seven deliberate defects, and every
+    // defect must be CAUGHT. A pack that passes under a broken mask is worthless.
+    //
+    // Two observables are scored per (item, mutant), because they have different
+    // power and the campaign needs to know which:
+    //   * TOKEN IDENTITY — the greedy continuation's ids. This is what the external
+    //     oracle gate (G9) can see, and it is argmax-only: a perturbation smaller
+    //     than the local top-2 gap is invisible to it.
+    //   * KV EQUIVALENCE — src/kv_equivalence, over every layer's K/V at every
+    //     prompt position plus the final hidden. No softmax sits between the defect
+    //     and the observable, so this sees perturbations token identity cannot.
+    //
+    // The mutations are applied through ResidentLayerSchedule, NOT by editing the
+    // window arithmetic, and that is deliberate: `window_start =
+    // filled.saturating_sub(w)` means a schedule of w-1 IS "window_start off by +1
+    // wherever the window is saturated", and w+1 IS the off-by-one the other way.
+    // Expressing the defects as data makes the harness committable and repeatable
+    // instead of a scratch build that has to be reverted.
+    //
+    // Run targeted, gates armed from the SHELL (they are process-latched — see the
+    // Phase 2 gate test above):
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
+    // [CAMELID_GEMMA3_MUTATION_OUT=/path/receipt.json] \
+    //   cargo test --release --lib gemma3_real_row_window_mutation -- --nocapture
+    // (~25 min: 8 schedules x the pack's mutation subset, token-by-token.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_window_mutation_harness() {
+        use crate::kv_equivalence::compare;
+        if !detect_metal_device().available {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_window_mutation_harness: set CAMELID_GEMMA3_GGUF to the \
+                 gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_window_mutation_harness: the production GEMV gates \
+                 (f32y/wire/NSG8) are not armed; arm them from the shell."
+            );
+            return;
+        }
+        let pack_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("qa/prompt-packs/gemma3-window-edge-pack-v1.json");
+        let pack: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pack_path).expect("read pack"))
+                .expect("parse pack");
+        let subset: Vec<String> = pack["mutation_subset"]
+            .as_array()
+            .expect("mutation_subset")
+            .iter()
+            .map(|v| v.as_str().expect("id").to_string())
+            .collect();
+        let all_items = pack["items"].as_array().expect("items");
+        let items: Vec<(String, Vec<u32>)> = subset
+            .iter()
+            .map(|id| {
+                let item = all_items
+                    .iter()
+                    .find(|i| i["id"].as_str() == Some(id.as_str()))
+                    .unwrap_or_else(|| panic!("pack item {id} missing"));
+                let ids: Vec<u32> = item["prompt_token_ids"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{id}: prompt_token_ids missing"))
+                    .iter()
+                    .map(|v| v.as_u64().expect("token id") as u32)
+                    .collect();
+                (id.clone(), ids)
+            })
+            .collect();
+
+        let row = load_gemma3_real_row(&path.to_string_lossy());
+        let weights = row.weights();
+        let base_schedule = row.schedule();
+        let n_layers = row.n_layers;
+        assert_eq!(
+            base_schedule.window.iter().filter(|w| w.is_some()).count(),
+            22,
+            "expected the 1B row's 22 sliding / 4 global cadence"
+        );
+        const GEN: usize = 12;
+
+        // --- the mutants, as schedule perturbations of the production object ---
+        let mut schedules: Vec<(&str, &str, ResidentLayerSchedule)> = Vec::new();
+        schedules.push((
+            "baseline",
+            "the production schedule, straight from the GGUF metadata",
+            base_schedule.clone(),
+        ));
+        schedules.push((
+            "window_minus_one",
+            "w-1 on every sliding layer == window_start off by +1 wherever the window is \
+             saturated; drops the OLDEST in-window position",
+            ResidentLayerSchedule {
+                use_alt_rope: base_schedule.use_alt_rope.clone(),
+                window: base_schedule
+                    .window
+                    .iter()
+                    .map(|w| w.map(|v| v - 1))
+                    .collect(),
+            },
+        ));
+        schedules.push((
+            "window_plus_one",
+            "w+1 == window_start off by -1; admits the FIRST out-of-window position",
+            ResidentLayerSchedule {
+                use_alt_rope: base_schedule.use_alt_rope.clone(),
+                window: base_schedule
+                    .window
+                    .iter()
+                    .map(|w| w.map(|v| v + 1))
+                    .collect(),
+            },
+        ));
+        schedules.push((
+            "no_lower_bound",
+            "the lower bound dropped entirely: full causal on all 26 layers — what every \
+             batched causal mask in the tree does today, and what the CPU runnable lane does",
+            ResidentLayerSchedule {
+                use_alt_rope: base_schedule.use_alt_rope.clone(),
+                window: vec![None; n_layers],
+            },
+        ));
+        schedules.push((
+            "window_on_all_layers",
+            "the 4 global layers slide too",
+            ResidentLayerSchedule {
+                use_alt_rope: base_schedule.use_alt_rope.clone(),
+                window: vec![Some(row.g3.sliding_window as usize); n_layers],
+            },
+        ));
+        schedules.push((
+            "window_on_wrong_layers",
+            "the schedule inverted: the 4 globals slide and the 22 sliders go full causal",
+            ResidentLayerSchedule {
+                use_alt_rope: base_schedule.use_alt_rope.clone(),
+                window: base_schedule
+                    .window
+                    .iter()
+                    .map(|w| {
+                        if w.is_some() {
+                            None
+                        } else {
+                            Some(row.g3.sliding_window as usize)
+                        }
+                    })
+                    .collect(),
+            },
+        ));
+        schedules.push((
+            "layer_pattern_shift_by_one",
+            "the whole local/global cadence rotated one layer (globals at 6/12/18/24 instead of \
+             5/11/17/23) — the shape a per-layer schedule indexing error takes in a batched loop",
+            ResidentLayerSchedule {
+                use_alt_rope: (0..n_layers)
+                    .map(|l| base_schedule.use_alt_rope[(l + n_layers - 1) % n_layers])
+                    .collect(),
+                window: (0..n_layers)
+                    .map(|l| base_schedule.window[(l + n_layers - 1) % n_layers])
+                    .collect(),
+            },
+        ));
+        schedules.push((
+            "rope_tables_swapped",
+            "ALT/primary RoPE table selection inverted; the window is untouched",
+            ResidentLayerSchedule {
+                use_alt_rope: base_schedule.use_alt_rope.iter().map(|b| !b).collect(),
+                window: base_schedule.window.clone(),
+            },
+        ));
+
+        // --- one (item, schedule) run: prefill + GEN greedy tokens + a KV snapshot ---
+        let run = |schedule: &ResidentLayerSchedule,
+                   prompt: &[u32]|
+         -> (Vec<u32>, crate::kv_equivalence::KvSnapshot) {
+            let n = prompt.len();
+            let mut session = ResidentDecodeState::new(
+                row.n_layers,
+                row.n_heads,
+                row.n_kv,
+                row.head_dim,
+                row.hidden,
+                row.ffn,
+                n + GEN + 1,
+                n + GEN + 1,
+                row.eps,
+                row.split_half_pairing,
+                Some(schedule.clone()),
+            )
+            .expect("resident session");
+            let forward = |session: &mut ResidentDecodeState,
+                           tok: u32,
+                           pos: usize,
+                           want_logits: bool|
+             -> Option<Vec<f32>> {
+                let (cos_g, sin_g) = crate::inference::gemma3_rope_tables(
+                    pos,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_global,
+                );
+                let (cos_l, sin_l) = crate::inference::gemma3_rope_tables(
+                    pos,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_local,
+                );
+                let stage = want_logits.then_some(LogitsStage {
+                    final_norm: &row.output_norm,
+                    output_weight_blocks: ResidentWeightBytes::Blocks36(&row.token_embd),
+                    vocab_size: row.vocab,
+                });
+                match session
+                    .forward_token(
+                        &row.embed(tok),
+                        &weights,
+                        &cos_g,
+                        &sin_g,
+                        Some((&cos_l, &sin_l)),
+                        pos,
+                        row.scale,
+                        stage,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .expect("resident forward")
+                {
+                    ResidentTokenOut::Data(v) => Some(v),
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            };
+            for (i, &tok) in prompt.iter().enumerate().take(n - 1) {
+                forward(&mut session, tok, i, false);
+            }
+            let mut generated = Vec::with_capacity(GEN);
+            let mut next = *prompt.last().expect("non-empty prompt");
+            let mut snapshot = None;
+            for (step, pos) in (n - 1..).take(GEN).enumerate() {
+                let logits = forward(&mut session, next, pos, true).expect("logits");
+                if step == 0 {
+                    // Every prompt position is now written; snapshot BEFORE any
+                    // generated token perturbs the cache, so the comparison covers
+                    // the PREFILL state alone — exactly what a batched prefill
+                    // produces. The snapshot's `final_hidden` slot carries the
+                    // first-token LOGITS (all 262 144 of them): they are the
+                    // downstream of the last layer's attention, which reaches no KV
+                    // cache and would otherwise be unobservable.
+                    snapshot = Some(session.kv_snapshot(n).with_final_hidden(logits.clone()));
+                }
+                let mut best = 0usize;
+                let mut best_v = f32::NEG_INFINITY;
+                for (i, &x) in logits.iter().enumerate() {
+                    if x > best_v {
+                        best_v = x;
+                        best = i;
+                    }
+                }
+                let tok = best as u32;
+                generated.push(tok);
+                // gemma3 EOG ids: <eos> = 1, <end_of_turn> = 106.
+                if tok == 1 || tok == 106 {
+                    break;
+                }
+                next = tok;
+            }
+            (generated, snapshot.expect("snapshot"))
+        };
+
+        // --- determinism positive control on the cheapest item ---
+        let (control_id, control_prompt) = items
+            .iter()
+            .min_by_key(|(_, p)| p.len())
+            .expect("non-empty subset");
+        let (a_tokens, a_kv) = run(&base_schedule, control_prompt);
+        let (b_tokens, b_kv) = run(&base_schedule, control_prompt);
+        assert_eq!(
+            a_tokens, b_tokens,
+            "positive control {control_id}: two baseline runs must generate the same tokens"
+        );
+        compare(&a_kv, &b_kv)
+            .expect("compare")
+            .assert_bit_identical(&format!("positive control {control_id}"));
+        eprintln!(
+            "[mutation] positive control {control_id} ({} tok): two baseline runs bit-identical, \
+             kv digest {}",
+            control_prompt.len(),
+            &a_kv.digest()[..16]
+        );
+
+        // --- the matrix ---
+        let mut receipt_items = Vec::new();
+        let mut caught_by_tokens: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut caught_by_kv: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (id, prompt) in &items {
+            let (base_tokens, base_kv) = run(&base_schedule, prompt);
+            eprintln!(
+                "\n[mutation] === {id} ({} prompt tokens) baseline {:?} kv {} ===",
+                prompt.len(),
+                base_tokens,
+                &base_kv.digest()[..16]
+            );
+            let mut per_mutant = Vec::new();
+            for (name, why, schedule) in schedules.iter().skip(1) {
+                let (tokens, kv) = run(schedule, prompt);
+                let v = compare(&base_kv, &kv).expect("compare");
+                let token_caught = tokens != base_tokens;
+                let kv_caught = !v.bit_identical;
+                let first_divergence = base_tokens
+                    .iter()
+                    .zip(&tokens)
+                    .position(|(a, b)| a != b)
+                    .or_else(|| (tokens.len() != base_tokens.len()).then_some(base_tokens.len()));
+                if token_caught {
+                    caught_by_tokens.entry(name).or_default().push(id.clone());
+                }
+                if kv_caught {
+                    caught_by_kv.entry(name).or_default().push(id.clone());
+                }
+                eprintln!(
+                    "[mutation]   {:28} tokens {:6} kv {:6}  {}",
+                    name,
+                    if token_caught { "CAUGHT" } else { "missed" },
+                    if kv_caught { "CAUGHT" } else { "MISSED" },
+                    v.summary()
+                );
+                per_mutant.push(serde_json::json!({
+                    "mutant": name,
+                    "defect": why,
+                    "token_identity_caught": token_caught,
+                    "kv_equivalence_caught": kv_caught,
+                    "first_token_divergence_index": first_divergence,
+                    "generated_token_ids": tokens,
+                    "kv_digest": kv.digest(),
+                    "kv_differing_elements": v.differing_elements,
+                    "kv_compared_elements": v.compared_elements(),
+                    "kv_max_abs_diff": v.max_abs_diff,
+                    "kv_median_position_max_abs": v.median_position_max_abs(),
+                    "final_hidden_max_abs_diff": v.hidden_max_abs_diff,
+                    "kv_first_difference": v.first_difference.map(|s| s.to_string()),
+                }));
+            }
+            receipt_items.push(serde_json::json!({
+                "item": id,
+                "prompt_tokens": prompt.len(),
+                "baseline_generated_token_ids": base_tokens,
+                "baseline_kv_digest": base_kv.digest(),
+                "mutants": per_mutant,
+            }));
+        }
+
+        // --- the gate: every mutant must be caught by at least one item ---
+        let mut survivors = Vec::new();
+        for (name, _, _) in schedules.iter().skip(1) {
+            let by_tokens = caught_by_tokens.get(name).map(Vec::len).unwrap_or(0);
+            let by_kv = caught_by_kv.get(name).map(Vec::len).unwrap_or(0);
+            eprintln!(
+                "[mutation] {name:28} caught by tokens on {by_tokens}/{} items, by KV on \
+                 {by_kv}/{} items",
+                items.len(),
+                items.len()
+            );
+            if by_tokens == 0 && by_kv == 0 {
+                survivors.push(*name);
+            }
+        }
+        let receipt = serde_json::json!({
+            "schema": "camelid.gemma3.window_mutation_harness/v1",
+            "pack": "qa/prompt-packs/gemma3-window-edge-pack-v1.json",
+            "pack_id": pack["pack_id"],
+            "row": "gemma_3_1b_it_q8_0",
+            "lane": "metal_resident_token_by_token (ResidentDecodeState driven directly)",
+            "generated_tokens_per_leg": GEN,
+            "mutants": schedules.iter().skip(1).map(|(n, w, _)| serde_json::json!({"mutant": n, "defect": w})).collect::<Vec<_>>(),
+            "caught_by_token_identity": caught_by_tokens,
+            "caught_by_kv_equivalence": caught_by_kv,
+            "survivors": survivors,
+            "items": receipt_items,
+        });
+        if let Some(out) = std::env::var_os("CAMELID_GEMMA3_MUTATION_OUT") {
+            std::fs::write(&out, serde_json::to_string_pretty(&receipt).expect("json"))
+                .expect("write mutation receipt");
+            eprintln!("[mutation] wrote {}", out.to_string_lossy());
+        }
+        assert!(
+            survivors.is_empty(),
+            "MUTANTS SURVIVED THE PACK: {survivors:?}. The pack is not a gate for these defects \
+             and Tier B must not start until it is (campaign stopping rule 2)."
+        );
+        eprintln!(
+            "\n[mutation] PASS: all {} mutants caught on the {}-item subset",
+            schedules.len() - 1,
+            items.len()
+        );
+    }
+
     // gemma3→Metal Phase 3a hazard H2 gate: the SESSION-level token-by-token
     // prefill. The Phase 2 final gate above drives ResidentDecodeState
     // directly; this test drives the production entry —
