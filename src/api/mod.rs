@@ -6427,6 +6427,7 @@ mod gemma4_template_tests {
                 remove_extra_whitespaces: false,
             },
             chat_template: Some(template.to_string()),
+            specials_index: OnceLock::new(),
         }
     }
 
@@ -20539,6 +20540,7 @@ mod tests {
                 remove_extra_whitespaces: false,
             },
             chat_template: Some("<|user|><|assistant|><|system|>".to_string()),
+            specials_index: OnceLock::new(),
         };
 
         assert_eq!(
@@ -20757,6 +20759,7 @@ mod tests {
             chat_template: Some(
                 "<|start_header_id|>{{ role }}<|end_header_id|>{{ content }}<|eot_id|>".to_string(),
             ),
+            specials_index: OnceLock::new(),
         };
 
         assert!(tokenizer.chat_prompt_parse_special());
@@ -21918,6 +21921,7 @@ mod tests {
             chat_template: Some(
                 "{{ bos_token }}[INST] {{ messages[0]['content'] }} [/INST]".to_string(),
             ),
+            specials_index: OnceLock::new(),
         }
     }
 
@@ -22047,6 +22051,7 @@ mod tests {
                 remove_extra_whitespaces: false,
             },
             chat_template: Some(template.to_string()),
+            specials_index: OnceLock::new(),
         }
     }
 
@@ -22231,6 +22236,7 @@ mod tests {
                 remove_extra_whitespaces: false,
             },
             chat_template: None,
+            specials_index: OnceLock::new(),
         }
     }
 
