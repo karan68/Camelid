@@ -4785,28 +4785,14 @@ impl LlamaInferenceSession {
         Ok(timings)
     }
 
-    /// Hazard H4 (gemma3→Metal Phase 3b): the CPU dense forward has no
-    /// sliding-window mask, no GeGLU, no dual-theta RoPE, and does not apply
-    /// the sandwich norms — for a windowed-attention arch it would attend
-    /// full-causal and decode fluent-looking garbage. Fail closed at forward
-    /// dispatch with an actionable error, so NO routing mistake (a resident
-    /// decline mid-session, a future serve change, a direct embedder call)
-    /// can silently run a windowed arch on this path. Keyed on
-    /// `arch_has_windowed_attention` (parsed metadata, not the arch string).
+    /// Hazard H4 (gemma3→Metal Phase 3b): session-level EARLY leg of the
+    /// windowed-arch CPU dense fail-closed. Names the lane before the layer
+    /// walk starts, so the operator sees "batch prefill" rather than the
+    /// generic per-layer message. This is a courtesy guard, NOT the
+    /// invariant — the invariant is the choke point every dense layer walk
+    /// bottoms out in, [`ensure_windowed_arch_off_cpu_dense_layer`].
     fn ensure_windowed_arch_off_cpu_dense(&self, lane: &str) -> Result<()> {
-        if crate::model::arch_has_windowed_attention(&self.config)
-            && !windowed_arch_cpu_dense_admitted_for_tests()
-        {
-            return Err(BackendError::UnsupportedModelArchitecture(format!(
-                "architecture {:?} has per-layer sliding-window attention, which the CPU dense \
-                 {lane} cannot express (it would run full-causal with no GeGLU/dual-theta \
-                 RoPE/sandwich norms and decode wrong tokens), so it fails closed. This arch is \
-                 served by the Metal resident lane (macOS, CAMELID_METAL_RESIDENT_DECODE=1, \
-                 Q8_0 row) or by the runnable bridge via `camelid serve`.",
-                self.config.architecture
-            )));
-        }
-        Ok(())
+        ensure_windowed_arch_off_cpu_dense_layer(&self.config, lane)
     }
 
     fn forward_single_token_timed_internal(
@@ -7116,6 +7102,43 @@ fn pooled_add(lhs: &CpuTensor, rhs: &CpuTensor, name: &str) -> Result<CpuTensor>
     decode_scratch::tensor_from_pooled(name, &lhs.shape.dims, out)
 }
 
+/// Hazard H4 (gemma3→Metal Phase 3b) — THE CHOKE POINT for the windowed-arch
+/// CPU dense fail-closed.
+///
+/// Every CPU dense layer walk in this file bottoms out in exactly one of two
+/// per-layer forwards: [`forward_layer_timed`] (single-row decode geometry)
+/// and [`forward_prefill_layer_chunk_timed`] (multi-row prefill geometry).
+/// There is no third. Putting the guard HERE — at the innermost point rather
+/// than at the entry points — means every caller inherits it: the session
+/// decode fallback, batch prefill, layer-major prefill, the speculative
+/// greedy verify walk, the distributed worker shard, the ghost-layer probe,
+/// the activation-range replay, and any entry point added later. A new dense
+/// walk cannot be written that skips it, because it cannot compute a layer
+/// without calling one of these two.
+///
+/// Why it must fail closed rather than degrade: the CPU dense forward has no
+/// sliding-window mask, no GeGLU, no dual-theta RoPE schedule and does not
+/// apply the sandwich norms. For a windowed-attention arch it attends
+/// full-causal over the whole history and returns fluent-looking WRONG
+/// tokens — silent corruption, not a crash. Keyed on
+/// `arch_has_windowed_attention` (parsed metadata, not the arch string), so a
+/// future windowed arch inherits it without an edit here.
+fn ensure_windowed_arch_off_cpu_dense_layer(config: &LlamaModelConfig, lane: &str) -> Result<()> {
+    if crate::model::arch_has_windowed_attention(config)
+        && !windowed_arch_cpu_dense_admitted_for_tests()
+    {
+        return Err(BackendError::UnsupportedModelArchitecture(format!(
+            "architecture {:?} has per-layer sliding-window attention, which the CPU dense \
+             {lane} cannot express (it would run full-causal with no GeGLU/dual-theta \
+             RoPE/sandwich norms and decode wrong tokens), so it fails closed. This arch is \
+             served by the Metal resident lane (macOS, CAMELID_METAL_RESIDENT_DECODE=1, \
+             Q8_0 row) or by the runnable bridge via `camelid serve`.",
+            config.architecture
+        )));
+    }
+    Ok(())
+}
+
 fn forward_layer_timed(
     hidden: &CpuTensor,
     layer: &LlamaLayerWeights,
@@ -7123,6 +7146,9 @@ fn forward_layer_timed(
     kv_cache: &mut LlamaKvCache,
 ) -> Result<LlamaTimedLayerOutput> {
     let config = params.config;
+    // H4 choke point: no windowed arch computes a CPU dense layer. See
+    // `ensure_windowed_arch_off_cpu_dense_layer`.
+    ensure_windowed_arch_off_cpu_dense_layer(config, "per-layer decode forward")?;
     let rope_freqs = params.rope_freqs;
     let rms_norm_epsilon = params.rms_norm_epsilon;
     let layer_idx = params.layer_idx;
@@ -7889,6 +7915,9 @@ fn forward_prefill_layer_chunk_timed(
 ) -> Result<LlamaTimedLayerOutput> {
     let config = params.config;
     let layer_idx = params.layer_idx;
+    // H4 choke point: no windowed arch computes a CPU dense layer. See
+    // `ensure_windowed_arch_off_cpu_dense_layer`.
+    ensure_windowed_arch_off_cpu_dense_layer(config, "per-layer prefill chunk")?;
     if params.base_position != kv_cache.position {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "prefill chunk base position {} does not match KV cache cursor {}",

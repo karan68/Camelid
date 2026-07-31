@@ -14392,3 +14392,227 @@ fn resident_session_construction_sets_the_kquant_lane_at_both_sites() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// gemma3→Metal Phase 3c, finding F1: the windowed-arch CPU dense fail-closed
+// is carried by a CHOKE POINT, not by a list of entry-point guards.
+//
+// The review found H4 guarded only 3 of the CPU dense entry points while the
+// Phase 3b routing flip made four more reachable for gemma3
+// (`forward_greedy_verify_chunk`, `forward_layer_range_from_hidden`,
+// `forward_worker_layers`, `ghost_forward_one_layer`). Whack-a-mole would
+// leave the next entry point unguarded, so the invariant moved to
+// `ensure_windowed_arch_off_cpu_dense_layer`, called from the only two
+// per-layer dense forwards there are.
+//
+// These tests are the completeness proof AND the revert detector: the two
+// choke-point tests fail if either choke-point call is deleted, the three
+// lane-name tests fail if the corresponding early session guard is deleted
+// (the message's lane changes to the per-layer one), and the four
+// entry-point tests fail if the choke point stops covering an inherited
+// caller.
+// ---------------------------------------------------------------------------
+
+/// A synthetic single-layer session whose config carries gemma3's windowed
+/// metadata. The weights are the KV-budget fixture's — shape-valid and
+/// numerically trivial — because every test below asserts a REFUSAL: none of
+/// them may reach any arithmetic.
+fn tiny_windowed_session(context_length: u32) -> (LlamaInferenceSession, tempfile::NamedTempFile) {
+    let (mut session, temp_file) = tiny_kv_budget_session(context_length);
+    session.config.architecture = "gemma3".to_string();
+    session.config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 2,
+        sliding_window_pattern: 2,
+        rope_freq_base_global: 10_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 1.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    (session, temp_file)
+}
+
+fn assert_windowed_fail_closed(message: &str, expected_lane: &str) {
+    assert!(
+        message.contains("sliding-window attention"),
+        "the H4 error must name the windowed-attention hazard: {message}"
+    );
+    assert!(
+        message.contains("fails closed"),
+        "the H4 error must be explicit about failing closed: {message}"
+    );
+    assert!(
+        message.contains("camelid serve"),
+        "the H4 error must name the lane that can serve this arch: {message}"
+    );
+    assert!(
+        message.contains(expected_lane),
+        "expected the {expected_lane:?} lane in the H4 error, got: {message}"
+    );
+}
+
+/// CHOKE POINT 1. `forward_layer_timed` is the per-layer dense forward every
+/// single-row CPU walk uses. Deleting its guard call makes this fail.
+#[test]
+fn windowed_arch_choke_point_refuses_the_per_layer_decode_forward() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap();
+    let layer = session.weights.layers[0].clone();
+    let err = forward_layer_timed(
+        &hidden,
+        &layer,
+        ForwardLayerParams {
+            config: &session.config,
+            rope_freqs: None,
+            rms_norm_epsilon: session.config.rms_norm_epsilon,
+            layer_idx: 0,
+            collect_diagnostics: false,
+            runtime_plan: &runtime_plan,
+        },
+        &mut session.kv_cache,
+    )
+    .expect_err("the per-layer decode forward must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer decode forward");
+}
+
+/// CHOKE POINT 2. `forward_prefill_layer_chunk_timed` is the per-layer dense
+/// forward every multi-row CPU walk uses. Deleting its guard call makes this
+/// fail — and note it fires BEFORE the base-position check, so no legitimate
+/// caller can order its way around it.
+#[test]
+fn windowed_arch_choke_point_refuses_the_per_layer_prefill_chunk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![2, 32], vec![0.1; 64]).unwrap();
+    let layer = session.weights.layers[0].clone();
+    let err = forward_prefill_layer_chunk_timed(
+        &hidden,
+        &layer,
+        PrefillLayerChunkParams {
+            config: &session.config,
+            rope_freqs: None,
+            rms_norm_epsilon: session.config.rms_norm_epsilon,
+            layer_idx: 0,
+            base_position: 0,
+            chunk_start: 0,
+            chunk_rows: 2,
+        },
+        &mut session.kv_cache,
+    )
+    .expect_err("the per-layer prefill chunk must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
+
+/// The non-windowed control: the identical fixture without the window schedule
+/// computes a layer. Without this, every test above would still pass if the
+/// choke point refused EVERYTHING.
+#[test]
+fn non_windowed_arch_still_computes_a_cpu_dense_layer() {
+    let (mut session, _temp_file) = tiny_kv_budget_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap();
+    let layer = session.weights.layers[0].clone();
+    forward_layer_timed(
+        &hidden,
+        &layer,
+        ForwardLayerParams {
+            config: &session.config,
+            rope_freqs: None,
+            rms_norm_epsilon: session.config.rms_norm_epsilon,
+            layer_idx: 0,
+            collect_diagnostics: false,
+            runtime_plan: &runtime_plan,
+        },
+        &mut session.kv_cache,
+    )
+    .expect("the non-windowed control must still compute a CPU dense layer");
+}
+
+/// EARLY GUARD 1 — `forward_prefill_chunk_timed_fast` (the "batch prefill"
+/// lane). Session-level chunking keeps a windowed arch off this entry point,
+/// so nothing reaches it in production; the guard exists so a future routing
+/// change surfaces the lane by name. Deleting `ensure_windowed_arch_off_cpu_
+/// dense("batch prefill")` makes this fail (the choke point then reports
+/// "per-layer prefill chunk" instead).
+#[test]
+fn windowed_arch_batch_prefill_names_its_lane_before_the_layer_walk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_prefill_chunk_timed_fast(&[0, 1])
+        .expect_err("batch prefill must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "batch prefill");
+}
+
+/// EARLY GUARD 2 — `forward_prefill_layer_major_timed_fast_inner` (the
+/// "layer-major prefill" lane). Same contract as above.
+#[test]
+fn windowed_arch_layer_major_prefill_names_its_lane_before_the_layer_walk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_prefill_layer_major_timed_fast_inner(&[0, 1], 2)
+        .expect_err("layer-major prefill must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "layer-major prefill");
+}
+
+/// EARLY GUARD 3 — the single-token decode fallback ("decode forward" lane),
+/// reached once the resident forward declines. This is the guard the H4 test
+/// in `api` exercises; it is pinned BY LANE NAME here so deleting it is
+/// visible rather than absorbed by the choke point.
+#[test]
+fn windowed_arch_decode_fallback_names_its_lane_before_the_layer_walk() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_single_token_timed_internal(0, false, true)
+        .expect_err("the decode fallback must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "decode forward");
+}
+
+/// F1 ENTRY POINT A — the speculative-decode CPU verify walk. Reachable from
+/// `camelid serve --spec-decode` (src/api/mod.rs) and the bench lanes; it had
+/// NO guard before Phase 3c and ran the full dense layer loop.
+#[test]
+fn windowed_arch_speculative_verify_chunk_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let err = session
+        .forward_greedy_verify_chunk(&[0, 1])
+        .expect_err("the speculative verify walk must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
+
+/// F1 ENTRY POINT B — the distributed worker shard
+/// (`crate::distributed`, src/distributed.rs). Had no guard before Phase 3c.
+#[test]
+fn windowed_arch_worker_layer_shard_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let err = session
+        .forward_worker_layers(hidden, false, 1, 0)
+        .expect_err("the distributed worker shard must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer decode forward");
+}
+
+/// F1 ENTRY POINT C — the activation-range replay used by the distribute
+/// master and the ghost lanes. Had no guard before Phase 3c; its `seq_len > 1`
+/// arm is a full CPU dense chunk loop.
+#[test]
+fn windowed_arch_layer_range_replay_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![2, 32], vec![0.1; 64]).unwrap();
+    let err = session
+        .forward_layer_range_from_hidden(&hidden, 0, 2)
+        .expect_err("the activation-range replay must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
+
+/// F1 ENTRY POINT D — the ghost single-layer probe (`camelid ghost`,
+/// src/main.rs). Had no guard before Phase 3c.
+#[test]
+fn windowed_arch_ghost_layer_probe_inherits_the_choke_point() {
+    let (mut session, _temp_file) = tiny_windowed_session(8);
+    let hidden = CpuTensor::from_f32("hidden", vec![1, 32], vec![0.1; 32]).unwrap();
+    let err = session
+        .ghost_forward_one_layer(&hidden, 0, 0, 1)
+        .expect_err("the ghost layer probe must refuse a windowed arch");
+    assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
+}
