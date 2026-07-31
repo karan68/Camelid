@@ -1370,3 +1370,163 @@ Both servers killed by saved PID only.
   belongs to the Phase 5 docs sweep.
 - Phase 5's own inheritance from §11i is unchanged: the capabilities-row rewrite + ledger regen,
   frontend fixtures, docs sweep. The `lane`/trim half of that list is now CLOSED by 12e-5.
+
+---
+
+## 13. Phase 4 record (2026-07-30)
+
+Phase 4 is the receipt phase: the SERVED resident lane compared against the pinned EXTERNAL
+oracle, not against the runnable lane — whose oracle role expires at the 512-token window.
+Bundle: `qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053/`
+(20 artifacts, README + manifest + SHA256SUMS).
+
+### 13a. The oracle exists and is the pinned one
+
+`llama-server` **version 9632 (`acd79d603`)** at
+`acd79d603cb2e1c84c0886137b80f1ad649b6857`, clean tree, Release build; binary sha256
+`382096b1dc10da68c2bf0a97e1f0dd36db90531cdea1434760d8c1a70fea1310`. Run on its **CPU** backend
+(`-ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096`) — the same comparator configuration the
+frozen runnable bundle used, so the two gemma3 receipts share an oracle. Two-phase discipline
+held for every capture, comparison and probe: the two engines were never resident together.
+
+### 13b. Sub-512 receipts
+
+**Chat (`scripts/chat-parity-gemma3.mjs`, committed gate pack, depths 1/5/50): CLEAN.**
+Cross-engine prompt tokenization identical 5/5 (16/16/16/19/17 tokens); **15/15 generation legs
+token-AND-text identical**; `all_pass: true`, zero flips. Note the contrast, stated carefully:
+the frozen runnable bundle recorded one flip on this same pack (0.3416 nat); this bundle does
+not re-adjudicate it — different host, different lane, and the runnable lane was not re-run on
+the sub-512 pack here.
+
+**Raw decode (`scripts/raw-decode-parity.mjs`, harness default 4 prompts, depths 1/5/50):
+committed as-is with `all_pass: false`, 6/12 legs token-AND-text identical.** Two distinct
+findings are inside that number:
+
+1. A **harness re-encode artifact**, not an engine divergence. The harness scores camelid by
+   re-encoding its TEXT; on this 262k SPM vocab a run of spaces re-encodes as single-space
+   tokens (`236743`) where llama.cpp emitted merged whitespace tokens (`138`, `140`). Reading
+   camelid's ACTUAL ids (`camelid.generated_token_ids`, `camelid-raw-probe.json`) removes it:
+   `"Q: What is 2+2? A:"` is token-identical for all 43 generated tokens plus the `106` stop.
+   The harness was NOT changed to hide this.
+2. **Three real flips, all at depth 50**, each probed from both sides
+   (`near-tie-analysis.json`):
+
+| prompt | idx | ref | camelid | camelid top-2 gap | oracle top-2 gap (no-repack / repack) | oracle rank of camelid tok |
+|---|---|---|---|---|---|---|
+| `The capital of France is` | 44 | 9639 | 32219 | 0.0032 | 0.0431 / 0.0285 | **1** |
+| `Once upon a time,` | 37 | 4658 | 11207 | 0.0173 | 0.4471 / 0.1398 | 2 |
+| `def fibonacci(n):` | 5 | 2094 | 22304 | 0.0353 | 0.4402 / 0.4402 | **1** |
+
+Two of the three are **oracle-side flips** — the same pinned binary and flags emit camelid's
+token when the position is scored from a re-fed prefix and the reference token when it decodes
+continuously from the raw prompt (`probe-oracle-continuous.json`); on prompt 0 the prefix-fed
+oracle also flips back when only its repack kernel changes. The third (`Once upon a time,`) is
+the weakest attribution: the oracle is rank-1-stable across all four kernel/thread controls AND
+the continuous control, and camelid's token is oracle rank 2 at **0.4471 nat** — ABOVE the
+0.33-nat Ornith line and above the frozen bundle's 0.3416. Disclosed as such, with the two
+mitigating measurements stated rather than argued: camelid's own gap there is 0.0173 nat, and
+the oracle's own gap moves 0.31 nat (0.4471 → 0.1398) when only its repack kernel changes.
+
+Consequence for Phase 5, and it is a real one: **there is no token-exact depth-50 claim for raw
+`/v1/completions` on this row.** Depths 1 and 5 are clean on 4/4.
+
+### 13c. The >=512 windowed receipt — the deliverable this campaign exists for
+
+New pack `qa/prompt-packs/gemma3-windowed-context-pack-v1.json`: three plain-English prompts
+whose rendered gemma3 turns tokenize to **606 / 1205 / 2403 tokens** = 1.18x / 2.35x / 4.69x the
+file's own `gemma3.attention.sliding_window = 512`, each answerable only from its first sentence.
+
+**Resident lane vs the pinned oracle: 3/3 prompt tokenization identical, 9/9 generation legs
+token-AND-text identical, ZERO flips, `all_pass: true`.** §7d required this pack to be clean and
+it is — the envelope is not drawn on at all.
+
+**The runnable lane on the same prompt, same oracle capture, same depth** (resident off,
+`cpu_reference` / `safe_cpu_decode`): diverges at generated index 2 and never resynchronises —
+oracle and resident emit `[818,103708,563,...]` "The Willow is the name of the river that runs
+past the town."; the runnable lane emits `[818,103708,7940,236761]` "The Willow River.".
+Prompt tokenization was identical (606/606) on both lanes, so they saw the byte-same input.
+**And it is not a near-tie**: re-fed the identical prefix, the oracle ranks its own/resident
+token `563` at logprob -0.2125 and the runnable lane's `7940` second at **1.667 nats** behind
+(`probe-window-divergence.json`) — four times the largest disclosed near-tie in the bundle.
+Attribution is stated as attribution: the two lanes are token-identical BELOW the window (13e's
+two gates), and the one documented architectural difference is the window mask the runnable lane
+does not implement.
+
+Cost bound, recorded: the runnable lane prefills 606 tokens in ~10.8 min (~0.2 tok/s), so only
+the shortest windowed prompt was run on it, at the single deepest leg. 1205/2403 on that lane
+were not attempted.
+
+### 13d. Determinism
+
+Two fresh `camelid serve` processes, full stop/start between them, no env overrides, greedy.
+Each session records 6 chat legs (incl. the 2403-token windowed prompt) and 5 raw-completion
+legs carrying ACTUAL generated token ids (incl. a 2395-token windowed prompt).
+`det-run1.json` and `det-run2.json` are **byte-identical files**, sha256
+`632992c609941494905650a186ec255bf7d545950f4490aedc6a3c7158bf64d3`.
+
+### 13e. Gates
+
+- `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean;
+  `cargo test --all-targets` **exit 0** under pipefail (every suite green, 0 failed).
+- `scripts/check-public-scrub.sh` clean.
+- All four bundle validators pass with the new bundle present:
+  `check-public-scrub.sh`, `audit-evidence-bundle-privacy.mjs --strict` (0 findings),
+  `check-evidence-bundle-checksums.sh`, `check-public-evidence-claims.mjs`
+  (159 manifests, up from 158).
+- Env-keyed gemma3 gates re-run at this head, targeted, release, production GEMV gates armed
+  from the shell:
+  - `gemma3_real_row_resident_forward_matches_runnable_oracle` (release, f32y+wire+NSG8):
+    depth 1 argmax 108 = oracle, max |logit diff| 6.247e-5; depth 5 argmax 1077, 7.820e-5;
+    depth 50 argmax 578, 9.584e-5 — **50/50 greedy tokens identical, overall max |logit diff|
+    2.122e-4**, 565.79 s. **Bit-for-bit the §9b/§11h record.**
+  - `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle` (same gates plus
+    `CAMELID_METAL_RESIDENT_DECODE=1`): 108 / 584 / 568 / 2364 / 1077, overall max |logit diff|
+    **7.820e-5**, 5/5 identical, 22.05 s. **Bit-for-bit the §10b record.**
+
+### 13f. Script fixes carried in this phase (receipt-label only, no engine behaviour)
+
+`scripts/chat-parity-gemma3.mjs`: (1) `--row-id` now defaults to the real row id
+`gemma_3_1b_it_q8_0` — this closes the §12i one-liner; (2) new `--lane-label` so the emitted
+receipt names the lane it actually certified instead of hardcoding
+`gemma3_marker_chat_greedy_runnable_serve`; (3) `postJson` moved from the global `fetch` to
+`node:http` with a `--request-timeout-ms` flag, mirroring `scripts/raw-decode-parity.mjs` — the
+undici ~5-minute header timeout aborted the client mid-request while the CPU runnable lane was
+still legitimately prefilling a 606-token prompt, which is exactly the leg 13c needs.
+
+### 13g. What Phase 5 MAY and MAY NOT claim
+
+**MAY:**
+- The row runs on the Metal GPU-resident serve lane by default and is token-AND-text identical
+  to llama.cpp `acd79d603` on the committed chat gate pack at depths 1/5/50 (15/15), with 5/5
+  cross-engine prompt tokenization.
+- **Correct sliding-window behaviour above 512 tokens**, proven against the external oracle at
+  606 / 1205 / 2403 prompt tokens, depths 1/5/50, 9/9 legs, zero flips. `tested_context` may
+  move from "well under the 512-token sliding window" to a bounded chat claim of **2,403 prompt
+  + 50 generated tokens**.
+- Determinism: byte-identical decode across two fresh serve processes, including past the
+  window.
+- That the runnable CPU lane is measurably the wrong reference above the window (1.667-nat
+  disagreement with the oracle at the divergence position) — i.e. the `full_support_blockers`
+  sentence "context above the 512-token sliding window ... mathematically wrong by construction"
+  now applies to the RUNNABLE lane only, and is CLOSED for the resident lane up to 2,403 tokens.
+
+**MAY NOT:**
+- No perf or throughput claim, and no speed comparison with llama.cpp.
+- No token-exact claim for raw `/v1/completions` at depth 50 (three disclosed flips, one of them
+  a 0.4471-nat stable-oracle near-tie). The clean raw-decode claim stops at depth 5.
+- No context claim above 2,403 prompt tokens; the file's native 32,768 is UNMEASURED here, as is
+  everything between ~2.4k and 32k.
+- No claim for any other gemma3 row or quant (§7c scope pin holds).
+- No multi-turn, streaming, tool-calling, speculative-decode or prefix-cache claim.
+- The runnable-lane divergence leg is ONE prompt at ONE depth; it is a demonstration, not a
+  runnable-lane receipt, and it must not be cited as a general runnable-lane characterization.
+- The frozen runnable bundle's sub-512 0.3416-nat flip is NOT re-adjudicated by this bundle.
+
+### 13h. Still open after Phase 4
+
+- The raw-decode depth-50 near-ties are a live limit on the row's claimable surface; closing
+  them would need either a chat-shaped raw pack or an oracle-side reduction-order study, and
+  neither is scoped.
+- §12i's other open items are unchanged except the `--row-id` default, which is CLOSED here.
+- The runnable lane's cost makes a full windowed cross-lane matrix impractical; if a broader
+  divergence table is ever wanted it needs a faster CPU reference, not more patience.
