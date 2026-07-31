@@ -2793,11 +2793,22 @@ impl LlamaInferenceSession {
         // (`windowed_arch_resident_host_available`); this bail is the engine-
         // level backstop for any other caller.
         let windowed_arch = crate::model::arch_has_windowed_attention(&self.config);
-        if windowed_arch && resident_decode_cuda_enabled() {
+        // gemma3→CUDA Phase 2 REPLACED the blanket CUDA bail that used to live
+        // here. The CUDA resident engine now carries the windowed forward, but
+        // only for a session that actually got the schedule: `Gemma3Metadata` is
+        // what supplies the per-layer window + dual-theta cadence, the sandwich
+        // norms, the GeGLU flag and the embed scale.
+        //
+        // So the bail narrowed rather than disappeared — a windowed arch WITHOUT
+        // parsed gemma3 metadata (a future windowed arch, or a gemma3 file whose
+        // metadata failed to parse) would build a full-causal engine under a GPU
+        // label. That is the failure mode that produces fluent, plausible, wrong
+        // text rather than an error, so it stays refused.
+        if windowed_arch && resident_decode_cuda_enabled() && self.config.gemma3.is_none() {
             bail!(
-                "windowed-attention arch: only the Metal resident engine carries the \
-                 sliding-window/dual-theta forward; the CUDA resident engine would run it \
-                 full-causal, so it is not admitted"
+                "windowed-attention arch with no parsed gemma3 schedule: the CUDA resident \
+                 engine needs the per-layer window/dual-theta cadence to run it, and would \
+                 otherwise run it full-causal, so it is not admitted"
             );
         }
         // GPU-runnable tier: an uncurated model is admitted to the resident path only after
@@ -3064,6 +3075,30 @@ impl LlamaInferenceSession {
         {
             return Ok(false);
         }
+        // Windowed archs (gemma3) decline the batched resident prefill outright.
+        // Two independent reasons, either of which alone is disqualifying:
+        //
+        //  1. The batched prefill kernels carry no window parameter, so the
+        //     prompt would be evaluated full-causal.
+        //  2. More subtly, this path BUILDS AND CACHES the resident engine. It
+        //     has no gemma3 metadata to pass, so it would cache an engine with
+        //     no windowed schedule and the generic (non-NEOX) rope pairing — and
+        //     the decode path, finding a cached engine for the same key, would
+        //     reuse it rather than rebuild. The wrong engine would then serve
+        //     every subsequent token. Declining here keeps the engine's first
+        //     construction on the decode path, which does have the metadata.
+        //
+        // `session_prefill_chunk_tokens` already forces token-by-token prefill
+        // for windowed archs, so this costs nothing that was otherwise available.
+        if crate::model::arch_has_windowed_attention(&self.config) {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!(
+                    "[resident-cuda] windowed arch: declining batched resident prefill (no window \
+                     in the batched kernels, and this path would cache a non-windowed engine)"
+                );
+            }
+            return Ok(false);
+        }
         let weights = Arc::clone(&self.weights);
         let dims = DenseLlamaDims::from_config(&self.config)?;
         let n_layers = dims.block_count;
@@ -3141,6 +3176,7 @@ impl LlamaInferenceSession {
                 rms_eps,
                 tables.split_half_pairing,
                 self.is_drafter,
+                self.config.gemma3.as_ref(),
             ) {
                 Some(engine) => {
                     // Prefill is whole-model only (`layer_range.is_some()` bails above), so
@@ -3771,9 +3807,16 @@ impl LlamaInferenceSession {
         // The CUDA engine runs the whole forward on the GPU and produces logits;
         // it serves both greedy decode (GPU argmax -> sampled token) and sampling
         // (returns the full logits row for the CPU temperature/top-p/top-k
-        // sampler). Only the hidden-state-threading variant (compute_logits =
-        // false) stays on the CPU path.
-        if !compute_logits {
+        // sampler).
+        //
+        // The hidden-state-threading variant (compute_logits = false) stays on
+        // the CPU path for every architecture EXCEPT a windowed one. gemma3 has
+        // no CPU path to stay on: its prefill is token-by-token through this
+        // forward (the batched kernels have no window), and every CPU dense layer
+        // walk is fail-closed by H4. Sending it back would land on that typed
+        // refusal and the row would not generate at all — which is exactly what
+        // happened the first time this lane was wired up.
+        if !compute_logits && self.config.gemma3.is_none() {
             return Ok(None);
         }
         let weights = Arc::clone(&self.weights);
@@ -3812,7 +3855,7 @@ impl LlamaInferenceSession {
             return Ok(None);
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
-        let tables = match rope::resident_decode_rope_tables(
+        let mut tables = match rope::resident_decode_rope_tables(
             position,
             head_dim,
             &self.config,
@@ -3832,6 +3875,29 @@ impl LlamaInferenceSession {
             .rope_dimension_count
             .map(|v| v as usize)
             .unwrap_or(head_dim);
+        // gemma3 dual-theta RoPE, mirroring the Metal lane verbatim
+        // (`inference::metal_resident`, gemma3→Metal Phase 2d) so the two GPU
+        // lanes rope identically:
+        //
+        //  - REPLACE the generic primary table with `gemma3_rope_tables` at the
+        //    GLOBAL theta. Not a refinement: the generic builder uses
+        //    `rope_pair_frequency`'s negated-exponent form, whose last-ULP drift
+        //    against the runnable oracle can flip a near-tie greedy token. Both
+        //    thetas must come from the verbatim form, not just the local one.
+        //  - FORCE split-half (NEOX) pairing from the parsed metadata. gemma3's
+        //    Q/K weights are not permuted for adjacent even/odd RoPE, and
+        //    `LlamaModelConfig::rope_neox_pairing` deliberately stays false for
+        //    gemma3 (Phase 1b design note), so the flag has to come from
+        //    `Gemma3Metadata` — otherwise the rotation pairs the wrong lanes.
+        //
+        // The ALT (local-theta) tables are built per token further down, once the
+        // engine exists to upload them into.
+        if let Some(g) = self.config.gemma3.as_ref() {
+            let (cos, sin) = rope::gemma3_rope_tables(position, rope_dim, g.rope_freq_base_global);
+            tables.cos = cos;
+            tables.sin = sin;
+            tables.split_half_pairing = g.rope_neox_pairing || tables.split_half_pairing;
+        }
 
         let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
         // The resident engine (compiled kernels + uploaded weights + GPU KV cache)
@@ -3854,9 +3920,29 @@ impl LlamaInferenceSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let need_build = guard
+        // A cached engine must AGREE with this session about being windowed.
+        // The cache is process-global and keyed on weight identity alone, so
+        // without this a windowed session could inherit an engine some other
+        // path built without the gemma3 schedule (full-causal attention, single
+        // theta, generic rope pairing, no sandwich norms) and decode fluent,
+        // plausible, wrong text under a GPU label. Cheap invariant, checked on
+        // every token, and a mismatch forces a rebuild rather than a fallback so
+        // the correct lane still serves.
+        let windowed_session = self.config.gemma3.is_some();
+        let windowed_mismatch = guard
             .as_ref()
-            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+            .is_some_and(|slot| slot.engine.is_windowed() != windowed_session);
+        if trace && windowed_mismatch {
+            eprintln!(
+                "[resident-cuda] cached engine windowed={} but session windowed={windowed_session}; \
+                 rebuilding",
+                !windowed_session
+            );
+        }
+        let need_build = windowed_mismatch
+            || guard
+                .as_ref()
+                .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
         if trace && need_build {
             match guard.as_ref() {
                 None => eprintln!("[resident-cuda] need_build: cache EMPTY (key={key:#x})"),
@@ -3893,6 +3979,7 @@ impl LlamaInferenceSession {
                 rms_eps,
                 tables.split_half_pairing,
                 self.is_drafter,
+                self.config.gemma3.as_ref(),
             ) {
                 Some(engine) => {
                     *guard = Some(ResidentCudaSlot {
@@ -3996,13 +4083,66 @@ impl LlamaInferenceSession {
             }
         }
 
+        // gemma3 per-token windowed inputs, both of which must be in place BEFORE
+        // the forward runs:
+        //
+        //  1. The ALT (local-θ) RoPE tables. `tables` above carries the primary
+        //     (global-θ) pair; sliding layers read these instead. Built with the
+        //     VERBATIM runnable-lane frequency form via `rope::gemma3_rope_tables`
+        //     — the same builder the Metal lane uses — because the negated-exponent
+        //     form's last-ULP drift can flip a near-tie greedy token.
+        //
+        //  2. The sqrt(d_model) embedding scale. gemma3 scales token embeddings
+        //     before layer 0; the generic dense gather does not, so the scale is
+        //     applied to a local copy here rather than mutating shared weights.
+        let gemma3_embedding: Option<Vec<f32>> = match self.config.gemma3.as_ref() {
+            Some(g) => {
+                let (cos_alt, sin_alt) =
+                    rope::gemma3_rope_tables(position, rope_dim, g.rope_freq_base_local);
+                if let Err(e) = slot.engine.upload_alt_rope(&cos_alt, &sin_alt) {
+                    if trace {
+                        eprintln!("[resident-cuda] gemma3 alt rope upload failed: {e}");
+                    }
+                    return Ok(None);
+                }
+                Some(embedding.data.iter().map(|v| v * g.embed_scale).collect())
+            }
+            None => None,
+        };
+        let embedding_data: &[f32] = match gemma3_embedding.as_deref() {
+            Some(scaled) => scaled,
+            None => &embedding.data,
+        };
+
         // Three GPU tails, all keeping the whole layer stack on the device:
         // `sample` (temperature sampling) draws the token on the GPU via Gumbel-max;
         // `gpu_sample_token` set means greedy (GPU argmax); otherwise the full logits
         // row goes back for the CPU sampler (top-k / top-p / penalties).
-        let forward = if let Some((inv_temp, seed)) = sample {
+        let forward = if !compute_logits {
+            // Windowed (gemma3) prefill step: thread the hidden state back rather
+            // than projecting logits. Guarded above — no other arch reaches here.
+            match slot.engine.forward_token_hidden(
+                embedding_data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+            ) {
+                Ok(h) => ResidentForward::Hidden(CpuTensor::from_f32(
+                    "resident_hidden",
+                    vec![1, hidden],
+                    h,
+                )?),
+                Err(e) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token_hidden err at {position}: {e}");
+                    }
+                    return Ok(None);
+                }
+            }
+        } else if let Some((inv_temp, seed)) = sample {
             match slot.engine.forward_token_sample(
-                &embedding.data,
+                embedding_data,
                 &tables.cos,
                 &tables.sin,
                 position,
@@ -4020,7 +4160,7 @@ impl LlamaInferenceSession {
             }
         } else if gpu_sample_token.is_some() {
             match slot.engine.forward_token(
-                &embedding.data,
+                embedding_data,
                 &tables.cos,
                 &tables.sin,
                 position,
@@ -4043,7 +4183,7 @@ impl LlamaInferenceSession {
             }
         } else {
             match slot.engine.forward_token_logits(
-                &embedding.data,
+                embedding_data,
                 &tables.cos,
                 &tables.sin,
                 position,
@@ -7126,8 +7266,9 @@ fn ensure_windowed_arch_off_cpu_dense_layer(config: &LlamaModelConfig, lane: &st
             "architecture {:?} has per-layer sliding-window attention, which the CPU dense \
              {lane} cannot express (it would run full-causal with no GeGLU/dual-theta \
              RoPE/sandwich norms and decode wrong tokens), so it fails closed. This arch is \
-             served by the Metal resident lane (macOS, CAMELID_METAL_RESIDENT_DECODE=1, \
-             Q8_0 row) or by the runnable bridge via `camelid serve`.",
+             served by a GPU-resident lane — Metal on macOS (CAMELID_METAL_RESIDENT_DECODE=1) \
+             or CUDA on an NVIDIA host — for the Q8_0 row, and by the runnable bridge via \
+             `camelid serve` where neither is available.",
             config.architecture
         )));
     }
@@ -12421,15 +12562,30 @@ pub(crate) fn windowed_arch_resident_host_available() -> bool {
     #[cfg(target_os = "macos")]
     {
         static METAL_DEVICE_PRESENT: OnceLock<bool> = OnceLock::new();
-        resident_decode_metal_enabled()
+        if resident_decode_metal_enabled()
             && !resident_decode_cuda_enabled()
             && crate::execution_plan::macos_q8_metal_plan_selectable()
             && *METAL_DEVICE_PRESENT.get_or_init(|| crate::metal::detect_metal_device().available)
+        {
+            return true;
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    // CUDA host (gemma3→CUDA Phase 2). Symmetric to the Metal arm above and
+    // subject to the same D20 discipline: routing consults the same operator
+    // INPUTS the plan does (`windowed_arch_cuda_resident_plan_selectable`), so
+    // the disclosed lane and the served lane cannot disagree.
+    //
+    // `resident_decode_cuda_enabled()` already requires a usable device and is
+    // forced off by deterministic mode, so no separate device probe is needed —
+    // it bottoms out in `cuda::gpu_accel_enabled()`.
+    //
+    // This is what makes gemma3 a GPU row on Windows. It is NOT sufficient on its
+    // own: admission is still pinned to Q8_0 by
+    // `windowed_arch_resident_quant_admissible` (H5), the engine still refuses a
+    // layer whose sandwich norms are unbound, and the CPU dense choke points are
+    // untouched.
+    resident_decode_cuda_enabled()
+        && crate::execution_plan::windowed_arch_cuda_resident_plan_selectable()
 }
 
 /// TEST-ONLY seam for the arch-keyed resident disqualifier in
@@ -12870,6 +13026,13 @@ fn build_resident_cuda_engine(
     rms_eps: f32,
     split_half_pairing: bool,
     is_drafter: bool,
+    // gemma3 (windowed-attention arch) metadata, or `None` for every other
+    // architecture. `Some` makes the engine build a windowed session: the
+    // per-layer dual-theta + sliding-window schedule over `range`, plus each
+    // layer's sandwich post-norms. Threaded in rather than read from a global so
+    // the schedule is keyed to the SAME parsed metadata the CPU oracle and the
+    // Metal lane use.
+    gemma3: Option<&crate::model::Gemma3Metadata>,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     use crate::cuda_resident::ProjQuant;
     // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks, or the
@@ -13197,7 +13360,7 @@ fn build_resident_cuda_engine(
         split_half_pairing,
     )
     .ok()?;
-    for (idx, l) in weights.layers[range].iter().enumerate() {
+    for (idx, l) in weights.layers[range.clone()].iter().enumerate() {
         let (q, k, v, o, gate, up, down) = match (
             raw(&l.attention_q),
             raw(&l.attention_k),
@@ -13241,6 +13404,48 @@ fn build_resident_cuda_engine(
                 quants,
             )
             .ok()?;
+        // gemma3 sandwich post-norms, uploaded per OWNED layer in the same order
+        // `set_layer_located` pushed them. Both must be bound: the forward
+        // refuses a windowed layer that is missing either, so a file that
+        // reached here without them declines the resident lane rather than
+        // decoding a norm-dropped forward.
+        if gemma3.is_some() {
+            let (post_attn, post_ffn) =
+                match (l.post_attention_norm.as_ref(), l.post_ffw_norm.as_ref()) {
+                    (Some(a), Some(f)) => (a, f),
+                    _ => {
+                        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                            eprintln!(
+                            "[resident-cuda] gemma3 layer {idx}: sandwich post-norms not bound; \
+                                 declining the resident lane"
+                        );
+                        }
+                        return None;
+                    }
+                };
+            engine
+                .set_layer_gemma3_norms(idx, &post_attn.data, &post_ffn.data)
+                .ok()?;
+        }
+    }
+    // gemma3 per-layer schedule over the OWNED layer range (absolute layer ids —
+    // a pipeline-sharded node holds a subrange). Deliberately the same shape as
+    // `LlamaInferenceSession::gemma3_resident_schedule`, which drives the Metal
+    // lane, so the two GPU lanes cannot disagree about which layers slide.
+    if let Some(g) = gemma3 {
+        let use_alt_rope: Vec<bool> = range.clone().map(|l| g.is_sliding_layer(l)).collect();
+        // Window INCLUDES the current position; `Gemma3Metadata::layer_window`
+        // already uses that convention, so this is a straight copy.
+        let window: Vec<Option<usize>> = range
+            .clone()
+            .map(|l| g.layer_window(l).map(|w| w as usize))
+            .collect();
+        if let Err(e) = engine.set_gemma3(use_alt_rope, window, g.ffn_geglu) {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[resident-cuda] gemma3 schedule refused: {e}");
+            }
+            return None;
+        }
     }
     // Honest run labeling (Phase 4): record the offload split and print a one-line
     // load banner so a capacity-mode (offloaded) run never reads like a native one.

@@ -5364,6 +5364,65 @@ pub(crate) fn launch_attention(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+/// Sliding-window decode attention (`attention_decode_sw`). Identical launch
+/// geometry to [`launch_attention`] — same block/G sizing, same shared-memory
+/// budget — plus a trailing `window` scalar. The kernel computes
+/// `start = position_count - window` on the device from `position_ptr`, so the
+/// launch config does not vary with position and the shared `scores[]` must
+/// still cover the absolute index range `[start, position_count)`; sizing is
+/// therefore unchanged from the full-causal launcher.
+///
+/// `window` is the gemma3 convention: it INCLUDES the current position, so a
+/// layer at `pos` attends `[pos + 1 - window ..= pos]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_attention_sw(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    q: &CudaSlice<f32>,
+    cache_k: &CudaSlice<u16>,
+    cache_v: &CudaSlice<u16>,
+    out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position: &CudaSlice<i32>,
+    shared_positions: usize,
+    max_pos: usize,
+    scale: f32,
+    window: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let max_groups = (1024 / head_dim as u32).max(1);
+    let groups = (shared_positions.max(1) as u32)
+        .div_ceil(head_dim as u32)
+        .clamp(1, max_groups);
+    let block = groups * head_dim as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: ((head_dim as u32 * (1 + groups)) + shared_positions as u32) * 4,
+    };
+    let (nh, nkv, hd, mp, win) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+        window as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(q)
+        .arg(cache_k)
+        .arg(cache_v)
+        .arg(out)
+        .arg(&nh)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(position)
+        .arg(&mp)
+        .arg(&scale)
+        .arg(&win);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 pub(crate) fn launch_silu_mul(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
@@ -5744,6 +5803,14 @@ struct ResidentLayer {
     ffn_norm: CudaSlice<f32>,
     q_norm: Option<CudaSlice<f32>>,
     k_norm: Option<CudaSlice<f32>>,
+    /// gemma3 "sandwich" post-norms: `post_attention_norm` is applied to the O
+    /// projection's output and `post_ffn_norm` to the down projection's output,
+    /// each BEFORE its residual add. `None` for every other architecture, which
+    /// keeps those layers on the fused gemv+residual path byte-identically.
+    /// Uploaded by [`CudaResidentDecode::set_layer_gemma3_norms`], never by
+    /// `set_layer_located` — so no existing call site changes shape.
+    post_attn_norm: Option<CudaSlice<f32>>,
+    post_ffn_norm: Option<CudaSlice<f32>>,
     offloaded: Option<OffloadedLayer>,
     /// Per-projection quant lane (q,k,v,o,gate,up,down), so the forward picks the
     /// right GEMV kernel + activation quantizer per tensor. All `Q8_0` for a plain
@@ -5812,6 +5879,33 @@ struct Qwen35Gpu {
     d_gate_attn: CudaSlice<f32>, // q_width (deinterleaved attention gate)
 }
 
+/// gemma3 (windowed-attention arch) per-layer resident state. `None` on
+/// [`CudaResidentDecode`] for every other architecture, so no extra VRAM and no
+/// path change for anything else.
+///
+/// Mirrors `metal::ResidentLayerSchedule` deliberately: the Metal lane
+/// (PR #560) and this one must express the same per-layer schedule, or the two
+/// GPU lanes could disagree about which layers slide. Both vectors are indexed
+/// by OWNED layer (a pipeline-sharded node holds a subrange), matching
+/// `LlamaInferenceSession::gemma3_resident_schedule`.
+#[cfg(feature = "cuda")]
+struct Gemma3Gpu {
+    /// Per owned layer: `true` selects the ALT (local-theta) rope tables.
+    use_alt_rope: Vec<bool>,
+    /// Per owned layer: `Some(w)` attends only the last `w` keys INCLUDING the
+    /// current position (`[pos + 1 - w ..= pos]`), matching
+    /// `Gemma3Metadata::layer_window` and the runnable reference. `None` is a
+    /// full-causal (global) layer.
+    window: Vec<Option<usize>>,
+    /// ALT (local-theta) rope tables for THIS token, uploaded by
+    /// [`CudaResidentDecode::upload_alt_rope`] before each forward. The primary
+    /// (global-theta) tables stay in `d_cos`/`d_sin`.
+    d_cos_alt: CudaSlice<f32>,
+    d_sin_alt: CudaSlice<f32>,
+    /// gemma3's FFN activation is GeGLU (`gelu_tanh(gate) * up`), not SiLU.
+    ffn_geglu: bool,
+}
+
 /// A captured CUDA graph, wrapped to be `Send`. cudarc does not mark `CudaGraph`
 /// Send because graphs are not internally synchronized; the resident engine is only
 /// ever accessed under the process-global resident-cache `Mutex`, which serializes
@@ -5873,6 +5967,13 @@ pub struct CudaResidentDecode {
     d_flash_lsum: CudaSlice<f32>,   // MAX_VERIFY_K * n_heads * SPLITK_MAX
     d_flash_acc: CudaSlice<f32>,    // MAX_VERIFY_K * n_heads * SPLITK_MAX * head_dim
     d_proj: CudaSlice<f32>,
+    /// Holds a projection's output AFTER a gemma3 sandwich post-norm and before
+    /// its residual add. A top-level field rather than one inside `Gemma3Gpu` so
+    /// the layer loop can hold `&self.layers[li].post_*_norm` and `&mut` this
+    /// buffer in one statement without a nested borrow through `self.gemma3`.
+    /// Allocated unconditionally: `hidden` f32s is a few KiB, and an
+    /// always-present buffer costs less than an `Option` on the hot path.
+    d_post: CudaSlice<f32>,
     d_gate: CudaSlice<f32>,
     d_up: CudaSlice<f32>,
     d_ffn_act: CudaSlice<f32>,
@@ -5935,6 +6036,9 @@ pub struct CudaResidentDecode {
     /// 1-element placeholder for Full layers. Empty for non-qwen35. Persists across
     /// tokens — zeroed by `reset_qwen35_state`.
     ssm_state: Vec<CudaSlice<f32>>,
+    /// gemma3 windowed-arch schedule + ALT rope tables + post-norm scratch.
+    /// `None` for every other architecture. Set by [`Self::set_gemma3`].
+    gemma3: Option<Gemma3Gpu>,
 }
 
 /// Max tokens verified per speculative round. The batched GEMM keeps the ordered
@@ -6154,6 +6258,7 @@ impl CudaResidentDecode {
                 1
             })?,
             d_proj: alloc_f(hidden)?,
+            d_post: alloc_f(hidden)?,
             d_gate: alloc_f(ffn_dim)?,
             d_up: alloc_f(ffn_dim)?,
             d_ffn_act: alloc_f(ffn_dim)?,
@@ -6176,6 +6281,7 @@ impl CudaResidentDecode {
             tree_scratch: None,
             offload: None,
             qwen35: None,
+            gemma3: None,
             ssm_conv_state: Vec::new(),
             ssm_state: Vec::new(),
             embd_table: None,
@@ -6267,6 +6373,8 @@ impl CudaResidentDecode {
                 ffn_norm,
                 q_norm: q_norm_gpu,
                 k_norm: k_norm_gpu,
+                post_attn_norm: None,
+                post_ffn_norm: None,
                 offloaded: None,
                 quants,
                 kind: LayerKind::Full,
@@ -6315,6 +6423,8 @@ impl CudaResidentDecode {
             ffn_norm,
             q_norm: q_norm_gpu,
             k_norm: k_norm_gpu,
+            post_attn_norm: None,
+            post_ffn_norm: None,
             offloaded: Some(OffloadedLayer { host: pinned, off }),
             quants,
             kind: LayerKind::Full,
@@ -6482,6 +6592,94 @@ impl CudaResidentDecode {
         Ok(())
     }
 
+    /// Install the gemma3 (windowed-attention arch) per-layer schedule. Call
+    /// AFTER every `set_layer_located`, and pair it with
+    /// [`Self::set_layer_gemma3_norms`] for each layer plus a per-token
+    /// [`Self::upload_alt_rope`].
+    ///
+    /// `use_alt_rope` and `window` are indexed by OWNED layer and must both be
+    /// exactly `self.layers.len()` long — a short or long schedule would
+    /// silently mis-key which layers slide, which is the one failure mode that
+    /// produces fluent, plausible, wrong text rather than an error, so it is a
+    /// typed refusal rather than a clamp.
+    pub fn set_gemma3(
+        &mut self,
+        use_alt_rope: Vec<bool>,
+        window: Vec<Option<usize>>,
+        ffn_geglu: bool,
+    ) -> Result<(), String> {
+        let n = self.layers.len();
+        if use_alt_rope.len() != n || window.len() != n {
+            return Err(format!(
+                "gemma3 schedule length mismatch: {} layers resident but use_alt_rope={} window={}; \
+                 refusing rather than running an unkeyed windowed forward",
+                n,
+                use_alt_rope.len(),
+                window.len()
+            ));
+        }
+        let s = self.k.stream.clone();
+        let half = self.rope_dim / 2;
+        let af = |n: usize| -> Result<CudaSlice<f32>, String> {
+            s.alloc_zeros::<f32>(n).map_err(|e| format!("alloc: {e}"))
+        };
+        self.gemma3 = Some(Gemma3Gpu {
+            use_alt_rope,
+            window,
+            d_cos_alt: af(half.max(1))?,
+            d_sin_alt: af(half.max(1))?,
+            ffn_geglu,
+        });
+        Ok(())
+    }
+
+    /// Upload one gemma3 layer's sandwich post-norms. `layer` indexes the OWNED
+    /// range, matching the order `set_layer_located` pushed them in.
+    pub fn set_layer_gemma3_norms(
+        &mut self,
+        layer: usize,
+        post_attn_norm: &[f32],
+        post_ffn_norm: &[f32],
+    ) -> Result<(), String> {
+        let s = self.k.stream.clone();
+        let l = self.layers.get_mut(layer).ok_or_else(|| {
+            format!("gemma3 post-norms for layer {layer}: no such resident layer")
+        })?;
+        l.post_attn_norm = Some(
+            s.clone_htod(post_attn_norm)
+                .map_err(|e| format!("htod: {e}"))?,
+        );
+        l.post_ffn_norm = Some(
+            s.clone_htod(post_ffn_norm)
+                .map_err(|e| format!("htod: {e}"))?,
+        );
+        Ok(())
+    }
+
+    /// Upload this token's ALT (local-theta) rope tables for a gemma3 session.
+    /// The primary (global-theta) pair still rides `forward_token`'s `cos`/`sin`
+    /// arguments; sliding layers read these instead. No-op when the engine
+    /// carries no gemma3 schedule.
+    pub fn upload_alt_rope(&mut self, cos_alt: &[f32], sin_alt: &[f32]) -> Result<(), String> {
+        let s = self.k.stream.clone();
+        let Some(g) = self.gemma3.as_mut() else {
+            return Ok(());
+        };
+        s.memcpy_htod(cos_alt, &mut g.d_cos_alt)
+            .map_err(|e| format!("htod alt cos: {e}"))?;
+        s.memcpy_htod(sin_alt, &mut g.d_sin_alt)
+            .map_err(|e| format!("htod alt sin: {e}"))?;
+        Ok(())
+    }
+
+    /// True when this engine is running a windowed (gemma3) schedule. Consulted
+    /// by the paths that have NO window support — batched prefill, batched and
+    /// tree speculative verify, and CUDA graph capture — so they decline rather
+    /// than silently evaluating a windowed model full-causal.
+    pub fn is_windowed(&self) -> bool {
+        self.gemma3.is_some()
+    }
+
     /// Keep the per-layer `ssm_conv_state`/`ssm_state` Vecs length-synced with `layers`
     /// for a Full (non-SSM) qwen35 layer: a never-read 1-element placeholder.
     pub fn push_ssm_placeholders(&mut self) -> Result<(), String> {
@@ -6617,6 +6815,9 @@ impl CudaResidentDecode {
             ffn_norm: ffn_norm_g,
             q_norm: None,
             k_norm: None,
+            // qwen35 SSM layers are never windowed; gemma3 has no SSM layers.
+            post_attn_norm: None,
+            post_ffn_norm: None,
             offloaded: None,
             quants,
             kind: LayerKind::Ssm(Box::new(ssm)),
@@ -6633,7 +6834,16 @@ impl CudaResidentDecode {
     }
 
     fn supports_batched_layer_stack(&self) -> bool {
-        !self.is_offloaded()
+        // A windowed (gemma3) schedule is declined here, which is the single
+        // choke point for batched prefill AND batched speculative verify: the
+        // batched/flash kernels (`attention_batched`, `attn_sk_*`,
+        // `launch_attention_flash_prefill`) carry NO window parameter, so they
+        // would evaluate a sliding layer full-causal — fluent, plausible, wrong.
+        // The windowed lane instead prefills token-by-token through the
+        // per-token forward, which is already what `session_prefill_chunk_tokens`
+        // forces arch-wide for windowed archs.
+        !self.is_windowed()
+            && !self.is_offloaded()
             && self.layers.iter().all(|layer| {
                 matches!(&layer.kind, LayerKind::Full)
                     && layer.quants.iter().all(|q| q.supports_batched())
@@ -6718,7 +6928,10 @@ impl CudaResidentDecode {
 
     /// Tree verification still uses the legacy Q8-only layer stack.
     pub fn supports_tree_verify(&self) -> bool {
-        !self.is_offloaded()
+        // Windowed (gemma3) declined for the same reason as the linear batched
+        // stack: `attention_tree_batched` has no window parameter.
+        !self.is_windowed()
+            && !self.is_offloaded()
             && self.output_quant == ProjQuant::Q8_0
             && self.layers.iter().all(|layer| {
                 matches!(&layer.kind, LayerKind::Full)
@@ -7268,14 +7481,32 @@ impl CudaResidentDecode {
                         )
                         .map_err(map)?;
                     }
-                    // RoPE on Q and K
+                    // gemma3 per-layer schedule, read once as plain Copy values so
+                    // no borrow of `self.gemma3` is held across the launches below.
+                    // `None`/`false` for every other architecture.
+                    let gemma3_window: Option<usize> =
+                        self.gemma3.as_ref().and_then(|g| g.window[li]);
+                    let gemma3_alt_rope: bool =
+                        self.gemma3.as_ref().is_some_and(|g| g.use_alt_rope[li]);
+                    // RoPE on Q and K.
+                    //
+                    // gemma3 dual-theta: a SLIDING layer ropes from the local-θ
+                    // (ALT) tables, a GLOBAL layer from the primary. Every other
+                    // arch has one table set and always takes the primary, so
+                    // this selection is a no-op for them (byte-identical).
                     let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
+                    let (rope_cos, rope_sin) = if gemma3_alt_rope {
+                        let g = self.gemma3.as_ref().expect("alt rope implies gemma3 state");
+                        (&g.d_cos_alt, &g.d_sin_alt)
+                    } else {
+                        (&self.d_cos, &self.d_sin)
+                    };
                     launch_rope(
                         &s,
                         &self.k.rope,
                         &mut self.d_q,
-                        &self.d_cos,
-                        &self.d_sin,
+                        rope_cos,
+                        rope_sin,
                         self.n_heads,
                         self.head_dim,
                         self.rope_dim,
@@ -7286,8 +7517,8 @@ impl CudaResidentDecode {
                         s_k,
                         &self.k.rope,
                         &mut self.d_k,
-                        &self.d_cos,
-                        &self.d_sin,
+                        rope_cos,
+                        rope_sin,
                         self.n_kv_heads,
                         self.head_dim,
                         self.rope_dim,
@@ -7334,7 +7565,35 @@ impl CudaResidentDecode {
                     // the one-block-per-head launch leaves idle; below SPLITK_THRESHOLD the single
                     // kernel is cheaper (one launch, no scratch). Both are token-parity to the same
                     // reference. Split-K is skipped during graph capture (split count is ctx-dependent).
-                    if !graph_capture && attn_shared > SPLITK_THRESHOLD {
+                    //
+                    // gemma3 SLIDING layers take `attention_decode_sw` instead,
+                    // which masks to the last `window` keys. They never take
+                    // split-K, and that costs nothing: the split-K kernels carry
+                    // no window parameter at all, and a sliding layer can never
+                    // reach the threshold anyway — the 1B row's window is 512 and
+                    // SPLITK_THRESHOLD is also 512, so a sliding layer's attended
+                    // key count is bounded at exactly the point split-K would
+                    // start to pay. GLOBAL gemma3 layers fall through to the
+                    // unchanged logic below.
+                    if let Some(window) = gemma3_window {
+                        launch_attention_sw(
+                            &s,
+                            &self.k.attention_sw,
+                            &self.d_q,
+                            &self.cache_k[li],
+                            &self.cache_v[li],
+                            &mut self.d_attn,
+                            self.n_heads,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            &self.d_position,
+                            attn_shared,
+                            self.max_pos,
+                            scale,
+                            window,
+                        )
+                        .map_err(map)?;
+                    } else if !graph_capture && attn_shared > SPLITK_THRESHOLD {
                         launch_attention_splitk(
                             &s,
                             &self.k,
@@ -7386,7 +7645,77 @@ impl CudaResidentDecode {
                     }
                     // O projection + residual. Input is the attention output (q_width wide):
                     // quantize it to the format the O lane reads, then project + add residual.
-                    if lq[3] == ProjQuant::Q8_0 {
+                    //
+                    // gemma3 sandwich: the post-attention norm sits BETWEEN the O
+                    // projection and the residual add —
+                    //   h = h + post_attention_norm(o_proj(attn))
+                    // — so the fused gemv+residual kernel (`output[row] += acc`)
+                    // cannot be used on these layers. Take the unfused shape and
+                    // insert the norm. Everything else keeps the fusion.
+                    if self.gemma3.is_some() {
+                        // Keyed on the SESSION being windowed, not on the norm
+                        // being present: a gemma3 layer that reached here without
+                        // its post-attention norm bound would otherwise silently
+                        // fall through to the Llama path and drop the norm — the
+                        // exact failure gemma2 is fail-closed for. Demand it.
+                        let post_attn =
+                            self.layers[li].post_attn_norm.as_ref().ok_or_else(|| {
+                                format!(
+                                    "gemma3 layer {li}: post_attention_norm is not bound on the \
+                                 resident layer; refusing rather than running the Llama-shaped \
+                                 forward, which would silently drop the sandwich norm"
+                                )
+                            })?;
+                        // H5 keeps windowed-arch resident admission pinned to Q8_0,
+                        // so a non-Q8_0 gemma3 layer must never reach here. Fail
+                        // loudly: the alternative is a silently wrong forward.
+                        if lq[3] != ProjQuant::Q8_0 {
+                            return Err(format!(
+                                "gemma3 layer {li}: O projection is {:?}, but the windowed resident \
+                                 lane is pinned to Q8_0; refusing rather than running an \
+                                 unvalidated quant through the sandwich-norm path",
+                                lq[3]
+                            ));
+                        }
+                        launch_quantize(
+                            &s,
+                            &self.k.quantize,
+                            &self.d_attn,
+                            &mut self.d_in_quants,
+                            &mut self.d_in_scales,
+                            qb,
+                        )
+                        .map_err(map)?;
+                        launch_gemv(
+                            &s,
+                            &self.k.gemv,
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &wo,
+                            self.hidden,
+                            qb,
+                            &mut self.d_proj,
+                        )
+                        .map_err(map)?;
+                        launch_rmsnorm(
+                            &s,
+                            &self.k.rms_norm,
+                            &self.d_proj,
+                            post_attn,
+                            &mut self.d_post,
+                            self.hidden,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                        launch_residual(
+                            &s,
+                            &self.k.residual_add,
+                            &mut self.d_hidden,
+                            &self.d_post,
+                            self.hidden,
+                        )
+                        .map_err(map)?;
+                    } else if lq[3] == ProjQuant::Q8_0 {
                         launch_quantize(
                             &s,
                             &self.k.quantize,
@@ -7746,8 +8075,88 @@ impl CudaResidentDecode {
                 o.ev_up.record(s_up).map_err(map)?;
                 s.wait(&o.ev_up).map_err(map)?;
             }
-            // SiLU(gate)*up -> down's activation, in down's format.
-            if lq[6] == ProjQuant::Q8_0 {
+            // gemma3 FFN: GeGLU instead of SiLU, and the post-FFN sandwich norm
+            // between the down projection and the residual —
+            //   h = h + post_ffw_norm(down_proj(gelu_tanh(gate) * up))
+            // — so this branch is the unfused shape for the same reason the O
+            // projection above is. `geglu_mul` has the identical
+            // `(gate, up, out, n)` signature and elementwise launch geometry as
+            // `silu_mul`, so it reuses `launch_silu_mul`'s launcher; only the
+            // CUfunction differs.
+            if let Some(ffn_geglu) = self.gemma3.as_ref().map(|g| g.ffn_geglu) {
+                // Two separate model properties, read from two separate places:
+                // the ACTIVATION comes from parsed metadata (`Gemma3Metadata
+                // .ffn_geglu`), the NORM from the bound weights. Keying one off
+                // the other would mean a future windowed arch with SiLU silently
+                // got GeGLU, so they stay independent and both are demanded.
+                let post_ffn = self.layers[li].post_ffn_norm.as_ref().ok_or_else(|| {
+                    format!(
+                        "gemma3 layer {li}: post_ffn_norm is not bound on the resident layer; \
+                         refusing rather than running the Llama-shaped forward, which would \
+                         silently drop the sandwich norm"
+                    )
+                })?;
+                let act_fn = if ffn_geglu {
+                    &self.k.geglu_mul
+                } else {
+                    &self.k.silu_mul
+                };
+                if lq[6] != ProjQuant::Q8_0 {
+                    return Err(format!(
+                        "gemma3 layer {li}: down projection is {:?}, but the windowed resident \
+                         lane is pinned to Q8_0; refusing rather than running an unvalidated \
+                         quant through the sandwich-norm path",
+                        lq[6]
+                    ));
+                }
+                launch_silu_mul(
+                    &s,
+                    act_fn,
+                    &self.d_gate,
+                    &self.d_up,
+                    &mut self.d_ffn_act,
+                    self.ffn_dim,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_ffn_act,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    fb,
+                )
+                .map_err(map)?;
+                launch_gemv(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wdown,
+                    self.hidden,
+                    fb,
+                    &mut self.d_proj,
+                )
+                .map_err(map)?;
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_proj,
+                    post_ffn,
+                    &mut self.d_post,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+                launch_residual(
+                    &s,
+                    &self.k.residual_add,
+                    &mut self.d_hidden,
+                    &self.d_post,
+                    self.hidden,
+                )
+                .map_err(map)?;
+            } else if lq[6] == ProjQuant::Q8_0 {
                 if fused {
                     launch_silu_mul_quantize(
                         &s,
@@ -7856,6 +8265,32 @@ impl CudaResidentDecode {
                 }
                 off_seq += 1;
             }
+            // gemma3→CUDA campaign, localization instrument. Mirrors the runnable
+            // oracle's `CAMELID_LAYER_DUMP` (src/runnable/model.rs): append this
+            // layer's hidden state so the two lanes can be diffed layer by layer.
+            // Costs a full sync + D2H per layer, so it is strictly a debugging
+            // lane — the var is never set in production or in any gate.
+            if let Some(path) = std::env::var("CAMELID_LAYER_DUMP").ok().as_deref() {
+                s.synchronize().map_err(map)?;
+                let mut h = vec![0f32; self.hidden];
+                s.memcpy_dtoh(&self.d_hidden, &mut h).map_err(map)?;
+                let l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
+                // Keyed on POSITION, not on call ordinal: the CUDA lane runs a
+                // load-time warmup the CPU lane has no counterpart for, so ordinal
+                // alignment silently compares different tokens.
+                let line = format!(
+                    "{position}\t{li}\t{l2:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+                    h[0], h[1], h[2], h[3]
+                );
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
         }
 
         if !compute_logits {
@@ -7962,7 +8397,12 @@ impl CudaResidentDecode {
         // embedding gather + resident rope tables reading d_sampled/d_position), which
         // needs no capture at all. qwen35's SSM state itself is graph-compatible
         // (stable engine-level buffers, no position launch scalars).
-        if cuda_graphs_enabled() && self.qwen35.is_none() {
+        // gemma3 is excluded from graph capture alongside qwen35. The captured
+        // graph freezes each layer's kernel identity and args, and a windowed
+        // schedule alternates between `attention_decode_sw` and the full-causal
+        // kernel per layer; nothing here has been proven under capture, and the
+        // safe outcome of getting it wrong is not a crash but a wrong token.
+        if cuda_graphs_enabled() && self.qwen35.is_none() && self.gemma3.is_none() {
             return self
                 .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
                 .map(Some);
@@ -7980,6 +8420,37 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(Some(out[0]))
+    }
+
+    /// Run the layer stack for one token and return the resulting hidden state
+    /// (PRE final-norm, `hidden` floats), without the lm_head projection.
+    ///
+    /// This is the hidden-state-threading form of [`Self::forward_token`], and it
+    /// exists for windowed (gemma3) sessions: they prefill token-by-token through
+    /// the per-token forward — the batched prefill has no window mask — and each
+    /// prefill token needs its hidden state threaded back, not logits. The Metal
+    /// lane has carried this shape since #560 (`ResidentTokenOut::Data` with
+    /// `compute_logits == false`); this is its CUDA twin, so the two GPU lanes
+    /// agree on what a windowed prefill step returns.
+    ///
+    /// Costs one D2H copy of `hidden` floats plus the usual single sync. Only the
+    /// windowed lane calls it; every other architecture keeps `compute_logits ==
+    /// false` on the CPU path exactly as before.
+    pub fn forward_token_hidden(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+    ) -> Result<Vec<f32>, String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda forward hidden: {e}");
+        let s = self.k.stream.clone();
+        self.forward_pass(embedding, cos, sin, position, scale, false, false, false)?;
+        let mut out = vec![0f32; self.hidden];
+        s.memcpy_dtoh(&self.d_hidden, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(out)
     }
 
     /// Install the device-side decode-loop tables (qwen35): the quantized

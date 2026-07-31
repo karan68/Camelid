@@ -708,9 +708,27 @@ impl RunnableModel {
             hidden[pos * dm..(pos + 1) * dm].copy_from_slice(&row);
         }
 
+        // gemma3→CUDA campaign, localization instrument. `CAMELID_LAYER_DUMP=<path>`
+        // appends this lane's LAST-position hidden state after every layer, so the
+        // resident GPU lanes can be diffed against this oracle layer by layer and
+        // the first divergent layer names the defect. Off unless the var is set;
+        // no effect on the forward itself.
+        let dump_path = std::env::var("CAMELID_LAYER_DUMP").ok();
+        let mut dump = String::new();
         for (li, layer) in self.layers.iter().enumerate() {
             self.attention_block(layer, li, &mut hidden, seq)?;
             self.ffn_block(layer, li, &mut hidden, seq)?;
+            if dump_path.is_some() {
+                let last = &hidden[(seq - 1) * dm..seq * dm];
+                let l2 = last.iter().map(|v| v * v).sum::<f32>().sqrt();
+                dump.push_str(&format!(
+                    "{li}\t{l2:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+                    last[0], last[1], last[2], last[3]
+                ));
+            }
+        }
+        if let Some(p) = dump_path {
+            let _ = std::fs::write(p, &dump);
         }
 
         // Final norm on the last position, then logits (one dequantized row per vocab).
@@ -877,6 +895,27 @@ impl RunnableModel {
             }
             for (h, dv) in hidden.iter_mut().zip(d.iter()) {
                 *h += *dv;
+            }
+            // gemma3→CUDA campaign localization instrument (see `forward_logits`).
+            // This is the KV-cached step the runnable SERVE lane actually runs, so
+            // it is the trace that lines up with the resident lanes' per-token
+            // forward. Off unless `CAMELID_LAYER_DUMP` is set.
+            if let Some(path) = std::env::var("CAMELID_LAYER_DUMP").ok().as_deref() {
+                let l2 = hidden.iter().map(|v| v * v).sum::<f32>().sqrt();
+                // Keyed on POSITION so this lines up with the resident lanes'
+                // traces regardless of load-time warmup forwards.
+                let line = format!(
+                    "{pos}\t{li}\t{l2:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+                    hidden[0], hidden[1], hidden[2], hidden[3]
+                );
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
             }
         }
 
