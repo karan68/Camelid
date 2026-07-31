@@ -1968,3 +1968,330 @@ reasons any one of which is sufficient:
 - The prompt-prefix-cache exclusion (§9e-5) is a real multi-turn cost and was NOT addressed:
   it is a KV-format and correctness change, not a perf commit, and the Phase 4 gates cannot
   validate it.
+
+---
+
+## 16. Long-prompt TTFT campaign, Phase 1 record — the parity harness (2026-07-31)
+
+A **new campaign** starts here, on branch `feat/gemma3-batched-prefill` off `main` at
+`a5945f8a`. Its target is TTFT on long prompts: prefill is token-by-token today
+(`session_prefill_chunk_tokens` hard-returns `1` for any windowed arch), so a 2 400-token
+prompt costs 2 400 sequential 26-layer command buffers. Its plan has two tiers — Tier A,
+batched weight streaming with a raw-bit gate; Tier B, windowed attention-as-matmul at
+head_dim 256.
+
+**Phase 1 builds the gate and nothing else. No kernel work was started, and none should be
+until this record's numbers are read.** The campaign's own recon found the existing windowed
+evidence has near-zero power against the exact error class the coming kernels introduce, so
+every downstream receipt would have been unfalsifiable. §16a explains what was wrong with
+it; §16b-§16f are the replacements; §16g is what the mutation run actually found, including
+the parts that should change the Tier A/B plan.
+
+### 16a. What the existing windowed evidence could not see
+
+Read off the committed files, not inferred:
+
+1. **The windowed pack cycles its content.** `qa/prompt-packs/gemma3-windowed-context-pack-v1.json`
+   builds its three prompts from a pool of **30 unique sentences cycled up to 8x** — 211
+   sentences, 30 distinct, at N=2403. A window-boundary error moves the edge across
+   verbatim-duplicate text, so the same information stays reachable from the duplicate.
+2. **Its load-bearing fact is out of every window.** "Willow" occurs only at character 48,
+   ~token 12. No query past position 523 has it in a 512-window at all, so at N=2403 it is
+   reachable **only through the 4 global layers** — which no window mutation touches. The
+   pack is a strong test of global-layer reach and almost no test of the 22 sliding layers.
+3. **No length is a boundary.** 606/1205/2403 are 30/53/35 mod 64 and 94/53/35 mod 128 — not
+   a tile multiple, not a tile edge, not a window edge.
+4. **The windowed sample is 31 content tokens**, not 9 legs: depths 1/5/50 are strict
+   prefixes of one greedy continuation, 14/8/9 content tokens across the three prompts.
+5. **Token identity was measured on re-encoded text**, not on the engine's ids
+   (`scripts/chat-parity-gemma3.mjs`), which is lossy in both directions on this 262k SPM
+   vocab — §16d.
+6. **No margins were recorded**, so the sensitivity of a passing leg could not be estimated
+   afterwards.
+
+The measured dead zone this leaves: reduction-order noise on this row is **2.122e-4** max
+|logit diff| (§9), and the smallest observed argmax flip sits at a **0.0032-nat** top-2 gap
+(§13). A perturbation between those bounds is invisible to any argmax-only gate.
+
+### 16b. The window convention, pinned once — `src/window_ref.rs`
+
+Three sites encoded `[max(0, p+1-w) ..= p]` separately (the Metal resident decode encode,
+the gemma4 CPU runtime, and the doc on `Gemma3Metadata::layer_window`), and **two of them
+cited a `src/model.rs is_position_visible` that does not exist**. `window_bounds()` is now
+the single reference, and its unit tests assert it against verbatim re-statements of the
+other two expressions over 0..2600 positions and six window values.
+
+`is_visible(query, key, window)` is written as `key + window > query`, never
+`key >= query - window`. The subtraction underflows for `query < window` on unsigned types —
+exactly the bug class that appears when the bound moves from host Rust (`saturating_sub`)
+into MSL, which has no such thing. The `>` rather than `>=` is where the
+INCLUDES-current-position convention lives: at `key = query + 1 - window` the predicate is
+`query + 1 > query` (visible, the oldest in-window position), and at `key = query - window`
+it is `query > query` (hidden, the first position outside).
+
+### 16c. The KV-equivalence invariant — `src/kv_equivalence.rs` + `ResidentDecodeState::kv_snapshot`
+
+End-to-end token identity is the right *outer* gate and a poor *inner* one: one argmax per
+step, after 26 layers of mixing. The direct claim is cheaper and far sharper — **a batched
+prefill of n tokens must leave the KV cache in the same state as n token-by-token
+forwards** — a per-(layer, position, head, dim) comparison with no softmax between the
+defect and the observable.
+
+- **Tier A** asserts `assert_bit_identical`. Batching over the token dimension re-associates
+  no reduction, so there is no tolerance to negotiate; a differing bit is a bug.
+- **Tier B** asserts `meets_bound(published bound, outlier factor)`. The scalar bound alone
+  is satisfiable by a kernel that is uniformly slightly wrong; the **outlier half** is what
+  has power — a uniform small delta is reduction noise, one position 10x above the
+  per-position median is a mask or stride defect.
+
+Two properties decide where a defect becomes visible, and both are asserted rather than
+assumed:
+
+- **Layer 0's cache is mask-independent.** Its K/V come from the token embedding, never from
+  attention, so a mask defect first appears in layer 1's cache. A RoPE defect, by contrast,
+  *must* move layer 0 — K is rotated before the cache write — and the synthetic gate asserts
+  that direction too.
+- **The last layer's attention reaches no KV cache at all.** A defect confined to it moves
+  **zero** cache elements. This is not hypothetical: building the gate produced exactly that
+  shape (§16e), and it found a hole in the invariant's own bound check, which is the whole
+  argument for writing the harness before the kernels.
+
+### 16d. The chat-parity harness now reads the engine's ids
+
+`scripts/chat-parity-gemma3.mjs` computed camelid's "tokens" by re-encoding camelid's output
+**string** with camelid's tokenizer. That round-trip is lossy in both directions:
+
+- it **manufactured** divergences — a run of spaces re-encodes as single-space tokens
+  (236743) where the engine emitted the merged whitespace tokens (138, 140), which is why
+  the Phase 4 bundle had to add `camelid-raw-probe.json` to unpick the artifact;
+- it **masked** them — any two id sequences that decode to the same string, or that the
+  tokenizer re-merges to the same canonical ids, compare EQUAL. A batched-prefill defect
+  that changes an id without changing the rendered text is invisible to it. That is the
+  defect class this campaign exists to catch.
+
+`token_match` is now scored on `camelid.generated_token_ids`, with trailing EOG ids (1, 106)
+stripped identically from both sides. A lane returning no diagnostics block makes the harness
+**throw**, not fall back. The old re-encode survives as `text_reencode_token_match`, reported
+and never scored, with a `text_reencode_artifact` flag that fires when the ids agree and the
+re-encode does not. `--top-logprobs N` (default 0, i.e. the request shape the frozen bundles
+used) records per-position top-2 margins on both engines.
+
+### 16e. The synthetic gate — and the hole it found in the invariant
+
+`metal_kv_snapshot_equivalence_catches_window_and_rope_mutations` runs in the DEFAULT suite:
+a 3-layer synthetic fixture, no GGUF, no model load. It establishes a positive control (two
+independent sessions, same schedule, same inputs -> bit-identical KV and equal digest) and
+then requires six schedule mutations to turn the invariant red. Measured, all six caught:
+
+| mutant | differing elements | kv max abs | hidden max abs | first difference |
+|---|---:|---:|---:|---|
+| `window_minus_one` | 7 296 / 13 824 | 1.083e1 | 4.073e0 | K layer 1 position 3 |
+| `window_plus_one` | 6 272 / 13 824 | 4.550e0 | 4.930e-1 | K layer 1 position 4 |
+| `no_lower_bound` (full causal) | 6 272 / 13 824 | 1.020e1 | 3.260e0 | K layer 1 position 4 |
+| `window_on_all_layers` | **1 152 / 13 824** | **0.000e0** | 2.356e0 | **final_hidden[0]** |
+| `window_on_the_wrong_layers` | 6 272 / 13 824 | 1.020e1 | 4.668e0 | K layer 1 position 4 |
+| `rope_tables_swapped` | 11 376 / 13 824 | 2.083e0 | 4.315e-1 | K layer **0** position 1 |
+
+Two rows carry findings:
+
+- **`window_on_all_layers` moves ZERO cache bits.** The mutation is confined to the last
+  layer, whose attention output projects no K/V, so every one of its 1 152 differing
+  elements is in the final hidden. An earlier draft of `meets_bound` checked only the caches
+  and **passed this mutant**. It now bounds the final hidden separately. Tier A/B harnesses
+  must therefore always capture a final-hidden (or logits) vector alongside the caches, or
+  a last-layer mask defect ships silently.
+- **`rope_tables_swapped` is the only mutant that reaches layer 0**, because RoPE is applied
+  to K *before* the cache write. The mask-only mutants are asserted to leave layer 0 exactly
+  untouched, and do.
+
+The gate also asserts the invariant's **blind spot**, so it stays documented rather than
+being rediscovered: with `filled <= window`, widening the window (or dropping it entirely) is
+a **bit-exact no-op**. Prompts must exceed the window to have any power over its bound.
+
+### 16f. The new pack — `qa/prompt-packs/gemma3-window-edge-pack-v1.json`
+
+24 items, built by the committed generator `scripts/build-gemma3-window-edge-pack.mjs`
+against the pinned oracle's tokenizer (`/tokenize`, `add_special=true`), which is what makes
+the token positions *measured* rather than estimated. Every item carries its
+`prompt_token_ids`, so the in-src mutation harness needs no tokenizer and the positions are
+checkable without re-running the generator.
+
+| item | tokens | anchors (offset from q) | window power |
+|---|---:|---|---|
+| `w-edge-q-510` | 1 024 | q-510 `crimson` (inside) | high |
+| `w-edge-q-511` | 1 024 | q-511 `amber` — the OLDEST visible position | high |
+| `w-edge-q-512` | 1 024 | q-512 `indigo` — the FIRST invisible position | high |
+| `w-edge-q-513` | 1 024 | q-513 `emerald` (outside, control) | high |
+| `w-multi-1536` | 1 536 | q-1024, q-552, q-511, q-64 | high |
+| `w-multi-2400` | 2 400 | q-2048, q-1024, q-552, q-511, q-64 | high |
+| `w-len-{63,64,65}` | 63/64/65 | — | **none** |
+| `w-len-{127,128,129}` | 127/128/129 | — | **none** |
+| `w-len-{255,256,257}` | 255/256/257 | — | **none** |
+| `w-len-511` | 511 | — | **none** |
+| `w-len-{512,513}` | 512/513 | — | minimal |
+| `w-len-{1023,1024,1025}` | 1023/1024/1025 | q-511 | high |
+| `w-len-{2400,2432,2433}` | 2400/2432/2433 | q-511 | high |
+
+Design points, each answering a specific defect in §16a:
+
+- **Content is non-repeating and it is asserted, not assumed.** No body sentence appears
+  twice anywhere in the pack; no anchor gate or colour is reused. The generator filters the
+  anchor vocabulary against every filler word list, which caught `copper` clashing with the
+  filler place "copper works" — a hand audit had already missed it.
+- **The four `w-edge-*` items are identical in construction and differ only in anchor
+  placement**, so a change in answer between them is attributable to the mask and nothing
+  else. Their answer word occurs exactly once per prompt, enforced at build time.
+- **Lengths are exact** and sit on the 512-window, the 64-wide NR0/NR1 attention tiles, and
+  the `n_pad = next_multiple_of(128)` boundary (2432 is n_pad; 2433 pushes n_pad to 2560).
+
+Three limits are recorded in the pack itself rather than discovered later:
+
+1. **`window_power: none` below 512 tokens is a fact about the arithmetic, not a weakness of
+   the content.** Below saturation `filled.saturating_sub(w)` is 0 for every `w`. Those nine
+   items exist for the Tier B TILE geometry and each says so.
+2. **At N=512 and N=513 the window edge lands on the TEMPLATE PREFIX, not on text** — the
+   position that moves in or out is 0 (BOS) and 1 (`<start_of_turn>`). No content anchor is
+   possible there, so those two items probe the attention-sink tokens instead.
+3. **A q-511/q-512 anchor PAIR inside one prompt is geometrically impossible**: an anchor
+   sentence is ~9 tokens long. Consecutive anchors in the multi-depth items are kept >=40
+   tokens apart, and the exact one-token pair is carried by the dedicated single-anchor
+   items. This is why there are four `w-edge-*` items rather than one.
+
+**And the honest framing of what the pack proves.** A sliding-window model can still recall a
+fact from outside a single layer's window by STACKING — 22 sliding layers give an effective
+receptive field of ~22x511 positions. The pack therefore does **not** claim that a correct
+implementation fails to recall a q-512 fact, and any harness built on that assumption would
+be wrong. Its power comes from **output sensitivity to the mask**: the token stream must
+change when the bound moves, scored against a reference run, never against a notion of the
+right answer.
+
+### 16g. The mutation run — and the finding that changes the Tier A/B plan
+
+`gemma3_real_row_window_mutation_harness` on the real row, 9-item mutation subset, 12 greedy
+tokens per leg, 8 schedules (production + 7 defects), 1 761 s in one process. Positive
+control first: two baseline runs of `w-len-513` gave identical tokens and **bit-identical KV**
+(digest `9c51bfa9b0c9eef9`).
+
+The defects are applied as `ResidentLayerSchedule` perturbations, not as scratch edits to the
+window arithmetic, and that is exact rather than convenient: `window_start =
+filled.saturating_sub(w)` means a schedule of `w-1` **is** "window_start off by +1 wherever
+the window is saturated", and `w+1` is the off-by-one the other way. The tree is left clean.
+
+**All seven mutants caught — `survivors` is empty — and the gate PASSES.** Which observable
+caught them is the result:
+
+| mutant | caught by TOKEN identity | caught by KV equivalence |
+|---|---:|---:|
+| `window_minus_one` (w-1) | **0 / 9** | 9 / 9 |
+| `window_plus_one` (w+1) | **0 / 9** | 9 / 9 |
+| `window_on_all_layers` | 6 / 9 | 9 / 9 |
+| `layer_pattern_shift_by_one` | 8 / 9 | 9 / 9 |
+| `no_lower_bound` (full causal) | 9 / 9 | 9 / 9 |
+| `window_on_wrong_layers` | 9 / 9 | 9 / 9 |
+| `rope_tables_swapped` | 9 / 9 | 9 / 9 |
+
+**A one-position window error changed not a single generated token on any of the nine items —
+including the four built specifically to make it visible, at 1 024 tokens with the answer word
+planted at exactly q-510 / q-511 / q-512 / q-513.** It is invisible to argmax at every length
+tested, 513 through 2 400.
+
+Its KV signature, by contrast, is unmistakable. Per item, for the two off-by-one mutants:
+
+| item | tokens | max abs ΔKV (w-1 / w+1) | per-position median (w-1 / w+1) | differing elements |
+|---|---:|---|---|---|
+| `w-edge-q-510` | 1 024 | 1.157 / 3.419 | 9.87e-3 / 6.37e-3 | ~6.8M / 13.9M |
+| `w-edge-q-511` | 1 024 | 0.996 / 8.598 | 1.42e-2 / 5.64e-3 | ~6.8M / 13.9M |
+| `w-edge-q-512` | 1 024 | 2.140 / 0.848 | 1.14e-2 / 6.06e-3 | ~6.8M / 13.9M |
+| `w-edge-q-513` | 1 024 | 0.771 / 1.002 | 1.37e-2 / 5.25e-3 | ~6.8M / 13.9M |
+| `w-multi-1536` | 1 536 | 11.502 / 10.885 | 3.50e-2 / 3.87e-2 | ~13.4M / 20.7M |
+| `w-multi-2400` | 2 400 | 3.107 / 1.788 | 4.19e-2 / 4.37e-2 | ~24.4M / 32.2M |
+| `w-len-513` | 513 | 0.583 / 0.429 | **0.0 / 0.0** | 287 743 / 7.1M |
+| `w-len-1024` | 1 024 | 1.637 / 1.416 | 1.33e-2 / 2.80e-3 | ~6.8M / 13.9M |
+| `w-len-2400` | 2 400 | 4.414 / 24.357 | 3.01e-2 / 3.33e-2 | ~24.4M / 32.2M |
+
+Against a reduction-noise floor of 2.122e-4, every one of those is 3-5 orders of magnitude
+clear. `w-len-513` is the sharpest case for the **outlier** half of the Tier B bound: its
+per-position median is exactly **0.0** (only 1-2 of 513 query positions clip, so the median
+across positions is zero) while 287 743 elements differ. A scalar bound alone would have to be
+set absurdly tight to see that; the per-position outlier test sees it immediately.
+
+A consistency check the data produced without being asked: at N=513, `window_plus_one` and
+`no_lower_bound` give **identical** KV numbers (274 944 differing, max 4.2887e-1, hidden
+1.4681). They must — a 513-wide window never clips 513 positions, so w+1 *is* full causal
+there.
+
+**Consequences, and they are not small:**
+
+1. **Gate G9 (external oracle, token identity) cannot carry Tier B on its own.** It has
+   measured zero power against the campaign's headline defect. It stays as the outer gate;
+   it is not the gate.
+2. **G1/G6 (KV equivalence) are promoted from "cheap direct check" to MANDATORY for both
+   tiers.** Tier A already had a raw-bit gate; Tier B must publish a bound AND the
+   per-position outlier factor, and the outlier half is the half with the power.
+3. **A Tier B harness must capture the first-token logits (or a final hidden) alongside the
+   caches.** The last layer's attention reaches no KV cache; §16e showed a mutant that moves
+   zero cache bits and is visible only there.
+4. **The pack's own high-power items did not save token identity.** Planting the answer word
+   at exactly q-511 and q-512 was the strongest content design available and it still did not
+   flip an argmax. This is not a defect of the pack — it is the measured ceiling of what
+   argmax observation can do on this row, and it should be quoted whenever someone proposes
+   token identity as a sufficient gate.
+
+### 16h. Baseline on the current (token-by-token) lane
+
+`scripts/chat-parity-gemma3.mjs` against the Metal GPU-resident serve lane, new pack, depths
+1/5/50, margins armed. Bundle
+`qa/evidence-bundles/gemma3-1b-q8-window-edge-harness-20260731-head-a82dd41a/`.
+
+- **Cross-engine prompt tokenization identical 24/24** — the pack's own `prompt_tokens`
+  matched the oracle's `/tokenize` on every item, so the exact lengths are real.
+- **70/72 generation legs token-AND-text identical**, `all_pass: false`.
+- **48/48 depth-1 and depth-5 legs clean.** Both failures are depth-50.
+- **All six anchored window items clean at every depth**, per-leg minimum top-2 margins
+  3.45-7.81 nats. Those are the items the window gates rest on.
+- The two failures, disclosed with their margins at the divergence position:
+  `w-len-256` depth 50, index 13, camelid gap **0.468** nat / oracle 0.235 nat; `w-len-513`
+  depth 50, index 5, camelid gap **0.0696** nat / oracle 0.314 nat. Both are unanchored
+  ladder items carrying the open-ended "name one item mentioned above" question, both sit
+  inside the near-tie band this row already discloses (§13: flips at 0.0032 / 0.0173 /
+  0.0353 nat, largest disclosed oracle-side gap 0.447), and neither is a window item.
+  Neither is excused: the receipt ships with `all_pass: false`.
+
+**One negative finding worth keeping.** `text_reencode_artifact` fired on **0/72** legs, and
+the old text round-trip disagreed with the engine ids on 0 legs where the ids matched. On
+this pack the fixed harness reaches the same verdict the old one would have. The fix is a
+*power* fix for the defect class ahead — an id change that does not change the rendered text
+— not a correction of a wrong result here, and it should not be advertised as one.
+
+### 16i. Gates and what was deliberately not done
+
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`
+and `scripts/check-public-scrub.sh` all clean. The two real-row tests are env-gated and skip
+in the default suite; the synthetic KV-equivalence gate runs in it.
+
+Deliberately not done:
+
+- **No kernel work.** Not one line of MSL, no admission-predicate change, no env flag. Phase
+  1 is the harness.
+- **No pack item was softened after seeing a result.** The two failing depth-50 legs stay in
+  the pack and in the receipt with their margins.
+- **No re-run of the mutation harness to tidy a denominator.** `differing_elements` in the
+  committed receipt is counted against a caches-only `compared_elements`; the code was
+  corrected afterwards so future receipts share one denominator, and the bundle README says
+  so rather than the numbers being regenerated to look neater.
+- **No promotion of any surface.** No README, COMPATIBILITY, STATUS or ledger edit; the row's
+  claims are unchanged. This phase adds a gate, not a claim.
+
+### 16j. Handover to Phase 2
+
+The GO condition on Tier B ("Phase 1's harness detects all five mutants") is **met, with all
+seven**, but the plan's gate list must be amended by §16g before Phase 2 starts:
+
+- G1 (raw `to_bits` KV equality, batched vs token-by-token, over the length sweep) is
+  implementable today: `ResidentDecodeState::kv_snapshot` + `kv_equivalence::compare` +
+  `assert_bit_identical`. Tier A should assert it at the pack's exact lengths, which now
+  include the tile and n_pad edges the old evidence never touched.
+- G6's bound must be published **with** its outlier factor, and the harness must capture the
+  first-token logits.
+- G9 stays, and its measured limitation is now on record.
+- The prompt-prefix cache remains closed on this row, so nothing here interacts with it.
