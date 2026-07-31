@@ -318,6 +318,12 @@ pub struct KvEquivalence {
     pub hidden_bit_identical: bool,
     /// Final-hidden max |a - b| (0.0 when neither side captured one).
     pub hidden_max_abs_diff: f32,
+    /// Number of final-hidden elements compared (0 when neither side captured one).
+    /// Kept explicitly so [`KvEquivalence::compared_elements`] and
+    /// `differing_elements` share a denominator — an earlier draft counted hidden
+    /// differences in the numerator and not the denominator, which produced receipt
+    /// lines like `differing=6945791/6829056`.
+    pub hidden_elements: usize,
 }
 
 fn diff(a: f32, b: f32) -> f32 {
@@ -363,6 +369,7 @@ pub fn compare(left: &KvSnapshot, right: &KvSnapshot) -> Result<KvEquivalence, K
         per_layer_max_abs: vec![0.0; g.n_layers],
         hidden_bit_identical: true,
         hidden_max_abs_diff: 0.0,
+        hidden_elements: 0,
     };
 
     for layer in 0..g.n_layers {
@@ -419,6 +426,7 @@ pub fn compare(left: &KvSnapshot, right: &KvSnapshot) -> Result<KvEquivalence, K
                     right: b.len(),
                 });
             }
+            out.hidden_elements = a.len();
             for (dim, (x, y)) in a.iter().zip(b).enumerate() {
                 if x.to_bits() == y.to_bits() {
                     continue;
@@ -472,10 +480,12 @@ impl KvEquivalence {
         );
     }
 
-    /// Total f32 elements the comparison covered (caches only).
+    /// Total f32 elements the comparison covered: both caches at every layer, plus
+    /// the final-hidden vector when one was captured. This is the denominator
+    /// `differing_elements` is counted against.
     #[must_use]
     pub fn compared_elements(&self) -> usize {
-        2 * self.geometry.n_layers * self.geometry.per_layer_elements()
+        2 * self.geometry.n_layers * self.geometry.per_layer_elements() + self.hidden_elements
     }
 
     /// Median of `per_position_max_abs`. Positions with no difference count as 0, so a
@@ -768,6 +778,15 @@ mod tests {
             .meets_bound(1.0e-3, 10.0)
             .expect_err("a last-layer-only defect must fail the bound");
         assert!(err.contains("final_hidden"), "{err}");
+        // The numerator and denominator must agree about the hidden: an earlier
+        // draft counted hidden differences in `differing_elements` but excluded them
+        // from `compared_elements`, printing receipt lines with a ratio above 1.
+        assert_eq!(v.hidden_elements, 3);
+        assert_eq!(
+            v.compared_elements(),
+            2 * g.n_layers * g.per_layer_elements() + 3
+        );
+        assert!(v.differing_elements <= v.compared_elements());
         // Same story for a bits-differ-at-zero-distance hidden change.
         let c = filled(g, 1.0).with_final_hidden(vec![1.0, 2.0, -0.0]);
         let d = filled(g, 1.0).with_final_hidden(vec![1.0, 2.0, 0.0]);
