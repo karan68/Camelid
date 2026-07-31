@@ -35,7 +35,7 @@ site) and **immediately reproduced the Phase 0 defect** — the plan said
 `gemma4_cuda_resident_runtime` for rows that fell back. That is why the predicate
 is now singular, and why the split is called out in its doc comment.
 
-## DEFECT FOUND: the gemma4 CUDA lane mis-decodes Q4_0
+## DEFECT FOUND: the gemma4 CUDA lane mis-decodes Q4_0 — SINCE ROOT-CAUSED AND FIXED (see phase5/)
 
 Making the lane default-on exposed a **pre-existing** bug that the opt-in default
 had been hiding. Reproducible on an RTX 3060 Laptop, `gemma-4-E2B-it-Q4_0.gguf`,
@@ -57,7 +57,7 @@ therefore pinned to Q8_0 until the Q4_0 path earns a parity receipt.
 |---|---|---|---|---|
 | E2B Q8_0 | **`gemma4_cuda_resident_runtime`** | `Paris` | **798 ms** | 2645 MiB |
 | E4B Q8_0 | `gemma4_cpu_runtime` (fit decline) | `Paris` | 17,758 ms | 107 MiB |
-| E2B Q4_0 | `gemma4_cpu_runtime` (quant decline) | `Paris` | 3,127 ms | 107 MiB |
+| E2B Q4_0 | `gemma4_cuda_resident_runtime` (admitted after the phase5 fix) | `Paris` | — | 1557 MiB |
 
 E2B Q8_0 on the CPU runtime was 4,076 ms for the same request, so the GPU lane is
 about 5x on this host. Recorded as an observation from a single unisolated

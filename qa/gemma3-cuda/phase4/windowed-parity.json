@@ -5,7 +5,7 @@
   "mode": "gemma3_cuda_resident_windowed_serve",
   "capture_method": "two_phase_oracle",
   "comparator": "llama.cpp /completion (gemma3 turn markers parsed, BOS via add_special), -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack",
-  "camelid_base": "http://127.0.0.1:8270",
+  "camelid_base": "http://127.0.0.1:8310",
   "llama_base": "http://127.0.0.1:8090",
   "token_counts": [
     1,

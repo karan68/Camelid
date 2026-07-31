@@ -147,8 +147,11 @@ text rather than an error.
 **gemma4 E2B Q8_0 now runs GPU-resident on this 6 GB card** — 2645 MiB, `Paris`,
 798 ms against 4,076 ms on the CPU runtime. E4B Q8_0 declines on fit (short by
 621 MiB including the headroom floor; it would take the GPU on an 8 GB card) and
-Q4_0 declines on the quant gate, since the gemma4 CUDA lane **mis-decodes Q4_0** —
-a pre-existing defect that flipping the default surfaced.
+Q4_0 was initially declined on the quant gate because the lane **mis-decoded** it — a
+pre-existing defect that flipping the default surfaced. That defect has since been
+root-caused and fixed (Phase 5: the tied head uploaded raw GGUF wire into kernels
+that index a repacked layout), and E2B Q4_0 now runs GPU-resident at 1557 MiB with
+a 5/5 token-identical greedy-parity capture against the CPU runtime.
 
 An earlier revision of this section said no gemma4 row reached the GPU here. That
 was wrong, and wrong because of a defect in this campaign's own fit guard: it
