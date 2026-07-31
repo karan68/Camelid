@@ -1530,3 +1530,195 @@ still legitimately prefilling a 606-token prompt, which is exactly the leg 13c n
 - §12i's other open items are unchanged except the `--row-id` default, which is CLOSED here.
 - The runnable lane's cost makes a full windowed cross-lane matrix impractical; if a broader
   divergence table is ever wanted it needs a faster CPU reference, not more patience.
+
+---
+
+## 14. Phase 5 record (2026-07-30)
+
+Phase 5 is the promotion-surface phase: the row, the ledger, the frontend, the docs, and a
+decision-log entry. No engine behaviour changed in this phase — the only `src/` edits are the
+capabilities literal, four stale comments, and the execution-plan comment that Phase 3b left
+pointing at a future that has now arrived.
+
+### 14a. The capabilities row
+
+`gemma_3_1b_it_q8_0` (src/api/mod.rs) rewritten against §13g and nothing wider.
+
+- `family` `gemma3_runnable_decoder` → **`gemma3_windowed_decoder`**. The old name described a
+  lane the row no longer defaults to; the new one describes the architecture.
+- `support_scope` → **`exact_row_metal_gpu_resident_windowed_chat_smoke_only`** (new literal;
+  `ledger/camelid-ledger.schema.json` `supportScopeVocabulary` extended in the same commit, which
+  `check-ledger-schema.mjs` enforces as a superset check).
+- `generation_runs` names both halves of the split:
+  `metal_gpu_resident_serve_chat_greedy_with_eog_stop_default_lane_on_metal_hosts_runnable_bridge_fallback_elsewhere`.
+- `tested_context` moves from "well under the 512-token sliding window" to
+  `gemma3_chat_greedy_1_5_50_at_606_1205_and_2403_prompt_tokens_plus_50_generated_all_above_the_512_token_sliding_window_metal_resident_lane_only`.
+- `parity_audited` states 15/15 sub-512 and 9/9 windowed, and that raw completions are clean
+  through depth 5 only.
+- `performance_measured` → `not_claimed_resident_lane_throughput_is_a_separate_unshipped_measurement_phase`.
+  The old `observed_about_5_s_per_token_...` value was DELETED and not replaced. Note the
+  side effect this buys: the frontend's `hasExactRowBoundedPerformanceEvidence` rejects any value
+  containing `not_`, so the row cannot advertise throughput readiness even by accident.
+- `frontend_readiness_gate` names the resident backend/decode path and states plainly that off
+  that lane only the sub-512 envelope is green.
+- `full_support_blockers` keeps the old ">512 is wrong by construction" sentence but re-attributes
+  it to the RUNNABLE lane, and adds the raw-decode depth-50 limit, the >2,403 limit, the
+  un-run bounded-context ladder, and the fail-closed surfaces.
+- `latest_checked_*` and `evidence` point at the Phase 4 bundle; the frozen July bundle is named
+  as history for the other lane and explicitly not re-adjudicated.
+
+### 14b. The execution-plan level string STAYS `sub512`, deliberately
+
+§11i left this open. The answer is not to widen it. `recognized_row_level` is keyed on the row
+NAME only and is platform-blind — the same string is reported on hosts where the unmasked
+runnable bridge serves the row. `supported_exact_row_smoke_sub512` is the envelope that holds on
+every host that recognizes this row; a `..._windowed_2403` string would over-claim on the
+fallback. The stale "this level string stays sub-512 until [Phase 4] lands" comment is replaced
+with that reasoning, and `/api/capabilities` carries the lane-aware claim as the support source
+of truth. Recorded in DECISIONS D20's closing section.
+
+### 14c. Ledger
+
+`node scripts/extract-capabilities-to-ledger.mjs` → 37 model rows, 40 contract fields each.
+`check-ledger-schema.mjs` passed (2 documents, coverage ⊇ code enums). `check-ledger-drift.mjs`
+passed all five checks: A freshness ok; B 22/24 support-claim rows mapped (the 2 unmapped are
+pre-existing DiffusionGemma/Ornith label mismatches, logged not failed); **C 14/14 catalog ids
+resolve** (13/13 before — the gemma3 catalog entry is the new one, and its resolution is the
+Phase 3c catalog_id/row_id fix holding); D 14 correct filename+sha co-occurrences; E anchors
+single-home.
+
+### 14d. Frontend
+
+The row had NO frontend presence at all before this phase.
+
+- `frontend/src/lib/supportedModels.js`: Gemma 3 1B-It added with `catalog_id`
+  `gemma_3_1b_it_q8_0` — the same id as the contract row and the backend catalog.
+- `model-lanes-smoke.mjs`: real row id + two lane checks (resolves to `supported` from the
+  filename alone with no backend `lane_class` hint; a Q4_K_M gemma3 file does NOT inherit it).
+- `model-state-smoke.mjs`: the row copied field-for-field OUT OF THE GENERATED LEDGER, plus the
+  counter-case to the gemma2 planning row above it, the Q8_0 pin, and a throughput-readiness
+  guard assertion.
+- `capability-readiness-smoke.mjs`: the shipped id resolves; the historical `gemma3_1b_it_q8_0`
+  spelling must NOT; the bare family string must NOT.
+
+No `executionPlan.js` change was needed — `metal_resident_q8_runtime` was already a known Metal
+backend and `runnable-runtime` a known specialized one, so both sides of the split already render.
+
+**Fixture verification was not by inspection.** A release `camelid serve` was run on this M4
+against the real row and `/api/capabilities` fetched live; the gemma3 row is **field-for-field
+identical to the regenerated ledger (40/40)**, and all 20 fields of the model-state fixture are
+byte-identical to the live payload. The catalog endpoint returns `catalog_id`
+`gemma_3_1b_it_q8_0`, and a live chat returns "Paris" with `finish_reason: stop` and NO
+`lane:"experimental"` disclosure — the join the Phase 3c fix was for, confirmed end to end rather
+than assumed.
+
+### 14e. Docs — two passes, and the second one was necessary
+
+Pass 1: README (pull id `gemma3_1b` → `gemma_3_1b`, matching the catalog-id-prefix convention
+every other row follows, closing the §12i three-spelling item; plus the serve-lane table row),
+COMPATIBILITY, SUPPORT_MATRIX, STATUS (campaign note, the July promotion marked as history rather
+than edited, and the new bundle added to Durable evidence anchors — its only index home, per
+drift Check E), DOCS, and DECISIONS D20.
+
+Pass 2 swept the whole tree, not just the files pass 1 touched, and found eight real things.
+The worst was mine: **D20.2 as first written documented the design Phase 3c explicitly rejected**
+— it named `ensure_windowed_arch_off_cpu_dense`, claimed "all three dispatch sites", tabulated
+three entry points and told future readers to add a fourth row when a fourth appeared. That is
+the whack-a-mole F1 exists to end. Rewritten around the shipped choke point
+(`ensure_windowed_arch_off_cpu_dense_layer`, two per-layer forwards, three session-level guards
+demoted to courtesy legs, ten pinning tests). The same stale wording is fixed in the
+capabilities-row comment. Also in pass 2:
+
+- `scripts/chat-parity-gemma3.mjs` still DEFAULTED `--lane-label` to `..._runnable_serve`. The
+  harness only speaks HTTP and cannot observe its lane, so a resident run would emit a receipt
+  stamped runnable — the same class of bug as the `--row-id` default closed in §13f. Now fails to
+  `..._serve_lane_unspecified`.
+- `src/inference.rs` claimed "gemma3 itself remains behind the arch disqualifier", contradicting
+  that disqualifier's own comment 55 lines above.
+- `src/model.rs` said gemma3 "serves via the runnable lane" and its resident lane is "guarded off".
+- `qa/invariant_lanes.json` cited `fn is_runnable_serve_arch`, a symbol that no longer exists —
+  the meta-test checks the anchor array but not the reason prose, so CI was green on a dead symbol.
+- `BACKEND_ASKS.md` still listed gemma3's dense-path dual-rope-base hazard as open; it is closed.
+- The gate pack's `purpose` asserted the runnable lane and a sub-512 ceiling. The pre-registered
+  sentence is kept VERBATIM (MUSTER 6.1) with a dated amendment appended; prompts untouched.
+- COMPATIBILITY was the one promoted row on that table citing no evidence bundle; and the bare
+  "clean 4/4" read as a silent drop from the 5-prompt chat pack — raw completions are a separate
+  4-prompt harness, now said so in the row, STATUS and SUPPORT_MATRIX.
+
+### 14f. Deliberately NOT done
+
+- gemma3 is NOT added to `qa/evidence-bundles/README.md` (STATUS.md is the canonical anchor
+  index), `docs/benchmarks/PARITY.md` (frozen to the four-row era — Mistral, Qwen3, gemma4 and
+  the K-quant rows are all absent; adding one row would imply a completeness the file lacks),
+  `docs/benchmarks/BENCHMARKS.md` or `docs/perf-deep-dive/LANE_STATUS_LEDGER.md` (throughput
+  surfaces, and this row has no throughput claim), or `CAPABILITY_MATRIX.md` (receipt-backed
+  capability axis; gemma3 has no capability receipts).
+- The `bounded_context_*` pack fields stay `not_promoted`. The windowed pack is a different
+  artifact from the repo's bounded-context ladder, and the ladder was not run.
+
+### 14g. Gates
+
+Per commit: `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test --all-targets` **exit 0** under pipefail (debug — the configuration CI runs).
+
+- `scripts/check-public-scrub.sh` exit 0.
+- All 27 `scripts/test-*.mjs` PASS.
+- `check-ledger-schema.mjs` and `check-ledger-drift.mjs` pass (§14c).
+- All four bundle validators pass: `check-public-scrub.sh`,
+  `audit-evidence-bundle-privacy.mjs --strict` (0 findings, 0 bundles with findings),
+  `check-evidence-bundle-checksums.sh`, `check-public-evidence-claims.mjs`
+  (159 manifests, 50 summary files).
+- Frontend: `npm run build` PASS. Node-only smokes PASS: model-state, model-lanes,
+  catalog-activation, first-run, catalog-browse, model-deletion, 3b-closure,
+  capability-readiness, integration, workspace, streaming, ui.
+
+**Env-keyed gemma3 battery re-run at this head** (release, production GEMV gates armed from the
+shell per §9d, targeted names):
+
+- `gemma3_real_row_resident_forward_matches_runnable_oracle`, no SKIP, **553.09 s**: depth 1
+  argmax resident=oracle=108, max |logit diff| 6.247e-5; depth 5 argmax 1077, 7.820e-5; depth 50
+  argmax 578, 9.584e-5 — **50/50 greedy tokens identical, overall max |logit diff| 2.122e-4**.
+  **Bit-for-bit the §9b / §11h / §13e record.**
+- `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle` (same gates plus
+  `CAMELID_METAL_RESIDENT_DECODE=1`), **21.98 s**: depths 1-5 argmax 108 / 584 / 568 / 2364 /
+  1077, all = oracle; **5/5 identical, overall max |logit diff| 7.820e-5**. **Bit-for-bit the
+  §10b / §11h / §13e record.**
+
+The Phase 2/3a stack is therefore proven unchanged under everything Phase 5 did — as expected,
+since Phase 5 changed no engine behaviour.
+
+**Live serve verification** (release, this M4 mini, no special env vars): `/v1/health` reports
+`selected_backend: metal_resident_q8_runtime`, `decode_path: q8_0_metal_resident_decode`,
+`prefill_path: q8_0_metal_resident_prefill`, `generation_ready: true`. `/api/capabilities`'s
+gemma3 row is field-for-field identical to the regenerated ledger (40/40). The catalog endpoint
+returns `catalog_id: gemma_3_1b_it_q8_0`. A greedy chat returns "Paris" with
+`finish_reason: stop` and **no `lane:"experimental"` disclosure**.
+
+**Two pre-existing failures, disclosed rather than absorbed into this campaign's record:**
+
+1. `tensor::nvfp4_tests::encode_vectors_reproduce_pin_wire_bytes_and_dequant` FAILS in a
+   `--release --lib` run (1397 passed / 1 failed / 23 ignored) on the `path-snan-first` case,
+   and PASSES in debug. This branch does not touch `src/tensor/` at any commit
+   (`git diff origin/main..HEAD -- src/tensor/` is empty), and CI runs the debug configuration,
+   which is green. It looks like sNaN handling being folded away under optimization; since
+   NaN-sentinel NVFP4 files are supposed to fail closed, it may be a real defect in shipped
+   release builds rather than a test bug. Raised as separate work, NOT fixed here.
+2. `npm run smoke:observatory` fails one check ("honest no-traffic state renders with no
+   requests / title missing"). Verified pre-existing by checking `frontend/` out at the
+   pre-Phase-5 head `5b047a3e` and re-running: identical failure. That smoke is not in the CI
+   workflow's frontend job.
+
+Two frontend smokes (`first-run-card`, `offline-banner`) could not run on this host — they need
+Chrome or Edge, which is not installed. CI's frontend job supplies a browser.
+
+### 14h. Still open after Phase 5
+
+- Perf is Phase 6 and is now the ONLY thing the row's `next_step` leads with. Nothing in the
+  repo claims a gemma3 throughput number.
+- The three depth-50 raw-completion near-ties (§13h) are unchanged and still bound the row's
+  raw surface to depth 5.
+- Context above 2,403 prompt tokens, and the bounded-context ladder packs, remain unrun.
+- The runnable CPU bridge still has no window mask. That is now stated as a lane-scoped blocker
+  rather than a row-wide one, but it is the reason the windowed claim cannot travel off Metal.
+- `encode_attention` still carries no `window_start` (§12i), which is why speculation stays
+  declined for windowed archs.
