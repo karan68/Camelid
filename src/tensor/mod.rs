@@ -6025,7 +6025,8 @@ fn nvfp4_best_index(x: f32, d: f32) -> u8 {
 /// comparison (all-NaN rows therefore encode to an all-zero wire, and +/-Inf rows
 /// saturate the scale to 0x7E while `best_index` leaves every element at code 0),
 /// scale byte = `fp32_to_ue4m3(amax / 6)`, elements quantized against the DECODED
-/// scale via first-wins nearest-LUT search.
+/// scale via first-wins nearest-LUT search. The amax scan compares BIT PATTERNS,
+/// not floats — see the comment in the loop; a plain `<` is miscompiled at `-O`.
 #[cfg(test)]
 pub(crate) fn encode_nvfp4_block(
     x: &[f32; NVFP4_VALUES_PER_BLOCK],
@@ -6035,8 +6036,22 @@ pub(crate) fn encode_nvfp4_block(
         let xb = &x[s * NVFP4_SUB_BLOCK_VALUES..(s + 1) * NVFP4_SUB_BLOCK_VALUES];
         let mut amax = 0.0_f32;
         for &v in xb {
-            if amax < v.abs() {
-                amax = v.abs();
+            let a = v.abs();
+            // The pin's `if (amax < a) amax = a;` never fires on a NaN, so a NaN
+            // element must leave `amax` untouched. Spelling that as the float `<`
+            // is NOT enough: while `amax` is still the literal 0.0, LLVM peels the
+            // first iteration and folds `select(0.0 < a, a, 0.0)` into a max
+            // intrinsic — `fmaxnm` on aarch64 — and `fmaxnm` returns the QUIETED
+            // operand when one input is a SIGNALING NaN (it returns the other
+            // operand only for a quiet one). A leading sNaN therefore poisoned
+            // `amax`, zeroing the sub-block scale, in optimized builds ONLY;
+            // fixture row `path-snan-first` caught it, debug builds never did.
+            // Here both operands are non-negative and non-NaN, and over that
+            // domain unsigned bit-pattern order IS IEEE magnitude order — so this
+            // is the same predicate, expressed as an integer compare that no
+            // float fold can rewrite.
+            if !a.is_nan() && a.to_bits() > amax.to_bits() {
+                amax = a;
             }
         }
         let ue = fp32_to_ue4m3(amax / 6.0);
@@ -6060,7 +6075,8 @@ pub(crate) fn encode_nvfp4_block(
 mod nvfp4_tests {
     use super::{
         decode_nvfp4_tensor, encode_nvfp4_block, fp32_to_ue4m3, nvfp4_block_decode_into,
-        KVALUES_MXFP4, NVFP4_VALUES_PER_BLOCK, NVFP4_WIRE_BYTES_PER_BLOCK, UE4M3_TO_F32,
+        KVALUES_MXFP4, NVFP4_SUB_BLOCK_VALUES, NVFP4_VALUES_PER_BLOCK, NVFP4_WIRE_BYTES_PER_BLOCK,
+        UE4M3_TO_F32,
     };
 
     fn fixture_json(name: &str) -> serde_json::Value {
@@ -6226,6 +6242,52 @@ mod nvfp4_tests {
                 seen_spotlock_tags.contains(expected),
                 "fixture is missing spot-lock tag {expected}: the semantic lock never ran"
             );
+        }
+    }
+
+    /// OPTIMIZATION-SENSITIVITY LOCK for the amax scan (see [`encode_nvfp4_block`]).
+    /// A NaN element must change NOTHING except its own nibble: not the sub-block
+    /// scale, not its 63 neighbours' codes. Asserted against a NaN-free encode of
+    /// the same row rather than a golden blob, so it keeps testing the property if
+    /// the fixtures are ever regenerated — and swept over EVERY slot and all four
+    /// NaN encodings, because the defect it guards was position- and
+    /// signalling-specific: only slot 0 of a sub-block (where `amax` is still the
+    /// literal 0.0, so LLVM peels the compare into `fmaxnm`) and only a SIGNALING
+    /// NaN (which `fmaxnm` quiets INTO the result instead of discarding). That
+    /// combination is one row of `nvfp4_encode_vectors.json` (`path-snan-first`)
+    /// and it failed in release while every debug build passed.
+    #[test]
+    fn encode_amax_ignores_nan_in_every_slot_and_encoding() {
+        let clean = encode_nvfp4_block(&[2.0_f32; NVFP4_VALUES_PER_BLOCK]);
+        // Anchor the NaN-free baseline so a broken encoder cannot make this test
+        // vacuous by agreeing with itself: amax 2.0 -> ue4m3(1/3) = 0x2B, and 2.0
+        // sits nearest code 7 (12 * 0.171875 = 2.0625).
+        assert_eq!(clean[..4], [0x2B; 4], "baseline scale bytes");
+        assert!(clean[4..].iter().all(|&b| b == 0x77), "baseline codes");
+
+        for slot in 0..NVFP4_VALUES_PER_BLOCK {
+            for nan_bits in [
+                0x7f80_0001_u32, // +sNaN (the regressing input)
+                0xff80_0001,     // -sNaN
+                0x7fc0_0000,     // +qNaN
+                0xffc0_0000,     // -qNaN
+            ] {
+                let mut x = [2.0_f32; NVFP4_VALUES_PER_BLOCK];
+                x[slot] = f32::from_bits(nan_bits);
+
+                // Only the NaN's own nibble goes to code 0; `best_index` never lets
+                // a NaN beat the initial candidate.
+                let mut want = clean;
+                let within = slot % NVFP4_SUB_BLOCK_VALUES;
+                let byte = 4 + (slot / NVFP4_SUB_BLOCK_VALUES) * 8 + within % 8;
+                want[byte] &= if within < 8 { 0xF0 } else { 0x0F };
+
+                assert_eq!(
+                    encode_nvfp4_block(&x),
+                    want,
+                    "NaN {nan_bits:#010x} in slot {slot} must not disturb the block"
+                );
+            }
         }
     }
 
