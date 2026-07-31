@@ -234,6 +234,38 @@ jobs:
           RUST_MIN_STACK: 8388608
         run: cargo test --all-targets ${{ matrix.features }}
 
+      # Everything above this line is a DEBUG build, and that is exactly how a
+      # release-only defect in the NVFP4 encoder sat in main unnoticed: while
+      # `amax` is still the literal 0.0, LLVM peels the first compare of the
+      # sub-block amax scan and folds it into a max intrinsic (`fmaxnm` on
+      # aarch64), which QUIETS a signaling NaN into the result instead of
+      # discarding it the way the pin's `<` does. A leading sNaN therefore zeroed
+      # the sub-block scale at -O and only at -O; every debug run was green.
+      #
+      # The suites below exist to reproduce the pin BYTE-FOR-BYTE, so they are
+      # the ones that have to hold in the profile we actually ship. Scoped to
+      # those rather than a second full `--all-targets` run to keep the added
+      # wall-clock bounded — this gates the optimization-sensitive numeric
+      # kernels, NOT the whole suite, so a release-only defect elsewhere is still
+      # ungated. Runs on every OS leg on purpose: the defect was a codegen fold,
+      # and codegen differs per target (the fmaxnm form is aarch64/macOS).
+      - name: Tests (release, bit-exactness suites)
+        # Explicit: the default shell on windows-latest is pwsh, which does not
+        # take `\` line continuations.
+        shell: bash
+        env:
+          RUST_MIN_STACK: 8388608
+        run: |
+          set -euo pipefail
+          cargo test --release --lib ${{ matrix.features }} nvfp4
+          cargo test --release ${{ matrix.features }} \
+            --test nvfp4_format \
+            --test nvfp4_wire_lane_refusals \
+            --test nvfp4_e4b_spotcheck \
+            --test runnable_dequant \
+            --test dg_quant_parity \
+            --test gemma4_kquant_regression
+
       # The Windows linker reserves an 8 MiB stack for camelid.exe because the
       # debug Clap parser needs it. Unit tests exercise a libtest executable,
       # so they cannot prove the shipped debug binary starts. Keep this direct
