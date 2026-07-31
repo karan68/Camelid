@@ -29,10 +29,37 @@ use crate::gemma4_runtime::{Gemma4Runtime, Gemma4StepOutput};
 use crate::{BackendError, Result};
 
 /// Wire protocol version. Bump on ANY change to the message layout.
-pub const GEMMA4_WIRE_VERSION: u32 = 1;
+///
+/// v2 added [`BEAT_MAGIC`]. A v1 master would read a beat where it expects a
+/// response and abort with "bad resp magic" — fail-closed but useless — so the
+/// handshake catches the skew first and names the real cause. A mixed-version
+/// pair refuses to run until both nodes are on the same build.
+pub const GEMMA4_WIRE_VERSION: u32 = 2;
 const HELLO_MAGIC: u32 = 0xCA4E1147;
 const STEP_MAGIC: u32 = 0xCA4E5701;
 const RESP_MAGIC: u32 = 0xCA4E5702;
+/// Worker -> master liveness frame, valid ONLY between a step being read and its
+/// response being written. Fixed 28 bytes, no length prefix.
+const BEAT_MAGIC: u32 = 0xCA4E5703;
+
+/// One heartbeat frame: magic | seq | elapsed_ms | fnv1a(seq ‖ elapsed_ms).
+///
+/// Built as one stack array and written with a single `write_all` so a beat is
+/// one syscall-visible unit: it can only ever be partially written by a socket
+/// error, never by interleaving, and that case is treated as a dead session
+/// rather than retried.
+///
+/// `elapsed_ms` is DIAGNOSTIC ONLY. The master never makes a control decision
+/// from a peer-supplied clock — it appears in log text and nowhere else.
+fn encode_beat(seq: u64, elapsed_ms: u64) -> [u8; 28] {
+    let mut frame = [0u8; 28];
+    frame[0..4].copy_from_slice(&BEAT_MAGIC.to_le_bytes());
+    frame[4..12].copy_from_slice(&seq.to_le_bytes());
+    frame[12..20].copy_from_slice(&elapsed_ms.to_le_bytes());
+    let checksum = fnv1a(&frame[4..20]);
+    frame[20..28].copy_from_slice(&checksum.to_le_bytes());
+    frame
+}
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -139,6 +166,63 @@ impl Gemma4Handshake {
     }
 }
 
+/// The worker's socket writer plus the two flags the beat thread coordinates on.
+///
+/// Generic over `W` so the beat loop can be unit-tested against a `Vec<u8>`
+/// without a socket; `serve_session` instantiates it at `BufWriter<TcpStream>`.
+struct SessionOut<W: Write> {
+    writer: W,
+    /// True except while a `step_range` call is in flight. The beat loop's wait
+    /// predicate reads it, so the beat thread cannot begin a write once it is set.
+    beats_closed: bool,
+    /// First write failure seen by either thread. A failed write may have left a
+    /// partial frame on the wire, so the session is over — never cleared.
+    failed: Option<String>,
+}
+
+/// Emit a beat every `interval` until the step finishes or a write fails.
+///
+/// Teardown latency is a scheduler hop rather than up to a full interval, which
+/// is the whole reason this is a condvar rather than `sleep` + an `AtomicBool`.
+/// `wait_timeout_while` re-checks the predicate under the lock, so there is no
+/// lost wakeup and `seq` stays gap-free.
+fn beat_loop<W: Write>(
+    out: &std::sync::Mutex<SessionOut<W>>,
+    cv: &std::sync::Condvar,
+    started: std::time::Instant,
+    interval: std::time::Duration,
+) {
+    let mut seq: u64 = 0;
+    let Ok(mut guard) = out.lock() else {
+        return; // compute thread panicked while holding the lock; nothing to do
+    };
+    loop {
+        let Ok((next, timeout)) =
+            cv.wait_timeout_while(guard, interval, |s: &mut SessionOut<W>| {
+                !s.beats_closed && s.failed.is_none()
+            })
+        else {
+            return;
+        };
+        guard = next;
+        if !timeout.timed_out() {
+            return; // predicate went false: the step is finishing
+        }
+        seq += 1;
+        let frame = encode_beat(seq, started.elapsed().as_millis() as u64);
+        // Hold the guard across write_all + flush so a beat is never truncated
+        // by teardown, which must take this same lock to set `beats_closed`.
+        if let Err(e) = guard
+            .writer
+            .write_all(&frame)
+            .and_then(|()| guard.writer.flush())
+        {
+            guard.failed = Some(format!("heartbeat write at beat {seq}: {e}"));
+            return;
+        }
+    }
+}
+
 fn model_file_len(path: &Path) -> Result<u64> {
     Ok(std::fs::metadata(path)
         .map_err(|e| BackendError::Io {
@@ -209,6 +293,10 @@ fn serve_session(runtime: &Gemma4Runtime, file_len: u64, stream: TcpStream) -> R
     stream
         .set_read_timeout(Some(WORKER_SESSION_IDLE_TIMEOUT))
         .ok();
+    // Bound writes too. A master that stops reading (but whose host is alive, so
+    // keepalive stays quiet) would otherwise block a beat or response write
+    // forever, holding the serial accept loop with it.
+    stream.set_write_timeout(Some(WORKER_WRITE_TIMEOUT)).ok();
     let peer = stream.peer_addr().map_err(|e| io_err("peer_addr", e))?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| io_err("clone", e))?);
     let mut writer = BufWriter::new(stream);
@@ -224,8 +312,22 @@ fn serve_session(runtime: &Gemma4Runtime, file_len: u64, stream: TcpStream) -> R
         return_logits: hello.return_logits, // master's choice
     };
     if hello != expected {
-        // Reject with the exact mismatch, then close.
-        let msg = format!("handshake mismatch: master sent {hello:?}, worker expects {expected:?}");
+        // Reject with the exact mismatch, then close. Version skew is called out
+        // first because it is now a real operational case — v2 added the
+        // heartbeat frame, so updating one node of a two-Mac pair and not the
+        // other lands here. The "handshake mismatch" substring is asserted by
+        // tests/gemma4_distributed_parity.rs; keep it.
+        let skew = if hello.wire_version == expected.wire_version {
+            String::new()
+        } else {
+            format!(
+                "wire version mismatch (master v{}, worker v{}): update both nodes to the same \
+                 camelid build — ",
+                hello.wire_version, expected.wire_version
+            )
+        };
+        let msg =
+            format!("{skew}handshake mismatch: master sent {hello:?}, worker expects {expected:?}");
         write_u32(&mut writer, RESP_MAGIC).ok();
         write_u32(&mut writer, 1).ok(); // status 1 = rejected
         let bytes = msg.as_bytes();
@@ -242,6 +344,16 @@ fn serve_session(runtime: &Gemma4Runtime, file_len: u64, stream: TcpStream) -> R
         hello.return_logits
     );
 
+    // From here on the writer is shared with the beat thread. The handshake
+    // above wrote through it directly, before any beat thread can exist — no
+    // new byte lives on the reject path, which is what keeps a v1 master's
+    // reject-read working against a v2 worker.
+    let out = std::sync::Mutex::new(SessionOut {
+        writer,
+        beats_closed: true,
+        failed: None,
+    });
+    let cv = std::sync::Condvar::new();
     let hidden = runtime.hidden_size();
     let (mut kc, mut vc) = runtime.empty_kv_caches();
     loop {
@@ -288,7 +400,42 @@ fn serve_session(runtime: &Gemma4Runtime, file_len: u64, stream: TcpStream) -> R
             )));
         }
 
-        let logits = match runtime.step_range(token, pos, Some(h), &mut kc, &mut vc)? {
+        // Arm the beat window. Any write failure from a previous step means the
+        // stream may carry a partial frame, so the session is already over.
+        {
+            let mut guard = out.lock().map_err(|_| poisoned())?;
+            if let Some(e) = guard.failed.take() {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "gemma4 distributed: {e}"
+                )));
+            }
+            guard.beats_closed = false;
+        }
+        let started = std::time::Instant::now();
+        let stepped = std::thread::scope(|scope| {
+            // A drop guard, NOT a plain assignment after the call: if step_range
+            // panics, the unwind must still tell the beat thread to stop, or
+            // `scope`'s implicit join deadlocks forever against a thread asleep
+            // on the condvar. Deleting this in the name of simplification turns
+            // a panicking step into a hung worker process. It is load-bearing.
+            struct StopBeats<'a, W: Write>(
+                &'a std::sync::Mutex<SessionOut<W>>,
+                &'a std::sync::Condvar,
+            );
+            impl<W: Write> Drop for StopBeats<'_, W> {
+                fn drop(&mut self) {
+                    if let Ok(mut guard) = self.0.lock() {
+                        guard.beats_closed = true;
+                    }
+                    self.1.notify_all();
+                }
+            }
+            let _stop = StopBeats(&out, &cv);
+            scope.spawn(|| beat_loop(&out, &cv, started, HEARTBEAT_INTERVAL));
+            runtime.step_range(token, pos, Some(h), &mut kc, &mut vc)
+        });
+        // The beat thread is now provably joined, so nothing else can write.
+        let logits = match stepped? {
             Gemma4StepOutput::Logits(logits) => logits,
             Gemma4StepOutput::Hidden(_) => {
                 return Err(BackendError::InvalidModelMetadata(
@@ -297,22 +444,37 @@ fn serve_session(runtime: &Gemma4Runtime, file_len: u64, stream: TcpStream) -> R
             }
         };
         let (next, max_logit) = greedy_argmax(&logits);
-
-        write_u32(&mut writer, RESP_MAGIC).map_err(|e| io_err("resp", e))?;
-        write_u32(&mut writer, 0).map_err(|e| io_err("resp", e))?;
-        write_u32(&mut writer, next).map_err(|e| io_err("resp", e))?;
+        let mut guard = out.lock().map_err(|_| poisoned())?;
+        if let Some(e) = guard.failed.take() {
+            // Do NOT append a response to a possibly-desynced stream.
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "gemma4 distributed: {e}"
+            )));
+        }
+        let writer = &mut guard.writer;
+        write_u32(writer, RESP_MAGIC).map_err(|e| io_err("resp", e))?;
+        write_u32(writer, 0).map_err(|e| io_err("resp", e))?;
+        write_u32(writer, next).map_err(|e| io_err("resp", e))?;
         writer
             .write_all(&max_logit.to_le_bytes())
             .map_err(|e| io_err("resp", e))?;
         if hello.return_logits {
-            write_u32(&mut writer, logits.len() as u32).map_err(|e| io_err("resp", e))?;
-            write_f32s(&mut writer, &logits).map_err(|e| io_err("resp logits", e))?;
-            write_u64(&mut writer, f32s_checksum(&logits)).map_err(|e| io_err("resp", e))?;
+            write_u32(writer, logits.len() as u32).map_err(|e| io_err("resp", e))?;
+            write_f32s(writer, &logits).map_err(|e| io_err("resp logits", e))?;
+            write_u64(writer, f32s_checksum(&logits)).map_err(|e| io_err("resp", e))?;
         } else {
-            write_u32(&mut writer, 0).map_err(|e| io_err("resp", e))?;
+            write_u32(writer, 0).map_err(|e| io_err("resp", e))?;
         }
         writer.flush().map_err(|e| io_err("resp flush", e))?;
     }
+}
+
+/// A poisoned session mutex means the compute thread panicked mid-step; the
+/// stream state is unknown, so the session is over.
+fn poisoned() -> BackendError {
+    BackendError::InvalidModelMetadata(
+        "gemma4 distributed: worker session lock poisoned by a panic mid-step".into(),
+    )
 }
 
 fn greedy_argmax(logits: &[f32]) -> (u32, f32) {
@@ -328,6 +490,7 @@ fn greedy_argmax(logits: &[f32]) -> (u32, f32) {
 }
 
 /// One step's reply from the worker.
+#[derive(Debug)]
 pub struct WorkerStep {
     pub next_token: u32,
     pub max_logit: f32,
@@ -340,7 +503,7 @@ pub struct WorkerStep {
 const STEP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Arm TCP keepalive so a *dead* peer is detected in ~35s by the kernel, even
-/// while a read is inside the long [`FIRST_STEP_READ_TIMEOUT`] budget.
+/// while a read is inside the long [`COLD_STEP_CEILING`] budget.
 ///
 /// This is what makes that budget safe to grant. A read timeout alone cannot
 /// tell "the worker is slowly paging in its shard" from "the worker's host fell
@@ -393,38 +556,72 @@ fn arm_keepalive(_stream: &TcpStream) {}
 
 /// Budget for the FIRST step of a session.
 ///
+/// How often the worker emits a [`BEAT_MAGIC`] frame while a `step_range` call
+/// is in flight.
+///
 /// The worker binds and answers the handshake before its shard is resident:
 /// `load_layer_range` maps the GGUF lazily and warms it on a background thread
 /// (that advisory blocks for minutes on macOS over USB, so it cannot run on the
 /// load path). The whole cold-fault cost therefore lands on the first
 /// `step_range` — measured at 171s for a 1.9GB tail shard off a 38MB/s USB
-/// volume, against the 30s steady-state budget. Charging cold I/O to a
-/// steady-state timeout turned a slow-but-correct run into a hard abort, so the
-/// first step gets its own budget — bounded in practice by [`arm_keepalive`],
-/// which drops a genuinely dead peer in ~35s rather than letting it sit here for
-/// the full budget — and later steps tighten back to [`STEP_READ_TIMEOUT`].
+/// volume, and a 26B tail shard is ~13GB, so ~350s at the same rate.
 ///
-/// Sized from measurement, not guessed: worst observed first token was 171s
-/// before the warm-up was range-scoped and 57s after, so this is ~5x the
-/// realistic worst case. It is deliberately NOT larger — the residual exposure
-/// is a worker that handshakes and then goes mute (still ACKing, so keepalive
-/// cannot see it), which costs one budget per request.
-const FIRST_STEP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// A 6-minute cold start costs ~72 frames x 28 bytes ~= 2KB of wire traffic.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The master's read budget for ALL post-handshake reads.
+///
+/// This is the constant that makes the lane scale. It bounds SILENCE, not work:
+/// every frame — heartbeat or response — re-arms it, so a worker that keeps
+/// proving liveness is tolerated indefinitely while one that goes mute is caught
+/// in at most four intervals. Unlike a first-step budget, it does not have to be
+/// re-guessed per disk speed or per row size, which is what previously made 12B
+/// and 26B unserviceable without raising a number that simultaneously widened
+/// the mute-worker window.
+///
+/// = 4 x [`HEARTBEAT_INTERVAL`], i.e. three consecutive missed beats. The beat
+/// thread sleeps on a condvar and does one 28-byte write on wake, so it is not
+/// plausibly starved for 20s even by a rayon-saturated `step_range`.
+const HEARTBEAT_SILENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wall-clock ceiling on the FIRST step of a session, checked after each beat.
+///
+/// A pure liveness backstop: there is still no timeout layer above this (the
+/// router mounts only tower-http `trace`/`cors`), so without it a worker that
+/// beats forever but never finishes would hang a serve request forever. Sized to
+/// be unreachable by legitimate paging rather than tight — ~2.6x the projected
+/// worst case (a 26B ~13GB tail shard at the measured 38MB/s is ~350s). If this
+/// fires, the worker is broken, not slow.
+const COLD_STEP_CEILING: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Wall-clock ceiling on every step after the first response.
+///
+/// Not 30s: a resident shard can be evicted under memory pressure on a 16 GB
+/// Mac, so a mid-generation step can legitimately go back to disk. In practice a
+/// wedged step is caught by [`HEARTBEAT_SILENCE_TIMEOUT`] long before this.
+const STEADY_STEP_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Worker-side `SO_SNDTIMEO`. Bounds a beat or response write against a master
+/// that stopped reading but whose host is alive, which keepalive cannot see and
+/// which would otherwise block the serial accept loop forever.
+const WORKER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a worker waits for the next step before abandoning the session.
 ///
 /// The accept loop is serial — one session at a time — so an abandoned-but-open
-/// session locks out every future master. Generous enough that a legitimately
-/// slow master is never dropped mid-generation; the master's own first step is
-/// bounded by [`FIRST_STEP_READ_TIMEOUT`], so a healthy pair never idles here.
-const WORKER_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// session locks out every future master. MUST be >= [`COLD_STEP_CEILING`]: the
+/// gap between the handshake and the master's first step covers the MASTER's own
+/// local `step_range` over layers `[0, split)`, whose shard can be just as cold
+/// as the worker's. At 300s this dropped healthy 26B sessions before the first
+/// token ever crossed the wire.
+const WORKER_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// Master-side connection to a gemma4 worker (one generation session).
 pub struct Gemma4WorkerClient {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
     /// Cleared once a step response has arrived, at which point the read
-    /// timeout drops from [`FIRST_STEP_READ_TIMEOUT`] to [`STEP_READ_TIMEOUT`].
+    /// step is bounded by [`COLD_STEP_CEILING`] rather than [`STEADY_STEP_CEILING`].
     cold: bool,
 }
 
@@ -445,7 +642,7 @@ impl Gemma4WorkerClient {
     /// hang a serve request forever.
     ///
     /// Worst-case wall time is bounded by the handshake running on
-    /// [`STEP_READ_TIMEOUT`], not [`FIRST_STEP_READ_TIMEOUT`]: 10 attempts x
+    /// [`STEP_READ_TIMEOUT`], not a step ceiling: 10 attempts x
     /// (30s read + 3s backoff) ~= 5.5 minutes. Only a permanent rejection short-
     /// circuits earlier; the cold budget is armed after this returns and so is
     /// never multiplied by the retry count.
@@ -534,18 +731,47 @@ impl Gemma4WorkerClient {
                 String::from_utf8_lossy(&msg).into_owned(),
             )));
         }
-        // Handshake done — now grant the first step its cold budget. This is
-        // reached exactly once per session and is never retried, so the worst
-        // case is one FIRST_STEP_READ_TIMEOUT, not ATTEMPTS of them.
+        // Handshake done. From here the read timeout bounds SILENCE, not work:
+        // the worker heartbeats while computing, so every frame re-arms it. It
+        // is armed once and never changed again — a slow worker is tolerated by
+        // beating, not by widening this.
         reader
             .get_ref()
-            .set_read_timeout(Some(FIRST_STEP_READ_TIMEOUT))
+            .set_read_timeout(Some(HEARTBEAT_SILENCE_TIMEOUT))
             .ok();
         Ok(Self {
             reader,
             writer,
             cold: true,
         })
+    }
+
+    /// Describe a failed frame read, distinguishing "went silent" from "died".
+    ///
+    /// A timeout here means the worker stopped proving liveness, which under v2
+    /// is a real fault rather than an ambiguous slow-disk case — the whole point
+    /// of the heartbeat is that a busy worker keeps talking. A reset or EOF is
+    /// the worker dying, and blaming silence for it would send the reader
+    /// looking at disk speed instead of the worker log.
+    fn silence_error(
+        &self,
+        e: std::io::Error,
+        beats: u64,
+        pos: usize,
+        ceiling: std::time::Duration,
+    ) -> BackendError {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            return BackendError::InvalidModelMetadata(format!(
+                "gemma4 distributed: worker went silent for {HEARTBEAT_SILENCE_TIMEOUT:?} at pos \
+                 {pos} after {beats} heartbeat(s) (step ceiling {ceiling:?}) — it stopped \
+                 sending liveness frames, so it is wedged or unreachable rather than merely \
+                 slow; check the worker log: {e}"
+            ));
+        }
+        io_err("resp", e)
     }
 
     /// Send one (token, position, hidden) step and receive the worker's result.
@@ -558,33 +784,58 @@ impl Gemma4WorkerClient {
         write_u64(&mut self.writer, f32s_checksum(h)).map_err(|e| io_err("step", e))?;
         self.writer.flush().map_err(|e| io_err("step flush", e))?;
 
-        let magic = read_u32(&mut self.reader).map_err(|e| {
-            // Only a TIMEOUT on the first step means "still paging in". A reset
-            // or EOF is the worker dying, and blaming a cold shard for it would
-            // send the reader looking at disk speed instead of the worker log.
-            let timed_out = matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            );
-            if self.cold && timed_out {
-                // Name the budget that was exceeded — "Resource temporarily
-                // unavailable" alone points nowhere near a cold shard.
-                return BackendError::InvalidModelMetadata(format!(
-                    "gemma4 distributed: no response to the first step (budget \
-                     {FIRST_STEP_READ_TIMEOUT:?}; keepalive may have dropped a dead peer \
-                     sooner) — either the worker is still paging in its shard from a slow or \
-                     remote model volume, or it is unreachable; check the worker log: {e}"
-                ));
+        // Consume heartbeats until the response arrives. The socket timeout
+        // bounds the gap BETWEEN frames, so a worker that keeps beating is
+        // tolerated for as long as the wall-clock ceiling allows, while one that
+        // goes mute is caught in at most HEARTBEAT_SILENCE_TIMEOUT.
+        let ceiling = if self.cold {
+            COLD_STEP_CEILING
+        } else {
+            STEADY_STEP_CEILING
+        };
+        let deadline = std::time::Instant::now() + ceiling;
+        let mut beats: u64 = 0;
+        let magic = loop {
+            let magic = read_u32(&mut self.reader)
+                .map_err(|e| self.silence_error(e, beats, pos, ceiling))?;
+            if magic != BEAT_MAGIC {
+                break magic;
             }
-            io_err("resp", e)
-        })?;
+            let seq = read_u64(&mut self.reader).map_err(|e| io_err("beat seq", e))?;
+            let elapsed_ms = read_u64(&mut self.reader).map_err(|e| io_err("beat elapsed", e))?;
+            let sent = read_u64(&mut self.reader).map_err(|e| io_err("beat checksum", e))?;
+            let mut body = [0u8; 16];
+            body[0..8].copy_from_slice(&seq.to_le_bytes());
+            body[8..16].copy_from_slice(&elapsed_ms.to_le_bytes());
+            if sent != fnv1a(&body) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "gemma4 distributed: heartbeat checksum mismatch at pos {pos} \
+                     (sent {sent:#x}) — the stream is desynced; refusing to continue"
+                )));
+            }
+            beats += 1;
+            // Exact +1. Beats are ordered on one TCP stream and the worker
+            // increments `seq` only after a frame is fully written, so a gap
+            // means lost or partial framing, not a slow worker. Fail closed
+            // rather than attempt to resync.
+            if seq != beats {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "gemma4 distributed: heartbeat sequence gap at pos {pos} \
+                     (expected {beats}, got {seq}) — the stream is desynced"
+                )));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "gemma4 distributed: worker still heartbeating after {ceiling:?} on a \
+                     single step at pos {pos} (beat {seq}, worker-side elapsed {elapsed_ms}ms). \
+                     It is alive but not finishing — a stuck worker, not a slow disk; check \
+                     the worker log."
+                )));
+            }
+        };
         if self.cold {
-            // The worker is answering, so its shard is resident: drop to the
-            // steady-state budget for the rest of the session.
-            self.reader
-                .get_ref()
-                .set_read_timeout(Some(STEP_READ_TIMEOUT))
-                .ok();
+            // The worker produced a response, so its shard is resident: later
+            // steps get the tighter wall-clock ceiling.
             self.cold = false;
         }
         if magic != RESP_MAGIC {
@@ -866,7 +1117,7 @@ impl Gemma4DistributedRuntime {
 mod tests {
     use super::*;
 
-    /// The long [`FIRST_STEP_READ_TIMEOUT`] is only defensible because keepalive
+    /// The long [`COLD_STEP_CEILING`] is only defensible because keepalive
     /// bounds a dead peer. `setsockopt` reports failure only through a return
     /// code this code deliberately ignores, so assert the options actually
     /// landed — silently unarmed keepalive would leave a hung dial blocking a
@@ -902,7 +1153,7 @@ mod tests {
             get(libc::SOL_SOCKET, libc::SO_KEEPALIVE),
             0,
             "SO_KEEPALIVE never armed: a black-holed worker would hang the first \
-             step for FIRST_STEP_READ_TIMEOUT"
+             step for the whole cold ceiling"
         );
         #[cfg(target_os = "macos")]
         assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE), 15, "idle secs");
@@ -910,5 +1161,292 @@ mod tests {
         assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 15, "idle secs");
         assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 5, "probe gap");
         assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPCNT), 4, "probe count");
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn handshake_for(listener_peer: &mut TcpStream, accept_ok: bool) -> Gemma4Handshake {
+        let h = Gemma4Handshake {
+            wire_version: GEMMA4_WIRE_VERSION,
+            block_count: 4,
+            hidden: 8,
+            worker_first_layer: 2,
+            worker_last_layer: 4,
+            model_file_len: 1234,
+            return_logits: false,
+        };
+        if accept_ok {
+            write_u32(listener_peer, RESP_MAGIC).unwrap();
+            write_u32(listener_peer, 0).unwrap();
+            listener_peer.flush().unwrap();
+        }
+        h
+    }
+
+    /// A beat encodes and verifies under the same checksum rule the master applies.
+    #[test]
+    fn beat_frame_round_trips_and_detects_corruption() {
+        let frame = encode_beat(7, 4242);
+        assert_eq!(
+            u32::from_le_bytes(frame[0..4].try_into().unwrap()),
+            BEAT_MAGIC
+        );
+        assert_eq!(u64::from_le_bytes(frame[4..12].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(frame[12..20].try_into().unwrap()), 4242);
+        assert_eq!(
+            u64::from_le_bytes(frame[20..28].try_into().unwrap()),
+            fnv1a(&frame[4..20]),
+            "checksum must cover seq ‖ elapsed_ms exactly as the master recomputes it"
+        );
+        let mut corrupt = frame;
+        corrupt[5] ^= 0xFF;
+        assert_ne!(
+            u64::from_le_bytes(corrupt[20..28].try_into().unwrap()),
+            fnv1a(&corrupt[4..20]),
+            "a flipped seq bit must not still satisfy the checksum"
+        );
+    }
+
+    /// The beat loop emits gap-free 1-based sequence numbers and stops promptly.
+    ///
+    /// Gap-freeness is what lets the master use strict `seq == beats + 1` as a
+    /// desync detector rather than merely a monotonicity check.
+    #[test]
+    fn beat_loop_emits_gap_free_sequence_then_stops_on_close() {
+        let out = Mutex::new(SessionOut {
+            writer: Vec::<u8>::new(),
+            beats_closed: false,
+            failed: None,
+        });
+        let cv = Condvar::new();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| beat_loop(&out, &cv, started, Duration::from_millis(10)));
+            // Let several beats accumulate, then close the window.
+            while out.lock().unwrap().writer.len() < 28 * 3 {
+                std::thread::yield_now();
+            }
+            out.lock().unwrap().beats_closed = true;
+            cv.notify_all();
+            h.join().unwrap();
+        });
+        let buf = out.into_inner().unwrap().writer;
+        assert_eq!(buf.len() % 28, 0, "only whole beat frames are ever written");
+        let count = buf.len() / 28;
+        assert!(count >= 3, "expected several beats, got {count}");
+        for i in 0..count {
+            let f = &buf[i * 28..(i + 1) * 28];
+            assert_eq!(u32::from_le_bytes(f[0..4].try_into().unwrap()), BEAT_MAGIC);
+            assert_eq!(
+                u64::from_le_bytes(f[4..12].try_into().unwrap()),
+                i as u64 + 1,
+                "seq must be 1-based and gap-free"
+            );
+            assert_eq!(
+                u64::from_le_bytes(f[20..28].try_into().unwrap()),
+                fnv1a(&f[4..20])
+            );
+        }
+    }
+
+    /// A write failure is latched and stops the loop, so no frame is ever
+    /// appended after a possibly-partial one.
+    #[test]
+    fn beat_loop_latches_write_failure_and_exits() {
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "peer gone",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Mutex::new(SessionOut {
+            writer: Failing,
+            beats_closed: false,
+            failed: None,
+        });
+        let cv = Condvar::new();
+        beat_loop(&out, &cv, Instant::now(), Duration::from_millis(1));
+        let guard = out.lock().unwrap();
+        assert!(
+            guard
+                .failed
+                .as_deref()
+                .is_some_and(|m| m.contains("heartbeat write")),
+            "write failure must be latched for the compute thread: {:?}",
+            guard.failed
+        );
+    }
+
+    /// The master must CONSUME beats and still return the real response.
+    ///
+    /// The end-to-end suites cannot cover this: they run warm, so steps take
+    /// ~40ms and no beat is ever emitted. This drives the wire contract
+    /// directly — several beats, then a response — which is the path that would
+    /// silently break if the master ever stopped treating BEAT_MAGIC as a
+    /// continue rather than a frame boundary.
+    #[test]
+    fn master_consumes_beats_then_reads_the_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut hello = [0u8; 36];
+            peer.read_exact(&mut hello).unwrap();
+            write_u32(&mut peer, RESP_MAGIC).unwrap();
+            write_u32(&mut peer, 0).unwrap();
+            peer.flush().unwrap();
+            // Read the step frame: magic|token|pos|h_len|h|checksum.
+            let mut head = [0u8; 16];
+            peer.read_exact(&mut head).unwrap();
+            let h_len = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
+            let mut body = vec![0u8; h_len * 4 + 8];
+            peer.read_exact(&mut body).unwrap();
+            // Three beats, then the response.
+            for seq in 1..=3u64 {
+                peer.write_all(&encode_beat(seq, seq * 1000)).unwrap();
+                peer.flush().unwrap();
+            }
+            write_u32(&mut peer, RESP_MAGIC).unwrap();
+            write_u32(&mut peer, 0).unwrap();
+            write_u32(&mut peer, 4242).unwrap();
+            peer.write_all(&1.5f32.to_le_bytes()).unwrap();
+            write_u32(&mut peer, 0).unwrap();
+            peer.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let handshake = Gemma4Handshake {
+            wire_version: GEMMA4_WIRE_VERSION,
+            block_count: 4,
+            hidden: 8,
+            worker_first_layer: 2,
+            worker_last_layer: 4,
+            model_file_len: 1234,
+            return_logits: false,
+        };
+        let mut client =
+            Gemma4WorkerClient::connect(&addr.to_string(), &handshake).expect("handshake ok");
+        let step = client
+            .step(1, 0, &[0.0f32; 8])
+            .expect("beats must not break the response");
+        assert_eq!(
+            step.next_token, 4242,
+            "response after beats must parse intact"
+        );
+        assert_eq!(step.max_logit, 1.5);
+        let _ = worker.join();
+    }
+
+    /// A beat with a wrong sequence number is a desync and must fail closed
+    /// rather than be tolerated as a slow worker.
+    #[test]
+    fn master_fails_closed_on_a_heartbeat_sequence_gap() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut hello = [0u8; 36];
+            peer.read_exact(&mut hello).unwrap();
+            write_u32(&mut peer, RESP_MAGIC).unwrap();
+            write_u32(&mut peer, 0).unwrap();
+            peer.flush().unwrap();
+            let mut head = [0u8; 16];
+            peer.read_exact(&mut head).unwrap();
+            let h_len = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
+            let mut body = vec![0u8; h_len * 4 + 8];
+            peer.read_exact(&mut body).unwrap();
+            // seq jumps 1 -> 3: a frame was lost, so the stream is untrustworthy.
+            peer.write_all(&encode_beat(1, 1000)).unwrap();
+            peer.write_all(&encode_beat(3, 3000)).unwrap();
+            peer.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let handshake = Gemma4Handshake {
+            wire_version: GEMMA4_WIRE_VERSION,
+            block_count: 4,
+            hidden: 8,
+            worker_first_layer: 2,
+            worker_last_layer: 4,
+            model_file_len: 1234,
+            return_logits: false,
+        };
+        let mut client =
+            Gemma4WorkerClient::connect(&addr.to_string(), &handshake).expect("handshake ok");
+        let err = client
+            .step(1, 0, &[0.0f32; 8])
+            .expect_err("gap must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sequence gap"),
+            "must name the desync rather than resync: {msg}"
+        );
+        let _ = worker.join();
+    }
+
+    /// THE REGRESSION TEST for the mute-worker residual.
+    ///
+    /// A worker that completes the handshake and then goes silent must be caught
+    /// in about one silence budget. Before v2 this cost a full 300s first-step
+    /// budget per request, and keepalive could not see it because the peer's TCP
+    /// stack keeps ACKing — which is exactly what this fake worker does by
+    /// holding an open, idle socket.
+    #[test]
+    fn mute_worker_is_caught_in_one_silence_budget_not_a_step_ceiling() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut hello = [0u8; 36];
+            use std::io::Read as _;
+            peer.read_exact(&mut hello).unwrap();
+            let _ = handshake_for(&mut peer, true);
+            // Now go mute, holding the socket open so keepalive stays quiet.
+            std::thread::sleep(HEARTBEAT_SILENCE_TIMEOUT + Duration::from_secs(5));
+        });
+
+        let handshake = Gemma4Handshake {
+            wire_version: GEMMA4_WIRE_VERSION,
+            block_count: 4,
+            hidden: 8,
+            worker_first_layer: 2,
+            worker_last_layer: 4,
+            model_file_len: 1234,
+            return_logits: false,
+        };
+        let mut client =
+            Gemma4WorkerClient::connect(&addr.to_string(), &handshake).expect("handshake ok");
+        let began = Instant::now();
+        let err = client.step(1, 0, &[0.0f32; 8]).expect_err("must fail");
+        let elapsed = began.elapsed();
+
+        assert!(
+            elapsed < HEARTBEAT_SILENCE_TIMEOUT + Duration::from_secs(10),
+            "a mute worker must be caught in about one silence budget, took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= HEARTBEAT_SILENCE_TIMEOUT - Duration::from_secs(2),
+            "must not fire before the silence budget elapses, took {elapsed:?}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("went silent"),
+            "error must name silence, not a cold shard: {msg}"
+        );
+        let _ = worker.join();
     }
 }
