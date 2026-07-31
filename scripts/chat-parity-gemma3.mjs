@@ -2,8 +2,9 @@
 // gemma3 chat-parity harness — TWO-PHASE (MUSTER M-A1), modeled on
 // scripts/chat-parity-qwen3-twophase.mjs.
 //
-// Parity contract: greedy chat via the runnable serve lane
-// (CAMELID_RUNNABLE_SERVE=1), prompt-token + generated-token + generated-text
+// Parity contract: greedy chat via a camelid serve lane (originally the runnable
+// serve lane, CAMELID_RUNNABLE_SERVE=1; the served lane actually exercised is
+// recorded by --lane-label), prompt-token + generated-token + generated-text
 // parity at 1/5/50 against the pinned llama.cpp reference. The rendered prompt
 // carries NO BOS string (byte-identical to the oracle's /apply-template output,
 // locked by qa/prompt-packs/gemma3-chat-template-shapes-v1.json); BOTH engines
@@ -23,25 +24,36 @@
 //   Phase 2 (ONLY camelid running):
 //     node scripts/chat-parity-gemma3.mjs --mode compare \
 //       --camelid http://127.0.0.1:8185 --oracle <oracle.json> \
-//       --model-id "<served id>" --row-id gemma3_1b_it_q8_0 \
+//       --model-id "<served id>" [--row-id gemma_3_1b_it_q8_0] \
 //       --display-name "Gemma 3 1B-It Q8_0" --comparator "llama.cpp 9632 ..." \
-//       --out <parity.json>
+//       [--lane-label gemma3_marker_chat_greedy_metal_resident_serve] \
+//       [--request-timeout-ms 3600000] --out <parity.json>
 
 import { writeFile, readFile, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import http from 'node:http'
 
 const args = parseArgs(process.argv.slice(2))
 const mode = args.get('mode')
 const llamaBase = (args.get('llama') || 'http://127.0.0.1:8090').replace(/\/$/, '')
 const camelidBase = (args.get('camelid') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8185').replace(/\/$/, '')
 const modelId = args.get('model-id') || 'Gemma 3 1B It'
-const rowId = args.get('row-id') || 'gemma3_1b_it_q8_0'
+// The compatibility row id is `gemma_3_1b_it_q8_0` (src/api/mod.rs); the older
+// `gemma3_1b_it_q8_0` spelling matches no row, so a receipt generated without an
+// explicit --row-id used to carry an id that resolved to nothing.
+const rowId = args.get('row-id') || 'gemma_3_1b_it_q8_0'
 const displayName = args.get('display-name') || 'Gemma 3 1B-It Q8_0'
+// Which served lane produced the camelid side. Defaults to the runnable serve lane
+// this harness was written for; pass --lane-label when driving another served lane
+// so the emitted receipt does not mislabel the lane it actually certified.
+const laneLabel = args.get('lane-label') || 'gemma3_marker_chat_greedy_runnable_serve'
 const comparatorLabel =
   args.get('comparator') || 'llama.cpp /completion (gemma3 turn markers parsed, BOS via add_special), -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack'
 const oraclePath = args.get('oracle')
 const outPath = args.get('out') || null
 const tokenCounts = (args.get('token-counts') || '1,5,50').split(',').map((s) => Number.parseInt(s.trim(), 10))
+// Socket idle timeout for both engines (default 30 min); see postJson below.
+const requestTimeoutMs = Number.parseInt(args.get('request-timeout-ms') || '1800000', 10)
 // gemma3 EOG ids in this row's vocab: <eos>=1, <end_of_turn>=106.
 const STOP = new Set([1, 106])
 let PROMPTS
@@ -60,14 +72,45 @@ function renderGemma3(userContent) {
   return `<start_of_turn>user\n${userContent.trim()}<end_of_turn>\n<start_of_turn>model\n`
 }
 
-async function postJson(base, path, body) {
-  const res = await fetch(`${base}${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+// node:http, NOT the global fetch: undici's ~5-minute headersTimeout fires while a
+// slow lane holds the connection open during a long prefill (a >=512-token prompt on
+// the f32 CPU runnable lane takes far longer than that), and the client then reports
+// UND_ERR_HEADERS_TIMEOUT for a request the server is still serving correctly. Same
+// fix, same flag name, as scripts/raw-decode-parity.mjs.
+function postJson(base, path, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(`${base}${path}`)
+    const data = JSON.stringify(body)
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) },
+      },
+      (res) => {
+        let buf = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => (buf += c))
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`${base}${path} -> HTTP ${res.statusCode}: ${buf.slice(0, 300)}`))
+          } else {
+            try {
+              resolve(JSON.parse(buf))
+            } catch {
+              reject(new Error(`${base}${path} -> non-JSON response: ${buf.slice(0, 200)}`))
+            }
+          }
+        })
+      },
+    )
+    req.setTimeout(requestTimeoutMs, () => req.destroy(new Error(`${base}${path} -> idle timeout after ${requestTimeoutMs}ms`)))
+    req.on('error', reject)
+    req.write(data)
+    req.end()
   })
-  if (!res.ok) throw new Error(`${base}${path} -> HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
-  return res.json()
 }
 
 async function referenceCompletion(promptText, nPredict) {
@@ -189,7 +232,7 @@ async function compare() {
     schema: 'camelid.gemma3.chat_parity.v1',
     row_id: rowId,
     display_name: displayName,
-    mode: 'gemma3_marker_chat_greedy_runnable_serve',
+    mode: laneLabel,
     capture_method: 'two_phase_oracle',
     comparator: oracle.comparator || comparatorLabel,
     camelid_base: camelidBase,
