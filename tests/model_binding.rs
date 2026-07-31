@@ -1225,8 +1225,16 @@ fn gemma3_binds_qk_and_sandwich_norms_with_window_metadata() {
     // it must still classify for the runnable bridge — never the CPU dense
     // forward, whose forward dispatch fails closed for windowed archs (H4).
     assert!(!is_runnable_only_arch(&config.architecture));
+    // Both capability legs false => bridge; Phase 3c added the quantization
+    // leg (a non-Q8_0 gemma3 has no resident lane on ANY host).
     assert!(camelid::model::arch_requires_runnable_bridge_given(
         &config.architecture,
+        false,
+        true
+    ));
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        true,
         false
     ));
     assert!(camelid::model::arch_has_windowed_attention(&config));
@@ -1684,8 +1692,16 @@ fn gemma3_real_row_binds_all_104_norm_tensors_and_window_schedule() {
     // still the only correct serve path, and the CPU dense forward fails
     // closed at forward dispatch (H4) via `arch_has_windowed_attention`.
     assert!(!is_runnable_only_arch(&config.architecture));
+    // Both capability legs false => bridge; Phase 3c added the quantization
+    // leg (a non-Q8_0 gemma3 has no resident lane on ANY host).
     assert!(camelid::model::arch_requires_runnable_bridge_given(
         &config.architecture,
+        false,
+        true
+    ));
+    assert!(camelid::model::arch_requires_runnable_bridge_given(
+        &config.architecture,
+        true,
         false
     ));
     assert!(camelid::model::arch_has_windowed_attention(&config));

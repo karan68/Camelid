@@ -156,37 +156,109 @@ pub fn is_runnable_only_arch(architecture: &str) -> bool {
 }
 
 /// Capability-aware serve/direct-session routing predicate (gemma3→Metal
-/// Phase 3b): true when this arch, ON THIS HOST, must be served through the
-/// runnable bridge because no optimized lane can run it correctly here.
-///
-/// - qwen35 / gemma2: always true ([`is_runnable_only_arch`]).
-/// - gemma3: true only where the Metal-resident lane cannot serve it
-///   (non-macOS hosts, `CAMELID_METAL_RESIDENT_DECODE=0` / deterministic
-///   mode, no Metal device, or a CUDA-resident process — the CUDA engine has
-///   no windowed forward). On a resident-capable host gemma3 routes to the
-///   dense/resident path and this returns false.
+/// Phase 3b, quant-aware since Phase 3c): true when this MODEL FILE, ON THIS
+/// HOST, must be served through the runnable bridge because no optimized lane
+/// can run it correctly here.
 ///
 /// The fallback is the runnable bridge, NEVER the CPU dense forward: the CPU
 /// dense forward has no sliding-window mask and fails closed for windowed
-/// archs at forward dispatch (hazard H4), so a routing mistake surfaces as a
-/// typed error instead of fluent-looking full-causal garbage.
-pub fn arch_requires_runnable_bridge(architecture: &str) -> bool {
+/// archs at every per-layer dispatch (hazard H4), so a routing mistake
+/// surfaces as a typed error instead of fluent-looking full-causal garbage.
+///
+/// - qwen35 / gemma2: always true ([`is_runnable_only_arch`]).
+/// - a Q8_0 gemma3: true only where the Metal-resident lane cannot serve it
+///   (non-macOS hosts, `CAMELID_METAL_RESIDENT_DECODE=0` / deterministic
+///   mode, no Metal device, or a CUDA-resident process — the CUDA engine has
+///   no windowed forward). On a resident-capable host it routes to the
+///   dense/resident path and this returns false.
+/// - a non-Q8_0 gemma3 (Q4_K_M, Q5_K, …): true on EVERY host. Resident
+///   admission is pinned to the Q8_0 exact row in the mechanism (hazard H5 —
+///   the K-quant resident gather drops gemma3's embed scale and no windowed
+///   K-quant lane has a parity receipt), so a K-quant gemma3 has no resident
+///   lane to fall onto anywhere and must take the bridge that served it
+///   before the flip.
+///
+/// This is keyed on the FILE, not the arch string, precisely because the
+/// quantization is half the decision (Phase 3c finding F3: an arch-only
+/// predicate stranded every non-Q8_0 gemma3 — routed to the dense lane,
+/// declined by H5, then H4-errored on every request).
+pub fn file_requires_runnable_bridge(gguf: &GgufFile) -> bool {
+    let architecture = gguf.architecture().unwrap_or_default();
     arch_requires_runnable_bridge_given(
         architecture,
         crate::inference::windowed_arch_resident_host_available(),
+        windowed_arch_resident_quant_admissible(gguf),
     )
 }
 
-/// Pure decision half of [`arch_requires_runnable_bridge`], split so the
-/// capability split is unit-testable without touching process env or a Metal
-/// device: `windowed_resident_host_available` is the host-capability probe
-/// result ([`crate::inference::windowed_arch_resident_host_available`]).
+/// Pure decision core of [`file_requires_runnable_bridge`], split so the
+/// routing split is unit-testable without touching process env, a Metal
+/// device, or a GGUF on disk.
+///
+/// - `windowed_resident_host_available`: the host-capability probe result
+///   ([`crate::inference::windowed_arch_resident_host_available`]).
+/// - `windowed_resident_quant_admissible`: whether the FILE's weights satisfy
+///   the H5 Q8_0 pin ([`windowed_arch_resident_quant_admissible`]).
+///
+/// A windowed arch needs BOTH to take the resident lane; failing either sends
+/// it to the runnable bridge, which is correct (slow) for every gemma3 quant.
 pub fn arch_requires_runnable_bridge_given(
     architecture: &str,
     windowed_resident_host_available: bool,
+    windowed_resident_quant_admissible: bool,
 ) -> bool {
     is_runnable_only_arch(architecture)
-        || (architecture == "gemma3" && !windowed_resident_host_available)
+        || (arch_string_has_windowed_attention(architecture)
+            && !(windowed_resident_host_available && windowed_resident_quant_admissible))
+}
+
+/// Arch-string mirror of [`arch_has_windowed_attention`] for the surfaces that
+/// run BEFORE the config is parsed (routing, the planner, the CLI admission
+/// guards). gemma3 is the only windowed arch today; a future one must be added
+/// here in lockstep with the parsed-metadata predicate.
+pub fn arch_string_has_windowed_attention(architecture: &str) -> bool {
+    architecture == "gemma3"
+}
+
+/// Whether this file's weights satisfy the windowed-arch resident admission
+/// pin (hazard H5), decided from GGUF metadata BEFORE any weights load.
+///
+/// Mirrors the engine-level pin in `inference::resident_decode_eligible`
+/// exactly: every per-layer linear (Q/K/V/O + FFN gate/up/down) must be Q8_0.
+/// The engine remains authoritative — this is the routing-time predicate that
+/// keeps a file the engine will decline from being routed onto the dense lane
+/// in the first place. Non-windowed archs are unaffected (always `true`); the
+/// caller pairs this with an arch check.
+pub fn windowed_arch_resident_quant_admissible(gguf: &GgufFile) -> bool {
+    use crate::gguf::GgufTensorType;
+    const LAYER_LINEAR_SUFFIXES: [&str; 7] = [
+        ".attn_q.weight",
+        ".attn_k.weight",
+        ".attn_v.weight",
+        ".attn_output.weight",
+        ".ffn_gate.weight",
+        ".ffn_up.weight",
+        ".ffn_down.weight",
+    ];
+    let mut saw_layer_linear = false;
+    for tensor in &gguf.tensors {
+        if !tensor.name.starts_with("blk.") {
+            continue;
+        }
+        if !LAYER_LINEAR_SUFFIXES
+            .iter()
+            .any(|suffix| tensor.name.ends_with(suffix))
+        {
+            continue;
+        }
+        saw_layer_linear = true;
+        if tensor.tensor_type != GgufTensorType::Q8_0 {
+            return false;
+        }
+    }
+    // A file with no recognizable per-layer linears is not something the
+    // resident lane can admit either; fail closed to the bridge.
+    saw_layer_linear
 }
 
 /// Whether this model's attention carries a per-layer sliding-window schedule
@@ -2606,26 +2678,116 @@ mod tests {
         // never the CPU dense forward — everywhere else. qwen35/gemma2 are
         // bridge-only regardless of capability; dense archs never bridge.
         for capable in [false, true] {
-            for arch in ["qwen35", "gemma2"] {
-                assert!(
-                    super::arch_requires_runnable_bridge_given(arch, capable),
-                    "{arch} must require the runnable bridge on every host"
-                );
-            }
-            for arch in ["llama", "mistral", "qwen2", "qwen3", "gemma4", "phi3", ""] {
-                assert!(
-                    !super::arch_requires_runnable_bridge_given(arch, capable),
-                    "{arch:?} must never require the runnable bridge"
-                );
+            for q8 in [false, true] {
+                for arch in ["qwen35", "gemma2"] {
+                    assert!(
+                        super::arch_requires_runnable_bridge_given(arch, capable, q8),
+                        "{arch} must require the runnable bridge on every host"
+                    );
+                }
+                for arch in ["llama", "mistral", "qwen2", "qwen3", "gemma4", "phi3", ""] {
+                    assert!(
+                        !super::arch_requires_runnable_bridge_given(arch, capable, q8),
+                        "{arch:?} must never require the runnable bridge"
+                    );
+                }
             }
         }
         assert!(
-            super::arch_requires_runnable_bridge_given("gemma3", false),
+            super::arch_requires_runnable_bridge_given("gemma3", false, true),
             "gemma3 must fall back to the runnable bridge where the resident lane cannot serve"
         );
         assert!(
-            !super::arch_requires_runnable_bridge_given("gemma3", true),
+            !super::arch_requires_runnable_bridge_given("gemma3", true, true),
             "gemma3 must route to the dense/resident lane on a resident-capable host"
+        );
+    }
+
+    /// Phase 3c finding F3: routing was quant-blind, so a gemma3 Q4_K_M on a
+    /// resident-capable Mac was routed onto the dense lane, declined by the
+    /// H5 Q8_0 pin, and then H4-errored on every request — a hard regression
+    /// against the pre-flip bridge, which served every gemma3 quant. The
+    /// quantization is now half the decision.
+    #[test]
+    fn a_non_q8_windowed_row_requires_the_runnable_bridge_on_every_host() {
+        for capable in [false, true] {
+            assert!(
+                super::arch_requires_runnable_bridge_given("gemma3", capable, false),
+                "a non-Q8_0 gemma3 has no resident lane on any host \
+                 (windowed_resident_host_available={capable}); it must take the bridge"
+            );
+        }
+        // The Q8_0 row on a capable host is the ONLY combination that routes
+        // to the dense/resident lane — the causality control for the above.
+        assert!(!super::arch_requires_runnable_bridge_given(
+            "gemma3", true, true
+        ));
+    }
+
+    /// The routing-time Q8_0 pin must mirror the engine-level H5 pin in
+    /// `inference::resident_decode_eligible`: EVERY per-layer linear Q8_0.
+    /// One non-Q8_0 layer linear anywhere is enough to send the file to the
+    /// bridge, and a file with no recognizable layer linears fails closed too.
+    #[test]
+    fn windowed_quant_admission_requires_every_layer_linear_to_be_q8_0() {
+        use crate::gguf::{GgufFile, GgufTensorDescriptor, GgufTensorType};
+        let tensor = |name: &str, tensor_type: GgufTensorType| GgufTensorDescriptor {
+            name: name.to_string(),
+            dimensions: vec![32, 32],
+            tensor_type,
+            relative_offset: 0,
+            absolute_offset: 0,
+            n_bytes: 0,
+        };
+        let names = [
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+        ];
+        let empty = || GgufFile {
+            path: std::path::PathBuf::new(),
+            version: 3,
+            tensor_count: 0,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: Default::default(),
+            tensors: Vec::new(),
+        };
+        let file = |types: &[GgufTensorType]| {
+            let mut gguf = empty();
+            gguf.tensors = names
+                .iter()
+                .zip(types)
+                .map(|(name, t)| tensor(name, *t))
+                .collect();
+            // A non-layer tensor at a different quant must not affect the
+            // decision (token_embd is Q8_0 on this row, output is tied).
+            gguf.tensors
+                .push(tensor("token_embd.weight", GgufTensorType::Q8_0));
+            gguf
+        };
+        let all_q8 = [GgufTensorType::Q8_0; 7];
+        assert!(super::windowed_arch_resident_quant_admissible(&file(
+            &all_q8
+        )));
+        // Each single non-Q8_0 layer linear must disqualify on its own.
+        for idx in 0..names.len() {
+            let mut types = all_q8;
+            types[idx] = GgufTensorType::Q4K;
+            assert!(
+                !super::windowed_arch_resident_quant_admissible(&file(&types)),
+                "a Q4_K {} must disqualify the resident lane",
+                names[idx]
+            );
+        }
+        assert!(
+            !super::windowed_arch_resident_quant_admissible(&empty()),
+            "a file with no per-layer linears must fail closed to the bridge"
         );
     }
 

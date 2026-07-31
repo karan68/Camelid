@@ -14616,3 +14616,87 @@ fn windowed_arch_ghost_layer_probe_inherits_the_choke_point() {
         .expect_err("the ghost layer probe must refuse a windowed arch");
     assert_windowed_fail_closed(&err.to_string(), "per-layer prefill chunk");
 }
+
+// ---------------------------------------------------------------------------
+// gemma3→Metal Phase 3c, hazard H5: the windowed-arch Q8_0 admission pin.
+//
+// The review found the pin had ZERO causal coverage: it sits ~120 lines past
+// the backend-enabled bail in `resident_decode_eligible`, so on any host with
+// no resident backend armed — every ordinary `cargo test` run — deleting the
+// pin failed nothing. Arming the backend from inside a test is forbidden
+// (§9d), so the decision was extracted into
+// `windowed_arch_layers_violate_q8_pin` and is pinned here directly.
+// ---------------------------------------------------------------------------
+
+fn q8_linear(name: &str) -> CpuTensor {
+    CpuTensor::from_q8_0_blocks(
+        name,
+        TensorShape { dims: vec![1, 32] },
+        vec![Q8_0Block {
+            scale: 0.25,
+            quants: [1; 32],
+        }],
+    )
+    .unwrap()
+}
+
+fn q4k_linear(name: &str) -> CpuTensor {
+    let mut tensor = CpuTensor::from_f32(name, vec![1, 256], vec![0.0; 256]).unwrap();
+    tensor.source_type = Some(GgufTensorType::Q4K);
+    tensor.q4_k_wire_bytes = Some(Arc::new(vec![0; crate::tensor::Q4_K_BLOCK_BYTES]));
+    tensor.data.clear();
+    tensor
+}
+
+fn all_q8_layer() -> LlamaLayerWeights {
+    let (session, _temp_file) = tiny_kv_budget_session(8);
+    let mut layer = session.weights.layers[0].clone();
+    layer.attention_q = q8_linear("blk.0.attn_q.weight");
+    layer.attention_k = q8_linear("blk.0.attn_k.weight");
+    layer.attention_v = q8_linear("blk.0.attn_v.weight");
+    layer.attention_output = q8_linear("blk.0.attn_output.weight");
+    layer.ffn_gate = q8_linear("blk.0.ffn_gate.weight");
+    layer.ffn_up = q8_linear("blk.0.ffn_up.weight");
+    layer.ffn_down = q8_linear("blk.0.ffn_down.weight");
+    layer
+}
+
+/// H5: an all-Q8_0 windowed layer range satisfies the pin (the control — a pin
+/// that refused everything would pass the negative cases below for free), and
+/// swapping ANY ONE of the seven per-layer linears to Q4_K violates it. This
+/// fails if the pin is deleted or narrowed to a subset of the linears.
+#[test]
+fn windowed_arch_q8_pin_rejects_any_non_q8_layer_linear() {
+    let base = all_q8_layer();
+    assert!(
+        !windowed_arch_layers_violate_q8_pin(std::slice::from_ref(&base), false),
+        "an all-Q8_0 windowed layer must satisfy the H5 pin"
+    );
+
+    type LayerSwap = (&'static str, fn(&mut LlamaLayerWeights));
+    let swaps: [LayerSwap; 7] = [
+        ("attn_q", |l| l.attention_q = q4k_linear("q")),
+        ("attn_k", |l| l.attention_k = q4k_linear("k")),
+        ("attn_v", |l| l.attention_v = q4k_linear("v")),
+        ("attn_output", |l| l.attention_output = q4k_linear("o")),
+        ("ffn_gate", |l| l.ffn_gate = q4k_linear("gate")),
+        ("ffn_up", |l| l.ffn_up = q4k_linear("up")),
+        ("ffn_down", |l| l.ffn_down = q4k_linear("down")),
+    ];
+    for (label, swap) in swaps {
+        let mut layer = base.clone();
+        swap(&mut layer);
+        assert!(
+            windowed_arch_layers_violate_q8_pin(std::slice::from_ref(&layer), false),
+            "a Q4_K {label} must violate the H5 Q8_0 pin"
+        );
+    }
+
+    // One bad layer anywhere in the range disqualifies the whole range.
+    let mut bad = base.clone();
+    bad.ffn_down = q4k_linear("down");
+    assert!(windowed_arch_layers_violate_q8_pin(
+        &[base.clone(), base, bad],
+        false
+    ));
+}

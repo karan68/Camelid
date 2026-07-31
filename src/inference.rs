@@ -2934,19 +2934,7 @@ impl LlamaInferenceSession {
         // falls back to the runnable bridge for such a file (slow, correct)
         // instead of decoding unverified output under a resident label.
         if windowed_arch
-            && self.weights.layers[range.clone()].iter().any(|layer| {
-                [
-                    &layer.attention_q,
-                    &layer.attention_k,
-                    &layer.attention_v,
-                    &layer.attention_output,
-                    &layer.ffn_gate,
-                    &layer.ffn_up,
-                    &layer.ffn_down,
-                ]
-                .into_iter()
-                .any(|t| !is_q8(t))
-            })
+            && windowed_arch_layers_violate_q8_pin(&self.weights.layers[range.clone()], wire_ok)
         {
             bail!(
                 "windowed-attention arch resident admission is pinned to the Q8_0 exact row \
@@ -12405,8 +12393,19 @@ fn resident_decode_metal_enabled() -> bool {
 /// stack arms it; deterministic mode force-disables it), and no CUDA resident
 /// engine driving decode — the CUDA engine has no sliding-window/dual-theta
 /// forward, so a CUDA-resident process must keep gemma3 on the runnable
-/// bridge. Consumed by `crate::model::arch_requires_runnable_bridge`, the
+/// bridge. Consumed by `crate::model::file_requires_runnable_bridge`, the
 /// capability-aware routing predicate serve and the CLI direct lanes key on.
+///
+/// It ALSO requires that the macOS Q8 Metal-resident PLAN selection can fire
+/// (`execution_plan::macos_q8_metal_plan_selectable`). Phase 3c finding: the
+/// plan and routing were reading different gate sets, so `CAMELID_PROFILE=safe`
+/// or `CAMELID_MAC_Q8_METAL_PLAN=0` produced a plan that disclosed a CPU
+/// reference lane (or, in the windowed arm, "serve chats via the runnable
+/// bridge") on `/v1/health` and `/api/capabilities` while serve actually ran
+/// the Metal-resident lane. The plan is the user-visible disclosure; routing
+/// now honors the same opt-outs, so the two can no longer disagree, and an
+/// operator who asks for the safe profile gets the bridge rather than a
+/// silently-still-accelerated lane.
 ///
 /// The env half is read LIVE (the underlying flags are not latched); only the
 /// device probe is cached — device presence cannot change within a process,
@@ -12417,6 +12416,7 @@ pub(crate) fn windowed_arch_resident_host_available() -> bool {
         static METAL_DEVICE_PRESENT: OnceLock<bool> = OnceLock::new();
         resident_decode_metal_enabled()
             && !resident_decode_cuda_enabled()
+            && crate::execution_plan::macos_q8_metal_plan_selectable()
             && *METAL_DEVICE_PRESENT.get_or_init(|| crate::metal::detect_metal_device().available)
     }
     #[cfg(not(target_os = "macos"))]
@@ -12473,6 +12473,36 @@ fn windowed_arch_cpu_dense_admitted_for_tests() -> bool {
     {
         false
     }
+}
+
+/// Hazard H5 (gemma3→Metal Phase 3b) — pure decision half of the windowed-arch
+/// Q8_0 admission pin, so it can be tested WITHOUT arming a resident backend.
+///
+/// Phase 3c finding: the pin lived inline in `resident_decode_eligible`, which
+/// bails at the backend-enabled gate ~120 lines earlier on any host with no
+/// `CAMELID_*_RESIDENT_DECODE` armed — i.e. every ordinary `cargo test` run —
+/// so deleting the pin failed nothing anywhere. Arming the gate from inside a
+/// test is forbidden here (§9d: process-wide OnceLocks latch sibling tests onto
+/// different kernels), so the decision is extracted instead.
+///
+/// True when this windowed arch's layer range contains ANY non-Q8_0 per-layer
+/// linear — the condition that must send the file to the runnable bridge,
+/// because the K-quant resident lane's gather drops gemma3's embed scale and
+/// no windowed K-quant lane has a parity receipt.
+fn windowed_arch_layers_violate_q8_pin(layers: &[LlamaLayerWeights], wire_ok: bool) -> bool {
+    layers.iter().any(|layer| {
+        [
+            &layer.attention_q,
+            &layer.attention_k,
+            &layer.attention_v,
+            &layer.attention_output,
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &layer.ffn_down,
+        ]
+        .into_iter()
+        .any(|t| !metal_resident_weight_eligible(t, wire_ok))
+    })
 }
 
 fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) -> bool {
