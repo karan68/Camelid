@@ -1,13 +1,29 @@
-use std::{fs, path::Path};
+use std::{fs, net::TcpListener, path::Path};
 use tempfile::tempdir;
 
 use camelid::{
-    distributed::{run_worker_loop, DistributedClient, DISTRIBUTED_CLIENT, DISTRIBUTED_RANGE},
+    distributed::{
+        run_network_benchmark_worker_on_listener, run_worker_loop_on_listener, DistributedClient,
+        DISTRIBUTED_CLIENT, DISTRIBUTED_RANGE,
+    },
     gguf::read_metadata,
     inference::{LlamaInferenceSession, LlamaLoadedWeights},
     model::{LlamaModelConfig, LlamaTensorBinding},
     tensor::TensorStore,
 };
+
+/// Bind loopback on an OS-assigned free port.
+///
+/// These tests used to hard-code 127.0.0.1:8099 and 127.0.0.1:8098. On a
+/// developer box that also runs `camelid serve` the bind lost the race, the
+/// worker thread died silently, and the coordinator connected to whatever else
+/// held the port — producing an opaque `ConnectionReset`/`UnexpectedEof` on the
+/// *client* read with no hint that the worker never started. Binding here (not
+/// inside the worker thread) also means the socket is listening before the
+/// coordinator connects, so no readiness sleep is needed.
+fn bind_ephemeral() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0").expect("bind loopback ephemeral port")
+}
 
 #[test]
 fn test_distributed_pipeline_parallel_inference() {
@@ -36,16 +52,20 @@ fn test_distributed_pipeline_parallel_inference() {
     let worker_config = LlamaModelConfig::from_gguf(&gguf).unwrap();
     let worker_session = LlamaInferenceSession::new(worker_config, worker_weights).unwrap();
 
-    // Spawn Worker in background thread
+    // Spawn Worker in background thread. The listener is already bound, so the
+    // coordinator below can connect immediately.
+    let listener = bind_ephemeral();
+    let worker_addr = listener.local_addr().unwrap().to_string();
     let _worker_handle = std::thread::spawn(move || {
-        let _ = run_worker_loop("127.0.0.1:8099", worker_session);
+        if let Err(e) = run_worker_loop_on_listener(listener, worker_session) {
+            // Surface the worker's own failure. Without this the only symptom is
+            // an unexplained EOF on the coordinator's read.
+            eprintln!("distributed worker loop exited with error: {e:#}");
+        }
     });
 
-    // Wait for worker server to bind
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // 2. Coordinator Setup (Loads layer 0..1)
-    let client = DistributedClient::connect("127.0.0.1:8099").unwrap();
+    let client = DistributedClient::connect(&worker_addr).unwrap();
     let _ = DISTRIBUTED_CLIENT.set(client);
     let _ = DISTRIBUTED_RANGE.set((0, 1));
 
@@ -64,7 +84,9 @@ fn test_distributed_pipeline_parallel_inference() {
     let mut coord_session = LlamaInferenceSession::new(coord_config, coord_weights).unwrap();
 
     // Run forward pass on coordinator (which will delegate layer 1 to worker!)
-    let output = coord_session.forward_single_token(0).unwrap();
+    let output = coord_session
+        .forward_single_token(0)
+        .expect("coordinator forward pass (layer 1 is delegated to the worker over TCP)");
 
     // Assert logits are computed and the dimensions are correct
     assert_eq!(output.logits.shape.dims, vec![1, 16]); // [1, vocab_size]
@@ -78,17 +100,18 @@ fn test_distributed_pipeline_parallel_inference() {
 
 #[test]
 fn test_network_benchmark() {
-    // Spawn benchmark worker in background thread
+    // Spawn benchmark worker in background thread on an already-bound listener.
+    let listener = bind_ephemeral();
+    let worker_addr = listener.local_addr().unwrap().to_string();
     let _worker_handle = std::thread::spawn(move || {
-        let _ = camelid::distributed::run_network_benchmark_worker("127.0.0.1:8098");
+        if let Err(e) = run_network_benchmark_worker_on_listener(listener) {
+            eprintln!("network benchmark worker exited with error: {e:#}");
+        }
     });
-
-    // Wait for worker server to bind
-    std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Run coordinator benchmark locally
     let result = camelid::distributed::run_network_benchmark_coordinator(
-        "127.0.0.1:8098",
+        &worker_addr,
         10,   // ping_count
         1024, // payload_size
         10,   // bandwidth_mb

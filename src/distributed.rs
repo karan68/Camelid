@@ -205,9 +205,22 @@ impl DistributedClient {
 pub static DISTRIBUTED_CLIENT: OnceLock<DistributedClient> = OnceLock::new();
 pub static DISTRIBUTED_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 
-pub fn run_worker_loop(addr: &str, mut session: LlamaInferenceSession) -> anyhow::Result<()> {
+pub fn run_worker_loop(addr: &str, session: LlamaInferenceSession) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    tracing::info!(addr = %addr, "Distributed Worker TCP server listening");
+    run_worker_loop_on_listener(listener, session)
+}
+
+/// Serve the worker protocol on an already-bound listener.
+///
+/// Callers that must know the port before the loop starts — tests binding
+/// `127.0.0.1:0` for an ephemeral port — bind themselves and hand the listener
+/// over, so there is no window in which the address is unbound and no
+/// hard-coded port to collide with.
+pub fn run_worker_loop_on_listener(
+    listener: TcpListener,
+    mut session: LlamaInferenceSession,
+) -> anyhow::Result<()> {
+    tracing::info!(addr = ?listener.local_addr(), "Distributed Worker TCP server listening");
 
     for stream in listener.incoming() {
         let mut stream = match stream {
@@ -274,7 +287,13 @@ pub fn run_worker_loop(addr: &str, mut session: LlamaInferenceSession) -> anyhow
 
 pub fn run_network_benchmark_worker(addr: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    tracing::info!(addr = %addr, "Network benchmark worker TCP server listening");
+    run_network_benchmark_worker_on_listener(listener)
+}
+
+/// Benchmark counterpart to [`run_worker_loop_on_listener`]: serve on a
+/// listener the caller already bound.
+pub fn run_network_benchmark_worker_on_listener(listener: TcpListener) -> anyhow::Result<()> {
+    tracing::info!(addr = ?listener.local_addr(), "Network benchmark worker TCP server listening");
 
     for stream in listener.incoming() {
         let mut stream = match stream {
