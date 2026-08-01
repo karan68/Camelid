@@ -1968,3 +1968,1352 @@ reasons any one of which is sufficient:
 - The prompt-prefix-cache exclusion (§9e-5) is a real multi-turn cost and was NOT addressed:
   it is a KV-format and correctness change, not a perf commit, and the Phase 4 gates cannot
   validate it.
+
+---
+
+## 16. Long-prompt TTFT campaign, Phase 1 record — the parity harness (2026-07-31)
+
+A **new campaign** starts here, on branch `feat/gemma3-batched-prefill` off `main` at
+`a5945f8a`. Its target is TTFT on long prompts: prefill is token-by-token today
+(`session_prefill_chunk_tokens` hard-returns `1` for any windowed arch), so a 2 400-token
+prompt costs 2 400 sequential 26-layer command buffers. Its plan has two tiers — Tier A,
+batched weight streaming with a raw-bit gate; Tier B, windowed attention-as-matmul at
+head_dim 256.
+
+**Phase 1 builds the gate and nothing else. No kernel work was started, and none should be
+until this record's numbers are read.** The campaign's own recon found the existing windowed
+evidence has near-zero power against the exact error class the coming kernels introduce, so
+every downstream receipt would have been unfalsifiable. §16a explains what was wrong with
+it; §16b-§16f are the replacements; §16g is what the mutation run actually found, including
+the parts that should change the Tier A/B plan.
+
+### 16a. What the existing windowed evidence could not see
+
+Read off the committed files, not inferred:
+
+1. **The windowed pack cycles its content.** `qa/prompt-packs/gemma3-windowed-context-pack-v1.json`
+   builds its three prompts from a pool of **30 unique sentences cycled up to 8x** — 211
+   sentences, 30 distinct, at N=2403. A window-boundary error moves the edge across
+   verbatim-duplicate text, so the same information stays reachable from the duplicate.
+2. **Its load-bearing fact is out of every window.** "Willow" occurs only at character 48,
+   ~token 12. No query past position 523 has it in a 512-window at all, so at N=2403 it is
+   reachable **only through the 4 global layers** — which no window mutation touches. The
+   pack is a strong test of global-layer reach and almost no test of the 22 sliding layers.
+3. **No length is a boundary.** 606/1205/2403 are 30/53/35 mod 64 and 94/53/35 mod 128 — not
+   a tile multiple, not a tile edge, not a window edge.
+4. **The windowed sample is 31 content tokens**, not 9 legs: depths 1/5/50 are strict
+   prefixes of one greedy continuation, 14/8/9 content tokens across the three prompts.
+5. **Token identity was measured on re-encoded text**, not on the engine's ids
+   (`scripts/chat-parity-gemma3.mjs`), which is lossy in both directions on this 262k SPM
+   vocab — §16d.
+6. **No margins were recorded**, so the sensitivity of a passing leg could not be estimated
+   afterwards.
+
+The measured dead zone this leaves: reduction-order noise on this row is **2.122e-4** max
+|logit diff| (§9), and the smallest observed argmax flip sits at a **0.0032-nat** top-2 gap
+(§13). A perturbation between those bounds is invisible to any argmax-only gate.
+
+### 16b. The window convention, pinned once — `src/window_ref.rs`
+
+Three sites encoded `[max(0, p+1-w) ..= p]` separately (the Metal resident decode encode,
+the gemma4 CPU runtime, and the doc on `Gemma3Metadata::layer_window`), and **two of them
+cited a `src/model.rs is_position_visible` that does not exist**. `window_bounds()` is now
+the single reference, and its unit tests assert it against verbatim re-statements of the
+other two expressions over 0..2600 positions and six window values.
+
+`is_visible(query, key, window)` is written as `key + window > query`, never
+`key >= query - window`. The subtraction underflows for `query < window` on unsigned types —
+exactly the bug class that appears when the bound moves from host Rust (`saturating_sub`)
+into MSL, which has no such thing. The `>` rather than `>=` is where the
+INCLUDES-current-position convention lives: at `key = query + 1 - window` the predicate is
+`query + 1 > query` (visible, the oldest in-window position), and at `key = query - window`
+it is `query > query` (hidden, the first position outside).
+
+### 16c. The KV-equivalence invariant — `src/kv_equivalence.rs` + `ResidentDecodeState::kv_snapshot`
+
+End-to-end token identity is the right *outer* gate and a poor *inner* one: one argmax per
+step, after 26 layers of mixing. The direct claim is cheaper and far sharper — **a batched
+prefill of n tokens must leave the KV cache in the same state as n token-by-token
+forwards** — a per-(layer, position, head, dim) comparison with no softmax between the
+defect and the observable.
+
+- **Tier A** asserts `assert_bit_identical`. Batching over the token dimension re-associates
+  no reduction, so there is no tolerance to negotiate; a differing bit is a bug.
+- **Tier B** asserts `meets_bound(published bound, outlier factor)`. The scalar bound alone
+  is satisfiable by a kernel that is uniformly slightly wrong; the **outlier half** is what
+  has power — a uniform small delta is reduction noise, one position 10x above the
+  per-position median is a mask or stride defect.
+
+Two properties decide where a defect becomes visible, and both are asserted rather than
+assumed:
+
+- **Layer 0's cache is mask-independent.** Its K/V come from the token embedding, never from
+  attention, so a mask defect first appears in layer 1's cache. A RoPE defect, by contrast,
+  *must* move layer 0 — K is rotated before the cache write — and the synthetic gate asserts
+  that direction too.
+- **The last layer's attention reaches no KV cache at all.** A defect confined to it moves
+  **zero** cache elements. This is not hypothetical: building the gate produced exactly that
+  shape (§16e), and it found a hole in the invariant's own bound check, which is the whole
+  argument for writing the harness before the kernels.
+
+### 16d. The chat-parity harness now reads the engine's ids
+
+`scripts/chat-parity-gemma3.mjs` computed camelid's "tokens" by re-encoding camelid's output
+**string** with camelid's tokenizer. That round-trip is lossy in both directions:
+
+- it **manufactured** divergences — a run of spaces re-encodes as single-space tokens
+  (236743) where the engine emitted the merged whitespace tokens (138, 140), which is why
+  the Phase 4 bundle had to add `camelid-raw-probe.json` to unpick the artifact;
+- it **masked** them — any two id sequences that decode to the same string, or that the
+  tokenizer re-merges to the same canonical ids, compare EQUAL. A batched-prefill defect
+  that changes an id without changing the rendered text is invisible to it. That is the
+  defect class this campaign exists to catch.
+
+`token_match` is now scored on `camelid.generated_token_ids`, with trailing EOG ids (1, 106)
+stripped identically from both sides. A lane returning no diagnostics block makes the harness
+**throw**, not fall back. The old re-encode survives as `text_reencode_token_match`, reported
+and never scored, with a `text_reencode_artifact` flag that fires when the ids agree and the
+re-encode does not. `--top-logprobs N` (default 0, i.e. the request shape the frozen bundles
+used) records per-position top-2 margins on both engines.
+
+### 16e. The synthetic gate — and the hole it found in the invariant
+
+`metal_kv_snapshot_equivalence_catches_window_and_rope_mutations` runs in the DEFAULT suite:
+a 3-layer synthetic fixture, no GGUF, no model load. It establishes a positive control (two
+independent sessions, same schedule, same inputs -> bit-identical KV and equal digest) and
+then requires six schedule mutations to turn the invariant red. Measured, all six caught:
+
+| mutant | differing elements | kv max abs | hidden max abs | first difference |
+|---|---:|---:|---:|---|
+| `window_minus_one` | 7 296 / 13 824 | 1.083e1 | 4.073e0 | K layer 1 position 3 |
+| `window_plus_one` | 6 272 / 13 824 | 4.550e0 | 4.930e-1 | K layer 1 position 4 |
+| `no_lower_bound` (full causal) | 6 272 / 13 824 | 1.020e1 | 3.260e0 | K layer 1 position 4 |
+| `window_on_all_layers` | **1 152 / 13 824** | **0.000e0** | 2.356e0 | **final_hidden[0]** |
+| `window_on_the_wrong_layers` | 6 272 / 13 824 | 1.020e1 | 4.668e0 | K layer 1 position 4 |
+| `rope_tables_swapped` | 11 376 / 13 824 | 2.083e0 | 4.315e-1 | K layer **0** position 1 |
+
+Two rows carry findings:
+
+- **`window_on_all_layers` moves ZERO cache bits.** The mutation is confined to the last
+  layer, whose attention output projects no K/V, so every one of its 1 152 differing
+  elements is in the final hidden. An earlier draft of `meets_bound` checked only the caches
+  and **passed this mutant**. It now bounds the final hidden separately. Tier A/B harnesses
+  must therefore always capture a final-hidden (or logits) vector alongside the caches, or
+  a last-layer mask defect ships silently.
+- **`rope_tables_swapped` is the only mutant that reaches layer 0**, because RoPE is applied
+  to K *before* the cache write. The mask-only mutants are asserted to leave layer 0 exactly
+  untouched, and do.
+
+The gate also asserts the invariant's **blind spot**, so it stays documented rather than
+being rediscovered: with `filled <= window`, widening the window (or dropping it entirely) is
+a **bit-exact no-op**. Prompts must exceed the window to have any power over its bound.
+
+### 16f. The new pack — `qa/prompt-packs/gemma3-window-edge-pack-v1.json`
+
+24 items, built by the committed generator `scripts/build-gemma3-window-edge-pack.mjs`
+against the pinned oracle's tokenizer (`/tokenize`, `add_special=true`), which is what makes
+the token positions *measured* rather than estimated. Every item carries its
+`prompt_token_ids`, so the in-src mutation harness needs no tokenizer and the positions are
+checkable without re-running the generator.
+
+| item | tokens | anchors (offset from q) | window power |
+|---|---:|---|---|
+| `w-edge-q-510` | 1 024 | q-510 `crimson` (inside) | high |
+| `w-edge-q-511` | 1 024 | q-511 `amber` — the OLDEST visible position | high |
+| `w-edge-q-512` | 1 024 | q-512 `indigo` — the FIRST invisible position | high |
+| `w-edge-q-513` | 1 024 | q-513 `emerald` (outside, control) | high |
+| `w-multi-1536` | 1 536 | q-1024, q-552, q-511, q-64 | high |
+| `w-multi-2400` | 2 400 | q-2048, q-1024, q-552, q-511, q-64 | high |
+| `w-len-{63,64,65}` | 63/64/65 | — | **none** |
+| `w-len-{127,128,129}` | 127/128/129 | — | **none** |
+| `w-len-{255,256,257}` | 255/256/257 | — | **none** |
+| `w-len-511` | 511 | — | **none** |
+| `w-len-{512,513}` | 512/513 | — | minimal |
+| `w-len-{1023,1024,1025}` | 1023/1024/1025 | q-511 | high |
+| `w-len-{2400,2432,2433}` | 2400/2432/2433 | q-511 | high |
+
+Design points, each answering a specific defect in §16a:
+
+- **Content is non-repeating and it is asserted, not assumed.** No body sentence appears
+  twice anywhere in the pack; no anchor gate or colour is reused. The generator filters the
+  anchor vocabulary against every filler word list, which caught `copper` clashing with the
+  filler place "copper works" — a hand audit had already missed it.
+- **The four `w-edge-*` items are identical in construction and differ only in anchor
+  placement**, so a change in answer between them is attributable to the mask and nothing
+  else. Their answer word occurs exactly once per prompt, enforced at build time.
+- **Lengths are exact** and sit on the 512-window, the 64-wide NR0/NR1 attention tiles, and
+  the `n_pad = next_multiple_of(128)` boundary (2432 is n_pad; 2433 pushes n_pad to 2560).
+
+Three limits are recorded in the pack itself rather than discovered later:
+
+1. **`window_power: none` below 512 tokens is a fact about the arithmetic, not a weakness of
+   the content.** Below saturation `filled.saturating_sub(w)` is 0 for every `w`. Those nine
+   items exist for the Tier B TILE geometry and each says so.
+2. **At N=512 and N=513 the window edge lands on the TEMPLATE PREFIX, not on text** — the
+   position that moves in or out is 0 (BOS) and 1 (`<start_of_turn>`). No content anchor is
+   possible there, so those two items probe the attention-sink tokens instead.
+3. **A q-511/q-512 anchor PAIR inside one prompt is geometrically impossible**: an anchor
+   sentence is ~9 tokens long. Consecutive anchors in the multi-depth items are kept >=40
+   tokens apart, and the exact one-token pair is carried by the dedicated single-anchor
+   items. This is why there are four `w-edge-*` items rather than one.
+
+**And the honest framing of what the pack proves.** A sliding-window model can still recall a
+fact from outside a single layer's window by STACKING — 22 sliding layers give an effective
+receptive field of ~22x511 positions. The pack therefore does **not** claim that a correct
+implementation fails to recall a q-512 fact, and any harness built on that assumption would
+be wrong. Its power comes from **output sensitivity to the mask**: the token stream must
+change when the bound moves, scored against a reference run, never against a notion of the
+right answer.
+
+### 16g. The mutation run — and the finding that changes the Tier A/B plan
+
+`gemma3_real_row_window_mutation_harness` on the real row, 9-item mutation subset, 12 greedy
+tokens per leg, 8 schedules (production + 7 defects), 1 761 s in one process. Positive
+control first: two baseline runs of `w-len-513` gave identical tokens and **bit-identical KV**
+(digest `9c51bfa9b0c9eef9`).
+
+The defects are applied as `ResidentLayerSchedule` perturbations, not as scratch edits to the
+window arithmetic, and that is exact rather than convenient: `window_start =
+filled.saturating_sub(w)` means a schedule of `w-1` **is** "window_start off by +1 wherever
+the window is saturated", and `w+1` is the off-by-one the other way. The tree is left clean.
+
+**All seven mutants caught — `survivors` is empty — and the gate PASSES.** Which observable
+caught them is the result:
+
+| mutant | caught by TOKEN identity | caught by KV equivalence |
+|---|---:|---:|
+| `window_minus_one` (w-1) | **0 / 9** | 9 / 9 |
+| `window_plus_one` (w+1) | **0 / 9** | 9 / 9 |
+| `window_on_all_layers` | 6 / 9 | 9 / 9 |
+| `layer_pattern_shift_by_one` | 8 / 9 | 9 / 9 |
+| `no_lower_bound` (full causal) | 9 / 9 | 9 / 9 |
+| `window_on_wrong_layers` | 9 / 9 | 9 / 9 |
+| `rope_tables_swapped` | 9 / 9 | 9 / 9 |
+
+**A one-position window error changed not a single generated token on any of the nine items —
+including the four built specifically to make it visible, at 1 024 tokens with the answer word
+planted at exactly q-510 / q-511 / q-512 / q-513.** It is invisible to argmax at every length
+tested, 513 through 2 400.
+
+Its KV signature, by contrast, is unmistakable. Per item, for the two off-by-one mutants:
+
+| item | tokens | max abs ΔKV (w-1 / w+1) | per-position median (w-1 / w+1) | differing elements |
+|---|---:|---|---|---|
+| `w-edge-q-510` | 1 024 | 1.157 / 3.419 | 9.87e-3 / 6.37e-3 | ~6.8M / 13.9M |
+| `w-edge-q-511` | 1 024 | 0.996 / 8.598 | 1.42e-2 / 5.64e-3 | ~6.8M / 13.9M |
+| `w-edge-q-512` | 1 024 | 2.140 / 0.848 | 1.14e-2 / 6.06e-3 | ~6.8M / 13.9M |
+| `w-edge-q-513` | 1 024 | 0.771 / 1.002 | 1.37e-2 / 5.25e-3 | ~6.8M / 13.9M |
+| `w-multi-1536` | 1 536 | 11.502 / 10.885 | 3.50e-2 / 3.87e-2 | ~13.4M / 20.7M |
+| `w-multi-2400` | 2 400 | 3.107 / 1.788 | 4.19e-2 / 4.37e-2 | ~24.4M / 32.2M |
+| `w-len-513` | 513 | 0.583 / 0.429 | **0.0 / 0.0** | 287 743 / 7.1M |
+| `w-len-1024` | 1 024 | 1.637 / 1.416 | 1.33e-2 / 2.80e-3 | ~6.8M / 13.9M |
+| `w-len-2400` | 2 400 | 4.414 / 24.357 | 3.01e-2 / 3.33e-2 | ~24.4M / 32.2M |
+
+Against a reduction-noise floor of 2.122e-4, every one of those is 3-5 orders of magnitude
+clear. `w-len-513` is the sharpest case for the **outlier** half of the Tier B bound: its
+per-position median is exactly **0.0** (only 1-2 of 513 query positions clip, so the median
+across positions is zero) while 287 743 elements differ. A scalar bound alone would have to be
+set absurdly tight to see that; the per-position outlier test sees it immediately.
+
+A consistency check the data produced without being asked: at N=513, `window_plus_one` and
+`no_lower_bound` give **identical** KV numbers (274 944 differing, max 4.2887e-1, hidden
+1.4681). They must — a 513-wide window never clips 513 positions, so w+1 *is* full causal
+there.
+
+**Consequences, and they are not small:**
+
+1. **Gate G9 (external oracle, token identity) cannot carry Tier B on its own.** It has
+   measured zero power against the campaign's headline defect. It stays as the outer gate;
+   it is not the gate.
+2. **G1/G6 (KV equivalence) are promoted from "cheap direct check" to MANDATORY for both
+   tiers.** Tier A already had a raw-bit gate; Tier B must publish a bound AND the
+   per-position outlier factor, and the outlier half is the half with the power.
+3. **A Tier B harness must capture the first-token logits (or a final hidden) alongside the
+   caches.** The last layer's attention reaches no KV cache; §16e showed a mutant that moves
+   zero cache bits and is visible only there.
+4. **The pack's own high-power items did not save token identity.** Planting the answer word
+   at exactly q-511 and q-512 was the strongest content design available and it still did not
+   flip an argmax. This is not a defect of the pack — it is the measured ceiling of what
+   argmax observation can do on this row, and it should be quoted whenever someone proposes
+   token identity as a sufficient gate.
+
+### 16h. Baseline on the current (token-by-token) lane
+
+`scripts/chat-parity-gemma3.mjs` against the Metal GPU-resident serve lane, new pack, depths
+1/5/50, margins armed. Bundle
+`qa/evidence-bundles/gemma3-1b-q8-window-edge-harness-20260731-head-a82dd41a/`.
+
+- **Cross-engine prompt tokenization identical 24/24** — the pack's own `prompt_tokens`
+  matched the oracle's `/tokenize` on every item, so the exact lengths are real.
+- **70/72 generation legs token-AND-text identical**, `all_pass: false`.
+- **48/48 depth-1 and depth-5 legs clean.** Both failures are depth-50.
+- **All six anchored window items clean at every depth**, per-leg minimum top-2 margins
+  3.45-7.81 nats. Those are the items the window gates rest on.
+- The two failures, disclosed with their margins at the divergence position:
+  `w-len-256` depth 50, index 13, camelid gap **0.468** nat / oracle 0.235 nat; `w-len-513`
+  depth 50, index 5, camelid gap **0.0696** nat / oracle 0.314 nat. Both are unanchored
+  ladder items carrying the open-ended "name one item mentioned above" question, both sit
+  inside the near-tie band this row already discloses (§13: flips at 0.0032 / 0.0173 /
+  0.0353 nat, largest disclosed oracle-side gap 0.447), and neither is a window item.
+  Neither is excused: the receipt ships with `all_pass: false`.
+
+**One negative finding worth keeping.** `text_reencode_artifact` fired on **0/72** legs, and
+the old text round-trip disagreed with the engine ids on 0 legs where the ids matched. On
+this pack the fixed harness reaches the same verdict the old one would have. The fix is a
+*power* fix for the defect class ahead — an id change that does not change the rendered text
+— not a correction of a wrong result here, and it should not be advertised as one.
+
+### 16i. Gates and what was deliberately not done
+
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`
+and `scripts/check-public-scrub.sh` all clean. The two real-row tests are env-gated and skip
+in the default suite; the synthetic KV-equivalence gate runs in it.
+
+Deliberately not done:
+
+- **No kernel work.** Not one line of MSL, no admission-predicate change, no env flag. Phase
+  1 is the harness.
+- **No pack item was softened after seeing a result.** The two failing depth-50 legs stay in
+  the pack and in the receipt with their margins.
+- **No re-run of the mutation harness to tidy a denominator.** `differing_elements` in the
+  committed receipt is counted against a caches-only `compared_elements`; the code was
+  corrected afterwards so future receipts share one denominator, and the bundle README says
+  so rather than the numbers being regenerated to look neater.
+- **No promotion of any surface.** No README, COMPATIBILITY, STATUS or ledger edit; the row's
+  claims are unchanged. This phase adds a gate, not a claim.
+
+### 16j. Handover to Phase 2
+
+The GO condition on Tier B ("Phase 1's harness detects all five mutants") is **met, with all
+seven**, but the plan's gate list must be amended by §16g before Phase 2 starts:
+
+- G1 (raw `to_bits` KV equality, batched vs token-by-token, over the length sweep) is
+  implementable today: `ResidentDecodeState::kv_snapshot` + `kv_equivalence::compare` +
+  `assert_bit_identical`. Tier A should assert it at the pack's exact lengths, which now
+  include the tile and n_pad edges the old evidence never touched.
+- G6's bound must be published **with** its outlier factor, and the harness must capture the
+  first-token logits.
+- G9 stays, and its measured limitation is now on record.
+- The prompt-prefix cache remains closed on this row, so nothing here interacts with it.
+
+## 17. Long-prompt TTFT campaign, Phase 2 record — Tier A, batched weight streaming (2026-07-31)
+
+Branch `feat/gemma3-batched-prefill`, off `main` at `a5945f8a`. Phase 2 builds Tier A: batch
+the weight-streaming half of prefill, opt-in, and hold it to raw bit-identity against the
+shipped token-by-token lane. **The gate passed on the first run and every campaign gate stayed
+green. The performance thesis did not: the measured win is 1.07-1.13x, against the plan's
+projected 2.0-3.6x, and §17e explains why with a mechanism rather than a shrug.** Read §17e
+before planning Tier B — it changes what the remaining prize is.
+
+### 17a. What shipped
+
+Everything is behind `CAMELID_GEMMA3_BATCH_PREFILL`, **default OFF this phase**. A non-gemma3
+row cannot reach it: the arming predicate is a conjunction with `config.gemma3.is_some()`.
+
+| piece | where |
+|---|---|
+| `prefill_tokens_windowed` / `_hidden` / `_inner` | `src/metal.rs` |
+| `schedule_window_bounds` — the window expression, written once, shared with `prepare_token` | `src/metal.rs` |
+| `gemma3_batch_prefill_enabled` / `gemma3_batch_prefill_rows` | `src/metal.rs` |
+| `gemma3_batched_prefill_armed`, dual arming gate, per-position dual-theta tables, G11 assert | `src/inference/metal_resident.rs` |
+
+The shape is `verify_batch_inner`'s, not `prefill_tokens`'. Inside a chunk, every stage whose
+output depends on one row runs the EXACT single-token kernel at a row byte offset (per-head
+QK-norm, RoPE, K/V scatter, attention); every stage that streams a weight matrix runs the
+proven byte-exact batched twin (`rms_norm_batch_f32`, the C0 batched-column GEMV); the
+elementwise stages run the same kernels with a wider `n`.
+
+### 17b. The four blockers, and how each was handled
+
+`prefill_tokens` refuses gemma3 on four independent gates. The campaign plan's §2.5 is
+confirmed: head_dim is only one of them, and relaxing it alone gets nothing.
+
+1. **head_dim > 128.** NOT relaxed. `MAX_DPL` / `MAX_DOCT` and the `<= 128` host gates on
+   `prefill_tokens`, `verify_batch` and the split-K route are untouched — they are
+   memory-safety gates shared by eleven kernels. Tier A is a *separate admission path* with no
+   fixed per-lane array anywhere in its chain, so 256 is admissible there and nowhere else.
+2. **The dual-theta schedule.** Carried: the ALT/primary table pair is selected per layer from
+   `schedule.use_alt_rope[l]`, mirroring `prepare_token` verbatim, and the caller must supply
+   the ALT tables for every position or the path fails closed. The tables are built per
+   position with `rope::gemma3_rope_tables` for BOTH thetas — the runnable-oracle frequency
+   form the decode path uses, NOT the generic negated-exponent form the existing prefill
+   builds. That was not cosmetic: the generic form's last-ULP drift would have shown up
+   directly as a G1 failure.
+3. **The sandwich norms.** Carried as two extra `rms_norm_batch_f32` dispatches per layer,
+   applied to the attention and FFN outputs BEFORE their residual adds, exactly as
+   `encode_attention_block` / `encode_ffn_block` do.
+4. **GeGLU.** Carried by dispatching the same `gelu_mul_f32` the decode encode uses with
+   `n = rows * ffn_dim`. Zero new MSL, as the plan predicted.
+
+**`use_attn_mm` is not on this path at all.** Its `!has_qk_norm` clause would refuse this
+QK-norm arch, and its `head_dim <= 128` clause would refuse this row — but attention-as-matmul
+is Tier B, and Tier A routes every row's attention through the unchanged `encode_attention`,
+which at head_dim 256 lands on `encode_attention_split3`, the exact kernel the shipped lane
+already runs. The sliding-window mask therefore needs no new kernel and no new MSL: the
+per-row `(window_start, position_count)` ride in through the attention scalar's
+`kv_base_offset` word, the same mechanism the token-by-token lane uses.
+
+**The window expression is now written once.** Three sites used to encode it separately.
+`schedule_window_bounds` is the shipped `filled.saturating_sub(w)` verbatim — deliberately NOT
+a call to `window_ref::window_bounds`, because the two disagree on the degenerate `Some(0)`,
+and bit-identity with the shipped lane is the gate. A test pins their agreement for every
+`w > 0` over 2 600 positions and records the one input where they differ.
+
+**G11 is asserted, not assumed.** `filled()` must equal `n` after the prefill or the caller
+declines and falls back losslessly. A short `filled` would re-seed from a CPU KV cache this
+lane deliberately leaves hollow, decline at `history_materialized`, and drop the whole prompt
+onto a CPU path that fails closed for windowed archs.
+
+### 17c. Gate G1 — bit-identity, measured
+
+Both sides are fed the SAME embedding array, so an embedding-lookup difference can neither
+mask nor manufacture a result. The final hidden is compared alongside the caches, because the
+last layer's attention reaches no KV cache at all (§16e found a mutant that moves zero cache
+bits).
+
+**Real row** (`gemma3_real_row_batched_prefill_kv_bit_identical`), 26 layers, head_dim 256,
+the shipped 22-sliding/4-global schedule, chunk 256:
+
+| n | elements compared | bit-identical |
+|---:|---:|---|
+| 5 | 72 320 | **yes** |
+| 256 | 3 702 784 | **yes** |
+| 257 | 3 717 248 | **yes** |
+| 513 | 7 420 032 | **yes** |
+| 1 024 | 14 811 136 | **yes** |
+
+**Synthetic** (`metal_batched_windowed_prefill_is_bit_identical_to_token_by_token`), 4 layers,
+head_dim 256, chunk 4, window 6, at n = 1/3/4/5/6/7/8/9/13/17 — chunk edges, exact multiples,
+ragged tails and both sides of window saturation. Bit-identical at every length, for the
+gemma3 shape (dual-theta + sandwich norms + GeGLU + QK-norm) **and** for a plain Llama shape
+run through the same entry point.
+
+No tolerance was negotiated and none was needed. Batching over the token dimension
+re-associates no reduction, so this was the expected outcome; it is recorded because the
+campaign's stopping rule 3 says a G1 failure is a bug to fix, not a bar to lower.
+
+### 17d. The other campaign gates — all unchanged
+
+| gate | result |
+|---|---|
+| `gemma3_real_row_resident_forward_matches_runnable_oracle` | 50/50 greedy tokens identical, overall max abs logit diff **2.122e-4** — the pinned constant, unchanged |
+| `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle` | 5/5 identical, **7.820e-5** — unchanged |
+| `gemma3_real_row_window_mutation_harness` (G7) | all **7/7** mutants caught, re-run with Tier A in the tree (1 683 s, one process). Per-mutant token/KV: `window_minus_one` 0/9 and 9/9, `window_plus_one` 0/9 and 9/9, `no_lower_bound` 9/9 and 9/9, `window_on_all_layers` 6/9 and 9/9, `window_on_wrong_layers` 9/9 and 9/9, `layer_pattern_shift_by_one` 8/9 and 9/9, `rope_tables_swapped` 9/9 and 9/9 — reproducing §16g exactly, including the finding that a one-position window error changes NO generated token on any of the nine items |
+| window-edge pack vs pinned llama.cpp `acd79d603`, **flag ON** | **70/72** legs token-AND-text identical, prompt tokenization 24/24 — the SAME two pre-existing depth-50 failures (`w-len-256` at generated index 13, `w-len-513` at index 5), same indices, same margins. No regression, and the two are not "fixed" |
+| `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --all-targets`, `scripts/check-public-scrub.sh` | clean |
+
+Non-gemma3 archs see zero behaviour change, asserted rather than argued:
+`batched_windowed_prefill_never_arms_for_a_non_gemma3_arch` holds in EITHER state of the
+(process-latched) flag, and the synthetic G1 runs a Llama-shaped fixture through the new entry
+point to show the added machinery is inert when every `Option` is `None`.
+
+### 17e. THE MEASUREMENT — and why Tier A's thesis does not survive it
+
+Same binary, flag on vs off, one server at a time, streamed SSE timing request-start to first
+content token, exact token-id prompts (tokenizer out of the loop), a distinct prompt window per
+request so no two share a prefix, `prompt_cache_hit false` on all 32. Round 0 is reported as
+the cold column and excluded from the mean; the mean is rounds 1-3.
+
+| N | flag OFF warm mean | sd | flag ON warm mean | sd | speedup | load (off / on) |
+|---:|---:|---:|---:|---:|---:|---|
+| 600 | 7.772 s | 0.116 | **7.231 s** | 0.105 | **1.07x** | 3.67-4.53 / 3.25-3.92 |
+| 1 200 | 16.314 s | 0.148 | **14.952 s** | 0.361 | **1.09x** | 3.72-4.41 / 3.05-4.17 |
+| 2 366 | 34.138 s | 0.218 | **30.604 s** | 0.180 | **1.12x** | 3.95-4.24 / 3.43-4.44 |
+| 2 400 | 35.162 s | 0.602 | **31.232 s** | 0.270 | **1.13x** | 3.88-4.41 / 3.30-3.76 |
+
+Cold (round 0) columns: off 8.070 / 16.624 / 34.266 / 35.065; on 7.119 / 14.630 / 30.363 /
+30.801. The flag-off column reproduces Phase 0's warm baselines (8.222 / 17.480 / 35.631) 4-7 %
+faster, consistent with the lower load this session ran under. **No first-request PSO-compile
+penalty appeared** — the Phase 3 warning the plan raised did not materialise, because the
+server's warm-up decode and the first chunk retire the compile before any measured request.
+
+**The plan projected 12.1-17.2 s at 2 400 tokens. The measurement is 31.2 s.**
+
+Three receipts explain it, and together they are a mechanism, not a hedge.
+
+**(1) The chunk width does not matter — at all.** `gemma3_real_row_batched_prefill_chunk_width_probe`,
+n = 1 200, one process, warm weight cache, the token-by-token baseline with encode-ahead armed
+(the lane as it actually runs, not a handicapped one):
+
+| rows per command buffer | 16 | 32 | 64 | 128 | 256 | 512 | token-by-token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ms/token | 11.99 | 12.08 | 12.27 | 12.36 | 12.43 | 12.59 | 13.73 |
+
+A 5 % spread across a 32x range of chunk widths, and *wider is slightly worse*. Whatever Tier A
+is spending its time on is invariant in the batch width — which is the opposite of what
+"amortize the weight stream over the chunk" predicts.
+
+**(2) The GPU is 99 % busy; the CPU is not the problem.** From the batched path's own
+per-command-buffer trace on the serve lane (`CAMELID_RESIDENT_TRACE=1`, 256-row chunks):
+`encode` ~10 ms, `commit_wait` 2.91-3.21 s, `gpu_busy` 2.89-3.20 s. CPU-side encode is
+**0.04 ms/token** of a 12 ms/token cost, and `commit_wait - gpu_busy` is ~0.01 ms/token. The
+time is inside the kernels. Per-row `gpu_busy` runs 11.3 ms at chunk base 0 and 12.6 ms at base
+768, so attention accounts for ~1.3 ms across that depth range and the depth-0 floor is
+~11.3 ms/token.
+
+**(3) The reason is in the kernel, and it is a constant.**
+`q8_0_block_linear_ksplit_f32y_wire_nsg8_verify` carries `constexpr uint MAX_T = 8;` and an
+outer `for (uint t0 = 0; t0 < n_rows_in; t0 += MAX_T)` loop. **Every weight block is re-read
+once per 8-column tile.** The effective batching factor is 8, hard-coded, no matter how wide
+the chunk is — which is exactly why (1) is flat. Per token, for any chunk >= 8:
+
+- weight traffic = (weight bytes) / 8 = 0.74 GB / 8 = **93 MB/token** (was 741 MB/token);
+- activation traffic = `sum over projections of (out_rows/2) * in_dim * 4` = **1.40 GB/token**,
+  because this is a GEMV: every threadgroup walks the whole activation panel, and that is
+  chunk-invariant too.
+
+So Tier A trades 0.65 GB/token of weight traffic for nothing it can avoid, and inherits a
+1.40 GB/token activation re-read that the single-token lane also pays but gets for free — its
+panel is 4.6 KB and lives in cache, while a 256-row FFN panel is 7.1 MB and does not. The
+combined 1.49 GB/token at this host's ~120 GB/s is 12.4 ms, which brackets the measured
+11.3-12.6 ms. Measured GEMM throughput on this path is **1.396 GFLOP/token / 11.3 ms =
+0.12 TFLOPS**, against the 3.4 TFLOPS Q8 GEMM wall this host is measured at (§15) and against
+the 0.8-1.5 TFLOPS the plan credited the batched-column GEMV. That 10x gap is the whole
+shortfall.
+
+Honest limit on this attribution: separating "DRAM-bandwidth-bound on the activation re-read"
+from "issue-bound in the inner loop" needs GPU performance counters, which are
+entitlement-gated on this host with a confirmed-dead headless route (§15). The chunk-invariance
+and the `MAX_T = 8` constant are read off the code and the measurements; the split between
+those two causes is not.
+
+### 17f. What this changes for Tier B — read this before Phase 4
+
+1. **The plan's 77-86 % attribution to weight re-streaming is refuted by measurement.** Removing
+   essentially all of it (741 -> 93 MB/token) bought 1.1x, not 2-3x. The residual is not
+   dispatch overhead either (§17e(2): 0.04 ms/token of encode). Phase 0's own note — that the
+   depth-0 `gpu_busy` floor was 9.8 ms against a 6.18 ms weight-traffic roofline — was already
+   pointing at this and was read too optimistically.
+2. **Tier B's headline is now smaller than it looked.** On the batched path, per-row `gpu_busy`
+   grows 11.3 -> 12.6 ms across chunk bases 0 -> 768, i.e. attention adds ~1.3 ms over that
+   depth range; the campaign's own attention law puts the TOTAL attention cost of a
+   2 400-token prompt at 35.68 M layer-positions x 1.789e-4 ms = **6.4 s of the measured
+   31.2 s**. Collapsing attention to zero would leave ~25 s. **Tier B as specified cannot reach
+   the plan's 1.3-2.4 s, or anything near it.** The
+   campaign's stopping rule 5 ("Phase 4's kernel must beat Tier A's per-row attention by >= 3x
+   on wall clock") is not the binding question any more — the binding question is the GEMM.
+3. **The remaining prize is the GEMM, and it is where bit-identity has to be spent.** The tiled
+   simdgroup-MM path (`half_mm_batched_f16o`, staged panels, fixed 8 KiB threadgroup memory) is
+   what reaches ~3 TFLOPS on this host for other rows, and the tree is explicit that it is
+   "numerically equivalent to the scalar k-split GEMM but not byte-exact: tile MMA accumulation
+   order". **So the campaign must now choose: bit-identity, or the speed.** It cannot have both
+   with the current kernel set. That choice belongs to the user, not to this phase.
+4. **There is a bit-identical middle option, and it is a kernel rewrite, not a bolt-on.** A
+   batched GEMV that stages the activation panel in threadgroup memory and reuses it across
+   output rows keeps every output element's reduction tree intact — same `sumq` then `* w_scale`
+   ordering, same two-stage `simd_sum` — so it would stay bit-identical while removing the
+   1.40 GB/token re-read. Raising `MAX_T` alone is NOT that fix: it is bit-identical and cheap,
+   but it can only recover the 93 MB/token weight term (~0.8 ms/token, ~7 %), and
+   `sumf[NR0][MAX_T] + yl[MAX_T][NQ]` is `10 * MAX_T` live floats per lane, so 16 lands at 160 —
+   the same register-spill cliff the v3 attention kernel already records at 88.
+5. **Default stays OFF.** Phase 3 was to flip it after receipts. On a 1.07-1.13x win with a
+   bit-identity guarantee the flip is defensible but not obviously worth the surface; the
+   recommendation is to hold the flip until the GEMM question in (3) is decided, and to run
+   Phase 3 as "decide the GEMM", not "flip the flag".
+
+### 17g. Deliberately not done
+
+- **No kernel MSL was written or changed.** Tier A is host wiring plus existing kernels; that
+  was the charter and it held.
+- **`MAX_T` was not raised.** It is a one-line change with a real register-pressure risk and a
+  ~7 % ceiling (§17f(4)); doing it inside a phase whose gate is bit-identity, without counters
+  to see the spill, would be guessing. Recorded as an available lever.
+- **The 68 MB of dead f16 KV mirrors at head_dim 256 was not reclaimed.** The plan lists it as
+  a free memory win, and it is, but the batched prefill dual-writes them exactly as the decode
+  encode does — which is what keeps the two lanes' cache state identical. Removing the write
+  would be invisible to G1 (the snapshot reads the f32 primary) and is therefore exactly the
+  kind of change that should not ride along inside a bit-identity phase. Still owed.
+- **No pack item was softened and no failing leg was excused.** The two depth-50 failures are
+  the Phase 1 ones, unchanged, and are reported as failures.
+- **No promotion of any surface.** No README, COMPATIBILITY, STATUS or ledger edit. This phase
+  adds a lane behind a flag, not a claim.
+
+## 18. Long-prompt TTFT campaign, Phase 3 record — the prefill GEMM (2026-07-31)
+
+Branch `feat/gemma3-batched-prefill`, continuing from §17. Phase 2 ended with a mechanism, not
+a mystery: Tier A's batched path is pinned at ~0.12 TFLOPS because
+`q8_0_block_linear_ksplit_f32y_wire_nsg8_verify` carries `constexpr uint MAX_T = 8`, so every
+weight block is re-read once per 8-column tile and the activation panel is re-walked by every
+threadgroup. §17f(3) put the choice to the user: bit-identity, or the speed.
+
+**The user chose the speed.** Phase 3 replaces the batched-prefill GEMV with a tiled
+simdgroup-matmul path. Bit-identity against today's prefill output is explicitly no longer the
+bar for the prefill GEMMs; correctness is carried by the Phase 1 harness — KV-cache equivalence
+with a published envelope, the 7-mutant harness, and external-oracle token parity — which is
+the standard the shipped lane already meets. Decode is untouched and stays bit-exact.
+
+### 18a. THE ENVELOPE, PINNED BEFORE ANY MEASUREMENT
+
+This section was committed **before** the first comparison was run; `git log` is the receipt.
+Pinning after seeing the number is how a bound becomes a rubber stamp.
+
+```
+kv_equivalence::meets_bound(bound = 5.0e-2, outlier_factor = 8.0)
+```
+
+applied to the whole `KvSnapshot` — every layer's K and V at every prompt position **and** the
+final hidden — of the MM prefill against `n` sequential `forward_token` prefill decodes.
+
+**Why 5.0e-2 and not the 2.122e-4 reduction-noise floor.** 2.122e-4 is the max |logit diff| a
+change that only re-associates f32 reductions produces on this row (§9). Phase 3 is strictly
+larger than that by construction: the tiled kernel stages the dequantized Q8_0 weight
+(`half(float(q) * w_scale)`) and the activation panel in **half** before the MMA. Half
+round-to-nearest is 2^-11 = 4.88e-4 *relative*, per element, before any reduction — so a bound
+at the f32-reduction-noise level is known-unreachable by arithmetic, and pinning there would be
+pinning a gate that must fail. The framing that matters: the weights are already Q8_0, whose
+quantization step is ~1/127 = 7.9e-3 relative, so representing `q * w_scale` in half adds an
+error ~16x *below* the quantization error both paths already carry.
+
+**Why 5.0e-2 is still a gate and not a rubber stamp.** The weakest window-mutation signature
+this campaign has ever recorded is max |ΔKV| **4.29e-1** (`w-len-513`, `window_plus_one`, §16g),
+and the next weakest is 5.83e-1 (`w-len-513`, `window_minus_one`). 5.0e-2 sits **8.6x below the
+weakest recorded mutant**, so the scalar half alone still separates numerics from every window
+defect on record by an order of magnitude. A bound loose enough to admit 4.29e-1 would not be a
+gate; this one is not that.
+
+**Why the outlier factor is 8.0.** §16g's finding is that the scalar half is the weak half: the
+sharpest mutant (`w-len-513`) has a per-position **median of exactly 0.0** with 287 743 elements
+differing, where any finite factor fires. Across the mutants that do have a non-zero median, the
+ratio (max |ΔKV| ÷ per-position median) runs 41x - 1525x; the **weakest is 41x**
+(`w-multi-2400`, `window_plus_one`: 1.788 / 4.37e-2). 8.0 leaves a **5.1x margin below the
+weakest recorded ratio** while still allowing a genuine 8x per-position spread for a uniform
+numerics change — which one must allow, because a position early in the prompt legitimately
+carries less accumulated round-off than a deep one.
+
+**What the pin commits to.** If the measurement exceeds either half, that is a Phase 3 failure
+reported as a failure, with the measured numbers, not a bound quietly moved to fit. The decode
+gates are unchanged and unmoved: `gemma3_real_row_resident_forward_matches_runnable_oracle` must
+stay 50/50 at exactly **2.122e-4** and `metal_attention_decode_split3_is_bit_identical_to_v1`
+must pass; either moving means decode was touched.
+
+### 18b. THE PIN FAILED — TWICE. What was wrong with it, and the amendment
+
+§18a was written before the first comparison and it did not survive it. Both failures are
+reproduced here verbatim rather than edited out, because a phase that pins a bound and then
+quietly moves it has published nothing.
+
+**Failure 1, at n = 5:**
+
+```
+max |final_hidden diff| 4.487305e0 exceeds the published bound 5.000000e-2
+(caches agree to 1.486051e-2)
+```
+
+**Failure 2, at n = 256, after splitting the hidden out:**
+
+```
+max |KV diff| 5.847931e-2 exceeds the published bound 5.000000e-2
+at K layer 10 kv_head 0 position 9 dim 201: 70.81397 (0x428da0c1) vs 70.87245 (0x428dbeb2)
+```
+
+**The error was the scale, not the reasoning.** §18a argued — correctly, and this still holds —
+that half round-to-nearest is 2^-11 = 4.883e-4 *relative* per operand element, so the 2.122e-4
+f32-reduction-noise floor is unreachable on this path by arithmetic. It then picked an
+**absolute** number as if this row's tensors were O(1). Measured, they are not:
+
+| tensor | max magnitude on this row |
+|---|---:|
+| K / V caches | **1.408e2** (n = 2 400; 8.26e1 at n = 5) |
+| final hidden | **3.294e4** |
+
+So the pinned 5.0e-2 was **3.6e-4 relative** at kv_scale 1.396e2 — *below* the half round-off
+floor the same paragraph had just derived. It was unreachable by arithmetic, which is precisely
+the failure mode §18a set out to avoid, arrived at from the other direction. And one scalar was
+covering two tensors **three orders of magnitude apart**: the diff site printed above
+(70.81397 vs 70.87245) is a 8.3e-4 relative disagreement on a value of 71, which is exactly
+half precision doing what half precision does.
+
+**The amendment.** The gate is still `kv_equivalence::meets_bound`, still with both halves, and
+the outlier factor is **unchanged at 8.0** — the half §16g showed carries the power. What
+changes is that each tensor is bounded on its own scale, and the caches and the final hidden are
+compared separately:
+
+| clause | amended pin | justification |
+|---|---|---|
+| caches, scalar | `2.0e-3 x kv_scale` fed to `meets_bound` | ~2x the single-GEMM half floor (two operands staged in half, ~9.8e-4 per output before cancellation), and still **below** the weakest recorded window mutant, which is 4.29e-1 absolute = **3.1e-3 relative** at this row's kv_scale |
+| caches, outlier | `8.0x` the per-position median — **unchanged from §18a** | 5.1x below the weakest recorded mutant ratio (41x, `w-multi-2400`/`window_plus_one`); `w-len-513`'s median is exactly 0.0, where any finite factor fires |
+| final hidden | `1.0e-2` relative to its own magnitude | arithmetic, not measured: 2^-11 per element x 2 operands = 9.8e-4 per GEMM output, and the residual stream sums 52 GEMM-fed blocks (26 layers x attention + FFN); in quadrature sqrt(52) x 9.8e-4 = 7.1e-3, rounded up |
+
+**The thin part, said plainly.** The cache scalar bound (2.0e-3 relative) now sits only **1.5x**
+below the weakest window-mutation signature on record (3.1e-3 relative). In absolute terms the
+measured worst numerics is 9.905e-2 against a weakest mutant of 4.29e-1 — 4.3x. That is a real
+narrowing versus Phase 2, which had infinite separation because it was bit-identical, and it is
+the price of the speed the user chose. **The outlier half is what carries this gate**, at 4.5x
+measured against a 41x weakest mutant — 9.1x of separation — exactly as §16g predicted it would
+have to.
+
+### 18c. What shipped — and what was REUSED rather than written
+
+**The kernel is not new and it is not experimental.** `q8_0_block_wire_mm` (`src/metal.rs:1431`)
+is the **shipped default prefill GEMM for every other Q8_0 row on this host**: it is armed by
+`CAMELID_METAL_MM`, which `apply_default_fast_stack` (`src/main.rs:5825-5843`) sets to `1` in the
+CLI unless the operator says otherwise. `docs/perf-deep-dive/METAL_PARITY_PLAN.md:30,37,128` is
+explicit that this kernel — not the scalar k-split GEMM — is "the established prefill baseline"
+and the parity reference other kernels are held to. So Phase 3 did not adopt an unproven kernel
+to buy speed; it stopped **excluding** gemma3 from the one the rest of the tree already runs.
+
+It fits without modification, which was checked rather than assumed:
+
+- **No head_dim dependence anywhere.** Tile constants `NR0 = 64` (weight rows), `NR1 = 128`
+  (prompt columns), `NK = 32` (`src/metal.rs:1443-1445`) are shape constants; head_dim enters the
+  prefill GEMMs only through `q_dim`/`kv_dim`, as a plain output row count. There is no per-lane
+  fixed-size array, so nothing here is in the `MAX_DPL` / `MAX_DOCT` family.
+- **Fixed 12 288 B of threadgroup memory** (`src/metal.rs:1429-1430`), independent of head_dim,
+  rows and chunk width.
+- **256-value contraction alignment already satisfied**: NK = 32 is exactly one Q8_0 block.
+
+Not reused, and why: `half_mm_batched_f16o` (`src/metal.rs:4106`) is the *attention*-as-matmul
+GEMM — half in, half out, for the S = Q·Kᵀ and P·V panels. It is Tier B's kernel, and Tier B's
+`use_attn_mm` gate additionally requires `!has_qk_norm`, which this arch fails. Phase 3 is the
+weight GEMMs only.
+
+| piece | where |
+|---|---|
+| `PrefillGemm` (EnvDefault / ForceScalar / ForceMm) | `src/metal.rs` |
+| `gemma3_prefill_mm_enabled` — `CAMELID_GEMMA3_PREFILL_MM`, default OFF | `src/metal.rs` |
+| `PREFILL_MM_THREADGROUP_BYTES` / `_ROW_TILE` / `_TOKEN_TILE`, `threadgroup_alloc_fits`, `assert_threadgroup_fits` | `src/metal.rs` |
+| MM admission + half staging panels + the two encode closures, inside `prefill_tokens_windowed_inner` | `src/metal.rs` |
+
+**Zero new MSL.** The whole change is host wiring plus one existing elementwise kernel
+(`f32_to_f16`, `src/metal.rs:3459`) to stage the activation panel.
+
+**What did NOT move, which is most of the correctness argument.** Every per-row stage still runs
+the EXACT single-token kernel at a row byte offset: per-head QK-norm, RoPE, K/V scatter and
+attention. The sliding-window mask is untouched — the per-row `(window_start, position_count)`
+still come from `schedule_window_bounds` and still ride in through the attention scalar's
+`kv_base_offset`. The sandwich norms, GeGLU and both residual adds are the same kernels on the
+same f32 buffers. **Decode is not on this path at all.**
+
+**The threadgroup-limit query the tree never had.** The campaign plan flagged that
+`maxThreadgroupMemoryLength` is queried nowhere in the tree. It is now: the MM admission
+predicate checks it (and declines, rather than asserting, because it has a fallback), and the two
+genuinely size-dependent allocations that had no guard at all — the K-quant resident GEMV scratch
+(`scratch_ints * 4`) and the flash prefill tiles (`128 * head_dim + 7296`, which is 40 064 B at
+head_dim 256, past the 32 KiB limit) — now assert against it with both numbers in the message
+instead of handing an over-large request to Metal.
+
+**Admission relaxes nothing.** `MAX_DPL` (`src/metal.rs:4595`), `MAX_DOCT` (`:4339`) and every
+`<= 128` host gate they guard are byte-for-byte unchanged. The MM predicate is separate and
+conjunctive: the flag, all seven weights Q8_0, 128-multiple output row counts, 32-multiple
+contraction widths, and the device threadgroup limit. Miss any one and the path falls back to the
+Phase 2 scalar GEMV **losslessly** — asserted, not assumed: the synthetic fixture's `ffn_dim` is
+288, and running it with `ForceMm` must still come out bit-identical to token-by-token.
+
+### 18d. The gates
+
+| gate | result |
+|---|---|
+| **Decode, bit-exact** — `gemma3_real_row_resident_forward_matches_runnable_oracle` | **PASS, 50/50 greedy tokens identical, overall max abs logit diff EXACTLY 2.122e-4** — the pinned constant, digit for digit (per-depth 6.247e-5 / 7.820e-5 / 9.584e-5 at depths 1/5/50). Decode did not move. |
+| **Decode, bit-exact** — `metal_attention_decode_split3_is_bit_identical_to_v1` | **PASS**, unchanged — decode attention is raw-bit identical across all six geometries including the production 4x1x256 and the windowed non-zero `kv_base_offset` read |
+| **G6 — KV envelope** (§18a/§18b), n = 5/256/257/513/1024/2400 | PASS, table below |
+| **G1 unchanged where it still applies** — `metal_batched_windowed_prefill_is_bit_identical_to_token_by_token`, `gemma3_real_row_batched_prefill_kv_bit_identical` | **PASS, still bit-identical.** The synthetic fixture (10 lengths x 2 arch shapes) and the real row (n = 5/256/257/513/1024, 14 811 136 elements at n=1024) both come out `bit_identical=true`. Both now pin `PrefillGemm::ForceScalar` explicitly, so a shell with the Phase 3 flag armed cannot silently turn a bit-identity assertion into a different claim. Phase 2's guarantee is intact and independent of Phase 3's presence in the tree. |
+| **G7 — mutation harness** | **PASS, all 7/7 mutants caught, `survivors` empty**, re-run with Phase 3 in the tree (1 604 s, one process). Per-mutant token/KV reproduces §16g and §17d digit for digit: `window_minus_one` 0/9 and 9/9, `window_plus_one` 0/9 and 9/9, `no_lower_bound` 9/9 and 9/9, `window_on_all_layers` 6/9 and 9/9, `window_on_wrong_layers` 9/9 and 9/9, `layer_pattern_shift_by_one` 8/9 and 9/9, `rope_tables_swapped` 9/9 and 9/9 — including the finding that a one-position window error changes NO generated token on any of the nine items. **See the separation table below: this re-run is what lets Phase 3's numerics be compared to the mutation signatures at the SAME prompt lengths, rather than against a remembered number.** |
+| **Window-edge pack vs the pinned oracle**, MM armed | **70/72 legs token-AND-text identical, prompt tokenization 24/24** — the Phase 1/2 baseline EXACTLY. The two failures are bit-for-bit the pre-existing depth-50 pair: `w-len-256` (256 prompt tokens) at generated index **13** and `w-len-513` (513 prompt tokens) at index **5** — same items, same indices, both unanchored ladder items carrying the open-ended "name one item mentioned above" question, neither a window item. Their min top-2 margins moved (camelid 0.0225 / 0.0857 nat against oracle 0.2042 / 0.3140), which is expected since the prefill numerics changed; they are reported as failures, `all_pass: false`, and are neither excused nor "fixed". `text_reencode_artifact` fired on 0/72, and token identity is scored on `camelid.generated_token_ids`, not on a re-encode. |
+| `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle` | **PASS, 5/5 identical, 7.820e-5** — unchanged. Its logit-diff constant was allowed to move this phase since prefill numerics change; it did not, because this test drives the TOKEN-BY-TOKEN prefill, which Phase 3 does not touch. |
+| `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --all-targets`, `scripts/check-public-scrub.sh` | **all clean.** `cargo fmt --check` rc=0, `cargo clippy --all-targets -- -D warnings` rc=0, `cargo test --all-targets` rc=0 (40 green targets, zero failures), `scripts/check-public-scrub.sh` rc=0. |
+
+**G6, measured** (`gemma3_real_row_prefill_mm_kv_meets_published_envelope`, chunk 256, MM prefill
+vs `n` sequential `forward_token` prefill decodes — the SHIPPED lane, not Phase 2's intermediate):
+
+| n | differing / compared | kv max abs | kv REL | per-position median | **outlier ratio** | hidden max abs | hidden REL |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 5 | 72 253 / 72 320 | 1.486e-2 | 1.799e-4 | 1.159e-2 | **1.3x** | 4.487e0 | 1.362e-4 |
+| 256 | 3 702 590 / 3 702 784 | 5.848e-2 | 4.188e-4 | 1.967e-2 | **3.0x** | 9.069e0 | 2.753e-4 |
+| 257 | 3 717 053 / 3 717 248 | 5.848e-2 | 4.188e-4 | 1.967e-2 | **3.0x** | 9.069e0 | 2.753e-4 |
+| 513 | 7 419 702 / 7 420 032 | 6.075e-2 | 4.351e-4 | 1.967e-2 | **3.1x** | 1.037e1 | 3.148e-4 |
+| 1 024 | 14 810 580 / 14 811 136 | 9.905e-2 | 7.094e-4 | 2.221e-2 | **4.5x** | 3.975e1 | 1.207e-3 |
+| 2 400 | 34 712 394 / 34 713 600 | 9.905e-2 | 7.035e-4 | 2.315e-2 | **4.3x** | 6.228e1 | 1.891e-3 |
+
+Bounds: cache REL 2.0e-3 (worst 7.094e-4, **2.8x margin**), hidden REL 1.0e-2 (worst 1.891e-3,
+**5.3x margin**), outlier factor 8.0 (worst 4.5x, **1.8x margin**). The outlier ratio rises with
+depth and then **plateaus** — 4.5x at 1 024, 4.3x at 2 400 — rather than running away, which is
+what a uniform numerics change should do and what a mask defect would not.
+
+The gate also refuses to pass by vacuity: it asserts the comparison is **not** bit-identical,
+because a bit-identical result would mean the fixture had silently fallen back to the scalar GEMM
+and the gate had proved nothing.
+
+**The separation, at matched lengths — the number the whole phase turns on.** The mutation
+harness was re-run on the shipped token-by-token lane (its own gate, §17d), so its signatures and
+Phase 3's numerics are measured on the same row, the same schedule and the same prompt lengths.
+Weakest off-by-one mutant per length against Phase 3's measured numerics:
+
+| n | Phase 3 numerics: max &#124;ΔKV&#124; / median / ratio | weakest off-by-one mutant: max &#124;ΔKV&#124; / median / ratio | separation on max | separation on ratio |
+|---:|---|---|---:|---:|
+| 513 | 6.075e-2 / 1.967e-2 / **3.1x** | 4.289e-1 / **0.0** / **inf** | **7.1x** | infinite |
+| 1 024 | 9.905e-2 / 2.221e-2 / **4.5x** | 1.416e0 / 2.802e-3 / **505x** | **14.3x** | **112x** |
+| 2 400 | 9.905e-2 / 2.315e-2 / **4.3x** | 4.414e0 / 3.007e-2 / **147x** | **44.6x** | **34x** |
+
+Two things this settles. **(a)** Phase 3's numerics do not swallow the campaign's headline defect
+at any length tested — the margin is smallest at 513, where the mutation is weakest because a
+513-wide prompt barely clips a 512 window, and it grows with depth exactly as it must. **(b)**
+The per-position **outlier ratio is the discriminator**, not the scalar: Phase 3's ratio sits at
+3-4.5x and is flat in depth, while every mutant's is 147x-infinite. A uniform numerics change and
+a localized mask defect look nothing alike in that statistic, which is the property §16g
+predicted the Tier B gate would have to rest on.
+
+### 18e. THE MEASUREMENT
+
+Three instruments, in increasing distance from the kernel. Every one records its 1-minute load
+average, because this host runs other sessions' work and §16/§17's 6-15 % spread must not be
+mistaken for a lever.
+
+**(1) The three paths in ONE process, same warm weight cache, same pipelines**
+(`gemma3_real_row_prefill_gemm_probe`, n = 1 200, chunk 256, load 2.87-3.05). This is the
+cleanest comparison in the phase: the env flag is a latched `OnceLock`, which is exactly why
+`PrefillGemm` exists.
+
+| prefill path | wall | ms/token | whole-path TFLOPS |
+|---|---:|---:|---:|
+| token-by-token (today's shipped lane) | 21.432 s | 17.860 | 0.078 |
+| batched GEMV (Phase 2) | 14.682 s | 12.235 | 0.114 |
+| **batched MM (Phase 3)** | **3.045 s** | **2.538** | **0.550** |
+
+**4.82x over Phase 2's GEMV, 7.04x over the shipped token-by-token lane**, at the kernel.
+"Whole-path TFLOPS" divides the MODEL's GEMM work — 2 x 26 836 992 MACs x 26 layers =
+1.3955 GFLOP/token — by the WHOLE per-token time, attention and norms and RoPE and scatter
+included. It is therefore a lower bound on the GEMM's own efficiency and an honest end-to-end
+figure at the same time.
+
+**(2) The chunk-width sweep — the mechanism, made visible.**
+Phase 2's §17e(1) headline was that chunk width did not matter *at all*: 11.99 -> 12.59 ms/token
+across a 32x range, 5 % spread, *wider slightly worse*, because `MAX_T = 8` fixed the batching
+factor at 8 no matter how wide the chunk was. Same probe, same n = 1 200, MM armed (load 4.02):
+
+| rows per command buffer | 16 | 32 | 64 | **128** | 256 | 512 | token-by-token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Phase 2 GEMV, ms/token | 11.99 | 12.08 | 12.27 | 12.36 | 12.43 | 12.59 | 13.73 |
+| **Phase 3 MM, ms/token** | **4.203** | **3.178** | **2.775** | **2.575** | **2.551** | **2.563** | 13.646 |
+
+The Phase 3 row falls steeply and then **stops falling exactly at 128** — the kernel's
+`NR1` prompt-column tile — and is flat beyond it. That is the batching factor becoming visible
+in wall-clock: it is now the tile width, not a constant buried in a GEMV. It also settles the
+one free parameter without guessing: the shipped default of 256 rows is already at the floor,
+and no tuning attempt is owed on this axis.
+
+**(3) The traffic arithmetic, and where it stops explaining things.**
+Per token, over all 26 layers, on this row (wire Q8_0 = 34 B per 32 weights; layer weights
+741.4 MB total):
+
+| term | Phase 2 GEMV (`MAX_T = 8`) | Phase 3 MM (128-column tile) |
+|---|---:|---:|
+| weight stream | 741.4 / 8 = **92.7 MB** | 741.4 / 128 = **5.79 MB** |
+| activation re-read | **1 400 MB** | **21.8 MB** |
+| GEMM output writes | 1.84 MB | 1.84 MB |
+| f32 -> half staging | — | 1.60 MB |
+| **total** | **1 494 MB** | **31.0 MB** |
+| at this host's ~120 GB/s | 12.45 ms/token | 0.26 ms/token |
+| **measured** (n = 1 200, chunk 256) | **12.24 ms/token** | **2.55 ms/token** |
+
+A **48x** reduction in GEMM-side traffic. Phase 2's row is bracketed by its own roofline
+(12.45 predicted, 12.24 measured) — it was bandwidth-bound and the model said so. **Phase 3's
+row is not, and that is the finding:** 2.55 measured against 0.26 predicted, because once the
+traffic is gone the GEMM is no longer what prefill is spending its time on.
+
+The remainder decomposes with no free parameters, using the attention slope Phase 0 refitted on
+this host (1.789e-4 ms per layer-position) and Sigma_l(d) = 22*min(d,512) + 4*d:
+
+| n | Sigma_l / n | attention, predicted | GEMM compute @3 TFLOPS | predicted total | measured |
+|---:|---:|---:|---:|---:|---:|
+| 1 200 | 11 267.7 | 2.016 ms | 0.47 ms | 2.49 ms | **2.54 ms** (-2.1 %) |
+| 2 400 | 14 866.9 | 2.659 ms | 0.47 ms | 3.13 ms | **3.16 ms** (-0.8 %) |
+
+(2 400 ms/token is from the served TTFT below; 1 200 from the in-process probe.)
+
+**Prefill is now 79 % attention at 1 200 tokens and 84 % at 2 400.** That is the whole
+finding of Phase 3 restated: the GEMM stopped being the cost.
+
+**(4) TTFT, end to end, served.** Same binary, one server alive at a time, PID saved and killed
+by that PID with death verified (`ps -p` + `pgrep` + port). Streamed SSE timed request-start to
+the first chunk carrying non-empty content — never inferred from a non-streaming total. Prompts
+are exact token-id arrays so the tokenizer is out of the loop, and every request takes a distinct
+prompt window so no two share a prefix (`prompt_cache_hit` false on all 27). Round 0 is the cold
+column and is excluded from the mean; the mean is rounds 1-2. All three legs ran inside 20
+minutes of each other at 1-minute load 2.50-3.73.
+
+| N | token-by-token (today) | batched GEMV (Phase 2) | **batched MM (Phase 3)** | MM vs GEMV | MM vs today |
+|---:|---:|---:|---:|---:|---:|
+| 600 | 8.734 s (sd 0.062) | 6.998 s (sd 0.024) | **1.304 s (sd 0.003)** | **5.36x** | **6.70x** |
+| 1 200 | 18.010 s (sd 0.410) | 14.450 s (sd 0.004) | **3.050 s (sd 0.001)** | **4.74x** | **5.90x** |
+| 2 400 | 38.174 s (sd 0.090) | 30.372 s (sd 0.016) | **7.573 s (sd 0.062)** | **4.01x** | **5.04x** |
+
+Cold (round 0): 9.301 / 18.073 / 37.708 off; 7.015 / 14.407 / 30.302 GEMV; 1.351 / 3.077 /
+7.562 MM. **No first-request PSO-compile penalty appeared on the new path either** — the MM cold
+column is within 1-4 % of its warm mean, and at 600 tokens it is the warm rounds that are faster.
+
+Per-token and against the envelope:
+
+| N | MM ms/token | whole-path TFLOPS | GEMM traffic |
+|---:|---:|---:|---:|
+| 600 | 2.174 | 0.642 | 31.0 MB/token |
+| 1 200 | 2.542 | 0.549 | 31.0 MB/token |
+| 2 400 | 3.155 | 0.442 | 31.0 MB/token |
+
+The TFLOPS column FALLS with prompt length, which is the right shape and the point: the GEMM work
+per token is constant, so a falling whole-path rate is attention taking a larger share.
+
+**Cross-check against the committed Phase 2 columns**, disclosed rather than smoothed. §17e
+measured 7.772 / 16.314 / 35.162 s flag-off and 7.231 / 14.952 / 31.232 s flag-on, 2.5 hours
+earlier at load 3.0-4.5. Today's GEMV column is 3-4 % FASTER than that flag-on column and today's
+token-by-token column is 8-12 % SLOWER than that flag-off column. Both sit inside the 6-15 %
+run-to-run spread this host is documented at (§16/§17, Phase 0 §9), and the host has been under
+sustained multi-session load for seven hours. The Phase 3 conclusion does not rest on either
+direction: measured against Phase 2's OWN committed flag-on numbers the MM path is still
+5.5x / 4.9x / 4.1x.
+
+### 18f. WHERE THE PREFILL ENVELOPE NOW SITS — and what it does to Tier B
+
+**§17f(3) put a choice to the user: bit-identity, or the speed. The speed was chosen, and this
+is what it bought and what it cost.**
+
+Bought: **4.0-5.4x on served TTFT against Phase 2's batched GEMV and 5.0-6.7x against the shipped
+token-by-token lane** — 2 400-token TTFT from 38.2 s to **7.6 s**, 1 200 from 18.0 s to **3.1 s**,
+600 from 8.7 s to **1.3 s**. At the kernel, 12.235 -> 2.538 ms/token (4.82x). The mechanism is a
+**48x** cut in GEMM-side memory traffic, 1 494 -> 31.0 MB/token, and it is confirmed three ways:
+the chunk sweep now saturates exactly at the kernel's 128-column tile, the Phase 2 roofline
+bracketed its own measurement, and the Phase 3 residual is fully accounted for by attention.
+
+Cost, stated without softening:
+
+1. **The prefill GEMMs are no longer bit-identical to the shipped lane**, and cannot be made so
+   with this kernel. The measured distance is 7.09e-4 relative on the caches and 1.89e-3 relative
+   on the final hidden.
+2. **The KV gate's scalar half narrowed from infinite separation to 4.3x** (9.905e-2 measured
+   against the weakest recorded window-mutation signature of 4.29e-1). The outlier half keeps
+   9.1x. Both are real gates; neither is what bit-identity was.
+3. **Decode is unaffected**, and that is asserted, not assumed — this path is not on the decode
+   graph at all and the decode gates are unmoved.
+
+**Three things this changes for Phase 4 / Tier B, and they invert §17f(2).**
+
+1. **§17f(2) is withdrawn on its own arithmetic.** It said "collapsing attention to zero would
+   leave ~25 s" at 2 400 tokens and concluded Tier B "cannot reach the plan's 1.3-2.4 s, or
+   anything near it". That was true *of the Phase 2 path*, where 25 s of the 31 s was GEMM.
+   Phase 3 removed that 25 s. At 2 400 tokens attention is now **~78 %** of prefill, and
+   collapsing it would leave roughly 0.47-0.7 ms/token = **1.1-1.7 s** — inside the campaign
+   plan's §6 Tier B projection, which §17f(2) had written off. **Tier B is the whole remaining
+   prize, and it is now the ONLY remaining prize.**
+2. **The campaign's stopping rule 5 is back in force and is the right rule again.** It requires
+   Phase 4's kernel to beat the per-row attention by >= 3x on wall clock. With attention at ~78 %
+   of prefill that is now the binding question, exactly as the plan originally framed it and
+   contrary to §17f(2)'s reframing.
+3. **The GEMM has ~5x of headroom left and it is not worth taking.** 0.550 TFLOPS whole-path
+   against this host's ~3.4 TFLOPS Q8_0 wall looks like a 6x gap, but that ratio is against the
+   WHOLE per-token time, 78 % of which is attention. The GEMM's own share is ~0.47 ms/token of
+   2.55; taking it to zero would buy 18 % and taking attention to zero would buy 78 %. **There is
+   no second tuning attempt owed on the GEMM** — the chunk sweep already settled the one free
+   parameter, the traffic model closes to within 3-8 %, and there are no GPU counters on this host
+   (§15) with which to chase the rest. The campaign's stopping rule is respected by stopping here,
+   not by guessing.
+
+### 18g. Deliberately not done
+
+- **No new MSL.** Not one line. The kernel was found in the tree, already shipped and already the
+  default for other rows, and reused unmodified.
+- **The default was NOT flipped.** `CAMELID_GEMMA3_PREFILL_MM` stays OFF, on top of
+  `CAMELID_GEMMA3_BATCH_PREFILL` which also stays OFF. A path that is not bit-identical to the
+  shipped lane should be flipped in its own phase with its own decision, not as a side effect of
+  the phase that built it.
+- **No second GEMM tuning attempt** — see §18f(3). The stopping rule allowed two; the first
+  (chunk width) was measured and showed the default is already at the floor, and the second would
+  be chasing 18 % of a cost that is no longer the bottleneck.
+- **`MAX_T` was still not raised.** §17g recorded it as an available lever worth ~7 %; it is now
+  moot for this row, since the GEMV is not on the fast path any more. It stays available for any
+  row that cannot take the tiled kernel.
+- **The 68 MB of dead f16 KV mirrors at head_dim 256 was still not reclaimed.** Owed since the
+  campaign plan's §7; still owed.
+- **No promotion of any surface.** No README, COMPATIBILITY, STATUS or ledger edit. This phase
+  adds a second flag behind a flag.
+- **No pack item softened, no failing leg excused.**
+
+### 18h. Handover
+
+**The flag stack, as it stands.** `CAMELID_GEMMA3_BATCH_PREFILL=1` arms Tier A (Phase 2,
+bit-identical, 1.25x measured today). Adding `CAMELID_GEMMA3_PREFILL_MM=1` swaps its seven
+weight GEMMs onto the tiled kernel (Phase 3, not bit-identical, 4.0-5.4x on top). Both default
+OFF. Arming the MM flag alone does nothing — the only production caller of
+`prefill_tokens_windowed` is the gemma3 batched-prefill seam.
+
+**The decision this phase does NOT make.** Whether either default flips. Phase 2 recommended
+holding the Tier A flip until the GEMM question was decided; the GEMM question is now decided
+and measured, so the flip decision is ripe — but it is a decision about shipping a
+non-bit-identical prefill to users, and it belongs to the user, not to the phase that built it.
+Everything needed to make it is in §18b (what the numerics cost), §18d (what the gates say) and
+§18e (what the speed is).
+
+**Evidence bundle:** `qa/evidence-bundles/gemma3-1b-q8-prefill-mm-20260731-head-2f0134c7/`.
+
+**For Phase 4 / Tier B, in priority order:**
+
+1. Attention is **79-84 %** of prefill now. Everything else is noise by comparison.
+2. The campaign plan's Design C (windowed attention-as-matmul via `half_mm_batched_f16o` +
+   `softmax_causal_rows`) is unchanged and still applies, including its two real blockers: the
+   `!has_qk_norm` clause on `use_attn_mm` (`src/metal.rs:13908`) and the `<= 128` head_dim clause.
+   Phase 3 did **not** touch either, and the f32->half Q/K conversion the plan proposes is now a
+   smaller step than it was, because this phase already established that staging half operands on
+   this row costs ~7e-4 relative and passes the envelope.
+3. The threadgroup-limit helpers (`threadgroup_alloc_fits` / `assert_threadgroup_fits`) exist now
+   and Tier B should use them at its head_dim-dependent allocation, which is the one the campaign
+   plan flagged as the reason the unchanged flash layout hard-fails at head_dim 256.
+4. Phase 0's chat-path tokenizer finding is now the second-largest remaining item after attention:
+   `parse_special=true` costs 0.53 ms per prompt token, i.e. **1.27 s at 2 400 tokens** — which is
+   17 % of today's 7.573 s MM TTFT, against 3.7 % of the 35 s it was measured on. It is outside
+   the engine and untouched by any tier. It was the right call not to smuggle it into Phase 2 or 3;
+   it should now be scoped on its own.
+
+## 19. Long-prompt TTFT campaign, Phase 4 record — Tier B, the attention (2026-07-31)
+
+Branch `feat/gemma3-batched-prefill`, continuing from §18. §18f withdrew §17f(2)'s pessimism on
+its own arithmetic and left exactly one prize: with the weight GEMMs collapsed, prefill was
+**79 % attention at 1 200 prompt tokens and 84 % at 2 400**, and every row still ran its own
+`encode_attention` over its whole window. Phase 4 replaces that per-row loop with the
+attention-as-matmul chain the tree already ships for non-windowed rows, and teaches that chain
+the per-query-row LOWER mask bound it has never had.
+
+### 19a. What was built — and what was REUSED
+
+**Reused, unmodified except for one uniform.** `half_mm_batched_f16o` (`src/metal.rs:4106`),
+`softmax_causal_rows` (`:4256`) and `transpose_v16` (`:3938`) are the S = K·Qᵀ / row-softmax /
+O = Vᵀ·P chain `prefill_tokens` already runs for other Q8_0 rows on this host. The operands are
+the **half K/V mirrors** (`cache_k16` / `cache_v16`) that the scatter already dual-writes on
+every token and that the campaign plan §7 recorded as **68 MB of dead allocation at head_dim
+256**, because the only reader (the split-K/v2 decode route) requires head_dim ≤ 128. They are
+not dead any more; Phase 4 is their first reader on this row.
+
+**New MSL: one `window` uniform and ~15 lines**, all in `half_mm_batched_f16o` and
+`softmax_causal_rows`:
+
+| site | what |
+|---|---|
+| `half_mm_batched_f16o`, S pass (`causal_mode == 1`) | lower TILE cull `r0 + NR0 + window <= t0 + q_offset + 1` — the tile is below the window when its LARGEST key plus the window fails to reach its SMALLEST query — plus the same test at 32×32 quadrant granularity on `sg_active` |
+| `half_mm_batched_f16o`, PV pass (`causal_mode == 2`) | lower `k_start` from the tile's smallest query, aligned DOWN to `NK` = 32; the `kk0` loop starts there instead of 0 |
+| `softmax_causal_rows` | `lo = (window == 0 \|\| q_abs < window) ? 0 : q_abs + 1 - window` on the max and sum loops, and the write loop **ZEROES** `[0, lo)` rather than skipping it |
+
+**Why P is zeroed below `lo` and not skipped.** The PV pass's `k_start` is a per-TILE bound taken
+from the tile's smallest query, while the mask is per-ROW. For any row above that smallest query,
+PV therefore reads columns in `[k_start, lo_row)`. Zeroing is what makes a per-tile bound sound
+for a per-row mask; skipping would read whatever was there.
+
+**One parameterised kernel, not two.** `window = 0` collapses every added term: the culls never
+fire, `k_start` is 0, `lo` is 0. So the 4 global gemma3 layers, and every non-gemma3 caller of
+this chain, run the identical arithmetic — the `window = 0` case IS the pre-change kernel, which
+is the regression that keeps `prefill_tokens` byte-unchanged for every other row.
+
+**The convention, and where it lives.** The predicate is written `key + window > q_abs`, never
+`q_abs - window`, so it is unsigned-safe below the window with no saturating branch. The `>`
+rather than `>=` is where "the window INCLUDES the current position" lives, and it is the same
+expression `schedule_window_bounds` (`src/metal.rs:12891`) pins host-side; the host passes the
+schedule's own `window[l]` straight through as the uniform rather than restating it.
+
+**The `!has_qk_norm` clause on `use_attn_mm` — the question §18 left open.** It is about the
+**surrounding plumbing, not the GEMM**. In `prefill_tokens` that clause exists to force the
+*weight* GEMM to emit f32 Q/K so the f32 per-head norm can run in cpu_reference order
+(`src/metal.rs:13985-13990` states this). On the gemma3 seam the weight GEMM already emits f32 —
+both the Phase 2 GEMV and Phase 3's `q8_0_block_wire_mm` do — the per-head QK-norm and RoPE
+already run the exact single-token f32 kernels per row, and Q is converted to half only AFTER
+both. The condition the clause enforces is already met, and `half_mm_batched_f16o` itself has no
+QK-norm dependence anywhere. `prefill_tokens`' own gate is untouched.
+
+**Admission relaxes nothing.** `MAX_DPL` (`src/metal.rs:4595`), `MAX_DOCT` (`:4339`) and every
+`<= 128` host gate they guard are byte-for-byte unchanged. The Tier B predicate is separate and
+conjunctive: the flag, Phase 3's MM GEMM (the context panel stays half into the O projection),
+f32 K/V caches (the half mirrors are the operands), head_dim a multiple of 64, a 64-aligned chunk
+start, no degenerate `Some(0)` window, the S/P scratch inside `attn_mm_scratch_cap_bytes`, and
+`threadgroup_alloc_fits` for the FIXED 8 192 B this chain needs — fixed, so head_dim never enters
+it. Miss any one and the path falls back to Phase 3's per-row attention rather than declining the
+prefill.
+
+**The scratch is linear in the CHUNK, not quadratic in the prompt.** S and P are
+`[head][chunk row][n_pad]` half, so 2 × 4 × 256 × 2 432 × 2 B = **10.0 MB** at n = 2 400 and
+33.5 MB at 8 192 — the campaign plan's ~1 GB-at-8k figure was for the untiled design, and query
+blocking is already done by the chunk loop. The cap check and the per-row fallback are
+implemented anyway.
+
+### 19b. THE BUG THIS PHASE FOUND, in full
+
+The first G6 run failed at n = 257, 513 and 2 400 and passed at 5, 256 and 1 024:
+
+```
+n=257:  kv_rel 8.675e-2  outlier_ratio 369.0x
+n=513:  kv_rel 9.649e-2  outlier_ratio 425.6x
+n=2400: max |KV diff| 3.312101e1 at K layer 17 kv_head 0 position 2372 dim 253:
+        24.620667 (0x41c4f720) vs -8.500366 (0xc1080180)
+```
+
+The pattern is the diagnosis: those are exactly the lengths with a **ragged last chunk**
+(k < chunk — 257 and 513 end with a 1-row chunk, 2 400 with a 96-row one), and 2 372 sits inside
+2 400's last chunk. `softmax_causal_rows` derives its per-head base as
+`head * rows_per_block * n_pad`; it had been handed `rows_per_block = k`, while the two GEMMs
+were handed the panel's true row pitch, `chunk`, as their batch strides. For any chunk narrower
+than the panel, **every head above head 0 read and wrote the wrong panel offset.** The fix is one
+word — `rows_per_block` is the panel pitch, and the live-row count rides in the dispatch height
+instead.
+
+Three things worth recording. **(1)** It is a silent-corruption bug, not a crash: every index
+stayed in bounds. **(2)** It only appears at four of the six gate lengths, and only because those
+lengths were chosen to straddle chunk and window edges — a sweep of round numbers would have
+passed. **(3)** It is precisely the class the campaign's §16g finding predicted token identity
+would be weak against and KV-equivalence strong against, and that is how it surfaced: the G6
+gate named the layer, head, position and dim.
+
+### 19c. The gates
+
+| gate | result |
+|---|---|
+| **Decode, bit-exact** — `gemma3_real_row_resident_forward_matches_runnable_oracle` | **PASS, 50/50 greedy tokens identical, overall max abs logit diff EXACTLY 2.122e-4** — the pinned constant, digit for digit (depth-50 leg 9.584e-5). Decode did not move. |
+| **Decode, bit-exact** — `metal_attention_decode_split3_is_bit_identical_to_v1` | **PASS**, unchanged, all six geometries including the production 4x1x256 and the windowed non-zero `kv_base_offset` read |
+| **G6 — KV envelope**, n = 5/256/257/513/1024/2400 | **PASS against §18b's bounds, UNMOVED.** Table below. |
+| **G5 — the mask, at the kernel** (`windowed_attn_mm_mask_matches_the_pinned_window_convention`) | **PASS.** At windows 0/1/37/64/65/128 the number of non-zero P entries is EXACTLY `min(q+1, window)` — an integer identity, so `>=` for `>` moves it by one and fails; `P[q][q-window]` is exactly 0.0 and `P[q][q-window+1]` strictly positive; the surviving weights match a CPU softmax over `[max(0,q+1-w), q]` to **5.949e-5**; and query blocking at a non-zero `q_offset` reproduces the unblocked P **bit for bit** — the code path the campaign plan flagged as otherwise unshippable-untested. |
+| **G1, still bit-identical where it still applies** — `metal_batched_windowed_prefill_is_bit_identical_to_token_by_token`, `gemma3_real_row_batched_prefill_kv_bit_identical` | **PASS.** Synthetic fixture (10 lengths x 2 arch shapes) and the real row (n = 5/256/257/513/1024, 14 811 136 elements at 1 024) both `bit_identical=true`. Both pin `PrefillGemm::ForceScalar` **and** `PrefillAttn::ForceRow`, so a shell with the Phase 4 flag armed cannot turn a bit-identity assertion into a different claim. Tier A's guarantee is intact and independent of Phases 3 and 4 being in the tree. |
+| `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle` | **PASS, 5/5 identical, 7.820e-5** — unchanged, because this drives the TOKEN-BY-TOKEN prefill, which Phase 4 does not touch. |
+
+**G6, measured** (`gemma3_real_row_prefill_attn_mm_kv_meets_published_envelope`, chunk 256, the
+full Tier A + Phase 3 + Phase 4 stack against `n` sequential `forward_token` prefill decodes —
+the SHIPPED lane, so these numbers are directly comparable to §18d's):
+
+| n | differing / compared | kv max abs | kv REL | per-position median | **outlier ratio** | hidden max abs | hidden REL |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 5 | 72 252 / 72 320 | 4.434e-2 | 5.368e-4 | 1.403e-2 | **3.2x** | 6.000e0 | 1.822e-4 |
+| 256 | 3 702 622 / 3 702 784 | 6.901e-2 | 4.942e-4 | 3.276e-2 | **2.1x** | 3.020e1 | 9.168e-4 |
+| 257 | 3 717 085 / 3 717 248 | 6.901e-2 | 4.942e-4 | 3.283e-2 | **2.1x** | 3.020e1 | 9.168e-4 |
+| 513 | 7 419 752 / 7 420 032 | 7.527e-2 | 5.390e-4 | 3.164e-2 | **2.4x** | 3.020e1 | 9.168e-4 |
+| 1 024 | 14 810 670 / 14 811 136 | 1.644e-1 | 1.177e-3 | 3.293e-2 | **5.0x** | 8.423e1 | 2.557e-3 |
+| 2 400 | 34 712 607 / 34 713 600 | 1.927e-1 | 1.369e-3 | 3.329e-2 | **5.8x** | 8.423e1 | 2.557e-3 |
+
+Bounds, all three carried over from §18b without amendment: cache REL 2.0e-3 (worst 1.369e-3,
+**1.46x margin**), hidden REL 1.0e-2 (worst 2.557e-3, **3.9x margin**), outlier factor 8.0 (worst
+5.8x, **1.38x margin**). **The envelope was not widened, and that was not a choice with much
+room in it**: §18b already recorded the scalar bound sitting only 1.5x below the weakest recorded
+window mutation, so a wider bound would have stopped being a gate. Phase 4 had to fit inside a
+bound pinned before Phase 3 measured anything, and it does.
+
+The gate refuses to pass by vacuity **twice**: the result must not be bit-identical to the
+token-by-token lane (which would mean the MM GEMM had fallen back), and must not be bit-identical
+to the per-row attention path either (which is exactly what a silent Tier B admission failure
+would produce).
+
+**The separation, at matched lengths.** Phase 4's numerics against §18d's weakest recorded
+off-by-one window mutant at the same prompt length:
+
+| n | Phase 4: max &#124;ΔKV&#124; / median / ratio | weakest off-by-one mutant: max &#124;ΔKV&#124; / median / ratio | separation on max | separation on ratio |
+|---:|---|---|---:|---:|
+| 513 | 7.527e-2 / 3.164e-2 / **2.4x** | 4.289e-1 / **0.0** / **inf** | **5.7x** | infinite |
+| 1 024 | 1.644e-1 / 3.293e-2 / **5.0x** | 1.416e0 / 2.802e-3 / **505x** | **8.6x** | **101x** |
+| 2 400 | 1.927e-1 / 3.329e-2 / **5.8x** | 4.414e0 / 3.007e-2 / **147x** | **22.9x** | **25x** |
+
+Said without softening: **the scalar half narrowed again**, from Phase 3's 7.1x / 14.3x / 44.6x
+to 5.7x / 8.6x / 22.9x — roughly halved at every length, which is what adding a second half-staged
+matmul chain to a path that already had one should do. It is still an order of magnitude at the
+lengths that matter and never below 5.7x. **The outlier half is what carries this gate**, at
+25x-infinite, exactly as §16g predicted the Tier B gate would have to.
+
+### 19d. THE MEASUREMENT
+
+**(1) Both attention paths in ONE process** (`gemma3_real_row_prefill_attn_probe`), same warm
+weight cache, same pipelines, Phase 3's tiled MM GEMM pinned on **both** sides so what is timed is
+attention and only attention:
+
+| n | per-row attention (Phase 3) | **batched windowed attention (Phase 4)** | speedup | 1-min load |
+|---:|---:|---:|---:|---:|
+| 1 200 | 3.019 s (2.516 ms/token) | **0.916 s (0.764 ms/token)** | **3.29x** | 6.48 |
+| 2 400 | 7.556 s (3.148 ms/token) | **1.821 s (0.759 ms/token)** | **4.15x** | 5.95 |
+
+**The campaign's stopping rule 5 is cleared** — it required >= 3x over Tier A's per-row attention
+on measured wall clock, and this is 3.29x / 4.15x on WHOLE-prefill wall with only attention
+changed, so it understates the attention term's own speedup.
+
+**The shape is the finding, not the ratio.** Per-token cost is now **flat in prompt length** —
+0.764 ms at 1 200 and 0.759 ms at 2 400 — where the per-row path grew 2.516 → 3.148. That is the
+window's O(1)-per-query property arriving in wall clock: each query tile reads at most 9 kv tiles
+no matter how long the prompt is. Backing out §18e's non-attention residual (0.47 ms/token,
+unchanged by this phase), attention itself went from 2.016 → **~0.29** ms/token at 1 200 and
+2.659 → **~0.29** at 2 400: **~7x and ~9x on the attention term**, and its share of prefill fell
+from 79 % / 84 % to **~38 %** at both lengths.
+
+**(2) The tile census**, computed with the kernel's own cull predicates over the actual dispatch
+grid (all 26 layers, chunk 256):
+
+| n | tiles in the grid | dropped by the causal cull | **dropped by the WINDOW cull** | computed |
+|---:|---:|---:|---:|---:|
+| 1 200 | 5 642 | 702 | **1 210 (21.4 % of the grid, 24.5 % of what causal alone kept)** | 3 730 |
+| 2 400 | 20 696 | 1 430 | **9 570 (46.2 % of the grid, 49.7 % of what causal alone kept)** | 9 696 |
+
+Read this against the campaign plan's §3.4 prediction of 31.4 % / 58.7 % skipped, and the
+difference is arithmetic rather than disagreement: the plan counted one 2 400 × 2 400 grid, while
+the chunked dispatch re-covers `[0, base)` for each chunk's query tiles, and 4 of the 26 layers
+are global and can never be window-culled. Over the 22 sliding layers alone the 2 400 figure is
+**54.6 %**, against the plan's 58.7 %. The plan's other claim — that the skip "is worth almost
+nothing at 600 tokens and everything at 2400" — is reproduced: 21.4 % at 1 200 against 46.2 % at
+2 400.
+
+**(3) The remaining gates.**
+
+| gate | result |
+|---|---|
+| **G7 — mutation harness**, re-run with Tier B in the tree | **PASS, all 7/7 mutants caught, `survivors` empty** (1 823 s, one process). Per-mutant token/KV reproduces §16g / §17d / §18d **digit for digit**: `window_minus_one` 0/9 and 9/9, `window_plus_one` 0/9 and 9/9, `no_lower_bound` 9/9 and 9/9, `window_on_all_layers` 6/9 and 9/9, `window_on_wrong_layers` 9/9 and 9/9, `layer_pattern_shift_by_one` 8/9 and 9/9, `rope_tables_swapped` 9/9 and 9/9 — including the finding the whole gate design rests on, that a one-position window error changes **no generated token on any of the nine items**. |
+| **Window-edge pack vs the pinned oracle**, Tier B armed | **70/72 legs token-AND-text identical, prompt tokenization 24/24 — the Phase 1/2/3 baseline EXACTLY.** The two failures are bit-for-bit the pre-existing depth-50 pair: item 13 (256 prompt tokens) at generated index **13** and item 17 (513 prompt tokens) at index **5**, same items, same indices, same oracle margins (0.2042 / 0.3140). camelid's min top-2 margins moved 0.0225 → **0.0165** and 0.0857 → **0.0733**, which is expected because the prefill numerics changed; they are reported as failures, `all_pass: false`, and are neither excused nor "fixed". |
+| **The capability row's own claim, re-established under the NEW DEFAULT** | **PASS.** The shipped row asserts 15/15 sub-512 legs and 9/9 windowed legs at 606/1205/2403 prompt tokens, measured on the token-by-token prefill. Re-run against the same committed oracle captures with **no campaign env vars set at all**: windowed **9/9, `all_pass: true`, prompt tokenization 3/3**; sub-512 **15/15, `all_pass: true`, prompt tokenization 5/5**. Nothing in the row became false, so the row is not edited. |
+| **The default posture actually reaches Tier B** | **PASS, and measured rather than argued.** A server started with `env -u` on all three campaign variables and `CAMELID_RESIDENT_TRACE=1` reports **`70 gemm=mm attn=mm`** and not one `attn=row` — every batched-prefill command buffer took Phase 3's GEMM and Phase 4's attention by default. |
+| `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --all-targets`, `scripts/check-public-scrub.sh` | **all clean.** fmt rc=0; clippy rc=0 (two findings fixed in-phase: an `int_plus_one` in the mask test's CPU reference and an `unused_mut`, both test-only); `cargo test --all-targets` rc=0 with **60 green targets, 1 817 tests passed, 0 failed**; scrub rc=0. |
+
+**(4) TTFT, end to end, served.** Same binary, one server alive at a time, PID saved and killed by
+that PID with death verified (`ps -p` + a port check). Streamed SSE timed request-start to the
+first chunk carrying non-empty content — never inferred from a non-streaming total. Prompts are
+exact token-id arrays so the tokenizer is out of the loop, and every request takes a distinct
+prompt window (`prompt_cache_hit` false on all 27). Round 0 is the cold column and is excluded
+from the mean; the mean is rounds 1-2. All three legs ran inside 6 minutes of each other.
+
+| N | token-by-token (`BATCH_PREFILL=0`) | Phase 3, per-row attention | **Phase 4, batched attention** | vs Phase 3 | vs token-by-token |
+|---:|---:|---:|---:|---:|---:|
+| 600 | 8.078 s (sd 0.046) | 1.316 s (sd 0.001) | **0.520 s (sd 0.016)** | **2.53x** | **15.54x** |
+| 1 200 | 17.453 s (sd 0.394) | 3.101 s (sd 0.017) | **0.971 s (sd 0.002)** | **3.19x** | **17.97x** |
+| 2 400 | 37.475 s (sd 0.188) | 7.703 s (sd 0.002) | **1.962 s (sd 0.025)** | **3.93x** | **19.10x** |
+
+1-minute load: 3.06-4.71 (token-by-token), 2.96-3.17 (Phase 3), 3.00 (Phase 4). Cold (round 0):
+9.288 / 17.286 / 37.457 off; 1.359 / 3.089 / 7.701 Phase 3; 0.534 / 0.970 / **1.884** Phase 4 —
+the Phase 4 cold column is *faster* than its warm mean at 2 400, so no first-request PSO-compile
+penalty appeared on the new path either.
+
+Per-token, and the rate against the model's own work:
+
+| N | Phase 4 ms/token | whole-path TFLOPS (weight-GEMM FLOPs / whole time) | attention GFLOP |
+|---:|---:|---:|---:|
+| 600 | 0.867 | 1.610 | 21.5 |
+| 1 200 | 0.809 | **1.725** | 55.4 |
+| 2 400 | 0.817 | **1.708** | 146.2 |
+
+**ms/token stopped growing with prompt length** — 0.867 / 0.809 / 0.817 against Phase 3's
+2.193 / 2.585 / 3.209 — which is the sliding window's O(1)-per-query property showing up
+end-to-end and not merely at the kernel. The whole-path TFLOPS column, defined exactly as §18e
+defined it (the MODEL's 1.3955 GFLOP/token of weight-GEMM work divided by the WHOLE per-token
+time, attention and norms and RoPE and scatter included, so it is a lower bound on GEMM
+efficiency), went from **0.442** at 2 400 in Phase 3 to **1.708** — half of this host's ~3.4
+TFLOPS Q8_0 GEMM wall, now that the whole prefill costs little more than its GEMMs.
+
+**All three lengths land inside the campaign plan's §6 Tier B projection** (0.4-0.6 s / 0.7-1.2 s
+/ 1.3-2.4 s), which §17f(2) had written off as unreachable and §18f withdrew.
+
+### 19e. THE DEFAULT FLIP — the decision, and what it rests on
+
+Phase 3 declined to flip: "a path that is not bit-identical to the shipped lane should be flipped
+in its own phase with its own decision". This is that phase. All three flags now default **ON**
+with `=0` as the operator opt-out, for the gemma3 row only.
+
+**What it buys:** 19.1x on 2 400-token TTFT, 18.0x at 1 200, 15.5x at 600 — 37.5 s to **1.96 s**.
+The five-turn chat of the campaign plan §1.5, ~105 s of cumulative prefill before the campaign,
+is now ~5 s.
+
+**What it costs, stated without softening:** the prefill GEMMs and prefill attention are no longer
+bit-identical to the token-by-token lane and cannot be made so with these kernels. Measured
+distance at 2 400: 1.369e-3 relative on the caches, 2.557e-3 relative on the final hidden. The KV
+gate's scalar separation from the weakest recorded window mutation is 5.7x-22.9x, down from Tier
+A's infinite and Phase 3's 7.1x-44.6x.
+
+**Why the receipts support it anyway:**
+
+1. The envelope was **pinned before Phase 3 measured anything and was not widened**. It could not
+   have been: §18b already put the scalar bound 1.5x below the weakest recorded mutation.
+2. The mask is proven by an **integer identity**, not a tolerance, at six windows including 1 and
+   the two tile-aligned cases, plus the boundary pair, plus q_offset blocking bit-identical.
+3. The mutation harness catches **7/7** with the batched attention in the tree.
+4. **Decode is untouched and asserted so** — 50/50 at exactly 2.122e-4, split3 raw-bit identical.
+5. **The capability row's own shipped claim was re-established under the new default**, 9/9 and
+   15/15, rather than being assumed to survive.
+6. **The default was proven to actually engage**, `70 gemm=mm attn=mm` with no env set.
+
+**Why nothing else changes.** All three flags are read only from `prefill_tokens_windowed`, whose
+single production caller ANDs the first with `config.gemma3.is_some()`
+(`src/inference/metal_resident.rs`). So for every non-gemma3 row the whole stack is inert in every
+env state — asserted by `batched_windowed_prefill_never_arms_for_a_non_gemma3_arch`, now extended
+to check the posture itself, including that `=0` is honoured (a default-on flag that ignores its
+own opt-out is a flag with no off switch). The module is macOS+Metal-only, so no non-Metal host
+sees any of it, and none of the three is in `MANAGED_ENV_KEYS`, so the execution planner never
+writes them and cannot read its own output back as an opt-out (the §-latch failure mode).
+
+**No shipped surface gained a throughput claim.** `performance_measured` stays
+`not_claimed_resident_lane_throughput_is_a_separate_unshipped_measurement_phase`; no README,
+COMPATIBILITY, STATUS or ledger row was edited.
+### 19f. Deliberately not done
+
+- **No new kernel, and almost no new MSL.** One `window` uniform on two existing kernels and
+  about fifteen lines. `half_mm_batched` (the f32-output twin) was deliberately left alone: it is
+  used by one ignored test, and giving the window to only the production variant keeps the
+  surface smaller.
+- **`prefill_tokens`' own `use_attn_mm` gate was NOT touched**, including its `!has_qk_norm` and
+  `head_dim <= 128` clauses. §19a explains why the clause does not apply on the gemma3 seam;
+  relaxing it *there* would be a change to every other row's admission and is not this phase's
+  business.
+- **`MAX_DPL` / `MAX_DOCT` and the `<= 128` host gates are byte-for-byte unchanged.** Tier B is a
+  separate admission predicate over a chain with no per-lane fixed-size array.
+- **The banded S panel was not built.** The campaign plan §6(3) proposed `[head][qb][576]` instead
+  of `[head][qb][n_pad]`, exploiting the 9-tile window. It is unnecessary here: the chunk loop
+  already blocks queries, so S and P are 10.0 MB at n = 2 400 and 33.5 MB at 8 192 — the plan's
+  ~1 GB figure was for the untiled design. It stays available if the context ceiling is ever
+  raised far enough to matter.
+- **No second tuning attempt.** The stopping rule allowed two. The first measurement cleared the
+  3x bar at 3.29x / 4.15x and showed per-token cost flat in prompt length, which is the shape the
+  design predicted; there are no GPU counters on this host (§15) with which to chase the rest, so
+  a second attempt would be guessing.
+- **The 68 MB of f16 KV mirrors is no longer dead**, which closes an item owed since the campaign
+  plan §7 — not by reclaiming the memory but by giving it a reader. If Tier B is ever disabled on
+  this row the mirrors go back to being dead weight, and the reclaim is owed again.
+- **No pack item softened, no failing leg excused, no bound moved.**
+
+### 19g. WHERE PREFILL NOW STANDS, and what remains
+
+Prefill at 2 400 prompt tokens is **0.817 ms/token served** (1.962 s), from 15.615 ms/token
+(37.475 s) before the campaign. Decomposed with the same no-free-parameter model §18e used —
+§18e's non-attention residual is 0.47 ms/token and this phase did not touch it:
+
+| term | at 1 200 | at 2 400 | share at 2 400 |
+|---|---:|---:|---:|
+| weight GEMMs + norms + RoPE + scatter (unchanged since Phase 3) | 0.47 ms | 0.47 ms | **~58 %** |
+| attention (was 2.016 / 2.659) | ~0.29 ms | ~0.29 ms | **~36 %** |
+| serve-side residual (measured minus in-process probe) | 0.045 ms | 0.058 ms | ~6 % |
+
+**The bottleneck has changed hands again, and it has gone back to the GEMM.** §18f(3) declined a
+second GEMM tuning attempt on the grounds that the GEMM was 18 % of prefill and attention 78 %;
+taking the GEMM to zero would have bought 18 %. It is now **~58 %**, and the same ~5x of nominal
+headroom (1.708 TFLOPS whole-path against a ~3.4 TFLOPS Q8_0 wall) is worth roughly three times
+what it was. That reopens the question §18f(3) closed — but it does not change the answer yet,
+because the reason it was closed still holds: the chunk sweep already settled the one free
+parameter, the traffic model closes to within 3-8 %, and there are **no GPU counters on this host**
+(§15, entitlement-gated with a confirmed-dead headless route). The next GEMM attempt needs Xcode
+on the T7 first, not another guess.
+
+**The largest remaining item is now outside the engine.** Phase 0 measured the chat-path
+tokenizer at `parse_special=true` costing **0.53 ms per prompt token**, i.e. **~1.27 s at 2 400
+tokens**. When that was measured it was 3.7 % of a 35 s TTFT and 17 % of Phase 3's 7.573 s. It is
+now **~65 % of the entire engine prefill** — a chat-path request at 2 400 tokens would spend more
+time tokenizing than computing. Every TTFT number in this campaign takes prompts as exact token-id
+arrays, so the tokenizer is deliberately out of the loop and none of these numbers include it.
+**This is the single highest-value remaining item for real chat TTFT**, it is outside the engine,
+and it is untouched by any tier.
+
+Also still owed, unchanged: context above 2 403 prompt tokens is unmeasured on this row.
+
+### 19h. Handover
+
+**The flag stack, as it now ships.** All three default ON for the gemma3 Q8_0 row, `=0` to opt
+out, and they nest: `CAMELID_GEMMA3_BATCH_PREFILL=0` restores the pre-campaign token-by-token
+prefill exactly; `CAMELID_GEMMA3_PREFILL_MM=0` keeps Tier A's bit-identical batched GEMV and
+turns off Phase 4 with it; `CAMELID_GEMMA3_PREFILL_ATTN_MM=0` keeps Phase 3 and restores per-row
+attention. Every intermediate posture is a tested configuration, not a hypothetical: the gates pin
+each side explicitly through `PrefillGemm` / `PrefillAttn`.
+
+**Evidence bundle:** `qa/evidence-bundles/gemma3-1b-q8-prefill-attn-mm-20260731-head-95429a42/`,
+including the FAILING first G6 run.
+
+**For whoever picks this up:**
+
+1. **The tokenizer** (§19g). Biggest remaining TTFT item for the chat path by a wide margin, and
+   it is not a kernel problem.
+2. **The GEMM, but only with a profiler.** ~58 % of prefill and ~5x of nominal headroom; blocked
+   on §15's entitlement problem, not on ideas.
+3. **Context above 2 403 tokens** is unmeasured. The S/P panels are linear in the chunk, not
+   quadratic in the prompt, so 8 k costs 33.5 MB of scratch and the cap gate will not fire — but
+   "will not fire" is arithmetic, not a measurement.
+4. **The f16 KV mirrors are live now** (§19f). If Tier B is ever turned off on this row they go
+   back to being 68 MB of dead allocation and the reclaim is owed again.
+5. **The two depth-50 window-edge failures are still there**, unchanged since Phase 1, still
+   unadjudicated, still reported as failures.

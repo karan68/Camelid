@@ -1649,6 +1649,86 @@ fn nope_config_disqualifies_the_resident_gpu_path() {
 /// when a resident backend is armed, and by the backend-enabled gate when
 /// none is (either way, never admitted). The positive admission is proven by
 /// the env-keyed real-row gates in `src/metal.rs`.
+/// gemma3 long-prompt TTFT campaign, Phase 2 — the zero-behaviour-change claim for
+/// every OTHER architecture, asserted rather than argued.
+///
+/// The Tier A batched windowed prefill arms on
+/// `config.gemma3.is_some() && CAMELID_GEMMA3_BATCH_PREFILL`. The conjunction is what
+/// makes the flag inert for a Llama-family row: no matter what the (process-latched)
+/// env flag says, a session with no gemma3 metadata must never take the new path. The
+/// flag's state cannot be forced from inside a test — it is a `OnceLock` — so the
+/// assertion is written to hold in EITHER state, which is exactly the claim.
+#[test]
+fn batched_windowed_prefill_never_arms_for_a_non_gemma3_arch() {
+    let (mut session, _temp) = tiny_kv_budget_session(64);
+    assert!(
+        session.config.gemma3.is_none(),
+        "the tiny fixture is a Llama-family row"
+    );
+    assert!(
+        !session.gemma3_batched_prefill_armed(),
+        "CAMELID_GEMMA3_BATCH_PREFILL must be inert for a non-gemma3 arch, in any env state"
+    );
+
+    // The same session, given gemma3 metadata, follows the flag — so the arch is the
+    // ONLY thing standing between the flag and the new path.
+    session.config.architecture = "gemma3".to_string();
+    session.config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 512,
+        sliding_window_pattern: 6,
+        rope_freq_base_global: 1_000_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 2.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    assert_eq!(
+        session.gemma3_batched_prefill_armed(),
+        crate::metal::gemma3_batch_prefill_enabled(),
+        "for a gemma3 row the predicate must be exactly the campaign flag"
+    );
+
+    // Phases 3 and 4 ride INSIDE that path: the tiled simdgroup-matmul prefill GEMM and
+    // the batched windowed attention are only reachable from `prefill_tokens_windowed`,
+    // whose only production caller is the predicate above. So the assertion that the
+    // predicate is false for a Llama-family row is the zero-behaviour-change proof for
+    // all three flags at once, in every env state — which is what lets them ship
+    // default-ON without touching any other row.
+    //
+    // What is additionally checked here is the POSTURE, which changed in Phase 4: all
+    // three are now default-ON with `=0` as the operator opt-out, and `=0` must actually
+    // be honoured (a default-on flag that ignores its opt-out is a flag with no off
+    // switch). Each clause is guarded on the env var's own state because these are
+    // process-latched `OnceLock`s that a test cannot force.
+    for (var, read) in [
+        (
+            "CAMELID_GEMMA3_BATCH_PREFILL",
+            crate::metal::gemma3_batch_prefill_enabled as fn() -> bool,
+        ),
+        (
+            "CAMELID_GEMMA3_PREFILL_MM",
+            crate::metal::gemma3_prefill_mm_enabled as fn() -> bool,
+        ),
+        (
+            "CAMELID_GEMMA3_PREFILL_ATTN_MM",
+            crate::metal::gemma3_prefill_attn_mm_enabled as fn() -> bool,
+        ),
+    ] {
+        match std::env::var(var).ok().as_deref() {
+            None => assert!(
+                read(),
+                "{var} must default ON since Phase 4 (long-prompt TTFT campaign, §19c)"
+            ),
+            Some("0") | Some("false") | Some("False") | Some("FALSE") => assert!(
+                !read(),
+                "{var}=0 is the operator opt-out and must be honoured"
+            ),
+            Some(_) => assert!(read(), "{var} set to anything but 0/false means ON"),
+        }
+    }
+}
+
 #[test]
 fn arch_disqualifiers_refuse_the_resident_gpu_path() {
     let (mut session, _temp) = tiny_kv_budget_session(64);

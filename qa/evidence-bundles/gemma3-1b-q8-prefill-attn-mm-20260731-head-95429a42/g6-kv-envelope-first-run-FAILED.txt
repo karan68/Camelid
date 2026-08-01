@@ -1,0 +1,15 @@
+# The FIRST G6 run, which FAILED. Kept because a phase that finds a bug and
+# reports only the fixed run has published nothing. Diagnosis: conductor 19b.
+
+test metal::tests::gemma3_real_row_prefill_attn_mm_kv_meets_published_envelope ... [G6-attn] n=5: bit_identical=false differing=72252/72320 kv_max_abs=4.434180e-2 median_pos_max=1.403427e-2 hidden_bit_identical=false hidden_max_abs=6.000000e0 outlier_ratio=3.2x kv_scale=8.260e1 kv_rel=5.368e-4 hidden_scale=3.294e4 hidden_rel=1.822e-4
+[G6-attn] n=256: bit_identical=false differing=3702622/3702784 kv_max_abs=6.900597e-2 median_pos_max=3.275967e-2 hidden_bit_identical=false hidden_max_abs=3.019629e1 outlier_ratio=2.1x kv_scale=1.396e2 kv_rel=4.942e-4 hidden_scale=3.294e4 hidden_rel=9.168e-4
+[G6-attn] n=257: bit_identical=false differing=3717085/3717248 kv_max_abs=1.211299e1 median_pos_max=3.283024e-2 hidden_bit_identical=false hidden_max_abs=1.136974e3 outlier_ratio=369.0x kv_scale=1.396e2 kv_rel=8.675e-2 hidden_scale=3.294e4 hidden_rel=3.452e-2
+[G6-attn] n=513: bit_identical=false differing=7419753/7420032 kv_max_abs=1.347325e1 median_pos_max=3.165817e-2 hidden_bit_identical=false hidden_max_abs=2.684006e3 outlier_ratio=425.6x kv_scale=1.396e2 kv_rel=9.649e-2 hidden_scale=3.294e4 hidden_rel=8.149e-2
+[G6-attn] n=1024: bit_identical=false differing=14810670/14811136 kv_max_abs=1.643524e-1 median_pos_max=3.293276e-2 hidden_bit_identical=false hidden_max_abs=8.422852e1 outlier_ratio=5.0x kv_scale=1.396e2 kv_rel=1.177e-3 hidden_scale=3.294e4 hidden_rel=2.557e-3
+[G6-attn] n=2400: bit_identical=false differing=34712630/34713600 kv_max_abs=3.312103e1 median_pos_max=3.362942e-2 hidden_bit_identical=false hidden_max_abs=6.915600e3 outlier_ratio=984.9x kv_scale=1.408e2 kv_rel=2.352e-1 hidden_scale=3.294e4 hidden_rel=2.100e-1
+  n=257: cache envelope (bound 2.000e-3 x kv_scale 1.3963e2 = 2.7926e-1, outlier factor 8) — max |KV diff| 1.211299e1 exceeds the published bound 2.792561e-1 at K layer 5 kv_head 0 position 256 dim 239: -7.4095445 (0xc0ed1afd) vs 4.7034492 (0x409682a8)
+  n=257: max |final_hidden diff| 1.136974e3 exceeds 1.000e-2 x the reference hidden's own magnitude 3.293694e4 (= 3.293694e2)
+  n=513: cache envelope (bound 2.000e-3 x kv_scale 1.3963e2 = 2.7926e-1, outlier factor 8) — max |KV diff| 1.347325e1 exceeds the published bound 2.792561e-1 at K layer 11 kv_head 0 position 512 dim 124: 22.901373 (0x41b73603) vs 9.428127 (0x4116d99c)
+  n=513: max |final_hidden diff| 2.684006e3 exceeds 1.000e-2 x the reference hidden's own magnitude 3.293694e4 (= 3.293694e2)
+  n=2400: cache envelope (bound 2.000e-3 x kv_scale 1.4081e2 = 2.8161e-1, outlier factor 8) — max |KV diff| 3.312103e1 exceeds the published bound 2.816119e-1 at K layer 17 kv_head 0 position 2372 dim 253: 24.620667 (0x41c4f720) vs -8.500366 (0xc1080180)
+  n=2400: max |final_hidden diff| 6.915600e3 exceeds 1.000e-2 x the reference hidden's own magnitude 3.293694e4 (= 3.293694e2)

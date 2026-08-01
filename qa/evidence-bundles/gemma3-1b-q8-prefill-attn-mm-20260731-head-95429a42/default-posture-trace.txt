@@ -1,0 +1,11 @@
+Proof that the SHIPPED DEFAULT posture takes Tier B through `camelid serve`.
+Server started with NO CAMELID_GEMMA3_* variables in the environment at all
+(env -u on all three), CAMELID_RESIDENT_TRACE=1. Every batched-prefill command
+buffer reports which GEMM and which attention it took:
+
+  70 gemm=mm attn=mm
+
+gemm=mm  -> Phase 3 tiled simdgroup-matmul weight GEMM
+attn=mm  -> Phase 4 batched windowed attention
+(attn=row would be Phase 3's per-row attention; no line at all would mean the
+ batched seam was never entered and the lane fell back to token-by-token.)
