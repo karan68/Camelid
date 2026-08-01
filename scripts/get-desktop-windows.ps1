@@ -43,24 +43,55 @@
   # The installer asset keeps its versioned name (Camelid.Desktop_<v>_x64-setup.exe),
   # so the release must be resolved through the API rather than a fixed
   # releases/latest/download URL like the macOS script uses.
-  $releaseUrl = if ($tag -eq 'latest') {
-    "https://api.github.com/repos/$repo/releases/latest"
-  } else {
-    "https://api.github.com/repos/$repo/releases/tags/$tag"
-  }
-  try {
-    $release = Invoke-RestMethod -Uri $releaseUrl
-  } catch {
-    throw "could not resolve release '$tag' from $releaseUrl -- $($_.Exception.Message)"
+  $installerOf = {
+    param($rel)
+    $found = @($rel.assets | Where-Object { $_.name -like '*x64-setup.exe' })
+    if ($found.Count -eq 1) { $found[0] } else { $null }
   }
 
-  $asset = @($release.assets | Where-Object { $_.name -like '*x64-setup.exe' })
-  if ($asset.Count -ne 1) {
-    throw ("release $($release.tag_name) does not publish exactly one Windows desktop installer " +
-      "(found $($asset.Count)). The release may predate the desktop app, or the desktop job was " +
-      "skipped; download an asset by hand from https://github.com/$repo/releases instead.")
+  if ($tag -eq 'latest') {
+    # Do NOT bind to releases/latest alone. A release whose desktop job failed still publishes
+    # its server artifacts and still becomes "latest", and binding to it strands every user on
+    # an error for something they cannot fix -- exactly what v0.4.8 did. Walk back to the most
+    # recent release that actually ships an installer, and say so when that is not the newest.
+    try {
+      $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=20"
+    } catch {
+      throw "could not list releases for $repo -- $($_.Exception.Message)"
+    }
+    $candidates = @($releases | Where-Object { -not $_.draft -and -not $_.prerelease })
+    if (-not $candidates) { throw "no published releases found for $repo" }
+
+    $release = $null
+    foreach ($candidate in $candidates) {
+      if (& $installerOf $candidate) { $release = $candidate; break }
+    }
+    if (-not $release) {
+      throw ("none of the $($candidates.Count) most recent $repo releases publishes a Windows " +
+        "desktop installer. Download an asset by hand from https://github.com/$repo/releases.")
+    }
+    if ($release.tag_name -ne $candidates[0].tag_name) {
+      Write-Warning ("$($candidates[0].tag_name) publishes no Windows desktop installer; " +
+        "installing $($release.tag_name), the most recent release that does.")
+    }
+  } else {
+    # An explicit tag is a specific request, so a missing installer there is a hard error
+    # rather than a silent substitution of a version the user did not ask for.
+    try {
+      $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag"
+    } catch {
+      throw "could not resolve release '$tag' for $repo -- $($_.Exception.Message)"
+    }
   }
-  $asset = $asset[0]
+
+  $asset = & $installerOf $release
+  if (-not $asset) {
+    $count = @($release.assets | Where-Object { $_.name -like '*x64-setup.exe' }).Count
+    throw ("release $($release.tag_name) does not publish exactly one Windows desktop installer " +
+      "(found $count). The release may predate the desktop app, or its desktop job failed; " +
+      "either omit CAMELID_DESKTOP_TAG to take the newest release that has one, or download an " +
+      "asset by hand from https://github.com/$repo/releases.")
+  }
 
   $installDir = Join-Path $env:LOCALAPPDATA 'Camelid Desktop'
   $workDir = Join-Path $env:TEMP "camelid-desktop-get-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"

@@ -24,48 +24,76 @@ fn desktop_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn tauri_conf() -> serde_json::Value {
-    let raw = std::fs::read_to_string(desktop_dir().join("tauri.conf.json"))
-        .expect("read tauri.conf.json");
-    serde_json::from_str(&raw).expect("tauri.conf.json is valid JSON")
+const SIGN_SCRIPT: &str = "windows/sign-artifact-signing.ps1";
+
+fn release_workflow() -> String {
+    let path = desktop_dir()
+        .parent()
+        .expect("repo root")
+        .join(".github/workflows/release.yml");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// `bundle.windows.signCommand` is the ONLY hook that can sign the copy of
-/// `camelid-desktop.exe` sealed inside the NSIS installer. Tauri rewrites the bundle-type
-/// marker (`__TAURI_BUNDLE_TYPE_VAR_UNK` -> `..._NSS`) on a staged copy, so a signature
-/// applied before `tauri build` is invalidated by that rewrite, and one applied afterwards
-/// cannot reach a binary already inside the installer. v0.4.6 shipped that copy `NotSigned`;
-/// v0.4.7 shipped it `HashMismatch`. Both are what dropping this config looks like.
+/// `bundle.windows.signCommand` is the only hook that can sign the copy of
+/// `camelid-desktop.exe` sealed inside the NSIS installer: Tauri patches the binary with the
+/// bundle type and signs only afterwards, so a signature applied before `tauri build` is
+/// invalidated and one applied after cannot reach a binary already inside the installer.
+/// v0.4.6 shipped that copy `NotSigned`; v0.4.7 shipped it `HashMismatch`.
+///
+/// It is wired by a config the RELEASE WORKFLOW generates, not by the committed
+/// `tauri.conf.json`, because the paths must be absolute and machine-specific — see
+/// `sign_command_paths_must_be_absolute`.
 #[test]
-fn sign_command_is_wired_to_a_script_that_exists() {
-    let conf = tauri_conf();
-    let sign = &conf["bundle"]["windows"]["signCommand"];
-    assert!(
-        !sign.is_null(),
-        "bundle.windows.signCommand must stay configured: it is the only point at which the \
-         binary inside the NSIS installer can be signed"
-    );
+fn release_workflow_generates_the_signing_config_and_passes_it_to_the_bundler() {
+    let wf = release_workflow();
 
-    let args: Vec<&str> = sign["args"]
-        .as_array()
-        .expect("signCommand must use the object notation so paths may contain whitespace")
-        .iter()
-        .map(|a| a.as_str().expect("signCommand args are strings"))
-        .collect();
     assert!(
-        args.contains(&"%1"),
-        "signCommand args must contain the %1 placeholder, or Tauri passes no file to sign: {args:?}"
+        wf.contains("camelid-desktop/tauri.signing.conf.json"),
+        "the release workflow must generate tauri.signing.conf.json; without it nothing signs \
+         the binary inside the installer"
     );
-
-    let script = args
-        .iter()
-        .find(|a| a.ends_with(".ps1"))
-        .expect("signCommand must invoke a .ps1 script");
-    let path = desktop_dir().join(script);
     assert!(
-        path.is_file(),
-        "signCommand points at {}, which does not exist — the release bundler would fail",
-        path.display()
+        wf.contains("--config tauri.bundle.conf.json --config tauri.signing.conf.json"),
+        "the bundler must be passed the generated signing config, or signCommand never runs"
+    );
+    assert!(
+        wf.contains(SIGN_SCRIPT),
+        "the generated signing config must point at {SIGN_SCRIPT}"
+    );
+    assert!(
+        desktop_dir().join(SIGN_SCRIPT).is_file(),
+        "{SIGN_SCRIPT} is referenced by the release workflow but does not exist"
+    );
+}
+
+/// Both paths in the generated signCommand must be ABSOLUTE.
+///
+/// Tauri invokes signCommand seven times per bundle — the app binary, five NSIS plugin DLLs,
+/// and the uninstaller staged as a `%TEMP%\nst*.tmp` — and the working directory is not
+/// constant: the uninstaller call runs from `target\release\nsis\x64`. v0.4.8 wired a
+/// project-relative script path, died there with `failed to run powershell`, and published no
+/// Windows installer at all. A bare `powershell` also failed to spawn on the runner, so the
+/// interpreter is resolved to a full path too.
+#[test]
+fn sign_command_paths_must_be_absolute() {
+    let wf = release_workflow();
+
+    assert!(
+        wf.contains("Resolve-Path 'camelid-desktop/windows/sign-artifact-signing.ps1'"),
+        "the signing script path must be resolved to an absolute path before it reaches \
+         signCommand: one of Tauri's seven invocations runs from target\\release\\nsis\\x64, \
+         where a project-relative path does not resolve"
+    );
+    assert!(
+        wf.contains("(Get-Command powershell.exe).Source"),
+        "the interpreter must be resolved to a full path: a bare `powershell` failed to spawn \
+         on the release runner"
+    );
+    assert!(
+        wf.contains("installerHooks = $hooks"),
+        "the generated signing config must carry installerHooks through, so it cannot silently \
+         drop the NVRTC-orphan cleanup if Tauri's config merge is not deep at bundle.windows"
     );
 }
 
@@ -74,16 +102,8 @@ fn sign_command_is_wired_to_a_script_that_exists() {
 /// exactly the silent failure the release gate exists to catch.
 #[test]
 fn sign_script_fails_closed_on_a_signing_error() {
-    let conf = tauri_conf();
-    let args = conf["bundle"]["windows"]["signCommand"]["args"]
-        .as_array()
-        .expect("signCommand args");
-    let script = args
-        .iter()
-        .filter_map(|a| a.as_str())
-        .find(|a| a.ends_with(".ps1"))
-        .expect("signCommand script");
-    let src = std::fs::read_to_string(desktop_dir().join(script)).expect("read signing script");
+    let src =
+        std::fs::read_to_string(desktop_dir().join(SIGN_SCRIPT)).expect("read signing script");
 
     assert!(
         src.contains("$LASTEXITCODE -ne 0"),
@@ -92,6 +112,30 @@ fn sign_script_fails_closed_on_a_signing_error() {
     assert!(
         src.contains("-ne 'Valid'"),
         "the signing script must verify the resulting signature, not just signtool's exit code"
+    );
+}
+
+/// An incomplete release must never become `latest`. The desktop jobs are independent by
+/// design, so a desktop failure publishes the server artifacts anyway — which is what left
+/// v0.4.8 as `latest` with no Windows installer and broke the documented one-command install
+/// for every user. The guard demotes such a release to a prerelease so `releases/latest` skips
+/// it and the previous complete release keeps serving installs.
+#[test]
+fn release_is_demoted_when_its_asset_set_is_incomplete() {
+    let wf = release_workflow();
+
+    assert!(
+        wf.contains("verify-release-assets"),
+        "the release workflow must verify the published asset set"
+    );
+    assert!(
+        wf.contains("--prerelease --latest=false"),
+        "an incomplete release must be demoted so releases/latest cannot point at it"
+    );
+    assert!(
+        wf.contains("x64-setup\\.exe$"),
+        "the completeness check must require the NSIS installer — that is the asset \
+         scripts/get-desktop-windows.ps1 resolves"
     );
 }
 

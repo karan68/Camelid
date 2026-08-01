@@ -1,18 +1,26 @@
 # Sign one file with Azure Artifact Signing (formerly Trusted Signing).
 #
-# This is Tauri's `bundle.windows.signCommand` hook: the bundler calls it with the path to
-# each binary it is about to package, AFTER it has finished rewriting that binary and BEFORE
-# it seals it into the installer. That timing is the whole point.
+# This is Tauri's `bundle.windows.signCommand`. The release workflow GENERATES
+# tauri.signing.conf.json pointing at this script with ABSOLUTE paths and passes it as an extra
+# `--config`. It is deliberately not wired into the committed tauri.conf.json: the paths are
+# machine-specific, and a developer running `tauri build` should not need signing tooling.
 #
-# WHY THIS EXISTS. Tauri stamps the bundle type into the binary it stages for the installer,
-# rewriting the marker `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed app knows
-# it came from NSIS. It patches a STAGED COPY, not target/release. v0.4.7 signed the binary
-# before `tauri bundle` ran, so that rewrite landed on already-signed bytes and every
-# installed copy reported HashMismatch -- a broken signature, which is a worse posture than
-# the unsigned binary v0.4.6 shipped. Signing from inside this hook is the only point at
-# which the bytes are final. Measured on the v0.4.7 artifacts: the installed and portable
-# copies differ in exactly two places, that 3-byte marker and the PE CheckSum (which
-# Authenticode excludes).
+# WHY THIS EXISTS. Tauri patches the binary with the bundle type
+# (`__TAURI_BUNDLE_TYPE_VAR_UNK` -> `..._NSS`) so the installed app knows how it was installed,
+# and signs only afterwards. A signature applied before `tauri build` is invalidated by that
+# rewrite; one applied after cannot reach a binary already sealed inside the installer. v0.4.6
+# shipped that copy NotSigned, v0.4.7 shipped it HashMismatch -- a broken signature, worse than
+# none. This hook is the only point at which the bytes are final.
+#
+# WHY ABSOLUTE PATHS. Tauri calls this hook SEVEN times per bundle -- the app binary, five NSIS
+# plugin DLLs, and the uninstaller staged as %TEMP%\nst*.tmp -- and the working directory is NOT
+# constant across them. Measured on a real bundle: six run from the Tauri project directory, but
+# the uninstaller call runs from target\release\nsis\x64, where a project-relative path does not
+# resolve. v0.4.8's release died exactly there -- `failed to bundle project: failed to run
+# powershell`, with this script never executing and no Windows installer published.
+#
+# Being invoked on the plugin DLLs and the uninstaller is correct, not incidental: those are the
+# installer's own components and ship inside it.
 #
 # AUTHENTICATION. signtool reaches the service through Azure.CodeSigning.Dlib, which uses
 # DefaultAzureCredential. The release workflow runs `azure/login` with OIDC beforehand, so
