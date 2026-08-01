@@ -4103,6 +4103,10 @@ kernel void half_mm_batched(
     }
 }
 
+// Half-output twin of `half_mm_batched`, and the ONLY variant that carries the
+// sliding-window mask (buffer 16). `window = 0` is the disabled case and is the
+// instruction-for-instruction pre-window kernel, which is what keeps every non-windowed
+// caller -- every non-gemma3 row through `prefill_tokens` -- byte-unchanged.
 kernel void half_mm_batched_f16o(
     device const half* a [[buffer(0)]],
     device const half* b [[buffer(1)]],
@@ -4120,6 +4124,7 @@ kernel void half_mm_batched_f16o(
     constant uint& group_a [[buffer(13)]],
     constant uint& causal_mode [[buffer(14)]],
     constant uint& q_offset [[buffer(15)]],
+    constant uint& window [[buffer(16)]],
     threadgroup half* shmem [[threadgroup(0)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -4138,6 +4143,30 @@ kernel void half_mm_batched_f16o(
     if (causal_mode == 1 && r0 > t0 + q_offset + NR1 - 1) {
         return; // S tile entirely above the causal diagonal: never read
     }
+    // SLIDING WINDOW (0 = disabled; every added term below then collapses -- the cull
+    // never fires and k_start is 0 -- so a window-free caller runs the identical
+    // arithmetic). Query at absolute position p attends keys in [p+1-window, p]: the
+    // window INCLUDES p, the convention `schedule_window_bounds` pins host-side.
+    // Written as `key + window > q` rather than `q - window` so it is unsigned-safe for
+    // q < window with no saturating branch.
+    //
+    // S pass (causal_mode 1): the tile spans keys [r0, r0+NR0) and queries
+    // [t0+q_offset, t0+q_offset+NR1). The most favourable pair is the LARGEST key with
+    // the SMALLEST query, so the whole tile is below the window when
+    // (r0+NR0-1) + window <= t0+q_offset. `softmax_causal_rows` masks exactly the same
+    // range, so a culled tile leaves S values that are never read.
+    if (causal_mode == 1 && window != 0 && r0 + NR0 + window <= t0 + q_offset + 1) {
+        return; // S tile entirely below the sliding window: never read
+    }
+    // PV pass (causal_mode 2): the contraction runs over key positions, so the window
+    // is a lower k bound taken from the SMALLEST query in the tile and aligned DOWN to
+    // NK. A too-low k_start is correct and only slower, because softmax zeroes P below
+    // every row's own lower bound -- which is what makes a per-TILE bound sound for a
+    // per-ROW mask.
+    const uint q_lo = t0 + q_offset;
+    const uint k_start = (causal_mode == 2 && window != 0 && q_lo >= window)
+        ? (((q_lo + 1 - window) / NK) * NK)
+        : 0;
     const uint k_end = (causal_mode == 2) ? min(kdim, t0 + q_offset + NR1) : kdim;
     device const half* ab = a + (tg.z / group_a) * a_batch_stride;
     device const half* bb = b + tg.z * b_batch_stride;
@@ -4156,14 +4185,18 @@ kernel void half_mm_batched_f16o(
     const uint sg_row_oct = (sg % 2) * 4;
     const uint sg_tok_oct = (sg / 2) * 4;
     // Skip quadrants that are entirely padding (tokens past cols) or, in the causal
-    // score pass, entirely above the diagonal. Staging and barriers stay uniform.
+    // score pass, entirely above the diagonal or entirely below the sliding window.
+    // Staging and barriers stay uniform. The quadrant is 32 keys x 32 queries, so the
+    // window test is the tile test at quadrant granularity.
     const uint quad_t0 = t0 + 8 * sg_tok_oct;
     const uint quad_r0 = r0 + 32 * (sg % 2);
     const bool sg_active = quad_t0 < cols
         && quad_r0 < rows
-        && !(causal_mode == 1 && quad_r0 > quad_t0 + q_offset + 31);
+        && !(causal_mode == 1 && quad_r0 > quad_t0 + q_offset + 31)
+        && !(causal_mode == 1 && window != 0
+             && quad_r0 + 32 + window <= quad_t0 + q_offset + 1);
 
-    for (uint kk0 = 0; kk0 < k_end; kk0 += NK) {
+    for (uint kk0 = k_start; kk0 < k_end; kk0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // A: 64 rows x 32 k staged TRANSPOSED (k-major in-block); zero-pad past kdim.
         // ROW TAIL: `rows` need not be a multiple of NR0, so the last row tile is
@@ -4251,7 +4284,8 @@ kernel void half_mm_batched_f16o(
 }
 
 // Causal softmax over one score row per simdgroup: P[q][p] = exp(scale*S - m) / l for
-// p <= q (zero otherwise, including the whole row when q >= n_tokens, so the PV pass
+// lo <= p <= q, where lo = max(0, q + 1 - window) and window = 0 disables the lower
+// bound (zero otherwise, including the whole row when q >= n_tokens, so the PV pass
 // can consume padded rows safely). Grid: (n_heads, n_pad rows), 32 threads.
 kernel void softmax_causal_rows(
     device const half* s [[buffer(0)]],
@@ -4261,6 +4295,7 @@ kernel void softmax_causal_rows(
     constant float& scale [[buffer(4)]],
     constant uint& q_offset [[buffer(5)]],
     constant uint& rows_per_block [[buffer(6)]],
+    constant uint& window [[buffer(7)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
@@ -4283,19 +4318,28 @@ kernel void softmax_causal_rows(
         return;
     }
     const uint write_end = min(n_pad, ((q_abs / 64) + 1) * 64);
+    // Sliding window (0 = disabled, and then lo is 0 and every loop below is the
+    // pre-window loop). `q_abs < window` is `q_abs + 1 <= window`, i.e. the whole causal
+    // prefix already fits inside the window; otherwise the first attended key is
+    // q_abs + 1 - window, because the window INCLUDES the current position.
+    const uint lo = (window == 0 || q_abs < window) ? 0u : (q_abs + 1 - window);
     float m = -INFINITY;
-    for (uint j = lane; j <= q_abs; j += 32) {
+    for (uint j = lo + lane; j <= q_abs; j += 32) {
         m = max(m, srow[j] * scale);
     }
     m = simd_max(m);
     float l = 0.0f;
-    for (uint j = lane; j <= q_abs; j += 32) {
+    for (uint j = lo + lane; j <= q_abs; j += 32) {
         l += exp(srow[j] * scale - m);
     }
     l = simd_sum(l);
     const float inv = 1.0f / l;
+    // Below `lo` P is ZEROED, not skipped: the PV pass starts its contraction at a
+    // per-TILE k_start derived from the tile's smallest query and aligned down to 32,
+    // so it reads columns in [k_start, lo) for every row above that smallest query.
     for (uint j = lane; j < write_end; j += 32) {
-        prow[j] = (j <= q_abs) ? half(exp(srow[j] * scale - m) * inv) : half(0.0f);
+        prow[j] =
+            (j >= lo && j <= q_abs) ? half(exp(srow[j] * scale - m) * inv) : half(0.0f);
     }
 }
 
@@ -12961,6 +13005,52 @@ pub fn gemma3_prefill_mm_enabled() -> bool {
     })
 }
 
+/// Which attention the batched windowed prefill runs (long-prompt TTFT campaign,
+/// Tier B). Same shape and the same reason as [`PrefillGemm`]: the env gate is a
+/// process-latched `OnceLock`, so a test process could otherwise never compare the
+/// per-row attention against the batched one.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum PrefillAttn {
+    /// `CAMELID_GEMMA3_PREFILL_ATTN_MM` decides.
+    EnvDefault,
+    /// Per row, through the unchanged `encode_attention` — Phase 2/3's attention.
+    ForceRow,
+    /// Batched windowed attention-as-matmul, where the shape admits it.
+    ForceMm,
+}
+
+/// Gate for the Phase 4 batched windowed attention-as-matmul (long-prompt TTFT
+/// campaign, Tier B). Like [`gemma3_prefill_mm_enabled`] this path is **not**
+/// bit-identical to the token-by-token lane — Q/K/V and the score and probability
+/// panels stage in half and the MMA accumulates in tile order — so its gate is the
+/// published KV-equivalence envelope, not raw bit equality.
+///
+/// Requires `CAMELID_GEMMA3_PREFILL_MM` (the context panel stays half all the way
+/// into the O projection) on top of `CAMELID_GEMMA3_BATCH_PREFILL`; arming it alone
+/// does nothing.
+pub fn gemma3_prefill_attn_mm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA3_PREFILL_ATTN_MM")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Threadgroup memory `half_mm_batched_f16o` needs: two 64x32 half staging tiles.
+/// FIXED — `sa = shmem`, `sb = shmem + 2048` — and independent of head_dim, which is
+/// what makes attention-as-matmul admissible at head_dim 256 while the `MAX_DPL` /
+/// `MAX_DOCT` kernels keep their <=128 memory-safety gates untouched.
+#[cfg(target_os = "macos")]
+const ATTN_MM_THREADGROUP_BYTES: usize = 8192;
+
+/// `half_mm_batched_f16o`'s square output tile (`NR0` = A rows, `NR1` = B rows). Both
+/// the S and PV passes tile on it, and `softmax_causal_rows` writes P up to the same
+/// 64-aligned causal boundary the PV pass reads.
+#[cfg(target_os = "macos")]
+const ATTN_MM_TILE: usize = 64;
+
 /// Threadgroup memory `q8_0_block_wire_mm` needs: A 128x32 half (8192 B) + B 64x32
 /// half (4096 B). FIXED — independent of head_dim, rows and chunk width — which is
 /// why this path is admissible at head_dim 256 while the `MAX_DPL` / `MAX_DOCT`
@@ -14274,13 +14364,14 @@ impl ResidentDecodeState {
             *p.add(10) = 1u32; // group=1 placeholder (real group below)
             *p.add(11) = gqa_group as u32;
         }
-        let softmax_scalar = nb(16);
+        let softmax_scalar = nb(20);
         unsafe {
             let p = softmax_scalar.contents() as *mut u32;
             *p = n_pad as u32;
             *p.add(1) = n_tokens as u32;
             *(p.add(2) as *mut f32) = scale;
             *p.add(3) = attn_qb as u32; // rows per query block
+            *p.add(4) = 0; // window = 0: full causal, this path serves no windowed arch
         }
         let normf_h = nb(if use_mm { n_pad * self.hidden * 2 } else { 2 });
         let ctx_h = nb(if use_mm { n_pad * q_dim * 2 } else { 2 });
@@ -14696,7 +14787,7 @@ impl ResidentDecodeState {
                     e.set_buffer(4, Some(&attn_mm_scalar), kdim_off + 4);
                     // dynamic scalars in a transient buffer (cols and the absolute
                     // query offset vary per query block)
-                    let dyn_buf = nb(44);
+                    let dyn_buf = nb(48);
                     unsafe {
                         let p = dyn_buf.contents() as *mut u32;
                         *p = a_bs;
@@ -14710,12 +14801,17 @@ impl ResidentDecodeState {
                         *p.add(8) = mode;
                         *p.add(9) = cols as u32;
                         *p.add(10) = q_off;
+                        // window = 0: this path serves the non-windowed archs, and the
+                        // kernel's window terms all collapse at 0. gemma3's windowed
+                        // prefill is a different function entirely.
+                        *p.add(11) = 0;
                     }
                     e.set_buffer(5, Some(&dyn_buf), 36);
                     for j in 0..9u64 {
                         e.set_buffer(6 + j, Some(&dyn_buf), j * 4);
                     }
                     e.set_buffer(15, Some(&dyn_buf), 40);
+                    e.set_buffer(16, Some(&dyn_buf), 44);
                     e.set_threadgroup_memory_length(0, 8192);
                     e.dispatch_thread_groups(
                         metal::MTLSize {
@@ -14792,6 +14888,7 @@ impl ResidentDecodeState {
                     e.set_buffer(4, Some(&softmax_scalar), 8);
                     e.set_buffer(5, Some(&qoff_buf), 0);
                     e.set_buffer(6, Some(&softmax_scalar), 12);
+                    e.set_buffer(7, Some(&softmax_scalar), 16); // window = 0
                     e.dispatch_thread_groups(
                         metal::MTLSize {
                             width: self.n_heads as u64,
@@ -15155,6 +15252,7 @@ impl ResidentDecodeState {
             chunk_rows,
             false,
             PrefillGemm::EnvDefault,
+            PrefillAttn::EnvDefault,
         )
         .map(|_| ())
     }
@@ -15175,6 +15273,7 @@ impl ResidentDecodeState {
         scale: f32,
         chunk_rows: usize,
         gemm: PrefillGemm,
+        attn: PrefillAttn,
     ) -> Option<()> {
         self.prefill_tokens_windowed_inner(
             embeddings,
@@ -15187,6 +15286,7 @@ impl ResidentDecodeState {
             chunk_rows,
             false,
             gemm,
+            attn,
         )
         .map(|_| ())
     }
@@ -15209,6 +15309,7 @@ impl ResidentDecodeState {
         scale: f32,
         chunk_rows: usize,
         gemm: PrefillGemm,
+        attn: PrefillAttn,
     ) -> Option<Vec<f32>> {
         self.prefill_tokens_windowed_inner(
             embeddings,
@@ -15221,6 +15322,7 @@ impl ResidentDecodeState {
             chunk_rows,
             true,
             gemm,
+            attn,
         )
     }
 
@@ -15237,6 +15339,7 @@ impl ResidentDecodeState {
         chunk_rows: usize,
         read_hidden: bool,
         gemm: PrefillGemm,
+        attn: PrefillAttn,
     ) -> Option<Vec<f32>> {
         // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
         // Mirrors verify_batch_inner's gate, MINUS the head_dim <= 128 clause: nothing on
@@ -15577,6 +15680,90 @@ impl ResidentDecodeState {
             .collect();
         let attn_scalars: Vec<Buffer> = (0..classes.len() * chunk).map(|_| nb(32)).collect();
 
+        // ---- Phase 4: batched windowed attention (Tier B) --------------------------------
+        // Phase 3 left prefill 79 % attention at 1 200 tokens and 84 % at 2 400 (§18e):
+        // every row still ran its own `encode_attention`, re-reading the whole window per
+        // query. This replaces the per-row loop with the attention-as-matmul chain the
+        // tree already ships for non-windowed rows — S = K Qᵀ and O = Vᵀ P through
+        // `half_mm_batched_f16o`, with `softmax_causal_rows` between them — and teaches
+        // exactly those two kernels the per-query-row LOWER mask bound they never had.
+        //
+        // On the `!has_qk_norm` clause that keeps `prefill_tokens` off this chain
+        // (`use_attn_mm`, src/metal.rs, rationale in that function's comment): it is about
+        // the surrounding plumbing, NOT about `half_mm_batched_f16o`. There it forces the
+        // WEIGHT GEMM to emit f32 Q/K so the f32 per-head norm can run in cpu_reference
+        // order. On this path the weight GEMM already emits f32 (both the Phase 2 GEMV and
+        // Phase 3's `q8_0_block_wire_mm` write f32), the per-head QK-norm and RoPE already
+        // run the exact single-token f32 kernels per row, and Q is converted to half only
+        // AFTER both. So the condition the clause exists to enforce is already met, and the
+        // GEMM itself has no QK-norm dependence at all.
+        //
+        // Admission relaxes nothing: `MAX_DPL` / `MAX_DOCT` and their <=128 host gates are
+        // untouched, and this chain has no per-lane fixed-size array and a FIXED 8 192 B
+        // threadgroup allocation, so head_dim never enters it.
+        let n_pad_max = n_tokens.next_multiple_of(ATTN_MM_TILE);
+        // S and P, [head][chunk row][n_pad] half each. Linear in the CHUNK width, not in
+        // n_tokens squared, because queries are already blocked by the chunk loop.
+        let attn_panel_elems = n_heads * chunk * n_pad_max;
+        let use_attn_mm = match attn {
+            PrefillAttn::ForceRow => false,
+            PrefillAttn::EnvDefault => gemma3_prefill_attn_mm_enabled(),
+            PrefillAttn::ForceMm => true,
+        } && use_mm
+            // The PV pass writes the context panel in half straight into the O GEMM's
+            // input; with the scalar GEMV there is no f32 consumer for it.
+            && !self.kv16
+            && !self.kvq8
+            // The S and PV operands are the half K/V mirrors, which are dual-written by
+            // the scatter in exactly this mode (and are dead weight in it today).
+            && head_dim.is_multiple_of(ATTN_MM_TILE)
+            && n_heads.is_multiple_of(n_kv_heads)
+            // Chunk starts must be 64-aligned so a query tile's causal boundary is the
+            // PV pass's `k_end` exactly; a single chunk covering the whole prompt starts
+            // at 0 and is aligned whatever its width.
+            && (chunk.is_multiple_of(ATTN_MM_TILE) || chunk == n_tokens)
+            // `Some(0)` means an EMPTY read range to `schedule_window_bounds` and a
+            // DISABLED window to the kernels. No real schedule produces it; fail closed
+            // rather than let the two conventions disagree.
+            && layer_windows.iter().all(|w| *w != Some(0))
+            && attn_panel_elems * 2 * 2 <= attn_mm_scratch_cap_bytes()
+            && threadgroup_alloc_fits(&kern.device, ATTN_MM_THREADGROUP_BYTES);
+        let attn_q_h = nb(if use_attn_mm { mm_pad * q_dim * 2 } else { 4 });
+        let attn_s = nb(if use_attn_mm { attn_panel_elems * 2 } else { 4 });
+        let attn_p = nb(if use_attn_mm { attn_panel_elems * 2 } else { 4 });
+        let attn_vt = nb(if use_attn_mm {
+            n_kv_heads * head_dim * n_pad_max * 2
+        } else {
+            4
+        });
+        if use_attn_mm {
+            // Zeroed once: the padded query rows of the Q panel are read by the S pass's
+            // unguarded vector loads, and S/P columns past a row's causal boundary are
+            // never read but should not be whatever the allocator handed back.
+            for (buf, bytes) in [
+                (&attn_q_h, mm_pad * q_dim * 2),
+                (&attn_s, attn_panel_elems * 2),
+                (&attn_p, attn_panel_elems * 2),
+                (&attn_vt, n_kv_heads * head_dim * n_pad_max * 2),
+            ] {
+                unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes) };
+            }
+        }
+        // The window uniform, one word per window class, written ONCE: `window = 0` is the
+        // disabled case, so the 4 global layers and the 22 sliding ones run the SAME
+        // parameterised kernel rather than two variants.
+        let attn_window_buf = nb(classes.len().max(1) * 4);
+        unsafe {
+            let p = attn_window_buf.contents() as *mut u32;
+            for (c, w) in classes.iter().enumerate() {
+                *p.add(c) = w.unwrap_or(0) as u32;
+            }
+        }
+        let attn_s_scalar = nb(52);
+        let attn_pv_scalar = nb(52);
+        let attn_sm_scalar = nb(20);
+        let attn_vt_scalar = nb(16);
+
         // f32 -> half staging for one GEMM input panel. `count_off` selects the element
         // count word in `mm_counts` (0 = k*hidden, 4 = k*q_dim, 8 = k*ffn_dim).
         let mm_stage = |e: &metal::ComputeCommandEncoderRef,
@@ -15617,6 +15804,43 @@ impl ResidentDecodeState {
                 },
                 metal::MTLSize {
                     width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        };
+
+        // One `half_mm_batched_f16o` dispatch: a 64x64 output tile per threadgroup, 128
+        // threads = 4 simdgroups, a FIXED 8 192 B of threadgroup memory. Buffers 3..=15
+        // are the thirteen uniform words of `scalar` in order; buffer 16 is the window,
+        // which rides in the per-class buffer so one dispatch path serves both the
+        // sliding and the global layers.
+        #[allow(clippy::too_many_arguments)]
+        let attn_mm_gemm = |e: &metal::ComputeCommandEncoderRef,
+                            a: &Buffer,
+                            b: &Buffer,
+                            c: &Buffer,
+                            scalar: &Buffer,
+                            window_off: u64,
+                            grid_rows: usize,
+                            grid_cols: usize| {
+            e.set_compute_pipeline_state(&kern.half_mm_batched_f16o_pipeline);
+            e.set_buffer(0, Some(a), 0);
+            e.set_buffer(1, Some(b), 0);
+            e.set_buffer(2, Some(c), 0);
+            for j in 0..13u64 {
+                e.set_buffer(3 + j, Some(scalar), j * 4);
+            }
+            e.set_buffer(16, Some(&attn_window_buf), window_off);
+            e.set_threadgroup_memory_length(0, ATTN_MM_THREADGROUP_BYTES as u64);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (grid_rows as u64).div_ceil(ATTN_MM_TILE as u64),
+                    height: (grid_cols as u64).div_ceil(ATTN_MM_TILE as u64),
+                    depth: n_heads as u64,
+                },
+                metal::MTLSize {
+                    width: 128,
                     height: 1,
                     depth: 1,
                 },
@@ -15689,6 +15913,68 @@ impl ResidentDecodeState {
                         // elements on f32/f16) — scale with the stride, NOT with head_dim.
                         *(p.add(28) as *mut u32) = (window_start * kv_position_stride) as u32;
                     }
+                }
+            }
+            // Phase 4 per-chunk geometry. Positions [0, n_pos) are live once this chunk's
+            // K/V are scattered; `n_pad` rounds that to the kernels' 64 tile so a query
+            // tile's causal boundary and `softmax_causal_rows`'s `write_end` coincide with
+            // the PV pass's `k_end`. The S pass is handed `rows = n_pos`, NOT n_pad, so its
+            // A-row guard never reads a cache slot past the live range.
+            let n_pos = base + k;
+            let n_pad = n_pos.next_multiple_of(ATTN_MM_TILE);
+            if use_attn_mm {
+                unsafe {
+                    // S = K Qᵀ: A = the half K mirror [kv_head][max_positions][head_dim],
+                    // B = the half Q panel [row][q_dim], C = S [head][row][n_pad].
+                    let p = attn_s_scalar.contents() as *mut u32;
+                    *p = head_dim as u32; // kdim (contract over head_dim)
+                    *p.add(1) = n_pos as u32; // rows: live KV positions
+                    *p.add(2) = k as u32; // cols: this chunk's queries
+                    *p.add(3) = (max_positions * head_dim) as u32; // a batch stride
+                    *p.add(4) = head_dim as u32; // b batch stride (head slice of a row)
+                    *p.add(5) = (chunk * n_pad) as u32; // c batch stride
+                    *p.add(6) = head_dim as u32; // a row stride
+                    *p.add(7) = q_dim as u32; // b row stride
+                    *p.add(8) = n_pad as u32; // c row stride
+                    *p.add(9) = 1; // a elem stride
+                    *p.add(10) = (n_heads / n_kv_heads) as u32; // GQA: share the KV head
+                    *p.add(11) = 1; // causal_mode: upper cull + window cull
+                    *p.add(12) = base as u32; // q_offset: chunk-local -> absolute
+                    // O = Vᵀ P: A = Vᵀ [kv_head][head_dim][n_pad], B = P, C = the half
+                    // context panel the O projection consumes.
+                    let p = attn_pv_scalar.contents() as *mut u32;
+                    *p = n_pad as u32; // kdim (contract over positions)
+                    *p.add(1) = head_dim as u32; // rows
+                    *p.add(2) = k as u32; // cols
+                    *p.add(3) = (head_dim * n_pad) as u32; // a batch stride
+                    *p.add(4) = (chunk * n_pad) as u32; // b batch stride
+                    *p.add(5) = head_dim as u32; // c batch stride (head slice)
+                    *p.add(6) = n_pad as u32; // a row stride
+                    *p.add(7) = n_pad as u32; // b row stride
+                    *p.add(8) = q_dim as u32; // c row stride
+                    *p.add(9) = 1; // a elem stride
+                    *p.add(10) = (n_heads / n_kv_heads) as u32;
+                    *p.add(11) = 2; // causal_mode: k_end clamp + window k_start
+                    *p.add(12) = base as u32;
+                    let p = attn_sm_scalar.contents() as *mut u32;
+                    *p = n_pad as u32; // score-row stride
+                    *p.add(1) = n_pos as u32;
+                    *(p.add(2) as *mut f32) = scale;
+                    *p.add(3) = base as u32; // q_offset
+                    // rows per block is the PANEL's row pitch, which is the chunk width
+                    // and NOT this chunk's row count: `softmax_causal_rows` derives its
+                    // per-head base as `head * rows_per_block * n_pad`, the same stride
+                    // the two GEMMs are handed as `c_batch_stride` / `b_batch_stride`.
+                    // A ragged last chunk (k < chunk) that passed `k` here sent every
+                    // head above 0 to the wrong panel offset — caught by G6 at n = 257 /
+                    // 513 / 2400 and by nothing else. The live-row count rides in the
+                    // dispatch height instead.
+                    *p.add(4) = chunk as u32;
+                    let p = attn_vt_scalar.contents() as *mut u32;
+                    *p = head_dim as u32;
+                    *p.add(1) = max_positions as u32;
+                    *p.add(2) = n_pad as u32;
+                    *p.add(3) = n_pos as u32; // zero-fill past the live range
                 }
             }
             write_buffer_f32(&act_a, &embeddings[base * hidden..(base + k) * hidden]);
@@ -15818,34 +16104,106 @@ impl ResidentDecodeState {
                 // v2 / split-K / split3 routing at that position_count is whatever the
                 // token-by-token lane would pick.
                 let class_base = layer_class[l] * chunk;
-                for i in 0..k {
-                    let (_, position_count) =
-                        schedule_window_bounds(layer_windows[l], base + i + 1);
-                    encode_attention(
-                        e,
-                        kern,
-                        &mut keep,
-                        &q_buf,
-                        &self.cache_k[l],
-                        &self.cache_v[l],
-                        if self.kv16 || self.kvq8 {
-                            None
-                        } else {
-                            Some((&self.cache_k16[l], &self.cache_v16[l]))
+                if use_attn_mm {
+                    // Phase 4: the whole chunk's attention as three dispatches instead of
+                    // 3k. Q is converted to half only HERE — after the f32 per-head
+                    // QK-norm and the f32 RoPE, both of which still run the exact
+                    // single-token kernels at a row byte offset.
+                    mm_stage(e, &q_buf, &attn_q_h, 4, k * q_dim);
+                    // Vᵀ for this layer's live cache slice, so the PV pass's A staging
+                    // reads contiguously; positions past `n_pos` are zero-filled.
+                    e.set_compute_pipeline_state(&kern.transpose_v16_pipeline);
+                    e.set_buffer(0, Some(&self.cache_v16[l]), 0);
+                    e.set_buffer(1, Some(&attn_vt), 0);
+                    for j in 0..4u64 {
+                        e.set_buffer(2 + j, Some(&attn_vt_scalar), j * 4);
+                    }
+                    e.dispatch_threads(
+                        metal::MTLSize {
+                            width: n_pad as u64,
+                            height: head_dim as u64,
+                            depth: n_kv_heads as u64,
                         },
-                        &scores_buf,
-                        &ctx_buf,
-                        &attn_scalars[class_base + i],
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        position_count,
-                        (i * q_dim * 4) as u64,
-                        (i * q_dim * 4) as u64,
+                        metal::MTLSize {
+                            width: 32,
+                            height: 4,
+                            depth: 1,
+                        },
                     );
+                    let window_off = (layer_class[l] * 4) as u64;
+                    attn_mm_gemm(
+                        e,
+                        &self.cache_k16[l],
+                        &attn_q_h,
+                        &attn_s,
+                        &attn_s_scalar,
+                        window_off,
+                        n_pad,
+                        k,
+                    );
+                    e.set_compute_pipeline_state(&kern.softmax_causal_rows_pipeline);
+                    e.set_buffer(0, Some(&attn_s), 0);
+                    e.set_buffer(1, Some(&attn_p), 0);
+                    for j in 0..5u64 {
+                        e.set_buffer(2 + j, Some(&attn_sm_scalar), j * 4);
+                    }
+                    e.set_buffer(7, Some(&attn_window_buf), window_off);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: n_heads as u64,
+                            height: (k as u64).div_ceil(8),
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 256,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    // Straight into the O projection's half input panel: no f32 context
+                    // round trip, and the padded rows stay zero from the one-time memset.
+                    attn_mm_gemm(
+                        e,
+                        &attn_vt,
+                        &attn_p,
+                        &mm_y_q,
+                        &attn_pv_scalar,
+                        window_off,
+                        head_dim,
+                        k,
+                    );
+                } else {
+                    for i in 0..k {
+                        let (_, position_count) =
+                            schedule_window_bounds(layer_windows[l], base + i + 1);
+                        encode_attention(
+                            e,
+                            kern,
+                            &mut keep,
+                            &q_buf,
+                            &self.cache_k[l],
+                            &self.cache_v[l],
+                            if self.kv16 || self.kvq8 {
+                                None
+                            } else {
+                                Some((&self.cache_k16[l], &self.cache_v16[l]))
+                            },
+                            &scores_buf,
+                            &ctx_buf,
+                            &attn_scalars[class_base + i],
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            position_count,
+                            (i * q_dim * 4) as u64,
+                            (i * q_dim * 4) as u64,
+                        );
+                    }
                 }
                 if use_mm {
-                    mm_stage(e, &ctx_buf, &mm_y_q, 4, k * q_dim);
+                    if !use_attn_mm {
+                        mm_stage(e, &ctx_buf, &mm_y_q, 4, k * q_dim);
+                    }
                     mm_gemm(e, &mm_y_q, &w[3], &o_buf, &o_gemv, hidden, k);
                 } else {
                     encode_resident_matmul_f32(
@@ -15956,10 +16314,11 @@ impl ResidentDecodeState {
                 let wall_us = commit_started.elapsed().as_micros();
                 let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb.to_owned());
                 eprintln!(
-                    "[batch-prefill] base={base} rows={k} gemm={} encode={encode_us}us \
-                     commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
+                    "[batch-prefill] base={base} rows={k} gemm={} attn={} \
+                     encode={encode_us}us commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
                      kernel_window={kernel_window_us}us",
-                    if use_mm { "mm" } else { "gemv" }
+                    if use_mm { "mm" } else { "gemv" },
+                    if use_attn_mm { "mm" } else { "row" }
                 );
             }
             if read_hidden {
@@ -26060,6 +26419,9 @@ mod tests {
                         // shell with CAMELID_GEMMA3_PREFILL_MM armed cannot silently turn
                         // this assertion into a different claim.
                         PrefillGemm::ForceScalar,
+                        // ... and pin the per-row attention too: Phase 4's batched
+                        // attention is not bit-identical either.
+                        PrefillAttn::ForceRow,
                     )
                     .expect("batched windowed prefill must be admitted for this fixture");
                 // G11: `filled` must land on n exactly, or the caller's rebuild
@@ -26111,6 +26473,7 @@ mod tests {
                         scale,
                         CHUNK,
                         PrefillGemm::ForceMm,
+                        PrefillAttn::ForceRow,
                     )
                     .expect("an inadmissible shape must FALL BACK, never decline the prefill");
                 compare(
@@ -26672,6 +27035,7 @@ mod tests {
                     row.scale,
                     256,
                     PrefillGemm::ForceScalar,
+                    PrefillAttn::ForceRow,
                 )
                 .expect("batched windowed prefill must be admitted for the real row");
             assert_eq!(
@@ -26891,6 +27255,7 @@ mod tests {
                     row.scale,
                     256,
                     PrefillGemm::ForceMm,
+                    PrefillAttn::ForceRow,
                 )
                 .expect("the tiled-MM prefill must be admitted for the real row");
             assert_eq!(
@@ -26979,6 +27344,225 @@ mod tests {
         );
         eprintln!(
             "[G6-mm] PASS at n = 5/256/257/513/1024/2400: worst cache RELATIVE diff \
+             {worst_kv:.6e} (bound {PHASE3_KV_REL_BOUND:.3e}), worst hidden RELATIVE diff \
+             {worst_hidden:.6e} (bound {PHASE3_HIDDEN_REL_BOUND:.3e}), outlier factor \
+             {PHASE3_KV_OUTLIER_FACTOR}"
+        );
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 4 — GATE G6 for Tier B.
+    //
+    // Same envelope, unmoved: the §18b bounds (`PHASE3_KV_REL_BOUND` 2.0e-3 x the
+    // caches' own magnitude, `PHASE3_HIDDEN_REL_BOUND` 1.0e-2 relative,
+    // `PHASE3_KV_OUTLIER_FACTOR` 8.0) were pinned and committed BEFORE Phase 3 measured
+    // anything, and Phase 4 does not widen them. That is deliberate and it is the whole
+    // gate: the scalar half already sits only 1.5x below the weakest recorded window
+    // mutation (4.29e-1 absolute = 3.1e-3 relative, §18b), so there is no room to widen
+    // it and still be separating numerics from mask defects. If batched attention does
+    // not fit inside the bound Phase 3 published, that is a Phase 4 failure reported as
+    // one — not a bound moved to fit.
+    //
+    // The reference is the SHIPPED token-by-token lane, so the number this prints is
+    // directly comparable to §18d's table and to the mutation signatures at the same
+    // lengths, rather than to an intermediate.
+    //
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=<gguf> \
+    //   cargo test --release --lib gemma3_real_row_prefill_attn_mm_kv -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_prefill_attn_mm_kv_meets_published_envelope() {
+        use crate::kv_equivalence::compare;
+        if !detect_metal_device().available {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_attn_mm_kv_meets_published_envelope: set \
+                 CAMELID_GEMMA3_GGUF to the gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_attn_mm_kv_meets_published_envelope: the \
+                 production GEMV gates (f32y/wire/NSG8) are not armed; arm them from the shell."
+            );
+            return;
+        }
+        let row = load_gemma3_real_row(&path.to_string_lossy());
+        let weights = row.weights();
+        let schedule = row.schedule();
+        assert_eq!(row.head_dim, 256, "expected the 1B row's head_dim");
+
+        let token_at = |i: usize| -> u32 { (2 + (i * 7919) % (row.vocab - 3)) as u32 };
+        let mut worst_kv = 0.0f32;
+        let mut worst_hidden = 0.0f32;
+        let mut failures: Vec<String> = Vec::new();
+        for &n in &[5usize, 256, 257, 513, 1024, 2400] {
+            let mut embeddings: Vec<f32> = Vec::with_capacity(n * row.hidden);
+            let mut cos_all: Vec<f32> = Vec::new();
+            let mut sin_all: Vec<f32> = Vec::new();
+            let mut alt_cos: Vec<f32> = Vec::new();
+            let mut alt_sin: Vec<f32> = Vec::new();
+            for t in 0..n {
+                embeddings.extend_from_slice(&row.embed(token_at(t)));
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_global,
+                );
+                cos_all.extend_from_slice(&c);
+                sin_all.extend_from_slice(&s);
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_local,
+                );
+                alt_cos.extend_from_slice(&c);
+                alt_sin.extend_from_slice(&s);
+            }
+            let mk_session = || {
+                ResidentDecodeState::new(
+                    row.n_layers,
+                    row.n_heads,
+                    row.n_kv,
+                    row.head_dim,
+                    row.hidden,
+                    row.ffn,
+                    n,
+                    n,
+                    row.eps,
+                    row.split_half_pairing,
+                    Some(schedule.clone()),
+                )
+                .expect("resident session")
+            };
+
+            let mut token_session = mk_session();
+            let mut token_hidden: Vec<f32> = Vec::with_capacity(n * row.hidden);
+            let half = row.rope_dim / 2;
+            for t in 0..n {
+                match token_session
+                    .forward_token(
+                        &embeddings[t * row.hidden..(t + 1) * row.hidden],
+                        &weights,
+                        &cos_all[t * half..(t + 1) * half],
+                        &sin_all[t * half..(t + 1) * half],
+                        Some((
+                            &alt_cos[t * half..(t + 1) * half],
+                            &alt_sin[t * half..(t + 1) * half],
+                        )),
+                        t,
+                        row.scale,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .expect("resident forward")
+                {
+                    ResidentTokenOut::Data(v) => token_hidden.extend_from_slice(&v),
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            }
+            assert_eq!(token_session.filled(), n);
+
+            let mut prefill = |attn: PrefillAttn| {
+                let mut s = mk_session();
+                let hidden = s
+                    .prefill_tokens_windowed_hidden(
+                        &embeddings,
+                        n,
+                        &weights,
+                        &cos_all,
+                        &sin_all,
+                        Some((&alt_cos, &alt_sin)),
+                        row.scale,
+                        256,
+                        PrefillGemm::ForceMm,
+                        attn,
+                    )
+                    .expect("the batched prefill must be admitted for the real row");
+                assert_eq!(
+                    s.filled(),
+                    n,
+                    "n={n}: batched prefill must leave filled == n (G11)"
+                );
+                (s.kv_snapshot(n), hidden)
+            };
+            // Phase 3's path (per-row attention) and Phase 4's, over the same prompt.
+            let (row_snapshot, _) = prefill(PrefillAttn::ForceRow);
+            let (mm_snapshot, mm_hidden) = prefill(PrefillAttn::ForceMm);
+            // NOT a pass by vacuity, and this is the assertion that catches a silent
+            // admission failure: if `use_attn_mm` had declined, Phase 4 would have run
+            // Phase 3's encode and these two would be bit-identical.
+            assert!(
+                !compare(&row_snapshot, &mm_snapshot)
+                    .expect("same geometry")
+                    .bit_identical,
+                "n={n}: batched attention came out bit-identical to the per-row path — \
+                 admission must have declined, so this gate proved nothing"
+            );
+
+            let token_snapshot = token_session.kv_snapshot(n);
+            let amax = |xs: &[f32]| xs.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let kv_scale = token_snapshot
+                .k
+                .iter()
+                .chain(&token_snapshot.v)
+                .fold(0.0f32, |m, b| m.max(amax(b)));
+            let hidden_scale = amax(&token_hidden);
+            let eq = compare(
+                &token_snapshot
+                    .clone()
+                    .with_final_hidden(token_hidden.clone()),
+                &mm_snapshot.clone().with_final_hidden(mm_hidden),
+            )
+            .expect("same geometry");
+            let median = eq.median_position_max_abs();
+            eprintln!(
+                "[G6-attn] n={n}: {} outlier_ratio={:.1}x kv_scale={kv_scale:.3e} \
+                 kv_rel={:.3e} hidden_scale={hidden_scale:.3e} hidden_rel={:.3e}",
+                eq.summary(),
+                if median > 0.0 {
+                    eq.max_abs_diff / median
+                } else {
+                    f32::INFINITY
+                },
+                eq.max_abs_diff / kv_scale.max(f32::MIN_POSITIVE),
+                eq.hidden_max_abs_diff / hidden_scale.max(f32::MIN_POSITIVE),
+            );
+            let eq_caches = compare(&token_snapshot, &mm_snapshot).expect("same geometry");
+            let cache_bound = PHASE3_KV_REL_BOUND * kv_scale;
+            if let Err(why) = eq_caches.meets_bound(cache_bound, PHASE3_KV_OUTLIER_FACTOR) {
+                failures.push(format!(
+                    "n={n}: cache envelope (bound {PHASE3_KV_REL_BOUND:.3e} x kv_scale \
+                     {kv_scale:.4e} = {cache_bound:.4e}, outlier factor \
+                     {PHASE3_KV_OUTLIER_FACTOR}) — {why}"
+                ));
+            }
+            if eq.hidden_max_abs_diff > PHASE3_HIDDEN_REL_BOUND * hidden_scale {
+                failures.push(format!(
+                    "n={n}: max |final_hidden diff| {:.6e} exceeds {PHASE3_HIDDEN_REL_BOUND:.3e} \
+                     x the reference hidden's own magnitude {hidden_scale:.6e} (= {:.6e})",
+                    eq.hidden_max_abs_diff,
+                    PHASE3_HIDDEN_REL_BOUND * hidden_scale
+                ));
+            }
+            worst_kv = worst_kv.max(eq.max_abs_diff / kv_scale);
+            worst_hidden = worst_hidden.max(eq.hidden_max_abs_diff / hidden_scale);
+        }
+        assert!(
+            failures.is_empty(),
+            "G6 (real row, Tier B): batched windowed attention misses the envelope \
+             published in GEMMA3_METAL_CONDUCTOR.md §18b at {} of 6 lengths:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+        eprintln!(
+            "[G6-attn] PASS at n = 5/256/257/513/1024/2400: worst cache RELATIVE diff \
              {worst_kv:.6e} (bound {PHASE3_KV_REL_BOUND:.3e}), worst hidden RELATIVE diff \
              {worst_hidden:.6e} (bound {PHASE3_HIDDEN_REL_BOUND:.3e}), outlier factor \
              {PHASE3_KV_OUTLIER_FACTOR}"
@@ -27082,6 +27666,7 @@ mod tests {
                 row.scale,
                 8,
                 gemm,
+                PrefillAttn::ForceRow,
             )
             .expect("warm-up");
         }
@@ -27113,6 +27698,7 @@ mod tests {
                     row.scale,
                     256,
                     gemm,
+                    PrefillAttn::ForceRow,
                 )
                 .expect("batched windowed prefill");
             report(label, started.elapsed().as_secs_f64());
@@ -27142,6 +27728,202 @@ mod tests {
                 .expect("resident forward");
         }
         report("token-by-token (today)", started.elapsed().as_secs_f64());
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 4 — the KERNEL-LEVEL measurement, and the
+    // campaign's stopping rule 5.
+    //
+    // Both attention paths over the SAME prompt in ONE process with the SAME warm weight
+    // cache and the SAME GEMM (Phase 3's tiled MM pinned on both sides), so what is being
+    // timed is attention and only attention. Stopping rule 5 requires the batched kernel
+    // to beat Tier A's per-row attention by >= 3x on wall clock; this is the number that
+    // decides it, and it is reported whether it clears the bar or not.
+    //
+    // Also printed, from the same tile arithmetic the kernel runs: how many 64x64 score
+    // tiles the dispatch grid covers, how many the causal cull drops, and how many the
+    // WINDOW cull drops. The window cull is the whole reason a windowed layer's per-query
+    // cost is O(1) in prompt length rather than O(n), so it is counted rather than
+    // asserted.
+    //
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=<gguf> \
+    //   cargo test --release --lib gemma3_real_row_prefill_attn_probe -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_prefill_attn_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_attn_probe: set CAMELID_GEMMA3_GGUF to the \
+                 gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_attn_probe: the production GEMV gates \
+                 (f32y/wire/NSG8) are not armed; arm them from the shell."
+            );
+            return;
+        }
+        let row = load_gemma3_real_row(&path.to_string_lossy());
+        let weights = row.weights();
+        let schedule = row.schedule();
+        const CHUNK: usize = 256;
+        let half = row.rope_dim / 2;
+
+        // The dispatch grid's tile census, computed with the kernel's OWN predicates:
+        // upper cull `r0 > t0 + q_offset + NR1 - 1`, window cull
+        // `r0 + NR0 + window <= t0 + q_offset + 1`, both at NR0 = NR1 = ATTN_MM_TILE.
+        let tile_census = |n: usize| -> (usize, usize, usize, usize) {
+            let (mut total, mut causal, mut win, mut kept) = (0usize, 0, 0, 0);
+            let mut base = 0usize;
+            while base < n {
+                let k = CHUNK.min(n - base);
+                let n_pad = (base + k).next_multiple_of(ATTN_MM_TILE);
+                for w in schedule.window.iter() {
+                    let w = w.unwrap_or(0);
+                    for ty in 0..k.div_ceil(ATTN_MM_TILE) {
+                        let t0 = ty * ATTN_MM_TILE;
+                        for tx in 0..n_pad / ATTN_MM_TILE {
+                            let r0 = tx * ATTN_MM_TILE;
+                            total += 1;
+                            if r0 > t0 + base + ATTN_MM_TILE - 1 {
+                                causal += 1;
+                            } else if w != 0 && r0 + ATTN_MM_TILE + w <= t0 + base + 1 {
+                                win += 1;
+                            } else {
+                                kept += 1;
+                            }
+                        }
+                    }
+                }
+                base += k;
+            }
+            (total, causal, win, kept)
+        };
+
+        for &n in &[1200usize, 2400] {
+            let token_at = |i: usize| -> u32 { (2 + (i * 7919) % (row.vocab - 3)) as u32 };
+            let mut embeddings: Vec<f32> = Vec::with_capacity(n * row.hidden);
+            let mut cos_all: Vec<f32> = Vec::new();
+            let mut sin_all: Vec<f32> = Vec::new();
+            let mut alt_cos: Vec<f32> = Vec::new();
+            let mut alt_sin: Vec<f32> = Vec::new();
+            for t in 0..n {
+                embeddings.extend_from_slice(&row.embed(token_at(t)));
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_global,
+                );
+                cos_all.extend_from_slice(&c);
+                sin_all.extend_from_slice(&s);
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_local,
+                );
+                alt_cos.extend_from_slice(&c);
+                alt_sin.extend_from_slice(&s);
+            }
+            // The MODEL's attention work at this length: sum over layers and positions of
+            // min(p+1, window) attended keys, x 2 matmuls x head_dim x n_heads x 2 flops.
+            // Tiling makes the kernel do somewhat more than this, so a rate computed
+            // against it is a LOWER bound on the kernel's efficiency.
+            let attended: u64 = schedule
+                .window
+                .iter()
+                .map(|w| {
+                    (0..n)
+                        .map(|p| match w {
+                            Some(win) => (p + 1).min(*win) as u64,
+                            None => (p + 1) as u64,
+                        })
+                        .sum::<u64>()
+                })
+                .sum();
+            let gflop =
+                4.0 * attended as f64 * (row.head_dim * row.n_heads) as f64 / 1.0e9;
+            let mk_session = || {
+                ResidentDecodeState::new(
+                    row.n_layers,
+                    row.n_heads,
+                    row.n_kv,
+                    row.head_dim,
+                    row.hidden,
+                    row.ffn,
+                    n,
+                    n,
+                    row.eps,
+                    row.split_half_pairing,
+                    Some(schedule.clone()),
+                )
+                .expect("resident session")
+            };
+            for attn in [PrefillAttn::ForceRow, PrefillAttn::ForceMm] {
+                let mut warm = mk_session();
+                warm.prefill_tokens_windowed_gemm(
+                    &embeddings[..64 * row.hidden],
+                    64,
+                    &weights,
+                    &cos_all[..64 * half],
+                    &sin_all[..64 * half],
+                    Some((&alt_cos[..64 * half], &alt_sin[..64 * half])),
+                    row.scale,
+                    64,
+                    PrefillGemm::ForceMm,
+                    attn,
+                )
+                .expect("warm-up");
+            }
+            let mut secs = [0.0f64; 2];
+            for (i, attn) in [PrefillAttn::ForceRow, PrefillAttn::ForceMm]
+                .into_iter()
+                .enumerate()
+            {
+                let mut session = mk_session();
+                let started = std::time::Instant::now();
+                session
+                    .prefill_tokens_windowed_gemm(
+                        &embeddings,
+                        n,
+                        &weights,
+                        &cos_all,
+                        &sin_all,
+                        Some((&alt_cos, &alt_sin)),
+                        row.scale,
+                        CHUNK,
+                        PrefillGemm::ForceMm,
+                        attn,
+                    )
+                    .expect("batched windowed prefill");
+                secs[i] = started.elapsed().as_secs_f64();
+            }
+            let (total, causal, win, kept) = tile_census(n);
+            eprintln!(
+                "[attn-probe] n={n} per-row {:7.3}s ({:6.3} ms/token) | batched {:7.3}s \
+                 ({:6.3} ms/token) | {:5.2}x | attention {:.2} GFLOP, batched-path \
+                 {:.3} TFLOPS lower bound | load {:.2}",
+                secs[0],
+                secs[0] * 1000.0 / n as f64,
+                secs[1],
+                secs[1] * 1000.0 / n as f64,
+                secs[0] / secs[1],
+                gflop,
+                gflop / 1.0e3 / secs[1],
+                loadavg_1m()
+            );
+            eprintln!(
+                "[attn-probe] n={n} score tiles: {total} in the grid, {causal} dropped by \
+                 the causal cull, {win} dropped by the WINDOW cull ({:.1} % of the grid, \
+                 {:.1} % of what causal alone would have kept), {kept} computed",
+                100.0 * win as f64 / total as f64,
+                100.0 * win as f64 / (win + kept) as f64,
+            );
+        }
     }
 
     // gemma3 long-prompt TTFT campaign, Phase 1 — THE MUTATION HARNESS (gate G7).
@@ -30553,6 +31335,8 @@ mod attn_mm_parity {
             *p.add(9) = 1u32; // a elem stride
             *p.add(10) = group as u32;
             *p.add(11) = 0u32; // no causal culling for the parity check
+            *p.add(12) = 0u32; // q_offset
+            *p.add(13) = 0u32; // window = 0 (disabled)
         }
         let cb = k_ref.queue.new_command_buffer();
         let e = cb.new_compute_command_encoder();
@@ -30612,12 +31396,15 @@ mod attn_mm_parity {
             (heads * n_pad * n_pad * 2) as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let sm_scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+        let sm_scalar = device.new_buffer(24, MTLResourceOptions::StorageModeShared);
         unsafe {
             let p = sm_scalar.contents() as *mut u32;
             *p = n_pad as u32;
             *p.add(1) = n as u32;
             *(p.add(2) as *mut f32) = scale;
+            *p.add(3) = 0u32; // q_offset
+            *p.add(4) = n_pad as u32; // rows per query block
+            *p.add(5) = 0u32; // window = 0 (disabled)
         }
         let ctx_buf =
             device.new_buffer((n * qdim * 2) as u64, MTLResourceOptions::StorageModeShared);
@@ -30633,7 +31420,7 @@ mod attn_mm_parity {
             e.set_buffer(0, Some(&a_buf), 0);
             e.set_buffer(1, Some(&b_buf), 0);
             e.set_buffer(2, Some(&s16_buf), 0);
-            for j in 0..12u64 {
+            for j in 0..14u64 {
                 e.set_buffer(3 + j, Some(&scalar), j * 4);
             }
             e.set_threadgroup_memory_length(0, 8192);
@@ -30668,6 +31455,8 @@ mod attn_mm_parity {
             *p.add(9) = hd as u32; // a elem stride (V^T)
             *p.add(10) = group as u32;
             *p.add(11) = 2u32; // causal k-clamp
+            *p.add(12) = 0u32; // q_offset
+            *p.add(13) = 0u32; // window = 0 (disabled)
         }
         // V: reuse `a` pattern as V too (separate buffer to be explicit)
         let v = a.clone();
@@ -30684,6 +31473,9 @@ mod attn_mm_parity {
         e.set_buffer(2, Some(&sm_scalar), 0);
         e.set_buffer(3, Some(&sm_scalar), 4);
         e.set_buffer(4, Some(&sm_scalar), 8);
+        e.set_buffer(5, Some(&sm_scalar), 12);
+        e.set_buffer(6, Some(&sm_scalar), 16);
+        e.set_buffer(7, Some(&sm_scalar), 20);
         e.dispatch_thread_groups(
             metal::MTLSize {
                 width: heads as u64,
@@ -30700,7 +31492,7 @@ mod attn_mm_parity {
         e.set_buffer(0, Some(&v_buf), 0);
         e.set_buffer(1, Some(&p_buf), 0);
         e.set_buffer(2, Some(&ctx_buf), 0);
-        for j in 0..12u64 {
+        for j in 0..14u64 {
             e.set_buffer(3 + j, Some(&pv_scalar), j * 4);
         }
         e.set_threadgroup_memory_length(0, 8192);
@@ -30760,6 +31552,265 @@ mod attn_mm_parity {
         }
         eprintln!("[attn-chain-parity] max_err={max_err2} worst={worst2:?}");
         assert!(max_err2 < 5e-2, "chain mismatch: {worst2:?}");
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 4 — GATE G5, at the kernel.
+    //
+    // The per-query-row LOWER mask bound, tested where an off-by-one is a COUNT and
+    // not a tolerance. For every scored row the harness asserts:
+    //
+    //   * the number of non-zero P entries is EXACTLY min(q+1, window) — an integer
+    //     identity, so `>=` instead of `>` in the predicate moves it by one and fails;
+    //   * P[q][q-window] is exactly 0.0 and P[q][q-window+1] is strictly positive —
+    //     which is where the "the window INCLUDES the current position" convention
+    //     (`schedule_window_bounds`: window_start = (p+1) - w) actually lives;
+    //   * the surviving weights match a CPU softmax over [max(0,q+1-w), q].
+    //
+    // It also runs the SAME prompt in query blocks with a non-zero `q_offset`, which
+    // the campaign plan flagged as a code path that would otherwise ship untested, and
+    // requires the blocked P to reproduce the unblocked P.
+    //
+    // window = 0 is carried as its own case: it must reproduce plain causal attention,
+    // which is the regression that keeps every non-windowed caller of this kernel
+    // (every non-gemma3 row through `prefill_tokens`) unchanged.
+    //
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    //   cargo test --release --lib windowed_attn_mm_mask -- --nocapture
+    #[test]
+    fn windowed_attn_mm_mask_matches_the_pinned_window_convention() {
+        let Some(k_ref) = metal_linear_kernel() else {
+            return;
+        };
+        let device = &k_ref.device;
+        let heads = 2usize;
+        let group = 1usize;
+        let kv_heads = heads / group;
+        let hd = 64usize;
+        let n = 200usize;
+        let n_pad = 256usize;
+        let max_pos = 256usize;
+        let qdim = heads * hd;
+        let scale = 0.5f32;
+
+        // Small, smooth operands: the row's score spread must stay well inside half's
+        // exponent range, or a legitimately attended weight could underflow to zero and
+        // the COUNT assertion would fire for a numerics reason instead of a mask one.
+        let mut a = vec![0u16; kv_heads * max_pos * hd];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = h((((i % 23) as f32) - 11.0) * 0.01);
+        }
+        let mut b = vec![0u16; n_pad * qdim];
+        for (i, v) in b.iter_mut().enumerate() {
+            *v = h((((i % 19) as f32) - 9.0) * 0.01);
+        }
+        let a_buf = device.new_buffer_with_data(
+            a.as_ptr() as *const _,
+            (a.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let b_buf = device.new_buffer_with_data(
+            b.as_ptr() as *const _,
+            (b.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // One (window, rows_per_block) run of S -> softmax -> P. Returns P as f32,
+        // laid out [head][rows_per_block][n_pad], concatenated over query blocks.
+        let run = |window: usize, rows_per_block: usize| -> Vec<f32> {
+            let blocks = n.div_ceil(rows_per_block);
+            let mut out = vec![0f32; heads * blocks * rows_per_block * n_pad];
+            for blk in 0..blocks {
+                let q_off = blk * rows_per_block;
+                let cols = (n - q_off).min(rows_per_block);
+                let panel = heads * rows_per_block * n_pad;
+                let s_buf = device
+                    .new_buffer((panel * 2) as u64, MTLResourceOptions::StorageModeShared);
+                let p_buf = device
+                    .new_buffer((panel * 2) as u64, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    std::ptr::write_bytes(s_buf.contents() as *mut u8, 0, panel * 2);
+                    std::ptr::write_bytes(p_buf.contents() as *mut u8, 0, panel * 2);
+                }
+                let win_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+                unsafe { *(win_buf.contents() as *mut u32) = window as u32 };
+                let sc = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = sc.contents() as *mut u32;
+                    *p = hd as u32; // kdim
+                    *p.add(1) = n as u32; // rows: live KV positions
+                    *p.add(2) = cols as u32;
+                    *p.add(3) = (max_pos * hd) as u32;
+                    *p.add(4) = hd as u32;
+                    *p.add(5) = (rows_per_block * n_pad) as u32;
+                    *p.add(6) = hd as u32;
+                    *p.add(7) = qdim as u32;
+                    *p.add(8) = n_pad as u32;
+                    *p.add(9) = 1;
+                    *p.add(10) = group as u32;
+                    *p.add(11) = 1; // causal_mode: S
+                    *p.add(12) = q_off as u32;
+                }
+                let sm = device.new_buffer(24, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = sm.contents() as *mut u32;
+                    *p = n_pad as u32;
+                    *p.add(1) = n as u32;
+                    *(p.add(2) as *mut f32) = scale;
+                    *p.add(3) = q_off as u32;
+                    *p.add(4) = rows_per_block as u32;
+                }
+                let cb = k_ref.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                e.set_compute_pipeline_state(&k_ref.half_mm_batched_f16o_pipeline);
+                e.set_buffer(0, Some(&a_buf), 0);
+                e.set_buffer(1, Some(&b_buf), (q_off * qdim * 2) as u64);
+                e.set_buffer(2, Some(&s_buf), 0);
+                for j in 0..13u64 {
+                    e.set_buffer(3 + j, Some(&sc), j * 4);
+                }
+                e.set_buffer(16, Some(&win_buf), 0);
+                e.set_threadgroup_memory_length(0, ATTN_MM_THREADGROUP_BYTES as u64);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: (n_pad as u64).div_ceil(64),
+                        height: (cols as u64).div_ceil(64),
+                        depth: heads as u64,
+                    },
+                    metal::MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                e.set_compute_pipeline_state(&k_ref.softmax_causal_rows_pipeline);
+                e.set_buffer(0, Some(&s_buf), 0);
+                e.set_buffer(1, Some(&p_buf), 0);
+                for j in 0..5u64 {
+                    e.set_buffer(2 + j, Some(&sm), j * 4);
+                }
+                e.set_buffer(7, Some(&win_buf), 0);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: heads as u64,
+                        height: (cols as u64).div_ceil(8),
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let got =
+                    unsafe { std::slice::from_raw_parts(p_buf.contents() as *const u16, panel) };
+                for hh in 0..heads {
+                    for r in 0..rows_per_block {
+                        for c in 0..n_pad {
+                            out[((hh * blocks + blk) * rows_per_block + r) * n_pad + c] =
+                                fh(got[(hh * rows_per_block + r) * n_pad + c]);
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        // Windows chosen off every tile boundary the kernel uses (64/32) as well as on
+        // one: 1 (degenerate: only the current position), 37 (prime, unaligned), 64
+        // (exactly the tile), 65 (one past), 128, and 0 (disabled).
+        for &window in &[0usize, 1, 37, 64, 65, 128] {
+            let rows_per_block = n_pad;
+            let p = run(window, rows_per_block);
+            let mut max_err = 0f32;
+            for hh in 0..heads {
+                for q in (0..n).step_by(7) {
+                    let row = &p[(hh * rows_per_block + q) * n_pad..][..n_pad];
+                    // --- the integer identity: how many positions were attended ---
+                    let attended = if window == 0 {
+                        q + 1
+                    } else {
+                        (q + 1).min(window)
+                    };
+                    let nonzero = row.iter().filter(|v| **v != 0.0).count();
+                    assert_eq!(
+                        nonzero, attended,
+                        "window={window} head={hh} q={q}: attended {nonzero} positions, \
+                         the pinned convention [max(0,q+1-w) ..= q] says {attended}"
+                    );
+                    // --- the boundary pair: `>` not `>=` ---
+                    if window > 0 && q + 1 > window {
+                        let lo = q + 1 - window;
+                        assert_eq!(
+                            row[lo - 1],
+                            0.0,
+                            "window={window} q={q}: position {} is OUTSIDE the window \
+                             and must weigh exactly 0",
+                            lo - 1
+                        );
+                        assert!(
+                            row[lo] > 0.0,
+                            "window={window} q={q}: position {lo} is the FIRST position \
+                             inside the window and must carry weight"
+                        );
+                    }
+                    assert!(row[q] > 0.0, "window={window} q={q}: self-attention lost");
+                    // --- and the surviving weights are a softmax over that range ---
+                    let lo = if window == 0 || q + 1 <= window {
+                        0
+                    } else {
+                        q + 1 - window
+                    };
+                    let mut sc = vec![0f32; q + 1 - lo];
+                    let mut m = f32::NEG_INFINITY;
+                    for (idx, p2) in (lo..=q).enumerate() {
+                        let mut acc = 0f32;
+                        for kk in 0..hd {
+                            acc += fh(a[(hh / group) * max_pos * hd + p2 * hd + kk])
+                                * fh(b[q * qdim + hh * hd + kk]);
+                        }
+                        sc[idx] = acc * scale;
+                        m = m.max(sc[idx]);
+                    }
+                    let l: f32 = sc.iter().map(|s| (s - m).exp()).sum();
+                    for (idx, p2) in (lo..=q).enumerate() {
+                        max_err = max_err.max((row[p2] - (sc[idx] - m).exp() / l).abs());
+                    }
+                }
+            }
+            eprintln!("[G5-mask] window={window}: max |P - cpu_ref| = {max_err:.3e}");
+            assert!(
+                max_err < 5e-3,
+                "window={window}: P disagrees with the CPU window reference by {max_err:.3e}"
+            );
+        }
+
+        // q_offset != 0: the same prompt in 128-row query blocks must reproduce the
+        // single-block P bit for bit. Without this the query-block offset path ships
+        // untested (it is unreachable on the non-windowed lane at this row's context).
+        for &window in &[0usize, 37, 64] {
+            let one = run(window, n_pad);
+            let split = run(window, 128);
+            let blocks = n.div_ceil(128);
+            for hh in 0..heads {
+                for q in 0..n {
+                    let (blk, r) = (q / 128, q % 128);
+                    for c in 0..n_pad {
+                        let x = one[(hh * n_pad + q) * n_pad + c];
+                        let y = split[((hh * blocks + blk) * 128 + r) * n_pad + c];
+                        assert_eq!(
+                            x.to_bits(),
+                            y.to_bits(),
+                            "window={window} head={hh} q={q} p={c}: query blocking \
+                             (q_offset={}) changed P", blk * 128
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("[G5-mask] q_offset blocking reproduces the unblocked P bit for bit");
     }
 }
 
