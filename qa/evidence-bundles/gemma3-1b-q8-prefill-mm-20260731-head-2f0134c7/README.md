@@ -23,7 +23,8 @@ envelope published in §18a/§18b, not raw bit equality.
 | `ttft-batched-mm.json` | TTFT sweep, + `CAMELID_GEMMA3_PREFILL_MM=1` — Phase 3 |
 | `gemm-probe.txt` | the three paths in ONE process (n=1200), and the chunk-width sweep |
 | `g6-kv-envelope.txt` | gate G6: KV + final-hidden equivalence vs the shipped lane |
-| `window-edge-mm-parity.json` | the window-edge pack vs the pinned oracle capture, MM armed |
+| `window-edge-mm-parity.json` | the window-edge pack vs the pinned oracle capture, MM armed — 70/72 legs, prompt tokenization 24/24 |
+| `window-mutation-phase3.json` | gate G7 re-run with Phase 3 in the tree — all 7 mutants caught |
 | `SHA256SUMS` | checksums of every file above |
 
 ## Method, and its discards
