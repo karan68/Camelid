@@ -9356,7 +9356,9 @@ fn encode_resident_kquant_matmul_f32(
         // or 2 mod 4 for plenty of real shapes — Llama-2-7B ffn_dim 11008 gives
         // n_sb 43, Qwen3-4B hidden 2560 gives n_sb 10 — so round the allocation
         // up. The kernel only ever indexes the first `scratch_ints` words.
-        e.set_threadgroup_memory_length(0, (scratch_ints * 4).next_multiple_of(16) as u64);
+        let kq_tg_bytes = (scratch_ints * 4).next_multiple_of(16);
+        assert_threadgroup_fits(&k.device, kq_tg_bytes, "K-quant resident GEMV scratch");
+        e.set_threadgroup_memory_length(0, kq_tg_bytes as u64);
         e.dispatch_thread_groups(
             metal::MTLSize {
                 width: rows as u64,
@@ -12923,6 +12925,83 @@ pub fn gemma3_batch_prefill_rows() -> usize {
     })
 }
 
+/// Which GEMM the batched windowed prefill streams its weights through.
+///
+/// The production wrappers pass [`PrefillGemm::EnvDefault`]; the test-only wrappers
+/// pin a side explicitly, so ONE process can compare both without fighting the
+/// process-latched env `OnceLock`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// `ForceScalar` / `ForceMm` exist so the gates can pin a side; production only ever
+// constructs `EnvDefault`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum PrefillGemm {
+    /// `CAMELID_GEMMA3_PREFILL_MM` decides.
+    EnvDefault,
+    /// The Phase 2 batched-column GEMV — bit-identical to the token-by-token lane.
+    ForceScalar,
+    /// The tiled simdgroup-matrix kernel, where the shape admits it.
+    ForceMm,
+}
+
+/// Gate for the Phase 3 tiled simdgroup-matmul prefill GEMM (long-prompt TTFT
+/// campaign). Default OFF: this path is **not** bit-identical to the token-by-token
+/// lane — the dequantized Q8_0 weight and the activation panel are staged in half
+/// and accumulated in tile-MMA order — so it ships opt-in behind its own flag, on
+/// top of `CAMELID_GEMMA3_BATCH_PREFILL`. Its gate is the published KV-equivalence
+/// envelope (`GEMMA3_METAL_CONDUCTOR.md` §18a), not raw bit equality.
+///
+/// Arming this without `CAMELID_GEMMA3_BATCH_PREFILL` does nothing: the only
+/// production caller of `prefill_tokens_windowed` is the gemma3 batched-prefill seam.
+pub fn gemma3_prefill_mm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA3_PREFILL_MM")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Threadgroup memory `q8_0_block_wire_mm` needs: A 128x32 half (8192 B) + B 64x32
+/// half (4096 B). FIXED — independent of head_dim, rows and chunk width — which is
+/// why this path is admissible at head_dim 256 while the `MAX_DPL` / `MAX_DOCT`
+/// kernels keep their <=128 memory-safety gates.
+#[cfg(target_os = "macos")]
+const PREFILL_MM_THREADGROUP_BYTES: usize = 12288;
+
+/// Output rows per `q8_0_block_wire_mm` threadgroup tile.
+#[cfg(target_os = "macos")]
+const PREFILL_MM_ROW_TILE: usize = 64;
+
+/// Prompt columns per `q8_0_block_wire_mm` threadgroup tile — the batching factor
+/// this phase is buying (the GEMV's is `MAX_T = 8`, §17e).
+#[cfg(target_os = "macos")]
+const PREFILL_MM_TOKEN_TILE: usize = 128;
+
+/// True when `bytes` fits this device's per-threadgroup limit.
+///
+/// The tree queried `maxThreadgroupMemoryLength` nowhere before this: every
+/// size-dependent `set_threadgroup_memory_length` was computed and handed straight
+/// to Metal. Call sites that can decline (an admission predicate) use this; call
+/// sites that cannot use [`assert_threadgroup_fits`].
+#[cfg(target_os = "macos")]
+fn threadgroup_alloc_fits(device: &metal::DeviceRef, bytes: usize) -> bool {
+    bytes as u64 <= device.max_threadgroup_memory_length()
+}
+
+/// Panic with the two numbers rather than handing an over-large threadgroup
+/// allocation to Metal. Used at the size-dependent allocation sites that have no
+/// fallback; a failure here is a programming error, and today it surfaces as an
+/// opaque GPU fault instead.
+#[cfg(target_os = "macos")]
+fn assert_threadgroup_fits(device: &metal::DeviceRef, bytes: usize, label: &str) {
+    assert!(
+        threadgroup_alloc_fits(device, bytes),
+        "{label}: threadgroup allocation of {bytes} B exceeds this device's \
+         maxThreadgroupMemoryLength of {} B",
+        device.max_threadgroup_memory_length()
+    );
+}
+
 /// A resident decode session that owns the on-GPU KV cache (per layer, sized to
 /// `max_positions`) and the reused hidden ping-pong buffers. A multi-token greedy decode runs
 /// each token in ONE command buffer with the KV cache persisting on the GPU across tokens --
@@ -14772,7 +14851,16 @@ impl ResidentDecodeState {
                 if use_flash_attn {
                     // Q + K/V half tiles (32 x head_dim each) | S 32x32 f32 | P 32x32 half
                     // | 4 x 8x8 half diag | 32 f32 inv-l.
-                    e.set_threadgroup_memory_length(0, (128 * self.head_dim + 7296) as u64);
+                    // Linear in head_dim: 23 680 B at 128, 40 064 B at 256 — past the
+                    // 32 KiB Apple limit. The <=128 host gate keeps it in range; this
+                    // asserts the arithmetic instead of trusting it.
+                    let flash_tg_bytes = 128 * self.head_dim + 7296;
+                    assert_threadgroup_fits(
+                        &k.device,
+                        flash_tg_bytes,
+                        "attention_prefill_flash_f32 tiles",
+                    );
+                    e.set_threadgroup_memory_length(0, flash_tg_bytes as u64);
                     e.dispatch_thread_groups(
                         metal::MTLSize {
                             width: self.n_heads as u64,
@@ -15029,6 +15117,18 @@ impl ResidentDecodeState {
     /// untouched), and `use_attn_mm` — which requires `!has_qk_norm` — is not on this path
     /// at all: attention-as-matmul is Tier B.
     ///
+    /// **Phase 3 amends one clause of the bit-identity claim above, and only one.** With
+    /// `CAMELID_GEMMA3_PREFILL_MM=1` the seven weight-streaming GEMMs (Q/K/V/O/gate/up/down)
+    /// run through the tiled simdgroup-matrix kernel `q8_0_block_wire_mm` instead of the
+    /// batched-column GEMV: each weight block is then read once per 128 prompt columns
+    /// rather than once per 8 (`MAX_T`), and both operands stage in threadgroup memory.
+    /// That path is NOT bit-identical — the dequantized Q8_0 weight and the activation panel
+    /// are staged in half and accumulated in tile-MMA order — so it is opt-in and gated by
+    /// the published KV-equivalence envelope (`GEMMA3_METAL_CONDUCTOR.md` §18a) instead of
+    /// by raw bit equality. Everything else on the path is untouched, including every
+    /// per-row stage: QK-norm, RoPE, K/V scatter and attention still run the EXACT
+    /// single-token kernels at a row byte offset, so the window semantics are unchanged.
+    ///
     /// Sets `filled = n_tokens` on success (the caller's `filled() == position` invariant;
     /// getting it wrong re-seeds from a CPU KV cache this lane leaves hollow). Returns
     /// `None` — losslessly, having written nothing — on any unsupported config.
@@ -15054,15 +15154,48 @@ impl ResidentDecodeState {
             scale,
             chunk_rows,
             false,
+            PrefillGemm::EnvDefault,
+        )
+        .map(|_| ())
+    }
+
+    /// `prefill_tokens_windowed` with the GEMM pinned rather than read from the env.
+    /// Test-only: the env gate is a process-latched `OnceLock`, so a single test process
+    /// could otherwise never compare the scalar and MM GEMMs against each other.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_tokens_windowed_gemm(
+        &mut self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        layers: &[ResidentLayerWeights],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        alt_rope_all: Option<(&[f32], &[f32])>,
+        scale: f32,
+        chunk_rows: usize,
+        gemm: PrefillGemm,
+    ) -> Option<()> {
+        self.prefill_tokens_windowed_inner(
+            embeddings,
+            n_tokens,
+            layers,
+            cos_all,
+            sin_all,
+            alt_rope_all,
+            scale,
+            chunk_rows,
+            false,
+            gemm,
         )
         .map(|_| ())
     }
 
     /// `prefill_tokens_windowed` that also reads back every row's post-final-layer hidden
-    /// state (`n_tokens * hidden`, row-major). Test-only: gate G1 compares the final hidden
-    /// alongside the KV caches, because a defect confined to the LAST layer's attention
-    /// moves ZERO cache bits (conductor §16e) and is visible only there. The production
-    /// lane never pays the readback.
+    /// state (`n_tokens * hidden`, row-major). Test-only: gates G1/G6 compare the final
+    /// hidden alongside the KV caches, because a defect confined to the LAST layer's
+    /// attention moves ZERO cache bits (conductor §16e) and is visible only there. The
+    /// production lane never pays the readback.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn prefill_tokens_windowed_hidden(
@@ -15075,6 +15208,7 @@ impl ResidentDecodeState {
         alt_rope_all: Option<(&[f32], &[f32])>,
         scale: f32,
         chunk_rows: usize,
+        gemm: PrefillGemm,
     ) -> Option<Vec<f32>> {
         self.prefill_tokens_windowed_inner(
             embeddings,
@@ -15086,6 +15220,7 @@ impl ResidentDecodeState {
             scale,
             chunk_rows,
             true,
+            gemm,
         )
     }
 
@@ -15101,6 +15236,7 @@ impl ResidentDecodeState {
         scale: f32,
         chunk_rows: usize,
         read_hidden: bool,
+        gemm: PrefillGemm,
     ) -> Option<Vec<f32>> {
         // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
         // Mirrors verify_batch_inner's gate, MINUS the head_dim <= 128 clause: nothing on
@@ -15273,6 +15409,50 @@ impl ResidentDecodeState {
                 .collect();
         }
 
+        // ---- Phase 3: the prefill GEMM ---------------------------------------------------
+        // The Phase 2 batched-column GEMV is bit-identical to the token-by-token lane and
+        // pinned at ~0.12 TFLOPS: `q8_0_block_linear_ksplit_f32y_wire_nsg8_verify` carries
+        // `MAX_T = 8`, so every weight block is re-read once per 8 columns and every
+        // threadgroup re-walks the whole activation panel (conductor §17e). The tiled
+        // simdgroup-matrix kernel `q8_0_block_wire_mm` — the SHIPPED default prefill GEMM
+        // for every other Q8_0 row on this host (`CAMELID_METAL_MM`, on by default in the
+        // CLI fast stack) — reads each weight block once per 128 columns and stages both
+        // operands in threadgroup memory. It is NOT bit-identical (half operand staging +
+        // tile-MMA accumulation order), which is why it sits behind its own flag and is
+        // gated by the published KV envelope rather than by raw bit equality.
+        //
+        // Admission is a SEPARATE predicate — it relaxes nothing. `MAX_DPL` / `MAX_DOCT`
+        // and the <=128 host gates they guard are untouched; this kernel has no per-lane
+        // fixed-size array and a FIXED 12 288 B threadgroup allocation, so head_dim never
+        // enters. What it does need is 128-multiple output row counts (its 64-row tile with
+        // the same 128 gate the shipped `prefill_tokens` MM path uses) and 32-multiple
+        // contraction widths (NK = 32 = one Q8_0 block per step).
+        let all_q8 = resident
+            .iter()
+            .flatten()
+            .all(|w| w.format == ResidentWeightFormat::Q8_0);
+        let use_mm = match gemm {
+            PrefillGemm::ForceScalar => false,
+            PrefillGemm::EnvDefault => gemma3_prefill_mm_enabled(),
+            PrefillGemm::ForceMm => true,
+        } && all_q8
+            && [q_dim, kv_dim, hidden, ffn_dim]
+                .iter()
+                .all(|r| r.is_multiple_of(2 * PREFILL_MM_ROW_TILE))
+            && [hidden, q_dim, ffn_dim]
+                .iter()
+                .all(|w| w.is_multiple_of(32))
+            && threadgroup_alloc_fits(&kern.device, PREFILL_MM_THREADGROUP_BYTES);
+        // Half activation panels, padded up to a whole token tile so the kernel's direct
+        // device B loads never run off the end. Padding rows only feed output columns past
+        // `n_rows_in`, which are never stored; they are zeroed once anyway so a run is not
+        // reading whatever the allocator handed back.
+        let mm_pad = if use_mm {
+            chunk.next_multiple_of(PREFILL_MM_TOKEN_TILE)
+        } else {
+            0
+        };
+
         // ---- Chunk-sized activation scratch, allocated ONCE and reused ------------------
         // Row-major [row][dim] throughout, matching the batched GEMV's `[token][dim]`
         // contract. ~32 MB total at chunk = 256 on the 1B row.
@@ -15310,6 +15490,24 @@ impl ResidentDecodeState {
         // attention dispatches — which is exactly what the token-by-token lane already
         // does, one command buffer per token, so it costs nothing relative to today.
         let scores_buf = nb(n_heads * n_tokens * 4);
+        // Half GEMM-input panels, one per contraction width (hidden for Q/K/V and
+        // gate/up, q_dim for O, ffn_dim for down). ~4.6 MB total at chunk = 256 on the
+        // 1B row. Reused within a layer across the two hidden-width stages: dispatches on
+        // an `MTLComputeCommandEncoder` are serial, so the QKV GEMMs have consumed the
+        // panel before the FFN norm overwrites it.
+        let mm_y_hidden = nb(mm_pad * hidden * 2);
+        let mm_y_q = nb(mm_pad * q_dim * 2);
+        let mm_y_ffn = nb(mm_pad * ffn_dim * 2);
+        let mm_counts = nb(12);
+        if use_mm {
+            for (buf, bytes) in [
+                (&mm_y_hidden, mm_pad * hidden * 2),
+                (&mm_y_q, mm_pad * q_dim * 2),
+                (&mm_y_ffn, mm_pad * ffn_dim * 2),
+            ] {
+                unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes) };
+            }
+        }
 
         // ---- Scalars --------------------------------------------------------------------
         let rms_scalar = nb(8);
@@ -15379,6 +15577,52 @@ impl ResidentDecodeState {
             .collect();
         let attn_scalars: Vec<Buffer> = (0..classes.len() * chunk).map(|_| nb(32)).collect();
 
+        // f32 -> half staging for one GEMM input panel. `count_off` selects the element
+        // count word in `mm_counts` (0 = k*hidden, 4 = k*q_dim, 8 = k*ffn_dim).
+        let mm_stage = |e: &metal::ComputeCommandEncoderRef,
+                        src: &Buffer,
+                        dst: &Buffer,
+                        count_off: u64,
+                        n: usize| {
+            e.set_compute_pipeline_state(&kern.f32_to_f16_pipeline);
+            e.set_buffer(0, Some(src), 0);
+            e.set_buffer(1, Some(dst), 0);
+            e.set_buffer(2, Some(&mm_counts), count_off);
+            dispatch_1d(e, &kern.f32_to_f16_pipeline, n);
+        };
+        // One `q8_0_block_wire_mm` dispatch: a 64-row x 128-column output tile per
+        // threadgroup, 256 threads = 8 simdgroups. `scalar` is the shared 12-byte
+        // [blocks_per_row, rows, n_rows_in] triple the GEMV path already carries, bound at
+        // offsets 0/4/8 exactly as the shipped `prefill_tokens` MM path binds it.
+        let mm_gemm = |e: &metal::ComputeCommandEncoderRef,
+                       y: &Buffer,
+                       w: &ResidentLinearWeight,
+                       out: &Buffer,
+                       scalar: &Buffer,
+                       rows: usize,
+                       n_rows_in: usize| {
+            e.set_compute_pipeline_state(&kern.q8_0_block_wire_mm_pipeline);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(2, Some(&w.buffer), 0);
+            e.set_buffer(3, Some(out), 0);
+            e.set_buffer(4, Some(scalar), 0);
+            e.set_buffer(5, Some(scalar), 4);
+            e.set_buffer(6, Some(scalar), 8);
+            e.set_threadgroup_memory_length(0, PREFILL_MM_THREADGROUP_BYTES as u64);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (rows / PREFILL_MM_ROW_TILE) as u64,
+                    height: (n_rows_in as u64).div_ceil(PREFILL_MM_TOKEN_TILE as u64),
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        };
+
         let mut hidden_out: Vec<f32> = if read_hidden {
             Vec::with_capacity(n_tokens * hidden)
         } else {
@@ -15395,6 +15639,27 @@ impl ResidentDecodeState {
             unsafe {
                 *(act_n.contents() as *mut u32) = (k * ffn_dim) as u32;
                 *(resid_n.contents() as *mut u32) = (k * hidden) as u32;
+                if use_mm {
+                    // The MM path writes the GEMV scalars itself (the scalar path lets
+                    // `encode_resident_matmul_f32` write them at encode time). The third
+                    // word is `n_rows_in` — the kernel's ragged-tail guard.
+                    let c = mm_counts.contents() as *mut u32;
+                    *c = (k * hidden) as u32;
+                    *c.add(1) = (k * q_dim) as u32;
+                    *c.add(2) = (k * ffn_dim) as u32;
+                    for (buf, bpr, rows) in [
+                        (&q_gemv, bpr_hidden, q_dim),
+                        (&kv_gemv, bpr_hidden, kv_dim),
+                        (&o_gemv, bpr_q, hidden),
+                        (&gateup_gemv, bpr_hidden, ffn_dim),
+                        (&down_gemv, bpr_ffn, hidden),
+                    ] {
+                        let p = buf.contents() as *mut u32;
+                        *p = bpr as u32;
+                        *p.add(1) = rows as u32;
+                        *p.add(2) = k as u32;
+                    }
+                }
                 for i in 0..k {
                     let s = (scatter_scalars.contents() as *mut u8).add(i * 16) as *mut u32;
                     *s = head_dim as u32;
@@ -15448,15 +15713,22 @@ impl ResidentDecodeState {
                 };
                 // --- Attention block ---
                 encode_rms_norm_batch(kern, e, cur, &attn_norm_bufs[l], &norm_buf, &rms_scalar, k);
-                encode_resident_matmul_f32(
-                    e, kern, &mut keep, &norm_buf, &w[0], &q_buf, &q_gemv, hidden, q_dim, k,
-                );
-                encode_resident_matmul_f32(
-                    e, kern, &mut keep, &norm_buf, &w[1], &k_buf, &kv_gemv, hidden, kv_dim, k,
-                );
-                encode_resident_matmul_f32(
-                    e, kern, &mut keep, &norm_buf, &w[2], &v_buf, &kv_gemv, hidden, kv_dim, k,
-                );
+                if use_mm {
+                    mm_stage(e, &norm_buf, &mm_y_hidden, 0, k * hidden);
+                    mm_gemm(e, &mm_y_hidden, &w[0], &q_buf, &q_gemv, q_dim, k);
+                    mm_gemm(e, &mm_y_hidden, &w[1], &k_buf, &kv_gemv, kv_dim, k);
+                    mm_gemm(e, &mm_y_hidden, &w[2], &v_buf, &kv_gemv, kv_dim, k);
+                } else {
+                    encode_resident_matmul_f32(
+                        e, kern, &mut keep, &norm_buf, &w[0], &q_buf, &q_gemv, hidden, q_dim, k,
+                    );
+                    encode_resident_matmul_f32(
+                        e, kern, &mut keep, &norm_buf, &w[1], &k_buf, &kv_gemv, hidden, kv_dim, k,
+                    );
+                    encode_resident_matmul_f32(
+                        e, kern, &mut keep, &norm_buf, &w[2], &v_buf, &kv_gemv, hidden, kv_dim, k,
+                    );
+                }
                 // Per-head QK-norm (Qwen3/gemma3), per row, in place, before RoPE.
                 if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
                     for i in 0..k {
@@ -15572,9 +15844,14 @@ impl ResidentDecodeState {
                         (i * q_dim * 4) as u64,
                     );
                 }
-                encode_resident_matmul_f32(
-                    e, kern, &mut keep, &ctx_buf, &w[3], &o_buf, &o_gemv, q_dim, hidden, k,
-                );
+                if use_mm {
+                    mm_stage(e, &ctx_buf, &mm_y_q, 4, k * q_dim);
+                    mm_gemm(e, &mm_y_q, &w[3], &o_buf, &o_gemv, hidden, k);
+                } else {
+                    encode_resident_matmul_f32(
+                        e, kern, &mut keep, &ctx_buf, &w[3], &o_buf, &o_gemv, q_dim, hidden, k,
+                    );
+                }
                 // gemma3 sandwich norm: RMSNorm on the attention output BEFORE the residual.
                 let attn_resid_src = match &post_attn_norm_bufs[l] {
                     Some(pn) => {
@@ -15594,30 +15871,36 @@ impl ResidentDecodeState {
                 );
                 // --- FFN block ---
                 encode_rms_norm_batch(kern, e, &mid, &ffn_norm_bufs[l], &norm_buf, &rms_scalar, k);
-                encode_resident_matmul_f32(
-                    e,
-                    kern,
-                    &mut keep,
-                    &norm_buf,
-                    &w[4],
-                    &gate_buf,
-                    &gateup_gemv,
-                    hidden,
-                    ffn_dim,
-                    k,
-                );
-                encode_resident_matmul_f32(
-                    e,
-                    kern,
-                    &mut keep,
-                    &norm_buf,
-                    &w[5],
-                    &up_buf,
-                    &gateup_gemv,
-                    hidden,
-                    ffn_dim,
-                    k,
-                );
+                if use_mm {
+                    mm_stage(e, &norm_buf, &mm_y_hidden, 0, k * hidden);
+                    mm_gemm(e, &mm_y_hidden, &w[4], &gate_buf, &gateup_gemv, ffn_dim, k);
+                    mm_gemm(e, &mm_y_hidden, &w[5], &up_buf, &gateup_gemv, ffn_dim, k);
+                } else {
+                    encode_resident_matmul_f32(
+                        e,
+                        kern,
+                        &mut keep,
+                        &norm_buf,
+                        &w[4],
+                        &gate_buf,
+                        &gateup_gemv,
+                        hidden,
+                        ffn_dim,
+                        k,
+                    );
+                    encode_resident_matmul_f32(
+                        e,
+                        kern,
+                        &mut keep,
+                        &norm_buf,
+                        &w[5],
+                        &up_buf,
+                        &gateup_gemv,
+                        hidden,
+                        ffn_dim,
+                        k,
+                    );
+                }
                 // gemma3 GeGLU (gelu_tanh(gate) * up) vs the Llama-family SiLU — the SAME
                 // elementwise kernels the decode encode dispatches, with a wider `n`.
                 let act_pipeline = if layers[l].ffn_geglu {
@@ -15634,9 +15917,15 @@ impl ResidentDecodeState {
                     &act_n,
                     k * ffn_dim,
                 );
-                encode_resident_matmul_f32(
-                    e, kern, &mut keep, &act_buf, &w[6], &down_buf, &down_gemv, ffn_dim, hidden, k,
-                );
+                if use_mm {
+                    mm_stage(e, &act_buf, &mm_y_ffn, 8, k * ffn_dim);
+                    mm_gemm(e, &mm_y_ffn, &w[6], &down_buf, &down_gemv, hidden, k);
+                } else {
+                    encode_resident_matmul_f32(
+                        e, kern, &mut keep, &act_buf, &w[6], &down_buf, &down_gemv, ffn_dim,
+                        hidden, k,
+                    );
+                }
                 let ffn_resid_src = match &post_ffw_norm_bufs[l] {
                     Some(pn) => {
                         encode_rms_norm_batch(kern, e, &down_buf, pn, &post_buf, &rms_scalar, k);
@@ -15667,9 +15956,10 @@ impl ResidentDecodeState {
                 let wall_us = commit_started.elapsed().as_micros();
                 let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb.to_owned());
                 eprintln!(
-                    "[batch-prefill] base={base} rows={k} encode={encode_us}us \
+                    "[batch-prefill] base={base} rows={k} gemm={} encode={encode_us}us \
                      commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
-                     kernel_window={kernel_window_us}us"
+                     kernel_window={kernel_window_us}us",
+                    if use_mm { "mm" } else { "gemv" }
                 );
             }
             if read_hidden {
@@ -25766,6 +26056,10 @@ mod tests {
                         Some((&alt_cos, &alt_sin)),
                         scale,
                         CHUNK,
+                        // G1 is a BIT-identity gate; pin the scalar GEMM explicitly so a
+                        // shell with CAMELID_GEMMA3_PREFILL_MM armed cannot silently turn
+                        // this assertion into a different claim.
+                        PrefillGemm::ForceScalar,
                     )
                     .expect("batched windowed prefill must be admitted for this fixture");
                 // G11: `filled` must land on n exactly, or the caller's rebuild
@@ -25794,6 +26088,42 @@ mod tests {
                     "n={n} {arch}: the comparison denominator must cover every cached K/V \
                      element AND every row's final hidden"
                 );
+
+                // Phase 3, FAIL-CLOSED SHAPE ADMISSION. This fixture's ffn_dim is 288 —
+                // not a multiple of the tiled kernel's 128-row gate — so asking for the
+                // MM GEMM must silently fall back to the scalar one and stay BIT-identical.
+                // A shape gate that admitted 288 would corrupt the tail rows of every FFN
+                // tile, which is precisely why the gate is asserted rather than assumed.
+                assert!(
+                    !ffn.is_multiple_of(2 * PREFILL_MM_ROW_TILE),
+                    "this leg only means something while the fixture's ffn_dim is \
+                     inadmissible for the tiled GEMM"
+                );
+                let mut mm_session = mk_session();
+                let mm_hidden = mm_session
+                    .prefill_tokens_windowed_hidden(
+                        &embeddings,
+                        n,
+                        &weights,
+                        &cos_all,
+                        &sin_all,
+                        Some((&alt_cos, &alt_sin)),
+                        scale,
+                        CHUNK,
+                        PrefillGemm::ForceMm,
+                    )
+                    .expect("an inadmissible shape must FALL BACK, never decline the prefill");
+                compare(
+                    &token_session
+                        .kv_snapshot(n)
+                        .with_final_hidden(token_hidden.clone()),
+                    &mm_session.kv_snapshot(n).with_final_hidden(mm_hidden),
+                )
+                .expect("same geometry")
+                .assert_bit_identical(&format!(
+                    "Phase 3 admission (synthetic, {arch}): ffn_dim {ffn} is not a \
+                     128-multiple, so ForceMm must fall back to the scalar GEMM"
+                ));
             }
         }
         eprintln!(
@@ -26341,6 +26671,7 @@ mod tests {
                     Some((&alt_cos, &alt_sin)),
                     row.scale,
                     256,
+                    PrefillGemm::ForceScalar,
                 )
                 .expect("batched windowed prefill must be admitted for the real row");
             assert_eq!(
@@ -26372,6 +26703,372 @@ mod tests {
         eprintln!(
             "[G1-real-row] PASS: bit-identical KV AND final hidden at n = 5/256/257/513/1024"
         );
+    }
+
+    /// The Phase 3 KV-equivalence envelope, PINNED IN `GEMMA3_METAL_CONDUCTOR.md` §18a
+    /// BEFORE the first measurement (commit `f3be4585`).
+    ///
+    /// `5.0e-2` sits 8.6x below the weakest window-mutation signature this campaign has
+    /// recorded (max |ΔKV| 4.29e-1, `w-len-513` / `window_plus_one`, §16g) and well above
+    /// the arithmetic floor of staging a half operand (2^-11 = 4.88e-4 relative, per
+    /// element, before any reduction — so the 2.122e-4 f32-reduction-noise floor is
+    /// unreachable here by construction, not by sloppiness).
+    #[cfg(target_os = "macos")]
+    const PHASE3_KV_BOUND: f32 = 5.0e-2;
+
+    /// The half of the envelope with the power (§16g). Mutants whose per-position median
+    /// is non-zero show ratios of 41x - 1525x; `w-len-513`'s median is exactly 0.0, where
+    /// any finite factor fires. 8.0 keeps a 5.1x margin below the weakest recorded ratio
+    /// while still allowing a real 8x per-position spread for a uniform numerics change.
+    #[cfg(target_os = "macos")]
+    const PHASE3_KV_OUTLIER_FACTOR: f32 = 8.0;
+
+    // gemma3 long-prompt TTFT campaign, Phase 3 — GATE G6 on the REAL row.
+    //
+    // The claim Phase 3 can make and Phase 2's could not: the tiled simdgroup-matmul
+    // prefill leaves the KV cache and every row's final hidden WITHIN A PUBLISHED
+    // ENVELOPE of `n` sequential `forward_token` prefill decodes — not bit-identical,
+    // because the dequantized Q8_0 weight and the activation panel stage in half and the
+    // MMA accumulates in tile order.
+    //
+    // Both halves of `meets_bound` are load-bearing and they catch different things:
+    //   * the scalar bound catches a kernel that is uniformly wrong;
+    //   * the per-position outlier test catches a mask/stride defect that touches few
+    //     positions hard — which is the shape EVERY window mutant has (§16g), including
+    //     the one whose per-position median is exactly 0.0.
+    // The final hidden is bounded separately, because the LAST layer's attention reaches
+    // no KV cache and a defect confined to it moves zero cache bits (§16e).
+    //
+    // The lengths are the Phase 2 G1 sweep verbatim, so the two gates are directly
+    // comparable: 5 (inside one chunk, window unsaturated), 256 (exactly one chunk),
+    // 257 (a 1-row ragged tail — the kernel's guarded store path), 513 (past the window
+    // AND past 512), 1024 (four chunks, deep clipping on all 22 sliding layers).
+    //
+    // Run targeted, gates armed from the SHELL (process-latched OnceLocks):
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
+    //   cargo test --release --lib gemma3_real_row_prefill_mm_kv -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_prefill_mm_kv_meets_published_envelope() {
+        use crate::kv_equivalence::compare;
+        if !detect_metal_device().available {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_mm_kv_meets_published_envelope: set \
+                 CAMELID_GEMMA3_GGUF to the gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_mm_kv_meets_published_envelope: the production \
+                 GEMV gates (f32y/wire/NSG8) are not armed; arm them from the shell."
+            );
+            return;
+        }
+        let row = load_gemma3_real_row(&path.to_string_lossy());
+        let weights = row.weights();
+        let schedule = row.schedule();
+        assert_eq!(row.head_dim, 256, "expected the 1B row's head_dim");
+
+        let token_at = |i: usize| -> u32 { (2 + (i * 7919) % (row.vocab - 3)) as u32 };
+        let mut worst_kv = 0.0f32;
+        let mut worst_hidden = 0.0f32;
+        for &n in &[5usize, 256, 257, 513, 1024] {
+            let mut embeddings: Vec<f32> = Vec::with_capacity(n * row.hidden);
+            let mut cos_all: Vec<f32> = Vec::new();
+            let mut sin_all: Vec<f32> = Vec::new();
+            let mut alt_cos: Vec<f32> = Vec::new();
+            let mut alt_sin: Vec<f32> = Vec::new();
+            for t in 0..n {
+                embeddings.extend_from_slice(&row.embed(token_at(t)));
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_global,
+                );
+                cos_all.extend_from_slice(&c);
+                sin_all.extend_from_slice(&s);
+                let (c, s) = crate::inference::gemma3_rope_tables(
+                    t,
+                    row.rope_dim,
+                    row.g3.rope_freq_base_local,
+                );
+                alt_cos.extend_from_slice(&c);
+                alt_sin.extend_from_slice(&s);
+            }
+            let mk_session = || {
+                ResidentDecodeState::new(
+                    row.n_layers,
+                    row.n_heads,
+                    row.n_kv,
+                    row.head_dim,
+                    row.hidden,
+                    row.ffn,
+                    n,
+                    n,
+                    row.eps,
+                    row.split_half_pairing,
+                    Some(schedule.clone()),
+                )
+                .expect("resident session")
+            };
+
+            // The reference is the SHIPPED token-by-token lane, not the Phase 2 batched
+            // one: Phase 2 is bit-identical to it, so this measures the whole distance
+            // Phase 3 travels rather than a distance from an intermediate.
+            let mut token_session = mk_session();
+            let mut token_hidden: Vec<f32> = Vec::with_capacity(n * row.hidden);
+            let half = row.rope_dim / 2;
+            for t in 0..n {
+                match token_session
+                    .forward_token(
+                        &embeddings[t * row.hidden..(t + 1) * row.hidden],
+                        &weights,
+                        &cos_all[t * half..(t + 1) * half],
+                        &sin_all[t * half..(t + 1) * half],
+                        Some((
+                            &alt_cos[t * half..(t + 1) * half],
+                            &alt_sin[t * half..(t + 1) * half],
+                        )),
+                        t,
+                        row.scale,
+                        None,
+                        None,
+                        0,
+                        None,
+                        None,
+                    )
+                    .expect("resident forward")
+                {
+                    ResidentTokenOut::Data(v) => token_hidden.extend_from_slice(&v),
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            }
+            assert_eq!(token_session.filled(), n);
+
+            let mut mm_session = mk_session();
+            let mm_hidden = mm_session
+                .prefill_tokens_windowed_hidden(
+                    &embeddings,
+                    n,
+                    &weights,
+                    &cos_all,
+                    &sin_all,
+                    Some((&alt_cos, &alt_sin)),
+                    row.scale,
+                    256,
+                    PrefillGemm::ForceMm,
+                )
+                .expect("the tiled-MM prefill must be admitted for the real row");
+            assert_eq!(
+                mm_session.filled(),
+                n,
+                "n={n}: batched prefill must leave filled == n (G11)"
+            );
+
+            let eq = compare(
+                &token_session
+                    .kv_snapshot(n)
+                    .with_final_hidden(token_hidden.clone()),
+                &mm_session.kv_snapshot(n).with_final_hidden(mm_hidden),
+            )
+            .expect("same geometry");
+            let median = eq.median_position_max_abs();
+            eprintln!(
+                "[G6-mm] n={n}: {} outlier_ratio={:.1}x",
+                eq.summary(),
+                if median > 0.0 {
+                    eq.max_abs_diff / median
+                } else {
+                    f32::INFINITY
+                }
+            );
+            // A pass here must not be a pass by vacuity: the MM path is NOT expected to
+            // be bit-identical, and if it ever were, the fixture would have silently
+            // fallen back to the scalar GEMM and this gate would be testing nothing.
+            assert!(
+                !eq.bit_identical,
+                "n={n}: the tiled-MM prefill came out bit-identical — it must have fallen \
+                 back to the scalar GEMM, so this gate proved nothing"
+            );
+            if let Err(why) = eq.meets_bound(PHASE3_KV_BOUND, PHASE3_KV_OUTLIER_FACTOR) {
+                panic!(
+                    "G6 (real row, n={n}): the tiled-MM prefill misses the envelope pinned \
+                     in GEMMA3_METAL_CONDUCTOR.md §18a (bound {PHASE3_KV_BOUND:.3e}, outlier \
+                     factor {PHASE3_KV_OUTLIER_FACTOR}) — {why}"
+                );
+            }
+            worst_kv = worst_kv.max(eq.max_abs_diff);
+            worst_hidden = worst_hidden.max(eq.hidden_max_abs_diff);
+        }
+        eprintln!(
+            "[G6-mm] PASS at n = 5/256/257/513/1024: worst kv_max_abs {worst_kv:.6e}, worst \
+             hidden_max_abs {worst_hidden:.6e}, against the pinned bound \
+             {PHASE3_KV_BOUND:.3e} / outlier factor {PHASE3_KV_OUTLIER_FACTOR}"
+        );
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 3 — the KERNEL-LEVEL measurement.
+    //
+    // Three prefill paths over the SAME prompt in ONE process, with the same warm weight
+    // cache and the same pipelines: token-by-token (today's shipped lane, encode-ahead
+    // armed), Phase 2's batched GEMV, and Phase 3's tiled MM. The env flag is a latched
+    // OnceLock, which is exactly why `PrefillGemm` exists — a shell can only pick one.
+    //
+    // Reported per path: ms/token, and achieved GEMM throughput against this host's
+    // measured ~3.4 TFLOPS Q8_0 wall (§15). The FLOP count is the model's, not the
+    // kernel's: 2 x 26 836 992 MACs x 26 layers = 1.3955 GFLOP per token, which is what
+    // an ideal GEMM would do. Attention, norms, RoPE and scatter are NOT in that number,
+    // so the reported TFLOPS is a lower bound on GEMM efficiency and an honest
+    // whole-path figure at the same time.
+    //
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=/path/gemma-3-1b-it-Q8_0.gguf \
+    //   cargo test --release --lib gemma3_real_row_prefill_gemm_probe -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_prefill_gemm_probe() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_gemm_probe: set CAMELID_GEMMA3_GGUF to the \
+                 gemma-3-1b-it-Q8_0 GGUF"
+            );
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP gemma3_real_row_prefill_gemm_probe: the production GEMV gates \
+                 (f32y/wire/NSG8) are not armed; arm them from the shell."
+            );
+            return;
+        }
+        let row = load_gemma3_real_row(&path.to_string_lossy());
+        let weights = row.weights();
+        let schedule = row.schedule();
+        let n = 1200usize;
+        let q_dim = row.n_heads * row.head_dim;
+        let kv_dim = row.n_kv * row.head_dim;
+        let macs_per_layer = row.hidden * q_dim
+            + 2 * row.hidden * kv_dim
+            + q_dim * row.hidden
+            + 3 * row.hidden * row.ffn;
+        let gflop_per_token = 2.0 * (macs_per_layer * row.n_layers) as f64 / 1.0e9;
+
+        let token_at = |i: usize| -> u32 { (2 + (i * 7919) % (row.vocab - 3)) as u32 };
+        let mut embeddings: Vec<f32> = Vec::with_capacity(n * row.hidden);
+        let mut cos_all: Vec<f32> = Vec::new();
+        let mut sin_all: Vec<f32> = Vec::new();
+        let mut alt_cos: Vec<f32> = Vec::new();
+        let mut alt_sin: Vec<f32> = Vec::new();
+        for t in 0..n {
+            embeddings.extend_from_slice(&row.embed(token_at(t)));
+            let (c, s) =
+                crate::inference::gemma3_rope_tables(t, row.rope_dim, row.g3.rope_freq_base_global);
+            cos_all.extend_from_slice(&c);
+            sin_all.extend_from_slice(&s);
+            let (c, s) =
+                crate::inference::gemma3_rope_tables(t, row.rope_dim, row.g3.rope_freq_base_local);
+            alt_cos.extend_from_slice(&c);
+            alt_sin.extend_from_slice(&s);
+        }
+        let mk_session = || {
+            ResidentDecodeState::new(
+                row.n_layers,
+                row.n_heads,
+                row.n_kv,
+                row.head_dim,
+                row.hidden,
+                row.ffn,
+                n,
+                n,
+                row.eps,
+                row.split_half_pairing,
+                Some(schedule.clone()),
+            )
+            .expect("resident session")
+        };
+        let half = row.rope_dim / 2;
+        // Warm the weight cache and both GEMM pipelines, so no measured run carries the
+        // upload or a PSO compile.
+        for gemm in [PrefillGemm::ForceScalar, PrefillGemm::ForceMm] {
+            let mut warm = mk_session();
+            warm.prefill_tokens_windowed_gemm(
+                &embeddings[..8 * row.hidden],
+                8,
+                &weights,
+                &cos_all[..8 * half],
+                &sin_all[..8 * half],
+                Some((&alt_cos[..8 * half], &alt_sin[..8 * half])),
+                row.scale,
+                8,
+                gemm,
+            )
+            .expect("warm-up");
+        }
+
+        let report = |label: &str, secs: f64| {
+            let ms_per_token = secs * 1000.0 / n as f64;
+            eprintln!(
+                "[gemm-probe] {label:<24} {secs:7.3}s  {ms_per_token:7.3} ms/token  \
+                 {:.3} TFLOPS  load {:.2}",
+                gflop_per_token / 1.0e3 / (ms_per_token / 1000.0),
+                loadavg_1m()
+            );
+        };
+
+        for (label, gemm) in [
+            ("batched gemv (Phase 2)", PrefillGemm::ForceScalar),
+            ("batched mm (Phase 3)", PrefillGemm::ForceMm),
+        ] {
+            let mut session = mk_session();
+            let started = std::time::Instant::now();
+            session
+                .prefill_tokens_windowed_gemm(
+                    &embeddings,
+                    n,
+                    &weights,
+                    &cos_all,
+                    &sin_all,
+                    Some((&alt_cos, &alt_sin)),
+                    row.scale,
+                    256,
+                    gemm,
+                )
+                .expect("batched windowed prefill");
+            report(label, started.elapsed().as_secs_f64());
+        }
+
+        let mut token_session = mk_session();
+        let started = std::time::Instant::now();
+        for t in 0..n {
+            token_session
+                .forward_token(
+                    &embeddings[t * row.hidden..(t + 1) * row.hidden],
+                    &weights,
+                    &cos_all[t * half..(t + 1) * half],
+                    &sin_all[t * half..(t + 1) * half],
+                    Some((
+                        &alt_cos[t * half..(t + 1) * half],
+                        &alt_sin[t * half..(t + 1) * half],
+                    )),
+                    t,
+                    row.scale,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .expect("resident forward");
+        }
+        report("token-by-token (today)", started.elapsed().as_secs_f64());
     }
 
     // gemma3 long-prompt TTFT campaign, Phase 1 — THE MUTATION HARNESS (gate G7).
