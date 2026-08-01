@@ -1,0 +1,4 @@
+test metal::tests::gemma3_real_row_prefill_attn_probe ... [attn-probe] n=1200 per-row   3.019s ( 2.516 ms/token) | batched   0.916s ( 0.764 ms/token) |  3.29x | attention 55.38 GFLOP, batched-path 0.060 TFLOPS lower bound | load 6.48
+[attn-probe] n=1200 score tiles: 5642 in the grid, 702 dropped by the causal cull, 1210 dropped by the WINDOW cull (21.4 % of the grid, 24.5 % of what causal alone would have kept), 3730 computed
+[attn-probe] n=2400 per-row   7.556s ( 3.148 ms/token) | batched   1.821s ( 0.759 ms/token) |  4.15x | attention 146.15 GFLOP, batched-path 0.080 TFLOPS lower bound | load 5.95
+[attn-probe] n=2400 score tiles: 20696 in the grid, 1430 dropped by the causal cull, 9570 dropped by the WINDOW cull (46.2 % of the grid, 49.7 % of what causal alone would have kept), 9696 computed

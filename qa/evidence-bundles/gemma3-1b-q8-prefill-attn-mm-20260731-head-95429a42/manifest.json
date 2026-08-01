@@ -1,0 +1,110 @@
+{
+  "schema": "camelid.gemma3.long_prompt_ttft_campaign_bundle.v1",
+  "bundle": "gemma3-1b-q8-prefill-attn-mm-20260731-head-95429a42",
+  "row_id": "gemma_3_1b_it_q8_0",
+  "campaign": "GEMMA3_METAL_CONDUCTOR.md section 19 - long-prompt TTFT campaign, Phase 4 (Tier B)",
+  "date_utc": "2026-07-31",
+  "source_head": "95429a42",
+  "model": {
+    "filename": "gemma-3-1b-it-Q8_0.gguf",
+    "sha256": "b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5",
+    "size_bytes": 1069306368,
+    "provenance": "ggml-org/gemma-3-1b-it-GGUF (upstream-verified exact, license gemma)",
+    "arch": "gemma3",
+    "sliding_window_tokens": 512,
+    "native_context_length": 32768
+  },
+  "host": {
+    "machine": "Apple M4 Mac mini",
+    "cores": 10,
+    "ram_gib": 16,
+    "os": "macOS 26.5"
+  },
+  "camelid_lane": {
+    "name": "metal_gpu_resident_batched_windowed_prefill",
+    "flags_default_on": [
+      "CAMELID_GEMMA3_BATCH_PREFILL",
+      "CAMELID_GEMMA3_PREFILL_MM",
+      "CAMELID_GEMMA3_PREFILL_ATTN_MM"
+    ],
+    "opt_out": "set the variable to 0",
+    "bit_identical_to_token_by_token_prefill": false,
+    "decode_unchanged": true,
+    "kernels_reused": [
+      "half_mm_batched_f16o",
+      "softmax_causal_rows",
+      "transpose_v16",
+      "q8_0_block_wire_mm"
+    ],
+    "new_msl": "one `window` uniform on half_mm_batched_f16o and softmax_causal_rows, about fifteen lines; window = 0 is the disabled case and is instruction-identical to the pre-change kernel"
+  },
+  "gates": {
+    "g6_kv_envelope": {
+      "bounds_source": "GEMMA3_METAL_CONDUCTOR.md section 18b, carried over unmoved",
+      "cache_relative_bound": 2.0e-3,
+      "hidden_relative_bound": 1.0e-2,
+      "outlier_factor": 8.0,
+      "lengths": [5, 256, 257, 513, 1024, 2400],
+      "worst_cache_relative": 1.368627e-3,
+      "worst_hidden_relative": 2.557266e-3,
+      "worst_outlier_ratio": 5.8,
+      "pass": true
+    },
+    "g5_mask_at_the_kernel": {
+      "windows": [0, 1, 37, 64, 65, 128],
+      "attended_count_identity": "exactly min(q+1, window)",
+      "max_abs_p_minus_cpu_reference": 5.949e-5,
+      "q_offset_blocking_bit_identical": true,
+      "pass": true
+    },
+    "g7_window_mutation_harness": {
+      "mutants": 7,
+      "caught": 7,
+      "survivors": [],
+      "runtime_s": 1823.51,
+      "pass": true
+    },
+    "window_edge_pack_vs_pinned_oracle": {
+      "legs_token_and_text_identical": "70/72",
+      "prompt_tokenization": "24/24",
+      "all_pass": false,
+      "pre_existing_failures": [
+        "item 13, 256 prompt tokens, depth 50, generated index 13",
+        "item 17, 513 prompt tokens, depth 50, generated index 5"
+      ],
+      "note": "identical to the Phase 1/2/3 baseline; both failures are the pre-existing unanchored depth-50 pair, reported and not excused"
+    },
+    "capability_row_claim_under_new_default": {
+      "windowed_ge512": "9/9 all_pass true, prompt tokenization 3/3",
+      "sub512_chat": "15/15 all_pass true, prompt tokenization 5/5",
+      "row_edited": false,
+      "note": "the row's own shipped claim was re-established under the flipped default rather than assumed to survive"
+    },
+    "decode_bit_exactness": {
+      "gemma3_real_row_resident_forward_matches_runnable_oracle": "50/50 greedy tokens identical, overall max abs logit diff 2.122e-4 (the pinned constant, unmoved)",
+      "metal_attention_decode_split3_is_bit_identical_to_v1": "pass, raw-bit identical across all six geometries"
+    },
+    "tier_a_bit_identity": "still bit-identical, synthetic fixture and real row; both gates now pin PrefillGemm::ForceScalar AND PrefillAttn::ForceRow",
+    "build_gates": "cargo fmt --check rc=0; cargo clippy --all-targets -- -D warnings rc=0; cargo test --all-targets rc=0 (60 green targets, 1817 passed, 0 failed); scripts/check-public-scrub.sh rc=0"
+  },
+  "ttft_seconds_warm_mean_rounds_1_2": {
+    "method": "streamed SSE, request start to the first chunk carrying non-empty content; prompts are exact token-id arrays so the tokenizer is out of the loop; round 0 excluded as the cold column; one server alive at a time, killed by saved PID",
+    "600": {"token_by_token": 8.078, "phase3_per_row_attention": 1.316, "phase4_batched_attention": 0.520},
+    "1200": {"token_by_token": 17.453, "phase3_per_row_attention": 3.101, "phase4_batched_attention": 0.971},
+    "2400": {"token_by_token": 37.475, "phase3_per_row_attention": 7.703, "phase4_batched_attention": 1.962},
+    "load_1m_range": {"token_by_token": [3.06, 4.71], "phase3": [2.96, 3.17], "phase4": [3.00, 3.00]}
+  },
+  "tile_census": {
+    "note": "computed with the kernel's own cull predicates over the actual dispatch grid, all 26 layers, chunk 256",
+    "1200": {"grid": 5642, "causal_culled": 702, "window_culled": 1210, "computed": 3730},
+    "2400": {"grid": 20696, "causal_culled": 1430, "window_culled": 9570, "computed": 9696}
+  },
+  "not_claimed": [
+    "no throughput or tokens-per-second number is promoted to any shipped surface; performance_measured stays not_claimed_*",
+    "no comparison with any other inference engine is made or implied; the pinned oracle capture is used only as a correctness reference",
+    "the prefill is NOT bit-identical to the token-by-token lane, by construction",
+    "context above 2403 prompt tokens remains unmeasured for this row",
+    "the TTFT figures exclude prompt tokenization by design"
+  ],
+  "deviations": "The first G6 run FAILED at n = 257/513/2400 and is committed verbatim as g6-kv-envelope-first-run-FAILED.txt; the bug it found (a softmax panel-pitch mismatch on ragged chunks) is described in conductor section 19b. Two window-edge pack legs fail and are the pre-existing pair. Host paths are redacted from every captured file."
+}

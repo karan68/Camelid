@@ -1,0 +1,776 @@
+[
+ {
+  "status": 200,
+  "ttft_s": 0.5342144160022144,
+  "headers_s": 0.018085750001773704,
+  "first_frame_s": 0.5342144160022144,
+  "total_s": 0.5994640829958371,
+  "content_chunks": 4,
+  "text": "arrow wharf.\n",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 581,
+    "first_content": 516,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 510.68,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.328,
+     "prompt_eval_forward_plus_sample": 511.008,
+     "first_content_minus_prompt_eval_forward": 5.319999999999993,
+     "first_content_minus_prompt_eval_forward_plus_sample": 4.992000000000019
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 516,
+     "final_yield": 581,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 65
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 488.859,
+    "first_token_forward_total": 21.821,
+    "generation_forward_total": 575.839,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 0,
+  "n": 600,
+  "load_before": [
+   3.0,
+   3.1,
+   3.42
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.42
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:19"
+ },
+ {
+  "status": 200,
+  "ttft_s": 0.9703645410045283,
+  "headers_s": 0.018894500004535075,
+  "first_frame_s": 0.9703645410045283,
+  "total_s": 1.0384583750055754,
+  "content_chunks": 4,
+  "text": " wharf.\n```",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 1019,
+    "first_content": 951,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 946.249,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.333,
+     "prompt_eval_forward_plus_sample": 946.582,
+     "first_content_minus_prompt_eval_forward": 4.750999999999976,
+     "first_content_minus_prompt_eval_forward_plus_sample": 4.418000000000006
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 951,
+     "final_yield": 1019,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 68
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 928.177,
+    "first_token_forward_total": 18.072,
+    "generation_forward_total": 1014.233,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 0,
+  "n": 1200,
+  "load_before": [
+   3.0,
+   3.1,
+   3.42
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:20"
+ },
+ {
+  "status": 200,
+  "ttft_s": 1.8837542080000276,
+  "headers_s": 0.018688791002205107,
+  "first_frame_s": 1.8837542080000276,
+  "total_s": 1.9564877079974394,
+  "content_chunks": 4,
+  "text": "in.\n```",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 1937,
+    "first_content": 1865,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 1859.878,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.33,
+     "prompt_eval_forward_plus_sample": 1860.2079999999999,
+     "first_content_minus_prompt_eval_forward": 5.122000000000071,
+     "first_content_minus_prompt_eval_forward_plus_sample": 4.792000000000144
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 1865,
+     "final_yield": 1937,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 72
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 1838.147,
+    "first_token_forward_total": 21.731,
+    "generation_forward_total": 1932.474,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 0,
+  "n": 2400,
+  "load_before": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:22"
+ },
+ {
+  "status": 200,
+  "ttft_s": 0.5084466670014081,
+  "headers_s": 0.018369999997958075,
+  "first_frame_s": 0.5084466670014081,
+  "total_s": 0.5748803750029765,
+  "content_chunks": 4,
+  "text": " wharf.\n```",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 556,
+    "first_content": 490,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 484.715,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.335,
+     "prompt_eval_forward_plus_sample": 485.04999999999995,
+     "first_content_minus_prompt_eval_forward": 5.285000000000025,
+     "first_content_minus_prompt_eval_forward_plus_sample": 4.9500000000000455
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 490,
+     "final_yield": 556,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 66
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 467.38,
+    "first_token_forward_total": 17.335,
+    "generation_forward_total": 550.966,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 1,
+  "n": 600,
+  "load_before": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:22"
+ },
+ {
+  "status": 200,
+  "ttft_s": 0.9721775419966434,
+  "headers_s": 0.018749416994978674,
+  "first_frame_s": 0.9721775419966434,
+  "total_s": 1.0403960830008145,
+  "content_chunks": 4,
+  "text": " lantern zenith wharf.",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 1021,
+    "first_content": 953,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 948.1569999999999,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.338,
+     "prompt_eval_forward_plus_sample": 948.4949999999999,
+     "first_content_minus_prompt_eval_forward": 4.843000000000075,
+     "first_content_minus_prompt_eval_forward_plus_sample": 4.505000000000109
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 953,
+     "final_yield": 1021,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 68
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 929.834,
+    "first_token_forward_total": 18.323,
+    "generation_forward_total": 1016.246,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 1,
+  "n": 1200,
+  "load_before": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:23"
+ },
+ {
+  "status": 200,
+  "ttft_s": 1.9793250410002656,
+  "headers_s": 0.018483540996385273,
+  "first_frame_s": 1.9793250410002656,
+  "total_s": 2.041065500001423,
+  "content_chunks": 2,
+  "text": ".\n",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 2022,
+    "first_content": 1960,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 1945.948,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.675,
+     "prompt_eval_forward_plus_sample": 1946.623,
+     "first_content_minus_prompt_eval_forward": 14.051999999999907,
+     "first_content_minus_prompt_eval_forward_plus_sample": 13.376999999999953
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 1960,
+     "final_yield": 2022,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 62
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 1914.47,
+    "first_token_forward_total": 31.478,
+    "generation_forward_total": 2007.566,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 1,
+  "n": 2400,
+  "load_before": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:25"
+ },
+ {
+  "status": 200,
+  "ttft_s": 0.5314155419982853,
+  "headers_s": 0.017811042001994792,
+  "first_frame_s": 0.5314155419982853,
+  "total_s": 0.6097190420041443,
+  "content_chunks": 4,
+  "text": "ove lantern wharf.",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 591,
+    "first_content": 513,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 500.53000000000003,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.603,
+     "prompt_eval_forward_plus_sample": 501.13300000000004,
+     "first_content_minus_prompt_eval_forward": 12.46999999999997,
+     "first_content_minus_prompt_eval_forward_plus_sample": 11.866999999999962
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 513,
+     "final_yield": 591,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 78
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 477.624,
+    "first_token_forward_total": 22.906,
+    "generation_forward_total": 578.862,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 2,
+  "n": 600,
+  "load_before": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:26"
+ },
+ {
+  "status": 200,
+  "ttft_s": 0.9699025829977472,
+  "headers_s": 0.018007124999712687,
+  "first_frame_s": 0.9699025829977472,
+  "total_s": 1.0375509160003276,
+  "content_chunks": 4,
+  "text": " wharf.\n```",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 1019,
+    "first_content": 951,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 946.691,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.328,
+     "prompt_eval_forward_plus_sample": 947.019,
+     "first_content_minus_prompt_eval_forward": 4.308999999999969,
+     "first_content_minus_prompt_eval_forward_plus_sample": 3.9809999999999945
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 951,
+     "final_yield": 1019,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 68
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 928.61,
+    "first_token_forward_total": 18.081,
+    "generation_forward_total": 1014.213,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 2,
+  "n": 1200,
+  "load_before": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:27"
+ },
+ {
+  "status": 200,
+  "ttft_s": 1.9444381249995786,
+  "headers_s": 0.01898633399832761,
+  "first_frame_s": 1.9444381249995786,
+  "total_s": 2.021582250003121,
+  "content_chunks": 4,
+  "text": " raft wharf.\n",
+  "diagnostics": {
+   "timings_ms": {
+    "generate": 2002,
+    "first_content": 1925,
+    "first_content_accounting": {
+     "prompt_eval_forward_total": 1913.959,
+     "prompt_eval_logits": 0.0,
+     "prompt_eval_sample": 0.876,
+     "prompt_eval_forward_plus_sample": 1914.835,
+     "first_content_minus_prompt_eval_forward": 11.04099999999994,
+     "first_content_minus_prompt_eval_forward_plus_sample": 10.164999999999964
+    },
+    "stream_event_accounting": {
+     "poll_yield_enabled": false,
+     "role_yield": null,
+     "generate_start": 0,
+     "first_content_yield": 1925,
+     "final_yield": 2002,
+     "generate_start_minus_role_yield": null,
+     "first_content_yield_minus_role_yield": null,
+     "final_yield_minus_first_content_yield": 77
+    },
+    "tokenize": 0,
+    "weight_load": 0,
+    "weight_cache_hit": true,
+    "prompt_cache_hit": false,
+    "session_create": 0,
+    "prefill_forward_total": 1887.864,
+    "first_token_forward_total": 26.095,
+    "generation_forward_total": 1991.155,
+    "prefill_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "first_token_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "generation_role_timings": {
+     "attention_context": -0.0,
+     "attention_output": -0.0,
+     "ffn_gate": -0.0,
+     "ffn_up": -0.0,
+     "ffn_down": -0.0,
+     "logits": 0.0
+    },
+    "layer_role_hotspots": {
+     "prefill": [],
+     "first_token": [],
+     "generation": []
+    }
+   },
+   "q8_schedule": null
+  },
+  "error": null,
+  "round": 2,
+  "n": 2400,
+  "load_before": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "load_after": [
+   3.0,
+   3.1,
+   3.41
+  ],
+  "tag": "p4-attn",
+  "wall_clock": "23:13:29"
+ }
+]

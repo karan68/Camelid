@@ -1,0 +1,53 @@
+Phase 4 gate block, one model-loading process at a time, in run order.
+
+===== metal_attention_decode_split3_is_bit_identical_to_v1
+running 1 test
+test metal::tests::metal_attention_decode_split3_is_bit_identical_to_v1 ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1463 filtered out; finished in 0.06s
+
+===== gemma3_real_row_resident_forward_matches_runnable_oracle
+test metal::tests::gemma3_real_row_resident_forward_matches_runnable_oracle ... [real-row] loading 26 layers from <redacted-local-path> Support/app.camelid.desktop/models/gemma-3-1b-it-Q8_0.gguf
+[real-row] loading the runnable oracle
+[real-row] depth 1: argmax resident=108 oracle=108, max |logit diff| = 6.247e-5
+[real-row] depth 5: argmax resident=1077 oracle=1077, max |logit diff| = 7.820e-5
+[real-row] depth 50: argmax resident=578 oracle=578, max |logit diff| = 9.584e-5
+[real-row] PASS: 50/50 greedy tokens identical to the runnable oracle; overall max |logit diff| = 2.122e-4
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1463 filtered out; finished in 554.07s
+
+===== gemma3_session_level_token_by_token_prefill_matches_runnable_oracle
+[session-level] depth 1: argmax session=108 oracle=108, max |logit diff| = 6.247e-5
+[session-level] depth 2: argmax session=584 oracle=584, max |logit diff| = 6.676e-5
+[session-level] depth 3: argmax session=568 oracle=568, max |logit diff| = 5.627e-5
+[session-level] depth 4: argmax session=2364 oracle=2364, max |logit diff| = 5.913e-5
+[session-level] depth 5: argmax session=1077 oracle=1077, max |logit diff| = 7.820e-5
+[session-level] PASS: 5/5 greedy tokens identical to the runnable oracle via the session-level token-by-token prefill; overall max |logit diff| = 7.820e-5
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1463 filtered out; finished in 20.61s
+
+===== gemma3_real_row_batched_prefill_kv_bit_identical
+test metal::tests::gemma3_real_row_batched_prefill_kv_bit_identical ... [G1-real-row] n=5: token-by-token 0.14s, batched 0.05s (2.98x), compared 72320 elements, bit_identical=true
+[G1-real-row] n=256: token-by-token 3.35s, batched 2.86s (1.17x), compared 3702784 elements, bit_identical=true
+[G1-real-row] n=257: token-by-token 3.42s, batched 2.87s (1.19x), compared 3717248 elements, bit_identical=true
+[G1-real-row] n=513: token-by-token 7.17s, batched 5.89s (1.22x), compared 7420032 elements, bit_identical=true
+[G1-real-row] n=1024: token-by-token 15.30s, batched 12.16s (1.26x), compared 14811136 elements, bit_identical=true
+[G1-real-row] PASS: bit-identical KV AND final hidden at n = 5/256/257/513/1024
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1463 filtered out; finished in 53.83s
+
+===== metal_batched_windowed_prefill_is_bit_identical_to_token_by_token
+running 1 test
+test metal::tests::metal_batched_windowed_prefill_is_bit_identical_to_token_by_token ... [G1-synthetic] PASS: batched windowed prefill BIT-IDENTICAL to token-by-token at n = 1/3/4/5/6/7/8/9/13/17 (chunk 4, window 6), for both the gemma3 shape (dual-theta + sandwich norms + GeGLU + QK-norm) and the plain llama shape
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1463 filtered out; finished in 0.42s
+
+===== windowed_attn_mm_mask_matches_the_pinned_window_convention
+[G5-mask] window=1: max |P - cpu_ref| = 0.000e0
+[G5-mask] window=37: max |P - cpu_ref| = 5.949e-5
+[G5-mask] window=64: max |P - cpu_ref| = 5.949e-5
+[G5-mask] window=65: max |P - cpu_ref| = 5.949e-5
+[G5-mask] window=128: max |P - cpu_ref| = 5.949e-5
+[G5-mask] q_offset blocking reproduces the unblocked P bit for bit
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1463 filtered out; finished in 0.08s
+

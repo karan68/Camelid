@@ -15967,6 +15967,7 @@ impl ResidentDecodeState {
                     *p.add(10) = (n_heads / n_kv_heads) as u32; // GQA: share the KV head
                     *p.add(11) = 1; // causal_mode: upper cull + window cull
                     *p.add(12) = base as u32; // q_offset: chunk-local -> absolute
+
                     // O = Vᵀ P: A = Vᵀ [kv_head][head_dim][n_pad], B = P, C = the half
                     // context panel the O projection consumes.
                     let p = attn_pv_scalar.contents() as *mut u32;
@@ -15988,6 +15989,7 @@ impl ResidentDecodeState {
                     *p.add(1) = n_pos as u32;
                     *(p.add(2) as *mut f32) = scale;
                     *p.add(3) = base as u32; // q_offset
+
                     // rows per block is the PANEL's row pitch, which is the chunk width
                     // and NOT this chunk's row count: `softmax_causal_rows` derives its
                     // per-head base as `head * rows_per_block * n_pad`, the same stride
@@ -27496,7 +27498,7 @@ mod tests {
             }
             assert_eq!(token_session.filled(), n);
 
-            let mut prefill = |attn: PrefillAttn| {
+            let prefill = |attn: PrefillAttn| {
                 let mut s = mk_session();
                 let hidden = s
                     .prefill_tokens_windowed_hidden(
@@ -27872,8 +27874,7 @@ mod tests {
                         .sum::<u64>()
                 })
                 .sum();
-            let gflop =
-                4.0 * attended as f64 * (row.head_dim * row.n_heads) as f64 / 1.0e9;
+            let gflop = 4.0 * attended as f64 * (row.head_dim * row.n_heads) as f64 / 1.0e9;
             let mk_session = || {
                 ResidentDecodeState::new(
                     row.n_layers,
@@ -31650,10 +31651,10 @@ mod attn_mm_parity {
                 let q_off = blk * rows_per_block;
                 let cols = (n - q_off).min(rows_per_block);
                 let panel = heads * rows_per_block * n_pad;
-                let s_buf = device
-                    .new_buffer((panel * 2) as u64, MTLResourceOptions::StorageModeShared);
-                let p_buf = device
-                    .new_buffer((panel * 2) as u64, MTLResourceOptions::StorageModeShared);
+                let s_buf =
+                    device.new_buffer((panel * 2) as u64, MTLResourceOptions::StorageModeShared);
+                let p_buf =
+                    device.new_buffer((panel * 2) as u64, MTLResourceOptions::StorageModeShared);
                 unsafe {
                     std::ptr::write_bytes(s_buf.contents() as *mut u8, 0, panel * 2);
                     std::ptr::write_bytes(p_buf.contents() as *mut u8, 0, panel * 2);
@@ -31785,7 +31786,9 @@ mod attn_mm_parity {
                     }
                     assert!(row[q] > 0.0, "window={window} q={q}: self-attention lost");
                     // --- and the surviving weights are a softmax over that range ---
-                    let lo = if window == 0 || q + 1 <= window {
+                    // `q < window` is clippy's rewrite of `q + 1 <= window`, and is the
+                    // same predicate the kernel spells `q_abs < window`.
+                    let lo = if window == 0 || q < window {
                         0
                     } else {
                         q + 1 - window
@@ -31831,7 +31834,8 @@ mod attn_mm_parity {
                             x.to_bits(),
                             y.to_bits(),
                             "window={window} head={hh} q={q} p={c}: query blocking \
-                             (q_offset={}) changed P", blk * 128
+                             (q_offset={}) changed P",
+                            blk * 128
                         );
                     }
                 }
