@@ -582,6 +582,43 @@ the existing SSE `decode_tps` real generation event, rendered unavailable when a
 release job is additive and independently skippable; existing server artifacts are untouched.
 See `camelid-desktop/README.md`.
 
+### D11 (cont.) — NSIS in-place upgrades must remove sidecar files the version no longer ships (2026-07-31)
+
+An overwrite-only installer has a blind spot: it rewrites the files it ships and leaves
+everything else alone, so a file installed by an **older** version that the current one dropped
+survives every future upgrade. Found in the field on a v0.4.6 box — `sidecar\nvrtc64_120_0.alt.dll`,
+85.7 MB, from an install predating the `.alt` filter in `scripts/package-windows-cuda.ps1`. The
+published v0.4.6 artifact correctly contains no `.alt` entry and
+`scripts/check-release-artifact.mjs` has a forbidden rule for it, so **the packaging and artifact
+gates were both already correct** — the defect was only ever in the upgrade path, which is why
+neither gate could see it and why re-running the one-command installer never cleared it.
+
+**Fix: `NSIS_HOOK_PREINSTALL`** (`camelid-desktop/windows/installer-hooks.nsh`, wired via
+`bundle.windows.nsis.installerHooks`), deleting `nvrtc64_*.dll` and `nvrtc-builtins64_*.dll` from
+`$INSTDIR\sidecar` before the file copy re-lays the current set.
+
+Deleting the whole NVRTC family rather than blacklisting `.alt` is the deliberate choice: these
+filenames encode the CUDA version (`nvrtc-builtins64_129.dll` is 12.9; `nvrtc64_120_0.dll` the
+12.x ABI), so a `CUDA_VERSION` bump renames them and strands the previous ones identically. A
+rename is exactly what an overwrite cannot fix, so the blacklist would have to be extended by
+hand every bump; re-laying the family is self-healing. Cost is that the good DLLs are deleted and
+immediately re-extracted — verified below.
+
+**Rejected: clearing `sidecar\` wholesale before extracting.** It looks safe because `sidecar\`
+is shipped content, but it is not: `sidecar_models_dir` (`camelid-desktop/src/engine.rs`) makes
+the desktop's model store `models\` *beside the engine binary* — i.e. `sidecar\models\`. The box
+that reported the orphan had **4.42 GB of user GGUF weights there**. A wholesale clear is
+therefore a data-loss bug, not a cleanup.
+
+**Verified against a real in-place upgrade,** not by reading the template: installer built from
+this config, planted `sidecar\nvrtc64_120_0.alt.dll`, upgraded over the existing install. The
+`.alt` orphan is gone, the shipped NVRTC pair is present and re-extracted at full size, the
+`models\` subtree survives byte-for-byte, and the app relaunches and health-gates.
+
+Failure is non-fatal by construction: `Delete` on a missing or locked file sets the error flag
+without aborting, so the worst case is the orphan surviving to the next upgrade — never a broken
+install.
+
 ## D12 — CPU KV cache: f16-rounded values were stored in f32 buffers; f16 storage + head-major layout lanes (2026-07-01)
 
 Measured finding (Item-3 recon): the CPU KV write path has rounded every stored

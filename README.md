@@ -55,8 +55,10 @@ Windows 10 or 11.
 irm https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-windows.ps1 | iex
 ```
 
-To update later, run the same command again; models and settings are preserved. To pin a
-version, set `CAMELID_DESKTOP_TAG` first (for example `$env:CAMELID_DESKTOP_TAG = 'v0.4.5'`).
+To update later, run the same command again; models and settings are preserved. The upgrade also
+drops superseded CUDA runtime files that an older version installed and the current one no longer
+ships, so an in-place update cannot accumulate dead weight. To pin a version, set
+`CAMELID_DESKTOP_TAG` first (for example `$env:CAMELID_DESKTOP_TAG = 'v0.4.5'`).
 
 Prefer to install by hand? Download either artifact from the [latest release][latest-release]:
 

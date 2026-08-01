@@ -46,6 +46,21 @@ camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral>
 On window close the sidecar is terminated cleanly. On Windows, a **job object** with
 `KILL_ON_JOB_CLOSE` also prevents a desktop crash from orphaning a `camelid` process.
 
+## Windows in-place upgrades
+
+The NSIS installer overwrites the files it ships but, like any overwrite-only installer, cannot
+by itself remove a file an **older** version installed that the current one no longer ships.
+`windows/installer-hooks.nsh` supplies an `NSIS_HOOK_PREINSTALL` that deletes the NVRTC
+redistributables (`nvrtc64_*.dll`, `nvrtc-builtins64_*.dll`) from `sidecar\` before the file
+copy, so every upgrade re-lays exactly the set that version ships. That covers both the
+`nvrtc64_120_0.alt.dll` orphan left by pre-filter releases and any future CUDA version bump,
+which renames these DLLs and would otherwise strand the previous ones.
+
+The hook is deliberately narrow, and widening it to clear `sidecar\` wholesale would **destroy
+user data**: the desktop's model store is the `models\` folder beside the engine binary
+(`sidecar_models_dir` in `src/engine.rs`), i.e. `sidecar\models\`, holding multi-GB downloaded
+GGUF weights. Only files the packaging scripts stage may be removed there.
+
 ## Startup failures
 
 The splash is fail-closed: it stays visible until the sidecar returns `200` from
