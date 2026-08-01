@@ -204,8 +204,17 @@ fn tinyllama_edge_reference_pack_records_required_prompt_shapes_and_tokens() {
     ] {
         let case = &cases[name];
         assert_eq!(case["prompt_tokens_match"], true, "case {name}");
-        assert_eq!(case["add_special"], false, "case {name}");
+        // The reference ran llama-tokenize without --no-bos against an SPM vocab that carries no
+        // tokenizer.ggml.add_bos_token override, so add_bos resolved to true. Every tokens array
+        // therefore leads with BOS, and add_special must say so — pinning it here keeps the two
+        // halves of each case from drifting apart again.
+        assert_eq!(case["add_special"], true, "case {name}");
         assert_eq!(case["parse_special"], true, "case {name}");
+        assert_eq!(
+            case["tokens"].as_array().unwrap()[0],
+            1,
+            "case {name}: add_special is true, so the reference arrays must lead with BOS (1)"
+        );
         assert_eq!(
             case["tokens"].as_array().unwrap().len(),
             case["reference_prompt_token_count"].as_u64().unwrap() as usize,
@@ -235,6 +244,10 @@ fn encodes_tinyllama_edge_reference_pack_like_llama_cpp_when_available() {
     .unwrap();
     let cases = fixture["cases"].as_object().unwrap();
 
+    // Collect every mismatch instead of panicking on the first case: a systematic fixture defect
+    // (a wrong flag applied to all five cases) looks exactly like one broken case when assert_eq!
+    // aborts the loop, which sends the reader hunting for a bug in a single prompt shape.
+    let mut failures = Vec::new();
     for (name, case) in cases {
         let text = case["expected_prompt"].as_str().unwrap();
         let add_special = case["add_special"].as_bool().unwrap();
@@ -246,12 +259,32 @@ fn encodes_tinyllama_edge_reference_pack_like_llama_cpp_when_available() {
             .map(|value| value.as_u64().unwrap() as u32)
             .collect();
 
-        assert_eq!(
-            tokenizer.encode(text, add_special, parse_special).unwrap(),
-            expected,
-            "TinyLlama tokenizer/chat-template edge parity failed for {name}; expected IDs are from fixtures/tokenizer/tinyllama-chat-template-edge-cases.json backed by the committed llama.cpp parity reports"
-        );
+        let actual = tokenizer.encode(text, add_special, parse_special).unwrap();
+        if actual != expected {
+            let diff_at = actual
+                .iter()
+                .zip(expected.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| actual.len().min(expected.len()));
+            failures.push(format!(
+                "  {name} (add_special={add_special}, parse_special={parse_special}): first \
+                 divergence at index {diff_at}\n    actual   ({} ids) {actual:?}\n    expected ({} ids) {expected:?}",
+                actual.len(),
+                expected.len()
+            ));
+        }
     }
+
+    assert!(
+        failures.is_empty(),
+        "TinyLlama tokenizer/chat-template edge parity failed for {}/{} case(s); expected IDs are \
+         from fixtures/tokenizer/tinyllama-chat-template-edge-cases.json backed by the committed \
+         llama.cpp parity reports. Do not edit the fixture to match the encoder — re-derive it \
+         with the invocation recorded under reference.invocation.\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -612,15 +645,29 @@ fn rejects_unknown_token_type_value() {
     assert!(err.contains("unknown tokenizer token type 42"));
 }
 
+/// Skipping is correct for contributors and for CI legs that carry no GGUF artifacts, but a skip
+/// that reports "ok" is indistinguishable from coverage — that is how a parity fixture rots
+/// unnoticed. A job that is CONFIGURED to prove tokenizer parity opts in with
+/// CAMELID_REQUIRE_MODEL_TESTS=1 and then cannot silently degrade to a no-op.
+fn require_model_tests(what: &str, var: &str, path: &Path) {
+    assert!(
+        std::env::var("CAMELID_REQUIRE_MODEL_TESTS").as_deref() != Ok("1"),
+        "CAMELID_REQUIRE_MODEL_TESTS=1 but no {what} artifact is present at {} — this job is \
+         configured to prove tokenizer parity and cannot. Set {var} to the GGUF path.",
+        path.display()
+    );
+    eprintln!(
+        "SKIP {what} tokenizer parity; set {var} or place the artifact at {}",
+        path.display()
+    );
+}
+
 fn load_real_llama3_tokenizer() -> Option<(Tokenizer, Vec<String>)> {
     let path = std::env::var("LLAMA3_GGUF")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("models/Meta-Llama-3-8B-Instruct-Q8_0.gguf"));
     if !path.exists() {
-        eprintln!(
-            "skipping real Llama 3 tokenizer parity; set LLAMA3_GGUF or place the artifact at {}",
-            path.display()
-        );
+        require_model_tests("Llama 3", "LLAMA3_GGUF", &path);
         return None;
     }
 
@@ -637,10 +684,7 @@ fn load_real_tinyllama_tokenizer() -> Option<Tokenizer> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf"));
     if !path.exists() {
-        eprintln!(
-            "skipping real TinyLlama tokenizer parity; set TINYLLAMA_GGUF or place the artifact at {}",
-            path.display()
-        );
+        require_model_tests("TinyLlama", "TINYLLAMA_GGUF", &path);
         return None;
     }
 
@@ -653,10 +697,7 @@ fn load_real_mistral_tokenizer() -> Option<Tokenizer> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("models/Mistral-7B-Instruct-v0.3-Q8_0.gguf"));
     if !path.exists() {
-        eprintln!(
-            "skipping real Mistral tokenizer parity; set MISTRAL_GGUF or place the artifact at {}",
-            path.display()
-        );
+        require_model_tests("Mistral", "MISTRAL_GGUF", &path);
         return None;
     }
 
@@ -671,10 +712,7 @@ fn load_real_mixtral_tokenizer() -> Option<Tokenizer> {
             std::path::PathBuf::from("models/mixtral-8x7b-instruct-v0.1-q8_0.gguf")
         });
     if !path.exists() {
-        eprintln!(
-            "skipping real Mixtral tokenizer parity; set MIXTRAL_GGUF or place the artifact at {}",
-            path.display()
-        );
+        require_model_tests("Mixtral", "MIXTRAL_GGUF", &path);
         return None;
     }
 
