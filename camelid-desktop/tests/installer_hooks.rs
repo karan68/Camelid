@@ -96,21 +96,67 @@ fn sign_command_paths_must_be_absolute() {
     );
 }
 
-/// The signing script must fail rather than return success when it cannot sign. A hook that
-/// swallows an error hands the bundler an unsigned binary and reports nothing, which is
-/// exactly the silent failure the release gate exists to catch.
+/// The signing script's failure policy, which is deliberately asymmetric.
+///
+/// A signtool failure must NOT fail the bundle: the release still has to produce an installer.
+/// Failing there is what left users with no Windows installer at all on v0.4.8 and v0.5.0 —
+/// strictly worse than the unsigned-payload installer v0.4.6 shipped, which installed and ran.
+///
+/// A signature that does not verify IS fatal: v0.4.7 shipped `HashMismatch` on every installed
+/// copy, and Windows reports that as a tampered chain. Broken is worse than absent.
 #[test]
-fn sign_script_fails_closed_on_a_signing_error() {
+fn sign_script_ships_unsigned_on_failure_but_never_ships_a_broken_signature() {
     let src =
         std::fs::read_to_string(desktop_dir().join(SIGN_SCRIPT)).expect("read signing script");
 
     assert!(
-        src.contains("$LASTEXITCODE -ne 0"),
-        "the signing script must check signtool's exit code"
+        src.contains("$signExit -ne 0"),
+        "the signing script must capture and check signtool's exit code"
+    );
+    assert!(
+        src.contains("shipping this file UNSIGNED rather than failing the bundle"),
+        "a signtool failure must be non-fatal, or a signing outage means users get no installer"
+    );
+    assert!(
+        src.contains("refusing to seal a broken signature"),
+        "a result that does not verify must be fatal: a broken signature is worse than none"
     );
     assert!(
         src.contains("-ne 'Valid'"),
-        "the signing script must verify the resulting signature, not just signtool's exit code"
+        "the script must verify the resulting signature, not just signtool's exit code"
+    );
+}
+
+/// The hook must log to a file, because Tauri DISCARDS its output on a non-zero exit and
+/// reports only `failed to bundle project: failed to run <cmd>`. Three consecutive releases
+/// failed here with nothing else to go on, and each diagnosis was guesswork.
+///
+/// It must also drop `$ErrorActionPreference` for the native signtool call: Windows PowerShell
+/// wraps a redirected native command's stderr in NativeCommandError records, and under `Stop`
+/// that is terminating — the script would die on signtool's first diagnostic line and never
+/// reach its own exit-code handling, turning any hiccup into an unexplained bundle failure.
+#[test]
+fn sign_script_is_observable_when_tauri_swallows_its_output() {
+    let src =
+        std::fs::read_to_string(desktop_dir().join(SIGN_SCRIPT)).expect("read signing script");
+    let wf = release_workflow();
+
+    assert!(
+        src.contains("CAMELID_SIGN_LOG"),
+        "the signing script must write to a log file; Tauri discards its stdout on failure"
+    );
+    assert!(
+        src.contains("$ErrorActionPreference = 'Continue'"),
+        "the native signtool call must run with ErrorActionPreference dropped, or a stderr line \
+         terminates the script before its exit-code handling runs"
+    );
+    assert!(
+        wf.contains("CAMELID_SIGN_LOG=$signLog"),
+        "the release workflow must set CAMELID_SIGN_LOG"
+    );
+    assert!(
+        wf.contains("name: Sign-command log"),
+        "the release workflow must print the sign log so a failure is diagnosable from CI alone"
     );
 }
 

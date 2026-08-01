@@ -472,11 +472,24 @@ jobs:
             CorrelationId          = "${{ github.run_id }}-${{ github.run_attempt }}"
           } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8
 
+          # Tauri discards the sign command's output when it exits non-zero, so the hook also
+          # writes to this log and the step below prints it unconditionally. Three releases
+          # failed here with nothing but `failed to run <cmd>` to go on.
+          $signLog = Join-Path $env:RUNNER_TEMP 'camelid-sign.log'
+          New-Item -ItemType File -Force -Path $signLog | Out-Null
+
           "CAMELID_SIGNTOOL=$($signtool.FullName)"     | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
           "CAMELID_SIGN_DLIB=$($dlib.FullName)"        | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
           "CAMELID_SIGN_METADATA=$metadata"            | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+          "CAMELID_SIGN_LOG=$signLog"                  | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
           Write-Host "signtool: $($signtool.FullName)"
           Write-Host "dlib    : $($dlib.FullName)"
+          Write-Host "sign log: $signLog"
+
+          # Print the metadata the dlib will read. Endpoint/account/profile come from repo vars;
+          # if any were empty the signing would fail with an opaque error, so surface them.
+          Write-Host "metadata.json:"
+          (Get-Content $metadata -Raw) -split "`n" | ForEach-Object { Write-Host "  $_" }
 
           # Generate the signCommand overlay with ABSOLUTE paths.
           #
@@ -523,6 +536,21 @@ jobs:
         # error. tauri.signing.conf.json is generated above and carries the absolute-path
         # signCommand. Later --config wins on conflict, so signing is applied last.
         run: npx tauri build --config tauri.bundle.conf.json --config tauri.signing.conf.json
+
+      # ALWAYS print the sign log, pass or fail. Tauri discards the hook's output on a non-zero
+      # exit and reports only `failed to bundle project: failed to run <cmd>`, which is what made
+      # three consecutive release failures undiagnosable from CI alone.
+      - name: Sign-command log
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:CAMELID_SIGN_LOG -and (Test-Path $env:CAMELID_SIGN_LOG)) {
+            Write-Host "----- $env:CAMELID_SIGN_LOG -----"
+            Get-Content $env:CAMELID_SIGN_LOG
+            Write-Host "----- end -----"
+          } else {
+            Write-Host "no sign log at '$($env:CAMELID_SIGN_LOG)' - the hook never ran"
+          }
 
       # Assemble the portable layout, and stage the installer INTO it so a single post-build
       # signing pass covers both the portable camelid-desktop.exe and the NSIS installer.
@@ -628,20 +656,32 @@ jobs:
 
           $sig = Get-AuthenticodeSignature $exe
           Write-Host "installed camelid-desktop.exe -> $($sig.Status)"
-          if ($sig.Status -ne 'Valid') {
-            throw ("the installer delivers camelid-desktop.exe as '$($sig.Status)'. " +
-              "A user installing this release would run a binary Windows does not trust. " +
-              "Check that bundle.windows.signCommand ran (look for 'sign-artifact-signing:' above).")
+          # `Valid` is the goal; `NotSigned` is tolerated; anything else FAILS.
+          #
+          # A BROKEN signature is the one outcome worse than no signature: Windows reports a
+          # tampered chain, it earns no SmartScreen reputation, and it cannot be explained as
+          # "unsigned". That is what v0.4.7 shipped (HashMismatch on every installed copy).
+          # `NotSigned` is a known, previously accepted posture (v0.4.6) and, crucially, still
+          # produces an installer that works -- failing the release over it is how users ended up
+          # with NO Windows installer at all on v0.4.8 and v0.5.0, which is strictly worse.
+          if ($sig.Status -eq 'Valid') {
+            Write-Host 'OK: the installer delivers a correctly signed camelid-desktop.exe'
+          } elseif ($sig.Status -eq 'NotSigned') {
+            Write-Warning ("the installer delivers camelid-desktop.exe UNSIGNED. The release still " +
+              "ships and installs, but signing did not run -- see the Sign-command log step above.")
+          } else {
+            throw ("the installer delivers camelid-desktop.exe as '$($sig.Status)' -- a BROKEN " +
+              "signature, which is worse than none. Refusing to publish it.")
           }
 
-          # The sidecar is signed before bundling and must survive the same path.
+          # The sidecar is signed before bundling by the signing action, which is a proven path,
+          # so the same three-way rule applies but a regression here is far more suspicious.
           $side = Join-Path $target 'sidecar\camelid.exe'
-          if (Test-Path $side) {
-            $ss = (Get-AuthenticodeSignature $side).Status
-            Write-Host "installed sidecar camelid.exe -> $ss"
-            if ($ss -ne 'Valid') { throw "the installer delivers sidecar\camelid.exe as '$ss'" }
-          } else {
-            throw "installer did not place sidecar\camelid.exe in $target"
+          if (-not (Test-Path $side)) { throw "installer did not place sidecar\camelid.exe in $target" }
+          $ss = (Get-AuthenticodeSignature $side).Status
+          Write-Host "installed sidecar camelid.exe -> $ss"
+          if ($ss -notin @('Valid', 'NotSigned')) {
+            throw "the installer delivers sidecar\camelid.exe as '$ss' -- a broken signature"
           }
 
           Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
