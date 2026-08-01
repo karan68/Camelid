@@ -619,6 +619,44 @@ Failure is non-fatal by construction: `Delete` on a missing or locked file sets 
 without aborting, so the worst case is the orphan surviving to the next upgrade — never a broken
 install.
 
+## D11 cont. — the binary inside the Windows installer is signed by the bundler, not by a folder pass (2026-08-01)
+
+`camelid-desktop.exe` exists as **two distinct copies**, and a folder-based signing pass can
+only ever reach one of them. Tauri stamps the bundle type into the copy it stages for the
+installer, rewriting `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed app knows how
+it was installed — and it rewrites a *staged copy*, leaving `target/release` untouched.
+
+That gives a window with exactly one entrance. A signature applied **before** `tauri build` is
+invalidated by the rewrite; a signature applied **after** cannot reach a binary already sealed
+inside the installer. Two releases shipped from the two sides of it:
+
+| release | when the desktop exe was signed | what users installed |
+| --- | --- | --- |
+| v0.4.6 | after bundling only | `NotSigned` |
+| v0.4.7 | before bundling only | `HashMismatch` — a *broken* signature |
+
+v0.4.7 was the worse outcome: an invalid signature earns no SmartScreen reputation and reads
+as tampering, where an unsigned binary merely reads as unsigned. It was diagnosed by byte-diffing
+the two published copies, which differ in exactly two places — the 3-byte marker at `0x8043c8`
+and the PE CheckSum, which Authenticode excludes from its hash.
+
+**Fix: `bundle.windows.signCommand`** (`camelid-desktop/windows/sign-artifact-signing.ps1`),
+the only hook Tauri invokes between the rewrite and packaging. It drives `signtool` through
+`Azure.CodeSigning.Dlib`.
+
+**Rejected: `artifact-signing-cli`,** which Tauri's own documentation suggests for Azure. It
+requires `AZURE_CLIENT_SECRET`, and this repo authenticates to Artifact Signing with OIDC
+federated credentials and stores no secret. Adopting it would have traded a short-lived
+federated token for a long-lived secret purely for convenience. The dlib authenticates through
+`DefaultAzureCredential`, which resolves the `azure/login` session the workflow already
+establishes, so OIDC is preserved.
+
+**The gate matters more than the fix.** Every prior signing check inspected a file handed to
+the signer; none could see the installer's payload, which is why two consecutive releases
+shipped defects there. `Prove the INSTALLED binary is signed` silently installs the built
+installer on the runner and asserts the unpacked binary verifies. Runners are ephemeral, so
+this costs nothing, and it would have caught both defects before publishing.
+
 ## D12 — CPU KV cache: f16-rounded values were stored in f32 buffers; f16 storage + head-major layout lanes (2026-07-01)
 
 Measured finding (Item-3 recon): the CPU KV write path has rounded every stored
