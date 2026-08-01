@@ -105,20 +105,31 @@ fn identity_key(path: &Path) -> Option<String> {
     let canonical = std::fs::canonicalize(path).ok()?;
     let meta = std::fs::metadata(&canonical).ok()?;
     let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
-    let mut key = format!(
-        "{}|{}|{}.{:09}",
+    Some(format!(
+        "{}|{}|{}.{:09}{}",
         canonical.display(),
         meta.len(),
         modified.as_secs(),
-        modified.subsec_nanos()
-    );
-    #[cfg(unix)]
-    {
-        use std::fmt::Write;
-        use std::os::unix::fs::MetadataExt;
-        write!(key, "|{}|{}", meta.dev(), meta.ino()).ok()?;
-    }
-    Some(key)
+        modified.subsec_nanos(),
+        volume_identity(&meta)
+    ))
+}
+
+/// The (device, inode) pair, which pins the file across a rename or a
+/// same-path replacement that happens to preserve length and mtime.
+///
+/// Unix only. Elsewhere the key is path + length + mtime, which is weaker but
+/// still misses on every ordinary rewrite; the digest is never *wrong*, and
+/// the verifier re-hashes regardless.
+#[cfg(unix)]
+fn volume_identity(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("|{}|{}", meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn volume_identity(_meta: &std::fs::Metadata) -> String {
+    String::new()
 }
 
 fn now_unix() -> u64 {
