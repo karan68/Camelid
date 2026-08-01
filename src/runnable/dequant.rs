@@ -23,9 +23,9 @@
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
 use crate::tensor::{
-    decode_bf16_tensor, decode_iq4_xs_tensor, decode_nvfp4_tensor, decode_q2_k_tensor,
-    decode_q3_k_tensor, decode_q4_0_tensor, decode_q4_k_tensor, decode_q5_k_tensor,
-    decode_q6_k_tensor, decode_q8_0_tensor, f16_bits_to_f32,
+    decode_bf16_tensor, decode_iq4_xs_tensor, decode_nvfp4_tensor, decode_q1_0_tensor,
+    decode_q2_k_tensor, decode_q3_k_tensor, decode_q4_0_tensor, decode_q4_k_tensor,
+    decode_q5_k_tensor, decode_q6_k_tensor, decode_q8_0_tensor, f16_bits_to_f32,
 };
 
 /// Dequantize one tensor's wire bytes to a flat row-major `Vec<f32>` of
@@ -56,9 +56,13 @@ pub fn dequantize(
         // (0x7F/0xFF) per DECISIONS.md D17/T5 — the byte-level half of the
         // admission seam split documented in `super::admit::check_quants`.
         GgufTensorType::NVFP4 => decode_nvfp4_tensor(tensor_name, bytes, n_elements),
+        // Sign-only 1-bit decode: element `j` is bit
+        // `j % 8` of byte `j / 8` against a shared f16 scale. Order is pinned by
+        // `tensor::tests::q1_0_dequant_matches_the_reference_layout`.
+        GgufTensorType::Q1_0 => decode_q1_0_tensor(tensor_name, bytes, n_elements),
         other => Err(BackendError::UnsupportedTensorType(format!(
             "tensor {tensor_name} is {other:?}; runnable dequant covers \
-             F32, F16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16, NVFP4"
+             F32, F16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16, NVFP4, Q1_0"
         ))),
     }
 }

@@ -11492,7 +11492,17 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 | GgufTensorType::Q2K
                 | GgufTensorType::Q3K
         ) && matches!(desc.dimensions.len(), 2 | 3);
-        let f32_bytes = if file_backed_q8_linear || wire_resident_kquant {
+        // Q1_0 2-D tensors load via `load_q1_0_as_q8_0_blocks_linear`, which
+        // losslessly re-encodes them into Q8_0 blocks and leaves `data` empty — so
+        // like the K-quant wire path above they never materialize an f32 copy and
+        // must not be charged for one. They are NOT free, though: the re-encoded
+        // blocks are retained in RAM, and that real cost is counted below (a 1.7B
+        // model is ~1.9 GB of blocks, against the ~6.9 GB f32 figure this arm
+        // removes). Under-counting here would let an 8B Q1_0 file past a budget it
+        // genuinely cannot meet.
+        let transcoded_q1_0 =
+            desc.tensor_type == GgufTensorType::Q1_0 && desc.dimensions.len() == 2;
+        let f32_bytes = if file_backed_q8_linear || wire_resident_kquant || transcoded_q1_0 {
             0
         } else {
             element_count.checked_mul(4).ok_or_else(|| {
@@ -11502,9 +11512,10 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 ))
             })?
         };
-        let retained_source_bytes = if retain_q8_blocks
-            && !file_backed_q8_linear
-            && desc.tensor_type == GgufTensorType::Q8_0
+        let retained_source_bytes = if transcoded_q1_0
+            || (retain_q8_blocks
+                && !file_backed_q8_linear
+                && desc.tensor_type == GgufTensorType::Q8_0)
         {
             let q8_block_count = element_count.checked_add(31).ok_or_else(|| {
                 BackendError::InvalidTensorData(format!(
@@ -12228,6 +12239,18 @@ async fn prepare_generation(
     // resident-eligibility choke point consults it, so a FAIL runs the model on CPU. Runs on
     // a blocking thread (it builds engines + decodes) and is awaited so the verdict is set
     // BEFORE this request generates. Curated rows never take this branch.
+    //
+    // KNOWN GAP (Q1_0, 2026-08-01): this gate keys on a plan LABEL, and a Q1_0 file can
+    // never earn that label — `cuda_resident_q8_runnable_plan` requires `has_q8_0_tensors`,
+    // which reads the GGUF descriptors (type id 41 for Q1_0), so the plan fails closed to
+    // `cpu_reference` and `is_runnable_tier` is false. But 2-D Q1_0 tensors are re-encoded
+    // to Q8_0 BLOCKS at load, so the weights are resident-eligible by the time the engine
+    // looks at them. On a CUDA host that means a Q1_0 model can reach the resident engine
+    // WITHOUT this one-time parity self-check ever running. Not reproduced here: this lane
+    // was developed on a Metal-only box and the gap is reasoned from the code, not
+    // measured. Fixing it means gating on the loaded tensors' runtime representation
+    // rather than on a plan string — deliberately left alone rather than patched blind,
+    // since the correct fix changes admission for every uncurated GPU model, not just Q1_0.
     if crate::inference::resident_decode_cuda_active() {
         let is_runnable_tier = {
             let plans = state.execution_plans.read().await;

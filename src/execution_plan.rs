@@ -1718,6 +1718,24 @@ fn quant_type(gguf: &GgufFile) -> String {
         "Q4_K_M".into()
     } else if has(GgufTensorType::Q6K) {
         "Q6_K".into()
+    } else if has(GgufTensorType::Q1_0) {
+        // Same reasoning as the Q4_K arm: recognized here so a Q1_0 file that omits
+        // `general.file_type` still reports its real quantization instead of the
+        // `dense_or_other` fallback. This fixes the QUANT LABEL only.
+        //
+        // It does NOT make `selected_backend` truthful for a Q1_0 file, and that gap
+        // is real: an unvalidated row fails closed to `cpu_reference` here, while the
+        // Metal resident lane engages on its own gates (`metal_resident_weight_eligible`
+        // + `CAMELID_METAL_RESIDENT_DECODE`) and never consults `selected_backend`. A
+        // Q1_0 file whose 2-D tensors were re-encoded to Q8_0 blocks at load therefore
+        // decodes GPU-resident while this plan still says `cpu_reference` — measured on
+        // Bonsai-1.7B: ~36-40 tok/s resident against ~9 tok/s with resident decode off.
+        //
+        // The plan-vs-engine split is pre-existing and not specific to Q1_0 (nothing in
+        // `inference.rs` or `metal_resident.rs` reads `selected_backend`), but the
+        // load-time re-encoding widens the set of files it applies to, so it is recorded
+        // here rather than left for the next reader to rediscover.
+        "Q1_0".into()
     } else {
         "dense_or_other".into()
     }

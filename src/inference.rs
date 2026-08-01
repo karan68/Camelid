@@ -693,6 +693,18 @@ impl LlamaLoadedWeights {
                 if matches!(desc.tensor_type, GgufTensorType::IQ4XS) && desc.dimensions.len() == 2 {
                     return store.load_iq4_xs_wire_linear(name);
                 }
+                // Q1_0 sign-only 1-bit 2-D linears: LOSSLESSLY re-encode to Q8_0 blocks.
+                // Q1_0's value set is exactly {-d, +d}, which Q8_0 holds exactly as
+                // qs = ±1 against the same scale, and QK1_0 = 128 tiles into 4 blocks
+                // of 32 — so this is a re-encoding, not a re-quantization (pinned by
+                // tensor::tests::q1_0_transcode_is_bit_exact). It puts Q1_0 files on the
+                // existing Q8_0 GPU-resident lane with no new kernels, and avoids the
+                // f32 blow-up the plain CPU loader would pay (~6.9 GB for a 1.7B model).
+                // It does give up the 1.125 bpw footprint at runtime (Q8_0 blocks are
+                // 9 bpw) — a native Q1_0 resident kernel is what would keep it.
+                if matches!(desc.tensor_type, GgufTensorType::Q1_0) && desc.dimensions.len() == 2 {
+                    return store.load_q1_0_as_q8_0_blocks_linear(name);
+                }
                 if matches!(
                     desc.tensor_type,
                     GgufTensorType::Q4K

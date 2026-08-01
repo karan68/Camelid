@@ -5726,7 +5726,7 @@ fn infer_quantization(path: &std::path::Path) -> String {
         .to_uppercase();
     for q in [
         "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_0", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q2_K",
-        "BF16", "F16", "F32",
+        "Q1_0", "BF16", "F16", "F32",
     ] {
         if name.contains(q) {
             return q.to_string();

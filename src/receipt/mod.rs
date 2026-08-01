@@ -261,6 +261,12 @@ fn file_type_label(value: &GgufMetadataValue) -> Option<&'static str> {
         // a GGUF. NOT 26: that is GGML_FTYPE_MOSTLY_NVFP4, a different (ggml) enum that
         // never lands in GGUF metadata (BASALT_RECON.md §5).
         39 => "NVFP4",
+        // 40 is the FILE-TYPE id Q1_0 GGUFs carry in `general.file_type`. Same
+        // enum-namespace caveat as NVFP4 above: this is the file-type enum, NOT the
+        // tensor type id 41 that Q1_0 tensor descriptors carry. The two are adjacent
+        // for Q1_0, which makes confusing them easy. Verified against the shipped
+        // artifact: Bonsai-1.7B-Q1_0.gguf declares file_type 40 with type-41 tensors.
+        40 => "Q1_0",
         _ => return None,
     })
 }

@@ -63,6 +63,13 @@ pub enum GgufTensorType {
     /// is the receipt-visible quantization label (receipt `lane.quantization`,
     /// smoke `headline_quant`) — never rename it.
     NVFP4,
+    /// Q1_0: GGUF tensor type id 41, a 128-element/18-byte block
+    /// `{ f16 d; u8 qs[16] }` (1.125 bpw).
+    /// Sign-only quantization: element `i` is `+d` when bit `i` of `qs` is set and
+    /// `-d` when it is clear — there is no codebook, sub-scale or zero point, so the
+    /// representable set is exactly `{-d, +d}`. The Debug name "Q1_0" is the
+    /// receipt-visible quantization label — never rename it.
+    Q1_0,
     Unknown(i32),
 }
 
@@ -94,6 +101,7 @@ impl GgufTensorType {
             28 => Self::F64,
             30 => Self::BF16,
             40 => Self::NVFP4,
+            41 => Self::Q1_0,
             other => Self::Unknown(other),
         }
     }
@@ -135,6 +143,9 @@ impl GgufTensorType {
             // block_nvfp4 = d[4] UE4M3 sub-block scales + qs[32] packed E2M1 nibbles = 36
             // bytes per QK_NVFP4=64 elements (4.5 bpw; pin ggml-common.h:211-217).
             Self::NVFP4 => Some((64, 36)),
+            // block_q1_0 = f16 d(2) + qs[QK1_0/8]=16 = 18 bytes per QK1_0=128
+            // elements (1.125 bpw).
+            Self::Q1_0 => Some((128, 18)),
             Self::I8 => Some((1, 1)),
             Self::I16 | Self::BF16 => Some((1, 2)),
             Self::I32 => Some((1, 4)),
@@ -695,8 +706,23 @@ mod nvfp4_wire_facts {
         assert_eq!(GgufTensorType::from_id(40), GgufTensorType::NVFP4);
         assert_eq!(GgufTensorType::NVFP4.layout(), Some((64, 36)));
         assert_eq!(format!("{:?}", GgufTensorType::NVFP4), "NVFP4");
-        // Unknown ids still fall through to the fail-closed catch-all.
-        assert_eq!(GgufTensorType::from_id(41), GgufTensorType::Unknown(41));
+        // Unknown ids still fall through to the fail-closed catch-all. This used to
+        // assert on id 41, which is now the allocated Q1_0 type (see `q1_0_id_and_layout_are_pinned`);
+        // 99 is not an allocated tensor type, so it stays a true negative.
+        assert_eq!(GgufTensorType::from_id(99), GgufTensorType::Unknown(99));
+    }
+
+    /// Always-on pin of the Q1_0 wire facts: tensor type id 41 with a 128-element /
+    /// 18-byte block. Same reasoning as the NVFP4 pin above — this test cannot skip,
+    /// so an id or layout regression fails on any box. A wrong block size here is the
+    /// silent-corruption surface: `layout` drives the byte-length check in `parse`,
+    /// so a shortfall accumulates and reports as a bogus "not contiguous" error on the
+    /// NEXT tensor (the Q5_1 trap, pinned below).
+    #[test]
+    fn q1_0_id_and_layout_are_pinned() {
+        assert_eq!(GgufTensorType::from_id(41), GgufTensorType::Q1_0);
+        assert_eq!(GgufTensorType::Q1_0.layout(), Some((128, 18)));
+        assert_eq!(format!("{:?}", GgufTensorType::Q1_0), "Q1_0");
     }
 
     /// Pin EVERY quantized block layout against the reference struct definitions
@@ -734,7 +760,9 @@ mod nvfp4_wire_facts {
         //   iq4_xs = d(2) + scales_h(2) + scales_l[4] + qs[128]     = 136
         //   tq1_0  = qs[48] + qh[4] + d(2)                          = 54
         //   tq2_0  = qs[64] + d(2)                                  = 66
+        //   q1_0   = d(2)                       + qs[16]            = 18
         let expected = [
+            (T::Q1_0, 128, 18),
             (T::Q4_0, 32, 18),
             (T::Q4_1, 32, 20),
             (T::Q5_0, 32, 22),
