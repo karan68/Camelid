@@ -2527,3 +2527,61 @@ those two causes is not.
   the Phase 1 ones, unchanged, and are reported as failures.
 - **No promotion of any surface.** No README, COMPATIBILITY, STATUS or ledger edit. This phase
   adds a lane behind a flag, not a claim.
+
+## 18. Long-prompt TTFT campaign, Phase 3 record — the prefill GEMM (2026-07-31)
+
+Branch `feat/gemma3-batched-prefill`, continuing from §17. Phase 2 ended with a mechanism, not
+a mystery: Tier A's batched path is pinned at ~0.12 TFLOPS because
+`q8_0_block_linear_ksplit_f32y_wire_nsg8_verify` carries `constexpr uint MAX_T = 8`, so every
+weight block is re-read once per 8-column tile and the activation panel is re-walked by every
+threadgroup. §17f(3) put the choice to the user: bit-identity, or the speed.
+
+**The user chose the speed.** Phase 3 replaces the batched-prefill GEMV with a tiled
+simdgroup-matmul path. Bit-identity against today's prefill output is explicitly no longer the
+bar for the prefill GEMMs; correctness is carried by the Phase 1 harness — KV-cache equivalence
+with a published envelope, the 7-mutant harness, and external-oracle token parity — which is
+the standard the shipped lane already meets. Decode is untouched and stays bit-exact.
+
+### 18a. THE ENVELOPE, PINNED BEFORE ANY MEASUREMENT
+
+This section was committed **before** the first comparison was run; `git log` is the receipt.
+Pinning after seeing the number is how a bound becomes a rubber stamp.
+
+```
+kv_equivalence::meets_bound(bound = 5.0e-2, outlier_factor = 8.0)
+```
+
+applied to the whole `KvSnapshot` — every layer's K and V at every prompt position **and** the
+final hidden — of the MM prefill against `n` sequential `forward_token` prefill decodes.
+
+**Why 5.0e-2 and not the 2.122e-4 reduction-noise floor.** 2.122e-4 is the max |logit diff| a
+change that only re-associates f32 reductions produces on this row (§9). Phase 3 is strictly
+larger than that by construction: the tiled kernel stages the dequantized Q8_0 weight
+(`half(float(q) * w_scale)`) and the activation panel in **half** before the MMA. Half
+round-to-nearest is 2^-11 = 4.88e-4 *relative*, per element, before any reduction — so a bound
+at the f32-reduction-noise level is known-unreachable by arithmetic, and pinning there would be
+pinning a gate that must fail. The framing that matters: the weights are already Q8_0, whose
+quantization step is ~1/127 = 7.9e-3 relative, so representing `q * w_scale` in half adds an
+error ~16x *below* the quantization error both paths already carry.
+
+**Why 5.0e-2 is still a gate and not a rubber stamp.** The weakest window-mutation signature
+this campaign has ever recorded is max |ΔKV| **4.29e-1** (`w-len-513`, `window_plus_one`, §16g),
+and the next weakest is 5.83e-1 (`w-len-513`, `window_minus_one`). 5.0e-2 sits **8.6x below the
+weakest recorded mutant**, so the scalar half alone still separates numerics from every window
+defect on record by an order of magnitude. A bound loose enough to admit 4.29e-1 would not be a
+gate; this one is not that.
+
+**Why the outlier factor is 8.0.** §16g's finding is that the scalar half is the weak half: the
+sharpest mutant (`w-len-513`) has a per-position **median of exactly 0.0** with 287 743 elements
+differing, where any finite factor fires. Across the mutants that do have a non-zero median, the
+ratio (max |ΔKV| ÷ per-position median) runs 41x - 1525x; the **weakest is 41x**
+(`w-multi-2400`, `window_plus_one`: 1.788 / 4.37e-2). 8.0 leaves a **5.1x margin below the
+weakest recorded ratio** while still allowing a genuine 8x per-position spread for a uniform
+numerics change — which one must allow, because a position early in the prompt legitimately
+carries less accumulated round-off than a deep one.
+
+**What the pin commits to.** If the measurement exceeds either half, that is a Phase 3 failure
+reported as a failure, with the measured numbers, not a bound quietly moved to fit. The decode
+gates are unchanged and unmoved: `gemma3_real_row_resident_forward_matches_runnable_oracle` must
+stay 50/50 at exactly **2.122e-4** and `metal_attention_decode_split3_is_bit_identical_to_v1`
+must pass; either moving means decode was touched.
