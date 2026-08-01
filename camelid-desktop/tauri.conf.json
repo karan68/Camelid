@@ -31,6 +31,17 @@
     "shortDescription": "Native chat app for the Camelid local inference engine.",
     "longDescription": "Camelid Desktop embeds the same Camelid engine shipped as the server binary and runs it as a loopback sidecar. It inherits the identical model-support contract; it makes no broader claims.",
     "windows": {
+      "signCommand": {
+        "cmd": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "windows/sign-artifact-signing.ps1",
+          "%1"
+        ]
+      },
       "nsis": {
         "installerHooks": "windows/installer-hooks.nsh"
       }

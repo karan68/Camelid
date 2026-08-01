@@ -1,20 +1,98 @@
-//! The Windows NSIS installer-hook contract (see `../DECISIONS.md`, D11 cont.).
+//! The Windows bundler-hook contract (see `../DECISIONS.md`, D11 cont.) — two hooks that the
+//! compiler cannot see and that fail silently, so they are asserted here instead.
 //!
-//! An overwrite-only installer rewrites the files it ships and leaves everything else alone, so
-//! a file installed by an OLDER version that the current one dropped survives every upgrade —
-//! that is how an 85.7 MB `nvrtc64_120_0.alt.dll` stranded on v0.4.6 boxes. `windows/installer-hooks.nsh`
-//! closes that path by re-laying the NVRTC set on every install.
+//! **`installerHooks`** — an overwrite-only installer rewrites the files it ships and leaves
+//! everything else alone, so a file installed by an OLDER version that the current one dropped
+//! survives every upgrade; that is how an 85.7 MB `nvrtc64_120_0.alt.dll` stranded on v0.4.6
+//! boxes. `windows/installer-hooks.nsh` closes that path by re-laying the NVRTC set on every
+//! install. The wholesale-clear guard below is the load-bearing one: `sidecar\models\` is the
+//! desktop's model store, so widening the hook is a data-loss bug, not a cleanup.
 //!
-//! These tests exist because nothing else can see this. The hook is NSIS source, invisible to
-//! the compiler; `scripts/check-release-artifact.mjs` inspects the built artifact, not the
-//! upgrade path; and the failure is silent — a stranded file changes no behavior, it just
-//! accumulates. The wholesale-clear guard below is the load-bearing one: `sidecar\models\` is
-//! the desktop's model store, so widening the hook is a data-loss bug, not a cleanup.
+//! **`signCommand`** — Tauri rewrites the bundle-type marker on the copy of the binary it
+//! stages for the installer, so that copy can only be signed from inside the bundler. Losing
+//! this config does not fail the build; it ships an installer whose payload Windows refuses to
+//! trust. v0.4.6 shipped it `NotSigned`, v0.4.7 `HashMismatch`.
+//!
+//! Neither failure is visible to anything else in the tree: both hooks are non-Rust source,
+//! and `scripts/check-release-artifact.mjs` inspects the built artifact rather than the
+//! installer's payload or the upgrade path. The release workflow's `Prove the INSTALLED binary
+//! is signed` step is the runtime counterpart to these compile-time assertions.
 
 use std::path::PathBuf;
 
 fn desktop_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn tauri_conf() -> serde_json::Value {
+    let raw = std::fs::read_to_string(desktop_dir().join("tauri.conf.json"))
+        .expect("read tauri.conf.json");
+    serde_json::from_str(&raw).expect("tauri.conf.json is valid JSON")
+}
+
+/// `bundle.windows.signCommand` is the ONLY hook that can sign the copy of
+/// `camelid-desktop.exe` sealed inside the NSIS installer. Tauri rewrites the bundle-type
+/// marker (`__TAURI_BUNDLE_TYPE_VAR_UNK` -> `..._NSS`) on a staged copy, so a signature
+/// applied before `tauri build` is invalidated by that rewrite, and one applied afterwards
+/// cannot reach a binary already inside the installer. v0.4.6 shipped that copy `NotSigned`;
+/// v0.4.7 shipped it `HashMismatch`. Both are what dropping this config looks like.
+#[test]
+fn sign_command_is_wired_to_a_script_that_exists() {
+    let conf = tauri_conf();
+    let sign = &conf["bundle"]["windows"]["signCommand"];
+    assert!(
+        !sign.is_null(),
+        "bundle.windows.signCommand must stay configured: it is the only point at which the \
+         binary inside the NSIS installer can be signed"
+    );
+
+    let args: Vec<&str> = sign["args"]
+        .as_array()
+        .expect("signCommand must use the object notation so paths may contain whitespace")
+        .iter()
+        .map(|a| a.as_str().expect("signCommand args are strings"))
+        .collect();
+    assert!(
+        args.iter().any(|a| *a == "%1"),
+        "signCommand args must contain the %1 placeholder, or Tauri passes no file to sign: {args:?}"
+    );
+
+    let script = args
+        .iter()
+        .find(|a| a.ends_with(".ps1"))
+        .expect("signCommand must invoke a .ps1 script");
+    let path = desktop_dir().join(script);
+    assert!(
+        path.is_file(),
+        "signCommand points at {}, which does not exist — the release bundler would fail",
+        path.display()
+    );
+}
+
+/// The signing script must fail rather than return success when it cannot sign. A hook that
+/// swallows an error hands the bundler an unsigned binary and reports nothing, which is
+/// exactly the silent failure the release gate exists to catch.
+#[test]
+fn sign_script_fails_closed_on_a_signing_error() {
+    let conf = tauri_conf();
+    let args = conf["bundle"]["windows"]["signCommand"]["args"]
+        .as_array()
+        .expect("signCommand args");
+    let script = args
+        .iter()
+        .filter_map(|a| a.as_str())
+        .find(|a| a.ends_with(".ps1"))
+        .expect("signCommand script");
+    let src = std::fs::read_to_string(desktop_dir().join(script)).expect("read signing script");
+
+    assert!(
+        src.contains("$LASTEXITCODE -ne 0"),
+        "the signing script must check signtool's exit code"
+    );
+    assert!(
+        src.contains("-ne 'Valid'"),
+        "the signing script must verify the resulting signature, not just signtool's exit code"
+    );
 }
 
 /// The hook path as the NSIS bundler resolves it: `bundle.windows.nsis.installerHooks`,

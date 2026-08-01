@@ -61,6 +61,33 @@ user data**: the desktop's model store is the `models\` folder beside the engine
 (`sidecar_models_dir` in `src/engine.rs`), i.e. `sidecar\models\`, holding multi-GB downloaded
 GGUF weights. Only files the packaging scripts stage may be removed there.
 
+## Windows code signing
+
+Release artifacts are signed with Azure Artifact Signing. The subtlety is that
+`camelid-desktop.exe` exists as **two distinct copies**, and only one of them is reachable
+from an ordinary post-build signing pass:
+
+| copy | signed by | when |
+| --- | --- | --- |
+| `sidecar\camelid.exe` | signing action, folder pass | before bundling; copied verbatim as a resource |
+| the exe **inside** the installer | `bundle.windows.signCommand` | during bundling |
+| portable exe + NSIS installer | signing action, folder pass | after bundling |
+
+The middle row needs its own mechanism because Tauri stamps the bundle type into the binary it
+stages for the installer, rewriting `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed
+app knows how it was installed. It rewrites a *staged copy*, not `target/release`. A signature
+applied before `tauri build` is therefore invalidated by that rewrite, and one applied
+afterwards cannot reach a binary already sealed inside the installer.
+`windows/sign-artifact-signing.ps1` runs in the only window where the bytes are final.
+
+Both shipped releases got this wrong before it was understood: v0.4.6 delivered that copy
+`NotSigned`, and v0.4.7 delivered it `HashMismatch` — a broken signature, which is worse than
+none. The release workflow now installs the built installer on the runner and asserts the
+unpacked binary verifies, so neither failure can ship again unnoticed.
+
+The script no-ops when its tooling environment is absent, so `tauri build` on a developer
+machine still works and simply produces unsigned output.
+
 ## Startup failures
 
 The splash is fail-closed: it stays visible until the sidecar returns `200` from
