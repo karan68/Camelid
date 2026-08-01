@@ -5081,7 +5081,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke",
                 support_scope: "exact_row_gpu_resident_raw_decode_parity_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "raw-completion greedy parity only (no chat-template/serve/WebUI closure); greedy flips at low-bit near-ties (GPU-resident 2/4 probe prompts 24-token identical, 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie where the reference token is camelid's immediate #2); CPU-deterministic path 1/4 identical; no bounded-context bucket, perf/RSS gate, runnable-smoke oracle qualification, or curated-catalog entry yet; the model is community-sourced (bartowski/Llama-3.2-1B-Instruct-GGUF), not a canonical row",
+                full_support_blockers: "raw-completion greedy parity only (no chat-template/serve/WebUI closure); greedy flips at low-bit near-ties (GPU-resident 2/4 probe prompts 24-token identical, 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie where the reference token is camelid's immediate #2); CPU-deterministic path 1/4 identical; no bounded-context bucket, perf/RSS gate, or runnable-smoke oracle qualification yet; the model is community-sourced (bartowski/Llama-3.2-1B-Instruct-GGUF), not a canonical row",
                 metadata_parses: "validated_llama_arch",
                 tokenizer_works: "validated_llama3_bpe_128k_bos_128000",
                 tensors_load: "validated_streaming_iq4_xs_136b_wire_superblocks_no_f32_materialisation_gpu_resident_and_cpu_plus_kquant_tied_head",
@@ -18726,6 +18726,55 @@ mod tests {
     }
 
     #[test]
+    fn every_supported_row_is_reachable_on_the_models_page() {
+        // REGRESSION: a row can be promoted to `supported_*` in the contract and
+        // still be invisible to every user. The Models page has exactly two ways
+        // to show a supported model -- a curated catalog row joined by EXACT id
+        // (the "Get models" download list), or an allowlisted exact filename (the
+        // local Supported lane) -- and a promotion that adds neither leaves the
+        // row provably supported and unreachable. Nine rows drifted this way
+        // before this test existed, including three whose ids simply never
+        // matched the catalog (`gemma3_1b_it_q8_0` vs `gemma_3_1b_it_q8_0`).
+        let catalog_ids: std::collections::HashSet<&str> = curated_catalog()
+            .iter()
+            .map(|item| item.catalog_id)
+            .collect();
+        let allowlisted_rows: std::collections::HashSet<&str> = NON_CATALOG_SUPPORTED_ARTIFACTS
+            .iter()
+            .map(|(_, row_id)| *row_id)
+            .collect();
+
+        let unreachable: Vec<&str> = supported_compatibility_row_ids()
+            .iter()
+            .filter(|id| !catalog_ids.contains(*id) && !allowlisted_rows.contains(*id))
+            .copied()
+            .collect();
+
+        assert!(
+            unreachable.is_empty(),
+            "supported rows with no catalog entry and no allowlisted artifact are \
+             invisible on the Models page: {unreachable:?}. Add a curated_catalog() \
+             row whose catalog_id EQUALS the row id when a public upload carries the \
+             certified bytes, else add the exact filename to \
+             NON_CATALOG_SUPPORTED_ARTIFACTS."
+        );
+    }
+
+    #[test]
+    fn allowlisted_artifacts_name_real_supported_rows() {
+        // The allowlist is keyed by row id, so a typo (or a row that was renamed
+        // out from under it) fails open into "this artifact is not supported"
+        // rather than loudly. Both halves must resolve.
+        for (filename, row_id) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+            assert!(
+                supported_compatibility_row_ids().contains(row_id),
+                "allowlisted artifact {filename} names {row_id}, which is not a \
+                 supported /api/capabilities row"
+            );
+        }
+    }
+
+    #[test]
     fn classify_model_lane_separates_supported_experimental_and_unsupported() {
         assert_eq!(
             classify_model_lane(Some("nomic-bert"), "nomic-embed-text-v1.5.Q8_0.gguf"),
@@ -18756,6 +18805,34 @@ mod tests {
         );
         assert_eq!(
             classify_model_lane(Some("qwen35"), "ornith-1.0-9b-Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
+        // Supported K-quant / low-bit rows that reach the lane through a catalog
+        // row (their certified bytes ARE a public upload)...
+        assert_eq!(
+            classify_model_lane(Some("llama"), "Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("llama"), "Llama-3.2-3B-Instruct-Q5_K_M.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("llama"), "Llama-3.2-1B-Instruct-IQ4_XS.gguf"),
+            ModelLaneClass::Supported,
+        );
+        // ...and the ones that reach it only through the non-catalog allowlist,
+        // because no upstream upload carries the certified bytes.
+        assert_eq!(
+            classify_model_lane(Some("llama"), "Llama-3.2-1B-Instruct-Q4_K_M.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("gemma4"), "gemma-4-E4B-it-NVFP4-mm.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("qwen3"), "Ternary-Bonsai-4B-TQ2_0.gguf"),
             ModelLaneClass::Supported,
         );
         // Implemented architecture but NOT a supported exact artifact (different
@@ -22858,6 +22935,31 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["general", "tools"],
         },
         CatalogItem {
+            // Same id rule as the qwen3/gemma3 rows below: catalog_id MUST equal
+            // the compatibility row id `llama3_2_1b_instruct_iq4_xs`, or
+            // `filename_is_supported_exact_row` cannot join catalog to ledger and
+            // the artifact demotes to Experimental on the Models page.
+            //
+            // Provenance is exact-artifact, not repo-level: the ledger anchors
+            // sha256 69e85c87..., which is bartowski's upload (verified against
+            // the HF LFS oid). Unsloth ships no IQ4_XS 1B file at all, so this
+            // repo is the only source of the certified bytes.
+            catalog_id: "llama3_2_1b_instruct_iq4_xs",
+            name: "Llama 3.2 1B Instruct IQ4_XS",
+            repo_id: "bartowski/Llama-3.2-1B-Instruct-GGUF",
+            filename: "Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+            // HF LFS size (verified 2026-07-31); matches the ledger row's
+            // 743,141,504 B. Must stay exact or pull's skip-if-complete/resume
+            // check misfires.
+            size_bytes: 743141504,
+            downloads: 169043,
+            likes: 172,
+            quant: "IQ4_XS",
+            architecture: "llama",
+            license: "llama3.2",
+            task_tags: &["general"],
+        },
+        CatalogItem {
             catalog_id: "llama32_3b_instruct_q8_0",
             name: "Llama 3.2 3B Instruct Q8_0",
             repo_id: "unsloth/Llama-3.2-3B-Instruct-GGUF",
@@ -22869,6 +22971,44 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             architecture: "llama",
             license: "llama3.2",
             task_tags: &["general", "tools"],
+        },
+        CatalogItem {
+            // The certified 3B K-quant artifacts are BARTOWSKI's, not unsloth's.
+            // Unsloth publishes files with byte-identical NAMES at different
+            // sizes/hashes (Q4_K_M 2,019,377,600 B vs the certified
+            // 2,019,377,696 B), so the repo_id here is load-bearing evidence, not
+            // a preference: pointing this row at unsloth would ship users a file
+            // the parity bundle never covered while `filename_is_supported_exact_row`
+            // — which matches on filename alone — still called it Supported.
+            catalog_id: "llama_3_2_3b_instruct_q4_k_m",
+            name: "Llama 3.2 3B Instruct Q4_K_M",
+            repo_id: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            // HF LFS size (verified 2026-07-31) for the ledger-anchored
+            // sha256 6c1a2b41....
+            size_bytes: 2019377696,
+            downloads: 162679,
+            likes: 229,
+            quant: "Q4_K_M",
+            architecture: "llama",
+            license: "llama3.2",
+            task_tags: &["general"],
+        },
+        CatalogItem {
+            // Bartowski for the same reason as the Q4_K_M row above (unsloth's
+            // same-named Q5_K_M is 2,322,153,920 B; the certified artifact is
+            // 2,322,154,016 B, sha256 0b94ccd0...).
+            catalog_id: "llama_3_2_3b_instruct_q5_k_m",
+            name: "Llama 3.2 3B Instruct Q5_K_M",
+            repo_id: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            filename: "Llama-3.2-3B-Instruct-Q5_K_M.gguf",
+            size_bytes: 2322154016,
+            downloads: 162679,
+            likes: 229,
+            quant: "Q5_K_M",
+            architecture: "llama",
+            license: "llama3.2",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "tinyllama_1_1b_chat_q8_0",
@@ -23142,6 +23282,36 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             architecture: "llama",
             license: "llama3.1",
             task_tags: &["general"],
+        },
+        CatalogItem {
+            // The ONLY Ornith row that can be a catalog download: Q8_0 is HF
+            // pristine (local recompute matches the repo's LFS oid
+            // d0e4beba..., REFERENCE_PIN_QWEN35.md). Its supported siblings are
+            // NOT here on purpose — the certified Q4_K_M is a home requant
+            // (2711bf1e..., 5,629,108,416 B) that differs from the HF upload
+            // (5720d1f6..., 5,629,108,704 B), and Q3_K_M has no upstream file at
+            // all. Both stay in NON_CATALOG_SUPPORTED_ARTIFACTS; cataloguing
+            // them would hand users bytes the parity bundles never covered.
+            //
+            // catalog_id carries the bare-name row id VERBATIM, spaces and all.
+            // It looks wrong next to the slug ids and is not: the ORDER CONTRACT
+            // above the Ornith ledger rows pins this id because the chat
+            // `--agent` gate matches it against the loaded model's identity. The
+            // catalog<->ledger join is exact-id, so any tidier spelling here
+            // silently demotes the row to Experimental.
+            catalog_id: "Ornith 1.0 9B",
+            name: "Ornith 1.0 9B Q8_0",
+            repo_id: "deepreinforce-ai/Ornith-1.0-9B-GGUF",
+            filename: "ornith-1.0-9b-Q8_0.gguf",
+            // HF LFS size (verified 2026-07-31) = the reference manifest's
+            // 9,527,500,992 B.
+            size_bytes: 9527500992,
+            downloads: 4573333,
+            likes: 590,
+            quant: "Q8_0",
+            architecture: "qwen35",
+            license: "mit",
+            task_tags: &["general", "tools"],
         },
     ]
 }
@@ -24723,9 +24893,29 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
     ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
     ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
     ("ornith-1.0-9b-Q3_K_M.gguf", "ornith_1_0_9b_q3_k_m"),
+    // Local requantization (BASALT/GABBRO pilot artifact, sha256 eb293344...,
+    // 6,058,607,776 B). There is no upstream upload to pull, so the row can only
+    // reach the Supported lane through this allowlist -- SUPPORT_MATRIX_v0.1.md
+    // already records "no frontend pull-catalog entry" for it.
+    ("gemma-4-E4B-it-NVFP4-mm.gguf", "gemma4_e4b_it_nvfp4"),
+    // Community-sourced (superkaiii/Ternary-Bonsai-4B). The Hub API refuses the
+    // repo tree (gated or withdrawn), so no catalog row can be honestly pinned
+    // to it; a file the operator already has still classifies from its exact
+    // certified name (sha256 b85dcbaa...).
+    ("Ternary-Bonsai-4B-TQ2_0.gguf", "ternary_bonsai_4b_tq2_0"),
+    // Provenance unresolved by design: the certified bytes (sha256 6a746610...,
+    // 807,693,984 B) match NO surveyed publisher upload -- bartowski's
+    // same-named file is 6f85a640.../807,694,464 B. Catalog-free on purpose.
+    (
+        "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        "llama_3_2_1b_instruct_q4_k_m",
+    ),
     // NB: Qwen3-4B-Q4_K_M.gguf is intentionally NOT here -- it is an official
     // Qwen/Qwen3-4B-GGUF upload, so it lives in curated_catalog() and is covered
-    // by the curated-catalog branch of filename_is_supported_exact_row.
+    // by the curated-catalog branch of filename_is_supported_exact_row. The
+    // Llama 3.2 3B K-quants and the 1B IQ4_XS are likewise catalog rows (their
+    // certified bytes ARE a public upload), not allowlist entries: the catalog
+    // branch carries an exact size, while this one matches on filename alone.
 ];
 
 /// True when `filename` is the exact GGUF artifact of a curated row whose
