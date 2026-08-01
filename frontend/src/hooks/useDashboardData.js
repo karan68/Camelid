@@ -466,6 +466,11 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
     models,
     runtime: {
       engine: normalizeEngineName(health?.engine),
+      // Which build is answering. `runtime` is an explicit projection of health, not a
+      // pass-through, so a field absent here is invisible to every view no matter what
+      // /v1/health serializes.
+      version: health?.version || null,
+      build: health?.build || null,
       loaded_now: Boolean(health?.loaded_now ?? health?.active_model_id),
       active_model_id: health?.active_model_id || null,
       generation_ready: Boolean(health?.generation_ready),

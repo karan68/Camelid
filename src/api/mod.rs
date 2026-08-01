@@ -503,6 +503,15 @@ pub struct LoadModelRequest {
 pub struct HealthResponse {
     pub ok: bool,
     pub engine: &'static str,
+    /// Release version of the running engine (the crate version, e.g. `0.4.7`), so an
+    /// operator can tell which build is answering without reading the binary's metadata.
+    /// Unlike [`HealthResponse::executable`] this is safe off-box: it names a public
+    /// release, not the host's filesystem.
+    pub version: &'static str,
+    /// Exact build identity — `git describe` when the tree had it at compile time,
+    /// otherwise the crate version. On a released binary these two agree; on a developer
+    /// build this is the field that says how far the process has drifted from a tag.
+    pub build: String,
     pub loaded_now: bool,
     pub generation_ready: bool,
     pub active_model_id: Option<String>,
@@ -2846,6 +2855,8 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     HealthResponse {
         ok: true,
         engine: "camelid",
+        version: env!("CARGO_PKG_VERSION"),
+        build: crate::receipt::camelid_version(),
         loaded_now,
         generation_ready,
         active_model_id: active_id_lock.clone(),
@@ -2875,6 +2886,8 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
     HealthResponse {
         ok: true,
         engine: "camelid",
+        version: env!("CARGO_PKG_VERSION"),
+        build: crate::receipt::camelid_version(),
         loaded_now: false,
         generation_ready: false,
         active_model_id: None,
@@ -17194,6 +17207,60 @@ mod tests {
                     "{uri} busy snapshot reports the in-flux registries as not ready"
                 );
             }
+        }
+    }
+
+    /// `/health` names the build that is answering. The WebUI's System view reads these
+    /// two fields directly, so an operator looking at a running engine can tell which
+    /// version it is without inspecting the binary — and they must survive a busy
+    /// snapshot, which is exactly when someone is most likely to be asking.
+    #[tokio::test]
+    async fn health_reports_the_running_engine_version_even_while_busy() {
+        use tower::ServiceExt;
+
+        let state = AppState::default();
+        let app = router_with_state(state.clone());
+
+        // Same wedge as above: the busy path builds a different HealthResponse, and a
+        // field added to only one of the two constructors would vanish here.
+        let _loaded = state.loaded_models.write().await;
+        let _active = state.active_model_id.write().await;
+        let _plans = state.execution_plans.write().await;
+
+        for uri in ["/health", "/v1/health"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            assert_eq!(
+                body["version"],
+                env!("CARGO_PKG_VERSION"),
+                "{uri} must report the crate version the process was built from"
+            );
+            // Deliberately only a non-empty check. `build` is `git describe`, which names
+            // the most recent TAG — so between a version bump and its tag it legitimately
+            // reads `v0.4.7-3-gabc` while the crate already says `0.4.8`. Asserting the two
+            // agree would fail every release-bump PR, which is the one moment they must be
+            // allowed to differ.
+            let build = body["build"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{uri} must report a build identity"));
+            assert!(
+                !build.is_empty(),
+                "{uri} build identity must never be empty"
+            );
         }
     }
 
