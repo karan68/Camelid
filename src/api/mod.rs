@@ -9024,7 +9024,14 @@ fn build_loaded_model(
     let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
     // Hash the exact GGUF bytes once at load time so receipts can name the
     // lane without re-hashing per request.
-    let gguf_sha256 = receipt::sha256_file_hex(&path).map_err(|err| match err {
+    //
+    // Memoized across process starts on (path, len, mtime, dev, ino): this
+    // read is the dominant cost of loading a large row — ~85 s for a 2.5 GB
+    // artifact on an external SSD — and it is paid before the first request
+    // can be served. The digest is unchanged, and no verification path reads
+    // the cache, so a stale entry can only cost a false alarm at verify time,
+    // never a false pass. See `receipt::gguf_hash_cache`.
+    let gguf_sha256 = receipt::sha256_file_hex_cached(&path).map_err(|err| match err {
         receipt::ReceiptError::Io { path, source } => BackendError::Io { path, source },
         other => BackendError::InvalidModelMetadata(other.to_string()),
     })?;
