@@ -57,6 +57,18 @@ function Note([string]$message) {
     }
 }
 
+# NOTHING may die silently in here again.
+#
+# v0.5.1 signed successfully and then vanished: signtool reported `Number of errors: 0`, and
+# 0.28s later Tauri reported `failed to run <cmd>` with the log ending mid-script. An unhandled
+# terminating error under `ErrorActionPreference = 'Stop'` produces exactly that -- the process
+# exits non-zero, and Tauri discards the stderr that would have named it. This trap makes any
+# such error self-reporting instead of another round of inference.
+trap {
+    Note "FATAL: unhandled error at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.GetType().Name): $($_.Exception.Message)"
+    exit 1
+}
+
 $signtool = $env:CAMELID_SIGNTOOL
 $dlib = $env:CAMELID_SIGN_DLIB
 $metadata = $env:CAMELID_SIGN_METADATA
@@ -123,14 +135,41 @@ if ($signExit -ne 0) {
     exit 0
 }
 
-# THIS one is fatal, and it is the only fatal case.
+# Read back what was actually written, with retries.
 #
-# signtool claiming success while the result does not verify means we are about to seal a
-# BROKEN signature into the installer -- exactly what v0.4.7 shipped, where every installed copy
-# reported HashMismatch. A broken signature is worse than no signature: Windows reports a
-# tampered chain, it earns no SmartScreen reputation, and it cannot be explained away as
-# "unsigned". Better to fail the release than ship that.
-$status = (Get-AuthenticodeSignature -LiteralPath $Path).Status
+# signtool has just closed this file and the signing service wrote to it moments earlier, so the
+# read can lose a race against antivirus or a lingering handle. That read must never be able to
+# kill the bundle: on v0.5.1 signtool reported `Number of errors: 0` and the script still exited
+# non-zero 0.28s later, with the log ending right here -- the signature: an unhandled terminating
+# error in this exact read.
+$status = $null
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+    try {
+        $status = (Get-AuthenticodeSignature -LiteralPath $Path).Status
+        break
+    } catch {
+        Note "  verify attempt $attempt could not read the signature: $($_.Exception.Message)"
+        Start-Sleep -Milliseconds 300
+    }
+}
+
+# UNREADABLE is not the same as BROKEN, and must not be treated as such.
+#
+# Failing here would throw away a correctly signed binary over a transient file lock, and put us
+# straight back to the no-installer outcome of v0.4.8 and v0.5.0. The release's `Prove the
+# INSTALLED binary is signed` step opens the finished installer and checks the payload for real;
+# that is the authoritative verdict, and it runs on a settled file.
+if ($null -eq $status) {
+    Note "WARNING: could not read back the signature of $Path after signing - continuing; the release install-verify gate is authoritative"
+    exit 0
+}
+
+# A CONFIRMED bad signature is the one fatal case.
+#
+# signtool claiming success while the result verifies as something other than Valid means we are
+# about to seal a BROKEN signature into the installer -- exactly what v0.4.7 shipped, where every
+# installed copy reported HashMismatch. Windows reports that as a tampered chain, it earns no
+# SmartScreen reputation, and it cannot be explained away as "unsigned".
 if ($status -ne 'Valid') {
     Note "FATAL: signtool reported success but $Path verifies as '$status' - refusing to seal a broken signature"
     exit 1

@@ -158,6 +158,40 @@ fn sign_script_is_observable_when_tauri_swallows_its_output() {
         wf.contains("name: Sign-command log"),
         "the release workflow must print the sign log so a failure is diagnosable from CI alone"
     );
+    assert!(
+        src.contains("trap {"),
+        "the script needs a trap: v0.5.1 signed successfully and then exited non-zero with the \
+         log ending mid-script, because an unhandled terminating error names itself only on \
+         stderr — which Tauri discards"
+    );
+}
+
+/// Reading the signature back must never be able to kill the bundle.
+///
+/// signtool has just closed the file and the signing service wrote to it moments earlier, so
+/// the read can lose a race against antivirus or a lingering handle. On v0.5.1 signtool reported
+/// `Number of errors: 0` and the script still exited non-zero 0.28s later, in exactly this read.
+///
+/// Unreadable is not the same as broken: failing there discards a correctly signed binary over a
+/// transient lock and lands back on the no-installer outcome. A CONFIRMED non-`Valid` result
+/// stays fatal.
+#[test]
+fn signature_readback_retries_and_an_unreadable_result_is_not_fatal() {
+    let src =
+        std::fs::read_to_string(desktop_dir().join(SIGN_SCRIPT)).expect("read signing script");
+
+    assert!(
+        src.contains("for ($attempt = 1; $attempt -le 5; $attempt++)"),
+        "the signature read-back must retry; it races the signing service's own write"
+    );
+    assert!(
+        src.contains("could not read back the signature"),
+        "an unreadable signature must warn and continue, not fail the bundle"
+    );
+    assert!(
+        src.contains("refusing to seal a broken signature"),
+        "a CONFIRMED non-Valid signature must still be fatal"
+    );
 }
 
 /// An incomplete release must never become `latest`. The desktop jobs are independent by
