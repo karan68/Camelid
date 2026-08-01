@@ -30,6 +30,11 @@
     "category": "DeveloperTool",
     "shortDescription": "Native chat app for the Camelid local inference engine.",
     "longDescription": "Camelid Desktop embeds the same Camelid engine shipped as the server binary and runs it as a loopback sidecar. It inherits the identical model-support contract; it makes no broader claims.",
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/installer-hooks.nsh"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
