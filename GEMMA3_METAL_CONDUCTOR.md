@@ -2295,3 +2295,235 @@ seven**, but the plan's gate list must be amended by §16g before Phase 2 starts
   first-token logits.
 - G9 stays, and its measured limitation is now on record.
 - The prompt-prefix cache remains closed on this row, so nothing here interacts with it.
+
+## 17. Long-prompt TTFT campaign, Phase 2 record — Tier A, batched weight streaming (2026-07-31)
+
+Branch `feat/gemma3-batched-prefill`, off `main` at `a5945f8a`. Phase 2 builds Tier A: batch
+the weight-streaming half of prefill, opt-in, and hold it to raw bit-identity against the
+shipped token-by-token lane. **The gate passed on the first run and every campaign gate stayed
+green. The performance thesis did not: the measured win is 1.07-1.13x, against the plan's
+projected 2.0-3.6x, and §17e explains why with a mechanism rather than a shrug.** Read §17e
+before planning Tier B — it changes what the remaining prize is.
+
+### 17a. What shipped
+
+Everything is behind `CAMELID_GEMMA3_BATCH_PREFILL`, **default OFF this phase**. A non-gemma3
+row cannot reach it: the arming predicate is a conjunction with `config.gemma3.is_some()`.
+
+| piece | where |
+|---|---|
+| `prefill_tokens_windowed` / `_hidden` / `_inner` | `src/metal.rs` |
+| `schedule_window_bounds` — the window expression, written once, shared with `prepare_token` | `src/metal.rs` |
+| `gemma3_batch_prefill_enabled` / `gemma3_batch_prefill_rows` | `src/metal.rs` |
+| `gemma3_batched_prefill_armed`, dual arming gate, per-position dual-theta tables, G11 assert | `src/inference/metal_resident.rs` |
+
+The shape is `verify_batch_inner`'s, not `prefill_tokens`'. Inside a chunk, every stage whose
+output depends on one row runs the EXACT single-token kernel at a row byte offset (per-head
+QK-norm, RoPE, K/V scatter, attention); every stage that streams a weight matrix runs the
+proven byte-exact batched twin (`rms_norm_batch_f32`, the C0 batched-column GEMV); the
+elementwise stages run the same kernels with a wider `n`.
+
+### 17b. The four blockers, and how each was handled
+
+`prefill_tokens` refuses gemma3 on four independent gates. The campaign plan's §2.5 is
+confirmed: head_dim is only one of them, and relaxing it alone gets nothing.
+
+1. **head_dim > 128.** NOT relaxed. `MAX_DPL` / `MAX_DOCT` and the `<= 128` host gates on
+   `prefill_tokens`, `verify_batch` and the split-K route are untouched — they are
+   memory-safety gates shared by eleven kernels. Tier A is a *separate admission path* with no
+   fixed per-lane array anywhere in its chain, so 256 is admissible there and nowhere else.
+2. **The dual-theta schedule.** Carried: the ALT/primary table pair is selected per layer from
+   `schedule.use_alt_rope[l]`, mirroring `prepare_token` verbatim, and the caller must supply
+   the ALT tables for every position or the path fails closed. The tables are built per
+   position with `rope::gemma3_rope_tables` for BOTH thetas — the runnable-oracle frequency
+   form the decode path uses, NOT the generic negated-exponent form the existing prefill
+   builds. That was not cosmetic: the generic form's last-ULP drift would have shown up
+   directly as a G1 failure.
+3. **The sandwich norms.** Carried as two extra `rms_norm_batch_f32` dispatches per layer,
+   applied to the attention and FFN outputs BEFORE their residual adds, exactly as
+   `encode_attention_block` / `encode_ffn_block` do.
+4. **GeGLU.** Carried by dispatching the same `gelu_mul_f32` the decode encode uses with
+   `n = rows * ffn_dim`. Zero new MSL, as the plan predicted.
+
+**`use_attn_mm` is not on this path at all.** Its `!has_qk_norm` clause would refuse this
+QK-norm arch, and its `head_dim <= 128` clause would refuse this row — but attention-as-matmul
+is Tier B, and Tier A routes every row's attention through the unchanged `encode_attention`,
+which at head_dim 256 lands on `encode_attention_split3`, the exact kernel the shipped lane
+already runs. The sliding-window mask therefore needs no new kernel and no new MSL: the
+per-row `(window_start, position_count)` ride in through the attention scalar's
+`kv_base_offset` word, the same mechanism the token-by-token lane uses.
+
+**The window expression is now written once.** Three sites used to encode it separately.
+`schedule_window_bounds` is the shipped `filled.saturating_sub(w)` verbatim — deliberately NOT
+a call to `window_ref::window_bounds`, because the two disagree on the degenerate `Some(0)`,
+and bit-identity with the shipped lane is the gate. A test pins their agreement for every
+`w > 0` over 2 600 positions and records the one input where they differ.
+
+**G11 is asserted, not assumed.** `filled()` must equal `n` after the prefill or the caller
+declines and falls back losslessly. A short `filled` would re-seed from a CPU KV cache this
+lane deliberately leaves hollow, decline at `history_materialized`, and drop the whole prompt
+onto a CPU path that fails closed for windowed archs.
+
+### 17c. Gate G1 — bit-identity, measured
+
+Both sides are fed the SAME embedding array, so an embedding-lookup difference can neither
+mask nor manufacture a result. The final hidden is compared alongside the caches, because the
+last layer's attention reaches no KV cache at all (§16e found a mutant that moves zero cache
+bits).
+
+**Real row** (`gemma3_real_row_batched_prefill_kv_bit_identical`), 26 layers, head_dim 256,
+the shipped 22-sliding/4-global schedule, chunk 256:
+
+| n | elements compared | bit-identical |
+|---:|---:|---|
+| 5 | 72 320 | **yes** |
+| 256 | 3 702 784 | **yes** |
+| 257 | 3 717 248 | **yes** |
+| 513 | 7 420 032 | **yes** |
+| 1 024 | 14 811 136 | **yes** |
+
+**Synthetic** (`metal_batched_windowed_prefill_is_bit_identical_to_token_by_token`), 4 layers,
+head_dim 256, chunk 4, window 6, at n = 1/3/4/5/6/7/8/9/13/17 — chunk edges, exact multiples,
+ragged tails and both sides of window saturation. Bit-identical at every length, for the
+gemma3 shape (dual-theta + sandwich norms + GeGLU + QK-norm) **and** for a plain Llama shape
+run through the same entry point.
+
+No tolerance was negotiated and none was needed. Batching over the token dimension
+re-associates no reduction, so this was the expected outcome; it is recorded because the
+campaign's stopping rule 3 says a G1 failure is a bug to fix, not a bar to lower.
+
+### 17d. The other campaign gates — all unchanged
+
+| gate | result |
+|---|---|
+| `gemma3_real_row_resident_forward_matches_runnable_oracle` | 50/50 greedy tokens identical, overall max abs logit diff **2.122e-4** — the pinned constant, unchanged |
+| `gemma3_session_level_token_by_token_prefill_matches_runnable_oracle` | 5/5 identical, **7.820e-5** — unchanged |
+| `gemma3_real_row_window_mutation_harness` (G7) | all **7/7** mutants caught, re-run with Tier A in the tree (1 683 s, one process). Per-mutant token/KV: `window_minus_one` 0/9 and 9/9, `window_plus_one` 0/9 and 9/9, `no_lower_bound` 9/9 and 9/9, `window_on_all_layers` 6/9 and 9/9, `window_on_wrong_layers` 9/9 and 9/9, `layer_pattern_shift_by_one` 8/9 and 9/9, `rope_tables_swapped` 9/9 and 9/9 — reproducing §16g exactly, including the finding that a one-position window error changes NO generated token on any of the nine items |
+| window-edge pack vs pinned llama.cpp `acd79d603`, **flag ON** | **70/72** legs token-AND-text identical, prompt tokenization 24/24 — the SAME two pre-existing depth-50 failures (`w-len-256` at generated index 13, `w-len-513` at index 5), same indices, same margins. No regression, and the two are not "fixed" |
+| `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test --all-targets`, `scripts/check-public-scrub.sh` | clean |
+
+Non-gemma3 archs see zero behaviour change, asserted rather than argued:
+`batched_windowed_prefill_never_arms_for_a_non_gemma3_arch` holds in EITHER state of the
+(process-latched) flag, and the synthetic G1 runs a Llama-shaped fixture through the new entry
+point to show the added machinery is inert when every `Option` is `None`.
+
+### 17e. THE MEASUREMENT — and why Tier A's thesis does not survive it
+
+Same binary, flag on vs off, one server at a time, streamed SSE timing request-start to first
+content token, exact token-id prompts (tokenizer out of the loop), a distinct prompt window per
+request so no two share a prefix, `prompt_cache_hit false` on all 32. Round 0 is reported as
+the cold column and excluded from the mean; the mean is rounds 1-3.
+
+| N | flag OFF warm mean | sd | flag ON warm mean | sd | speedup | load (off / on) |
+|---:|---:|---:|---:|---:|---:|---|
+| 600 | 7.772 s | 0.116 | **7.231 s** | 0.105 | **1.07x** | 3.67-4.53 / 3.25-3.92 |
+| 1 200 | 16.314 s | 0.148 | **14.952 s** | 0.361 | **1.09x** | 3.72-4.41 / 3.05-4.17 |
+| 2 366 | 34.138 s | 0.218 | **30.604 s** | 0.180 | **1.12x** | 3.95-4.24 / 3.43-4.44 |
+| 2 400 | 35.162 s | 0.602 | **31.232 s** | 0.270 | **1.13x** | 3.88-4.41 / 3.30-3.76 |
+
+Cold (round 0) columns: off 8.070 / 16.624 / 34.266 / 35.065; on 7.119 / 14.630 / 30.363 /
+30.801. The flag-off column reproduces Phase 0's warm baselines (8.222 / 17.480 / 35.631) 4-7 %
+faster, consistent with the lower load this session ran under. **No first-request PSO-compile
+penalty appeared** — the Phase 3 warning the plan raised did not materialise, because the
+server's warm-up decode and the first chunk retire the compile before any measured request.
+
+**The plan projected 12.1-17.2 s at 2 400 tokens. The measurement is 31.2 s.**
+
+Three receipts explain it, and together they are a mechanism, not a hedge.
+
+**(1) The chunk width does not matter — at all.** `gemma3_real_row_batched_prefill_chunk_width_probe`,
+n = 1 200, one process, warm weight cache, the token-by-token baseline with encode-ahead armed
+(the lane as it actually runs, not a handicapped one):
+
+| rows per command buffer | 16 | 32 | 64 | 128 | 256 | 512 | token-by-token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ms/token | 11.99 | 12.08 | 12.27 | 12.36 | 12.43 | 12.59 | 13.73 |
+
+A 5 % spread across a 32x range of chunk widths, and *wider is slightly worse*. Whatever Tier A
+is spending its time on is invariant in the batch width — which is the opposite of what
+"amortize the weight stream over the chunk" predicts.
+
+**(2) The GPU is 99 % busy; the CPU is not the problem.** From the batched path's own
+per-command-buffer trace on the serve lane (`CAMELID_RESIDENT_TRACE=1`, 256-row chunks):
+`encode` ~10 ms, `commit_wait` 2.91-3.21 s, `gpu_busy` 2.89-3.20 s. CPU-side encode is
+**0.04 ms/token** of a 12 ms/token cost, and `commit_wait - gpu_busy` is ~0.01 ms/token. The
+time is inside the kernels. Per-row `gpu_busy` runs 11.3 ms at chunk base 0 and 12.6 ms at base
+768, so attention accounts for ~1.3 ms across that depth range and the depth-0 floor is
+~11.3 ms/token.
+
+**(3) The reason is in the kernel, and it is a constant.**
+`q8_0_block_linear_ksplit_f32y_wire_nsg8_verify` carries `constexpr uint MAX_T = 8;` and an
+outer `for (uint t0 = 0; t0 < n_rows_in; t0 += MAX_T)` loop. **Every weight block is re-read
+once per 8-column tile.** The effective batching factor is 8, hard-coded, no matter how wide
+the chunk is — which is exactly why (1) is flat. Per token, for any chunk >= 8:
+
+- weight traffic = (weight bytes) / 8 = 0.74 GB / 8 = **93 MB/token** (was 741 MB/token);
+- activation traffic = `sum over projections of (out_rows/2) * in_dim * 4` = **1.40 GB/token**,
+  because this is a GEMV: every threadgroup walks the whole activation panel, and that is
+  chunk-invariant too.
+
+So Tier A trades 0.65 GB/token of weight traffic for nothing it can avoid, and inherits a
+1.40 GB/token activation re-read that the single-token lane also pays but gets for free — its
+panel is 4.6 KB and lives in cache, while a 256-row FFN panel is 7.1 MB and does not. The
+combined 1.49 GB/token at this host's ~120 GB/s is 12.4 ms, which brackets the measured
+11.3-12.6 ms. Measured GEMM throughput on this path is **1.396 GFLOP/token / 11.3 ms =
+0.12 TFLOPS**, against the 3.4 TFLOPS Q8 GEMM wall this host is measured at (§15) and against
+the 0.8-1.5 TFLOPS the plan credited the batched-column GEMV. That 10x gap is the whole
+shortfall.
+
+Honest limit on this attribution: separating "DRAM-bandwidth-bound on the activation re-read"
+from "issue-bound in the inner loop" needs GPU performance counters, which are
+entitlement-gated on this host with a confirmed-dead headless route (§15). The chunk-invariance
+and the `MAX_T = 8` constant are read off the code and the measurements; the split between
+those two causes is not.
+
+### 17f. What this changes for Tier B — read this before Phase 4
+
+1. **The plan's 77-86 % attribution to weight re-streaming is refuted by measurement.** Removing
+   essentially all of it (741 -> 93 MB/token) bought 1.1x, not 2-3x. The residual is not
+   dispatch overhead either (§17e(2): 0.04 ms/token of encode). Phase 0's own note — that the
+   depth-0 `gpu_busy` floor was 9.8 ms against a 6.18 ms weight-traffic roofline — was already
+   pointing at this and was read too optimistically.
+2. **Tier B's headline is now smaller than it looked.** On the batched path, per-row `gpu_busy`
+   grows 11.3 -> 12.6 ms across chunk bases 0 -> 768, i.e. attention adds ~1.3 ms over that
+   depth range; the campaign's own attention law puts the TOTAL attention cost of a
+   2 400-token prompt at 35.68 M layer-positions x 1.789e-4 ms = **6.4 s of the measured
+   31.2 s**. Collapsing attention to zero would leave ~25 s. **Tier B as specified cannot reach
+   the plan's 1.3-2.4 s, or anything near it.** The
+   campaign's stopping rule 5 ("Phase 4's kernel must beat Tier A's per-row attention by >= 3x
+   on wall clock") is not the binding question any more — the binding question is the GEMM.
+3. **The remaining prize is the GEMM, and it is where bit-identity has to be spent.** The tiled
+   simdgroup-MM path (`half_mm_batched_f16o`, staged panels, fixed 8 KiB threadgroup memory) is
+   what reaches ~3 TFLOPS on this host for other rows, and the tree is explicit that it is
+   "numerically equivalent to the scalar k-split GEMM but not byte-exact: tile MMA accumulation
+   order". **So the campaign must now choose: bit-identity, or the speed.** It cannot have both
+   with the current kernel set. That choice belongs to the user, not to this phase.
+4. **There is a bit-identical middle option, and it is a kernel rewrite, not a bolt-on.** A
+   batched GEMV that stages the activation panel in threadgroup memory and reuses it across
+   output rows keeps every output element's reduction tree intact — same `sumq` then `* w_scale`
+   ordering, same two-stage `simd_sum` — so it would stay bit-identical while removing the
+   1.40 GB/token re-read. Raising `MAX_T` alone is NOT that fix: it is bit-identical and cheap,
+   but it can only recover the 93 MB/token weight term (~0.8 ms/token, ~7 %), and
+   `sumf[NR0][MAX_T] + yl[MAX_T][NQ]` is `10 * MAX_T` live floats per lane, so 16 lands at 160 —
+   the same register-spill cliff the v3 attention kernel already records at 88.
+5. **Default stays OFF.** Phase 3 was to flip it after receipts. On a 1.07-1.13x win with a
+   bit-identity guarantee the flip is defensible but not obviously worth the surface; the
+   recommendation is to hold the flip until the GEMM question in (3) is decided, and to run
+   Phase 3 as "decide the GEMM", not "flip the flag".
+
+### 17g. Deliberately not done
+
+- **No kernel MSL was written or changed.** Tier A is host wiring plus existing kernels; that
+  was the charter and it held.
+- **`MAX_T` was not raised.** It is a one-line change with a real register-pressure risk and a
+  ~7 % ceiling (§17f(4)); doing it inside a phase whose gate is bit-identity, without counters
+  to see the spill, would be guessing. Recorded as an available lever.
+- **The 68 MB of dead f16 KV mirrors at head_dim 256 was not reclaimed.** The plan lists it as
+  a free memory win, and it is, but the batched prefill dual-writes them exactly as the decode
+  encode does — which is what keeps the two lanes' cache state identical. Removing the write
+  would be invisible to G1 (the snapshot reads the f32 primary) and is therefore exactly the
+  kind of change that should not ride along inside a bit-identity phase. Still owed.
+- **No pack item was softened and no failing leg was excused.** The two depth-50 failures are
+  the Phase 1 ones, unchanged, and are reported as failures.
+- **No promotion of any surface.** No README, COMPATIBILITY, STATUS or ledger edit. This phase
+  adds a lane behind a flag, not a claim.
