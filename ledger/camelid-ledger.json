@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "f52b35fa",
+    "source_head": "02ff6333",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -1174,7 +1174,7 @@
         "status": "supported_exact_row_smoke",
         "support_scope": "exact_row_gpu_resident_raw_decode_parity_smoke_only",
         "full_support_status": "blocked_pending_normalized_full_support",
-        "full_support_blockers": "raw-completion greedy parity only (no chat-template/serve/WebUI closure); greedy flips at low-bit near-ties (GPU-resident 2/4 probe prompts 24-token identical, 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie where the reference token is camelid's immediate #2); CPU-deterministic path 1/4 identical; no bounded-context bucket, perf/RSS gate, runnable-smoke oracle qualification, or curated-catalog entry yet; the model is community-sourced (bartowski/Llama-3.2-1B-Instruct-GGUF), not a canonical row",
+        "full_support_blockers": "raw-completion greedy parity only (no chat-template/serve/WebUI closure); greedy flips at low-bit near-ties (GPU-resident 2/4 probe prompts 24-token identical, 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie where the reference token is camelid's immediate #2); CPU-deterministic path 1/4 identical; no bounded-context bucket, perf/RSS gate, or runnable-smoke oracle qualification yet; the model is community-sourced (bartowski/Llama-3.2-1B-Instruct-GGUF), not a canonical row",
         "metadata_parses": "validated_llama_arch",
         "tokenizer_works": "validated_llama3_bpe_128k_bos_128000",
         "tensors_load": "validated_streaming_iq4_xs_136b_wire_superblocks_no_f32_materialisation_gpu_resident_and_cpu_plus_kquant_tied_head",
