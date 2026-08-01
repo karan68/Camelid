@@ -15192,6 +15192,9 @@ impl ResidentDecodeState {
         }
 
         let kern = metal_linear_kernel()?;
+        // Shares CAMELID_RESIDENT_TRACE with the token-by-token lane, so one env var
+        // gives a comparable per-command-buffer line from whichever path ran.
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
         let max_positions = self.max_positions;
         let n_heads = self.n_heads;
         let n_kv_heads = self.n_kv_heads;
@@ -15425,6 +15428,7 @@ impl ResidentDecodeState {
             }
             write_buffer_f32(&act_a, &embeddings[base * hidden..(base + k) * hidden]);
 
+            let encode_started = std::time::Instant::now();
             let mut keep: Vec<Buffer> = Vec::new();
             let cb = kern.queue.new_command_buffer();
             let e = cb.new_compute_command_encoder();
@@ -15652,8 +15656,22 @@ impl ResidentDecodeState {
                 from_a = !from_a;
             }
             e.end_encoding();
+            let encode_us = encode_started.elapsed().as_micros();
+            let commit_started = std::time::Instant::now();
             cb.commit();
             cb.wait_until_completed();
+            if trace {
+                // Attribution, not decoration: `gpu_busy` vs wall separates
+                // "the kernels are slow" from "the CPU cannot feed the GPU". Tier A's
+                // whole claim is about the former, so the phase record needs the split.
+                let wall_us = commit_started.elapsed().as_micros();
+                let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb.to_owned());
+                eprintln!(
+                    "[batch-prefill] base={base} rows={k} encode={encode_us}us \
+                     commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
+                     kernel_window={kernel_window_us}us"
+                );
+            }
             if read_hidden {
                 let final_buf = if from_a { &act_a } else { &act_b };
                 let mut out = vec![0.0f32; k * hidden];
@@ -25998,6 +26016,184 @@ mod tests {
                 }
             }
             row
+        }
+    }
+
+    // gemma3 long-prompt TTFT campaign, Phase 2 — the CHUNK-WIDTH probe.
+    //
+    // The chunk width is the one free parameter Tier A has, and the naive reading
+    // ("wider amortizes the weights further, so wider is better") is wrong on this
+    // kernel. The batched-column GEMV is a GEMV, not a tiled GEMM: every threadgroup
+    // walks the WHOLE activation panel, so activation traffic per token is
+    // `sum_projections(out_rows / 2 * in_dim * 4)` — about 53 MB per layer per token
+    // on this row, and INDEPENDENT of the chunk width. What the chunk width does
+    // control is whether that panel is small enough to be served from cache: at 256
+    // rows the FFN activation panel is `256 * 6912 * 4` = 7.1 MB and the `down`
+    // projection re-reads it 576 times per layer; at 64 rows it is 1.8 MB.
+    //
+    // Weight traffic runs the other way — 0.74 GB per layer-sweep, so 11.6 MB/token
+    // at 64 rows and 46 MB/token at 16 — which is why the answer is a measurement and
+    // not an argument. This probe is that measurement, and the default it picks is
+    // recorded in the phase record rather than being folded into the code silently.
+    //
+    // Timing-only: correctness is `gemma3_real_row_batched_prefill_kv_bit_identical`.
+    // Skipped unless CAMELID_GEMMA3_CHUNK_PROBE is set, because a wall-clock probe in
+    // the default suite would be noise on a shared host.
+    //
+    // CAMELID_METAL_F32Y=1 CAMELID_METAL_WIRE=1 CAMELID_METAL_WIRE_NSG8=1 \
+    // CAMELID_GEMMA3_GGUF=<gguf> CAMELID_GEMMA3_CHUNK_PROBE=1 \
+    //   cargo test --release --lib gemma3_real_row_batched_prefill_chunk -- --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma3_real_row_batched_prefill_chunk_width_probe() {
+        if !detect_metal_device().available
+            || std::env::var_os("CAMELID_GEMMA3_CHUNK_PROBE").is_none()
+        {
+            return;
+        }
+        let Some(path) = std::env::var_os("CAMELID_GEMMA3_GGUF") else {
+            eprintln!("SKIP chunk-width probe: set CAMELID_GEMMA3_GGUF");
+            return;
+        };
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!("SKIP chunk-width probe: the production GEMV gates are not armed");
+            return;
+        }
+        let row = load_gemma3_real_row(&path.to_string_lossy());
+        let weights = row.weights();
+        let schedule = row.schedule();
+        let n = 1200usize;
+        let token_at = |i: usize| -> u32 { (2 + (i * 7919) % (row.vocab - 3)) as u32 };
+        let mut embeddings: Vec<f32> = Vec::with_capacity(n * row.hidden);
+        let mut cos_all: Vec<f32> = Vec::new();
+        let mut sin_all: Vec<f32> = Vec::new();
+        let mut alt_cos: Vec<f32> = Vec::new();
+        let mut alt_sin: Vec<f32> = Vec::new();
+        for t in 0..n {
+            embeddings.extend_from_slice(&row.embed(token_at(t)));
+            let (c, s) =
+                crate::inference::gemma3_rope_tables(t, row.rope_dim, row.g3.rope_freq_base_global);
+            cos_all.extend_from_slice(&c);
+            sin_all.extend_from_slice(&s);
+            let (c, s) =
+                crate::inference::gemma3_rope_tables(t, row.rope_dim, row.g3.rope_freq_base_local);
+            alt_cos.extend_from_slice(&c);
+            alt_sin.extend_from_slice(&s);
+        }
+        let mk_session = || {
+            ResidentDecodeState::new(
+                row.n_layers,
+                row.n_heads,
+                row.n_kv,
+                row.head_dim,
+                row.hidden,
+                row.ffn,
+                n,
+                n,
+                row.eps,
+                row.split_half_pairing,
+                Some(schedule.clone()),
+            )
+            .expect("resident session")
+        };
+        // Warm the weight cache and the pipelines with one small batched run, so the
+        // first measured chunk width does not carry the upload.
+        {
+            let mut warm = mk_session();
+            warm.prefill_tokens_windowed(
+                &embeddings[..8 * row.hidden],
+                8,
+                &weights,
+                &cos_all[..8 * (row.rope_dim / 2)],
+                &sin_all[..8 * (row.rope_dim / 2)],
+                Some((
+                    &alt_cos[..8 * (row.rope_dim / 2)],
+                    &alt_sin[..8 * (row.rope_dim / 2)],
+                )),
+                row.scale,
+                8,
+            )
+            .expect("warm-up");
+        }
+        for &chunk in &[16usize, 32, 64, 128, 256, 512] {
+            let mut session = mk_session();
+            let started = std::time::Instant::now();
+            session
+                .prefill_tokens_windowed(
+                    &embeddings,
+                    n,
+                    &weights,
+                    &cos_all,
+                    &sin_all,
+                    Some((&alt_cos, &alt_sin)),
+                    row.scale,
+                    chunk,
+                )
+                .expect("batched windowed prefill");
+            let s = started.elapsed().as_secs_f64();
+            eprintln!(
+                "[chunk-probe] rows={chunk:4}  n={n}  {s:7.3}s  {:6.3} ms/token  load {:.2}",
+                s * 1000.0 / n as f64,
+                loadavg_1m()
+            );
+        }
+        // Token-by-token baseline in the same process, same weights, same warm cache.
+        let mut token_session = mk_session();
+        let half = row.rope_dim / 2;
+        let started = std::time::Instant::now();
+        for t in 0..n {
+            token_session
+                .forward_token(
+                    &embeddings[t * row.hidden..(t + 1) * row.hidden],
+                    &weights,
+                    &cos_all[t * half..(t + 1) * half],
+                    &sin_all[t * half..(t + 1) * half],
+                    Some((
+                        &alt_cos[t * half..(t + 1) * half],
+                        &alt_sin[t * half..(t + 1) * half],
+                    )),
+                    t,
+                    row.scale,
+                    None,
+                    None,
+                    0,
+                    // Encode-ahead armed, as the production prefill loop has it — the
+                    // baseline must be the lane as it actually runs, not a handicapped one.
+                    (t + 1 < n).then(|| {
+                        (
+                            &cos_all[(t + 1) * half..(t + 2) * half],
+                            &sin_all[(t + 1) * half..(t + 2) * half],
+                        )
+                    }),
+                    (t + 1 < n).then(|| {
+                        (
+                            &alt_cos[(t + 1) * half..(t + 2) * half],
+                            &alt_sin[(t + 1) * half..(t + 2) * half],
+                        )
+                    }),
+                )
+                .expect("resident forward");
+        }
+        let s = started.elapsed().as_secs_f64();
+        eprintln!(
+            "[chunk-probe] token-by-token  n={n}  {s:7.3}s  {:6.3} ms/token  load {:.2}",
+            s * 1000.0 / n as f64,
+            loadavg_1m()
+        );
+    }
+
+    /// 1-minute load average, so every timing line carries the host condition it was
+    /// taken under (the campaign's Phase 0 rule: a 6–15 % host spread must not be
+    /// mistaken for a lever).
+    #[cfg(target_os = "macos")]
+    fn loadavg_1m() -> f64 {
+        let mut avg = [0.0f64; 3];
+        // SAFETY: `getloadavg` fills at most `nelem` doubles into the caller's array.
+        let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+        if n > 0 {
+            avg[0]
+        } else {
+            f64::NAN
         }
     }
 
