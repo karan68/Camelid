@@ -1689,18 +1689,43 @@ fn batched_windowed_prefill_never_arms_for_a_non_gemma3_arch() {
         "for a gemma3 row the predicate must be exactly the campaign flag"
     );
 
-    // Phase 3 rides INSIDE that path: the tiled simdgroup-matmul prefill GEMM is only
-    // reachable from `prefill_tokens_windowed`, whose only production caller is the
-    // predicate above. So the assertion that the predicate is false for a Llama-family
-    // row is also the zero-behaviour-change proof for Phase 3 — in either flag state,
-    // for both flags. What is additionally checked here is that the Phase 3 flag is
-    // OPT-IN: absent its env var it must read false.
-    if std::env::var_os("CAMELID_GEMMA3_PREFILL_MM").is_none() {
-        assert!(
-            !crate::metal::gemma3_prefill_mm_enabled(),
-            "CAMELID_GEMMA3_PREFILL_MM must default OFF: the tiled-MM prefill GEMM is not \
-             bit-identical to the token-by-token lane"
-        );
+    // Phases 3 and 4 ride INSIDE that path: the tiled simdgroup-matmul prefill GEMM and
+    // the batched windowed attention are only reachable from `prefill_tokens_windowed`,
+    // whose only production caller is the predicate above. So the assertion that the
+    // predicate is false for a Llama-family row is the zero-behaviour-change proof for
+    // all three flags at once, in every env state — which is what lets them ship
+    // default-ON without touching any other row.
+    //
+    // What is additionally checked here is the POSTURE, which changed in Phase 4: all
+    // three are now default-ON with `=0` as the operator opt-out, and `=0` must actually
+    // be honoured (a default-on flag that ignores its opt-out is a flag with no off
+    // switch). Each clause is guarded on the env var's own state because these are
+    // process-latched `OnceLock`s that a test cannot force.
+    for (var, read) in [
+        (
+            "CAMELID_GEMMA3_BATCH_PREFILL",
+            crate::metal::gemma3_batch_prefill_enabled as fn() -> bool,
+        ),
+        (
+            "CAMELID_GEMMA3_PREFILL_MM",
+            crate::metal::gemma3_prefill_mm_enabled as fn() -> bool,
+        ),
+        (
+            "CAMELID_GEMMA3_PREFILL_ATTN_MM",
+            crate::metal::gemma3_prefill_attn_mm_enabled as fn() -> bool,
+        ),
+    ] {
+        match std::env::var(var).ok().as_deref() {
+            None => assert!(
+                read(),
+                "{var} must default ON since Phase 4 (long-prompt TTFT campaign, §19c)"
+            ),
+            Some("0") | Some("false") | Some("False") | Some("FALSE") => assert!(
+                !read(),
+                "{var}=0 is the operator opt-out and must be honoured"
+            ),
+            Some(_) => assert!(read(), "{var} set to anything but 0/false means ON"),
+        }
     }
 }
 

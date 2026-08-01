@@ -12938,18 +12938,25 @@ fn schedule_window_bounds(window: Option<usize>, filled: usize) -> (usize, usize
 }
 
 /// Gate for the gemma3 batched windowed prefill (long-prompt TTFT campaign,
-/// Tier A). Default OFF for Phase 2: the path is opt-in until its receipts are
-/// published, then Phase 3 flips the default and keeps `=0` as the opt-out (the
-/// convention the serve lanes already use).
+/// Tier A). **Default ON since Phase 4**, with `=0` as the operator opt-out —
+/// the convention the serve lanes already use.
 ///
-/// Arming this alone is enough — it does NOT require
-/// `CAMELID_METAL_RESIDENT_PREFILL`, which arms the *other* (non-windowed)
-/// batched prefill that gemma3 fails closed on.
+/// This path is bit-identical to the token-by-token lane on its own; what rides
+/// inside it is not (see [`gemma3_prefill_mm_enabled`] and
+/// [`gemma3_prefill_attn_mm_enabled`]), and the three flip together because
+/// arming this one alone buys 1.25x while the stack buys ~9x on TTFT. Setting
+/// this to 0 restores the pre-campaign token-by-token prefill exactly, whatever
+/// the other two say.
+///
+/// It does NOT require `CAMELID_METAL_RESIDENT_PREFILL`, which arms the *other*
+/// (non-windowed) batched prefill that gemma3 fails closed on. It is ANDed with
+/// the arch at its only production caller, so in ANY state it is a no-op for
+/// every non-gemma3 row.
 pub fn gemma3_batch_prefill_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_GEMMA3_BATCH_PREFILL")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        !std::env::var("CAMELID_GEMMA3_BATCH_PREFILL")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
     })
 }
 
@@ -12989,19 +12996,24 @@ pub(crate) enum PrefillGemm {
 }
 
 /// Gate for the Phase 3 tiled simdgroup-matmul prefill GEMM (long-prompt TTFT
-/// campaign). Default OFF: this path is **not** bit-identical to the token-by-token
-/// lane — the dequantized Q8_0 weight and the activation panel are staged in half
-/// and accumulated in tile-MMA order — so it ships opt-in behind its own flag, on
-/// top of `CAMELID_GEMMA3_BATCH_PREFILL`. Its gate is the published KV-equivalence
-/// envelope (`GEMMA3_METAL_CONDUCTOR.md` §18a), not raw bit equality.
+/// campaign). **Default ON since Phase 4**, `=0` to opt out.
 ///
-/// Arming this without `CAMELID_GEMMA3_BATCH_PREFILL` does nothing: the only
-/// production caller of `prefill_tokens_windowed` is the gemma3 batched-prefill seam.
+/// This path is **not** bit-identical to the token-by-token lane — the dequantized
+/// Q8_0 weight and the activation panel are staged in half and accumulated in
+/// tile-MMA order — so its gate is the published KV-equivalence envelope
+/// (`GEMMA3_METAL_CONDUCTOR.md` §18a/§18b), not raw bit equality. Shipping it on
+/// by default is a deliberate choice of prefill speed over prefill bit-identity,
+/// recorded in §19c. Decode is not on this path and stays bit-exact.
+///
+/// Setting this to 0 without also setting `CAMELID_GEMMA3_BATCH_PREFILL=0` leaves
+/// Tier A's bit-identical batched GEMV in place, which is the conservative middle
+/// posture. Setting it in either direction does nothing for a non-gemma3 row: the
+/// only production caller of `prefill_tokens_windowed` is the gemma3 seam.
 pub fn gemma3_prefill_mm_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_GEMMA3_PREFILL_MM")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        !std::env::var("CAMELID_GEMMA3_PREFILL_MM")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
     })
 }
 
@@ -13022,19 +13034,23 @@ pub(crate) enum PrefillAttn {
 }
 
 /// Gate for the Phase 4 batched windowed attention-as-matmul (long-prompt TTFT
-/// campaign, Tier B). Like [`gemma3_prefill_mm_enabled`] this path is **not**
-/// bit-identical to the token-by-token lane — Q/K/V and the score and probability
-/// panels stage in half and the MMA accumulates in tile order — so its gate is the
-/// published KV-equivalence envelope, not raw bit equality.
+/// campaign, Tier B). **Default ON**, `=0` to opt out.
 ///
-/// Requires `CAMELID_GEMMA3_PREFILL_MM` (the context panel stays half all the way
-/// into the O projection) on top of `CAMELID_GEMMA3_BATCH_PREFILL`; arming it alone
-/// does nothing.
+/// Like [`gemma3_prefill_mm_enabled`] this path is **not** bit-identical to the
+/// token-by-token lane — Q/K/V and the score and probability panels stage in half
+/// and the MMA accumulates in tile order — so its gate is the published
+/// KV-equivalence envelope plus the exact-count mask gate
+/// (`windowed_attn_mm_mask_matches_the_pinned_window_convention`), not raw bit
+/// equality.
+///
+/// Rides on `CAMELID_GEMMA3_PREFILL_MM` (the context panel stays half all the way
+/// into the O projection) inside `CAMELID_GEMMA3_BATCH_PREFILL`; turning either of
+/// those off turns this off too, whatever it says.
 pub fn gemma3_prefill_attn_mm_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_GEMMA3_PREFILL_ATTN_MM")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        !std::env::var("CAMELID_GEMMA3_PREFILL_ATTN_MM")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
     })
 }
 
@@ -15209,22 +15225,33 @@ impl ResidentDecodeState {
     /// lane uses. At head_dim 256 that routes to `encode_attention_split3`, the exact
     /// kernel the shipped lane already runs.
     ///
-    /// `head_dim > 128` is NOT gated here (this is a separate admission path; the ≤128
+    /// `head_dim > 128` is NOT gated here: this is a separate admission path, and the ≤128
     /// gates on `prefill_tokens`, `verify_batch` and the `MAX_DPL`/`MAX_DOCT` kernels are
-    /// untouched), and `use_attn_mm` — which requires `!has_qk_norm` — is not on this path
-    /// at all: attention-as-matmul is Tier B.
+    /// untouched.
     ///
-    /// **Phase 3 amends one clause of the bit-identity claim above, and only one.** With
-    /// `CAMELID_GEMMA3_PREFILL_MM=1` the seven weight-streaming GEMMs (Q/K/V/O/gate/up/down)
-    /// run through the tiled simdgroup-matrix kernel `q8_0_block_wire_mm` instead of the
-    /// batched-column GEMV: each weight block is then read once per 128 prompt columns
-    /// rather than once per 8 (`MAX_T`), and both operands stage in threadgroup memory.
-    /// That path is NOT bit-identical — the dequantized Q8_0 weight and the activation panel
-    /// are staged in half and accumulated in tile-MMA order — so it is opt-in and gated by
-    /// the published KV-equivalence envelope (`GEMMA3_METAL_CONDUCTOR.md` §18a) instead of
-    /// by raw bit equality. Everything else on the path is untouched, including every
-    /// per-row stage: QK-norm, RoPE, K/V scatter and attention still run the EXACT
-    /// single-token kernels at a row byte offset, so the window semantics are unchanged.
+    /// **Phases 3 and 4 amend the bit-identity claim above, in two named places and
+    /// nowhere else.** Both are default-ON with `=0` opt-outs (§19c); both are gated by
+    /// the published KV-equivalence envelope (`GEMMA3_METAL_CONDUCTOR.md` §18a/§18b)
+    /// rather than by raw bit equality, because neither can be bit-identical:
+    ///
+    /// 1. **The weight GEMMs** (`CAMELID_GEMMA3_PREFILL_MM`). Q/K/V/O/gate/up/down run
+    ///    through the tiled simdgroup-matrix kernel `q8_0_block_wire_mm` instead of the
+    ///    batched-column GEMV: each weight block is read once per 128 prompt columns
+    ///    rather than once per 8 (`MAX_T`), and both operands stage in threadgroup memory.
+    /// 2. **Attention** (`CAMELID_GEMMA3_PREFILL_ATTN_MM`, and it needs (1) because the
+    ///    context panel stays half all the way into the O projection). The per-row
+    ///    `encode_attention` loop becomes three dispatches per layer-chunk —
+    ///    `half_mm_batched_f16o` for S = K Qᵀ, `softmax_causal_rows`, and
+    ///    `half_mm_batched_f16o` again for O = Vᵀ P — reading the half K/V mirrors the
+    ///    scatter already dual-writes. The sliding window becomes a `window` uniform on
+    ///    the first and third of those, culling score tiles that lie entirely below it;
+    ///    `window = 0` is the disabled case the 4 global layers take.
+    ///
+    /// What did NOT move under either: the per-head QK-norm, RoPE and the K/V scatter
+    /// still run the EXACT single-token kernels at a row byte offset, and the window
+    /// bounds still come from the shared [`schedule_window_bounds`] — the batched mask is
+    /// the same arithmetic in the kernel rather than a second convention. With (2) off,
+    /// attention is the per-row path described above, unchanged.
     ///
     /// Sets `filled = n_tokens` on success (the caller's `filled() == position` invariant;
     /// getting it wrong re-seeds from a CPU KV cache this lane leaves hollow). Returns

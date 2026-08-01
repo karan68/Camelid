@@ -176,8 +176,11 @@ impl super::LlamaInferenceSession {
         //   * CAMELID_METAL_RESIDENT_PREFILL — the existing (non-windowed) `prefill_tokens`,
         //     which fails closed on gemma3 (schedule / sandwich norms / GeGLU) and on
         //     head_dim > 128;
-        //   * CAMELID_GEMMA3_BATCH_PREFILL — the long-prompt TTFT campaign's Tier A
-        //     `prefill_tokens_windowed`, gemma3-only, default OFF this phase.
+        //   * CAMELID_GEMMA3_BATCH_PREFILL — the long-prompt TTFT campaign's
+        //     `prefill_tokens_windowed`, gemma3-only, default ON since Phase 4 with
+        //     `=0` as the operator opt-out. Its two inner flags
+        //     (CAMELID_GEMMA3_PREFILL_MM, CAMELID_GEMMA3_PREFILL_ATTN_MM) are read
+        //     inside that call and are likewise default-ON opt-outs.
         let gemma3_batched = self.gemma3_batched_prefill_armed();
         let resident_prefill_armed = std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
