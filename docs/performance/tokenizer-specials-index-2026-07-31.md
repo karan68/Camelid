@@ -266,5 +266,19 @@ target/release/examples/tokenizer_probe stats <row.gguf>
 - **`Tokenizer::from_gguf` takes 72 s on Phi-4-mini-instruct-Q4_K_M** (200,064
   entries). Unrelated to the special-token scan — it is in construction, not
   encode, and is unchanged by this work. Every other row builds in under 1.4 s.
+
+  **Resolved after this report.** The cost was not per-token work over the
+  vocabulary: `is_exact_phi4_mini_q4km` SHA-256'd the entire 2.5 GB artifact to
+  check the pin admitting the `gpt-4o` pre-tokenizer, and that volume reads at
+  ~29 MB/s. Narrowing the pin to the GGUF header region `[0, data_start_offset)`
+  — 8,250,976 bytes, everything that can move a token id — took construction to
+  65 ms warm (#577).
+
+  Loading the row was still slow afterwards for a *second*, independent
+  full-file read: `build_loaded_model` hashes the whole GGUF to name the receipt
+  lane. That digest is now memoized across process starts on
+  (path, len, mtime, dev, ino), measured 65,098 ms cold → 0.1 ms warm on the
+  same artifact. Two full-file reads per load became zero on every start after
+  the first.
 - **gemma-4's `encode_spm_segment` rank-merge path** is ~13x slower per
   character than gemma-3's, in both modes.
