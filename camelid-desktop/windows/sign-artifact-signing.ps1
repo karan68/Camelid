@@ -41,12 +41,28 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# EVERYTHING goes to a log file as well as stdout.
+#
+# Tauri SWALLOWS this script's output when it exits non-zero -- it prints
+# `failed to bundle project: failed to run <cmd>` and nothing else. Three consecutive releases
+# died here and every diagnosis was guesswork, because the one thing that would have explained
+# the failure was the output being discarded. CAMELID_SIGN_LOG is an absolute path the workflow
+# sets and prints after the bundle step, whether that step passed or failed.
+$logPath = $env:CAMELID_SIGN_LOG
+function Note([string]$message) {
+    $line = "sign-artifact-signing: $message"
+    Write-Host $line
+    if ($logPath) {
+        try { Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format o)] $line" } catch { }
+    }
+}
+
 $signtool = $env:CAMELID_SIGNTOOL
 $dlib = $env:CAMELID_SIGN_DLIB
 $metadata = $env:CAMELID_SIGN_METADATA
 
 if (-not $signtool -and -not $dlib -and -not $metadata) {
-    Write-Host "sign-artifact-signing: signing not configured (CAMELID_SIGNTOOL unset) - skipping $Path"
+    Note "signing not configured (CAMELID_SIGNTOOL unset) - skipping $Path"
     exit 0
 }
 
@@ -57,33 +73,66 @@ foreach ($pair in @(
         @{ Name = 'CAMELID_SIGN_DLIB'; Value = $dlib },
         @{ Name = 'CAMELID_SIGN_METADATA'; Value = $metadata })) {
     if (-not $pair.Value) {
-        throw "signing is partially configured: $($pair.Name) is empty while others are set"
+        Note "FATAL: signing is partially configured: $($pair.Name) is empty while others are set"
+        exit 1
     }
-    if ($pair.Name -ne 'CAMELID_SIGNTOOL' -and -not (Test-Path $pair.Value)) {
-        throw "$($pair.Name) points at '$($pair.Value)', which does not exist"
+    if (-not (Test-Path -LiteralPath $pair.Value)) {
+        Note "FATAL: $($pair.Name) points at '$($pair.Value)', which does not exist"
+        exit 1
     }
 }
 
-if (-not (Test-Path $Path)) {
-    throw "nothing to sign at '$Path'"
+if (-not (Test-Path -LiteralPath $Path)) {
+    Note "FATAL: nothing to sign at '$Path'"
+    exit 1
 }
 
-Write-Host "sign-artifact-signing: signing $Path"
+Note "signing $Path"
 
 # Timestamping is not optional here: Artifact Signing certificates are valid for three days,
 # so an untimestamped signature stops verifying almost immediately after release.
-& $signtool sign /v /debug /fd SHA256 `
-    /tr http://timestamp.acs.microsoft.com /td SHA256 `
-    /dlib $dlib /dmdf $metadata `
-    $Path
-if ($LASTEXITCODE -ne 0) {
-    throw "signtool failed with exit code $LASTEXITCODE for $Path"
+#
+# `$ErrorActionPreference` is dropped to Continue for exactly this call. Windows PowerShell wraps
+# every stderr line of a native command in a NativeCommandError ErrorRecord when the stream is
+# redirected, and under 'Stop' that is TERMINATING -- the script would die on signtool's first
+# diagnostic line and never reach the exit-code check below, turning any signing hiccup into an
+# unexplained bundle failure. Verified locally: with 'Stop' this path exited 1 instead of 0.
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $output = & $signtool sign /v /debug /fd SHA256 `
+        /tr http://timestamp.acs.microsoft.com /td SHA256 `
+        /dlib $dlib /dmdf $metadata `
+        $Path 2>&1
+    $signExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousPreference
+}
+foreach ($line in @($output)) { Note "  signtool| $line" }
+
+# A SIGNTOOL FAILURE IS NOT FATAL TO THE BUILD.
+#
+# The bundler must still produce an installer. Failing here is what left users with no Windows
+# installer at all on v0.4.8 and v0.5.0 -- strictly worse than the unsigned-payload installer
+# v0.4.6 shipped, which at least installed and ran. An unsigned binary is a known, previously
+# accepted posture; no binary is not. The release's `Prove the INSTALLED binary is signed` step
+# reports what actually shipped, and `verify-release-assets` guarantees an incomplete release
+# never becomes `latest`.
+if ($signExit -ne 0) {
+    Note "WARNING: signtool exited $signExit for $Path - shipping this file UNSIGNED rather than failing the bundle"
+    exit 0
 }
 
-# Fail closed on the result, not just the exit code: a signature that does not verify on the
-# machine that just produced it will not verify on a user's machine either.
-$status = (Get-AuthenticodeSignature -FilePath $Path).Status
+# THIS one is fatal, and it is the only fatal case.
+#
+# signtool claiming success while the result does not verify means we are about to seal a
+# BROKEN signature into the installer -- exactly what v0.4.7 shipped, where every installed copy
+# reported HashMismatch. A broken signature is worse than no signature: Windows reports a
+# tampered chain, it earns no SmartScreen reputation, and it cannot be explained away as
+# "unsigned". Better to fail the release than ship that.
+$status = (Get-AuthenticodeSignature -LiteralPath $Path).Status
 if ($status -ne 'Valid') {
-    throw "signtool reported success but $Path verifies as '$status'"
+    Note "FATAL: signtool reported success but $Path verifies as '$status' - refusing to seal a broken signature"
+    exit 1
 }
-Write-Host "sign-artifact-signing: $Path -> Valid"
+Note "$Path -> Valid"
