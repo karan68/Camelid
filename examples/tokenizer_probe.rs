@@ -30,14 +30,21 @@ fn main() {
 
     let load_start = Instant::now();
     let gguf = read_metadata(gguf_path).expect("read gguf metadata");
+    let meta_ms = load_start.elapsed().as_secs_f64() * 1e3;
+    let data_start_offset = gguf.data_start_offset;
+    let build_start = Instant::now();
     let tokenizer = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+    let build_ms = build_start.elapsed().as_secs_f64() * 1e3;
     let load_ms = load_start.elapsed().as_secs_f64() * 1e3;
     eprintln!(
-        "loaded {} vocab={} model={} load_ms={:.1}",
+        "loaded {} vocab={} model={} load_ms={:.1} meta_ms={:.1} build_ms={:.1} header_bytes={}",
         gguf_path,
         tokenizer.tokens.len(),
         tokenizer.model.as_summary_model(),
-        load_ms
+        load_ms,
+        meta_ms,
+        build_ms,
+        data_start_offset
     );
 
     match mode {

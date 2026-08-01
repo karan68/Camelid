@@ -520,27 +520,57 @@ fn resolve_gpt2_pre_tokenizer(
     }
 }
 
-const PHI4_MINI_Q4KM_SHA256: &str =
-    "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a";
+/// SHA-256 of the pinned artifact's GGUF *header region* — bytes
+/// `[0, data_start_offset)`: magic, version, counts, the whole KV metadata
+/// block, and every tensor descriptor. Tensor payload bytes are deliberately
+/// excluded.
+///
+/// This pin used to cover the entire 2.5 GB file, which cost ~72 s of pure
+/// read on every `Tokenizer::from_gguf` — before any encode, so it landed on
+/// model load / first request. The narrowing is sound rather than merely
+/// cheaper: the gate exists to admit the `gpt-4o` dialect only for the one
+/// artifact its tokenization was validated against, and *everything* that can
+/// change tokenization lives in the header region (`tokenizer.ggml.pre`, the
+/// token list, merges, token_type, scores, the special ids). Tensor payload
+/// bytes cannot move a token id. The descriptors are still covered, so the
+/// quantization and tensor layout stay pinned too.
+///
+/// Regenerate after any intentional artifact change with:
+///   head -c "$(offset)" model.gguf | shasum -a 256
+/// where `$(offset)` is the `data_start_offset` the reader reports.
+const PHI4_MINI_Q4KM_HEADER_SHA256: &str =
+    "971d9aac49438815528a5036221d85b2b0cbaf8c13e05f412c4574e16d186312";
 
 fn is_exact_phi4_mini_q4km(file: &GgufFile) -> bool {
     let named_phi4 = file.architecture() == Some("phi3")
         && file.model_name() == Some("Phi 4 Mini Instruct")
         && file.path.file_name().and_then(|name| name.to_str())
             == Some("Phi-4-mini-instruct-Q4_K_M.gguf");
-    named_phi4 && sha256_file(&file.path).is_some_and(|sha256| sha256 == PHI4_MINI_Q4KM_SHA256)
+    named_phi4
+        && sha256_file_prefix(&file.path, file.data_start_offset)
+            .is_some_and(|sha256| sha256 == PHI4_MINI_Q4KM_HEADER_SHA256)
 }
 
-fn sha256_file(path: &std::path::Path) -> Option<String> {
+/// SHA-256 of exactly the first `len` bytes of `path`, or `None` if the file
+/// cannot be opened, is shorter than `len`, or `len` is zero. A short file
+/// yields `None` rather than the hash of whatever was there: a truncated
+/// artifact must not be able to satisfy a pin over a region it does not have.
+fn sha256_file_prefix(path: &std::path::Path, len: u64) -> Option<String> {
+    if len == 0 {
+        return None;
+    }
     let mut file = File::open(path).ok()?;
     let mut digest = sha2::Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..want]).ok()?;
         if read == 0 {
-            break;
+            return None;
         }
         digest.update(&buffer[..read]);
+        remaining -= read as u64;
     }
     Some(format!("{:x}", digest.finalize()))
 }
@@ -2892,6 +2922,58 @@ mod tests {
         let mut renamed = exact.clone();
         renamed.path = PathBuf::from("renamed.gguf");
         assert!(!is_exact_phi4_mini_q4km(&renamed));
+    }
+
+    // The artifact pin hashes only `[0, data_start_offset)`, so the bounded
+    // read has to be exact: hash every byte of the region and refuse anything
+    // that cannot supply the whole of it. Getting this wrong either breaks the
+    // gpt-4o gate for the real artifact or lets a truncated file satisfy a pin
+    // over bytes it does not have.
+    #[test]
+    fn sha256_file_prefix_hashes_exactly_the_requested_region() {
+        use sha2::Digest;
+
+        // Larger than the 64 KiB read buffer, so the final partial chunk (and
+        // the `min(remaining, buffer)` clamp) is actually exercised.
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("artifact.bin");
+        std::fs::write(&path, &bytes).expect("write fixture");
+
+        let expect = |len: usize| {
+            let mut digest = sha2::Sha256::new();
+            digest.update(&bytes[..len]);
+            format!("{:x}", digest.finalize())
+        };
+
+        // A prefix hash must equal the hash of that prefix alone — never of
+        // the whole file, and never of a buffer-rounded amount.
+        for len in [1usize, 65_536, 65_537, 131_072, 199_999] {
+            assert_eq!(
+                super::sha256_file_prefix(&path, len as u64),
+                Some(expect(len)),
+                "prefix hash diverged at len={len}"
+            );
+        }
+        // Whole file, requested exactly.
+        assert_eq!(
+            super::sha256_file_prefix(&path, bytes.len() as u64),
+            Some(expect(bytes.len()))
+        );
+
+        // Truncated artifact: the region is not there, so there is no hash to
+        // report — NOT the hash of the short content.
+        assert_eq!(
+            super::sha256_file_prefix(&path, bytes.len() as u64 + 1),
+            None
+        );
+        // A zero-length region pins nothing and must never match.
+        assert_eq!(super::sha256_file_prefix(&path, 0), None);
+        // Unreadable path.
+        assert_eq!(
+            super::sha256_file_prefix(&dir.path().join("absent.bin"), 32),
+            None
+        );
     }
 
     // Parity gate for the missing-`pre` Llama-3 rescue: the exact Meta-Llama-3-8B GGUF
