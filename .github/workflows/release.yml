@@ -478,20 +478,51 @@ jobs:
           Write-Host "signtool: $($signtool.FullName)"
           Write-Host "dlib    : $($dlib.FullName)"
 
-          # The hook path in tauri.conf.json is relative to the Tauri project directory. If it
-          # ever stops resolving, signCommand silently never runs, so assert it here.
-          if (-not (Test-Path 'camelid-desktop/windows/sign-artifact-signing.ps1')) {
-            throw 'signCommand script missing at camelid-desktop/windows/sign-artifact-signing.ps1'
-          }
+          # Generate the signCommand overlay with ABSOLUTE paths.
+          #
+          # Everything here must be absolute. Tauri calls signCommand seven times per bundle
+          # (app binary, five NSIS plugin DLLs, uninstaller temp file) and the working
+          # directory is NOT constant: the uninstaller call runs from target\release\nsis\x64,
+          # not the Tauri project dir. v0.4.8 wired this relatively and died there with
+          # `failed to bundle project: failed to run powershell`, publishing no Windows
+          # installer at all. `powershell` is resolved to its full path for the same reason --
+          # a bare name failed to spawn on the runner.
+          #
+          # installerHooks is RE-STATED here, read out of tauri.conf.json rather than
+          # hardcoded, so this overlay cannot silently drop the NVRTC-orphan cleanup if
+          # Tauri's config merge is ever shallower than a deep merge at bundle.windows.
+          # Derived, not duplicated -- it cannot drift from the source of truth.
+          $script = (Resolve-Path 'camelid-desktop/windows/sign-artifact-signing.ps1').Path
+          $pwshExe = (Get-Command powershell.exe).Source
+          $baseConf = Get-Content 'camelid-desktop/tauri.conf.json' -Raw | ConvertFrom-Json
+          $hooks = $baseConf.bundle.windows.nsis.installerHooks
+          if (-not $hooks) { throw 'tauri.conf.json no longer declares bundle.windows.nsis.installerHooks' }
 
-      # One pass again, as before v0.4.7. The binary is signed from inside the bundler via
-      # signCommand, at the only moment its bytes are final.
+          $signingConf = [ordered]@{
+            bundle = [ordered]@{
+              windows = [ordered]@{
+                signCommand = [ordered]@{
+                  cmd  = $pwshExe
+                  args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '%1')
+                }
+                nsis = [ordered]@{ installerHooks = $hooks }
+              }
+            }
+          }
+          $signingConf | ConvertTo-Json -Depth 8 |
+            Set-Content -Path 'camelid-desktop/tauri.signing.conf.json' -Encoding utf8
+          Write-Host "signCommand : $pwshExe -File $script %1"
+          Write-Host "installerHooks carried through: $hooks"
+
+      # One pass. The binary is signed from inside the bundler via signCommand, at the only
+      # moment its bytes are final.
       - name: Build desktop bundle (NSIS installer)
         working-directory: camelid-desktop
-        # The bundle-only config overlay adds the staged sidecar/* as resources. It is
-        # kept out of the base tauri.conf.json so a plain `cargo build -p camelid-desktop`
-        # (no sidecar staged) never hits the empty-glob error.
-        run: npx tauri build --config tauri.bundle.conf.json
+        # tauri.bundle.conf.json adds the staged sidecar/* as resources; it is kept out of the
+        # base config so a plain `cargo build -p camelid-desktop` never hits the empty-glob
+        # error. tauri.signing.conf.json is generated above and carries the absolute-path
+        # signCommand. Later --config wins on conflict, so signing is applied last.
+        run: npx tauri build --config tauri.bundle.conf.json --config tauri.signing.conf.json
 
       # Assemble the portable layout, and stage the installer INTO it so a single post-build
       # signing pass covers both the portable camelid-desktop.exe and the NSIS installer.
@@ -847,3 +878,74 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # ---------------------------------------------------------------------------------
+  # An incomplete release must never become `latest`.
+  #
+  # The desktop jobs are deliberately independent -- they are in no other job's `needs`,
+  # so a desktop failure cannot block the server artifacts. v0.4.8 showed the cost of that
+  # independence with nothing watching it: `desktop-windows` failed, the release published
+  # anyway, became `latest`, and the documented one-command install broke for every user
+  # with an error they could do nothing about.
+  #
+  # This job closes that gap without re-coupling the builds. It runs after everything
+  # (`if: always()`), and if the published release is missing any expected asset it flips the
+  # release to a PRERELEASE. GitHub's `releases/latest` skips prereleases, so the previous
+  # complete release stays `latest` and the install path keeps working while the gap is fixed.
+  # The run still fails loudly -- this hides nothing, it just stops the damage reaching users.
+  verify-release-assets:
+    needs: [release, desktop-windows, desktop-macos]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Require a complete asset set, or demote the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.RELEASE_TAG }}
+          SKIP_DESKTOP: ${{ github.event.inputs.skip_desktop }}
+        run: |
+          set -euo pipefail
+          names="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          echo "published assets:"; echo "$names" | sed 's/^/  /'
+
+          missing=""
+          require() {
+            if ! echo "$names" | grep -qx -- "$1"; then missing="$missing $1"; fi
+          }
+          require camelid-linux-x86_64.tar.gz
+          require camelid-linux-x86_64.tar.gz.sha256
+          require camelid-macos-arm64.tar.gz
+          require camelid-macos-arm64.tar.gz.sha256
+          require camelid-windows-x64.zip
+          require camelid-windows-x64.zip.sha256
+
+          # The desktop artifacts are only expected when the desktop jobs were meant to run.
+          if [ "${SKIP_DESKTOP:-false}" != "true" ]; then
+            require camelid-desktop-windows-x64.zip
+            require camelid-desktop-windows-x64.zip.sha256
+            require camelid-desktop-macos-arm64.dmg
+            require camelid-desktop-macos-arm64.dmg.sha256
+            # The NSIS installer keeps its versioned Tauri name, so match by suffix. This is
+            # the asset scripts/get-desktop-windows.ps1 resolves; without it the documented
+            # one-command install has nothing to download.
+            setup_count="$(echo "$names" | grep -c 'x64-setup\.exe$' || true)"
+            if [ "$setup_count" != "1" ]; then
+              missing="$missing <exactly-one-x64-setup.exe (found $setup_count)>"
+            fi
+          fi
+
+          if [ -n "$missing" ]; then
+            echo "::error::release $TAG is INCOMPLETE, missing:$missing"
+            echo "Demoting $TAG to a prerelease so releases/latest keeps pointing at the last complete release."
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease --latest=false
+            exit 1
+          fi
+
+          echo "release $TAG publishes the complete asset set."

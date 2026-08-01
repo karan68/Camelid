@@ -657,6 +657,45 @@ shipped defects there. `Prove the INSTALLED binary is signed` silently installs 
 installer on the runner and asserts the unpacked binary verifies. Runners are ephemeral, so
 this costs nothing, and it would have caught both defects before publishing.
 
+## D11 cont. — signCommand paths must be absolute, and an incomplete release must never be `latest` (2026-08-01)
+
+v0.4.8 published with **no Windows desktop installer**. `desktop-windows` died with
+`failed to bundle project: failed to run powershell`, the server artifacts published anyway, the
+release became `latest`, and the documented one-command install broke for every user with an
+error they could do nothing about.
+
+**Cause: `signCommand` is invoked seven times per bundle with a working directory that is not
+constant.** Measured on a real bundle — the app binary, five NSIS plugin DLLs, and the
+uninstaller staged as `%TEMP%\nst*.tmp`. Six run from the Tauri project directory; the
+uninstaller call runs from `target\release\nsis\x64`. The project-relative script path resolved
+for six and failed the build on the seventh. A bare `powershell` also failed to spawn on the
+runner, so the interpreter is resolved to a full path too.
+
+**Fix:** the release workflow generates `camelid-desktop/tauri.signing.conf.json` at release
+time with absolute paths, passed as an extra `--config`. It is gitignored and deliberately
+absent from the committed `tauri.conf.json`, so a developer's `tauri build` needs no signing
+tooling. The overlay re-states `installerHooks` — read out of `tauri.conf.json`, derived rather
+than duplicated — so it cannot silently drop the NVRTC-orphan cleanup if Tauri's config merge is
+ever shallower than a deep merge at `bundle.windows`.
+
+**Verified by a real bundle, not an assertion.** Text checks are what let v0.4.8 through: the
+config was present, the script parsed, and its path resolved *from the project directory*. The
+fix was proven by running `tauri build` with the generated config and observing all seven
+invocations spawn.
+
+**Two guards, because the fix alone only covers this bug:**
+
+1. `verify-release-assets` (`if: always()`, needs every publishing job) checks the published
+   asset set and, if anything is missing, flips the release to a **prerelease** so
+   `releases/latest` skips it and the previous complete release keeps serving installs. It then
+   fails loudly. The desktop jobs stay independent — they still cannot block server artifacts —
+   but their failure can no longer reach users. **Rejected:** making the desktop jobs blocking,
+   which would let a desktop-only failure withhold the server release.
+2. `scripts/get-desktop-windows.ps1` no longer binds to `releases/latest`. It walks back to the
+   most recent release that actually publishes an installer and warns which it chose. An
+   explicit `CAMELID_DESKTOP_TAG` still fails hard rather than silently substituting a version
+   the user did not ask for.
+
 ## D12 — CPU KV cache: f16-rounded values were stored in f32 buffers; f16 storage + head-major layout lanes (2026-07-01)
 
 Measured finding (Item-3 recon): the CPU KV write path has rounded every stored

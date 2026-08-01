@@ -73,20 +73,33 @@ from an ordinary post-build signing pass:
 | the exe **inside** the installer | `bundle.windows.signCommand` | during bundling |
 | portable exe + NSIS installer | signing action, folder pass | after bundling |
 
-The middle row needs its own mechanism because Tauri stamps the bundle type into the binary it
-stages for the installer, rewriting `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed
-app knows how it was installed. It rewrites a *staged copy*, not `target/release`. A signature
-applied before `tauri build` is therefore invalidated by that rewrite, and one applied
-afterwards cannot reach a binary already sealed inside the installer.
-`windows/sign-artifact-signing.ps1` runs in the only window where the bytes are final.
+The middle row needs its own mechanism because Tauri patches the binary with the bundle type,
+rewriting `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed app knows how it was
+installed, and signs only afterwards. A signature applied before `tauri build` is invalidated by
+that rewrite, and one applied afterwards cannot reach a binary already sealed inside the
+installer. `windows/sign-artifact-signing.ps1` runs in the only window where the bytes are final.
 
-Both shipped releases got this wrong before it was understood: v0.4.6 delivered that copy
-`NotSigned`, and v0.4.7 delivered it `HashMismatch` — a broken signature, which is worse than
-none. The release workflow now installs the built installer on the runner and asserts the
-unpacked binary verifies, so neither failure can ship again unnoticed.
+Three shipped releases got some part of this wrong, which is why the guards below exist:
 
-The script no-ops when its tooling environment is absent, so `tauri build` on a developer
-machine still works and simply produces unsigned output.
+| release | what users got |
+| --- | --- |
+| v0.4.6 | installed exe `NotSigned` — signed only after bundling |
+| v0.4.7 | installed exe `HashMismatch` — signed only before bundling; a broken signature is worse than none |
+| v0.4.8 | **no Windows installer at all** — `signCommand` used a project-relative script path |
+
+**`signCommand` paths must be absolute, and the release workflow generates them.** Tauri invokes
+the hook **seven times** per bundle — the app binary, five NSIS plugin DLLs, and the uninstaller
+staged as a `%TEMP%\nst*.tmp` — and the working directory is *not* constant: six run from the
+Tauri project directory, but the uninstaller call runs from `target\release\nsis\x64`. A
+project-relative path resolves for six of seven and fails the build on the last. The workflow
+therefore writes `tauri.signing.conf.json` at release time with absolute paths (and re-states
+`installerHooks`, read from `tauri.conf.json`, so the overlay cannot drop it), and passes it as an
+extra `--config`. It is deliberately absent from the committed config so a developer's
+`tauri build` needs no signing tooling; the script also no-ops when its environment is unset.
+
+Two independent guards close the loop: the release workflow installs the built installer on the
+runner and asserts the unpacked binary verifies, and `verify-release-assets` demotes any release
+whose asset set is incomplete so `releases/latest` can never point at one.
 
 ## Startup failures
 

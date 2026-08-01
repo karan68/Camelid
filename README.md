@@ -46,10 +46,10 @@ ready to use.
 
 #### Windows
 
-Paste one command into PowerShell — it downloads the signed installer from the latest release,
-verifies its Authenticode signature, installs the app per-user (no admin rights) under
-`%LOCALAPPDATA%\Camelid Desktop`, and launches it. No toolchain required; it needs 64-bit
-Windows 10 or 11.
+Paste one command into PowerShell — it downloads the signed installer from the newest release
+that publishes one, verifies its Authenticode signature, installs the app per-user (no admin
+rights) under `%LOCALAPPDATA%\Camelid Desktop`, and launches it. No toolchain required; it needs
+64-bit Windows 10 or 11.
 
 ```powershell
 irm https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-windows.ps1 | iex
