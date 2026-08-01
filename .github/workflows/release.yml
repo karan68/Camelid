@@ -310,15 +310,23 @@ jobs:
   # release camelid.exe as a loopback sidecar, signs its artifacts with the same Azure
   # Trusted Signing identity as build-windows, and attaches them to the release itself.
   #
-  # Signing layout (azure/artifact-signing-action is folder-based / post-build; Tauri
-  # PATCHES camelid-desktop.exe during bundling so it can only be signed after the bundle):
+  # Signing layout (azure/artifact-signing-action is folder-based, so every pass signs a
+  # staged folder rather than a named file):
   #   - sidecar camelid.exe  -> signed BEFORE bundling (so it is signed inside the installer
   #                             and the portable zip)
-  #   - camelid-desktop.exe  -> signed AFTER bundling (portable copy)
-  #   - NSIS installer       -> signed AFTER bundling
-  # Accepted v1 limitation: the camelid-desktop.exe baked INSIDE the installer is unsigned
-  # (the installer itself, the portable exe, and the sidecar are signed).
-  # See camelid-desktop/README.md, DECISIONS.md D11.
+  #   - camelid-desktop.exe  -> signed BEFORE bundling, for the same reason
+  #   - NSIS installer       -> signed AFTER bundling (it does not exist before)
+  #
+  # Through v0.4.6 the desktop exe was signed only AFTER bundling, which was recorded as an
+  # accepted v1 limitation: the copy sealed inside the installer went out unsigned, so the
+  # documented one-command install ran an unsigned app while the portable zip's identical
+  # binary was signed. The premise behind accepting it -- that Tauri patches the exe during
+  # bundling, so it could only be signed afterwards -- does not hold. Authenticode is a pure
+  # append: on the published v0.4.6 artifacts the signed copy's PE certificate table begins
+  # at offset 10513920, exactly the unsigned copy's length. The bundler embeds the same
+  # payload either way, so the exe is now signed before the bundler reads it, with a
+  # fail-closed assertion between the two steps.
+  # See DECISIONS.md D11 for the desktop app's design record.
   desktop-windows:
     if: ${{ github.event.inputs.skip_desktop != 'true' }}
     runs-on: windows-latest
@@ -407,17 +415,66 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Build desktop bundle (NSIS installer)
+      # Build the desktop binary but STOP before bundling, so camelid-desktop.exe can be
+      # signed while it is still the bundler's input. Through v0.4.6 this was one
+      # `tauri build`, which meant the NSIS installer was assembled around the unsigned
+      # binary and every user who installed via the installer ran an unsigned app --
+      # even though the portable zip's copy of the same binary was signed.
+      # Same config overlay as the bundle step below, so the compiled binary is identical
+      # to what the single-pass `tauri build` produced -- the only thing this split
+      # changes is WHEN the exe is signed, not what is built.
+      - name: Build desktop binary (no bundle yet)
+        working-directory: camelid-desktop
+        run: npx tauri build --no-bundle --config tauri.bundle.conf.json
+
+      # Sign in a dedicated folder: `files-folder` + an `exe` filter pointed at
+      # target/release would sweep in every other executable cargo left there.
+      - name: Stage camelid-desktop.exe for pre-bundle signing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path sign-stage | Out-Null
+          Copy-Item target/release/camelid-desktop.exe sign-stage -Force
+
+      - name: Sign camelid-desktop.exe BEFORE bundling (Azure Artifact Signing)
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\sign-stage
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Return the signed bytes to the path the bundler reads, and fail closed if they are
+      # not signed -- this assertion is the gate the shipped defect would trip. Signing
+      # before bundling is safe because Authenticode is a pure append: on the v0.4.6
+      # artifacts the signed copy's PE certificate table starts at exactly the unsigned
+      # copy's length, so the bundler embeds the same payload either way.
+      - name: Return the signed exe to the bundler's input path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item sign-stage/camelid-desktop.exe target/release/camelid-desktop.exe -Force
+          $status = (Get-AuthenticodeSignature 'target/release/camelid-desktop.exe').Status
+          if ($status -ne 'Valid') {
+            throw "camelid-desktop.exe is '$status' going into the bundler; the installer would ship an unsigned app"
+          }
+          Write-Host "pre-bundle signature: $status"
+
+      - name: Bundle the NSIS installer around the signed exe
         working-directory: camelid-desktop
         # The bundle-only config overlay adds the staged sidecar/* as resources. It is
         # kept out of the base tauri.conf.json so a plain `cargo build -p camelid-desktop`
         # (no sidecar staged) never hits the empty-glob error.
-        run: npx tauri build --config tauri.bundle.conf.json
+        run: npx tauri bundle --config tauri.bundle.conf.json
 
       # Assemble the portable layout, and stage the installer INTO it so a single post-build
       # signing pass covers both the portable camelid-desktop.exe and the NSIS installer.
-      # (Tauri patches camelid-desktop.exe during bundling, so it can only be signed now —
-      # after the bundle. The sidecar camelid.exe was already signed above.)
+      # (The desktop exe is already signed above; re-signing it here is harmless and keeps
+      # the installer -- which can only exist after bundling -- covered by the same pass.)
       - name: Assemble portable layout (+ stage installer for signing)
         shell: pwsh
         run: |
