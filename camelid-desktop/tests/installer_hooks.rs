@@ -53,7 +53,7 @@ fn sign_command_is_wired_to_a_script_that_exists() {
         .map(|a| a.as_str().expect("signCommand args are strings"))
         .collect();
     assert!(
-        args.iter().any(|a| *a == "%1"),
+        args.contains(&"%1"),
         "signCommand args must contain the %1 placeholder, or Tauri passes no file to sign: {args:?}"
     );
 
