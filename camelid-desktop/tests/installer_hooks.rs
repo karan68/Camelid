@@ -31,8 +31,7 @@ fn release_workflow() -> String {
         .parent()
         .expect("repo root")
         .join(".github/workflows/release.yml");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 /// `bundle.windows.signCommand` is the only hook that can sign the copy of
