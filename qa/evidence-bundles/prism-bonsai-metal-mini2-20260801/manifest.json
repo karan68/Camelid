@@ -1,0 +1,181 @@
+{
+  "schema": "camelid.prism_macos_metal_smoke/v1",
+  "date": "2026-08-01",
+  "status": "pass_supported_exact_rows_macos_metal",
+  "source_branch": "feat/prism-metal",
+  "base_revision": "c7dcf7a96d1a",
+  "host": {
+    "label": "Mac mini 2",
+    "cpu_gpu": "Apple M4",
+    "memory_gib": 16,
+    "operating_system": "macOS 26.5.2",
+    "connection": "Thunderbolt"
+  },
+  "artifacts": [
+    {
+      "file": "Bonsai-4B-Q1_0.gguf",
+      "sha256": "4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168",
+      "result": "chat_completions_pass"
+    },
+    {
+      "file": "Ternary-Bonsai-4B-Q2_0.gguf",
+      "sha256": "4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b",
+      "result": "chat_completions_pass"
+    },
+    {
+      "file": "Ternary-Bonsai-4B-PQ2_0.gguf",
+      "sha256": "829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb",
+      "result": "chat_completions_pass"
+    },
+    {
+      "file": "Bonsai-8B-Q1_0.gguf",
+      "sha256": "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+      "result": "chat_completions_pass"
+    },
+    {
+      "file": "Ternary-Bonsai-8B-Q2_0.gguf",
+      "sha256": "3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b",
+      "result": "chat_completions_pass"
+    },
+    {
+      "file": "Bonsai-27B-Q1_0.gguf",
+      "sha256": "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0",
+      "result": "text_and_vision_chat_completions_pass"
+    },
+    {
+      "file": "Ternary-Bonsai-27B-Q2_0.gguf",
+      "sha256": "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757",
+      "result": "text_and_vision_cli_pass"
+    },
+    {
+      "file": "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
+      "sha256": "eb561d41a7bbeb0fcf04883c8af11078ef6cae0a66862a0b68443cfca495269d",
+      "result": "qwen3_vl_projector_load_and_metal_encode_pass"
+    }
+  ],
+  "deterministic_chat_probe": {
+    "request": "user=Hello, temperature=0, max_tokens=8",
+    "results": {
+      "Bonsai-4B-Q1_0.gguf": [9707, 0, 4354, 11, 358, 5293, 429, 498],
+      "Ternary-Bonsai-4B-Q2_0.gguf": [9707, 0, 4354, 11, 358, 1969, 37163, 429],
+      "Ternary-Bonsai-4B-PQ2_0.gguf": [9707, 0, 4354, 11, 358, 1969, 37163, 429],
+      "Bonsai-8B-Q1_0.gguf": [9707, 0, 358, 2776, 425, 2382, 2143, 11],
+      "Ternary-Bonsai-8B-Q2_0.gguf": [9707, 0, 358, 2776, 425, 2382, 2143, 11]
+    }
+  },
+  "vision_probe": {
+    "model": "Bonsai-27B-Q1_0.gguf",
+    "projector": "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
+    "request": "one PNG data URL, Describe this image., image token bounds 1..1, temperature=0, max_tokens=8",
+    "nonstreaming_text": "Here's a thinking process:\n\n1",
+    "generated_token_ids": [8160, 579, 264, 7047, 1817, 25, 271, 16],
+    "prompt_tokens": 17,
+    "sse": "pass_reasoning_content_deltas_and_done"
+  },
+  "sampled_vision_probe": {
+    "model": "Bonsai-27B-Q1_0.gguf",
+    "projector": "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
+    "request": "one PNG data URL, Describe this screenshot concisely. Do not repeat list items., temperature=0.7, top_p=0.95, top_k=20, min_p=0, seed=42, max_tokens=128",
+    "reference": "PrismML-Eng/Bonsai-demo scripts/start_llama_server.sh 27B sampler defaults",
+    "content_delta_tokens": 69,
+    "wall_seconds_including_image_prefill": 20.06,
+    "approx_end_to_end_tokens_per_second": 3.44,
+    "finish_reason": "stop",
+    "sse": "pass_content_deltas_and_done",
+    "exact_repetition_cycle": false
+  },
+  "reference_fork_benchmark": {
+    "repository": "Mintplex-Labs/prism-ml-llama.cpp",
+    "revision": "9ca265a57f85f2117942490f421f64a226dd9847",
+    "binary": "llama-cli b1-9ca265a, AppleClang 17, Darwin arm64, Metal",
+    "model": "Bonsai-27B-Q1_0.gguf",
+    "projector": "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
+    "request": "frontier-128x64.png, Describe this screenshot concisely. Do not repeat list items., ctx=4096, gpu_layers=99, temperature=0.7, top_p=0.95, top_k=20, min_p=0, seed=42",
+    "matched_69_token_run": {
+      "prompt_tokens_per_second": 27.1,
+      "generation_tokens_per_second": 16.6,
+      "wall_seconds_including_fresh_process_and_model_load": 6.65,
+      "end_to_end_output_tokens_per_second": 10.38
+    },
+    "full_128_token_run": {
+      "prompt_tokens_per_second": 24.6,
+      "generation_tokens_per_second": 16.5,
+      "wall_seconds_including_fresh_process_and_model_load": 11.83,
+      "end_to_end_output_tokens_per_second": 10.82
+    },
+    "llama_bench_tg128": {
+      "repetitions": 3,
+      "average_tokens_per_second": 7.683935,
+      "standard_deviation_tokens_per_second": 0.05422
+    },
+    "camelid_to_reference_comparison": "pre-optimization matched 69-token vision request: Camelid 3.44 end-to-end tok/s versus reference fork 10.38 end-to-end tok/s; this historical gap triggered the Q1 Metal optimization pass recorded below"
+  },
+  "q1_metal_optimization_benchmark": {
+    "implementation": [
+      "Q1_0 Metal GEMV reuses each activation slice across eight output rows per SIMD group",
+      "Q1_0 scalar parity fixture expanded from 3 to 19 rows to cover multiple row-reuse threadgroups",
+      "non-final Qwen3.5 prompt and image slots skip the unused vocabulary projection",
+      "non-final prompt slots advance in bounded 16-slot Metal command-buffer chunks with explicit state-buffer barriers"
+    ],
+    "small_image_greedy_69_token_probe": {
+      "image": "frontier-128x64.png",
+      "baseline_wall_seconds": 20.168087,
+      "optimized_wall_seconds": 7.741898,
+      "optimized_end_to_end_output_tokens_per_second": 8.91,
+      "speedup": 2.61,
+      "text": "byte-for-byte identical before and after optimization"
+    },
+    "small_image_prism_sampled_probe": {
+      "image": "frontier-128x64.png",
+      "prompt_tokens": 35,
+      "completion_tokens": 52,
+      "wall_seconds": 6.534225,
+      "end_to_end_output_tokens_per_second": 7.96,
+      "finish_reason": "stop",
+      "coherent": true
+    },
+    "text_128_token_probe": {
+      "prompt_tokens": 32,
+      "completion_tokens": 128,
+      "wall_seconds": 11.611931,
+      "end_to_end_output_tokens_per_second": 11.02,
+      "finish_reason": "stop"
+    },
+    "full_resolution_vision_probe": {
+      "image": "frontier.png",
+      "dimensions": "1442x720",
+      "prompt_tokens": 139,
+      "completion_tokens": 96,
+      "wall_seconds": 19.604472,
+      "end_to_end_output_tokens_per_second": 4.9,
+      "finish_reason": "stop",
+      "coherent": true
+    },
+    "reference_fork_full_resolution_probe": {
+      "process_state": "fresh llama-cli process including model load and image preparation",
+      "completion_tokens": 128,
+      "wall_seconds": 29.89,
+      "prompt_tokens_per_second": 55.4,
+      "generation_tokens_per_second": 16.4,
+      "end_to_end_output_tokens_per_second": 4.28
+    }
+  },
+  "implementation_checks": [
+    "cargo test --lib: 1494 passed, 0 failed, 24 ignored",
+    "cargo check --tests",
+    "cargo test --lib qwen35_imrope_tests",
+    "cargo test --lib prism_ -- --nocapture with the real projector and image",
+    "cargo test --test tensor_store prism_",
+    "cargo test --lib metal_prism_low_bit_resident_projection_matches_scalar_decode",
+    "frontend npm run build",
+    "frontend npm run smoke:integration"
+  ],
+  "boundaries": [
+    "supported exact-row smoke for the seven hash-pinned language artifacts on macOS Apple Silicon Metal; not a Windows or broader-family claim",
+    "one local PNG or JPEG data URL per Chat Completions request",
+    "remote image URLs, multiple images, audio, video, and vision-plus-tools fail closed",
+    "OpenAI Responses multimodal input remains unsupported",
+    "no bounded-context or production-throughput claim",
+    "27B vision prefill is correct but remains a batching optimization target"
+  ]
+}

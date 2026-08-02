@@ -71,7 +71,13 @@ function readJsonStorage(key, fallback) {
 
 function writeJsonStorage(key, value) {
   if (typeof window === 'undefined') return
-  window.localStorage.setItem(key, JSON.stringify(value))
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    // Image attachments can exhaust a browser's small localStorage quota.
+    // Keep the live in-memory conversation and request working; persistence
+    // is best-effort and must never crash or cancel the current generation.
+  }
 }
 
 function normalizeSortText(value) {
@@ -474,6 +480,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       loaded_now: Boolean(health?.loaded_now ?? health?.active_model_id),
       active_model_id: health?.active_model_id || null,
       generation_ready: Boolean(health?.generation_ready),
+      vision_ready: Boolean(health?.vision_ready),
       q8_runtime: health?.q8_runtime || null,
       ...executionRuntimeFields(health),
       status: health?.ok ? 'online' : 'offline',
@@ -899,7 +906,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
     if (target.role !== 'user') return
     const content = String(editedContent ?? target.content ?? '').trim()
     if (!content) return
-    await sendMessage({ overrideContent: content, truncateFromMessageId: messageId })
+    await sendMessage({
+      overrideContent: content,
+      overrideImage: target.image || null,
+      truncateFromMessageId: messageId,
+    })
   }
 
   const stopGeneration = () => {
@@ -915,7 +926,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
      old tail instead of duplicating it. The gate checks below are identical
      for every path — resends cannot bypass the fail-closed chat gate. */
   const sendMessage = async (options = {}) => {
-    const { overrideContent = null, truncateFromMessageId = null } = options
+    const { overrideContent = null, overrideImage = null, truncateFromMessageId = null } = options
     const draftContent = overrideContent ?? composer
     if (!draftContent.trim()) return
     // Supported rows chat through the full gate. Implemented-but-unsupported rows
@@ -940,7 +951,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // Fresh chats start from the __new__ sentinel. Select the real conversation immediately
       // so the main thread renders the same streaming message object as the sidebar preview.
       setSelectedConversationId(conversation.id)
-      const userMessage = { id: makeId('message'), role: 'user', content: messageContent, model_id: selectedModelId, created_at: nowIso() }
+      const userMessage = {
+        id: makeId('message'),
+        role: 'user',
+        content: messageContent,
+        ...(overrideImage ? { image: overrideImage } : {}),
+        model_id: selectedModelId,
+        created_at: nowIso(),
+      }
       setPendingChat({ conversationId: conversation.id, content: messageContent, modelId: selectedModelId })
       if (overrideContent === null) setComposer('')
 
@@ -953,8 +971,24 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const history = [...baseMessages, userMessage]
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .filter((message) => !message.content.startsWith('Conversation created.'))
-        .map(({ role, content }) => ({ role, content }))
-      const requestMessages = applyLocalChatPolicy(history)
+      // The current Metal lane accepts one image. Retain every attachment in
+      // the local transcript, but send only the most recent one so follow-ups
+      // keep image context and attaching a replacement does not form an
+      // unsupported multi-image request.
+      let activeImageIndex = -1
+      history.forEach((message, index) => {
+        if (message.image?.data_url) activeImageIndex = index
+      })
+      const requestHistory = history.map(({ role, content, image }, index) => ({
+        role,
+        content: index === activeImageIndex
+          ? [
+              { type: 'image_url', image_url: { url: image.data_url } },
+              { type: 'text', text: content },
+            ]
+          : content,
+      }))
+      const requestMessages = applyLocalChatPolicy(requestHistory)
       const promptTokenEstimate = estimateChatTokenCount(requestMessages)
 
       persistConversations((current) => current.map((item) => (
@@ -1029,7 +1063,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
           // locked. Experimental rows have no parity contract and small models loop
           // badly under greedy decoding, so they sample for usable output.
           temperature: selectedModelExperimental ? 0.7 : 0,
-          ...(selectedModelExperimental ? { top_p: 0.9 } : {}),
+          // Prism's checked 27B demo sampler: keep the experimental lane aligned
+          // with the model authors instead of letting low-bit greedy decode fall
+          // into exact repetition loops.
+          ...(selectedModelExperimental ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
           max_tokens: localChatMaxTokens(history, requestModelId),
           /* Empty today: a sampling override is sent only when /api/capabilities
              advertises a supported row for that exact parameter. */

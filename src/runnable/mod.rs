@@ -13,8 +13,10 @@ pub mod admit;
 pub mod dequant;
 pub mod model;
 pub mod smoke;
+mod vision;
 
 pub use admit::{admit, AdmissionAxis, AdmissionOk, AdmissionReject, TokenizerFamily};
 pub use dequant::dequantize;
 pub use model::RunnableModel;
 pub use smoke::{headline_quant_of, oracle_qualified, smoke_admit, SmokeReport};
+pub use vision::{PrismVisionEmbedding, PrismVisionProjector};

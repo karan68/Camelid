@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use minijinja::{
     context, Environment, Error as MiniJinjaError, ErrorKind as MiniJinjaErrorKind,
     UndefinedBehavior,
@@ -514,6 +515,9 @@ pub struct HealthResponse {
     pub build: String,
     pub loaded_now: bool,
     pub generation_ready: bool,
+    /// True when the active runnable model has a resident Prism/Qwen3-VL
+    /// projector and can accept OpenAI `image_url` chat content parts.
+    pub vision_ready: bool,
     pub active_model_id: Option<String>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
@@ -738,6 +742,10 @@ pub struct ChatCompletionRequest {
     /// channels are stripped from chat output either way. Default: false (the
     /// reference's `enable_thinking:false` rendering).
     pub camelid_enable_thinking: Option<bool>,
+    /// Private Prism image sizing extensions. Values are merged image-token
+    /// counts (Qwen3-VL emits one token per aligned 32x32-pixel tile).
+    pub camelid_image_min_tokens: Option<u32>,
+    pub camelid_image_max_tokens: Option<u32>,
     /// OpenAI-style tool/function definitions. When present, they are rendered
     /// into the prompt through the loaded model's own chat template (Hybrid agent
     /// mode); the model's tool-call output is parsed back into `tool_calls` (for
@@ -831,12 +839,13 @@ pub enum StopSpec {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Image data URLs collected from OpenAI `image_url` parts. Their in-order
+    /// location in `content` is represented by the Qwen vision marker.
+    #[serde(skip)]
+    pub image_urls: Vec<String>,
     /// Content-part types from the OpenAI parts form that Camelid cannot honor
-    /// (`image_url`, `input_audio`, `video_url`, â€¦). Camelid generates text
-    /// tokens only â€” vision/audio towers are never loaded â€” so the chat
-    /// handlers fail closed with a typed `unsupported_multimodal_content`
-    /// error whenever this is non-empty. Plain-string content and `text` parts
-    /// never populate it.
+    /// (`input_audio`, `video_url`, â€¦). Plain strings, `text`, and `image_url`
+    /// do not populate this collection.
     #[serde(skip)]
     pub unsupported_content_parts: Vec<String>,
 }
@@ -879,6 +888,22 @@ struct ChatContentPartWire {
     #[serde(rename = "type")]
     part_type: String,
     text: Option<String>,
+    image_url: Option<ChatImageUrlWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChatImageUrlWire {
+    Object { url: String },
+    String(String),
+}
+
+impl ChatImageUrlWire {
+    fn into_url(self) -> String {
+        match self {
+            Self::Object { url } | Self::String(url) => url,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -937,21 +962,29 @@ impl<'de> Deserialize<'de> for ChatMessage {
         D: serde::Deserializer<'de>,
     {
         let mut wire = ChatMessageWire::deserialize(deserializer)?;
-        let (mut content, unsupported_content_parts) = match wire.content {
-            Some(ChatContentWire::Text(text)) => (text, Vec::new()),
+        let (mut content, image_urls, unsupported_content_parts) = match wire.content {
+            Some(ChatContentWire::Text(text)) => (text, Vec::new(), Vec::new()),
             Some(ChatContentWire::Parts(parts)) => {
                 let mut text = String::new();
+                let mut images = Vec::new();
                 let mut unsupported = Vec::new();
                 for part in parts {
                     if part.part_type == "text" {
                         text.push_str(part.text.as_deref().unwrap_or(""));
+                    } else if part.part_type == "image_url" {
+                        if let Some(image_url) = part.image_url {
+                            text.push_str("<|vision_start|><|image_pad|><|vision_end|>");
+                            images.push(image_url.into_url());
+                        } else {
+                            unsupported.push(part.part_type);
+                        }
                     } else {
                         unsupported.push(part.part_type);
                     }
                 }
-                (text, unsupported)
+                (text, images, unsupported)
             }
-            None => (String::new(), Vec::new()),
+            None => (String::new(), Vec::new(), Vec::new()),
         };
         if !wire.tool_calls.is_empty() {
             if wire.role != "assistant" {
@@ -981,6 +1014,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
         Ok(ChatMessage {
             role: wire.role,
             content,
+            image_urls,
             unsupported_content_parts,
         })
     }
@@ -1002,10 +1036,10 @@ fn reject_unsupported_multimodal_content(messages: &[ChatMessage]) -> Option<Res
         StatusCode::BAD_REQUEST,
         "unsupported_multimodal_content",
         format!(
-            "unsupported multimodal content part(s): {}. Camelid is a text-token \
-             inference engine; image/audio/video inputs are fail-closed for every \
-             model row (Gemma 4 vision/audio towers are never loaded). Send content \
-             as a string or as {{\"type\":\"text\"}} parts.",
+            "unsupported multimodal content part(s): {}. This endpoint accepts text \
+             and, when /v1/health reports vision_ready=true, one PNG/JPEG data URL \
+             in an OpenAI {{\"type\":\"image_url\"}} part. Audio, video, remote \
+             image URLs, and malformed image parts fail closed.",
             part_types.join(", ")
         ),
         Some("messages"),
@@ -2828,10 +2862,14 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     // Model load inserts the generic metadata before initializing these runtimes, and a
     // failed initialization leaves the model visible but intentionally not ready. Health
     // must agree with request routing, which also requires the runtime-map entry.
-    let runnable_serve_ready = match active_id_lock.as_ref() {
-        Some(id) => state.runnable_runtimes.read().await.contains_key(id),
-        None => false,
+    let runnable_runtime = match active_id_lock.as_ref() {
+        Some(id) => state.runnable_runtimes.read().await.get(id).cloned(),
+        None => None,
     };
+    let runnable_serve_ready = runnable_runtime.is_some();
+    let vision_ready = runnable_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.vision_ready());
     let dg_serve_ready = match active_id_lock.as_ref() {
         Some(id) => state.dg_runtimes.read().await.contains_key(id),
         None => false,
@@ -2859,6 +2897,7 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now,
         generation_ready,
+        vision_ready,
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
         execution_plan,
@@ -2890,6 +2929,7 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         build: crate::receipt::camelid_version(),
         loaded_now: false,
         generation_ready: false,
+        vision_ready: false,
         active_model_id: None,
         q8_runtime: q8_runtime_health(),
         execution_plan: None,
@@ -4157,7 +4197,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal after the Mac mini 2 text and vision matrix; the claim is exact-file and platform-scoped, with Windows, broader qwen35 or quant support, bounded context, and production throughput still unclaimed.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -4196,6 +4236,21 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "TQ2_0",
                 status: "supported_named_exact_rows_only",
                 notes: "ternary_bonsai_4b_tq2_0 only: single-node CPU completion smoke (receipt qa/ternary/tq2_0-bonsai-parity-receipt.json). Other TQ2_0 files load to the unverified experimental lane only; no ternary-wide claim.",
+            },
+            SupportItem {
+                id: "Q1_0",
+                status: "supported_named_exact_rows_only",
+                notes: "Bonsai 4B, 8B, and 27B Q1_0 are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No Q1_0-wide, Windows, bounded-context, or production-throughput claim is implied.",
+            },
+            SupportItem {
+                id: "Q2_0",
+                status: "supported_named_exact_rows_only",
+                notes: "Ternary Bonsai 4B, 8B, and 27B Prism Q2_0-G128 artifacts are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. Upstream Q2_0-G64 remains structurally distinct and unclaimed.",
+            },
+            SupportItem {
+                id: "PQ2_0",
+                status: "supported_named_exact_rows_only",
+                notes: "Ternary Bonsai 4B PQ2_0 is supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hash in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No PQ2_0-wide, Windows, bounded-context, or production-throughput claim is implied.",
             },
             SupportItem {
                 id: "IQ4_XS",
@@ -4245,6 +4300,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
                 notes: "exact dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking DISABLED) have row-specific smoke support: qwen2 BPE pre-tokenizer + hardcoded ChatML renderer, per-head QK-norm + NEOX (split-half) RoPE, and token-AND-text-identical greedy parity vs llama.cpp at 1/5/50 tokens on macOS/Ubuntu and on Windows x86_64 CPU (both the cpu_reference scalar path and the x86_q8 AVX2 runtime-repack path, bit-identical). 1.7B additionally runs the GPU-resident decode+prefill path and a 15,373-token single-shot prefill lane on macOS, with opt-in thinking-mode leading-trace parity. Exact rows only; other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the validated envelope, and broad Qwen-family support are not implied.",
+            },
+            SupportItem {
+                id: "prism_bonsai_qwen35_exact_4b_8b_27b_metal",
+                status: "supported_exact_row_smoke_lanes",
+                notes: "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal. The exact 27B Q1_0 row additionally has browser and API single-image smoke with the checked Q8_0 projector. Exact rows and platform only; Windows, neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied.",
             },
         ],
         planned_model_families: vec![
@@ -5085,6 +5145,304 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_output: "Paris",
                 evidence: "Ternary-Bonsai-4B-TQ2_0.gguf (sha256 b85dcbaa6f57a9c71252371c97f4c68602c2c5fc61a9e1ce74d963d6fee5047c, general.architecture=qwen3, 36 layers, TQ2_0 2.06bpw ternary linears + Q6_K tied embed/lm_head, yarn rope factor 4) runs end-to-end on a single i7-11800H CPU (CUDA hidden), streaming the TQ2_0 wire blocks and the Q6_K head so the 4B model fits in 3.09GB RSS instead of ~16GB f32. Greedy parity vs llama.cpp acd79d6 (llama-server -ngl 0, /completion temp 0 top_k 1): 3/4 probe prompts token-identical for 24 tokens (capital-of-France, once-upon-a-time, quick-brown-fox), 1 diverges at a near-tie (2+2= continuation, camelid '2' vs llama '4' after both emit the correct '= 4,'). Decode 11.34 tok/s = 0.53x llama.cpp (21.25), the general forward gap. Receipt: qa/ternary/tq2_0-bonsai-parity-receipt.json. Camelid supports exact-row CPU completion smoke for this row only; no bounded-context, performance, serve/WebUI, GPU, or full support is implied",
                 next_step: "formal bounded-context + serve/WebUI parity closure, a perf/RSS gate, and a curated current-head refresh before any wider ternary claim; an AVX2 Q6_K head and last-position-only prefill would lift throughput further",
+            },
+            // Prism ML Bonsai rows: support is exact-artifact and macOS Metal
+            // scoped. Every id below is also a curated catalog id, so the Models
+            // page derives Supported from this contract rather than hand-written UI
+            // copy. The single receipt hash-pins all seven files and the projector.
+            ModelCompatibilityTarget {
+                id: "bonsai_4b_q1_0",
+                family: "qwen35_bonsai_metal",
+                quantization: "Q1_0",
+                status: "supported_exact_row_smoke",
+                tool_capable: false,
+                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                full_support_status: "blocked_pending_portability_and_bounded_context",
+                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen35_hybrid_metadata",
+                tokenizer_works: "validated_qwen35_bpe_chatml",
+                tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
+                generation_runs: "validated_chat_completions_on_macos_metal",
+                parity_audited: "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                performance_measured: "recorded_smoke_only_not_a_portable_sla",
+                frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
+                frontend_readiness_gate: "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+                chat_template_renderer: "qwen35_chatml",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "deterministic_eight_token_probe",
+                evidence: "Bonsai-4B-Q1_0.gguf sha256 4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+            },
+            ModelCompatibilityTarget {
+                id: "ternary_bonsai_4b_q2_0",
+                family: "qwen35_bonsai_metal",
+                quantization: "Q2_0/Q2_0_G128",
+                status: "supported_exact_row_smoke",
+                tool_capable: false,
+                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                full_support_status: "blocked_pending_portability_and_bounded_context",
+                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
+                tokenizer_works: "validated_qwen35_bpe_chatml",
+                tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
+                generation_runs: "validated_chat_completions_on_macos_metal",
+                parity_audited: "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                performance_measured: "recorded_smoke_only_not_a_portable_sla",
+                frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+                chat_template_renderer: "qwen35_chatml",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "deterministic_eight_token_probe",
+                evidence: "Ternary-Bonsai-4B-Q2_0.gguf sha256 4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+            },
+            ModelCompatibilityTarget {
+                id: "ternary_bonsai_4b_pq2_0",
+                family: "qwen35_bonsai_metal",
+                quantization: "PQ2_0",
+                status: "supported_exact_row_smoke",
+                tool_capable: false,
+                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                full_support_status: "blocked_pending_portability_and_bounded_context",
+                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_pq2_type_142",
+                tokenizer_works: "validated_qwen35_bpe_chatml",
+                tensors_load: "validated_all_tensors_packed_pq2_0_wire_resident",
+                generation_runs: "validated_chat_completions_on_macos_metal",
+                parity_audited: "pq2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                performance_measured: "recorded_smoke_only_not_a_portable_sla",
+                frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+                chat_template_renderer: "qwen35_chatml",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "deterministic_eight_token_probe",
+                evidence: "Ternary-Bonsai-4B-PQ2_0.gguf sha256 829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+            },
+            ModelCompatibilityTarget {
+                id: "bonsai_8b_q1_0",
+                family: "qwen35_bonsai_metal",
+                quantization: "Q1_0",
+                status: "supported_exact_row_smoke",
+                tool_capable: false,
+                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                full_support_status: "blocked_pending_portability_and_bounded_context",
+                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen35_hybrid_metadata",
+                tokenizer_works: "validated_qwen35_bpe_chatml",
+                tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
+                generation_runs: "validated_chat_completions_on_macos_metal",
+                parity_audited: "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                performance_measured: "recorded_smoke_only_not_a_portable_sla",
+                frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
+                frontend_readiness_gate: "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+                chat_template_renderer: "qwen35_chatml",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "deterministic_eight_token_probe",
+                evidence: "Bonsai-8B-Q1_0.gguf sha256 284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+            },
+            ModelCompatibilityTarget {
+                id: "ternary_bonsai_8b_q2_0",
+                family: "qwen35_bonsai_metal",
+                quantization: "Q2_0/Q2_0_G128",
+                status: "supported_exact_row_smoke",
+                tool_capable: false,
+                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                full_support_status: "blocked_pending_portability_and_bounded_context",
+                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
+                tokenizer_works: "validated_qwen35_bpe_chatml",
+                tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
+                generation_runs: "validated_chat_completions_on_macos_metal",
+                parity_audited: "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                performance_measured: "recorded_smoke_only_not_a_portable_sla",
+                frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+                chat_template_renderer: "qwen35_chatml",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "deterministic_eight_token_probe",
+                evidence: "Ternary-Bonsai-8B-Q2_0.gguf sha256 3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+            },
+            ModelCompatibilityTarget {
+                id: "bonsai_27b_q1_0",
+                family: "qwen35_bonsai_metal_vision",
+                quantization: "Q1_0",
+                status: "supported_exact_row_smoke",
+                tool_capable: false,
+                support_scope: "exact_row_macos_apple_silicon_metal_text_and_single_image_chat_smoke_only",
+                full_support_status: "blocked_pending_portability_bounded_context_and_multimodal_expansion",
+                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+                metadata_parses: "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
+                tokenizer_works: "validated_qwen35_bpe_chatml_and_single_image_token_injection",
+                tensors_load: "validated_packed_q1_0_wire_resident_model_plus_q8_0_vision_projector",
+                generation_runs: "validated_text_nonstreaming_sse_and_single_local_png_chat_completions_on_macos_metal",
+                parity_audited: "q1_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_deterministic_vision_probe_passes",
+                performance_measured: "optimized_small_image_8_91_end_to_end_output_tokens_per_second_and_full_resolution_4_9_recorded_not_a_portable_sla",
+                frontend_load_path_verified: "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
+                frontend_readiness_gate: "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
+                tested_context: "short_text_and_single_image_chat_smoke_with_runtime_capacity_capped_at_4096",
+                chat_template_renderer: "qwen35_chatml_with_qwen3_vl_image_token",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "mac_mini_2_text_vision_and_browser_acceptance",
+                latest_checked_result: "pass",
+                latest_checked_output: "coherent_full_resolution_image_description_and_128_token_text_completion",
+                evidence: "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the projector hash-pinned separately in the receipt passed text, nonstreaming and SSE image Chat Completions, browser image upload, projector CPU to Metal parity, and coherent full-resolution vision on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
+                next_step: "run the Windows kernel, projector, API, and browser matrix, then add bounded-context, multi-image policy, and normalized throughput packs before widening this exact-row scope",
+            },
+            ModelCompatibilityTarget {
+                id: "ternary_bonsai_27b_q2_0",
+                family: "qwen35_bonsai_metal_vision",
+                quantization: "Q2_0/Q2_0_G128",
+                status: "supported_exact_row_smoke",
+                tool_capable: false,
+                support_scope: "exact_row_macos_apple_silicon_metal_text_and_single_image_cli_smoke_only",
+                full_support_status: "blocked_pending_portability_bounded_context_and_multimodal_expansion",
+                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, browser image Chat Completions on this exact quant, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+                metadata_parses: "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
+                tokenizer_works: "validated_qwen35_bpe_chatml_and_single_image_token_injection",
+                tensors_load: "validated_packed_q2_0_wire_resident_model_plus_q8_0_vision_projector",
+                generation_runs: "validated_text_chat_completions_and_single_local_png_cli_vision_on_macos_metal",
+                parity_audited: "q2_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_cli_vision_probe_passes",
+                performance_measured: "recorded_smoke_only_not_a_portable_sla",
+                frontend_load_path_verified: "curated_model_catalog_entry_and_text_chat_smoke_validated",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match; image support remains scoped to the checked CLI probe and separately installed Q8_0 mmproj",
+                tested_context: "short_text_and_single_image_cli_smoke_with_runtime_capacity_capped_at_4096",
+                chat_template_renderer: "qwen35_chatml_with_qwen3_vl_image_token",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "mac_mini_2_text_and_cli_vision_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "coherent_text_and_checked_single_image_cli_output",
+                evidence: "Ternary-Bonsai-27B-Q2_0.gguf sha256 868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757 plus the projector hash-pinned separately in the receipt passed text Chat Completions, single-image CLI vision, and projector CPU to Metal parity on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
+                next_step: "run the Windows kernel, projector, API, and browser matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "llama3_2_1b_instruct_iq4_xs",
@@ -6447,6 +6805,7 @@ mod gemma4_template_tests {
     #[test]
     fn chat_prompt_uses_gemma4_turn_markers() {
         let messages = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "hi".to_string(),
@@ -6462,6 +6821,7 @@ mod gemma4_template_tests {
     #[test]
     fn qwen3_chatml_prompt_renders_thinking_disabled_generation_prompt() {
         let messages = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "What is the capital of France?".to_string(),
@@ -6477,6 +6837,7 @@ mod gemma4_template_tests {
     #[test]
     fn qwen2_chatml_prompt_matches_default_system_template_shape() {
         let messages = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "Reply with exactly: hello".to_string(),
@@ -6500,11 +6861,13 @@ mod gemma4_template_tests {
     fn phi3_prompt_renders_end_marked_turns_and_generation_prompt() {
         let messages = [
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "system".to_string(),
                 content: "Be concise.".to_string(),
             },
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "Capital of France?".to_string(),
@@ -6575,6 +6938,7 @@ mod gemma4_template_tests {
                 .messages
                 .into_iter()
                 .map(|message| ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: message.role,
                     content: message.content,
@@ -6600,6 +6964,7 @@ mod gemma4_template_tests {
         let template = "{% for message in messages %}{% if message['role'] == 'system' and 'tools' in message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}";
         let tokenizer = phi4_template_test_tokenizer(template);
         let messages = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "Read notes.txt".to_string(),
@@ -6621,6 +6986,7 @@ mod gemma4_template_tests {
     #[test]
     fn qwen3_chatml_prompt_renders_thinking_enabled_generation_prompt() {
         let messages = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "What is the capital of France?".to_string(),
@@ -6646,11 +7012,13 @@ mod gemma4_template_tests {
         // A trailing assistant turn must NOT get an extra generation prompt.
         let messages = [
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hi".to_string(),
             },
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "assistant".to_string(),
                 content: "hello".to_string(),
@@ -6805,6 +7173,7 @@ mod gemma4_template_tests {
                 .messages
                 .iter()
                 .map(|m| ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: m.role.clone(),
                     content: m.content.clone(),
@@ -6860,6 +7229,7 @@ mod gemma4_template_tests {
                 .messages
                 .iter()
                 .map(|m| ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: m.role.clone(),
                     content: m.content.clone(),
@@ -6918,6 +7288,7 @@ mod gemma4_template_tests {
                 .messages
                 .iter()
                 .map(|m| ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: m.role.clone(),
                     content: m.content.clone(),
@@ -6936,11 +7307,13 @@ mod gemma4_template_tests {
     fn qwen3_chatml_prompt_with_tools_renders_tool_definitions_and_suppresses_thinking() {
         let messages = [
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "system".to_string(),
                 content: "You are an agent.".to_string(),
             },
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "Read notes.txt".to_string(),
@@ -6972,6 +7345,7 @@ mod gemma4_template_tests {
     #[test]
     fn qwen3_chatml_prompt_with_tools_no_system_message() {
         let messages = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -7581,6 +7955,7 @@ pub struct RunnableServeRuntime {
     model: crate::runnable::RunnableModel,
     tokenizer: std::sync::Arc<Tokenizer>,
     architecture: String,
+    vision: Option<crate::runnable::PrismVisionProjector>,
 }
 
 impl RunnableServeRuntime {
@@ -7590,11 +7965,31 @@ impl RunnableServeRuntime {
         let architecture = gguf.architecture().unwrap_or_default().to_string();
         let tokenizer = std::sync::Arc::new(Tokenizer::from_gguf(&gguf)?);
         let model = crate::runnable::RunnableModel::load(&path_str)?;
+        let vision = if architecture == "qwen35" {
+            prism_mmproj_path(path)
+                .map(crate::runnable::PrismVisionProjector::load)
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(projector) = &vision {
+            if projector.projection_dim() != 5120 {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Prism projector output width {} does not match Qwen3.5 27B width 5120",
+                    projector.projection_dim()
+                )));
+            }
+        }
         Ok(Self {
             model,
             tokenizer,
             architecture,
+            vision,
         })
+    }
+
+    fn vision_ready(&self) -> bool {
+        self.vision.is_some()
     }
 
     /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
@@ -7603,9 +7998,16 @@ impl RunnableServeRuntime {
         &self,
         prompt_ids: &[u32],
         max_new: usize,
+        sampling: &SamplingConfig,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self.model.generate_stopping(prompt_ids, max_new, &stop)?;
+        let ids = self.model.generate_stopping_streaming_with_sampling(
+            prompt_ids,
+            max_new,
+            &stop,
+            sampling,
+            &mut |_| {},
+        )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
@@ -7617,15 +8019,101 @@ impl RunnableServeRuntime {
         &self,
         prompt_ids: &[u32],
         max_new: usize,
+        sampling: &SamplingConfig,
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids =
-            self.model
-                .generate_stopping_streaming(prompt_ids, max_new, &stop, &mut on_token)?;
+        let ids = self.model.generate_stopping_streaming_with_sampling(
+            prompt_ids,
+            max_new,
+            &stop,
+            sampling,
+            &mut on_token,
+        )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_vision_greedy(
+        &self,
+        prefix: &[u32],
+        image_bytes: &[u8],
+        suffix: &[u32],
+        min_image_tokens: usize,
+        max_image_tokens: usize,
+        max_new: usize,
+        sampling: &SamplingConfig,
+    ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
+        self.generate_vision_greedy_streaming(
+            prefix,
+            image_bytes,
+            suffix,
+            min_image_tokens,
+            max_image_tokens,
+            max_new,
+            sampling,
+            |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_vision_greedy_streaming<F: FnMut(u32)>(
+        &self,
+        prefix: &[u32],
+        image_bytes: &[u8],
+        suffix: &[u32],
+        min_image_tokens: usize,
+        max_image_tokens: usize,
+        max_new: usize,
+        sampling: &SamplingConfig,
+        mut on_token: F,
+    ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
+        let projector = self.vision.as_ref().ok_or_else(|| {
+            BackendError::UnsupportedGguf("no Prism vision projector is loaded".into())
+        })?;
+        let image =
+            projector.encode_image_bytes(image_bytes, min_image_tokens, max_image_tokens)?;
+        let prompt_tokens = prefix.len() + image.embeddings.len() + suffix.len();
+        let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let ids = self
+            .model
+            .generate_vision_stopping_streaming_with_sampling(
+                prefix,
+                &image,
+                suffix,
+                max_new,
+                &stop,
+                sampling,
+                &mut on_token,
+            )?;
+        let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
+        Ok((text, ids, prompt_tokens))
+    }
+}
+
+/// Resolve a projector explicitly (`CAMELID_MMPROJ`) or from a sibling
+/// `*mmproj*.gguf` file. Sorting makes discovery deterministic when a model
+/// directory contains more than one candidate.
+fn prism_mmproj_path(model_path: &std::path::Path) -> Option<PathBuf> {
+    if let Some(explicit) = env::var_os("CAMELID_MMPROJ").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(explicit));
+    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(model_path.parent()?)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                && path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("mmproj")
+                })
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 /// Render a gemma3 chat prompt byte-faithful to the GGUF `tokenizer.chat_template`
@@ -7963,6 +8451,215 @@ async fn load_runnable_serve_runtime(
     Ok(())
 }
 
+const PRISM_IMAGE_PAD: &str = "<|image_pad|>";
+const MAX_PRISM_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+enum RunnablePreparedPrompt {
+    Text(Vec<u32>),
+    Vision {
+        prefix: Vec<u32>,
+        image_bytes: Vec<u8>,
+        suffix: Vec<u32>,
+        min_image_tokens: usize,
+        max_image_tokens: usize,
+    },
+}
+
+#[allow(clippy::result_large_err)]
+fn runnable_sampling_config(
+    req: &ChatCompletionRequest,
+) -> std::result::Result<SamplingConfig, Response> {
+    let config = SamplingConfig {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_k: req.top_k.map(|value| value as usize),
+        top_p: req.top_p,
+        min_p: req.min_p,
+        typical_p: req.typical_p,
+        top_n_sigma: req.top_n_sigma,
+        min_keep: req.min_keep.map(|value| value as usize),
+        seed: req.seed,
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        repeat_penalty: req.repeat_penalty.unwrap_or(1.0),
+        penalty_last_n: req.penalty_last_n.map(|value| value as usize),
+        logit_bias: parse_logit_bias(req.logit_bias.as_ref()).map_err(|message| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_sampling_parameter",
+                message,
+                Some("logit_bias"),
+            )
+        })?,
+    };
+    config.validate().map_err(|error| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_sampling_parameter",
+            error.to_string(),
+            None,
+        )
+    })?;
+    Ok(config)
+}
+
+#[allow(clippy::result_large_err)]
+fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Response> {
+    let (header, payload) = url.split_once(',').ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_image_url",
+            "image_url must be a base64 PNG/JPEG data URL; Camelid does not fetch remote URLs"
+                .to_string(),
+            Some("messages"),
+        )
+    })?;
+    let media = header.to_ascii_lowercase();
+    if !matches!(
+        media.as_str(),
+        "data:image/png;base64" | "data:image/jpeg;base64" | "data:image/jpg;base64"
+    ) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_image_url",
+            "image_url must use data:image/png;base64 or data:image/jpeg;base64; remote URLs and other formats are not accepted"
+                .to_string(),
+            Some("messages"),
+        ));
+    }
+    let max_encoded = MAX_PRISM_IMAGE_BYTES.div_ceil(3) * 4;
+    if payload.len() > max_encoded {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image_too_large",
+            format!("decoded image data must not exceed {MAX_PRISM_IMAGE_BYTES} bytes"),
+            Some("messages"),
+        ));
+    }
+    let bytes = BASE64_STANDARD.decode(payload).map_err(|error| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_image_data",
+            format!("image_url contains invalid base64: {error}"),
+            Some("messages"),
+        )
+    })?;
+    if bytes.len() > MAX_PRISM_IMAGE_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image_too_large",
+            format!("decoded image data must not exceed {MAX_PRISM_IMAGE_BYTES} bytes"),
+            Some("messages"),
+        ));
+    }
+    Ok(bytes)
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_runnable_prompt(
+    runtime: &RunnableServeRuntime,
+    req: &ChatCompletionRequest,
+    messages: &[ChatMessage],
+    prompt_text: &str,
+    tools_present: bool,
+) -> std::result::Result<RunnablePreparedPrompt, Response> {
+    let image_urls: Vec<&str> = messages
+        .iter()
+        .flat_map(|message| message.image_urls.iter().map(String::as_str))
+        .collect();
+    if image_urls.is_empty() {
+        let add_special = runtime.architecture == "gemma2" || runtime.architecture == "gemma3";
+        let ids = runtime
+            .tokenizer
+            .encode(prompt_text, add_special, true)
+            .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "tokenize_error",
+                    error.to_string(),
+                    None,
+                )
+            })?;
+        return Ok(RunnablePreparedPrompt::Text(ids));
+    }
+    if image_urls.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_image_count",
+            "Prism chat currently accepts exactly one image per request".to_string(),
+            Some("messages"),
+        ));
+    }
+    if runtime.architecture != "qwen35" {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "vision_model_required",
+            "image_url content requires a Prism/Qwen3.5 vision model".to_string(),
+            Some("model"),
+        ));
+    }
+    if !runtime.vision_ready() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "vision_projector_not_ready",
+            "the language model is loaded, but no Prism mmproj GGUF was found; place a *mmproj*.gguf beside the model or set CAMELID_MMPROJ before loading it"
+                .to_string(),
+            Some("model"),
+        ));
+    }
+    if tools_present {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_vision_tools",
+            "tool calling and image input cannot be combined in the current Prism chat lane"
+                .to_string(),
+            Some("tools"),
+        ));
+    }
+    if prompt_text.matches(PRISM_IMAGE_PAD).count() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_vision_prompt",
+            "the rendered Prism prompt must contain exactly one image marker".to_string(),
+            Some("messages"),
+        ));
+    }
+    let (prefix_text, suffix_text) = prompt_text.split_once(PRISM_IMAGE_PAD).unwrap();
+    let prefix = runtime
+        .tokenizer
+        .encode(prefix_text, false, true)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tokenize_error",
+                error.to_string(),
+                None,
+            )
+        })?;
+    let suffix = runtime
+        .tokenizer
+        .encode(suffix_text, false, true)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tokenize_error",
+                error.to_string(),
+                None,
+            )
+        })?;
+    let min_image_tokens = req.camelid_image_min_tokens.unwrap_or(8).clamp(1, 1024) as usize;
+    let max_image_tokens = req
+        .camelid_image_max_tokens
+        .unwrap_or(128)
+        .clamp(min_image_tokens as u32, 1024) as usize;
+    Ok(RunnablePreparedPrompt::Vision {
+        prefix,
+        image_bytes: decode_prism_image_data_url(image_urls[0])?,
+        suffix,
+        min_image_tokens,
+        max_image_tokens,
+    })
+}
+
 /// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
 /// ChatML prompt (with tools when present), greedy-generate to EOG, split the
 /// `<think>` reasoning, and lift `<function=â€¦>` tool calls into structured `tool_calls`
@@ -7985,26 +8682,41 @@ async fn runnable_chat_nonstreaming(
     } else {
         render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
     };
-    // gemma3 renders carry no BOS string (oracle /apply-template parity) — BOS is
-    // added at token level (add_special=true), matching llama-server's chat path.
-    let add_special = runtime.architecture == "gemma2" || runtime.architecture == "gemma3";
-    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, add_special, true) {
-        Ok(ids) => ids,
-        Err(e) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tokenize_error",
-                e.to_string(),
-                None,
-            )
-        }
+    let prepared =
+        match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+    let sampling = match runnable_sampling_config(req) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
-    let prompt_token_count = prompt_ids.len();
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let rt = runtime.clone();
-    let result =
-        tokio::task::spawn_blocking(move || rt.generate_greedy(&prompt_ids, max_tokens)).await;
-    let (text, ids) = match result {
+    let result = tokio::task::spawn_blocking(move || match prepared {
+        RunnablePreparedPrompt::Text(prompt_ids) => {
+            let prompt_token_count = prompt_ids.len();
+            rt.generate_greedy(&prompt_ids, max_tokens, &sampling)
+                .map(|(text, ids)| (text, ids, prompt_token_count))
+        }
+        RunnablePreparedPrompt::Vision {
+            prefix,
+            image_bytes,
+            suffix,
+            min_image_tokens,
+            max_image_tokens,
+        } => rt.generate_vision_greedy(
+            &prefix,
+            &image_bytes,
+            &suffix,
+            min_image_tokens,
+            max_image_tokens,
+            max_tokens,
+            &sampling,
+        ),
+    })
+    .await;
+    let (text, ids, prompt_token_count) = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             return api_error(
@@ -8103,21 +8815,15 @@ async fn runnable_chat_streaming(
     } else {
         render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
     };
-    // gemma3 renders carry no BOS string (oracle /apply-template parity) — BOS is
-    // added at token level (add_special=true), matching llama-server's chat path.
-    let add_special = runtime.architecture == "gemma2" || runtime.architecture == "gemma3";
-    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, add_special, true) {
-        Ok(ids) => ids,
-        Err(e) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tokenize_error",
-                e.to_string(),
-                None,
-            )
-        }
+    let prepared =
+        match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+    let sampling = match runnable_sampling_config(req) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
-    let prompt_token_count = prompt_ids.len();
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
@@ -8132,19 +8838,43 @@ async fn runnable_chat_streaming(
 
     enum StreamItem {
         Token(u32),
-        Done(String, Vec<u32>),
+        Done(String, Vec<u32>, usize),
         Fail(String),
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let rt = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let send_tx = tx.clone();
-        let result = rt.generate_greedy_streaming(&prompt_ids, max_tokens, |tok| {
-            let _ = send_tx.send(StreamItem::Token(tok));
-        });
+        let result = match prepared {
+            RunnablePreparedPrompt::Text(prompt_ids) => {
+                let prompt_token_count = prompt_ids.len();
+                rt.generate_greedy_streaming(&prompt_ids, max_tokens, &sampling, |tok| {
+                    let _ = send_tx.send(StreamItem::Token(tok));
+                })
+                .map(|(text, ids)| (text, ids, prompt_token_count))
+            }
+            RunnablePreparedPrompt::Vision {
+                prefix,
+                image_bytes,
+                suffix,
+                min_image_tokens,
+                max_image_tokens,
+            } => rt.generate_vision_greedy_streaming(
+                &prefix,
+                &image_bytes,
+                &suffix,
+                min_image_tokens,
+                max_image_tokens,
+                max_tokens,
+                &sampling,
+                |tok| {
+                    let _ = send_tx.send(StreamItem::Token(tok));
+                },
+            ),
+        };
         match result {
-            Ok((text, ids)) => {
-                let _ = tx.send(StreamItem::Done(text, ids));
+            Ok((text, ids, prompt_token_count)) => {
+                let _ = tx.send(StreamItem::Done(text, ids, prompt_token_count));
             }
             Err(e) => {
                 let _ = tx.send(StreamItem::Fail(e.to_string()));
@@ -8174,7 +8904,8 @@ async fn runnable_chat_streaming(
         let mut phase_ids: Vec<u32> = Vec::new();
         let mut emitted = 0usize;
         let mut seen_visible = false;
-        let mut final_state: Option<std::result::Result<(String, Vec<u32>), String>> = None;
+        type RunnableStreamResult = std::result::Result<(String, Vec<u32>, usize), String>;
+        let mut final_state: Option<RunnableStreamResult> = None;
 
         while let Some(item) = rx.recv().await {
             match item {
@@ -8226,8 +8957,8 @@ async fn runnable_chat_streaming(
                     };
                     yield Ok(Event::default().data(chunk(delta, None).to_string()));
                 }
-                StreamItem::Done(text, ids) => {
-                    final_state = Some(Ok((text, ids)));
+                StreamItem::Done(text, ids, prompt_token_count) => {
+                    final_state = Some(Ok((text, ids, prompt_token_count)));
                     break;
                 }
                 StreamItem::Fail(e) => {
@@ -8238,7 +8969,7 @@ async fn runnable_chat_streaming(
         }
 
         match final_state {
-            Some(Ok((text, ids))) => {
+            Some(Ok((text, ids, prompt_token_count))) => {
                 let (_reasoning, content) = split_ornith_think(&text);
                 let tool_calls = if lift_tool_calls {
                     parse_ornith_tool_calls_json(&content)
@@ -10653,14 +11384,30 @@ async fn chat_completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
-    // Fail closed on multimodal input before any routing: no Camelid row loads
-    // a vision/audio tower, so image/audio/video parts must produce a typed
-    // error, never a silent text-only generation.
+    // Fail closed on unsupported multimodal types before routing. Prism
+    // `image_url` parts are collected separately and handled by the qwen35
+    // runnable lane; audio, video, and malformed parts never degrade into a
+    // silent text-only generation.
     if let Some(messages) = req.messages.as_deref() {
         if let Some(response) = reject_unsupported_multimodal_content(messages) {
             return response;
         }
     }
+    let has_image_input = req.messages.as_deref().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| !message.image_urls.is_empty())
+    });
+    let vision_unsupported_on_lane = |lane: &str| {
+        api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "vision_model_required",
+            format!(
+                "image_url input requires the Prism/Qwen3.5 vision lane; the selected {lane} lane is text-only"
+            ),
+            Some("model"),
+        )
+    };
     // Structured-output constraints are parsed BEFORE lane dispatch so malformed
     // schemas/CFGs fail uniformly and no lane can silently drop one.
     let constraint = match constraint_from_request(
@@ -10697,6 +11444,9 @@ async fn chat_completions(
     // through to the existing Llama/3B path unchanged.
     match resolve_gemma4_runtime(&state, &req).await {
         Ok(Some((id, runtime))) => {
+            if has_image_input {
+                return vision_unsupported_on_lane("gemma4");
+            }
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
             }
@@ -10733,6 +11483,9 @@ async fn chat_completions(
     // (block-level SSE; a denoise block is minutes of compute).
     match resolve_dg_runtime(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
+            if has_image_input {
+                return vision_unsupported_on_lane("diffusion-gemma");
+            }
             if constraint.is_some() {
                 return constraint_unsupported_on_lane();
             }
@@ -10746,6 +11499,9 @@ async fn chat_completions(
         }
         Ok(None) => {}
         Err(resp) => return resp,
+    }
+    if has_image_input {
+        return vision_unsupported_on_lane("dense");
     }
     // Multi-choice (n > 1) fans out into independent generations. Validate the
     // count and reject the combinations Camelid does not implement before the
@@ -11492,17 +12248,17 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 | GgufTensorType::Q2K
                 | GgufTensorType::Q3K
         ) && matches!(desc.dimensions.len(), 2 | 3);
-        // Q1_0 2-D tensors load via `load_q1_0_as_q8_0_blocks_linear`, which
-        // losslessly re-encodes them into Q8_0 blocks and leaves `data` empty — so
-        // like the K-quant wire path above they never materialize an f32 copy and
-        // must not be charged for one. They are NOT free, though: the re-encoded
-        // blocks are retained in RAM, and that real cost is counted below (a 1.7B
-        // model is ~1.9 GB of blocks, against the ~6.9 GB f32 figure this arm
-        // removes). Under-counting here would let an 8B Q1_0 file past a budget it
-        // genuinely cannot meet.
-        let transcoded_q1_0 =
-            desc.tensor_type == GgufTensorType::Q1_0 && desc.dimensions.len() == 2;
-        let f32_bytes = if file_backed_q8_linear || wire_resident_kquant || transcoded_q1_0 {
+        // Prism Q1_0/Q2_0 2-D tensors remain in their native packed wire layout
+        // for the Metal resident lane. They carry neither an f32 copy nor the
+        // historical Q1->Q8 expansion, so budget the exact descriptor bytes.
+        let wire_resident_prism = matches!(
+            desc.tensor_type,
+            GgufTensorType::Q1_0
+                | GgufTensorType::Q2_0G64
+                | GgufTensorType::Q2_0G128
+                | GgufTensorType::Pq2_0
+        ) && desc.dimensions.len() == 2;
+        let f32_bytes = if file_backed_q8_linear || wire_resident_kquant || wire_resident_prism {
             0
         } else {
             element_count.checked_mul(4).ok_or_else(|| {
@@ -11512,10 +12268,11 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 ))
             })?
         };
-        let retained_source_bytes = if transcoded_q1_0
-            || (retain_q8_blocks
-                && !file_backed_q8_linear
-                && desc.tensor_type == GgufTensorType::Q8_0)
+        let retained_source_bytes = if wire_resident_prism {
+            desc.n_bytes
+        } else if retain_q8_blocks
+            && !file_backed_q8_linear
+            && desc.tensor_type == GgufTensorType::Q8_0
         {
             let q8_block_count = element_count.checked_add(31).ok_or_else(|| {
                 BackendError::InvalidTensorData(format!(
@@ -17177,6 +17934,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_image_url_part_preserves_order_and_collects_data_url() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
+                {"type": "text", "text": "What is this?"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            message.content,
+            "<|vision_start|><|image_pad|><|vision_end|>What is this?"
+        );
+        assert_eq!(message.image_urls, ["data:image/png;base64,AQID"]);
+        assert!(message.unsupported_content_parts.is_empty());
+    }
+
+    #[test]
+    fn prism_image_data_url_accepts_local_png_and_rejects_remote_fetches() {
+        assert_eq!(
+            decode_prism_image_data_url("data:image/png;base64,AQID").unwrap(),
+            [1, 2, 3]
+        );
+        assert!(decode_prism_image_data_url("https://example.invalid/image.png").is_err());
+    }
+
+    #[test]
     fn health_backend_reports_the_effective_serving_lane() {
         assert_eq!(health_backend(false, false, false, false), "none");
         assert_eq!(health_backend(false, false, false, true), "llama");
@@ -18932,6 +19716,24 @@ mod tests {
             classify_model_lane(Some("qwen3"), "Ternary-Bonsai-4B-TQ2_0.gguf"),
             ModelLaneClass::Supported,
         );
+        // The seven Mac mini 2-certified Prism artifacts are catalog-backed
+        // exact rows. A real qwen35 header plus any one of these exact filenames
+        // must land in Supported; neighboring files stay experimental below.
+        for filename in [
+            "Bonsai-4B-Q1_0.gguf",
+            "Ternary-Bonsai-4B-Q2_0.gguf",
+            "Ternary-Bonsai-4B-PQ2_0.gguf",
+            "Bonsai-8B-Q1_0.gguf",
+            "Ternary-Bonsai-8B-Q2_0.gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            "Ternary-Bonsai-27B-Q2_0.gguf",
+        ] {
+            assert_eq!(
+                classify_model_lane(Some("qwen35"), filename),
+                ModelLaneClass::Supported,
+                "{filename} should resolve through its supported catalog row",
+            );
+        }
         // Implemented architecture but NOT a supported exact artifact (different
         // quant/filename) â†’ experimental, never falsely supported.
         assert_eq!(
@@ -18940,6 +19742,10 @@ mod tests {
         );
         assert_eq!(
             classify_model_lane(Some("qwen35"), "ornith-1.0-9b-Q6_K.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
+        assert_eq!(
+            classify_model_lane(Some("qwen35"), "Ternary-Bonsai-8B-PQ2_0.gguf"),
             ModelLaneClass::ExperimentalImplemented,
         );
         assert_eq!(
@@ -19195,6 +20001,16 @@ mod tests {
                 // greedy token-identical vs llama.cpp acd79d6 + 1 near-tie. Decode
                 // ~0.53x llama (general forward gap). See qa/ternary/ receipt.
                 "ternary_bonsai_4b_tq2_0",
+                // Prism ML Bonsai exact-artifact macOS Metal rows. These are
+                // intentionally row-scoped: the seven catalog ids below are the
+                // seven hash-pinned files in the Mac mini 2 receipt.
+                "bonsai_4b_q1_0",
+                "ternary_bonsai_4b_q2_0",
+                "ternary_bonsai_4b_pq2_0",
+                "bonsai_8b_q1_0",
+                "ternary_bonsai_8b_q2_0",
+                "bonsai_27b_q1_0",
+                "ternary_bonsai_27b_q2_0",
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 // Llama-3.2-3B-Instruct K-quant rows (filename-anchored ids): GPU-resident
@@ -19275,6 +20091,7 @@ mod tests {
                 "llama_spm_decoder",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
                 "nomic_bert_encoder_exact_v1_5_q8_0",
+                "prism_bonsai_qwen35_exact_4b_8b_27b_metal",
                 "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
             ])
         );
@@ -20720,6 +21537,7 @@ mod tests {
         assert_eq!(
             render_chat_prompt(
                 &[ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
@@ -20754,11 +21572,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "Be terse.".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
@@ -20783,6 +21603,7 @@ mod tests {
         // grammar).
         let err = render_chat_prompt_for_tokenization_with_tools(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -20944,6 +21765,7 @@ mod tests {
         assert_eq!(
             render_chat_prompt(
                 &[ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " hello ".to_string(),
@@ -20964,21 +21786,25 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "system".to_string(),
                         content: "Answer briefly.".to_string(),
                     },
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Say alpha.".to_string(),
                     },
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "assistant".to_string(),
                         content: "alpha".to_string(),
                     },
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Now say beta.".to_string(),
@@ -21000,11 +21826,13 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Complete cam".to_string(),
                     },
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "assistant".to_string(),
                         content: "elid".to_string(),
@@ -21025,6 +21853,7 @@ mod tests {
         assert_eq!(
             render_chat_prompt(
                 &[ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "Line one.\n\n  Indented line two.  ".to_string(),
@@ -21049,11 +21878,13 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "system".to_string(),
                         content: " Be brief. ".to_string(),
                     },
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: " Hello there. ".to_string(),
@@ -21073,6 +21904,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "Hello there.".to_string(),
@@ -21095,16 +21927,19 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Complete cam".to_string(),
                     },
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "assistant".to_string(),
                         content: " elid ".to_string(),
                     },
                     ChatMessage {
+                        image_urls: Vec::new(),
                         unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Now say hi".to_string(),
@@ -21138,6 +21973,7 @@ mod tests {
         })];
 
         let messages = vec![ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "Read notes.txt".to_string(),
@@ -21167,11 +22003,13 @@ mod tests {
 
         let messages = vec![
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
             },
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "Do something".to_string(),
@@ -21199,21 +22037,25 @@ mod tests {
 
         let messages = vec![
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "Read it".to_string(),
             },
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "assistant".to_string(),
                 content: "read_file({\"path\":\"notes.txt\"})".to_string(),
             },
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "tool".to_string(),
                 content: "alpha\nbeta\ngamma".to_string(),
             },
             ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "How many lines?".to_string(),
@@ -21241,6 +22083,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -21264,6 +22107,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -21289,11 +22133,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "  Be brief.  ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "  hello  ".to_string(),
@@ -21320,11 +22166,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "  Be brief.  ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "  hello  ".to_string(),
@@ -21351,16 +22199,19 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
@@ -21387,16 +22238,19 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
@@ -21422,6 +22276,7 @@ mod tests {
     fn tool_render_nested_vs_flat_diagnostic() {
         let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
         let user = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "read notes.txt".to_string(),
@@ -21457,11 +22312,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "  Be brief.  ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "  hello  ".to_string(),
@@ -21487,6 +22344,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -21511,21 +22369,25 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: " Answer tersely. ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
@@ -21551,11 +22413,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "Complete cam".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " elid ".to_string(),
@@ -21580,6 +22444,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -21603,6 +22468,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -21627,11 +22493,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "Complete cam".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " elid ".to_string(),
@@ -21659,6 +22527,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -21684,21 +22553,25 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: " Answer tersely. ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
@@ -21727,11 +22600,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "Be brief.".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
@@ -21757,11 +22632,13 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: " system ".to_string(),
                     content: "Be brief.".to_string(),
                 },
                 ChatMessage {
+                    image_urls: Vec::new(),
                     unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
@@ -21785,6 +22662,7 @@ mod tests {
             "{% for message in messages %}{{ message['role'] }}={{ message['content'] }}\n{% endfor %}",
         );
         let messages = [ChatMessage {
+            image_urls: Vec::new(),
             unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -21812,6 +22690,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -21831,6 +22710,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -21854,6 +22734,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -21882,6 +22763,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -21908,6 +22790,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -21935,6 +22818,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -21962,6 +22846,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
@@ -22005,6 +22890,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -22028,6 +22914,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -23409,6 +24296,102 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             architecture: "qwen35",
             license: "mit",
             task_tags: &["general", "tools"],
+        },
+        // Prism ML publishes the exact Mac mini 2-certified Bonsai bytes. Keep
+        // these ids identical to their /api/capabilities exact-row ids: that
+        // join is what makes the Models page say Supported rather than merely
+        // decorating an unverified download. Sizes are the HF LFS byte counts,
+        // rechecked against the hash-pinned test files on 2026-08-01.
+        CatalogItem {
+            catalog_id: "bonsai_4b_q1_0",
+            name: "Bonsai 4B Q1_0",
+            repo_id: "prism-ml/Bonsai-4B-gguf",
+            filename: "Bonsai-4B-Q1_0.gguf",
+            size_bytes: 572270624,
+            downloads: 16415,
+            likes: 53,
+            quant: "Q1_0",
+            architecture: "qwen35",
+            license: "apache-2.0",
+            task_tags: &["general", "reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "ternary_bonsai_4b_q2_0",
+            name: "Ternary Bonsai 4B Q2_0",
+            repo_id: "prism-ml/Ternary-Bonsai-4B-gguf",
+            filename: "Ternary-Bonsai-4B-Q2_0.gguf",
+            size_bytes: 1074969344,
+            downloads: 7994,
+            likes: 30,
+            quant: "Q2_0",
+            architecture: "qwen35",
+            license: "apache-2.0",
+            task_tags: &["general", "reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "ternary_bonsai_4b_pq2_0",
+            name: "Ternary Bonsai 4B PQ2_0",
+            repo_id: "prism-ml/Ternary-Bonsai-4B-gguf",
+            filename: "Ternary-Bonsai-4B-PQ2_0.gguf",
+            size_bytes: 1074969344,
+            downloads: 7994,
+            likes: 30,
+            quant: "PQ2_0",
+            architecture: "qwen35",
+            license: "apache-2.0",
+            task_tags: &["general", "reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "bonsai_8b_q1_0",
+            name: "Bonsai 8B Q1_0",
+            repo_id: "prism-ml/Bonsai-8B-gguf",
+            filename: "Bonsai-8B-Q1_0.gguf",
+            size_bytes: 1158654496,
+            downloads: 64163,
+            likes: 762,
+            quant: "Q1_0",
+            architecture: "qwen35",
+            license: "apache-2.0",
+            task_tags: &["general", "reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "ternary_bonsai_8b_q2_0",
+            name: "Ternary Bonsai 8B Q2_0",
+            repo_id: "prism-ml/Ternary-Bonsai-8B-gguf",
+            filename: "Ternary-Bonsai-8B-Q2_0.gguf",
+            size_bytes: 2182184672,
+            downloads: 120197,
+            likes: 130,
+            quant: "Q2_0",
+            architecture: "qwen35",
+            license: "apache-2.0",
+            task_tags: &["general", "reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "bonsai_27b_q1_0",
+            name: "Bonsai 27B Q1_0",
+            repo_id: "prism-ml/Bonsai-27B-gguf",
+            filename: "Bonsai-27B-Q1_0.gguf",
+            size_bytes: 3803452480,
+            downloads: 2510237,
+            likes: 719,
+            quant: "Q1_0",
+            architecture: "qwen35",
+            license: "apache-2.0",
+            task_tags: &["general", "reasoning", "coding", "tools"],
+        },
+        CatalogItem {
+            catalog_id: "ternary_bonsai_27b_q2_0",
+            name: "Ternary Bonsai 27B Q2_0",
+            repo_id: "prism-ml/Ternary-Bonsai-27B-gguf",
+            filename: "Ternary-Bonsai-27B-Q2_0.gguf",
+            size_bytes: 7165121600,
+            downloads: 716341,
+            likes: 1136,
+            quant: "Q2_0",
+            architecture: "qwen35",
+            license: "apache-2.0",
+            task_tags: &["general", "reasoning", "coding", "tools"],
         },
     ]
 }
@@ -26121,6 +27104,9 @@ mod catalog_fit_tests {
 
     fn host(cuda: bool, vram_free: u64, ram_total: u64, ram_free: u64) -> HardwareProfile {
         HardwareProfile {
+            metal_available: false,
+            metal_device_name: None,
+            metal_unified_memory: false,
             cuda_available: cuda,
             cuda_device_count: if cuda { 1 } else { 0 },
             cuda_device_name: None,
@@ -26241,6 +27227,63 @@ mod catalog_fit_tests {
                     item.catalog_id
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prism_supported_rows_are_exact_downloadable_catalog_artifacts() {
+        let expected = [
+            (
+                "bonsai_4b_q1_0",
+                "prism-ml/Bonsai-4B-gguf",
+                "Bonsai-4B-Q1_0.gguf",
+                572270624,
+            ),
+            (
+                "ternary_bonsai_4b_q2_0",
+                "prism-ml/Ternary-Bonsai-4B-gguf",
+                "Ternary-Bonsai-4B-Q2_0.gguf",
+                1074969344,
+            ),
+            (
+                "ternary_bonsai_4b_pq2_0",
+                "prism-ml/Ternary-Bonsai-4B-gguf",
+                "Ternary-Bonsai-4B-PQ2_0.gguf",
+                1074969344,
+            ),
+            (
+                "bonsai_8b_q1_0",
+                "prism-ml/Bonsai-8B-gguf",
+                "Bonsai-8B-Q1_0.gguf",
+                1158654496,
+            ),
+            (
+                "ternary_bonsai_8b_q2_0",
+                "prism-ml/Ternary-Bonsai-8B-gguf",
+                "Ternary-Bonsai-8B-Q2_0.gguf",
+                2182184672,
+            ),
+            (
+                "bonsai_27b_q1_0",
+                "prism-ml/Bonsai-27B-gguf",
+                "Bonsai-27B-Q1_0.gguf",
+                3803452480,
+            ),
+            (
+                "ternary_bonsai_27b_q2_0",
+                "prism-ml/Ternary-Bonsai-27B-gguf",
+                "Ternary-Bonsai-27B-Q2_0.gguf",
+                7165121600,
+            ),
+        ];
+
+        for (id, repo, filename, size) in expected {
+            let item = row(id);
+            assert_eq!(item.repo_id, repo);
+            assert_eq!(item.filename, filename);
+            assert_eq!(item.size_bytes, size);
+            assert!(super::supported_compatibility_row_ids().contains(id));
+            assert!(super::filename_is_supported_exact_row(filename));
         }
     }
 
