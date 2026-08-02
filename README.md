@@ -37,7 +37,7 @@ ready to use.
 > Experimental; the claim is limited to the listed artifacts on macOS Apple Silicon Metal.
 > [See the exact rows and vision setup.](#prismml--bonsai-macos-metal-support)
 > Also make sure to download [Ternary-Bonsai-27B-mmproj-Q8_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf)
-> and drop it in your models page for vision projector. I will have this automated in the next release.
+> and drop it in your models directory for vision projector. I will have this automated in the next release.
 
 ## Why Camelid
 
