@@ -1,11 +1,222 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{BackendError, Result};
 use crate::inference::LlamaInferenceSession;
 use crate::tensor::{CpuTensor, Q4KRepack8Cell, RuntimeDType, TensorShape};
+
+/// Wire version of the `serve-distributed` connect handshake.
+///
+/// Bump on any change to [`NodeIdentity`]'s meaning. Peers require equality, so an old
+/// binary meeting a new one is refused at connect rather than producing wrong numbers
+/// somewhere deep in a forward pass.
+pub const HANDSHAKE_VERSION: u32 = 1;
+
+const HANDSHAKE_MAGIC: u32 = 0xCA9E_0001;
+
+/// A handshake is a few hundred bytes. The cap exists so a hostile or confused peer
+/// cannot make the other side allocate on a length it chose.
+const MAX_HANDSHAKE_BYTES: u32 = 64 * 1024;
+
+/// What a node asserts about itself when a distributed connection opens.
+///
+/// The pipeline ships raw activations between two processes that each hold half a model.
+/// Nothing in the activation stream identifies the model, the build, or the split, so
+/// without this exchange two peers running *different* weights or *different* code
+/// connect happily and produce confident, wrong output. Every field below is one way
+/// that can happen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeIdentity {
+    pub wire_version: u32,
+    /// Engine build. Different code can mean different math, so peers must match.
+    pub engine_version: String,
+    /// Full-file SHA-256 of the GGUF. This is the model's identity: file length (what a
+    /// weaker handshake might compare) is equal for any two same-size quantisations.
+    pub model_sha256: String,
+    pub total_layers: u32,
+    pub hidden_size: u32,
+    /// The layer range the worker owns, `[start, end)`.
+    pub worker_layer_start: u32,
+    pub worker_layer_end: u32,
+    /// Host platform, e.g. `windows/x86_64`. **Reported, never enforced** — a coordinator
+    /// and worker on different platforms are a supported configuration and have been
+    /// measured producing byte-identical output. Carried so an operator (and a future
+    /// receipt) can see what actually ran.
+    pub platform: String,
+    /// Presented by the coordinator when the worker requires one. Never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl NodeIdentity {
+    /// Build the identity for a node holding `worker_layers` of `model`.
+    ///
+    /// Hashing is served from the on-disk digest cache, so this is a stat on the warm
+    /// path rather than a re-read of the whole GGUF.
+    pub fn for_model(
+        model: &Path,
+        total_layers: u32,
+        hidden_size: u32,
+        worker_layers: std::ops::Range<u32>,
+    ) -> Result<Self> {
+        let model_sha256 = crate::receipt::sha256_file_hex_cached(model).map_err(|err| {
+            BackendError::RuntimeShapeMismatch(format!(
+                "could not hash {} for the distributed handshake: {err}",
+                model.display()
+            ))
+        })?;
+        Ok(Self {
+            wire_version: HANDSHAKE_VERSION,
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            model_sha256,
+            total_layers,
+            hidden_size,
+            worker_layer_start: worker_layers.start,
+            worker_layer_end: worker_layers.end,
+            platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+            token: None,
+        })
+    }
+
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// The first field on which `self` (the worker's own view) disagrees with the
+    /// `peer` that just connected, named exactly.
+    ///
+    /// `platform` is deliberately absent: see the field's documentation.
+    fn first_mismatch(&self, peer: &Self) -> Option<String> {
+        fn differs<T: PartialEq + std::fmt::Display>(
+            field: &str,
+            worker: &T,
+            coordinator: &T,
+        ) -> Option<String> {
+            (worker != coordinator).then(|| {
+                format!("{field} mismatch: worker has {worker}, coordinator has {coordinator}")
+            })
+        }
+        differs("wire_version", &self.wire_version, &peer.wire_version)
+            .or_else(|| differs("engine_version", &self.engine_version, &peer.engine_version))
+            .or_else(|| differs("model_sha256", &self.model_sha256, &peer.model_sha256))
+            .or_else(|| differs("total_layers", &self.total_layers, &peer.total_layers))
+            .or_else(|| differs("hidden_size", &self.hidden_size, &peer.hidden_size))
+            .or_else(|| {
+                differs(
+                    "worker_layer_start",
+                    &self.worker_layer_start,
+                    &peer.worker_layer_start,
+                )
+            })
+            .or_else(|| {
+                differs(
+                    "worker_layer_end",
+                    &self.worker_layer_end,
+                    &peer.worker_layer_end,
+                )
+            })
+    }
+
+    /// Whether `peer` may drive this node, and why not when it may not.
+    ///
+    /// `required_token` is the worker's configured secret. When set, a coordinator that
+    /// presents nothing or presents the wrong value is refused; the comparison is
+    /// length-independent and constant time so a rejected peer learns nothing about the
+    /// secret from how long the refusal took.
+    pub fn admit(
+        &self,
+        peer: &Self,
+        required_token: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        if let Some(expected) = required_token {
+            match peer.token.as_deref() {
+                Some(presented) if constant_time_eq(expected.as_bytes(), presented.as_bytes()) => {}
+                Some(_) => return Err("authentication failed: token rejected".to_string()),
+                None => {
+                    return Err(
+                        "authentication failed: this worker requires a token and the \
+                         coordinator presented none"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        match self.first_mismatch(peer) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Compares without an early exit and without leaking the secret's length.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // Fold length into the result instead of returning early on it.
+    let mut diff = (a.len() ^ b.len()) as u8;
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The worker's answer to a connect attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandshakeResponse {
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<NodeIdentity>,
+}
+
+fn write_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> std::io::Result<()> {
+    let body = serde_json::to_vec(value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let len = u32::try_from(body.len())
+        .ok()
+        .filter(|n| *n <= MAX_HANDSHAKE_BYTES);
+    let Some(len) = len else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "handshake frame exceeds the maximum size",
+        ));
+    };
+    writer.write_all(&HANDSHAKE_MAGIC.to_le_bytes())?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(&body)?;
+    writer.flush()
+}
+
+fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> std::io::Result<T> {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if u32::from_le_bytes(magic) != HANDSHAKE_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a Camelid distributed handshake",
+        ));
+    }
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes)?;
+    let len = u32::from_le_bytes(len_bytes);
+    if len > MAX_HANDSHAKE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "handshake frame exceeds the maximum size",
+        ));
+    }
+    let mut body = vec![0u8; len as usize];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
 
 /// Which whole-model tensors a node loads in the `serve-distributed` pipeline.
 ///
@@ -60,6 +271,174 @@ mod pipeline_role_tests {
             positional,
             "a head-shard coordinator must not inherit the positional rule"
         );
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+
+    fn identity() -> NodeIdentity {
+        NodeIdentity {
+            wire_version: HANDSHAKE_VERSION,
+            engine_version: "0.5.2".to_string(),
+            model_sha256: "a".repeat(64),
+            total_layers: 16,
+            hidden_size: 2048,
+            worker_layer_start: 8,
+            worker_layer_end: 16,
+            platform: "linux/x86_64".to_string(),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn a_matching_peer_is_admitted() {
+        assert!(identity().admit(&identity(), None).is_ok());
+    }
+
+    /// Each of these is a way two nodes can connect and compute different mathematics.
+    /// The refusal has to name the field, or an operator is left guessing which of two
+    /// machines is the wrong one.
+    #[test]
+    fn every_identity_field_is_refused_by_name() {
+        let mut cases: Vec<(&str, NodeIdentity)> = Vec::new();
+        let mut peer = identity();
+        peer.wire_version += 1;
+        cases.push(("wire_version", peer));
+        let mut peer = identity();
+        peer.engine_version = "0.5.1".to_string();
+        cases.push(("engine_version", peer));
+        let mut peer = identity();
+        peer.model_sha256 = "b".repeat(64);
+        cases.push(("model_sha256", peer));
+        let mut peer = identity();
+        peer.total_layers = 32;
+        cases.push(("total_layers", peer));
+        let mut peer = identity();
+        peer.hidden_size = 4096;
+        cases.push(("hidden_size", peer));
+        let mut peer = identity();
+        peer.worker_layer_start = 7;
+        cases.push(("worker_layer_start", peer));
+        let mut peer = identity();
+        peer.worker_layer_end = 15;
+        cases.push(("worker_layer_end", peer));
+
+        for (field, peer) in cases {
+            let err = identity()
+                .admit(&peer, None)
+                .expect_err("a peer differing in one field must be refused");
+            assert!(
+                err.contains(field),
+                "refusal must name the field; {field} produced: {err}"
+            );
+        }
+    }
+
+    /// A same-size GGUF with different contents is the case a length comparison cannot
+    /// see, and it is the one that silently produces wrong output.
+    #[test]
+    fn a_different_model_of_the_same_size_is_refused() {
+        let mut peer = identity();
+        peer.model_sha256 = "c".repeat(64);
+        let err = identity().admit(&peer, None).unwrap_err();
+        assert!(err.contains("model_sha256"), "{err}");
+    }
+
+    /// Platform difference is a supported configuration: a Windows x86_64 coordinator and
+    /// an ARM64 macOS worker have been measured producing byte-identical output. Refusing
+    /// it would break a working cluster.
+    #[test]
+    fn a_different_platform_is_reported_not_refused() {
+        let mut peer = identity();
+        peer.platform = "macos/aarch64".to_string();
+        assert!(identity().admit(&peer, None).is_ok());
+    }
+
+    #[test]
+    fn a_worker_with_a_token_refuses_a_coordinator_without_one() {
+        let err = identity().admit(&identity(), Some("s3cret")).unwrap_err();
+        assert!(err.contains("requires a token"), "{err}");
+    }
+
+    #[test]
+    fn a_wrong_token_is_refused() {
+        let peer = identity().with_token(Some("wrong".to_string()));
+        let err = identity().admit(&peer, Some("s3cret")).unwrap_err();
+        assert!(err.contains("token rejected"), "{err}");
+    }
+
+    #[test]
+    fn the_right_token_is_admitted() {
+        let peer = identity().with_token(Some("s3cret".to_string()));
+        assert!(identity().admit(&peer, Some("s3cret")).is_ok());
+    }
+
+    /// A token check that ran before the identity check would let a stranger probe which
+    /// models a worker holds. Identity is only compared once the peer has authenticated.
+    #[test]
+    fn authentication_is_decided_before_identity_is_revealed() {
+        let mut peer = identity();
+        peer.model_sha256 = "d".repeat(64);
+        let err = identity().admit(&peer, Some("s3cret")).unwrap_err();
+        assert!(
+            err.contains("authentication failed"),
+            "an unauthenticated peer must not learn about model identity, got: {err}"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn a_frame_round_trips() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &identity()).unwrap();
+        let back: NodeIdentity = read_frame(&mut buf.as_slice()).unwrap();
+        assert_eq!(back, identity());
+    }
+
+    #[test]
+    fn a_frame_without_the_magic_is_rejected() {
+        let buf = vec![0u8; 8];
+        let err = read_frame::<_, NodeIdentity>(&mut buf.as_slice()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("not a Camelid distributed handshake"));
+    }
+
+    /// The length prefix is attacker-chosen, so it is bounded before it is allocated.
+    #[test]
+    fn an_oversized_declared_length_is_rejected_before_allocating() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&HANDSHAKE_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = read_frame::<_, NodeIdentity>(&mut buf.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("maximum size"), "{err}");
+    }
+
+    #[test]
+    fn the_bind_policy_matches_the_http_servers_rule() {
+        let loopback: SocketAddr = "127.0.0.1:5005".parse().unwrap();
+        let public: SocketAddr = "0.0.0.0:5005".parse().unwrap();
+
+        assert!(check_worker_bind_policy(&loopback, false, false).is_ok());
+        assert!(check_worker_bind_policy(&public, true, false).is_ok());
+        assert!(check_worker_bind_policy(&public, false, true).is_ok());
+
+        let err = check_worker_bind_policy(&public, false, false).unwrap_err();
+        assert!(
+            err.contains("refusing unauthenticated non-loopback"),
+            "{err}"
+        );
+        assert!(err.contains("CAMELID_DISTRIBUTED_TOKEN"), "{err}");
     }
 }
 
@@ -170,9 +549,32 @@ pub struct DistributedClient {
 }
 
 impl DistributedClient {
-    pub fn connect(addr: &str) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+    /// Open a connection and complete the identity handshake.
+    ///
+    /// A worker that disagrees about the model, the build, or the split refuses here, so a
+    /// misconfigured pair fails at startup with a named field instead of producing plausible
+    /// wrong output for the life of the process.
+    pub fn connect(addr: &str, identity: &NodeIdentity) -> std::io::Result<Self> {
+        let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
+        write_frame(&mut stream, identity)?;
+        let response: HandshakeResponse = read_frame(&mut stream)?;
+        if !response.accepted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "worker {addr} refused the distributed handshake: {}",
+                    response.refusal.as_deref().unwrap_or("no reason given")
+                ),
+            ));
+        }
+        if let Some(worker) = &response.worker {
+            tracing::info!(
+                worker_platform = %worker.platform,
+                worker_layers = format!("{}..{}", worker.worker_layer_start, worker.worker_layer_end),
+                "distributed handshake accepted"
+            );
+        }
         Ok(Self {
             stream: Mutex::new(stream),
             addr: addr.to_string(),
@@ -261,9 +663,45 @@ impl DistributedClient {
 pub static DISTRIBUTED_CLIENT: OnceLock<DistributedClient> = OnceLock::new();
 pub static DISTRIBUTED_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 
-pub fn run_worker_loop(addr: &str, session: LlamaInferenceSession) -> anyhow::Result<()> {
+/// Refuse an unauthenticated worker listener that faces the network.
+///
+/// This mirrors the rule the HTTP server already applies in [`crate::api::server`]:
+/// loopback stays frictionless, and exposing the port requires either a token or an
+/// explicit acknowledgement. The worker port deserves at least that much — it accepts raw
+/// activations and spends this machine's CPU on them, with no request logging and no
+/// per-request authorization behind it.
+pub fn check_worker_bind_policy(
+    addr: &SocketAddr,
+    has_token: bool,
+    allow_unauthenticated_remote: bool,
+) -> std::result::Result<(), String> {
+    if addr.ip().is_loopback() || has_token || allow_unauthenticated_remote {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing unauthenticated non-loopback distributed worker listener {addr}; set \
+         --distributed-token/CAMELID_DISTRIBUTED_TOKEN or explicitly acknowledge the risk \
+         with --allow-unauthenticated-remote"
+    ))
+}
+
+pub fn run_worker_loop(
+    addr: &str,
+    session: LlamaInferenceSession,
+    identity: NodeIdentity,
+    required_token: Option<String>,
+    allow_unauthenticated_remote: bool,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    run_worker_loop_on_listener(listener, session)
+    let bound = listener.local_addr()?;
+    if let Err(reason) = check_worker_bind_policy(
+        &bound,
+        required_token.is_some(),
+        allow_unauthenticated_remote,
+    ) {
+        anyhow::bail!(reason);
+    }
+    run_worker_loop_on_listener(listener, session, identity, required_token)
 }
 
 /// Serve the worker protocol on an already-bound listener.
@@ -275,6 +713,8 @@ pub fn run_worker_loop(addr: &str, session: LlamaInferenceSession) -> anyhow::Re
 pub fn run_worker_loop_on_listener(
     listener: TcpListener,
     mut session: LlamaInferenceSession,
+    identity: NodeIdentity,
+    required_token: Option<String>,
 ) -> anyhow::Result<()> {
     tracing::info!(addr = ?listener.local_addr(), "Distributed Worker TCP server listening");
 
@@ -288,7 +728,48 @@ pub fn run_worker_loop_on_listener(
         };
 
         let _ = stream.set_nodelay(true);
-        tracing::info!("Worker accepted connection from coordinator");
+
+        // Admit before a single activation is read: a peer that disagrees about the model,
+        // the build or the split can only produce wrong numbers, and one that cannot
+        // authenticate has no business spending this machine's CPU.
+        let peer: NodeIdentity = match read_frame(&mut stream) {
+            Ok(peer) => peer,
+            Err(e) => {
+                tracing::warn!(error = %e, "rejected a connection that did not open with a handshake");
+                continue;
+            }
+        };
+        if let Err(reason) = identity.admit(&peer, required_token.as_deref()) {
+            tracing::warn!(%reason, "refused a distributed coordinator");
+            let _ = write_frame(
+                &mut stream,
+                &HandshakeResponse {
+                    accepted: false,
+                    refusal: Some(reason),
+                    worker: None,
+                },
+            );
+            continue;
+        }
+        if let Err(e) = write_frame(
+            &mut stream,
+            &HandshakeResponse {
+                accepted: true,
+                refusal: None,
+                // Never echo a credential back, whatever this node was configured with.
+                worker: Some(NodeIdentity {
+                    token: None,
+                    ..identity.clone()
+                }),
+            },
+        ) {
+            tracing::error!(error = %e, "failed to acknowledge the handshake");
+            continue;
+        }
+        tracing::info!(
+            coordinator_platform = %peer.platform,
+            "Worker accepted connection from coordinator"
+        );
 
         loop {
             let mut header_buf = [0u8; 16];
