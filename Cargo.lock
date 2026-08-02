@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "camelid"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "camelid-desktop"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "serde_json",
