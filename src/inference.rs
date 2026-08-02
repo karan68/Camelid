@@ -16642,6 +16642,7 @@ fn run_q8_0_unified_prefill_tiled(
     output: &mut [f32],
     use_avx2: bool,
     use_vnni: bool,
+    use_avxvnni: bool,
     use_4x8: bool,
     groups_per_chunk: usize,
 ) {
@@ -16718,6 +16719,7 @@ fn run_q8_0_unified_prefill_tiled(
                         &mut sums,
                         use_avx2,
                         use_vnni,
+                        use_avxvnni,
                     );
                 }
                 for (ir, row_sums) in sums.iter().enumerate() {
@@ -16750,6 +16752,17 @@ fn q8_owner_avx512vnni_available() -> bool {
     false
 }
 
+/// Whether the 256-bit AVX-VNNI owner microkernel can run on this CPU. `vpdpbusd`
+/// without AVX-512 is the whole consumer Intel line from Alder Lake onwards.
+#[cfg(target_arch = "x86_64")]
+fn q8_owner_avxvnni_available() -> bool {
+    std::arch::is_x86_feature_detected!("avxvnni") && std::arch::is_x86_feature_detected!("avx2")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn q8_owner_avxvnni_available() -> bool {
+    false
+}
+
 /// Per-block 4x4 accumulate for the unified owner: AVX-512 VNNI when available (v2), else the
 /// AVX2/scalar microkernel (v1). All three produce a bit-identical i32 dot (integer, order-free),
 /// so the f32 result is byte-identical regardless of which runs.
@@ -16760,6 +16773,7 @@ fn q8_0_unified_accumulate(
     sums: &mut [[f32; 4]; 4],
     use_avx2: bool,
     use_vnni: bool,
+    use_avxvnni: bool,
 ) {
     #[cfg(target_arch = "x86_64")]
     if use_vnni {
@@ -16769,7 +16783,16 @@ fn q8_0_unified_accumulate(
         }
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if use_avxvnni {
+        // SAFETY: the owner dispatch sets use_avxvnni only when avx2 + avxvnni are detected.
+        unsafe {
+            q8_0_packed_rows4_gemm4_accumulate_block_avxvnni(input_block, weight_block, sums);
+        }
+        return;
+    }
     let _ = use_vnni;
+    let _ = use_avxvnni;
     q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_block, sums, use_avx2);
 }
 
@@ -16828,6 +16851,64 @@ unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(
             lanes[2] + lanes[3] + lanes[10] + lanes[11],
             lanes[4] + lanes[5] + lanes[12] + lanes[13],
             lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums[lane][output_lane] += *dot as f32 * weight_block.scales[output_lane] * input_scale;
+        }
+    }
+}
+
+/// Bit-exact 256-bit AVX-VNNI 4x4 microkernel: the sibling of
+/// [`q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni`] for parts that carry `vpdpbusd` but no
+/// AVX-512 — every consumer Intel line from Alder Lake onwards, which otherwise falls all the way
+/// back to the AVX2 `maddubs`+`madd` pair.
+///
+/// Structure is the AVX2 sibling's, not the zmm one's: one 32-byte weight chunk (4 output lanes x 8
+/// K-values) against each input lane's 8 K-values broadcast four times. The only change is that
+/// `maddubs_epi16` + `madd_epi16(_, ones)` + `add_epi32` collapses into a single `dpbusd`, which
+/// computes the same "sum four adjacent byte products into each i32 lane" and, unlike `maddubs`,
+/// carries no saturating i16 intermediate.
+///
+/// `dpbusd` needs an UNSIGNED first operand, so the weight sign is folded into the input exactly as
+/// the AVX2 sibling does it: `sign_epi8(w, w)` is `|w|`, and where `w == 0` it yields 0 on both
+/// sides so the product is 0 either way. Q8_0 quants are in [-127, 127], so negating an input
+/// cannot overflow i8. Accumulation is i32 and associative, and the f32 tail keeps the siblings'
+/// `(dot * weight_scale) * input_scale` order with no FMA, so the result is byte-identical.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avxvnni(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
+) {
+    use std::arch::x86_64::{
+        _mm256_dpbusd_avx_epi32, _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_setzero_si256,
+        _mm256_sign_epi8, _mm256_storeu_si256,
+    };
+    let wq = weight_block.quants.as_ptr();
+    let iq = input_block.quants.as_ptr();
+    let mut acc = [_mm256_setzero_si256(); 4];
+    for chunk in 0..4usize {
+        let weight32 = unsafe { _mm256_loadu_si256(wq.add(chunk * 32).cast()) };
+        let abs_weight = _mm256_sign_epi8(weight32, weight32);
+        for (lane, acc_lane) in acc.iter_mut().enumerate() {
+            let lane_values =
+                unsafe { std::ptr::read_unaligned(iq.add(chunk * 32 + lane * 8).cast::<i64>()) };
+            let signed_input = _mm256_sign_epi8(_mm256_set1_epi64x(lane_values), weight32);
+            *acc_lane = _mm256_dpbusd_avx_epi32(*acc_lane, abs_weight, signed_input);
+        }
+    }
+    for (lane, acc_lane) in acc.iter().enumerate() {
+        let mut lanes = [0_i32; 8];
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        // Lane pairs map to output lanes exactly as the AVX2 sibling's pairwise reduce does.
+        let dots = [
+            lanes[0] + lanes[1],
+            lanes[2] + lanes[3],
+            lanes[4] + lanes[5],
+            lanes[6] + lanes[7],
         ];
         for (output_lane, dot) in dots.iter().enumerate() {
             sums[lane][output_lane] += *dot as f32 * weight_block.scales[output_lane] * input_scale;
@@ -16954,6 +17035,7 @@ fn q8_0_unified_prefill_projection(
     name: &str,
     use_avx2: bool,
     use_vnni: bool,
+    use_avxvnni: bool,
     use_4x8: bool,
     schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<CpuTensor> {
@@ -16998,6 +17080,7 @@ fn q8_0_unified_prefill_projection(
             &mut output[..packed_rows * output_width],
             use_avx2,
             use_vnni,
+            use_avxvnni,
             use_4x8,
             schedule.groups_per_chunk,
         );
@@ -17083,10 +17166,18 @@ fn try_q8_matmul_owner_prefill(
         return Ok(None);
     }
     let use_vnni = runtime_plan.q8.q8_matmul_owner_vnni && q8_owner_avx512vnni_available();
+    // 256-bit vpdpbusd: same instruction, no AVX-512. Only consulted when the 512-bit path is
+    // unavailable, so an AVX-512 host is completely unaffected. Shares the operator's one VNNI
+    // knob rather than adding a second.
+    let use_avxvnni =
+        !use_vnni && runtime_plan.q8.q8_matmul_owner_vnni && q8_owner_avxvnni_available();
     let use_4x8 = use_vnni && runtime_plan.q8.q8_matmul_owner_4x8;
     // Engaged-check: sweeps assert this fires for owner-on configs (a config
     // whose env mutation was swallowed by a cached plan measures a fake null).
     Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if use_avxvnni {
+        Q8_SCHED_MATMUL_OWNER_AVXVNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let output = q8_0_unified_prefill_projection(
         input,
         packed,
@@ -17094,6 +17185,7 @@ fn try_q8_matmul_owner_prefill(
         name,
         runtime_plan.q8.q8_matmul_owner_avx2,
         use_vnni,
+        use_avxvnni,
         use_4x8,
         runtime_plan.q8_packed_rows4_matmul_schedule,
     )?;

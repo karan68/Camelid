@@ -1,0 +1,91 @@
+{
+  "what": "A 256-bit AVX-VNNI microkernel for the Q8_0 unified prefill owner. The owner's fast inner was gated on avx512f+avx512bw+avx512vnni, so every consumer Intel part from 12th gen onward -- which carries AVX-VNNI on 256-bit registers and has AVX-512 fused off -- fell back to the AVX2 maddubs+madd inner. Unlike the K-quant owner, THIS owner is default-on for windows x86_64, so the slow path was shipping.",
+  "lever": "q8_0_packed_rows4_gemm4_accumulate_block_avxvnni, selected when the Q8 owner is on AND its VNNI flag is on AND avx512vnni is absent AND avxvnni+avx2 are present. Additive: the AVX-512 4x4 path, the AVX-512 4x8 path, the AVX2 path and the scalar path are byte-identical to main.",
+  "camelid_head": "c5e140538 + this branch (perf/q8-owner-avxvnni)",
+
+  "host": {
+    "cpu": "win i9-14900HX 8P+16E (24 physical / 32 logical), Raptor Lake",
+    "isa": "avx2=true fma=true avxvnni=true; avx512f=false avx512bw=false avx512vnni=false",
+    "why_this_host_matters": "It is the shape the old gate misses: VNNI dot-product instructions present, AVX-512 absent. On this class of part the default-on Q8 owner was permanently on its slowest vector inner.",
+    "gpu": "RTX 4060 Laptop present but hidden with CUDA_VISIBLE_DEVICES=-1 for every measurement",
+    "power": "AC for every reported number (Win32_Battery BatteryStatus=2 recorded pre and post each run)"
+  },
+
+  "models": [
+    { "path": "<home>/models/Llama-3.2-1B-Instruct-Q8_0.gguf", "size_mb": 1260 },
+    { "path": "<home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf", "size_mb": 3263.4, "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921" }
+  ],
+
+  "method": {
+    "harness": "camelid bench-owner-sweep --max-tokens 1 (prefill only)",
+    "arms": ["off", "owner_avx2", "owner_avxvnni256"],
+    "pairing": "all three arms run once per round inside one process, interleaved, so a per-round ratio cancels thermal and clock drift. 2 warmup rounds discarded.",
+    "statistic": "median of per-round ratios, 95% percentile bootstrap CI over rounds (2000 resamples)",
+    "engagement_check": "every row carries owner_prefill_taken and q8_avxvnni256_taken; the sweep hard-fails a config whose owner never dispatched.",
+    "harness_fix_required_first": "The Q8 sweep hard-coded owner_vnni4x4 / owner_vnni4x8 arms with no capability branch. On a host without AVX-512 those arms set the VNNI env, got use_vnni=false, and silently measured the AVX2 inner against itself -- a fake null. The sweep now picks the 512-bit arms only when avx512f/bw/vnni are present and otherwise measures owner_avxvnni256 under a label that says which kernel actually ran."
+  },
+
+  "results": {
+    "primary": {
+      "baseline": "owner_avx2 -- the arm this change replaces",
+      "llama1b_q8_0": {
+        "p124_12_rounds":  { "off": 241.348, "owner_avx2": 221.783, "owner_avxvnni256": 236.412, "ratio": 1.0735, "ci95": [1.0581, 1.0892], "won": "12/12" },
+        "p606_12_rounds":  { "off": 207.750, "owner_avx2": 196.336, "owner_avxvnni256": 210.478, "ratio": 1.0681, "ci95": [1.0551, 1.0762], "won": "12/12" },
+        "p2421_8_rounds":  { "off": 143.435, "owner_avx2": 134.867, "owner_avxvnni256": 140.326, "ratio": 1.0459, "ci95": [1.0087, 1.0594], "won": "7/8" }
+      },
+      "llama3b_q8_0": {
+        "p124_10_rounds":  { "off": 63.994, "owner_avx2": 62.130, "owner_avxvnni256": 65.918, "ratio": 1.0698, "ci95": [1.0450, 1.0782], "won": "10/10" },
+        "p606_10_rounds":  { "off": 63.176, "owner_avx2": 60.171, "owner_avxvnni256": 65.269, "ratio": 1.0694, "ci95": [1.0562, 1.0911], "won": "10/10" },
+        "p2421_6_rounds":  { "off": 51.835, "owner_avx2": 51.428, "owner_avxvnni256": 54.494, "ratio": 1.0581, "ci95": [1.0487, 1.0644], "won": "6/6" }
+      },
+      "totals": { "cells": 6, "cells_significant": 6, "paired_rounds": 58, "rounds_won": 57, "ratio_range": [1.046, 1.074] },
+      "units": "prefill_tok_s, median over measured rounds",
+      "claim": "+5-7% over the AVX2 inner, significant in all six cells"
+    },
+
+    "secondary_and_more_important": {
+      "note": "The same runs also answer a question this change did not set out to ask: is the default-on owner worth having at all on this host? Ratios below are owner_avxvnni256 vs the SAME sweep's off arm, paired per round.",
+      "llama3b_q8_0": {
+        "p124":  { "ratio": 1.0248, "ci95": [1.0098, 1.0436], "won": "8/10",  "verdict": "significant win" },
+        "p606":  { "ratio": 1.0274, "ci95": [1.0229, 1.0469], "won": "9/10",  "verdict": "significant win" },
+        "p2421": { "ratio": 1.0386, "ci95": [1.0031, 1.1153], "won": "5/6",   "verdict": "significant win" }
+      },
+      "llama1b_q8_0": {
+        "p124":  { "ratio": 0.9878, "ci95": [0.9666, 1.0017], "won": "3/12",  "verdict": "not significant" },
+        "p606":  { "ratio": 0.9970, "ci95": [0.9871, 1.0207], "won": "5/12",  "verdict": "not significant" },
+        "p2421": { "ratio": 0.9730, "ci95": [0.9577, 0.9909], "won": "0/8",   "verdict": "SIGNIFICANT LOSS" }
+      },
+      "reading": "On 3B -- the model class the owner's default-on receipt used -- owner_avx2 was LOSING to off on this host (off/avx2 = 1.0396, 1.0336, 1.0188). The new inner flips that: the owner now beats off by 2.5-3.9%. On 1B the owner is break-even at short prompts and still a significant 2.7% LOSS at 2421 tokens even with the new inner. That 1B regression is pre-existing, is NOT fixed here, and is the open question this receipt hands back."
+    }
+  },
+
+  "engagement_accounting": {
+    "q8_avxvnni256_taken == owner_prefill_taken in every owner_avxvnni256 row": true,
+    "counts": "1B: 80 / 240 / 800 for 124 / 606 / 2421 tokens. 3B: 140 / 420 / 1400. Both scale exactly with chunk count.",
+    "contrast_with_the_kquant_owner": "There the new inner covered 6 of 7 owner matmuls because Q4_K_M mixes in a per-layer Q6_K tensor. Here the model is uniformly Q8_0, so the new inner covers 100% of owner matmuls.",
+    "vnni512_taken": "not applicable on this host; the 512-bit arms are not even offered by the capability-aware sweep."
+  },
+
+  "parity": {
+    "unit": "q8_0_owner_avxvnni_microkernel_is_bit_identical compares to_bits() against BOTH q8_0_packed_rows4_gemm4_block_scalar (the oracle) and q8_0_packed_rows4_gemm4_accumulate_block_avx2 (the kernel being replaced). Accumulator seeded non-zero so the += contract is covered. Boundary quants 0, -127, +127 pinned explicitly.",
+    "negative_control": "Removing the weight-sign fold (`sign_epi8(input, weight)` -> bare broadcast) makes the test FAIL on the scalar-oracle assertion. The test is not vacuous.",
+    "end_to_end": { "distinct_sha256_per_model": 1, "arms_compared": ["off", "owner_avx2", "owner_avxvnni256"], "llama1b_hash16": "7e0e06439ddb5927", "llama3b_hash16": "2589ae037befddf0" },
+    "why_it_must_be_exact": "dpbusd sums four adjacent u8 x i8 products into each i32 lane, which is exactly what maddubs_epi16 + madd_epi16(_, ones) computes, and unlike maddubs it carries no saturating i16 intermediate. Lane-pair to output-lane mapping is unchanged, accumulation is associative i32, and the f32 tail keeps the siblings' (dot * weight_scale) * input_scale order with no FMA."
+  },
+
+  "blast_radius": {
+    "avx512_hosts": "provably unaffected -- use_avxvnni requires !use_vnni, so a host that selects the 512-bit inner never evaluates it. The 4x8 tile is likewise unreachable here because use_4x8 requires use_vnni.",
+    "non_avxvnni_hosts": "unaffected -- same AVX2/scalar branch as before.",
+    "operator_knobs": "no new knob. The existing CAMELID_X86_Q8_MATMUL_OWNER_VNNI selects the widest VNNI inner the host can run.",
+    "default_state": "the Q8 owner is already default-on for windows x86_64 (Q8MatmulOwnerScope::from_env), so this changes which kernel ships, not whether the owner ships."
+  },
+
+  "open_questions": [
+    "The 1B Q8 regression against off (0.973 at 2421 tokens, 0/8 rounds) is real, pre-existing, and untouched by this change. The owner's default-on receipt was taken on a 3B model on an i7-11800H -- a non-hybrid part -- so neither the small-model case nor the hybrid-core case was covered. Someone should decide whether the owner should be size-gated.",
+    "Only one host, and it is hybrid. AVX-VNNI also ships on Alder/Meteor/Arrow Lake and on Zen 5; none measured.",
+    "The 4x8 tile has no 256-bit twin. It is AVX-512-only, so AVX-VNNI hosts get the 4x4 tile only -- there may be more left on the table.",
+    "Only Llama-architecture Q8_0 models were swept."
+  ],
+
+  "verdict": "Lands as an additive fast path on a DEFAULT-ON code path: +5-7% prefill over the AVX2 inner in all six measured cells, 57/58 paired rounds, byte-identical output, and no reachable change on any AVX-512 host. On 3B it converts the owner from a measured net loss into a measured net win against off."
+}

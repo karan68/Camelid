@@ -14786,3 +14786,75 @@ fn windowed_arch_q8_pin_rejects_any_non_q8_layer_linear() {
         false
     ));
 }
+
+/// The 256-bit AVX-VNNI Q8 owner microkernel must agree bit for bit with BOTH the scalar oracle and
+/// the AVX2 kernel it replaces. `dpbusd` forces an unsigned first operand, so the weight sign is
+/// folded onto the input; the boundary quants pinned below (0, -127, 127) are what that folding is
+/// most likely to get wrong. The accumulator is seeded non-zero so the `+=` contract is covered too.
+/// Called directly rather than through the dispatch, so it cannot pass vacuously.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn q8_0_owner_avxvnni_microkernel_is_bit_identical() {
+    if !std::arch::is_x86_feature_detected!("avxvnni")
+        || !std::arch::is_x86_feature_detected!("avx2")
+    {
+        return;
+    }
+
+    let make_block = |seed: u32, scales: [f32; 4]| -> Q8_0PackedRows4Block {
+        let mut quants = [0_i8; 128];
+        for (i, q) in quants.iter_mut().enumerate() {
+            let h = (i as u32).wrapping_add(seed).wrapping_mul(2_654_435_761);
+            *q = (((h >> 24) as i32) - 128).clamp(-127, 127) as i8;
+        }
+        quants[0] = 0;
+        quants[1] = -127;
+        quants[2] = 127;
+        quants[8] = -127;
+        quants[9] = 0;
+        Q8_0PackedRows4Block { scales, quants }
+    };
+
+    let input = make_block(1, [0.5, -0.25, 1.0, 0.000_976_562_5]);
+    let weight = make_block(7, [0.125, 2.0, -0.031_25, 1.0]);
+    let seed_sums = [[1.5_f32, -2.25, 0.0, 7.125]; 4];
+
+    let int_sums = q8_0_packed_rows4_gemm4_block_scalar(&input, &weight);
+    let mut expected = seed_sums;
+    for (input_lane, row) in expected.iter_mut().enumerate() {
+        let input_scale = input.scales[input_lane];
+        for (output_lane, cell) in row.iter_mut().enumerate() {
+            *cell +=
+                int_sums[input_lane][output_lane] as f32 * weight.scales[output_lane] * input_scale;
+        }
+    }
+
+    let mut actual = seed_sums;
+    // SAFETY: avx2 + avxvnni confirmed present above.
+    unsafe {
+        q8_0_packed_rows4_gemm4_accumulate_block_avxvnni(&input, &weight, &mut actual);
+    }
+    for (actual_row, expected_row) in actual.iter().zip(expected.iter()) {
+        for (a, e) in actual_row.iter().zip(expected_row.iter()) {
+            assert_eq!(a.to_bits(), e.to_bits(), "avxvnni inner vs scalar oracle");
+        }
+    }
+
+    let mut avx2 = seed_sums;
+    // SAFETY: avx2 confirmed present above; the blocks are complete rows4/I8 blocks and `avx2` is a
+    // contiguous 4x4 f32 accumulator.
+    unsafe {
+        q8_0_packed_rows4_gemm4_accumulate_block_avx2(
+            input.quants.as_ptr(),
+            input.scales.as_ptr(),
+            weight.quants.as_ptr(),
+            weight.scales.as_ptr(),
+            avx2.as_mut_ptr().cast::<f32>(),
+        );
+    }
+    for (actual_row, avx2_row) in actual.iter().zip(avx2.iter()) {
+        for (a, b) in actual_row.iter().zip(avx2_row.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "avxvnni inner vs avx2 inner");
+        }
+    }
+}
