@@ -2641,9 +2641,20 @@ mod startup_model_tests {
         // Camelid picked the file itself, so it owes the user a running server
         // and the UI to choose again — not an exit that reinstalling can't fix,
         // because the models directory outlives the app.
+        //
+        // Two failure modes, asserted separately. The contract this test guards is that the
+        // serve task STAYS ALIVE; reaching /v1/health is how we confirm it is really serving.
+        // Collapsing both into one `healthy` flag made a slow runner indistinguishable from a
+        // genuine regression — the old form polled a fixed 100 × 100 ms and failed CI with
+        // "must not take the server down" even when the server was up and merely slow to bind.
+        // The wait is now deadline-based and generous; it costs nothing in the passing case
+        // because the loop exits the moment health answers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut healthy = false;
-        for _ in 0..100 {
+        let mut exited_early = false;
+        while std::time::Instant::now() < deadline {
             if server.is_finished() {
+                exited_early = true;
                 break;
             }
             if tokio::task::spawn_blocking(move || health_ok(addr))
@@ -2658,8 +2669,15 @@ mod startup_model_tests {
         server.abort();
 
         assert!(
+            !exited_early,
+            "an auto-selected startup model that cannot load must not take the server down, \
+             but the serve task exited on its own"
+        );
+        assert!(
             healthy,
-            "an auto-selected startup model that cannot load must not take the server down"
+            "the serve task stayed alive but never answered /v1/health within 60s — the \
+             startup-model contract held, so suspect a slow or loaded runner rather than a \
+             regression in it"
         );
     }
 
