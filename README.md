@@ -36,6 +36,7 @@ ready to use.
 > the 27B Q2 row has a checked single-image CLI smoke. These rows are **Supported**, not
 > Experimental; the claim is limited to the listed artifacts on macOS Apple Silicon Metal.
 > [See the exact rows and vision setup.](#prismml--bonsai-macos-metal-support)
+> Also make sure to download [ernary-Bonsai-27B-mmproj-Q8_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf)
 
 ## Why Camelid
 
