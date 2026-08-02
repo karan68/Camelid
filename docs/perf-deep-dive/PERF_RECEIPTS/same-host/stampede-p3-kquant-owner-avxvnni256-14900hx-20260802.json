@@ -44,6 +44,7 @@
 
   "engagement_accounting": {
     "note": "This is the strongest structural evidence in the receipt, because it reproduces exactly across two unrelated architectures.",
+    "counter_scopes": "The two counters are deliberately scoped differently, which is what makes the difference between them readable: kquant_owner_prefill_taken increments in BOTH q4_k_block_dot_core_with_repack and q6_k_block_dot_core (all K-quant owner matmuls), while kquant_avxvnni256_taken increments only in q4_k_owner_prefill_tiled (the Q4_K tiled path). Their difference is therefore the Q6_K matmul count, not an unexplained shortfall.",
     "llama3b_28_layers":  { "owner_prefill_taken": 196, "avxvnni256_taken": 168, "per_chunk": "196 = 28 x 7, 168 = 28 x 6" },
     "qwen3_4b_36_layers": { "owner_prefill_taken": 252, "avxvnni256_taken": 216, "per_chunk": "252 = 36 x 7, 216 = 36 x 6" },
     "scaling": "counters scale exactly with chunk count: llama 606 tok = 3 chunks -> 588/504, 2421 tok = 10 chunks -> 1960/1680",
@@ -52,7 +53,7 @@
   },
 
   "parity": {
-    "unit": "q4_k_owner_avxvnni_inner_is_bit_identical asserts kquant_owner_avxvnni_taken > 0 BEFORE comparing, so it cannot pass vacuously, then compares to_bits() against q4_k_block_dot_core. It also asserts kquant_owner_vnni_taken == 0.",
+    "unit": "q4_k_owner_avxvnni_inner_is_bit_identical asserts kquant_owner_avxvnni_taken > 0 BEFORE comparing, so it cannot pass vacuously, then compares to_bits() against q4_k_block_dot_core. It also asserts kquant_owner_vnni_taken == 0. It runs 8 input rows against ROW_BLOCK = 64, so the path it covers is the PARTIAL row-block tail; full 64-row blocks are covered by the sweep and e2e runs, where a chunk is hundreds of rows.",
     "instruction_level": "_mm256_dpbusd_avx_epi32 was separately checked against a scalar reference over the operand range the kernel actually feeds it.",
     "end_to_end": { "distinct_sha256_over_all_measured_requests": 1, "hash": "a20ada7a5982", "avxvnni_taken_on_arm": 504, "avxvnni_taken_off_arm": 0, "wall_s": { "off": 17.48, "on": 11.25, "pct_faster": 35.6 } },
     "why_it_must_be_exact": "VNNI accumulates the same u8 x i8 products into the same i32 lanes as the AVX2 sequence; the reduction order inside a 32-value block is unchanged, so there is no reassociation to lose."
