@@ -49,6 +49,7 @@ fn renderer_matches_reference_strings_for_all_shapes() {
             .map(|m| camelid::api::ChatMessage {
                 role: m.role.clone(),
                 content: m.content.clone(),
+                image_urls: Vec::new(),
                 unsupported_content_parts: Vec::new(),
             })
             .collect();

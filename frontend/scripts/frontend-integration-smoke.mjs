@@ -130,6 +130,45 @@ try {
   assert.equal(statusContainsSupportedEvidence('not_started'), false, 'reserved future pack ids must not count as verified evidence')
   assert.equal(capabilityRowMatchesSearch(capabilities.model_compatibility[2], 'future-context-512-smoke-v1'), true, 'ledger search should include displayed evidence bundle ids')
 
+  const visionReadyMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: { id: 'vision-chat', title: 'Vision', messages: [] },
+    selectedModel,
+    selectedModelId: selectedModel.id,
+    setSelectedModelId: noop,
+    models: [selectedModel],
+    runtime: { ...readyRuntime, vision_ready: true },
+    capabilities,
+    pendingConversation: null,
+    composer: 'Describe this image',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable,
+    setTab: noop,
+  }))
+  assert.match(visionReadyMarkup, /accept="image\/png,image\/jpeg"/, 'vision-ready runtime should expose the local PNG/JPEG picker')
+  assert.match(visionReadyMarkup, /Attach one PNG or JPEG for the loaded Prism vision model/, 'vision picker must explain its one-image Prism boundary')
+
+  const textOnlyRendered = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: { id: 'text-chat', title: 'Text', messages: [] },
+    selectedModel,
+    selectedModelId: selectedModel.id,
+    setSelectedModelId: noop,
+    models: [selectedModel],
+    runtime: readyRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Text only',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable,
+    setTab: noop,
+  }))
+  assert.doesNotMatch(textOnlyRendered, /accept="image\/png,image\/jpeg"/, 'text-only runtime must not advertise an image control it cannot serve')
+
   const wrongArtifactModel = {
     ...selectedModel,
     id: 'llama32_3b_instruct_q8_0_spoof',
@@ -688,6 +727,32 @@ try {
   assert.match(backendReadyButUnsupported3BChatMarkup, /Draft a prompt while Camelid finishes getting ready/, 'support-gated 3B composer should stay editable while send remains locked behind the exact-row contract')
   assert.match(backendReadyButUnsupported3BChatMarkup, /data-send-ready="false"/, 'support-gated 3B rows must keep send disabled until the exact-row contract is promoted')
   assert.doesNotMatch(backendReadyButUnsupported3BChatMarkup, /Local chat ready|Message Camelid…/, 'support-gated 3B rows must not render the live-chat ready UX')
+
+  const experimental3BChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: null,
+    selectedModel: liveBackendIdModel,
+    selectedModelId: liveBackendIdModel.id,
+    setSelectedModelId: noop,
+    models: [liveBackendIdModel],
+    runtime: { ...liveBackendIdRuntime, vision_ready: true },
+    capabilities: backendReadyButUnsupported3BCapabilities,
+    pendingConversation: null,
+    composer: 'Test the implemented experimental lane',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: backendReadyButUnsupported3BGate.chatUnlocked,
+    selectedModelExperimental: backendReadyButUnsupported3BGate.experimentalUnlocked,
+    setTab: noop,
+  }))
+
+  assert.equal(backendReadyButUnsupported3BGate.chatMode, 'experimental', 'a generation-ready implemented row outside the supported contract should use the explicit experimental lane')
+  assert.match(experimental3BChatMarkup, /Experimental chat ready/, 'the experimental lane should read as ready without borrowing the supported badge')
+  assert.match(experimental3BChatMarkup, /Experimental ready/, 'the model picker should group a runnable experimental row with ready choices')
+  assert.match(experimental3BChatMarkup, /data-send-ready="true"/, 'the explicit experimental lane should unlock send')
+  assert.match(experimental3BChatMarkup, /Attach one PNG or JPEG for the loaded Prism vision model/, 'vision-ready experimental rows should expose the image picker')
+  assert.doesNotMatch(experimental3BChatMarkup, /Runtime ready, support gated/, 'a runnable experimental row must not look blocked')
 
   const backendReadyButUnsupported3BSystemMarkup = renderToStaticMarkup(React.createElement(SystemView, {
     runtime: liveBackendIdRuntime,

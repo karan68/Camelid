@@ -214,7 +214,7 @@ Not sure where to begin? Pick **Llama 3.2 3B** — the best balance of quality a
 
 ### Catalog models — `camelid pull`
 
-Twenty-five curated rows ship in the `camelid pull` catalog. Run `camelid pull` with no argument to
+Thirty-two curated rows ship in the `camelid pull` catalog. Run `camelid pull` with no argument to
 print the list, or `camelid pull <id>` to download into `./models`. Ids resolve by **unique
 substring**, so the short ids below are all you need — `camelid pull 3b_instruct_q8` works exactly
 like the full `llama32_3b_instruct_q8_0`. Where a model ships in several quantizations the id has to
@@ -248,6 +248,13 @@ lists them rather than guessing which multi-GB file you meant.
 | **Qwen2.5 Coder 7B** | `Q8_0` | `qwen25` | 8.1 GB | `qwen25_coder` | `qwen2.5-coder-7b-instruct-q8_0.gguf` |
 | **Cohere Command R v01** | `Q8_0` | `command-r` | 37.2 GB | `command_r` | `c4ai-command-r-v01-Q8_0.gguf` |
 | **Ornith 1.0 9B** — hybrid DeltaNet, `tool_capable` | `Q8_0` | `qwen35` | 9.5 GB | `ornith` | `ornith-1.0-9b-Q8_0.gguf` |
+| **Bonsai 4B** | `Q1_0` | `qwen35` | 0.6 GB | `bonsai_4b_q1` | `Bonsai-4B-Q1_0.gguf` |
+| **Ternary Bonsai 4B** | `Q2_0` | `qwen35` | 1.1 GB | `bonsai_4b_q2` | `Ternary-Bonsai-4B-Q2_0.gguf` |
+| **Ternary Bonsai 4B** | `PQ2_0` | `qwen35` | 1.1 GB | `bonsai_4b_pq2` | `Ternary-Bonsai-4B-PQ2_0.gguf` |
+| **Bonsai 8B** | `Q1_0` | `qwen35` | 1.2 GB | `bonsai_8b_q1` | `Bonsai-8B-Q1_0.gguf` |
+| **Ternary Bonsai 8B** | `Q2_0` | `qwen35` | 2.2 GB | `bonsai_8b_q2` | `Ternary-Bonsai-8B-Q2_0.gguf` |
+| **Bonsai 27B** | `Q1_0` | `qwen35` | 3.8 GB | `bonsai_27b_q1` | `Bonsai-27B-Q1_0.gguf` |
+| **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
 The two Gemma 4 rows marked *two-Mac distributed* are validated on the layer-sharded two-host lane —
 they are memory-infeasible on a single 16 GB machine. Command R is listed for completeness; at
@@ -272,6 +279,41 @@ bytes — the 3B K-quants, the 1B IQ4_XS, Ornith Q8_0 — the row is in the pull
 Each row's exact envelope — which surfaces are certified, which contexts were checked, and what is
 explicitly not claimed — lives in [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md).
 [COMPATIBILITY.md](COMPATIBILITY.md) is the complete, authoritative supported-row ledger.
+
+### PrismML / Bonsai macOS Metal support
+
+Seven exact PrismML Bonsai GGUFs are supported exact-row smoke on Apple Silicon Metal
+without expanding their Q1_0, legacy Q2_0, or PQ2_0 linears into dense weights.
+The checked Mac mini 2 matrix covers 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2.
+The 27B row can pair with `Ternary-Bonsai-27B-mmproj-Q8_0.gguf` for Qwen3-VL
+image input. Exact hashes and results are recorded in
+[`qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json`](qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json).
+
+All seven language-model files are available from the Models page or with
+`camelid pull <id>`. The vision projector is a companion file rather than a
+loadable model, so download it separately from Prism ML and place it beside the
+27B GGUF:
+
+```bash
+hf download prism-ml/Ternary-Bonsai-27B-gguf \
+  Ternary-Bonsai-27B-mmproj-Q8_0.gguf --local-dir /path/to/model-directory
+```
+
+Place the projector beside the language-model GGUF (its filename must contain
+`mmproj`) or set `CAMELID_MMPROJ` explicitly, then start the normal browser UI:
+
+```bash
+camelid serve --model /path/to/Bonsai-27B-Q1_0.gguf
+```
+
+When `/v1/health` reports `vision_ready: true`, Chat shows an **Image** control.
+It accepts one local PNG/JPEG, keeps that image active for follow-up turns, and
+sends an OpenAI-compatible `image_url` data part. The same shape works directly
+with `/v1/chat/completions`, including SSE streaming. Remote URLs, multiple
+images, audio/video, and vision combined with tools fail closed; multimodal
+input on `/v1/responses` remains unsupported. Support is limited to the seven
+hash-pinned artifacts on macOS Apple Silicon Metal; it is not yet a Windows,
+bounded-context, broad-qwen35, quant-wide, or production-throughput claim.
 
 ## Ways to use Camelid
 

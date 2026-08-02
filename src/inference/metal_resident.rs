@@ -91,7 +91,14 @@ pub(super) fn weights_use_kquant(weights: &super::LlamaLoadedWeights) -> bool {
     let is_kquant = |t: &CpuTensor| {
         matches!(
             t.source_type,
-            Some(GgufTensorType::Q4K) | Some(GgufTensorType::Q6K)
+            Some(
+                GgufTensorType::Q4K
+                    | GgufTensorType::Q6K
+                    | GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            )
         )
     };
     weights.layers.iter().any(|l| {
@@ -112,6 +119,18 @@ pub(super) fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeight
     let kquant = match tensor.source_type {
         Some(GgufTensorType::Q4K) => Some((metal::ResidentWeightFormat::Q4K, tensor.q4_k_wire())),
         Some(GgufTensorType::Q6K) => Some((metal::ResidentWeightFormat::Q6K, tensor.q6_k_wire())),
+        Some(GgufTensorType::Q1_0) => {
+            Some((metal::ResidentWeightFormat::Q1_0, tensor.low_bit_wire()))
+        }
+        Some(GgufTensorType::Q2_0G64) => {
+            Some((metal::ResidentWeightFormat::Q2_0G64, tensor.low_bit_wire()))
+        }
+        Some(GgufTensorType::Q2_0G128) => {
+            Some((metal::ResidentWeightFormat::Q2_0G128, tensor.low_bit_wire()))
+        }
+        Some(GgufTensorType::Pq2_0) => {
+            Some((metal::ResidentWeightFormat::Q2_0G128, tensor.low_bit_wire()))
+        }
         _ => None,
     };
     if let Some((format, wire)) = kquant {

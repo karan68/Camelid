@@ -50,13 +50,35 @@ struct MetalLinearKernel {
     q6k_linear_simd_pipeline: ComputePipelineState,
     q4k_linear_tiled_pipeline: ComputePipelineState,
     q6k_linear_tiled_pipeline: ComputePipelineState,
+    q1_0_linear_pipeline: ComputePipelineState,
+    q2_0_g64_linear_pipeline: ComputePipelineState,
+    q2_0_g128_linear_pipeline: ComputePipelineState,
     embed_row_gather_q4k_pipeline: ComputePipelineState,
     embed_row_gather_q6k_pipeline: ComputePipelineState,
+    embed_row_gather_q1_0_pipeline: ComputePipelineState,
+    embed_row_gather_q2_0_g64_pipeline: ComputePipelineState,
+    embed_row_gather_q2_0_g128_pipeline: ComputePipelineState,
     rms_norm_pipeline: ComputePipelineState,
     rms_norm_per_head_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
+    dense_f16_linear_pipeline: ComputePipelineState,
+    dense_f32_linear_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
     gelu_mul_pipeline: ComputePipelineState,
+    qwen35_l2_norm_pipeline: ComputePipelineState,
+    qwen35_conv1d_pipeline: ComputePipelineState,
+    qwen35_delta_rule_pipeline: ComputePipelineState,
+    qwen35_sigmoid_mul_pipeline: ComputePipelineState,
+    qwen35_ssm_gates_pipeline: ComputePipelineState,
+    qwen35_deinterleave_qgate_pipeline: ComputePipelineState,
+    vision_layer_norm_pipeline: ComputePipelineState,
+    vision_add_bias_pipeline: ComputePipelineState,
+    vision_bias_residual_pipeline: ComputePipelineState,
+    vision_bias_gelu_pipeline: ComputePipelineState,
+    vision_patch_sum_pipeline: ComputePipelineState,
+    vision_rope_pipeline: ComputePipelineState,
+    vision_attention_pipeline: ComputePipelineState,
+    vision_diagnostics_pipeline: ComputePipelineState,
     soft_cap_pipeline: ComputePipelineState,
     scale_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
@@ -2083,6 +2105,212 @@ kernel void embed_row_gather_q6k(
     const int scale = int(reinterpret_cast<device const char*>(block + 192)[i >> 4]);
     embedding[gid] = d * float(scale * q6k_code(block, i));
 }
+
+// Prism packed-wire GEMV/GEMM. Q1_0 mirrors the tuned Prism llama.cpp decode
+// geometry: each simdgroup evaluates eight output rows while reusing the same
+// activation slices. Camelid uses one simdgroup per runtime-compiled
+// threadgroup so the kernel also runs on devices whose register allocation
+// caps this pipeline at 32 threads. The Q2 kernels retain the one-row geometry
+// required by their parity-locked accumulation.
+// All kernels cover decode (n_tokens=1) and prefill (threadgroup grid
+// y=n_tokens) without expanding the resident weights.
+kernel void q1_0_linear_f32(
+    device const float* input [[buffer(0)]],
+    device const uchar* weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint rows_per_simdgroup = 8;
+    const uint threads_per_block = 8;
+    const uint blocks_in_flight = 32 / threads_per_block;
+    const uint first_row = tg.x * rows_per_simdgroup;
+    const uint token = tg.y;
+    if (first_row >= rows || token >= n_tokens) return;
+
+    const uint block_lane = lane / threads_per_block;
+    const uint slice = (lane % threads_per_block) * 16;
+    float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint block_index = block_lane;
+         block_index < blocks_per_row;
+         block_index += blocks_in_flight) {
+        const uint input_base =
+            token * blocks_per_row * 128 + block_index * 128 + slice;
+        float values[16];
+        float input_sum = 0.0f;
+        for (uint i = 0; i < 16; ++i) {
+            values[i] = input[input_base + i];
+            input_sum += values[i];
+        }
+        for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+            const uint row = first_row + row_offset;
+            if (row >= rows) continue;
+            device const uchar* block =
+                weights + ((ulong)row * blocks_per_row + block_index) * 18;
+            const float d = float(*reinterpret_cast<device const half*>(block));
+            device const uchar* bits = block + 2 + slice / 8;
+            const uchar b0 = bits[0];
+            const uchar b1 = bits[1];
+            float selected = 0.0f;
+            selected += select(0.0f, values[ 0], bool(b0 & 0x01));
+            selected += select(0.0f, values[ 1], bool(b0 & 0x02));
+            selected += select(0.0f, values[ 2], bool(b0 & 0x04));
+            selected += select(0.0f, values[ 3], bool(b0 & 0x08));
+            selected += select(0.0f, values[ 4], bool(b0 & 0x10));
+            selected += select(0.0f, values[ 5], bool(b0 & 0x20));
+            selected += select(0.0f, values[ 6], bool(b0 & 0x40));
+            selected += select(0.0f, values[ 7], bool(b0 & 0x80));
+            selected += select(0.0f, values[ 8], bool(b1 & 0x01));
+            selected += select(0.0f, values[ 9], bool(b1 & 0x02));
+            selected += select(0.0f, values[10], bool(b1 & 0x04));
+            selected += select(0.0f, values[11], bool(b1 & 0x08));
+            selected += select(0.0f, values[12], bool(b1 & 0x10));
+            selected += select(0.0f, values[13], bool(b1 & 0x20));
+            selected += select(0.0f, values[14], bool(b1 & 0x40));
+            selected += select(0.0f, values[15], bool(b1 & 0x80));
+            sums[row_offset] += d * (2.0f * selected - input_sum);
+        }
+    }
+    for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+        const float total = simd_sum(sums[row_offset]);
+        const uint row = first_row + row_offset;
+        if (lane == 0 && row < rows) output[token * rows + row] = total;
+    }
+}
+
+kernel void q2_0_g64_linear_f32(
+    device const float* input [[buffer(0)]],
+    device const uchar* weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row = tg.x;
+    const uint token = tg.y;
+    if (row >= rows || token >= n_tokens) return;
+    float sum = 0.0f;
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        device const uchar* block = weights + ((ulong)row * blocks_per_row + b) * 18;
+        const float d = float(*reinterpret_cast<device const half*>(block));
+        device const uchar* qs = block + 2;
+        const uint input_base = token * blocks_per_row * 64 + b * 64;
+        for (uint half_idx = 0; half_idx < 2; ++half_idx) {
+            const uint i = lane + half_idx * 32;
+            const uint q = (uint(qs[i >> 2]) >> ((i & 3) * 2)) & 3u;
+            sum += input[input_base + i] * float(int(q) - 1) * d;
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) output[token * rows + row] = sum;
+}
+
+kernel void q2_0_g128_linear_f32(
+    device const float* input [[buffer(0)]],
+    device const uchar* weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row = tg.x;
+    const uint token = tg.y;
+    if (row >= rows || token >= n_tokens) return;
+    // Match Prism's pinned llama.cpp Metal AR kernel exactly: 8 lanes own the
+    // sixteen-element slices of one 128-value block, so a simdgroup evaluates
+    // four blocks in flight. The lo/high-bit select reductions and the
+    // per-slice scale application intentionally preserve the oracle's f32
+    // association; multiplying every element by d first is mathematically
+    // equivalent but changes greedy logits for these ultra-low-bit rows.
+    const uint lanes_per_block = 8;
+    const uint blocks_in_flight = 32 / lanes_per_block;
+    const uint block_lane = lane / lanes_per_block;
+    const uint slice = (lane % lanes_per_block) * 16;
+    float sum = 0.0f;
+    for (uint b = block_lane; b < blocks_per_row; b += blocks_in_flight) {
+        device const uchar* block = weights + ((ulong)row * blocks_per_row + b) * 34;
+        const float d = float(*reinterpret_cast<device const half*>(block));
+        device const uchar* qs = block + 2 + slice / 4;
+        const uint input_base = token * blocks_per_row * 128 + b * 128 + slice;
+        float yl[16];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 16; ++i) {
+            yl[i] = input[input_base + i];
+            sumy += yl[i];
+        }
+        float acc_lo = 0.0f;
+        for (uint i = 0; i < 16; ++i) {
+            const uchar packed = qs[i / 4];
+            acc_lo += select(0.0f, yl[i], bool(packed & (1u << (2 * (i % 4)))));
+        }
+        float acc_hi = 0.0f;
+        for (uint i = 0; i < 16; ++i) {
+            const uchar packed = qs[i / 4];
+            acc_hi += select(0.0f, yl[i], bool(packed & (1u << (2 * (i % 4) + 1))));
+        }
+        sum += d * (acc_lo + 2.0f * acc_hi - sumy);
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) output[token * rows + row] = sum;
+}
+
+kernel void embed_row_gather_q1_0(
+    device const uchar* weights [[buffer(0)]],
+    device const uint* selected_id [[buffer(1)]],
+    device float* embedding [[buffer(2)]],
+    constant uint& blocks_per_row [[buffer(3)]],
+    constant float& embed_scale [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint width = blocks_per_row * 128;
+    if (gid >= width) return;
+    device const uchar* block = weights + ((ulong)(*selected_id) * blocks_per_row + gid / 128) * 18;
+    const uint i = gid & 127u;
+    const float d = float(*reinterpret_cast<device const half*>(block));
+    const uint bit = (uint(block[2 + (i >> 3)]) >> (i & 7)) & 1u;
+    embedding[gid] = (bit != 0 ? d : -d) * embed_scale;
+}
+
+kernel void embed_row_gather_q2_0_g64(
+    device const uchar* weights [[buffer(0)]],
+    device const uint* selected_id [[buffer(1)]],
+    device float* embedding [[buffer(2)]],
+    constant uint& blocks_per_row [[buffer(3)]],
+    constant float& embed_scale [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint width = blocks_per_row * 64;
+    if (gid >= width) return;
+    device const uchar* block = weights + ((ulong)(*selected_id) * blocks_per_row + gid / 64) * 18;
+    const uint i = gid & 63u;
+    const float d = float(*reinterpret_cast<device const half*>(block));
+    const uint q = (uint(block[2 + (i >> 2)]) >> ((i & 3) * 2)) & 3u;
+    embedding[gid] = float(int(q) - 1) * d * embed_scale;
+}
+
+kernel void embed_row_gather_q2_0_g128(
+    device const uchar* weights [[buffer(0)]],
+    device const uint* selected_id [[buffer(1)]],
+    device float* embedding [[buffer(2)]],
+    constant uint& blocks_per_row [[buffer(3)]],
+    constant float& embed_scale [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint width = blocks_per_row * 128;
+    if (gid >= width) return;
+    device const uchar* block = weights + ((ulong)(*selected_id) * blocks_per_row + gid / 128) * 34;
+    const uint i = gid & 127u;
+    const float d = float(*reinterpret_cast<device const half*>(block));
+    const uint q = (uint(block[2 + (i >> 2)]) >> ((i & 3) * 2)) & 3u;
+    embedding[gid] = float(int(q) - 1) * d * embed_scale;
+}
 "#;
 
 // Q8_K activation quantization is compiled separately with fast math disabled.
@@ -2182,6 +2410,50 @@ kernel void residual_add_f32(
 ) {
     if (gid >= n) return;
     output[gid] = a[gid] + b[gid];
+}
+
+// Dense row-major projection for vision-tower F16/F32 weights. One SIMD group owns
+// one (token, output-row) dot product; the output is token-major `[tokens, rows]`.
+kernel void dense_f16_linear_f32(
+    device const float* input [[buffer(0)]],
+    device const half* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& input_width [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& tokens [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint row = group.x;
+    const uint token = group.y;
+    if (row >= rows || token >= tokens) return;
+    const device float* x = input + ulong(token) * input_width;
+    const device half* w = weight + ulong(row) * input_width;
+    float partial = 0.0f;
+    for (uint i = lane; i < input_width; i += 32) partial += x[i] * float(w[i]);
+    const float sum = simd_sum(partial);
+    if (lane == 0) output[ulong(token) * rows + row] = sum;
+}
+
+kernel void dense_f32_linear_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& input_width [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& tokens [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint row = group.x;
+    const uint token = group.y;
+    if (row >= rows || token >= tokens) return;
+    const device float* x = input + ulong(token) * input_width;
+    const device float* w = weight + ulong(row) * input_width;
+    float partial = 0.0f;
+    for (uint i = lane; i < input_width; i += 32) partial += x[i] * w[i];
+    const float sum = simd_sum(partial);
+    if (lane == 0) output[ulong(token) * rows + row] = sum;
 }
 
 // Per-head RMSNorm for Gemma's QK-norm (and weightless V-norm): one threadgroup
@@ -5506,6 +5778,344 @@ kernel void attention_decode_splitk_kv16_direct_tree(
         }
     }
 }
+
+// Qwen3.5 gated-delta-net kernels. These operate on the same f32 activation
+// buffers as the resident attention/FFN stack, allowing the complete hybrid
+// token graph to remain inside one Metal command buffer.
+kernel void qwen35_l2_norm_per_head(
+    device float* data [[buffer(0)]],
+    constant uint& head_dim [[buffer(1)]],
+    constant float& eps [[buffer(2)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    const ulong base = ulong(head) * head_dim;
+    for (uint i = tid; i < head_dim; i += 256) scratch[i] = data[base + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) ss += scratch[i] * scratch[i];
+        scratch[head_dim] = 1.0f / max(sqrt(ss), eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = scratch[head_dim];
+    for (uint i = tid; i < head_dim; i += 256) data[base + i] = scratch[i] * scale;
+}
+
+kernel void qwen35_conv1d(
+    device const float* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* state [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& conv_dim [[buffer(4)]],
+    constant uint& d_conv [[buffer(5)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= conv_dim) return;
+    const uint cm1 = d_conv - 1;
+    device const float* w = weights + ulong(c) * d_conv;
+    device float* st = state + ulong(c) * cm1;
+    const float x = input[c];
+    float acc = 0.0f;
+    for (uint t = 0; t < cm1; ++t) acc += w[t] * st[t];
+    acc += w[cm1] * x;
+    output[c] = acc / (1.0f + exp(-acc));
+    for (uint t = 0; t + 1 < cm1; ++t) st[t] = st[t + 1];
+    st[cm1 - 1] = x;
+}
+
+kernel void qwen35_ssm_gates(
+    device const float* beta_raw [[buffer(0)]],
+    device const float* alpha_raw [[buffer(1)]],
+    device const float* dt_bias [[buffer(2)]],
+    device const float* a [[buffer(3)]],
+    device float* beta [[buffer(4)]],
+    device float* glog [[buffer(5)]],
+    constant uint& n_heads [[buffer(6)]],
+    uint h [[thread_position_in_grid]]
+) {
+    if (h >= n_heads) return;
+    beta[h] = 1.0f / (1.0f + exp(-beta_raw[h]));
+    const float x = alpha_raw[h] + dt_bias[h];
+    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    glog[h] = sp * a[h];
+}
+
+kernel void qwen35_delta_rule(
+    device float* state [[buffer(0)]],
+    device const float* k_conv [[buffer(1)]],
+    device const float* q_conv [[buffer(2)]],
+    device const float* v_conv [[buffer(3)]],
+    device const float* gate_z [[buffer(4)]],
+    device const float* beta [[buffer(5)]],
+    device const float* glog [[buffer(6)]],
+    device const float* norm_weight [[buffer(7)]],
+    device float* output [[buffer(8)]],
+    constant uint& d_state [[buffer(9)]],
+    constant uint& n_key_heads [[buffer(10)]],
+    constant float& eps [[buffer(11)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint j [[thread_index_in_threadgroup]]
+) {
+    if (j >= d_state) return;
+    threadgroup float* sk = scratch;
+    threadgroup float* sq = scratch + d_state;
+    threadgroup float* so = scratch + 2 * d_state;
+    const uint key_head = head % n_key_heads;
+    sk[j] = k_conv[ulong(key_head) * d_state + j];
+    sq[j] = q_conv[ulong(key_head) * d_state + j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* s = state + ulong(head) * d_state * d_state;
+    const float decay = exp(glog[head]);
+    float sk_j = 0.0f;
+    for (uint i = 0; i < d_state; ++i) {
+        const ulong idx = ulong(i) * d_state + j;
+        const float value = s[idx] * decay;
+        s[idx] = value;
+        sk_j += value * sk[i];
+    }
+    const float delta = (v_conv[ulong(head) * d_state + j] - sk_j) * beta[head];
+    const float qscale = rsqrt(float(d_state));
+    float out_j = 0.0f;
+    for (uint i = 0; i < d_state; ++i) {
+        const ulong idx = ulong(i) * d_state + j;
+        const float value = s[idx] + sk[i] * delta;
+        s[idx] = value;
+        out_j += value * (sq[i] * qscale);
+    }
+    so[j] = out_j;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (j == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < d_state; ++i) sum += so[i] * so[i];
+        scratch[3 * d_state] = rsqrt(sum / float(d_state) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float normed = so[j] * scratch[3 * d_state] * norm_weight[j];
+    const float z = gate_z[ulong(head) * d_state + j];
+    output[ulong(head) * d_state + j] = normed * (z / (1.0f + exp(-z)));
+}
+
+kernel void qwen35_sigmoid_mul(
+    device float* values [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) values[i] *= 1.0f / (1.0f + exp(-gate[i]));
+}
+
+kernel void qwen35_deinterleave_qgate(
+    device const float* fused [[buffer(0)]],
+    device float* query [[buffer(1)]],
+    device float* gate [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    const uint head = i / head_dim;
+    const uint d = i % head_dim;
+    const ulong base = ulong(head) * 2 * head_dim;
+    query[i] = fused[base + d];
+    gate[i] = fused[base + head_dim + d];
+}
+
+// Qwen3-VL vision tower primitives. Activations are token-major and remain f32;
+// the separate dense/Q8 projection kernels own all matrix contractions.
+kernel void vision_layer_norm_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    const ulong base = ulong(token) * width;
+    float local_sum = 0.0f;
+    for (uint i = tid; i < width; i += 256) local_sum += input[base + i];
+    scratch[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float mean = scratch[0] / float(width);
+    float local_var = 0.0f;
+    for (uint i = tid; i < width; i += 256) {
+        const float centered = input[base + i] - mean;
+        local_var += centered * centered;
+    }
+    scratch[tid] = local_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = rsqrt(scratch[0] / float(width) + eps);
+    for (uint i = tid; i < width; i += 256) {
+        output[base + i] = (input[base + i] - mean) * inv * weight[i] + bias[i];
+    }
+}
+
+kernel void vision_add_bias_f32(
+    device float* values [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    constant uint& width [[buffer(2)]],
+    constant uint& total [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < total) values[i] += bias[i % width];
+}
+
+kernel void vision_bias_residual_f32(
+    device const float* residual [[buffer(0)]],
+    device const float* projected [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant uint& total [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < total) output[i] = residual[i] + projected[i] + bias[i % width];
+}
+
+kernel void vision_bias_gelu_f32(
+    device float* values [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    constant uint& width [[buffer(2)]],
+    constant uint& total [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= total) return;
+    const float x = values[i] + bias[i % width];
+    const float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    values[i] = 0.5f * x * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+}
+
+kernel void vision_patch_sum_f32(
+    device const float* first [[buffer(0)]],
+    device const float* second [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device const float* position [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& width [[buffer(5)]],
+    constant uint& total [[buffer(6)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < total) output[i] = first[i] + second[i] + bias[i % width] + position[i];
+}
+
+kernel void vision_rope_f32(
+    device float* qkv [[buffer(0)]],
+    device const float* cosine [[buffer(1)]],
+    device const float* sine [[buffer(2)]],
+    constant uint& hidden [[buffer(3)]],
+    constant uint& heads [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant uint& tokens [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint half_dim = head_dim / 2;
+    const uint per_token = heads * half_dim;
+    const uint total = tokens * per_token;
+    if (gid >= total) return;
+    const uint token = gid / per_token;
+    const uint rem = gid - token * per_token;
+    const uint head = rem / half_dim;
+    const uint pair = rem - head * half_dim;
+    const float c = cosine[ulong(token) * half_dim + pair];
+    const float s = sine[ulong(token) * half_dim + pair];
+    const ulong token_base = ulong(token) * 3 * hidden;
+    for (uint qk = 0; qk < 2; ++qk) {
+        const ulong base = token_base + ulong(qk) * hidden + ulong(head) * head_dim;
+        const float x0 = qkv[base + pair];
+        const float x1 = qkv[base + pair + half_dim];
+        qkv[base + pair] = x0 * c - x1 * s;
+        qkv[base + pair + half_dim] = x0 * s + x1 * c;
+    }
+}
+
+kernel void vision_attention_f32(
+    device const float* qkv [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& hidden [[buffer(2)]],
+    constant uint& heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& tokens [[buffer(5)]],
+    constant float& scale [[buffer(6)]],
+    threadgroup float* scores [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    const uint query_token = group.x;
+    const uint head = group.y;
+    if (query_token >= tokens || head >= heads) return;
+    const ulong qbase = ulong(query_token) * 3 * hidden + ulong(head) * head_dim;
+    float local_max = -INFINITY;
+    for (uint key_token = tid; key_token < tokens; key_token += 128) {
+        const ulong kbase = ulong(key_token) * 3 * hidden + hidden + ulong(head) * head_dim;
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) score += qkv[qbase + d] * qkv[kbase + d];
+        score *= scale;
+        scores[key_token] = score;
+        local_max = max(local_max, score);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float maximum = -INFINITY;
+        for (uint key_token = 0; key_token < tokens; ++key_token) maximum = max(maximum, scores[key_token]);
+        float sum = 0.0f;
+        for (uint key_token = 0; key_token < tokens; ++key_token) {
+            const float value = exp(scores[key_token] - maximum);
+            scores[key_token] = value;
+            sum += value;
+        }
+        scores[tokens] = 1.0f / sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_sum = scores[tokens];
+    for (uint d = tid; d < head_dim; d += 128) {
+        float value = 0.0f;
+        for (uint key_token = 0; key_token < tokens; ++key_token) {
+            const ulong vbase = ulong(key_token) * 3 * hidden + 2 * hidden + ulong(head) * head_dim;
+            value += scores[key_token] * inv_sum * qkv[vbase + d];
+        }
+        output[ulong(query_token) * hidden + ulong(head) * head_dim + d] = value;
+    }
+}
+
+// Trace-only checkpoint. One thread scans a stage and records
+// [non-finite count, max absolute value, L2 norm] at `slot`.
+kernel void vision_diagnostics_f32(
+    device const float* values [[buffer(0)]],
+    device float* metrics [[buffer(1)]],
+    constant uint& total [[buffer(2)]],
+    constant uint& slot [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    float invalid = 0.0f;
+    float maximum = 0.0f;
+    float squared = 0.0f;
+    for (uint i = 0; i < total; ++i) {
+        const float value = values[i];
+        if (!isfinite(value)) {
+            invalid += 1.0f;
+        } else {
+            maximum = max(maximum, abs(value));
+            squared += value * value;
+        }
+    }
+    metrics[slot * 3] = invalid;
+    metrics[slot * 3 + 1] = maximum;
+    metrics[slot * 3 + 2] = sqrt(squared);
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -5548,6 +6158,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let residual_add_pipeline = device
                 .new_compute_pipeline_state_with_function(&residual_add_function)
                 .ok()?;
+            let dense_f16_linear_function = elementwise_library
+                .get_function("dense_f16_linear_f32", None)
+                .ok()?;
+            let dense_f16_linear_pipeline = device
+                .new_compute_pipeline_state_with_function(&dense_f16_linear_function)
+                .ok()?;
+            let dense_f32_linear_function = elementwise_library
+                .get_function("dense_f32_linear_f32", None)
+                .ok()?;
+            let dense_f32_linear_pipeline = device
+                .new_compute_pipeline_state_with_function(&dense_f32_linear_function)
+                .ok()?;
             let silu_mul_function = elementwise_library
                 .get_function("silu_mul_f32", None)
                 .ok()?;
@@ -5560,6 +6182,56 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let gelu_mul_pipeline = device
                 .new_compute_pipeline_state_with_function(&gelu_mul_function)
                 .ok()?;
+            let qwen35_l2_norm_function = elementwise_library
+                .get_function("qwen35_l2_norm_per_head", None)
+                .ok()?;
+            let qwen35_l2_norm_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_l2_norm_function)
+                .ok()?;
+            let qwen35_conv1d_function = elementwise_library
+                .get_function("qwen35_conv1d", None)
+                .ok()?;
+            let qwen35_conv1d_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_conv1d_function)
+                .ok()?;
+            let qwen35_delta_rule_function = elementwise_library
+                .get_function("qwen35_delta_rule", None)
+                .ok()?;
+            let qwen35_delta_rule_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_delta_rule_function)
+                .ok()?;
+            let qwen35_sigmoid_mul_function = elementwise_library
+                .get_function("qwen35_sigmoid_mul", None)
+                .ok()?;
+            let qwen35_sigmoid_mul_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_sigmoid_mul_function)
+                .ok()?;
+            let qwen35_ssm_gates_function = elementwise_library
+                .get_function("qwen35_ssm_gates", None)
+                .ok()?;
+            let qwen35_ssm_gates_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_ssm_gates_function)
+                .ok()?;
+            let qwen35_deinterleave_qgate_function = elementwise_library
+                .get_function("qwen35_deinterleave_qgate", None)
+                .ok()?;
+            let qwen35_deinterleave_qgate_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_deinterleave_qgate_function)
+                .ok()?;
+            let make_elementwise = |name: &str| {
+                let function = elementwise_library.get_function(name, None).ok()?;
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()
+            };
+            let vision_layer_norm_pipeline = make_elementwise("vision_layer_norm_f32")?;
+            let vision_add_bias_pipeline = make_elementwise("vision_add_bias_f32")?;
+            let vision_bias_residual_pipeline = make_elementwise("vision_bias_residual_f32")?;
+            let vision_bias_gelu_pipeline = make_elementwise("vision_bias_gelu_f32")?;
+            let vision_patch_sum_pipeline = make_elementwise("vision_patch_sum_f32")?;
+            let vision_rope_pipeline = make_elementwise("vision_rope_f32")?;
+            let vision_attention_pipeline = make_elementwise("vision_attention_f32")?;
+            let vision_diagnostics_pipeline = make_elementwise("vision_diagnostics_f32")?;
             let soft_cap_function = elementwise_library
                 .get_function("soft_cap_f32", None)
                 .ok()?;
@@ -5983,6 +6655,20 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q6k_linear_tiled_pipeline = device
                 .new_compute_pipeline_state_with_function(&q6k_linear_tiled_function)
                 .ok()?;
+            let q1_0_linear_function = library.get_function("q1_0_linear_f32", None).ok()?;
+            let q1_0_linear_pipeline = device
+                .new_compute_pipeline_state_with_function(&q1_0_linear_function)
+                .ok()?;
+            let q2_0_g64_linear_function =
+                library.get_function("q2_0_g64_linear_f32", None).ok()?;
+            let q2_0_g64_linear_pipeline = device
+                .new_compute_pipeline_state_with_function(&q2_0_g64_linear_function)
+                .ok()?;
+            let q2_0_g128_linear_function =
+                library.get_function("q2_0_g128_linear_f32", None).ok()?;
+            let q2_0_g128_linear_pipeline = device
+                .new_compute_pipeline_state_with_function(&q2_0_g128_linear_function)
+                .ok()?;
             let embed_row_gather_q4k_function =
                 library.get_function("embed_row_gather_q4k", None).ok()?;
             let embed_row_gather_q4k_pipeline = device
@@ -5992,6 +6678,23 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 library.get_function("embed_row_gather_q6k", None).ok()?;
             let embed_row_gather_q6k_pipeline = device
                 .new_compute_pipeline_state_with_function(&embed_row_gather_q6k_function)
+                .ok()?;
+            let embed_row_gather_q1_0_function =
+                library.get_function("embed_row_gather_q1_0", None).ok()?;
+            let embed_row_gather_q1_0_pipeline = device
+                .new_compute_pipeline_state_with_function(&embed_row_gather_q1_0_function)
+                .ok()?;
+            let embed_row_gather_q2_0_g64_function = library
+                .get_function("embed_row_gather_q2_0_g64", None)
+                .ok()?;
+            let embed_row_gather_q2_0_g64_pipeline = device
+                .new_compute_pipeline_state_with_function(&embed_row_gather_q2_0_g64_function)
+                .ok()?;
+            let embed_row_gather_q2_0_g128_function = library
+                .get_function("embed_row_gather_q2_0_g128", None)
+                .ok()?;
+            let embed_row_gather_q2_0_g128_pipeline = device
+                .new_compute_pipeline_state_with_function(&embed_row_gather_q2_0_g128_function)
                 .ok()?;
             let queue = device.new_command_queue();
             Some(MetalLinearKernel {
@@ -6019,13 +6722,35 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q6k_linear_simd_pipeline,
                 q4k_linear_tiled_pipeline,
                 q6k_linear_tiled_pipeline,
+                q1_0_linear_pipeline,
+                q2_0_g64_linear_pipeline,
+                q2_0_g128_linear_pipeline,
                 embed_row_gather_q4k_pipeline,
                 embed_row_gather_q6k_pipeline,
+                embed_row_gather_q1_0_pipeline,
+                embed_row_gather_q2_0_g64_pipeline,
+                embed_row_gather_q2_0_g128_pipeline,
                 rms_norm_pipeline,
                 rms_norm_per_head_pipeline,
                 residual_add_pipeline,
+                dense_f16_linear_pipeline,
+                dense_f32_linear_pipeline,
                 silu_mul_pipeline,
                 gelu_mul_pipeline,
+                qwen35_l2_norm_pipeline,
+                qwen35_conv1d_pipeline,
+                qwen35_delta_rule_pipeline,
+                qwen35_sigmoid_mul_pipeline,
+                qwen35_ssm_gates_pipeline,
+                qwen35_deinterleave_qgate_pipeline,
+                vision_layer_norm_pipeline,
+                vision_add_bias_pipeline,
+                vision_bias_residual_pipeline,
+                vision_bias_gelu_pipeline,
+                vision_patch_sum_pipeline,
+                vision_rope_pipeline,
+                vision_attention_pipeline,
+                vision_diagnostics_pipeline,
                 soft_cap_pipeline,
                 scale_pipeline,
                 rope_rotate_pipeline,
@@ -9248,20 +9973,17 @@ fn encode_q8_matmul_f32y(
     out: &Buffer,
     scalar: &Buffer,
     rows: usize,
+    wire: bool,
 ) {
     let nsg8 = wire_nsg8_enabled();
-    let pipeline = if wire_weights_enabled() && nsg8 {
+    let pipeline = if wire && nsg8 {
         &k.q8_0_block_ksplit_f32y_wire_nsg8_pipeline
-    } else if wire_weights_enabled() {
+    } else if wire {
         &k.q8_0_block_ksplit_f32y_wire_pipeline
     } else {
         &k.q8_0_block_ksplit_f32y_pipeline
     };
-    let threads_per_tg = if wire_weights_enabled() && nsg8 {
-        256
-    } else {
-        128
-    };
+    let threads_per_tg = if wire && nsg8 { 256 } else { 128 };
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(y), 0);
     e.set_buffer(2, Some(weight), 0);
@@ -9298,6 +10020,43 @@ fn encode_resident_matmul_f32(
     n_tokens: usize,
 ) {
     match weight.format {
+        ResidentWeightFormat::DenseF32 | ResidentWeightFormat::DenseF16 => {
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = input_width as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let pipeline = if weight.format == ResidentWeightFormat::DenseF16 {
+                &k.dense_f16_linear_pipeline
+            } else {
+                &k.dense_f32_linear_pipeline
+            };
+            e.set_compute_pipeline_state(pipeline);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(1, Some(&weight.buffer), 0);
+            e.set_buffer(2, Some(out), 0);
+            e.set_buffer(3, Some(scalar), 0);
+            e.set_buffer(4, Some(scalar), 4);
+            e.set_buffer(5, Some(scalar), 8);
+            let (groups, threads) = if weight.format == ResidentWeightFormat::Q1_0 {
+                (rows.div_ceil(8), 32)
+            } else {
+                (rows, 32)
+            };
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: groups as u64,
+                    height: n_tokens as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: threads,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
         ResidentWeightFormat::Q8_0 => {
             unsafe {
                 let p = scalar.contents() as *mut u32;
@@ -9306,8 +10065,12 @@ fn encode_resident_matmul_f32(
                 *p.add(2) = n_tokens as u32;
             }
             if n_tokens == 1 {
-                encode_q8_matmul_f32y(e, k, y, &weight.buffer, out, scalar, rows);
+                encode_q8_matmul_f32y(e, k, y, &weight.buffer, out, scalar, rows, weight.q8_wire);
             } else {
+                debug_assert!(
+                    weight.q8_wire,
+                    "batched Q8 projection requires 34-byte wire weights"
+                );
                 encode_q8_matmul_f32y_batched(e, k, y, &weight.buffer, out, scalar, rows, n_tokens);
             }
         }
@@ -9330,7 +10093,161 @@ fn encode_resident_matmul_f32(
             );
             keep.extend([scales, quants]);
         }
+        ResidentWeightFormat::Q1_0
+        | ResidentWeightFormat::Q2_0G64
+        | ResidentWeightFormat::Q2_0G128 => {
+            let values_per_block = weight.format.values_per_block();
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = (input_width / values_per_block) as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            let pipeline = match weight.format {
+                ResidentWeightFormat::Q1_0 => &k.q1_0_linear_pipeline,
+                ResidentWeightFormat::Q2_0G64 => &k.q2_0_g64_linear_pipeline,
+                ResidentWeightFormat::Q2_0G128 => &k.q2_0_g128_linear_pipeline,
+                _ => unreachable!(),
+            };
+            e.set_compute_pipeline_state(pipeline);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(2, Some(&weight.buffer), 0);
+            e.set_buffer(3, Some(out), 0);
+            e.set_buffer(4, Some(scalar), 0);
+            e.set_buffer(5, Some(scalar), 4);
+            e.set_buffer(6, Some(scalar), 8);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: rows as u64,
+                    height: n_tokens as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
     }
+}
+
+/// Run one packed Prism projection against a page-backed Q1/Q2 matrix.
+///
+/// This is the 27B Qwen3.5 bring-up bridge: its recurrent graph remains in the
+/// runnable implementation while every large projection executes through the
+/// same native Metal kernels and the same NoCopy buffer cache as the fully
+/// resident dense engine. Keeping this small API here avoids a second packed
+/// decoder or a second Metal allocation of the weights.
+#[cfg(target_os = "macos")]
+pub(crate) fn try_prism_wire_matvec_f32(
+    input: &[f32],
+    pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+    format: ResidentWeightFormat,
+    output_rows: usize,
+) -> Option<Vec<f32>> {
+    try_prism_wire_matmul_flat(input, input.len(), 1, pages, format, output_rows)
+}
+
+/// Batched form of [`try_prism_wire_matvec_f32`]. The Prism kernels dispatch
+/// one `(output row, token)` threadgroup, so prompt positions share one command
+/// buffer and stream the same resident matrix without host round-trips.
+#[cfg(target_os = "macos")]
+pub(crate) fn try_prism_wire_matmul_f32(
+    inputs: &[Vec<f32>],
+    pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+    format: ResidentWeightFormat,
+    output_rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    let input_width = inputs.first()?.len();
+    if input_width == 0 || inputs.iter().any(|input| input.len() != input_width) {
+        return None;
+    }
+    let mut flat = Vec::with_capacity(inputs.len() * input_width);
+    for input in inputs {
+        flat.extend_from_slice(input);
+    }
+    let output =
+        try_prism_wire_matmul_flat(&flat, input_width, inputs.len(), pages, format, output_rows)?;
+    Some(
+        output
+            .chunks_exact(output_rows)
+            .map(<[f32]>::to_vec)
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn try_prism_wire_matmul_flat(
+    input: &[f32],
+    input_width: usize,
+    n_tokens: usize,
+    pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+    format: ResidentWeightFormat,
+    output_rows: usize,
+) -> Option<Vec<f32>> {
+    if input.is_empty()
+        || input.len() != input_width.checked_mul(n_tokens)?
+        || n_tokens == 0
+        || output_rows == 0
+        || !matches!(
+            format,
+            ResidentWeightFormat::Q1_0
+                | ResidentWeightFormat::Q2_0G64
+                | ResidentWeightFormat::Q2_0G128
+        )
+    {
+        return None;
+    }
+    let weight = ResidentWeightBytes::WirePages { format, pages };
+    if !weight.matches_shape(input_width, output_rows) {
+        return None;
+    }
+
+    let kernel = metal_linear_kernel()?;
+    let input_buf = kernel.device.new_buffer(
+        std::mem::size_of_val(input) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let output_buf = kernel.device.new_buffer(
+        (n_tokens * output_rows * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let scalar_buf = kernel
+        .device
+        .new_buffer(12, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&input_buf, input);
+
+    let resident = {
+        let mut cache = METAL_LINEAR_CACHE
+            .get_or_init(|| Mutex::new(MetalLinearCache::new()))
+            .lock()
+            .ok()?;
+        resolve_resident_weight(&mut cache, &kernel.device, &weight, true)?
+    };
+
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let mut keep = Vec::new();
+    encode_resident_matmul_f32(
+        encoder,
+        kernel,
+        &mut keep,
+        &input_buf,
+        &resident,
+        &output_buf,
+        &scalar_buf,
+        input_width,
+        output_rows,
+        n_tokens,
+    );
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let mut output = vec![0.0_f32; n_tokens * output_rows];
+    read_buffer_f32(&output_buf, &mut output);
+    Some(output)
 }
 
 /// The Q4_K/Q6_K half of [`encode_resident_matmul_f32`] with the activation-quant
@@ -9378,7 +10295,12 @@ fn encode_resident_kquant_matmul_f32(
         (ResidentWeightFormat::Q6K, true) => &k.q6k_linear_simd_pipeline,
         (ResidentWeightFormat::Q4K, false) => &k.q4k_linear_tiled_pipeline,
         (ResidentWeightFormat::Q6K, false) => &k.q6k_linear_tiled_pipeline,
-        (ResidentWeightFormat::Q8_0, _) => unreachable!(),
+        (ResidentWeightFormat::Q8_0, _)
+        | (ResidentWeightFormat::DenseF32, _)
+        | (ResidentWeightFormat::DenseF16, _)
+        | (ResidentWeightFormat::Q1_0, _)
+        | (ResidentWeightFormat::Q2_0G64, _)
+        | (ResidentWeightFormat::Q2_0G128, _) => unreachable!(),
     };
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(scales), 0);
@@ -9393,7 +10315,12 @@ fn encode_resident_kquant_matmul_f32(
             * match weight.format {
                 ResidentWeightFormat::Q4K => 9,
                 ResidentWeightFormat::Q6K => 8,
-                ResidentWeightFormat::Q8_0 => unreachable!(),
+                ResidentWeightFormat::Q8_0
+                | ResidentWeightFormat::DenseF32
+                | ResidentWeightFormat::DenseF16
+                | ResidentWeightFormat::Q1_0
+                | ResidentWeightFormat::Q2_0G64
+                | ResidentWeightFormat::Q2_0G128 => unreachable!(),
             };
         // `setThreadgroupMemoryLength:` requires a multiple of 16 bytes
         // (MTLDebugComputeCommandEncoder hard-asserts otherwise). `n_sb` is odd
@@ -12076,6 +13003,1710 @@ fn encode_attention_block(
     ]);
 }
 
+#[cfg(target_os = "macos")]
+fn qwen35_f32_buffer(k: &MetalLinearKernel, values: &[f32]) -> Buffer {
+    let buffer = k.device.new_buffer(
+        std::mem::size_of_val(values) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    write_buffer_f32(&buffer, values);
+    buffer
+}
+
+#[cfg(target_os = "macos")]
+fn qwen35_zero_buffer(k: &MetalLinearKernel, bytes: usize) -> Buffer {
+    let buffer = k
+        .device
+        .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+    unsafe { std::ptr::write_bytes(buffer.contents() as *mut u8, 0, bytes.max(4)) };
+    buffer
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum Qwen35MetalSelection {
+    Greedy,
+    Logits,
+}
+
+#[cfg(target_os = "macos")]
+enum Qwen35MetalStep {
+    Token(u32),
+    Logits(Vec<f32>),
+}
+
+#[cfg(target_os = "macos")]
+impl Qwen35MetalDecode {
+    pub(crate) fn new(
+        config: Qwen35MetalConfig,
+        inputs: &[Qwen35MetalLayerInput<'_>],
+        final_norm: &[f32],
+        output: ResidentWeightBytes<'_>,
+        max_positions: usize,
+    ) -> Option<Self> {
+        if config.hidden == 0
+            || config.ffn_dim == 0
+            || config.head_dim == 0
+            || config.rope_dim == 0
+            || config.rope_dim > config.head_dim
+            || !config.rope_dim.is_multiple_of(2)
+            || config.n_heads == 0
+            || config.n_kv_heads == 0
+            || !config.n_heads.is_multiple_of(config.n_kv_heads)
+            || config.d_conv < 2
+            || config.d_state == 0
+            || config.value_dim != config.n_value_heads * config.d_state
+            || config.conv_dim != 2 * config.key_dim + config.value_dim
+            || config.key_dim != config.n_key_heads * config.d_state
+            || final_norm.len() != config.hidden
+            || max_positions == 0
+            || !output.matches_shape(config.hidden, config.vocab)
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        let mut cache = metal_linear_cache().lock().ok()?;
+        let mut layers = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.attn_norm.len() != config.hidden
+                || input.post_attn_norm.len() != config.hidden
+                || !input.ffn_gate.matches_shape(config.hidden, config.ffn_dim)
+                || !input.ffn_up.matches_shape(config.hidden, config.ffn_dim)
+                || !input.ffn_down.matches_shape(config.ffn_dim, config.hidden)
+            {
+                return None;
+            }
+            let ffn_gate = resolve_resident_weight(&mut cache, &k.device, &input.ffn_gate, true)?;
+            let ffn_up = resolve_resident_weight(&mut cache, &k.device, &input.ffn_up, true)?;
+            let ffn_down = resolve_resident_weight(&mut cache, &k.device, &input.ffn_down, true)?;
+            let kind = match &input.kind {
+                Qwen35MetalLayerKindInput::Full {
+                    q,
+                    k: kw,
+                    v,
+                    output,
+                    q_norm,
+                    k_norm,
+                } => {
+                    let q_dim = config.n_heads * config.head_dim;
+                    let kv_dim = config.n_kv_heads * config.head_dim;
+                    if q_norm.len() != config.head_dim
+                        || k_norm.len() != config.head_dim
+                        || !q.matches_shape(config.hidden, 2 * q_dim)
+                        || !kw.matches_shape(config.hidden, kv_dim)
+                        || !v.matches_shape(config.hidden, kv_dim)
+                        || !output.matches_shape(q_dim, config.hidden)
+                    {
+                        return None;
+                    }
+                    Qwen35MetalLayerKind::Full {
+                        q: resolve_resident_weight(&mut cache, &k.device, q, true)?,
+                        k: resolve_resident_weight(&mut cache, &k.device, kw, true)?,
+                        v: resolve_resident_weight(&mut cache, &k.device, v, true)?,
+                        output: resolve_resident_weight(&mut cache, &k.device, output, true)?,
+                        q_norm: qwen35_f32_buffer(k, q_norm),
+                        k_norm: qwen35_f32_buffer(k, k_norm),
+                        cache_k: qwen35_zero_buffer(
+                            k,
+                            config.n_kv_heads * max_positions * config.head_dim * 4,
+                        ),
+                        cache_v: qwen35_zero_buffer(
+                            k,
+                            config.n_kv_heads * max_positions * config.head_dim * 4,
+                        ),
+                    }
+                }
+                Qwen35MetalLayerKindInput::Ssm {
+                    qkv,
+                    gate,
+                    beta,
+                    alpha,
+                    output,
+                    conv1d,
+                    dt_bias,
+                    a,
+                    norm,
+                } => {
+                    if conv1d.len() != config.conv_dim * config.d_conv
+                        || dt_bias.len() != config.n_value_heads
+                        || a.len() != config.n_value_heads
+                        || norm.len() != config.d_state
+                        || !qkv.matches_shape(config.hidden, config.conv_dim)
+                        || !gate.matches_shape(config.hidden, config.value_dim)
+                        || !beta.matches_shape(config.hidden, config.n_value_heads)
+                        || !alpha.matches_shape(config.hidden, config.n_value_heads)
+                        || !output.matches_shape(config.value_dim, config.hidden)
+                    {
+                        return None;
+                    }
+                    Qwen35MetalLayerKind::Ssm {
+                        qkv: resolve_resident_weight(&mut cache, &k.device, qkv, true)?,
+                        gate: resolve_resident_weight(&mut cache, &k.device, gate, true)?,
+                        beta: resolve_resident_weight(&mut cache, &k.device, beta, true)?,
+                        alpha: resolve_resident_weight(&mut cache, &k.device, alpha, true)?,
+                        output: resolve_resident_weight(&mut cache, &k.device, output, true)?,
+                        conv1d: qwen35_f32_buffer(k, conv1d),
+                        dt_bias: qwen35_f32_buffer(k, dt_bias),
+                        a: qwen35_f32_buffer(k, a),
+                        norm: qwen35_f32_buffer(k, norm),
+                        conv_state: qwen35_zero_buffer(
+                            k,
+                            config.conv_dim * (config.d_conv - 1) * 4,
+                        ),
+                        state: qwen35_zero_buffer(
+                            k,
+                            config.n_value_heads * config.d_state * config.d_state * 4,
+                        ),
+                    }
+                }
+            };
+            layers.push(Qwen35MetalLayer {
+                attn_norm: qwen35_f32_buffer(k, input.attn_norm),
+                post_attn_norm: qwen35_f32_buffer(k, input.post_attn_norm),
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                kind,
+            });
+        }
+        let output = resolve_resident_weight(&mut cache, &k.device, &output, true)?;
+        drop(cache);
+        Some(Self {
+            config,
+            max_positions,
+            layers,
+            final_norm: qwen35_f32_buffer(k, final_norm),
+            output,
+            hidden_a: qwen35_zero_buffer(k, config.hidden * 4),
+            hidden_b: qwen35_zero_buffer(k, config.hidden * 4),
+            filled: 0,
+        })
+    }
+
+    pub(crate) fn reset(&mut self) {
+        for layer in &self.layers {
+            match &layer.kind {
+                Qwen35MetalLayerKind::Full {
+                    cache_k, cache_v, ..
+                } => unsafe {
+                    std::ptr::write_bytes(
+                        cache_k.contents() as *mut u8,
+                        0,
+                        cache_k.length() as usize,
+                    );
+                    std::ptr::write_bytes(
+                        cache_v.contents() as *mut u8,
+                        0,
+                        cache_v.length() as usize,
+                    );
+                },
+                Qwen35MetalLayerKind::Ssm {
+                    conv_state, state, ..
+                } => unsafe {
+                    std::ptr::write_bytes(
+                        conv_state.contents() as *mut u8,
+                        0,
+                        conv_state.length() as usize,
+                    );
+                    std::ptr::write_bytes(state.contents() as *mut u8, 0, state.length() as usize);
+                },
+            }
+        }
+        self.filled = 0;
+    }
+
+    pub(crate) fn forward_greedy(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+    ) -> Option<u32> {
+        match self.forward_select(embedding, cos, sin, position, Qwen35MetalSelection::Greedy)? {
+            Qwen35MetalStep::Token(token) => Some(token),
+            Qwen35MetalStep::Logits(_) => None,
+        }
+    }
+
+    /// Advance a sequence of non-final prompt slots in bounded command-buffer
+    /// chunks. Recurrent and KV buffers are shared across the encoded token
+    /// graphs, so Metal preserves the same state transitions while Camelid
+    /// avoids one commit/wait round trip per slot.
+    pub(crate) fn forward_prefill_batch(
+        &mut self,
+        slots: &[(Vec<f32>, Vec<f32>, Vec<f32>)],
+    ) -> bool {
+        const SLOTS_PER_COMMAND_BUFFER: usize = 16;
+
+        if slots.is_empty() {
+            return true;
+        }
+        let c = self.config;
+        if self.filled + slots.len() > self.max_positions
+            || slots.iter().any(|(embedding, cos, sin)| {
+                embedding.len() != c.hidden
+                    || cos.len() != c.rope_dim / 2
+                    || sin.len() != c.rope_dim / 2
+            })
+        {
+            return false;
+        }
+        let Some(k) = metal_linear_kernel() else {
+            return false;
+        };
+        let mut state_resources: Vec<&metal::ResourceRef> =
+            Vec::with_capacity(self.layers.len() * 2);
+        for layer in &self.layers {
+            match &layer.kind {
+                Qwen35MetalLayerKind::Full {
+                    cache_k, cache_v, ..
+                } => {
+                    state_resources.push(cache_k);
+                    state_resources.push(cache_v);
+                }
+                Qwen35MetalLayerKind::Ssm {
+                    conv_state, state, ..
+                } => {
+                    state_resources.push(conv_state);
+                    state_resources.push(state);
+                }
+            }
+        }
+
+        for chunk in slots.chunks(SLOTS_PER_COMMAND_BUFFER) {
+            let cb = k.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let mut keep = Vec::new();
+            let mut owned = Vec::with_capacity(chunk.len() * 4);
+            for (offset, (embedding, cos, sin)) in chunk.iter().enumerate() {
+                let position = self.filled + offset;
+                let hidden_a = qwen35_f32_buffer(k, embedding);
+                let hidden_b = qwen35_zero_buffer(k, c.hidden * 4);
+                let cos_buf = qwen35_f32_buffer(k, cos);
+                let sin_buf = qwen35_f32_buffer(k, sin);
+                for layer in &self.layers {
+                    match &layer.kind {
+                        Qwen35MetalLayerKind::Full { .. } => encode_qwen35_full_layer(
+                            encoder,
+                            k,
+                            &mut keep,
+                            &hidden_a,
+                            &hidden_b,
+                            layer,
+                            &cos_buf,
+                            &sin_buf,
+                            c,
+                            self.max_positions,
+                            position,
+                        ),
+                        Qwen35MetalLayerKind::Ssm { .. } => encode_qwen35_ssm_layer(
+                            encoder, k, &mut keep, &hidden_a, &hidden_b, layer, c,
+                        ),
+                    }
+                    encode_qwen35_ffn(encoder, k, &mut keep, &hidden_b, &hidden_a, layer, c);
+                }
+                owned.extend([hidden_a, hidden_b, cos_buf, sin_buf]);
+                if offset + 1 < chunk.len() {
+                    encoder.memory_barrier_with_resources(&state_resources);
+                }
+            }
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            drop(owned);
+            pool_recycle(k, keep);
+            self.filled += chunk.len();
+        }
+        true
+    }
+
+    /// Run the same resident graph as [`Self::forward_greedy`] but expose the
+    /// final shared-memory logits to Camelid's full sampler. This is reserved for
+    /// non-greedy requests; parity-locked greedy decode keeps its GPU argmax and
+    /// never pays the ~1 MiB host snapshot.
+    pub(crate) fn forward_logits(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+    ) -> Option<Vec<f32>> {
+        match self.forward_select(embedding, cos, sin, position, Qwen35MetalSelection::Logits)? {
+            Qwen35MetalStep::Logits(logits) => Some(logits),
+            Qwen35MetalStep::Token(_) => None,
+        }
+    }
+
+    fn forward_select(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        selection: Qwen35MetalSelection,
+    ) -> Option<Qwen35MetalStep> {
+        let c = self.config;
+        if embedding.len() != c.hidden
+            || cos.len() != c.rope_dim / 2
+            || sin.len() != c.rope_dim / 2
+            || position != self.filled
+            || position >= self.max_positions
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        write_buffer_f32(&self.hidden_a, embedding);
+        let cos_buf = qwen35_f32_buffer(k, cos);
+        let sin_buf = qwen35_f32_buffer(k, sin);
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = vec![cos_buf.to_owned(), sin_buf.to_owned()];
+        for layer in &self.layers {
+            match &layer.kind {
+                Qwen35MetalLayerKind::Full { .. } => encode_qwen35_full_layer(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.hidden_a,
+                    &self.hidden_b,
+                    layer,
+                    &cos_buf,
+                    &sin_buf,
+                    c,
+                    self.max_positions,
+                    position,
+                ),
+                Qwen35MetalLayerKind::Ssm { .. } => encode_qwen35_ssm_layer(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.hidden_a,
+                    &self.hidden_b,
+                    layer,
+                    c,
+                ),
+            }
+            encode_qwen35_ffn(e, k, &mut keep, &self.hidden_b, &self.hidden_a, layer, c);
+        }
+
+        let normed = pool_get(k, (c.hidden * 4) as u64);
+        let norm_scalar = pool_get(k, 8);
+        let logits = pool_get(k, (c.vocab * 4) as u64);
+        let mm_scalar = pool_get(k, 12);
+        unsafe {
+            let p = norm_scalar.contents() as *mut u8;
+            *(p as *mut u32) = c.hidden as u32;
+            *(p.add(4) as *mut f32) = c.eps;
+        }
+        encode_rms_norm_f32(
+            e,
+            k,
+            &self.hidden_a,
+            &self.final_norm,
+            &normed,
+            &norm_scalar,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &normed,
+            &self.output,
+            &logits,
+            &mm_scalar,
+            c.hidden,
+            c.vocab,
+            1,
+        );
+        let greedy_buffers = if matches!(selection, Qwen35MetalSelection::Greedy) {
+            let selected = pool_get(k, 4);
+            let vocab_scalar = pool_get(k, 4);
+            unsafe { *(vocab_scalar.contents() as *mut u32) = c.vocab as u32 };
+            e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+            e.set_buffer(0, Some(&logits), 0);
+            e.set_buffer(1, Some(&selected), 0);
+            e.set_buffer(2, Some(&vocab_scalar), 0);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Some((selected, vocab_scalar))
+        } else {
+            None
+        };
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let output = match &greedy_buffers {
+            Some((selected, _)) => {
+                Qwen35MetalStep::Token(unsafe { *(selected.contents() as *const u32) })
+            }
+            None => {
+                let values = unsafe {
+                    std::slice::from_raw_parts(logits.contents() as *const f32, c.vocab).to_vec()
+                };
+                Qwen35MetalStep::Logits(values)
+            }
+        };
+        keep.extend([normed, norm_scalar, logits, mm_scalar]);
+        if let Some((selected, vocab_scalar)) = greedy_buffers {
+            keep.extend([selected, vocab_scalar]);
+        }
+        pool_recycle(k, keep);
+        self.filled += 1;
+        Some(output)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn encode_vision_layer_norm(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input: &Buffer,
+    weight: &Buffer,
+    bias: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    tokens: usize,
+) {
+    encoder.set_compute_pipeline_state(&kernel.vision_layer_norm_pipeline);
+    encoder.set_buffer(0, Some(input), 0);
+    encoder.set_buffer(1, Some(weight), 0);
+    encoder.set_buffer(2, Some(bias), 0);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_buffer(4, Some(scalar), 0);
+    encoder.set_buffer(5, Some(scalar), 4);
+    encoder.set_threadgroup_memory_length(0, 256 * 4);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: tokens as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn encode_vision_bias(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    values: &Buffer,
+    bias: &Buffer,
+    scalar: &Buffer,
+    total: usize,
+) {
+    encoder.set_compute_pipeline_state(&kernel.vision_add_bias_pipeline);
+    encoder.set_buffer(0, Some(values), 0);
+    encoder.set_buffer(1, Some(bias), 0);
+    encoder.set_buffer(2, Some(scalar), 0);
+    encoder.set_buffer(3, Some(scalar), 4);
+    dispatch_1d(encoder, &kernel.vision_add_bias_pipeline, total);
+}
+
+#[cfg(target_os = "macos")]
+fn encode_vision_bias_residual(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    residual: &Buffer,
+    projected: &Buffer,
+    bias: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    total: usize,
+) {
+    encoder.set_compute_pipeline_state(&kernel.vision_bias_residual_pipeline);
+    encoder.set_buffer(0, Some(residual), 0);
+    encoder.set_buffer(1, Some(projected), 0);
+    encoder.set_buffer(2, Some(bias), 0);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_buffer(4, Some(scalar), 0);
+    encoder.set_buffer(5, Some(scalar), 4);
+    dispatch_1d(encoder, &kernel.vision_bias_residual_pipeline, total);
+}
+
+#[cfg(target_os = "macos")]
+fn encode_vision_bias_gelu(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    values: &Buffer,
+    bias: &Buffer,
+    scalar: &Buffer,
+    total: usize,
+) {
+    encoder.set_compute_pipeline_state(&kernel.vision_bias_gelu_pipeline);
+    encoder.set_buffer(0, Some(values), 0);
+    encoder.set_buffer(1, Some(bias), 0);
+    encoder.set_buffer(2, Some(scalar), 0);
+    encoder.set_buffer(3, Some(scalar), 4);
+    dispatch_1d(encoder, &kernel.vision_bias_gelu_pipeline, total);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_vision_diagnostics(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    values: &Buffer,
+    metrics: &Buffer,
+    scalars: &Buffer,
+    total: usize,
+    label: String,
+    labels: &mut Vec<String>,
+) {
+    let slot = labels.len();
+    unsafe {
+        let p = (scalars.contents() as *mut u8).add(slot * 8) as *mut u32;
+        *p = total as u32;
+        *p.add(1) = slot as u32;
+    }
+    labels.push(label);
+    encoder.set_compute_pipeline_state(&kernel.vision_diagnostics_pipeline);
+    encoder.set_buffer(0, Some(values), 0);
+    encoder.set_buffer(1, Some(metrics), 0);
+    encoder.set_buffer(2, Some(scalars), (slot * 8) as u64);
+    encoder.set_buffer(3, Some(scalars), (slot * 8 + 4) as u64);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+impl PrismVisionMetalEncoder {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        config: PrismVisionMetalConfig,
+        patch_0: ResidentWeightBytes<'_>,
+        patch_1: ResidentWeightBytes<'_>,
+        patch_bias: &[f32],
+        layers: &[PrismVisionMetalLayerInput<'_>],
+        post_weight: &[f32],
+        post_bias: &[f32],
+        merger_0: ResidentWeightBytes<'_>,
+        merger_0_bias: &[f32],
+        merger_2: ResidentWeightBytes<'_>,
+        merger_2_bias: &[f32],
+    ) -> Option<Self> {
+        let c = config;
+        let merged = c.hidden * c.merge * c.merge;
+        if c.patch_input == 0
+            || c.hidden == 0
+            || c.ffn == 0
+            || c.heads == 0
+            || !c.hidden.is_multiple_of(c.heads)
+            || c.merge != 2
+            || c.projection == 0
+            || patch_bias.len() != c.hidden
+            || post_weight.len() != c.hidden
+            || post_bias.len() != c.hidden
+            || merger_0_bias.len() != merged
+            || merger_2_bias.len() != c.projection
+            || !patch_0.matches_shape(c.patch_input, c.hidden)
+            || !patch_1.matches_shape(c.patch_input, c.hidden)
+            || !merger_0.matches_shape(merged, merged)
+            || !merger_2.matches_shape(merged, c.projection)
+            || layers.is_empty()
+        {
+            return None;
+        }
+        let kernel = metal_linear_kernel()?;
+        let mut cache = metal_linear_cache().lock().ok()?;
+        let mut resident_layers = Vec::with_capacity(layers.len());
+        for layer in layers {
+            if layer.ln1_weight.len() != c.hidden
+                || layer.ln1_bias.len() != c.hidden
+                || layer.qkv_bias.len() != 3 * c.hidden
+                || layer.attn_output_bias.len() != c.hidden
+                || layer.ln2_weight.len() != c.hidden
+                || layer.ln2_bias.len() != c.hidden
+                || layer.ffn_up_bias.len() != c.ffn
+                || layer.ffn_down_bias.len() != c.hidden
+                || !layer.qkv.matches_shape(c.hidden, 3 * c.hidden)
+                || !layer.attn_output.matches_shape(c.hidden, c.hidden)
+                || !layer.ffn_up.matches_shape(c.hidden, c.ffn)
+                || !layer.ffn_down.matches_shape(c.ffn, c.hidden)
+            {
+                return None;
+            }
+            resident_layers.push(PrismVisionMetalLayer {
+                ln1_weight: qwen35_f32_buffer(kernel, layer.ln1_weight),
+                ln1_bias: qwen35_f32_buffer(kernel, layer.ln1_bias),
+                qkv: resolve_resident_weight(&mut cache, &kernel.device, &layer.qkv, true)?,
+                qkv_bias: qwen35_f32_buffer(kernel, layer.qkv_bias),
+                attn_output: resolve_resident_weight(
+                    &mut cache,
+                    &kernel.device,
+                    &layer.attn_output,
+                    true,
+                )?,
+                attn_output_bias: qwen35_f32_buffer(kernel, layer.attn_output_bias),
+                ln2_weight: qwen35_f32_buffer(kernel, layer.ln2_weight),
+                ln2_bias: qwen35_f32_buffer(kernel, layer.ln2_bias),
+                ffn_up: resolve_resident_weight(&mut cache, &kernel.device, &layer.ffn_up, true)?,
+                ffn_up_bias: qwen35_f32_buffer(kernel, layer.ffn_up_bias),
+                ffn_down: resolve_resident_weight(
+                    &mut cache,
+                    &kernel.device,
+                    &layer.ffn_down,
+                    true,
+                )?,
+                ffn_down_bias: qwen35_f32_buffer(kernel, layer.ffn_down_bias),
+            });
+        }
+        let patch_0 = resolve_resident_weight(&mut cache, &kernel.device, &patch_0, true)?;
+        let patch_1 = resolve_resident_weight(&mut cache, &kernel.device, &patch_1, true)?;
+        let merger_0 = resolve_resident_weight(&mut cache, &kernel.device, &merger_0, true)?;
+        let merger_2 = resolve_resident_weight(&mut cache, &kernel.device, &merger_2, true)?;
+        drop(cache);
+        Some(Self {
+            config,
+            patch_0,
+            patch_1,
+            patch_bias: qwen35_f32_buffer(kernel, patch_bias),
+            layers: resident_layers,
+            post_weight: qwen35_f32_buffer(kernel, post_weight),
+            post_bias: qwen35_f32_buffer(kernel, post_bias),
+            merger_0,
+            merger_0_bias: qwen35_f32_buffer(kernel, merger_0_bias),
+            merger_2,
+            merger_2_bias: qwen35_f32_buffer(kernel, merger_2_bias),
+        })
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        patches: &[f32],
+        position: &[f32],
+        patch_width: usize,
+        patch_height: usize,
+    ) -> Option<Vec<Vec<f32>>> {
+        let c = self.config;
+        let tokens = patch_width.checked_mul(patch_height)?;
+        if tokens == 0
+            || tokens > 4096
+            || !patch_width.is_multiple_of(c.merge)
+            || !patch_height.is_multiple_of(c.merge)
+            || patches.len() != tokens * c.patch_input
+            || position.len() != tokens * c.hidden
+        {
+            return None;
+        }
+        let output_tokens = tokens / (c.merge * c.merge);
+        let merged = c.hidden * c.merge * c.merge;
+        let head_dim = c.hidden / c.heads;
+        if !head_dim.is_multiple_of(2) {
+            return None;
+        }
+        let kernel = metal_linear_kernel()?;
+        let buffer = |floats: usize| qwen35_zero_buffer(kernel, floats * 4);
+        let patch_input = qwen35_f32_buffer(kernel, patches);
+        let position_buffer = qwen35_f32_buffer(kernel, position);
+        let patch_first = buffer(tokens * c.hidden);
+        let patch_second = buffer(tokens * c.hidden);
+        let hidden_a = buffer(tokens * c.hidden);
+        let hidden_b = buffer(tokens * c.hidden);
+        let normalized = buffer(tokens * c.hidden);
+        let qkv = buffer(tokens * 3 * c.hidden);
+        let attention = buffer(tokens * c.hidden);
+        let projected = buffer(tokens * c.hidden);
+        let ffn = buffer(tokens * c.ffn);
+        let merger_hidden = buffer(output_tokens * merged);
+        let result = buffer(output_tokens * c.projection);
+
+        let scalar = |input: usize, rows: usize, count: usize| {
+            let value = qwen35_zero_buffer(kernel, 12);
+            unsafe {
+                let p = value.contents() as *mut u32;
+                *p = input as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = count as u32;
+            }
+            value
+        };
+        let patch_mm = scalar(c.patch_input, c.hidden, tokens);
+        let qkv_mm = scalar(c.hidden, 3 * c.hidden, tokens);
+        let hidden_mm = scalar(c.hidden, c.hidden, tokens);
+        let ffn_up_mm = scalar(c.hidden, c.ffn, tokens);
+        let ffn_down_mm = scalar(c.ffn, c.hidden, tokens);
+        let merger_0_mm = scalar(merged, merged, output_tokens);
+        let merger_2_mm = scalar(merged, c.projection, output_tokens);
+        let element_scalar = |width: usize, total: usize| {
+            let value = qwen35_zero_buffer(kernel, 8);
+            unsafe {
+                let p = value.contents() as *mut u32;
+                *p = width as u32;
+                *p.add(1) = total as u32;
+            }
+            value
+        };
+        let hidden_element = element_scalar(c.hidden, tokens * c.hidden);
+        let qkv_element = element_scalar(3 * c.hidden, tokens * 3 * c.hidden);
+        let ffn_element = element_scalar(c.ffn, tokens * c.ffn);
+        let merged_element = element_scalar(merged, output_tokens * merged);
+        let projection_element = element_scalar(c.projection, output_tokens * c.projection);
+        let norm_scalar = qwen35_zero_buffer(kernel, 8);
+        unsafe {
+            let p = norm_scalar.contents() as *mut u8;
+            *(p as *mut u32) = c.hidden as u32;
+            *(p.add(4) as *mut f32) = c.eps;
+        }
+        let (cosine, sine) = vision_rope_tables(patch_width, patch_height, c.merge, head_dim);
+        let cosine = qwen35_f32_buffer(kernel, &cosine);
+        let sine = qwen35_f32_buffer(kernel, &sine);
+        let rope_scalar = qwen35_zero_buffer(kernel, 16);
+        unsafe {
+            let p = rope_scalar.contents() as *mut u32;
+            *p = c.hidden as u32;
+            *p.add(1) = c.heads as u32;
+            *p.add(2) = head_dim as u32;
+            *p.add(3) = tokens as u32;
+        }
+        let attention_scalar = qwen35_zero_buffer(kernel, 28);
+        unsafe {
+            let p = attention_scalar.contents() as *mut u8;
+            *(p as *mut u32) = c.hidden as u32;
+            *(p.add(4) as *mut u32) = c.heads as u32;
+            *(p.add(8) as *mut u32) = head_dim as u32;
+            *(p.add(12) as *mut u32) = tokens as u32;
+            *(p.add(16) as *mut f32) = 1.0 / (head_dim as f32).sqrt();
+        }
+
+        let command = kernel.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        let mut keep = Vec::new();
+        let trace = std::env::var("CAMELID_VISION_TRACE")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let max_trace_slots = 4 * self.layers.len() + 8;
+        let trace_metrics = trace.then(|| buffer(max_trace_slots * 3));
+        let trace_scalars = trace.then(|| qwen35_zero_buffer(kernel, max_trace_slots * 8));
+        let mut trace_labels = Vec::new();
+        encode_resident_matmul_f32(
+            encoder,
+            kernel,
+            &mut keep,
+            &patch_input,
+            &self.patch_0,
+            &patch_first,
+            &patch_mm,
+            c.patch_input,
+            c.hidden,
+            tokens,
+        );
+        encode_resident_matmul_f32(
+            encoder,
+            kernel,
+            &mut keep,
+            &patch_input,
+            &self.patch_1,
+            &patch_second,
+            &patch_mm,
+            c.patch_input,
+            c.hidden,
+            tokens,
+        );
+        encoder.set_compute_pipeline_state(&kernel.vision_patch_sum_pipeline);
+        encoder.set_buffer(0, Some(&patch_first), 0);
+        encoder.set_buffer(1, Some(&patch_second), 0);
+        encoder.set_buffer(2, Some(&self.patch_bias), 0);
+        encoder.set_buffer(3, Some(&position_buffer), 0);
+        encoder.set_buffer(4, Some(&hidden_a), 0);
+        encoder.set_buffer(5, Some(&hidden_element), 0);
+        encoder.set_buffer(6, Some(&hidden_element), 4);
+        dispatch_1d(
+            encoder,
+            &kernel.vision_patch_sum_pipeline,
+            tokens * c.hidden,
+        );
+        if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+            encode_vision_diagnostics(
+                encoder,
+                kernel,
+                &hidden_a,
+                metrics,
+                scalars,
+                tokens * c.hidden,
+                "patch+position".into(),
+                &mut trace_labels,
+            );
+        }
+
+        let attention_scratch = (tokens + 1) * 4;
+        assert_threadgroup_fits(
+            &kernel.device,
+            attention_scratch,
+            "Qwen3-VL attention scores",
+        );
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            encode_vision_layer_norm(
+                encoder,
+                kernel,
+                &hidden_a,
+                &layer.ln1_weight,
+                &layer.ln1_bias,
+                &normalized,
+                &norm_scalar,
+                tokens,
+            );
+            encode_resident_matmul_f32(
+                encoder,
+                kernel,
+                &mut keep,
+                &normalized,
+                &layer.qkv,
+                &qkv,
+                &qkv_mm,
+                c.hidden,
+                3 * c.hidden,
+                tokens,
+            );
+            encode_vision_bias(
+                encoder,
+                kernel,
+                &qkv,
+                &layer.qkv_bias,
+                &qkv_element,
+                tokens * 3 * c.hidden,
+            );
+            encoder.set_compute_pipeline_state(&kernel.vision_rope_pipeline);
+            encoder.set_buffer(0, Some(&qkv), 0);
+            encoder.set_buffer(1, Some(&cosine), 0);
+            encoder.set_buffer(2, Some(&sine), 0);
+            encoder.set_buffer(3, Some(&rope_scalar), 0);
+            encoder.set_buffer(4, Some(&rope_scalar), 4);
+            encoder.set_buffer(5, Some(&rope_scalar), 8);
+            encoder.set_buffer(6, Some(&rope_scalar), 12);
+            dispatch_1d(
+                encoder,
+                &kernel.vision_rope_pipeline,
+                tokens * c.heads * (head_dim / 2),
+            );
+            if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+                encode_vision_diagnostics(
+                    encoder,
+                    kernel,
+                    &qkv,
+                    metrics,
+                    scalars,
+                    tokens * 3 * c.hidden,
+                    format!("layer {layer_index} qkv+rope"),
+                    &mut trace_labels,
+                );
+            }
+            encoder.set_compute_pipeline_state(&kernel.vision_attention_pipeline);
+            encoder.set_buffer(0, Some(&qkv), 0);
+            encoder.set_buffer(1, Some(&attention), 0);
+            encoder.set_buffer(2, Some(&attention_scalar), 0);
+            encoder.set_buffer(3, Some(&attention_scalar), 4);
+            encoder.set_buffer(4, Some(&attention_scalar), 8);
+            encoder.set_buffer(5, Some(&attention_scalar), 12);
+            encoder.set_buffer(6, Some(&attention_scalar), 16);
+            encoder.set_threadgroup_memory_length(0, attention_scratch as u64);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: tokens as u64,
+                    height: c.heads as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+                encode_vision_diagnostics(
+                    encoder,
+                    kernel,
+                    &attention,
+                    metrics,
+                    scalars,
+                    tokens * c.hidden,
+                    format!("layer {layer_index} attention"),
+                    &mut trace_labels,
+                );
+            }
+            encode_resident_matmul_f32(
+                encoder,
+                kernel,
+                &mut keep,
+                &attention,
+                &layer.attn_output,
+                &projected,
+                &hidden_mm,
+                c.hidden,
+                c.hidden,
+                tokens,
+            );
+            encode_vision_bias_residual(
+                encoder,
+                kernel,
+                &hidden_a,
+                &projected,
+                &layer.attn_output_bias,
+                &hidden_b,
+                &hidden_element,
+                tokens * c.hidden,
+            );
+            encode_vision_layer_norm(
+                encoder,
+                kernel,
+                &hidden_b,
+                &layer.ln2_weight,
+                &layer.ln2_bias,
+                &normalized,
+                &norm_scalar,
+                tokens,
+            );
+            encode_resident_matmul_f32(
+                encoder,
+                kernel,
+                &mut keep,
+                &normalized,
+                &layer.ffn_up,
+                &ffn,
+                &ffn_up_mm,
+                c.hidden,
+                c.ffn,
+                tokens,
+            );
+            encode_vision_bias_gelu(
+                encoder,
+                kernel,
+                &ffn,
+                &layer.ffn_up_bias,
+                &ffn_element,
+                tokens * c.ffn,
+            );
+            encode_resident_matmul_f32(
+                encoder,
+                kernel,
+                &mut keep,
+                &ffn,
+                &layer.ffn_down,
+                &projected,
+                &ffn_down_mm,
+                c.ffn,
+                c.hidden,
+                tokens,
+            );
+            encode_vision_bias_residual(
+                encoder,
+                kernel,
+                &hidden_b,
+                &projected,
+                &layer.ffn_down_bias,
+                &hidden_a,
+                &hidden_element,
+                tokens * c.hidden,
+            );
+            if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+                encode_vision_diagnostics(
+                    encoder,
+                    kernel,
+                    &hidden_a,
+                    metrics,
+                    scalars,
+                    tokens * c.hidden,
+                    format!("layer {layer_index} output"),
+                    &mut trace_labels,
+                );
+            }
+        }
+
+        encode_vision_layer_norm(
+            encoder,
+            kernel,
+            &hidden_a,
+            &self.post_weight,
+            &self.post_bias,
+            &normalized,
+            &norm_scalar,
+            tokens,
+        );
+        if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+            encode_vision_diagnostics(
+                encoder,
+                kernel,
+                &normalized,
+                metrics,
+                scalars,
+                tokens * c.hidden,
+                "post norm".into(),
+                &mut trace_labels,
+            );
+        }
+        encode_resident_matmul_f32(
+            encoder,
+            kernel,
+            &mut keep,
+            &normalized,
+            &self.merger_0,
+            &merger_hidden,
+            &merger_0_mm,
+            merged,
+            merged,
+            output_tokens,
+        );
+        if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+            encode_vision_diagnostics(
+                encoder,
+                kernel,
+                &merger_hidden,
+                metrics,
+                scalars,
+                output_tokens * merged,
+                "merger linear".into(),
+                &mut trace_labels,
+            );
+        }
+        encode_vision_bias_gelu(
+            encoder,
+            kernel,
+            &merger_hidden,
+            &self.merger_0_bias,
+            &merged_element,
+            output_tokens * merged,
+        );
+        if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+            encode_vision_diagnostics(
+                encoder,
+                kernel,
+                &merger_hidden,
+                metrics,
+                scalars,
+                output_tokens * merged,
+                "merger gelu".into(),
+                &mut trace_labels,
+            );
+        }
+        encode_resident_matmul_f32(
+            encoder,
+            kernel,
+            &mut keep,
+            &merger_hidden,
+            &self.merger_2,
+            &result,
+            &merger_2_mm,
+            merged,
+            c.projection,
+            output_tokens,
+        );
+        encode_vision_bias(
+            encoder,
+            kernel,
+            &result,
+            &self.merger_2_bias,
+            &projection_element,
+            output_tokens * c.projection,
+        );
+        if let (Some(metrics), Some(scalars)) = (&trace_metrics, &trace_scalars) {
+            encode_vision_diagnostics(
+                encoder,
+                kernel,
+                &result,
+                metrics,
+                scalars,
+                output_tokens * c.projection,
+                "projected image".into(),
+                &mut trace_labels,
+            );
+        }
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        let mut output = vec![0.0f32; output_tokens * c.projection];
+        read_buffer_f32(&result, &mut output);
+        if let Some(metrics) = &trace_metrics {
+            let mut values = vec![0.0f32; trace_labels.len() * 3];
+            read_buffer_f32(metrics, &mut values);
+            for (label, metric) in trace_labels.iter().zip(values.chunks_exact(3)) {
+                eprintln!(
+                    "[qwen3vl trace] {label}: invalid={} max={:.6} l2={:.6}",
+                    metric[0] as usize, metric[1], metric[2]
+                );
+            }
+        }
+        pool_recycle(kernel, keep);
+        Some(
+            output
+                .chunks_exact(c.projection)
+                .map(<[f32]>::to_vec)
+                .collect(),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn vision_rope_tables(
+    patch_width: usize,
+    patch_height: usize,
+    merge: usize,
+    head_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let section = half / 2;
+    let mut cosine = Vec::with_capacity(patch_width * patch_height * half);
+    let mut sine = Vec::with_capacity(cosine.capacity());
+    for tile_y in (0..patch_height).step_by(merge) {
+        for tile_x in (0..patch_width).step_by(merge) {
+            for dy in 0..merge {
+                for dx in 0..merge {
+                    for pair in 0..half {
+                        let (position, dimension) = if pair < section {
+                            ((tile_y + dy) as f32, pair)
+                        } else {
+                            ((tile_x + dx) as f32, pair - section)
+                        };
+                        let angle =
+                            position * 10_000.0f32.powf(-2.0 * dimension as f32 / half as f32);
+                        cosine.push(angle.cos());
+                        sine.push(angle.sin());
+                    }
+                }
+            }
+        }
+    }
+    (cosine, sine)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen35_full_layer(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Qwen35MetalLayer,
+    cos: &Buffer,
+    sin: &Buffer,
+    c: Qwen35MetalConfig,
+    max_positions: usize,
+    position: usize,
+) {
+    let Qwen35MetalLayerKind::Full {
+        q: q_weight,
+        k: k_weight,
+        v: v_weight,
+        output: o_weight,
+        q_norm,
+        k_norm,
+        cache_k,
+        cache_v,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let q_dim = c.n_heads * c.head_dim;
+    let kv_dim = c.n_kv_heads * c.head_dim;
+    let filled = position + 1;
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let q_fused = pool_get(k, (2 * q_dim * 4) as u64);
+    let query = pool_get(k, (q_dim * 4) as u64);
+    let gate = pool_get(k, (q_dim * 4) as u64);
+    let key = pool_get(k, (kv_dim * 4) as u64);
+    let value = pool_get(k, (kv_dim * 4) as u64);
+    let scores = pool_get(k, (c.n_heads * filled * 4) as u64);
+    let context = pool_get(k, (q_dim * 4) as u64);
+    let mix = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let q_mm = pool_get(k, 12);
+    let kv_mm = pool_get(k, 12);
+    let o_mm = pool_get(k, 12);
+    let split_scalar = pool_get(k, 8);
+    let qk_norm_scalar = pool_get(k, 12);
+    let q_rope = pool_get(k, 16);
+    let k_rope = pool_get(k, 16);
+    let scatter_scalar = pool_get(k, 16);
+    let mirror_flag = pool_get(k, 4);
+    let attn_scalar = pool_get(k, 32);
+    let n_q = pool_get(k, 4);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        let s = split_scalar.contents() as *mut u32;
+        *s = c.head_dim as u32;
+        *s.add(1) = q_dim as u32;
+        let n = qk_norm_scalar.contents() as *mut u8;
+        *(n as *mut u32) = c.head_dim as u32;
+        *(n.add(4) as *mut f32) = c.eps;
+        *(n.add(8) as *mut u32) = 1;
+        let set_rope = |buffer: &Buffer, heads: usize| {
+            let r = buffer.contents() as *mut u32;
+            *r = heads as u32;
+            *r.add(1) = c.head_dim as u32;
+            *r.add(2) = (c.rope_dim / 2) as u32;
+            *r.add(3) = 1;
+        };
+        set_rope(&q_rope, c.n_heads);
+        set_rope(&k_rope, c.n_kv_heads);
+        let sc = scatter_scalar.contents() as *mut u32;
+        *sc = c.head_dim as u32;
+        *sc.add(1) = max_positions as u32;
+        *sc.add(2) = position as u32;
+        *sc.add(3) = kv_dim as u32;
+        *(mirror_flag.contents() as *mut u32) = 0;
+        let a = attn_scalar.contents() as *mut u8;
+        *(a as *mut u32) = c.n_heads as u32;
+        *(a.add(4) as *mut u32) = c.head_dim as u32;
+        *(a.add(8) as *mut u32) = filled as u32;
+        *(a.add(12) as *mut u32) = (c.n_heads / c.n_kv_heads) as u32;
+        *(a.add(16) as *mut f32) = 1.0 / (c.head_dim as f32).sqrt();
+        *(a.add(20) as *mut u32) = c.head_dim as u32;
+        *(a.add(24) as *mut u32) = (max_positions * c.head_dim) as u32;
+        *(a.add(28) as *mut u32) = 0;
+        *(n_q.contents() as *mut u32) = q_dim as u32;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.attn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        q_weight,
+        &q_fused,
+        &q_mm,
+        c.hidden,
+        2 * q_dim,
+        1,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, k_weight, &key, &kv_mm, c.hidden, kv_dim, 1,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, v_weight, &value, &kv_mm, c.hidden, kv_dim, 1,
+    );
+    e.set_compute_pipeline_state(&k.qwen35_deinterleave_qgate_pipeline);
+    e.set_buffer(0, Some(&q_fused), 0);
+    e.set_buffer(1, Some(&query), 0);
+    e.set_buffer(2, Some(&gate), 0);
+    e.set_buffer(3, Some(&split_scalar), 0);
+    e.set_buffer(4, Some(&split_scalar), 4);
+    dispatch_1d(e, &k.qwen35_deinterleave_qgate_pipeline, q_dim);
+    encode_rms_norm_per_head(e, k, &query, q_norm, &query, &qk_norm_scalar, c.n_heads, 0);
+    encode_rms_norm_per_head(e, k, &key, k_norm, &key, &qk_norm_scalar, c.n_kv_heads, 0);
+    encode_rope(
+        e,
+        k,
+        &query,
+        cos,
+        sin,
+        &q_rope,
+        c.n_heads,
+        c.rope_dim / 2,
+        0,
+        0,
+    );
+    encode_rope(
+        e,
+        k,
+        &key,
+        cos,
+        sin,
+        &k_rope,
+        c.n_kv_heads,
+        c.rope_dim / 2,
+        0,
+        0,
+    );
+    e.set_compute_pipeline_state(&k.kv_scatter_pipeline);
+    e.set_buffer(0, Some(&key), 0);
+    e.set_buffer(1, Some(&value), 0);
+    e.set_buffer(2, Some(cache_k), 0);
+    e.set_buffer(3, Some(cache_v), 0);
+    e.set_buffer(4, Some(&scatter_scalar), 0);
+    e.set_buffer(5, Some(&scatter_scalar), 4);
+    e.set_buffer(6, Some(&scatter_scalar), 8);
+    e.set_buffer(7, Some(&scatter_scalar), 12);
+    e.set_buffer(8, Some(&scatter_scalar), 0);
+    e.set_buffer(9, Some(&scatter_scalar), 0);
+    e.set_buffer(10, Some(&mirror_flag), 0);
+    dispatch_1d(e, &k.kv_scatter_pipeline, kv_dim);
+    encode_attention(
+        e,
+        k,
+        keep,
+        &query,
+        cache_k,
+        cache_v,
+        None,
+        &scores,
+        &context,
+        &attn_scalar,
+        c.n_heads,
+        c.n_kv_heads,
+        c.head_dim,
+        filled,
+        0,
+        0,
+    );
+    e.set_compute_pipeline_state(&k.qwen35_sigmoid_mul_pipeline);
+    e.set_buffer(0, Some(&context), 0);
+    e.set_buffer(1, Some(&gate), 0);
+    e.set_buffer(2, Some(&n_q), 0);
+    dispatch_1d(e, &k.qwen35_sigmoid_mul_pipeline, q_dim);
+    encode_resident_matmul_f32(
+        e, k, keep, &context, o_weight, &mix, &o_mm, q_dim, c.hidden, 1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        q_fused,
+        query,
+        gate,
+        key,
+        value,
+        scores,
+        context,
+        mix,
+        norm_scalar,
+        q_mm,
+        kv_mm,
+        o_mm,
+        split_scalar,
+        qk_norm_scalar,
+        q_rope,
+        k_rope,
+        scatter_scalar,
+        mirror_flag,
+        attn_scalar,
+        n_q,
+        n_hidden,
+    ]);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen35_ssm_layer(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Qwen35MetalLayer,
+    c: Qwen35MetalConfig,
+) {
+    let Qwen35MetalLayerKind::Ssm {
+        qkv: qkv_weight,
+        gate: gate_weight,
+        beta: beta_weight,
+        alpha: alpha_weight,
+        output: output_weight,
+        conv1d,
+        dt_bias,
+        a,
+        norm,
+        conv_state,
+        state,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let qkv = pool_get(k, (c.conv_dim * 4) as u64);
+    let gate = pool_get(k, (c.value_dim * 4) as u64);
+    let beta_raw = pool_get(k, (c.n_value_heads * 4) as u64);
+    let alpha_raw = pool_get(k, (c.n_value_heads * 4) as u64);
+    let beta = pool_get(k, (c.n_value_heads * 4) as u64);
+    let glog = pool_get(k, (c.n_value_heads * 4) as u64);
+    let conv_out = pool_get(k, (c.conv_dim * 4) as u64);
+    let delta_out = pool_get(k, (c.value_dim * 4) as u64);
+    let mix = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let hidden_mm = pool_get(k, 12);
+    let gate_mm = pool_get(k, 12);
+    let output_mm = pool_get(k, 12);
+    let head_mm = pool_get(k, 12);
+    let gate_heads = pool_get(k, 4);
+    let conv_scalar = pool_get(k, 8);
+    let l2_scalar = pool_get(k, 8);
+    let delta_scalar = pool_get(k, 12);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        *(gate_heads.contents() as *mut u32) = c.n_value_heads as u32;
+        let cv = conv_scalar.contents() as *mut u32;
+        *cv = c.conv_dim as u32;
+        *cv.add(1) = c.d_conv as u32;
+        let l2 = l2_scalar.contents() as *mut u8;
+        *(l2 as *mut u32) = c.d_state as u32;
+        *(l2.add(4) as *mut f32) = c.eps;
+        let d = delta_scalar.contents() as *mut u8;
+        *(d as *mut u32) = c.d_state as u32;
+        *(d.add(4) as *mut u32) = c.n_key_heads as u32;
+        *(d.add(8) as *mut f32) = c.eps;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.attn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, qkv_weight, &qkv, &hidden_mm, c.hidden, c.conv_dim, 1,
+    );
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        gate_weight,
+        &gate,
+        &gate_mm,
+        c.hidden,
+        c.value_dim,
+        1,
+    );
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        beta_weight,
+        &beta_raw,
+        &head_mm,
+        c.hidden,
+        c.n_value_heads,
+        1,
+    );
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        alpha_weight,
+        &alpha_raw,
+        &head_mm,
+        c.hidden,
+        c.n_value_heads,
+        1,
+    );
+    e.set_compute_pipeline_state(&k.qwen35_ssm_gates_pipeline);
+    e.set_buffer(0, Some(&beta_raw), 0);
+    e.set_buffer(1, Some(&alpha_raw), 0);
+    e.set_buffer(2, Some(dt_bias), 0);
+    e.set_buffer(3, Some(a), 0);
+    e.set_buffer(4, Some(&beta), 0);
+    e.set_buffer(5, Some(&glog), 0);
+    e.set_buffer(6, Some(&gate_heads), 0);
+    dispatch_1d(e, &k.qwen35_ssm_gates_pipeline, c.n_value_heads);
+    e.set_compute_pipeline_state(&k.qwen35_conv1d_pipeline);
+    e.set_buffer(0, Some(conv1d), 0);
+    e.set_buffer(1, Some(&qkv), 0);
+    e.set_buffer(2, Some(conv_state), 0);
+    e.set_buffer(3, Some(&conv_out), 0);
+    e.set_buffer(4, Some(&conv_scalar), 0);
+    e.set_buffer(5, Some(&conv_scalar), 4);
+    dispatch_1d(e, &k.qwen35_conv1d_pipeline, c.conv_dim);
+    for offset in [0usize, c.key_dim] {
+        e.set_compute_pipeline_state(&k.qwen35_l2_norm_pipeline);
+        e.set_buffer(0, Some(&conv_out), (offset * 4) as u64);
+        e.set_buffer(1, Some(&l2_scalar), 0);
+        e.set_buffer(2, Some(&l2_scalar), 4);
+        e.set_threadgroup_memory_length(0, ((c.d_state + 1) * 4) as u64);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: c.n_key_heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    e.set_compute_pipeline_state(&k.qwen35_delta_rule_pipeline);
+    e.set_buffer(0, Some(state), 0);
+    e.set_buffer(1, Some(&conv_out), (c.key_dim * 4) as u64);
+    e.set_buffer(2, Some(&conv_out), 0);
+    e.set_buffer(3, Some(&conv_out), (2 * c.key_dim * 4) as u64);
+    e.set_buffer(4, Some(&gate), 0);
+    e.set_buffer(5, Some(&beta), 0);
+    e.set_buffer(6, Some(&glog), 0);
+    e.set_buffer(7, Some(norm), 0);
+    e.set_buffer(8, Some(&delta_out), 0);
+    e.set_buffer(9, Some(&delta_scalar), 0);
+    e.set_buffer(10, Some(&delta_scalar), 4);
+    e.set_buffer(11, Some(&delta_scalar), 8);
+    e.set_threadgroup_memory_length(0, ((3 * c.d_state + 1) * 4) as u64);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: c.n_value_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: c.d_state as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &delta_out,
+        output_weight,
+        &mix,
+        &output_mm,
+        c.value_dim,
+        c.hidden,
+        1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        qkv,
+        gate,
+        beta_raw,
+        alpha_raw,
+        beta,
+        glog,
+        conv_out,
+        delta_out,
+        mix,
+        norm_scalar,
+        hidden_mm,
+        gate_mm,
+        output_mm,
+        head_mm,
+        gate_heads,
+        conv_scalar,
+        l2_scalar,
+        delta_scalar,
+        n_hidden,
+    ]);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen35_ffn(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Qwen35MetalLayer,
+    c: Qwen35MetalConfig,
+) {
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let gate = pool_get(k, (c.ffn_dim * 4) as u64);
+    let up = pool_get(k, (c.ffn_dim * 4) as u64);
+    let act = pool_get(k, (c.ffn_dim * 4) as u64);
+    let down = pool_get(k, (c.hidden * 4) as u64);
+    let hidden_mm = pool_get(k, 12);
+    let down_mm = pool_get(k, 12);
+    let n_ffn = pool_get(k, 4);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        *(n_ffn.contents() as *mut u32) = c.ffn_dim as u32;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.post_attn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        &layer.ffn_gate,
+        &gate,
+        &hidden_mm,
+        c.hidden,
+        c.ffn_dim,
+        1,
+    );
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        &layer.ffn_up,
+        &up,
+        &hidden_mm,
+        c.hidden,
+        c.ffn_dim,
+        1,
+    );
+    encode_binary(e, &k.silu_mul_pipeline, &gate, &up, &act, &n_ffn, c.ffn_dim);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &act,
+        &layer.ffn_down,
+        &down,
+        &down_mm,
+        c.ffn_dim,
+        c.hidden,
+        1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &down,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        norm_scalar,
+        gate,
+        up,
+        act,
+        down,
+        hidden_mm,
+        down_mm,
+        n_ffn,
+        n_hidden,
+    ]);
+}
+
 /// Hand out a scratch buffer of at least `bytes` from the recycle pool, or allocate a
 /// fresh one at the pool's power-of-two class size. Pool-derived buffers are owned by the
 /// per-token `keep` vec and MUST come back via `pool_recycle` only after the command
@@ -12176,14 +14807,17 @@ pub fn try_ffn_block_resident(
     let gate_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, gate_weight_blocks),
+        q8_wire: false,
     };
     let up_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, up_weight_blocks),
+        q8_wire: false,
     };
     let down_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, down_weight_blocks),
+        q8_wire: false,
     };
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
@@ -12270,18 +14904,22 @@ pub fn try_attention_block_resident(
     let q_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, q_weight_blocks),
+        q8_wire: false,
     };
     let k_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, k_weight_blocks),
+        q8_wire: false,
     };
     let v_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, v_weight_blocks),
+        q8_wire: false,
     };
     let o_w = ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, o_weight_blocks),
+        q8_wire: false,
     };
     let cache_k_buf = upload_cache_buffer(k, cache_k);
     let cache_v_buf = upload_cache_buffer(k, cache_v);
@@ -12411,6 +15049,7 @@ pub fn try_decode_layer_resident(
     let wrap_q8 = |blocks: &[u8]| ResidentLinearWeight {
         format: ResidentWeightFormat::Q8_0,
         buffer: upload_weight_buffer(k, blocks),
+        q8_wire: false,
     };
     let q_w = wrap_q8(q_weight_blocks);
     let k_w = wrap_q8(k_weight_blocks);
@@ -12576,6 +15215,7 @@ pub fn try_decode_forward_resident(
                 let q8 = |buffer| ResidentLinearWeight {
                     format: ResidentWeightFormat::Q8_0,
                     buffer,
+                    q8_wire: false,
                 };
                 [
                     q8(cache.q8_block_weight_buffer(&k.device, l.q_weight_blocks)),
@@ -12701,25 +15341,38 @@ pub struct ResidentLayerWeights<'a> {
 /// Where a resident weight's bytes live on the CPU side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentWeightFormat {
+    DenseF32,
+    DenseF16,
     Q8_0,
     Q4K,
     Q6K,
+    Q1_0,
+    Q2_0G64,
+    Q2_0G128,
 }
 
 impl ResidentWeightFormat {
     #[cfg(target_os = "macos")]
     fn values_per_block(self) -> usize {
         match self {
+            Self::DenseF32 | Self::DenseF16 => 1,
             Self::Q8_0 => 32,
             Self::Q4K | Self::Q6K => 256,
+            Self::Q1_0 | Self::Q2_0G128 => 128,
+            Self::Q2_0G64 => 64,
         }
     }
 
     fn wire_bytes_per_block(self) -> usize {
         match self {
+            Self::DenseF32 => 4,
+            Self::DenseF16 => 2,
             Self::Q8_0 => 34,
             Self::Q4K => 144,
             Self::Q6K => 210,
+            Self::Q1_0 => 18,
+            Self::Q2_0G64 => 18,
+            Self::Q2_0G128 => 34,
         }
     }
 }
@@ -12776,6 +15429,10 @@ impl ResidentWeightBytes<'_> {
 struct ResidentLinearWeight {
     format: ResidentWeightFormat,
     buffer: Buffer,
+    /// Q8_0 has two resident layouts: decoded 36-byte blocks and raw 34-byte
+    /// GGUF wire blocks. Carry the physical layout with the buffer instead of
+    /// consulting process-global fast-path flags at dispatch time.
+    q8_wire: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -12786,6 +15443,7 @@ fn resolve_resident_weight(
     q8_wire: bool,
 ) -> Option<ResidentLinearWeight> {
     let format = weight.format();
+    let physical_q8_wire = format == ResidentWeightFormat::Q8_0 && q8_wire;
     let buffer = match weight {
         ResidentWeightBytes::Blocks36(blocks) => {
             if q8_wire {
@@ -12804,7 +15462,176 @@ fn resolve_resident_weight(
             cache.raw_wire_weight_buffer(device, bytes)
         }
     };
-    Some(ResidentLinearWeight { format, buffer })
+    Some(ResidentLinearWeight {
+        format,
+        buffer,
+        q8_wire: physical_q8_wire,
+    })
+}
+
+/// Geometry shared by the Qwen3-VL vision transformer and merger graph.
+#[derive(Clone, Copy)]
+pub(crate) struct PrismVisionMetalConfig {
+    pub patch_input: usize,
+    pub hidden: usize,
+    pub ffn: usize,
+    pub heads: usize,
+    pub merge: usize,
+    pub projection: usize,
+    pub eps: f32,
+}
+
+/// One vision-transformer layer before its matrices are resolved into resident
+/// Metal buffers. Large matrices may point directly at page-backed GGUF data.
+pub(crate) struct PrismVisionMetalLayerInput<'a> {
+    pub ln1_weight: &'a [f32],
+    pub ln1_bias: &'a [f32],
+    pub qkv: ResidentWeightBytes<'a>,
+    pub qkv_bias: &'a [f32],
+    pub attn_output: ResidentWeightBytes<'a>,
+    pub attn_output_bias: &'a [f32],
+    pub ln2_weight: &'a [f32],
+    pub ln2_bias: &'a [f32],
+    pub ffn_up: ResidentWeightBytes<'a>,
+    pub ffn_up_bias: &'a [f32],
+    pub ffn_down: ResidentWeightBytes<'a>,
+    pub ffn_down_bias: &'a [f32],
+}
+
+#[cfg(target_os = "macos")]
+struct PrismVisionMetalLayer {
+    ln1_weight: Buffer,
+    ln1_bias: Buffer,
+    qkv: ResidentLinearWeight,
+    qkv_bias: Buffer,
+    attn_output: ResidentLinearWeight,
+    attn_output_bias: Buffer,
+    ln2_weight: Buffer,
+    ln2_bias: Buffer,
+    ffn_up: ResidentLinearWeight,
+    ffn_up_bias: Buffer,
+    ffn_down: ResidentLinearWeight,
+    ffn_down_bias: Buffer,
+}
+
+/// Full Qwen3-VL image encoder resident on Metal. Quantized and dense GGUF
+/// matrices retain their NoCopy backing for the lifetime of this object.
+#[cfg(target_os = "macos")]
+pub(crate) struct PrismVisionMetalEncoder {
+    config: PrismVisionMetalConfig,
+    patch_0: ResidentLinearWeight,
+    patch_1: ResidentLinearWeight,
+    patch_bias: Buffer,
+    layers: Vec<PrismVisionMetalLayer>,
+    post_weight: Buffer,
+    post_bias: Buffer,
+    merger_0: ResidentLinearWeight,
+    merger_0_bias: Buffer,
+    merger_2: ResidentLinearWeight,
+    merger_2_bias: Buffer,
+}
+
+/// Dimensions shared by the resident Qwen3.5 hybrid graph.
+#[derive(Clone, Copy)]
+pub(crate) struct Qwen35MetalConfig {
+    pub hidden: usize,
+    pub ffn_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    pub d_conv: usize,
+    pub d_state: usize,
+    pub n_key_heads: usize,
+    pub n_value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub conv_dim: usize,
+    pub vocab: usize,
+    pub eps: f32,
+}
+
+pub(crate) struct Qwen35MetalLayerInput<'a> {
+    pub attn_norm: &'a [f32],
+    pub post_attn_norm: &'a [f32],
+    pub ffn_gate: ResidentWeightBytes<'a>,
+    pub ffn_up: ResidentWeightBytes<'a>,
+    pub ffn_down: ResidentWeightBytes<'a>,
+    pub kind: Qwen35MetalLayerKindInput<'a>,
+}
+
+pub(crate) enum Qwen35MetalLayerKindInput<'a> {
+    Full {
+        q: ResidentWeightBytes<'a>,
+        k: ResidentWeightBytes<'a>,
+        v: ResidentWeightBytes<'a>,
+        output: ResidentWeightBytes<'a>,
+        q_norm: &'a [f32],
+        k_norm: &'a [f32],
+    },
+    Ssm {
+        qkv: ResidentWeightBytes<'a>,
+        gate: ResidentWeightBytes<'a>,
+        beta: ResidentWeightBytes<'a>,
+        alpha: ResidentWeightBytes<'a>,
+        output: ResidentWeightBytes<'a>,
+        conv1d: &'a [f32],
+        dt_bias: &'a [f32],
+        a: &'a [f32],
+        norm: &'a [f32],
+    },
+}
+
+#[cfg(target_os = "macos")]
+struct Qwen35MetalLayer {
+    attn_norm: Buffer,
+    post_attn_norm: Buffer,
+    ffn_gate: ResidentLinearWeight,
+    ffn_up: ResidentLinearWeight,
+    ffn_down: ResidentLinearWeight,
+    kind: Qwen35MetalLayerKind,
+}
+
+#[cfg(target_os = "macos")]
+enum Qwen35MetalLayerKind {
+    Full {
+        q: ResidentLinearWeight,
+        k: ResidentLinearWeight,
+        v: ResidentLinearWeight,
+        output: ResidentLinearWeight,
+        q_norm: Buffer,
+        k_norm: Buffer,
+        cache_k: Buffer,
+        cache_v: Buffer,
+    },
+    Ssm {
+        qkv: ResidentLinearWeight,
+        gate: ResidentLinearWeight,
+        beta: ResidentLinearWeight,
+        alpha: ResidentLinearWeight,
+        output: ResidentLinearWeight,
+        conv1d: Buffer,
+        dt_bias: Buffer,
+        a: Buffer,
+        norm: Buffer,
+        conv_state: Buffer,
+        state: Buffer,
+    },
+}
+
+/// Complete Qwen3.5 text token graph resident on Metal. Packed model weights
+/// remain backed by their NoCopy pages; K/V, convolution and delta-rule state
+/// persist in GPU-visible buffers across tokens.
+#[cfg(target_os = "macos")]
+pub(crate) struct Qwen35MetalDecode {
+    config: Qwen35MetalConfig,
+    max_positions: usize,
+    layers: Vec<Qwen35MetalLayer>,
+    final_norm: Buffer,
+    output: ResidentLinearWeight,
+    hidden_a: Buffer,
+    hidden_b: Buffer,
+    filled: usize,
 }
 
 /// Optional final stage for `forward_token`: when present, the session also runs the final
@@ -12878,7 +15705,14 @@ pub struct SampleStage<'a> {
 /// the returned logits, which is slower but correct.
 #[cfg(target_os = "macos")]
 fn gpu_sampling_tail_is_scale_safe(format: ResidentWeightFormat, embed_scale: f32) -> bool {
-    embed_scale == 1.0 || format == ResidentWeightFormat::Q8_0
+    embed_scale == 1.0
+        || matches!(
+            format,
+            ResidentWeightFormat::Q8_0
+                | ResidentWeightFormat::Q1_0
+                | ResidentWeightFormat::Q2_0G64
+                | ResidentWeightFormat::Q2_0G128
+        )
 }
 
 /// What a resident forward_token call produced: the raw logits/hidden vector (CPU
@@ -13958,6 +16792,13 @@ impl ResidentDecodeState {
                     *(p as *mut u32) = match eb.format {
                         ResidentWeightFormat::Q8_0 => self.hidden / 32,
                         ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K => self.hidden / 256,
+                        ResidentWeightFormat::Q1_0 | ResidentWeightFormat::Q2_0G128 => {
+                            self.hidden / 128
+                        }
+                        ResidentWeightFormat::Q2_0G64 => self.hidden / 64,
+                        ResidentWeightFormat::DenseF32 | ResidentWeightFormat::DenseF16 => {
+                            unreachable!("dense weights are not token embeddings")
+                        }
                     } as u32;
                     *(p.add(4) as *mut f32) = sample.embed_scale;
                 }
@@ -14005,6 +16846,12 @@ impl ResidentDecodeState {
                     ResidentWeightFormat::Q8_0 => &k.embed_row_gather_q8_wire_pipeline,
                     ResidentWeightFormat::Q4K => &k.embed_row_gather_q4k_pipeline,
                     ResidentWeightFormat::Q6K => &k.embed_row_gather_q6k_pipeline,
+                    ResidentWeightFormat::Q1_0 => &k.embed_row_gather_q1_0_pipeline,
+                    ResidentWeightFormat::Q2_0G64 => &k.embed_row_gather_q2_0_g64_pipeline,
+                    ResidentWeightFormat::Q2_0G128 => &k.embed_row_gather_q2_0_g128_pipeline,
+                    ResidentWeightFormat::DenseF32 | ResidentWeightFormat::DenseF16 => {
+                        unreachable!("dense weights are not token embeddings")
+                    }
                 };
                 e.set_compute_pipeline_state(gather_pipeline);
                 e.set_buffer(0, Some(&eb.buffer), 0);
@@ -14454,7 +17301,12 @@ impl ResidentDecodeState {
             }
             let local_scalar = pool_get(k, 12);
             match w.format {
-                ResidentWeightFormat::Q8_0 => encode_resident_matmul_f32(
+                ResidentWeightFormat::DenseF32
+                | ResidentWeightFormat::DenseF16
+                | ResidentWeightFormat::Q8_0
+                | ResidentWeightFormat::Q1_0
+                | ResidentWeightFormat::Q2_0G64
+                | ResidentWeightFormat::Q2_0G128 => encode_resident_matmul_f32(
                     e,
                     k,
                     &mut projection_keep,
@@ -18519,6 +21371,139 @@ mod tests {
         );
     }
 
+    /// Packed-wire correctness gate for all Prism text quant formats. This
+    /// drives the production resident projection encoder for decode and batched
+    /// prefill, comparing against the scalar decoders rather than another GPU
+    /// implementation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_prism_low_bit_resident_projection_matches_scalar_decode() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Prism low-bit Metal pipelines");
+        // Cross both SIMD groups in the first threadgroup and spill into the
+        // next one. A three-row fixture only exercises SIMD group zero and
+        // cannot catch a broken `simdgroup_index_in_threadgroup` mapping.
+        let rows = 19usize;
+        let n_tokens = 2usize;
+        let input_width = 256usize;
+        let inputs: Vec<f32> = (0..n_tokens * input_width)
+            .map(|i| (((i * 37 + 11) % 101) as f32 - 50.0) * 0.03125)
+            .collect();
+
+        for format in [
+            ResidentWeightFormat::Q1_0,
+            ResidentWeightFormat::Q2_0G64,
+            ResidentWeightFormat::Q2_0G128,
+        ] {
+            let block_elements = format.values_per_block();
+            let block_bytes = format.wire_bytes_per_block();
+            let blocks_per_row = input_width / block_elements;
+            let mut wire = vec![0u8; rows * blocks_per_row * block_bytes];
+            for row in 0..rows {
+                for block_idx in 0..blocks_per_row {
+                    let block = &mut wire[(row * blocks_per_row + block_idx) * block_bytes
+                        ..(row * blocks_per_row + block_idx + 1) * block_bytes];
+                    let scale = 0.125 + row as f32 * 0.0625 + block_idx as f32 * 0.03125;
+                    block[..2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    match format {
+                        ResidentWeightFormat::Q1_0 => {
+                            for (i, byte) in block[2..].iter_mut().enumerate() {
+                                *byte = ((row * 53 + block_idx * 29 + i * 17 + 0x5a) & 0xff) as u8;
+                            }
+                        }
+                        ResidentWeightFormat::Q2_0G64 | ResidentWeightFormat::Q2_0G128 => {
+                            for (i, byte) in block[2..].iter_mut().enumerate() {
+                                *byte = ((row * 47 + block_idx * 31 + i * 23 + 0xe4) & 0xff) as u8;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+
+            let tensor_type = match format {
+                ResidentWeightFormat::Q1_0 => crate::gguf::GgufTensorType::Q1_0,
+                ResidentWeightFormat::Q2_0G64 => crate::gguf::GgufTensorType::Q2_0G64,
+                ResidentWeightFormat::Q2_0G128 => crate::gguf::GgufTensorType::Q2_0G128,
+                _ => unreachable!(),
+            };
+            let mut expected = vec![0.0f32; n_tokens * rows];
+            let row_bytes = blocks_per_row * block_bytes;
+            for row in 0..rows {
+                let row_wire = &wire[row * row_bytes..(row + 1) * row_bytes];
+                let decoded = match tensor_type {
+                    crate::gguf::GgufTensorType::Q1_0 => {
+                        crate::tensor::decode_q1_0_tensor("test", row_wire, input_width).unwrap()
+                    }
+                    _ => crate::tensor::decode_q2_0_tensor(
+                        "test",
+                        row_wire,
+                        input_width,
+                        tensor_type,
+                    )
+                    .unwrap(),
+                };
+                for token in 0..n_tokens {
+                    expected[token * rows + row] = decoded
+                        .iter()
+                        .zip(&inputs[token * input_width..(token + 1) * input_width])
+                        .map(|(w, x)| w * x)
+                        .sum();
+                }
+            }
+
+            let input_buf = kernel.device.new_buffer(
+                (inputs.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let weight_buf = kernel
+                .device
+                .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let output_buf = kernel.device.new_buffer(
+                (expected.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let scalar = kernel
+                .device
+                .new_buffer(12, MTLResourceOptions::StorageModeShared);
+            write_buffer_f32(&input_buf, &inputs);
+            write_buffer_bytes(&weight_buf, &wire);
+            let resident = ResidentLinearWeight {
+                format,
+                buffer: weight_buf,
+                q8_wire: format == ResidentWeightFormat::Q8_0,
+            };
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            encode_resident_matmul_f32(
+                encoder,
+                kernel,
+                &mut Vec::new(),
+                &input_buf,
+                &resident,
+                &output_buf,
+                &scalar,
+                input_width,
+                rows,
+                n_tokens,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let mut got = vec![0.0f32; expected.len()];
+            read_buffer_f32(&output_buf, &mut got);
+            for (i, (&actual, &want)) in got.iter().zip(&expected).enumerate() {
+                let tolerance = 2.0e-5 * want.abs().max(1.0);
+                assert!(
+                    (actual - want).abs() <= tolerance,
+                    "{format:?} output {i}: gpu={actual} cpu={want} tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
     /// Correctness gate for the shared Q4_K/Q6_K resident projection used by decode,
     /// output projection, speculative verification, and prefill. The GPU performs the
     /// production Q8_K activation quantization and tiled K-quant dot; the expected values
@@ -18642,7 +21627,12 @@ mod tests {
                                 let d = 0.009 + row as f32 * 0.0005 + sb as f32 * 0.0004;
                                 block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
                             }
-                            ResidentWeightFormat::Q8_0 => unreachable!(),
+                            ResidentWeightFormat::Q8_0
+                            | ResidentWeightFormat::DenseF32
+                            | ResidentWeightFormat::DenseF16
+                            | ResidentWeightFormat::Q1_0
+                            | ResidentWeightFormat::Q2_0G64
+                            | ResidentWeightFormat::Q2_0G128 => unreachable!(),
                         }
                     }
                 }
@@ -18672,7 +21662,12 @@ mod tests {
                             ResidentWeightFormat::Q6K => {
                                 crate::inference::q6_k_wire_row_dot(row_wire, &q8)
                             }
-                            ResidentWeightFormat::Q8_0 => unreachable!(),
+                            ResidentWeightFormat::Q8_0
+                            | ResidentWeightFormat::DenseF32
+                            | ResidentWeightFormat::DenseF16
+                            | ResidentWeightFormat::Q1_0
+                            | ResidentWeightFormat::Q2_0G64
+                            | ResidentWeightFormat::Q2_0G128 => unreachable!(),
                         };
                     }
                 }
@@ -18696,6 +21691,7 @@ mod tests {
                 let weight = ResidentLinearWeight {
                     format,
                     buffer: weight_buf,
+                    q8_wire: false,
                 };
                 let mut keep = Vec::new();
                 let cb = kernel.queue.new_command_buffer();
@@ -19175,7 +22171,7 @@ mod tests {
                 }
                 let cb = kernel.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
-                encode_q8_matmul_f32y(e, kernel, &y_buf, &w_buf, &out_buf, &scalar, rows);
+                encode_q8_matmul_f32y(e, kernel, &y_buf, &w_buf, &out_buf, &scalar, rows, true);
                 e.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();

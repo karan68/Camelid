@@ -952,6 +952,68 @@ fn lower_bit_quant_tensors_decode_to_reference_f32_loads() {
 }
 
 #[test]
+fn prism_q2_dialects_and_pq2_decode_their_published_wire_layouts() {
+    for (name, type_id, elements, packed_bytes, expected_type) in [
+        ("g64", 42, 64_i64, 16_usize, GgufTensorType::Q2_0G64),
+        ("g128", 42, 128_i64, 32_usize, GgufTensorType::Q2_0G128),
+        ("pq2", 142, 128_i64, 32_usize, GgufTensorType::Pq2_0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("q2-{name}.gguf"));
+        let mut payload = Vec::with_capacity(2 + packed_bytes);
+        payload.extend_from_slice(&0x3c00_u16.to_le_bytes()); // f16 scale = 1
+                                                              // Four consecutive 2-bit codes 00,01,10,11 -> -1,0,+1,+2.
+        payload.extend(std::iter::repeat_n(0xE4_u8, packed_bytes));
+        write_tensor_gguf_with_dims(&path, type_id, &[elements], &payload);
+
+        let gguf = read_metadata(&path).unwrap();
+        assert_eq!(gguf.tensors[0].tensor_type, expected_type, "{name}");
+        let tensor = TensorStore::open(&path, &gguf)
+            .load_cpu_f32("test.weight")
+            .unwrap();
+        assert_eq!(tensor.source_type, Some(expected_type), "{name}");
+        assert_eq!(tensor.data.len(), elements as usize, "{name}");
+        for values in tensor.data.chunks_exact(4) {
+            assert_eq!(values, [-1.0, 0.0, 1.0, 2.0], "{name}");
+        }
+    }
+}
+
+#[test]
+fn prism_rank2_loader_keeps_one_page_backed_copy_of_packed_weights() {
+    for (name, type_id, columns, row_bytes, expected_type) in [
+        ("q1", 41, 128_i64, 18_usize, GgufTensorType::Q1_0),
+        ("q2-g64", 42, 64_i64, 18_usize, GgufTensorType::Q2_0G64),
+        ("q2-g128", 42, 128_i64, 34_usize, GgufTensorType::Q2_0G128),
+        ("pq2", 142, 128_i64, 34_usize, GgufTensorType::Pq2_0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}-rank2.gguf"));
+        let payload = (0..row_bytes * 2)
+            .map(|byte| byte.wrapping_mul(17) as u8)
+            .collect::<Vec<_>>();
+        write_tensor_gguf_with_dims(&path, type_id, &[columns, 2], &payload);
+
+        let gguf = read_metadata(&path).unwrap();
+        let tensor = TensorStore::open(&path, &gguf)
+            .load_prism_wire_linear("test.weight")
+            .unwrap();
+
+        assert_eq!(tensor.source_type, Some(expected_type), "{name}");
+        assert!(tensor.data.is_empty(), "{name} materialized f32 weights");
+        assert!(
+            tensor.tq2_0_wire_bytes.is_none(),
+            "{name} retained a duplicate Vec"
+        );
+        assert!(
+            tensor.kquant_wire_pages.is_some(),
+            "{name} did not use no-copy pages"
+        );
+        assert_eq!(tensor.low_bit_wire(), Some(payload.as_slice()), "{name}");
+    }
+}
+
+#[test]
 fn rejects_q8_0_tensor_with_non_block_aligned_first_dimension() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad-q8.gguf");

@@ -654,7 +654,7 @@ impl LlamaLoadedWeights {
         let nocopy_fast_load = metal_nocopy_fast_load_enabled();
         if nocopy_fast_load {
             eprintln!(
-                "[camelid] CAMELID_METAL_NOCOPY: loading Q8_0/Q4_K/Q6_K weights as page-aligned wire \
+                "[camelid] CAMELID_METAL_NOCOPY: loading Q8_0/K-quant/Prism Q1_0/Q2_0 weights as page-aligned wire \
                  pages (GPU reads them in place; requires the wire kernel stack)"
             );
         }
@@ -693,17 +693,26 @@ impl LlamaLoadedWeights {
                 if matches!(desc.tensor_type, GgufTensorType::IQ4XS) && desc.dimensions.len() == 2 {
                     return store.load_iq4_xs_wire_linear(name);
                 }
-                // Q1_0 sign-only 1-bit 2-D linears: LOSSLESSLY re-encode to Q8_0 blocks.
-                // Q1_0's value set is exactly {-d, +d}, which Q8_0 holds exactly as
-                // qs = ±1 against the same scale, and QK1_0 = 128 tiles into 4 blocks
-                // of 32 — so this is a re-encoding, not a re-quantization (pinned by
-                // tensor::tests::q1_0_transcode_is_bit_exact). It puts Q1_0 files on the
-                // existing Q8_0 GPU-resident lane with no new kernels, and avoids the
-                // f32 blow-up the plain CPU loader would pay (~6.9 GB for a 1.7B model).
-                // It does give up the 1.125 bpw footprint at runtime (Q8_0 blocks are
-                // 9 bpw) — a native Q1_0 resident kernel is what would keep it.
-                if matches!(desc.tensor_type, GgufTensorType::Q1_0) && desc.dimensions.len() == 2 {
-                    return store.load_q1_0_as_q8_0_blocks_linear(name);
+                // Prism Q1/Q2 linears stay in their native packed wire format on
+                // macOS. The Metal resident lane consumes these bytes directly;
+                // there is no whole-model Q8/F32 expansion. Keep the pre-existing
+                // lossless Q1->Q8 bridge on other platforms until their native
+                // backend lands; Windows is intentionally the follow-up machine.
+                if matches!(
+                    desc.tensor_type,
+                    GgufTensorType::Q1_0
+                        | GgufTensorType::Q2_0G64
+                        | GgufTensorType::Q2_0G128
+                        | GgufTensorType::Pq2_0
+                ) && desc.dimensions.len() == 2
+                {
+                    if cfg!(target_os = "macos") {
+                        return store.load_prism_wire_linear(name);
+                    }
+                    if desc.tensor_type == GgufTensorType::Q1_0 {
+                        return store.load_q1_0_as_q8_0_blocks_linear(name);
+                    }
+                    return store.load_cpu_f32(name);
                 }
                 if matches!(
                     desc.tensor_type,
@@ -12681,9 +12690,19 @@ fn windowed_arch_layers_violate_q8_pin(layers: &[LlamaLayerWeights], wire_ok: bo
 }
 
 fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) -> bool {
-    tensor.source_type == Some(GgufTensorType::Q8_0)
-        && (tensor.q8_0_block_slice().is_some()
-            || (wire_mode_active && tensor.q8_0_wire_pages.is_some()))
+    match tensor.source_type {
+        Some(GgufTensorType::Q8_0) => {
+            tensor.q8_0_block_slice().is_some()
+                || (wire_mode_active && tensor.q8_0_wire_pages.is_some())
+        }
+        Some(
+            GgufTensorType::Q1_0
+            | GgufTensorType::Q2_0G64
+            | GgufTensorType::Q2_0G128
+            | GgufTensorType::Pq2_0,
+        ) => tensor.low_bit_wire().is_some(),
+        _ => false,
+    }
 }
 
 /// Process-global resident CUDA engine, keyed by the model's weight identity.
