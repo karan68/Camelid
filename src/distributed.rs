@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +18,24 @@ use crate::tensor::{CpuTensor, Q4KRepack8Cell, RuntimeDType, TensorShape};
 pub const HANDSHAKE_VERSION: u32 = 1;
 
 const HANDSHAKE_MAGIC: u32 = 0xCA9E_0001;
+const HANDSHAKE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_DISTRIBUTED_TOKEN_BYTES: usize = 4 * 1024;
 
 /// A handshake is a few hundred bytes. The cap exists so a hostile or confused peer
 /// cannot make the other side allocate on a length it chose.
 const MAX_HANDSHAKE_BYTES: u32 = 64 * 1024;
+
+fn engine_build_identity() -> String {
+    let commit = crate::receipt::camelid_commit();
+    if commit == "unknown" {
+        return env!("CARGO_PKG_VERSION").to_string();
+    }
+    if crate::receipt::camelid_version().ends_with("-dirty") {
+        format!("{commit}+dirty")
+    } else {
+        commit
+    }
+}
 
 /// What a node asserts about itself when a distributed connection opens.
 ///
@@ -29,7 +44,7 @@ const MAX_HANDSHAKE_BYTES: u32 = 64 * 1024;
 /// without this exchange two peers running *different* weights or *different* code
 /// connect happily and produce confident, wrong output. Every field below is one way
 /// that can happen.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub wire_version: u32,
     /// Engine build. Different code can mean different math, so peers must match.
@@ -52,6 +67,23 @@ pub struct NodeIdentity {
     pub token: Option<String>,
 }
 
+impl std::fmt::Debug for NodeIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NodeIdentity")
+            .field("wire_version", &self.wire_version)
+            .field("engine_version", &self.engine_version)
+            .field("model_sha256", &self.model_sha256)
+            .field("total_layers", &self.total_layers)
+            .field("hidden_size", &self.hidden_size)
+            .field("worker_layer_start", &self.worker_layer_start)
+            .field("worker_layer_end", &self.worker_layer_end)
+            .field("platform", &self.platform)
+            .field("token_present", &self.token.is_some())
+            .finish()
+    }
+}
+
 impl NodeIdentity {
     /// Build the identity for a node holding `worker_layers` of `model`.
     ///
@@ -71,7 +103,7 @@ impl NodeIdentity {
         })?;
         Ok(Self {
             wire_version: HANDSHAKE_VERSION,
-            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            engine_version: engine_build_identity(),
             model_sha256,
             total_layers,
             hidden_size,
@@ -153,15 +185,58 @@ impl NodeIdentity {
     }
 }
 
+pub fn validate_distributed_token(
+    token: Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("distributed token must not be empty".to_string());
+    }
+    if token.len() > MAX_DISTRIBUTED_TOKEN_BYTES {
+        return Err(format!(
+            "distributed token exceeds the {MAX_DISTRIBUTED_TOKEN_BYTES}-byte limit"
+        ));
+    }
+    if token.chars().any(char::is_control) {
+        return Err("distributed token must not contain control characters".to_string());
+    }
+    Ok(Some(token))
+}
+
+pub fn resolve_distributed_token(
+    token: Option<String>,
+    token_file: Option<&Path>,
+) -> std::result::Result<Option<String>, String> {
+    if token.is_some() && token_file.is_some() {
+        return Err(
+            "--distributed-token and --distributed-token-file are mutually exclusive".to_string(),
+        );
+    }
+    let token = match (token, token_file) {
+        (Some(token), None) => Some(token),
+        (None, Some(path)) => Some(std::fs::read_to_string(path).map_err(|err| {
+            format!(
+                "could not read distributed token file {}: {err}",
+                path.display()
+            )
+        })?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("conflict handled above"),
+    };
+    validate_distributed_token(token)
+}
+
 /// Compares without an early exit and without leaking the secret's length.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Fold length into the result instead of returning early on it.
-    let mut diff = (a.len() ^ b.len()) as u8;
-    let len = a.len().max(b.len());
-    for i in 0..len {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..MAX_DISTRIBUTED_TOKEN_BYTES {
         let x = a.get(i).copied().unwrap_or(0);
         let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }
@@ -218,12 +293,18 @@ fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> std::io:
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
+fn set_handshake_timeouts(stream: &TcpStream, timeout: Option<Duration>) -> std::io::Result<()> {
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)
+}
+
 /// Which whole-model tensors a node loads in the `serve-distributed` pipeline.
 ///
 /// Ownership here is a property of the **role**, not of the layer range. A worker's
 /// [`LlamaInferenceSession::forward_worker_layers`] returns a bare hidden state — it
 /// applies neither `output_norm` nor the output projection — so the coordinator always
-/// finalizes the forward pass and needs both ends of the model whatever shard it holds.
+/// finalizes the forward pass and needs both ends of the model while holding the prefix
+/// shard supported by this transport.
 ///
 /// [`crate::inference::LlamaLoadedWeights::load`] instead derives ownership *positionally*,
 /// for a generic pipeline whose LAST stage emits logits. Using that rule here gives a
@@ -246,6 +327,32 @@ impl PipelineRole {
             Self::Worker => (false, false),
         }
     }
+
+    pub fn validate_layer_range(
+        self,
+        layer_start: usize,
+        layer_end: usize,
+        total_layers: usize,
+    ) -> Result<()> {
+        if total_layers < 2 || layer_start >= layer_end || layer_end > total_layers {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "distributed layer range {layer_start}..{layer_end} cannot partition model layers 0..{total_layers}"
+            )));
+        }
+        match self {
+            Self::Coordinator if layer_start != 0 || layer_end == total_layers => {
+                Err(BackendError::InvalidModelMetadata(format!(
+                    "distributed coordinator must own a non-empty prefix 0..SPLIT below layer {total_layers}, got {layer_start}..{layer_end}"
+                )))
+            }
+            Self::Worker if layer_start == 0 || layer_end != total_layers => {
+                Err(BackendError::InvalidModelMetadata(format!(
+                    "distributed worker must own a non-empty suffix SPLIT..{total_layers}, got {layer_start}..{layer_end}"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -256,7 +363,7 @@ mod pipeline_role_tests {
     /// "simplifies" `tensor_ownership` back to deriving from the layer range, a `0..k`
     /// coordinator silently loses the output head again and every request 503s.
     #[test]
-    fn the_coordinator_owns_both_ends_whatever_shard_it_holds() {
+    fn the_prefix_coordinator_owns_both_ends() {
         assert_eq!(PipelineRole::Coordinator.tensor_ownership(), (true, true));
         assert_eq!(PipelineRole::Worker.tensor_ownership(), (false, false));
 
@@ -272,11 +379,45 @@ mod pipeline_role_tests {
             "a head-shard coordinator must not inherit the positional rule"
         );
     }
+
+    #[test]
+    fn roles_accept_only_a_complete_prefix_suffix_partition() {
+        PipelineRole::Coordinator
+            .validate_layer_range(0, 8, 16)
+            .unwrap();
+        PipelineRole::Worker
+            .validate_layer_range(8, 16, 16)
+            .unwrap();
+
+        for (role, start, end) in [
+            (PipelineRole::Coordinator, 4, 8),
+            (PipelineRole::Coordinator, 0, 16),
+            (PipelineRole::Worker, 0, 8),
+            (PipelineRole::Worker, 8, 15),
+            (PipelineRole::Worker, 8, 17),
+        ] {
+            role.validate_layer_range(start, end, 16)
+                .expect_err("gapped, overlapping, or out-of-bounds partitions must fail");
+        }
+    }
 }
 
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
+
+    fn connect_to_response(response: HandshakeResponse) -> std::io::Result<DistributedClient> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: NodeIdentity = read_frame(&mut stream).unwrap();
+            write_frame(&mut stream, &response).unwrap();
+        });
+        let result = DistributedClient::connect(&addr.to_string(), &identity());
+        server.join().unwrap();
+        result
+    }
 
     fn identity() -> NodeIdentity {
         NodeIdentity {
@@ -375,6 +516,89 @@ mod handshake_tests {
         assert!(identity().admit(&peer, Some("s3cret")).is_ok());
     }
 
+    #[test]
+    fn distributed_tokens_are_non_empty_bounded_and_control_free() {
+        assert_eq!(validate_distributed_token(None).unwrap(), None);
+        assert_eq!(
+            validate_distributed_token(Some("  s3cret  ".to_string())).unwrap(),
+            Some("s3cret".to_string())
+        );
+        assert!(validate_distributed_token(Some("  ".to_string())).is_err());
+        assert!(validate_distributed_token(Some("line\nbreak".to_string())).is_err());
+        assert!(
+            validate_distributed_token(Some("x".repeat(MAX_DISTRIBUTED_TOKEN_BYTES + 1))).is_err()
+        );
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "  from-file\n").unwrap();
+        assert_eq!(
+            resolve_distributed_token(None, Some(file.path())).unwrap(),
+            Some("from-file".to_string())
+        );
+        assert!(resolve_distributed_token(Some("inline".to_string()), Some(file.path())).is_err());
+    }
+
+    #[test]
+    fn node_identity_debug_redacts_the_token() {
+        let identity = identity().with_token(Some("do-not-print-me".to_string()));
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains("do-not-print-me"));
+        assert!(debug.contains("token_present: true"));
+    }
+
+    #[test]
+    fn model_identity_uses_embedded_build_provenance() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let identity = NodeIdentity::for_model(file.path(), 16, 2048, 8..16).unwrap();
+        assert_eq!(identity.engine_version, engine_build_identity());
+        let commit = crate::receipt::camelid_commit();
+        if commit != "unknown" {
+            assert!(identity.engine_version.starts_with(&commit));
+        }
+    }
+
+    #[test]
+    fn a_stalled_handshake_read_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        set_handshake_timeouts(&server, Some(Duration::from_millis(20))).unwrap();
+
+        let err = read_frame::<_, NodeIdentity>(&mut server).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        drop(client);
+    }
+
+    #[test]
+    fn coordinator_requires_the_accepted_workers_identity() {
+        let err = match connect_to_response(HandshakeResponse {
+            accepted: true,
+            refusal: None,
+            worker: None,
+        }) {
+            Ok(_) => panic!("accepted response without worker identity must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut worker = identity();
+        worker.model_sha256 = "b".repeat(64);
+        let err = match connect_to_response(HandshakeResponse {
+            accepted: true,
+            refusal: None,
+            worker: Some(worker),
+        }) {
+            Ok(_) => panic!("accepted response with mismatched worker identity must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("model_sha256"), "{err}");
+    }
+
     /// A token check that ran before the identity check would let a stranger probe which
     /// models a worker holds. Identity is only compared once the peer has authenticated.
     #[test]
@@ -395,6 +619,10 @@ mod handshake_tests {
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
+
+        let mut length_wrapping_candidate = b"abc".to_vec();
+        length_wrapping_candidate.extend([0; 256]);
+        assert!(!constant_time_eq(b"abc", &length_wrapping_candidate));
     }
 
     #[test]
@@ -557,6 +785,7 @@ impl DistributedClient {
     pub fn connect(addr: &str, identity: &NodeIdentity) -> std::io::Result<Self> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
+        set_handshake_timeouts(&stream, Some(HANDSHAKE_IO_TIMEOUT))?;
         write_frame(&mut stream, identity)?;
         let response: HandshakeResponse = read_frame(&mut stream)?;
         if !response.accepted {
@@ -568,13 +797,24 @@ impl DistributedClient {
                 ),
             ));
         }
-        if let Some(worker) = &response.worker {
-            tracing::info!(
-                worker_platform = %worker.platform,
-                worker_layers = format!("{}..{}", worker.worker_layer_start, worker.worker_layer_end),
-                "distributed handshake accepted"
-            );
+        let worker = response.worker.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "worker accepted the distributed handshake without returning its identity",
+            )
+        })?;
+        if let Some(reason) = identity.first_mismatch(worker) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("worker accepted with a mismatched identity: {reason}"),
+            ));
         }
+        tracing::info!(
+            worker_platform = %worker.platform,
+            worker_layers = format!("{}..{}", worker.worker_layer_start, worker.worker_layer_end),
+            "distributed handshake accepted"
+        );
+        set_handshake_timeouts(&stream, None)?;
         Ok(Self {
             stream: Mutex::new(stream),
             addr: addr.to_string(),
@@ -728,6 +968,10 @@ pub fn run_worker_loop_on_listener(
         };
 
         let _ = stream.set_nodelay(true);
+        if let Err(e) = set_handshake_timeouts(&stream, Some(HANDSHAKE_IO_TIMEOUT)) {
+            tracing::warn!(error = %e, "could not arm distributed handshake timeout");
+            continue;
+        }
 
         // Admit before a single activation is read: a peer that disagrees about the model,
         // the build or the split can only produce wrong numbers, and one that cannot
@@ -764,6 +1008,10 @@ pub fn run_worker_loop_on_listener(
             },
         ) {
             tracing::error!(error = %e, "failed to acknowledge the handshake");
+            continue;
+        }
+        if let Err(e) = set_handshake_timeouts(&stream, None) {
+            tracing::error!(error = %e, "could not clear distributed handshake timeout");
             continue;
         }
         tracing::info!(

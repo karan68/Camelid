@@ -936,9 +936,17 @@ enum Command {
         threads: Option<usize>,
         /// Shared secret the coordinator must present to this worker. Required before a
         /// worker will bind a non-loopback address, unless the risk is explicitly
-        /// acknowledged with --allow-unauthenticated-remote.
-        #[arg(long, env = "CAMELID_DISTRIBUTED_TOKEN")]
+        /// acknowledged with --allow-unauthenticated-remote. Prefer the file option on
+        /// shared machines so the secret is not present in the process command line.
+        #[arg(
+            long,
+            env = "CAMELID_DISTRIBUTED_TOKEN",
+            conflicts_with = "distributed_token_file"
+        )]
         distributed_token: Option<String>,
+        /// Read the distributed shared secret from a text file.
+        #[arg(long, env = "CAMELID_DISTRIBUTED_TOKEN_FILE")]
+        distributed_token_file: Option<PathBuf>,
         #[command(flatten)]
         server: ServerPolicyArgs,
     },
@@ -1904,9 +1912,15 @@ async fn main() -> anyhow::Result<()> {
             model,
             threads,
             distributed_token,
+            distributed_token_file,
             server,
         } => {
             configure_rayon_threads(threads)?;
+            let distributed_token = camelid::distributed::resolve_distributed_token(
+                distributed_token,
+                distributed_token_file.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?;
 
             let parts: Vec<&str> = layer_range.split("..").collect();
             anyhow::ensure!(
@@ -1929,6 +1943,11 @@ async fn main() -> anyhow::Result<()> {
 
                 let gguf = camelid::gguf::read_metadata(&model)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+                camelid::distributed::PipelineRole::Coordinator.validate_layer_range(
+                    layer_start,
+                    layer_end,
+                    config.block_count as usize,
+                )?;
                 let identity = camelid::distributed::NodeIdentity::for_model(
                     &model,
                     config.block_count,
@@ -1936,6 +1955,7 @@ async fn main() -> anyhow::Result<()> {
                     (layer_end as u32)..(config.block_count),
                 )?
                 .with_token(distributed_token.clone());
+                let distributed_model_sha256 = identity.model_sha256.clone();
 
                 tracing::info!(worker_addr = %worker_addr_str, "Coordinator connecting to worker");
                 let client =
@@ -1952,7 +1972,10 @@ async fn main() -> anyhow::Result<()> {
                 api::serve(
                     addr,
                     threads,
-                    Some(api::StartupModel::explicit(model)),
+                    Some(api::StartupModel::distributed(
+                        model,
+                        distributed_model_sha256,
+                    )),
                     false,
                     false,
                     None,
@@ -1966,6 +1989,11 @@ async fn main() -> anyhow::Result<()> {
                     DenseLaneWindowedForward::CpuDenseOnly,
                 )?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+                camelid::distributed::PipelineRole::Worker.validate_layer_range(
+                    layer_start,
+                    layer_end,
+                    config.block_count as usize,
+                )?;
                 let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
                 let store = camelid::tensor::TensorStore::open(&model, &gguf);
 
