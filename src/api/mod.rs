@@ -9682,27 +9682,36 @@ async fn load_weights_lru(
     }
 
     let store = TensorStore::open(&model.path, &model.gguf);
-    let range = if let Some(&(layer_start, layer_end)) = crate::distributed::DISTRIBUTED_RANGE.get()
-    {
-        tracing::info!(
-            "API loader running in distributed coordinator mode; loading layers {}..{}",
-            layer_start,
-            layer_end
-        );
-        Some(layer_start..layer_end)
-    } else {
-        None
-    };
-    let weights = Arc::new(
-        LlamaLoadedWeights::load(&store, binding, range).map_err(|err| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "loaded_cpu_weights_unavailable",
-                err.to_string(),
-                Some("model"),
+    // Only the coordinator reaches the API loader; a worker runs `run_worker_loop` instead.
+    // Its ownership is role-derived, not positional -- see `distributed::PipelineRole`.
+    let loaded = match crate::distributed::DISTRIBUTED_RANGE.get() {
+        Some(&(layer_start, layer_end)) => {
+            let (load_embedding, load_output) =
+                crate::distributed::PipelineRole::Coordinator.tensor_ownership();
+            tracing::info!(
+                "API loader running in distributed coordinator mode; loading layers {}..{}",
+                layer_start,
+                layer_end
+            );
+            LlamaLoadedWeights::load_distributed(
+                &store,
+                binding,
+                layer_start,
+                layer_end,
+                load_embedding,
+                load_output,
             )
-        })?,
-    );
+        }
+        None => LlamaLoadedWeights::load(&store, binding, None),
+    };
+    let weights = Arc::new(loaded.map_err(|err| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "loaded_cpu_weights_unavailable",
+            err.to_string(),
+            Some("model"),
+        )
+    })?);
 
     state
         .cached_weights

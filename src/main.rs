@@ -1957,13 +1957,15 @@ async fn main() -> anyhow::Result<()> {
                     layer_start,
                     layer_end
                 );
+                let (load_embedding, load_output) =
+                    camelid::distributed::PipelineRole::Worker.tensor_ownership();
                 let weights = camelid::inference::LlamaLoadedWeights::load_distributed(
                     &store,
                     &binding,
                     layer_start,
                     layer_end,
-                    false,
-                    false,
+                    load_embedding,
+                    load_output,
                 )?;
 
                 tracing::info!("Worker weights loaded successfully. Initializing session.");

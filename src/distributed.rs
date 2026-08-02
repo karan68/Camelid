@@ -7,6 +7,62 @@ use crate::error::{BackendError, Result};
 use crate::inference::LlamaInferenceSession;
 use crate::tensor::{CpuTensor, Q4KRepack8Cell, RuntimeDType, TensorShape};
 
+/// Which whole-model tensors a node loads in the `serve-distributed` pipeline.
+///
+/// Ownership here is a property of the **role**, not of the layer range. A worker's
+/// [`LlamaInferenceSession::forward_worker_layers`] returns a bare hidden state — it
+/// applies neither `output_norm` nor the output projection — so the coordinator always
+/// finalizes the forward pass and needs both ends of the model whatever shard it holds.
+///
+/// [`crate::inference::LlamaLoadedWeights::load`] instead derives ownership *positionally*,
+/// for a generic pipeline whose LAST stage emits logits. Using that rule here gives a
+/// `0..k` coordinator no output projection, and every request fails with
+/// `runtime shape mismatch: ... requires rank-2 weight token_embd.weight, got [0]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineRole {
+    /// Runs the HTTP API, owns its layer shard plus the embedding and output head.
+    Coordinator,
+    /// Owns its layer shard only.
+    Worker,
+}
+
+impl PipelineRole {
+    /// `(load_embedding, load_output)` for
+    /// [`crate::inference::LlamaLoadedWeights::load_distributed`].
+    pub const fn tensor_ownership(self) -> (bool, bool) {
+        match self {
+            Self::Coordinator => (true, true),
+            Self::Worker => (false, false),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_role_tests {
+    use super::PipelineRole;
+
+    /// The rule this transport needs is deliberately *not* the positional one. If anyone
+    /// "simplifies" `tensor_ownership` back to deriving from the layer range, a `0..k`
+    /// coordinator silently loses the output head again and every request 503s.
+    #[test]
+    fn the_coordinator_owns_both_ends_whatever_shard_it_holds() {
+        assert_eq!(PipelineRole::Coordinator.tensor_ownership(), (true, true));
+        assert_eq!(PipelineRole::Worker.tensor_ownership(), (false, false));
+
+        // The positional rule `LlamaLoadedWeights::load` applies, restated here: the first
+        // shard owns the embedding, the last shard owns the output head.
+        let total_layers = 16;
+        let head_shard = 0..8;
+        let positional = (head_shard.start == 0, head_shard.end >= total_layers);
+        assert_eq!(positional, (true, false));
+        assert_ne!(
+            PipelineRole::Coordinator.tensor_ownership(),
+            positional,
+            "a head-shard coordinator must not inherit the positional rule"
+        );
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DistributedHeader {
