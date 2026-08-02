@@ -217,7 +217,7 @@ impl PrismVisionProjector {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl PrismVisionInput {
     pub(crate) fn patch_count(&self) -> usize {
         self.patch_width * self.patch_height
