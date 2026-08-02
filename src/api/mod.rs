@@ -8034,6 +8034,7 @@ impl RunnableServeRuntime {
         Ok((text, ids))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_vision_greedy(
         &self,
         prefix: &[u32],
@@ -8056,6 +8057,7 @@ impl RunnableServeRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_vision_greedy_streaming<F: FnMut(u32)>(
         &self,
         prefix: &[u32],
@@ -8463,6 +8465,7 @@ enum RunnablePreparedPrompt {
     },
 }
 
+#[allow(clippy::result_large_err)]
 fn runnable_sampling_config(
     req: &ChatCompletionRequest,
 ) -> std::result::Result<SamplingConfig, Response> {
@@ -8499,6 +8502,7 @@ fn runnable_sampling_config(
     Ok(config)
 }
 
+#[allow(clippy::result_large_err)]
 fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Response> {
     let (header, payload) = url.split_once(',').ok_or_else(|| {
         api_error(
@@ -8550,6 +8554,7 @@ fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Respon
     Ok(bytes)
 }
 
+#[allow(clippy::result_large_err)]
 fn prepare_runnable_prompt(
     runtime: &RunnableServeRuntime,
     req: &ChatCompletionRequest,
@@ -8899,7 +8904,8 @@ async fn runnable_chat_streaming(
         let mut phase_ids: Vec<u32> = Vec::new();
         let mut emitted = 0usize;
         let mut seen_visible = false;
-        let mut final_state: Option<std::result::Result<(String, Vec<u32>, usize), String>> = None;
+        type RunnableStreamResult = std::result::Result<(String, Vec<u32>, usize), String>;
+        let mut final_state: Option<RunnableStreamResult> = None;
 
         while let Some(item) = rx.recv().await {
             match item {

@@ -9965,6 +9965,7 @@ fn mm_prefill_enabled() -> bool {
 /// The weight buffer must match the active format: decoded 36-byte blocks normally, wire
 /// 34-byte blocks when CAMELID_METAL_WIRE is on (prepare_token resolves accordingly).
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn encode_q8_matmul_f32y(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
@@ -13467,6 +13468,7 @@ impl Qwen35MetalDecode {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn encode_vision_layer_norm(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
@@ -13517,6 +13519,7 @@ fn encode_vision_bias(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn encode_vision_bias_residual(
     encoder: &metal::ComputeCommandEncoderRef,
     kernel: &MetalLinearKernel,
@@ -15471,6 +15474,7 @@ fn resolve_resident_weight(
 
 /// Geometry shared by the Qwen3-VL vision transformer and merger graph.
 #[derive(Clone, Copy)]
+#[cfg(target_os = "macos")]
 pub(crate) struct PrismVisionMetalConfig {
     pub patch_input: usize,
     pub hidden: usize,
@@ -15483,6 +15487,7 @@ pub(crate) struct PrismVisionMetalConfig {
 
 /// One vision-transformer layer before its matrices are resolved into resident
 /// Metal buffers. Large matrices may point directly at page-backed GGUF data.
+#[cfg(target_os = "macos")]
 pub(crate) struct PrismVisionMetalLayerInput<'a> {
     pub ln1_weight: &'a [f32],
     pub ln1_bias: &'a [f32],
@@ -15533,6 +15538,7 @@ pub(crate) struct PrismVisionMetalEncoder {
 
 /// Dimensions shared by the resident Qwen3.5 hybrid graph.
 #[derive(Clone, Copy)]
+#[cfg(target_os = "macos")]
 pub(crate) struct Qwen35MetalConfig {
     pub hidden: usize,
     pub ffn_dim: usize,
@@ -15551,6 +15557,7 @@ pub(crate) struct Qwen35MetalConfig {
     pub eps: f32,
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) struct Qwen35MetalLayerInput<'a> {
     pub attn_norm: &'a [f32],
     pub post_attn_norm: &'a [f32],
@@ -15560,6 +15567,7 @@ pub(crate) struct Qwen35MetalLayerInput<'a> {
     pub kind: Qwen35MetalLayerKindInput<'a>,
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) enum Qwen35MetalLayerKindInput<'a> {
     Full {
         q: ResidentWeightBytes<'a>,

@@ -8,7 +8,10 @@
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 
 use image::{imageops::FilterType, RgbImage};
 
@@ -19,6 +22,7 @@ use crate::wire_mmap::WirePages;
 use super::dequant;
 
 #[derive(Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct VisionMat {
     pub pages: Arc<WirePages>,
     pub tensor_type: GgufTensorType,
@@ -46,6 +50,7 @@ impl VisionMat {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct PrismVisionLayer {
     pub ln1_weight: Vec<f32>,
     pub ln1_bias: Vec<f32>,
@@ -61,6 +66,7 @@ pub(crate) struct PrismVisionLayer {
     pub ffn_down_bias: Vec<f32>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct PrismVisionModel {
     pub image_size: usize,
     pub patch_size: usize,
@@ -84,6 +90,7 @@ pub(crate) struct PrismVisionModel {
     pub merger_2_bias: Vec<f32>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct PrismVisionInput {
     /// Tile-major patches `[patch_count, 3 * patch_size * patch_size]`.
     pub patches: Vec<f32>,

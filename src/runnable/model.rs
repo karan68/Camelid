@@ -59,6 +59,7 @@ impl RawMatBytes {
         Self::Owned(Arc::new(bytes))
     }
 
+    #[cfg(target_os = "macos")]
     fn wire_pages(&self) -> Option<&Arc<crate::wire_mmap::WirePages>> {
         match self {
             Self::WirePages(pages) => Some(pages),
@@ -961,6 +962,7 @@ impl RunnableModel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_vision_stopping_streaming_with_sampling(
         &self,
         prefix: &[u32],
@@ -1357,6 +1359,7 @@ struct Qwen35Runtime {
     /// Interleaved multimodal RoPE pair counts `[time, height, width, extra]`.
     /// Text uses one position in every section; image embeddings supply a 2-D
     /// grid through the same full-attention layers.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     rope_sections: [usize; 4],
     d_conv: usize,      // causal conv kernel width (4)
     d_state: usize,     // per-head state dim = head_k_dim = head_v_dim (128)
@@ -1773,6 +1776,7 @@ impl RunnableModel {
     }
 
     #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_vision_metal(
         &self,
         prefix: &[u32],
@@ -3795,7 +3799,7 @@ mod gpu_ssm_layer_tests {
         let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
         let n = 8usize;
         let cpu = model
-            .generate_qwen35_cpu(&prompt, n, &[], &mut |_| {})
+            .generate_qwen35_cpu(&prompt, n, &[], None, &mut |_| {})
             .expect("cpu gen");
         let gpu = model
             .generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
@@ -3846,7 +3850,7 @@ mod gpu_ssm_layer_tests {
             let r = if gpu {
                 model.generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
             } else {
-                model.generate_qwen35_cpu(&prompt, n, &[], &mut |_| {})
+                model.generate_qwen35_cpu(&prompt, n, &[], None, &mut |_| {})
             };
             r.expect("generate");
             t.elapsed().as_secs_f64()
