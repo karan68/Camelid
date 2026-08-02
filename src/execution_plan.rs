@@ -401,7 +401,6 @@ pub fn plan_for_model_with_platform_and_env(
     let row = exact_model_row(model_path, gguf);
     let model_family = model_family(&row, gguf);
     let quant_type = quant_type(gguf);
-    let support_level = support_level(&row, &quant_type);
     let thread_count = threads.unwrap_or_else(default_thread_count);
     let diagnostics_status = match profile {
         ExecutionProfile::Debug => {
@@ -412,7 +411,6 @@ pub fn plan_for_model_with_platform_and_env(
 
     let mut reasons = vec![profile_reason];
     reasons.push(format!("exact_model_row={row}"));
-    reasons.push(format!("support_level={support_level}"));
     reasons.push(format!("quant_type={quant_type}"));
 
     let mut env_updates: BTreeMap<&'static str, Option<&'static str>> = BTreeMap::new();
@@ -429,6 +427,22 @@ pub fn plan_for_model_with_platform_and_env(
     let has_tensor = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0_tensors = has_tensor(GgufTensorType::Q8_0);
     let has_kquant_tensors = has_tensor(GgufTensorType::Q4K) || has_tensor(GgufTensorType::Q6K);
+    let has_prism_low_bit_tensors = has_tensor(GgufTensorType::Q1_0)
+        || has_tensor(GgufTensorType::Q2_0G64)
+        || has_tensor(GgufTensorType::Q2_0G128)
+        || has_tensor(GgufTensorType::Pq2_0);
+    let prism_low_bit_tensor_mix_supported = gguf.tensors.iter().all(|tensor| {
+        matches!(
+            tensor.tensor_type,
+            GgufTensorType::Q1_0
+                | GgufTensorType::Q2_0G64
+                | GgufTensorType::Q2_0G128
+                | GgufTensorType::Pq2_0
+                | GgufTensorType::F32
+                | GgufTensorType::F16
+                | GgufTensorType::BF16
+        )
+    });
     // ALLOW-list, not a deny-list: the Metal resident K-quant lane consumes
     // Q4_K/Q6_K super-blocks and the unquantized norm/embedding tensors that
     // sit alongside them. Anything else — including `Unknown(_)`, which is how
@@ -445,6 +459,30 @@ pub fn plan_for_model_with_platform_and_env(
                 | GgufTensorType::BF16
         )
     });
+
+    // The static Q8 support table below is intentionally platform-blind, but the
+    // Bonsai promotion is not: it is certified only on the packed Apple-Silicon
+    // Metal lane. Mirror the routing predicate here so the execution plan cannot
+    // say supported when Safe mode, a CPU fallback, Windows, or a renamed
+    // neighboring quant is what will actually run.
+    let prism_supported_exact_row = prism_bonsai_expected_quant(&row).is_some_and(|expected| {
+        expected == quant_type.as_str()
+            || (expected == "Q2_0_G128" && matches!(quant_type.as_str(), "Q2_0" | "Q2_0_G128"))
+    }) && has_prism_low_bit_tensors
+        && prism_low_bit_tensor_mix_supported
+        && is_prism_low_bit_metal_arch(gguf)
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && !matches!(profile, ExecutionProfile::Safe)
+        && planner_env.flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
+        && !planner_env.flag_disabled("CAMELID_MAC_Q8_METAL_PLAN");
+    let support_level = if prism_supported_exact_row {
+        "supported_exact_row_smoke_macos_metal".to_string()
+    } else {
+        support_level(&row, &quant_type)
+    };
+    reasons.push(format!("support_level={support_level}"));
 
     let (
         selected_backend,
@@ -480,6 +518,31 @@ pub fn plan_for_model_with_platform_and_env(
             )),
         }
         gemma4_plan(admitted.is_ok())
+    } else if has_prism_low_bit_tensors
+        && prism_low_bit_tensor_mix_supported
+        && is_prism_low_bit_metal_arch(gguf)
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && !matches!(profile, ExecutionProfile::Safe)
+        && planner_env.flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
+        && !planner_env.flag_disabled("CAMELID_MAC_Q8_METAL_PLAN")
+    {
+        env_updates.insert("CAMELID_MAC_Q8_REPACK", Some("off"));
+        env_updates.insert("CAMELID_PARALLEL_LINEAR", Some("on"));
+        reasons.push(
+            "Prism packed low-bit Metal lane selected; Q1_0/Q2_0 wire blocks remain packed \
+             in unified memory and execute directly in the resident Metal kernels"
+                .into(),
+        );
+        (
+            "metal_resident_prism_low_bit_runtime",
+            "metal_resident_prism_packed_wire",
+            "prism_low_bit_metal_resident_prefill",
+            "resident_single_command_buffer_prefill",
+            "prism_low_bit_metal_resident_decode",
+            "scalar_prism_block_decode_fallback",
+        )
     } else if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(
@@ -1450,6 +1513,24 @@ fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
         .unwrap_or(true)
 }
 
+/// Architectures implemented by the packed Prism Q1_0/Q2_0 Metal runtime.
+///
+/// This is deliberately separate from [`is_gpu_runnable_arch`]: that predicate
+/// describes the generic dense CUDA/Metal engine and correctly excludes
+/// `qwen35`, while the dedicated Qwen3.5 runnable graph is exactly what drives
+/// Bonsai on Apple Silicon. Sharing the generic predicate made `/v1/health`
+/// disclose `cpu_reference` even while the resident Qwen3.5 Metal graph was
+/// active.
+fn is_prism_low_bit_metal_arch(gguf: &GgufFile) -> bool {
+    let arch = gguf.architecture().unwrap_or("");
+    if !matches!(arch, "qwen3" | "qwen35") {
+        return false;
+    }
+    gguf.metadata_u32(&format!("{arch}.expert_count"))
+        .map(|experts| experts == 0)
+        .unwrap_or(true)
+}
+
 /// Plan labels for a mixed K-quant (Q4_K_M = Q4_K + Q6_K) model. K-quant 2-D linears
 /// load WIRE-ONLY and are decoded either by the GPU-resident engine (`q4k_gemv`/
 /// `q6k_gemv`) when CUDA resident decode is driving this process, or by the CPU
@@ -1595,7 +1676,29 @@ fn support_level(row: &str, quant_type: &str) -> String {
     if quant_type != "Q8_0" {
         return "unknown_or_unvalidated".into();
     }
-    recognized_row_level(row).into()
+    let level = recognized_row_level(row);
+    if level == "recognized_prism_bonsai_exact_row" {
+        "unknown_or_unvalidated".into()
+    } else {
+        level.into()
+    }
+}
+
+/// Quant certified for one exact Prism/Bonsai artifact name. Exact normalized
+/// stem only: size/family substring matching would let neighboring files inherit
+/// the Mac mini 2 receipt. Q2 returns the geometry-refined label the tensor scan
+/// reports, while the catalog continues to use the upstream-friendly `Q2_0`.
+fn prism_bonsai_expected_quant(row: &str) -> Option<&'static str> {
+    let normalized = normalize_row(row);
+    let stem = normalized.strip_suffix("_gguf").unwrap_or(&normalized);
+    Some(match stem {
+        "bonsai_4b_q1_0" | "bonsai_8b_q1_0" | "bonsai_27b_q1_0" => "Q1_0",
+        "ternary_bonsai_4b_q2_0" | "ternary_bonsai_8b_q2_0" | "ternary_bonsai_27b_q2_0" => {
+            "Q2_0_G128"
+        }
+        "ternary_bonsai_4b_pq2_0" => "PQ2_0",
+        _ => return None,
+    })
 }
 
 /// Quant-blind name→level table. Besides `support_level` above, this powers
@@ -1650,6 +1753,10 @@ fn recognized_row_level(row: &str) -> &'static str {
         // Non-Q8_0 quants of the same name report unknown via `support_level`
         // and are declined by the resident admission (hazard H5).
         "supported_exact_row_smoke_sub512"
+    } else if prism_bonsai_expected_quant(row).is_some() {
+        // Recognition only. The plan promotes this to the supported level iff
+        // the quant and full macOS Metal routing predicate match above.
+        "recognized_prism_bonsai_exact_row"
     } else if normalized.contains("mixtral_8x7b_instruct_v0_1") {
         "bounded_runtime_only_unsupported"
     } else {
@@ -1703,6 +1810,17 @@ fn model_family(row: &str, gguf: &GgufFile) -> String {
 fn quant_type(gguf: &GgufFile) -> String {
     let has = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0 = has(GgufTensorType::Q8_0);
+    // File type 41 identifies Prism Q2_0 but cannot identify its deployed
+    // block geometry. The directory resolver can, so it outranks metadata.
+    if has(GgufTensorType::Q2_0G64) {
+        return "Q2_0_G64".into();
+    }
+    if has(GgufTensorType::Pq2_0) {
+        return "PQ2_0".into();
+    }
+    if has(GgufTensorType::Q2_0G128) {
+        return "Q2_0_G128".into();
+    }
     if let Some(declared) = crate::receipt::declared_file_type_label(gguf) {
         if declared != "Q8_0" || has_q8_0 {
             return declared.into();
@@ -1718,6 +1836,8 @@ fn quant_type(gguf: &GgufFile) -> String {
         "Q4_K_M".into()
     } else if has(GgufTensorType::Q6K) {
         "Q6_K".into()
+    } else if has(GgufTensorType::Q1_0) {
+        "Q1_0".into()
     } else {
         "dense_or_other".into()
     }
@@ -2972,6 +3092,97 @@ mod tests {
             &[GgufTensorType::Q4K, GgufTensorType::Q6K],
         );
         assert_eq!(quant_type(&undeclared_mix), "Q4_K_M");
+    }
+
+    #[test]
+    fn prism_q2_geometry_and_metal_lane_are_disclosed_truthfully() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        for architecture in ["qwen3", "qwen35"] {
+            for (tensor_type, expected) in [
+                (GgufTensorType::Q2_0G64, "Q2_0_G64"),
+                (GgufTensorType::Q2_0G128, "Q2_0_G128"),
+                (GgufTensorType::Pq2_0, "PQ2_0"),
+            ] {
+                let mut gguf = quant_fixture("Ternary Bonsai 1.7B", Some(41), &[tensor_type]);
+                gguf.metadata.insert(
+                    "general.architecture".into(),
+                    GgufMetadataValue::String(architecture.into()),
+                );
+                let outcome = plan_for_model_with_platform(
+                    &PathBuf::from("/models/renamed.gguf"),
+                    &gguf,
+                    Some(8),
+                    metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+                );
+                assert_eq!(outcome.plan.quant_type, expected);
+                assert_eq!(
+                    outcome.plan.selected_backend,
+                    "metal_resident_prism_low_bit_runtime"
+                );
+                assert_eq!(
+                    outcome.plan.decode_path,
+                    "prism_low_bit_metal_resident_decode"
+                );
+            }
+        }
+        clear_profile_env();
+    }
+
+    #[test]
+    fn exact_bonsai_rows_report_supported_only_on_the_certified_metal_lane() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+
+        for (filename, file_type, tensor_type) in [
+            ("Bonsai-4B-Q1_0.gguf", 40, GgufTensorType::Q1_0),
+            ("Ternary-Bonsai-4B-Q2_0.gguf", 41, GgufTensorType::Q2_0G128),
+            ("Ternary-Bonsai-4B-PQ2_0.gguf", 41, GgufTensorType::Pq2_0),
+            ("Bonsai-8B-Q1_0.gguf", 40, GgufTensorType::Q1_0),
+            ("Ternary-Bonsai-8B-Q2_0.gguf", 41, GgufTensorType::Q2_0G128),
+            ("Bonsai-27B-Q1_0.gguf", 40, GgufTensorType::Q1_0),
+            ("Ternary-Bonsai-27B-Q2_0.gguf", 41, GgufTensorType::Q2_0G128),
+        ] {
+            let mut gguf = quant_fixture("hub", Some(file_type), &[tensor_type]);
+            gguf.metadata.insert(
+                "general.architecture".into(),
+                GgufMetadataValue::String("qwen35".into()),
+            );
+            let outcome = plan_for_model_with_platform(
+                &PathBuf::from(format!("/models/{filename}")),
+                &gguf,
+                Some(8),
+                metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+            );
+            assert_eq!(
+                outcome.plan.support_level, "supported_exact_row_smoke_macos_metal",
+                "{filename} support level",
+            );
+            assert_eq!(
+                outcome.plan.selected_backend, "metal_resident_prism_low_bit_runtime",
+                "{filename} backend",
+            );
+        }
+
+        let mut q1 = quant_fixture("hub", Some(40), &[GgufTensorType::Q1_0]);
+        q1.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen35".into()),
+        );
+        let windows = plan_for_model_with_platform(
+            &PathBuf::from("/models/Bonsai-4B-Q1_0.gguf"),
+            &q1,
+            Some(8),
+            platform("windows", "aarch64", &[]),
+        );
+        assert_eq!(windows.plan.support_level, "unknown_or_unvalidated");
+        assert_ne!(
+            windows.plan.selected_backend,
+            "metal_resident_prism_low_bit_runtime"
+        );
+        clear_profile_env();
     }
 
     #[test]

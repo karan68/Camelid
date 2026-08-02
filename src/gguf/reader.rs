@@ -63,6 +63,25 @@ pub enum GgufTensorType {
     /// is the receipt-visible quantization label (receipt `lane.quantization`,
     /// smoke `headline_quant`) — never rename it.
     NVFP4,
+    /// Q1_0: GGUF tensor type id 41, a 128-element/18-byte block
+    /// `{ f16 d; u8 qs[16] }` (1.125 bpw).
+    /// Sign-only quantization: element `i` is `+d` when bit `i` of `qs` is set and
+    /// `-d` when it is clear — there is no codebook, sub-scale or zero point, so the
+    /// representable set is exactly `{-d, +d}`. The Debug name "Q1_0" is the
+    /// receipt-visible quantization label — never rename it.
+    Q1_0,
+    /// Transitional GGUF type id 42 before the file-level block geometry has
+    /// been resolved. Prism's legacy Q2_0 uses 128-value / 34-byte blocks while
+    /// upstream llama.cpp uses 64-value / 18-byte blocks under the SAME type id.
+    /// This variant must never escape [`read_metadata_with_len`].
+    Q2_0,
+    /// Upstream llama.cpp Q2_0: 64 values in 18 bytes (`f16 d; u8 qs[16]`).
+    Q2_0G64,
+    /// Prism legacy Q2_0: 128 values in 34 bytes (`f16 d; u8 qs[32]`).
+    Q2_0G128,
+    /// Prism's forward-compatible packed Q2 type id 142. Wire-identical to
+    /// the legacy g128 layout, but able to coexist with upstream type-42 g64.
+    Pq2_0,
     Unknown(i32),
 }
 
@@ -94,6 +113,9 @@ impl GgufTensorType {
             28 => Self::F64,
             30 => Self::BF16,
             40 => Self::NVFP4,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
+            142 => Self::Pq2_0,
             other => Self::Unknown(other),
         }
     }
@@ -135,6 +157,15 @@ impl GgufTensorType {
             // block_nvfp4 = d[4] UE4M3 sub-block scales + qs[32] packed E2M1 nibbles = 36
             // bytes per QK_NVFP4=64 elements (4.5 bpw; pin ggml-common.h:211-217).
             Self::NVFP4 => Some((64, 36)),
+            // block_q1_0 = f16 d(2) + qs[QK1_0/8]=16 = 18 bytes per QK1_0=128
+            // elements (1.125 bpw).
+            Self::Q1_0 => Some((128, 18)),
+            // Type id 42 is ambiguous on disk. The parser resolves it using the
+            // complete tensor directory before any byte size is consumed.
+            Self::Q2_0 => None,
+            Self::Q2_0G64 => Some((64, 18)),
+            Self::Q2_0G128 => Some((128, 34)),
+            Self::Pq2_0 => Some((128, 34)),
             Self::I8 => Some((1, 1)),
             Self::I16 | Self::BF16 => Some((1, 2)),
             Self::I32 => Some((1, 4)),
@@ -446,6 +477,8 @@ pub fn read_metadata_with_len(path: &Path, declared_len: u64) -> Result<GgufFile
         ));
     }
 
+    resolve_q2_0_dialect(&mut raw_tensors, data_start_offset, file_len, alignment)?;
+
     let mut tensors = Vec::with_capacity(raw_tensors.len());
     let mut seen_tensor_names = std::collections::BTreeSet::new();
     let mut expected_offset = 0u64;
@@ -498,6 +531,114 @@ pub fn read_metadata_with_len(path: &Path, declared_len: u64) -> Result<GgufFile
         metadata,
         tensors,
     })
+}
+
+/// Resolve the two incompatible type-id-42 layouts without trusting filenames.
+///
+/// Prism's legacy files and upstream llama.cpp files both serialize `Q2_0` as
+/// GGML type 42. Their only authoritative discriminator is the tensor directory:
+/// every tensor's stored offset must agree with the byte size implied by one
+/// block geometry. We validate the complete directory under both candidates and
+/// accept exactly one. If offsets alone leave both candidates possible, an exact
+/// final tensor/file boundary breaks the tie; otherwise the file is rejected as
+/// ambiguous instead of silently decoding with the wrong geometry.
+fn resolve_q2_0_dialect(
+    raw_tensors: &mut [(String, Vec<u64>, GgufTensorType, u64)],
+    data_start_offset: u64,
+    file_len: u64,
+    alignment: u64,
+) -> Result<()> {
+    if !raw_tensors
+        .iter()
+        .any(|(_, _, ty, _)| *ty == GgufTensorType::Q2_0)
+    {
+        return Ok(());
+    }
+
+    let candidates = [GgufTensorType::Q2_0G64, GgufTensorType::Q2_0G128];
+    let mut structurally_valid = Vec::new();
+    let mut exact_tail = Vec::new();
+    let mut failures = Vec::new();
+
+    for candidate in candidates {
+        match validate_tensor_directory(
+            raw_tensors,
+            candidate,
+            data_start_offset,
+            file_len,
+            alignment,
+        ) {
+            Ok(tail_is_exact) => {
+                structurally_valid.push(candidate);
+                if tail_is_exact {
+                    exact_tail.push(candidate);
+                }
+            }
+            Err(reason) => failures.push(format!("{candidate:?}: {reason}")),
+        }
+    }
+
+    let resolved = match (exact_tail.as_slice(), structurally_valid.as_slice()) {
+        ([only], _) => *only,
+        ([], [only]) => *only,
+        _ => {
+            let detail = if failures.is_empty() {
+                "both layouts satisfy the tensor directory".to_string()
+            } else {
+                failures.join("; ")
+            };
+            return Err(BackendError::InvalidGguf(format!(
+                "cannot resolve GGUF type 42 Q2_0 dialect (g64 vs g128): {detail}"
+            )));
+        }
+    };
+
+    for (_, _, ty, _) in raw_tensors {
+        if *ty == GgufTensorType::Q2_0 {
+            *ty = resolved;
+        }
+    }
+    Ok(())
+}
+
+fn validate_tensor_directory(
+    raw_tensors: &[(String, Vec<u64>, GgufTensorType, u64)],
+    q2_candidate: GgufTensorType,
+    data_start_offset: u64,
+    file_len: u64,
+    alignment: u64,
+) -> std::result::Result<bool, String> {
+    let mut expected_offset = 0u64;
+    let mut final_end = data_start_offset;
+    for (name, dimensions, raw_type, relative_offset) in raw_tensors {
+        if *relative_offset != expected_offset {
+            return Err(format!(
+                "tensor {name} offset {relative_offset} != expected {expected_offset}"
+            ));
+        }
+        let tensor_type = if *raw_type == GgufTensorType::Q2_0 {
+            q2_candidate
+        } else {
+            *raw_type
+        };
+        let n_bytes =
+            tensor_nbytes(name, dimensions, tensor_type).map_err(|err| err.to_string())?;
+        final_end = data_start_offset
+            .checked_add(*relative_offset)
+            .and_then(|start| start.checked_add(n_bytes))
+            .ok_or_else(|| format!("tensor {name} byte range overflow"))?;
+        if final_end > file_len {
+            return Err(format!("tensor {name} extends beyond end of file"));
+        }
+        expected_offset = align_to(
+            relative_offset
+                .checked_add(n_bytes)
+                .ok_or_else(|| format!("tensor {name} offset overflow"))?,
+            alignment,
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(final_end == file_len)
 }
 
 fn read_value(cursor: &mut Cursor) -> Result<GgufMetadataValue> {
@@ -695,8 +836,33 @@ mod nvfp4_wire_facts {
         assert_eq!(GgufTensorType::from_id(40), GgufTensorType::NVFP4);
         assert_eq!(GgufTensorType::NVFP4.layout(), Some((64, 36)));
         assert_eq!(format!("{:?}", GgufTensorType::NVFP4), "NVFP4");
-        // Unknown ids still fall through to the fail-closed catch-all.
-        assert_eq!(GgufTensorType::from_id(41), GgufTensorType::Unknown(41));
+        // Unknown ids still fall through to the fail-closed catch-all. This used to
+        // assert on id 41, which is now the allocated Q1_0 type (see `q1_0_id_and_layout_are_pinned`);
+        // 99 is not an allocated tensor type, so it stays a true negative.
+        assert_eq!(GgufTensorType::from_id(99), GgufTensorType::Unknown(99));
+    }
+
+    /// Always-on pin of the Q1_0 wire facts: tensor type id 41 with a 128-element /
+    /// 18-byte block. Same reasoning as the NVFP4 pin above — this test cannot skip,
+    /// so an id or layout regression fails on any box. A wrong block size here is the
+    /// silent-corruption surface: `layout` drives the byte-length check in `parse`,
+    /// so a shortfall accumulates and reports as a bogus "not contiguous" error on the
+    /// NEXT tensor (the Q5_1 trap, pinned below).
+    #[test]
+    fn q1_0_id_and_layout_are_pinned() {
+        assert_eq!(GgufTensorType::from_id(41), GgufTensorType::Q1_0);
+        assert_eq!(GgufTensorType::Q1_0.layout(), Some((128, 18)));
+        assert_eq!(format!("{:?}", GgufTensorType::Q1_0), "Q1_0");
+    }
+
+    #[test]
+    fn q2_0_id_is_explicitly_unresolved_until_the_directory_is_known() {
+        assert_eq!(GgufTensorType::from_id(42), GgufTensorType::Q2_0);
+        assert_eq!(GgufTensorType::Q2_0.layout(), None);
+        assert_eq!(GgufTensorType::Q2_0G64.layout(), Some((64, 18)));
+        assert_eq!(GgufTensorType::Q2_0G128.layout(), Some((128, 34)));
+        assert_eq!(GgufTensorType::from_id(142), GgufTensorType::Pq2_0);
+        assert_eq!(GgufTensorType::Pq2_0.layout(), Some((128, 34)));
     }
 
     /// Pin EVERY quantized block layout against the reference struct definitions
@@ -734,7 +900,12 @@ mod nvfp4_wire_facts {
         //   iq4_xs = d(2) + scales_h(2) + scales_l[4] + qs[128]     = 136
         //   tq1_0  = qs[48] + qh[4] + d(2)                          = 54
         //   tq2_0  = qs[64] + d(2)                                  = 66
+        //   q1_0   = d(2)                       + qs[16]            = 18
         let expected = [
+            (T::Q1_0, 128, 18),
+            (T::Q2_0G64, 64, 18),
+            (T::Q2_0G128, 128, 34),
+            (T::Pq2_0, 128, 34),
             (T::Q4_0, 32, 18),
             (T::Q4_1, 32, 20),
             (T::Q5_0, 32, 22),

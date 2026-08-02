@@ -421,8 +421,14 @@ quartet added by `scripts/basalt-nvfp4-golden/gen_sidecar_fixture.mjs`
 (deterministic, <4 KB, shas pinned in `tests/invariant_matrix_binding.rs` and
 `tests/fixtures/gguf/SHA256SUMS`):
 
-- `nvfp4_unknown_type_trip.gguf` — GGML type id 41 → parse refusal ("unknown or
-  removed GGML type"), the file boundary shared by every lane.
+- `nvfp4_unknown_type_trip.gguf` — GGML type id 99 → parse refusal ("unknown or
+  removed GGML type"), the file boundary shared by every lane. (Was id 41 until 2026-08-01.
+  Picking 41 was a mis-specification on the day this fixture was authored: the pin
+  receipt in this same bundle (`pin_extraction_receipts.md` §1) already listed 41 as
+  allocated. The fixture kept tripping the refusal only because Camelid had not
+  implemented 41; implementing it (the 1-bit Q1_0 format) exposed that. 99 is far
+  outside the range any real file uses, so the next type to be implemented cannot
+  quietly defuse it again.)
 - `nvfp4_k_div_trip.gguf` — NVFP4 first dim 48 → parse refusal ("not divisible
   by block size 64"), never a silent pad.
 - `nvfp4_sidecar_admit_trip.gguf` — sidecar trio + `tokenizer.ggml.model`, so

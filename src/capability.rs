@@ -35,6 +35,9 @@ impl SimdCaps {
 /// A snapshot of the host's inference-relevant capabilities.
 #[derive(Debug, Clone)]
 pub struct HardwareProfile {
+    pub metal_available: bool,
+    pub metal_device_name: Option<String>,
+    pub metal_unified_memory: bool,
     pub cuda_available: bool,
     pub cuda_device_count: usize,
     pub cuda_device_name: Option<String>,
@@ -54,6 +57,7 @@ impl HardwareProfile {
     /// context and reads device attributes but compiles no kernels, and degrades
     /// to "no CUDA" cleanly on hosts without a device.
     pub fn detect() -> Self {
+        let metal = crate::metal::detect_metal_device();
         let cap = cuda::probe_capability();
         let (
             cuda_available,
@@ -80,6 +84,9 @@ impl HardwareProfile {
             .unwrap_or(1);
         let (host_ram_total_bytes, host_ram_free_bytes) = host_ram_bytes();
         HardwareProfile {
+            metal_available: metal.available,
+            metal_device_name: metal.device_name,
+            metal_unified_memory: metal.has_unified_memory.unwrap_or(false),
             cuda_available,
             cuda_device_count,
             cuda_device_name,
@@ -107,7 +114,13 @@ impl HardwareProfile {
     /// startup diagnostics. This is the line every tunable is justified against.
     pub fn log(&self) {
         const GIB: f64 = (1024 * 1024 * 1024) as f64;
-        if self.cuda_available {
+        if self.metal_available {
+            eprintln!(
+                "[hw] GPU: {} | Metal compute | unified-memory {} | GPU-resident inference available",
+                self.metal_device_name.as_deref().unwrap_or("Apple GPU"),
+                if self.metal_unified_memory { "yes" } else { "unknown" },
+            );
+        } else if self.cuda_available {
             let (cc_major, cc_minor) = self.cuda_compute_capability.unwrap_or((0, 0));
             eprintln!(
                 "[hw] GPU: {} (x{}) | compute {}.{} | tensor-cores {} | VRAM {:.1} GiB free / {:.1} GiB total",

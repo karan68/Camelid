@@ -82,6 +82,13 @@ function UserTurn({ message, messageContent, onEditResend }) {
   return (
     <article className="cxturn cxturn--user">
       <div className="cxturn__user-chip">
+        {message.image?.data_url && (
+          <img
+            className="cxturn__user-image"
+            src={message.image.data_url}
+            alt={message.image.name ? `Uploaded ${message.image.name}` : 'Uploaded image'}
+          />
+        )}
         {editing ? (
           <div className="cxturn__edit">
             <textarea

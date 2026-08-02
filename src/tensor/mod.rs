@@ -1180,11 +1180,10 @@ pub struct CpuTensor {
     pub q8_0_file_backing: Option<Q8_0FileBacking>,
     pub q8_0_wire_mmap: Option<crate::wire_mmap::WireMmapTensor>,
     pub q8_0_wire_pages: Option<std::sync::Arc<crate::wire_mmap::WirePages>>,
-    /// Page-aligned raw GGUF wire bytes for a rank-2 K-quant tensor. This is
+    /// Page-aligned raw GGUF wire bytes for a rank-2 compact tensor. This is
     /// the no-copy Metal counterpart of the format-specific `*_wire_bytes`
     /// fields below: only one representation is populated. The tensor's
-    /// `source_type` identifies whether the pages contain Q4_K, Q5_K, Q6_K,
-    /// Q2_K, or Q3_K super-blocks.
+    /// `source_type` identifies the K-quant or Prism Q1/Q2 block format.
     pub kquant_wire_pages: Option<std::sync::Arc<crate::wire_mmap::WirePages>>,
     pub q8_0_split_file_backing: Option<Vec<Q8_0FileBacking>>,
     /// Q4_K_M super-block wire bytes (144 bytes/super-block, row-major), retained
@@ -1218,10 +1217,10 @@ pub struct CpuTensor {
     /// Populated by the Q3_K load path; `None` for non-Q3_K tensors. (Q2_K models mix
     /// in Q3_K projections — typically attn_output / ffn_down.)
     pub q3_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
-    /// Ternary TQ2_0 wire bytes (66 bytes/256-weight block, row-major), retained when
-    /// the tensor's `source_type` is `Tq2_0` so the CPU ternary block-dot streams the
-    /// quantized weights instead of materialising f32 (a 4B model fully decoded to f32 is
-    /// ~16 GB and OOMs). Populated by `load_tq2_0_wire_linear`; `None` otherwise.
+    /// Low-bit row-major wire bytes. Originally introduced for mainstream TQ2_0,
+    /// this backing also retains Prism Q1_0 and both Q2_0 dialects so native GPU
+    /// kernels consume the packed file representation without a Q8/F32 expansion.
+    /// `source_type` is the authoritative format discriminator.
     pub tq2_0_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     /// IQ4_XS wire bytes (136 bytes/256-weight super-block, row-major), retained when the
     /// tensor's `source_type` is `IQ4XS` so the CPU i-quant block-dot streams the quantized
@@ -1251,6 +1250,26 @@ impl CpuTensor {
             return None;
         }
         self.q6_k_wire_bytes
+            .as_deref()
+            .map(Vec::as_slice)
+            .or_else(|| self.kquant_wire_pages.as_deref().map(|pages| pages.bytes()))
+    }
+
+    /// Raw packed bytes for TQ2_0 and the Prism Q1/Q2 family.
+    pub fn low_bit_wire(&self) -> Option<&[u8]> {
+        if !matches!(
+            self.source_type,
+            Some(
+                GgufTensorType::Tq2_0
+                    | GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            )
+        ) {
+            return None;
+        }
+        self.tq2_0_wire_bytes
             .as_deref()
             .map(Vec::as_slice)
             .or_else(|| self.kquant_wire_pages.as_deref().map(|pages| pages.bytes()))
@@ -2338,6 +2357,19 @@ impl CpuTensor {
         if let Some(blocks) = self.q8_0_blocks.as_deref() {
             return self.embedding_lookup_q8_0_block_backed(token_ids, name, vocab, width, blocks);
         }
+        if let Some(wire) = self.low_bit_wire() {
+            if matches!(
+                self.source_type,
+                Some(
+                    GgufTensorType::Q1_0
+                        | GgufTensorType::Q2_0G64
+                        | GgufTensorType::Q2_0G128
+                        | GgufTensorType::Pq2_0,
+                )
+            ) {
+                return self.embedding_lookup_low_bit_wire(token_ids, name, vocab, width, wire);
+            }
+        }
         // K-quant token-embedding: the wire-only loader leaves `data` empty, so gather
         // each requested row by dequantizing its super-blocks straight from wire bytes.
         if let Some(wire) = self.q4_k_wire() {
@@ -2627,6 +2659,68 @@ impl CpuTensor {
                 dequant_block(&row[b * block_bytes..(b + 1) * block_bytes], &mut values);
                 out.extend_from_slice(&values);
             }
+        }
+        Self::from_f32(name, vec![token_ids.len(), width], out)
+    }
+
+    fn embedding_lookup_low_bit_wire(
+        &self,
+        token_ids: &[u32],
+        name: impl Into<String>,
+        vocab: usize,
+        width: usize,
+        wire: &[u8],
+    ) -> Result<Self> {
+        let tensor_type = self.source_type.ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("low-bit embedding has no source type".to_string())
+        })?;
+        let (block_elements, block_bytes) = tensor_type.layout().ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(format!(
+                "low-bit embedding has unresolved layout {tensor_type:?}"
+            ))
+        })?;
+        let block_elements = block_elements as usize;
+        let block_bytes = block_bytes as usize;
+        if !width.is_multiple_of(block_elements) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "{tensor_type:?} embedding width {width} is not divisible by {block_elements}"
+            )));
+        }
+        let row_bytes = width / block_elements * block_bytes;
+        let expected = vocab.checked_mul(row_bytes).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("low-bit embedding byte count overflow".to_string())
+        })?;
+        if wire.len() != expected {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "low-bit embedding wire bytes {} do not match expected {expected}",
+                wire.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(token_ids.len() * width);
+        for &token_id in token_ids {
+            let token_idx = usize::try_from(token_id).map_err(|_| {
+                BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} does not fit usize"
+                ))
+            })?;
+            if token_idx >= vocab {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} out of range for vocab size {vocab}"
+                )));
+            }
+            let row = &wire[token_idx * row_bytes..(token_idx + 1) * row_bytes];
+            let decoded = match tensor_type {
+                GgufTensorType::Q1_0 => decode_q1_0_tensor("embedding row", row, width)?,
+                GgufTensorType::Q2_0G64 | GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+                    decode_q2_0_tensor("embedding row", row, width, tensor_type)?
+                }
+                other => {
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "unsupported low-bit embedding type {other:?}"
+                    )))
+                }
+            };
+            out.extend_from_slice(&decoded);
         }
         Self::from_f32(name, vec![token_ids.len(), width], out)
     }
@@ -3887,6 +3981,58 @@ impl TensorStore {
         CpuTensor::from_q8_0_blocks(tensor_name, shape, blocks)
     }
 
+    /// Load a 2-D Q1_0 tensor by LOSSLESSLY re-encoding it into Q8_0 blocks.
+    ///
+    /// This is a re-encoding, NOT a re-quantization: Q1_0's representable set is
+    /// exactly `{-d, +d}`, and a Q8_0 block represents both values EXACTLY as
+    /// `qs = ±1` against the same scale `d`. `QK1_0 = 128` is `4 * 32`, so each
+    /// Q1_0 block tiles into exactly 4 Q8_0 blocks that share its scale, with no
+    /// remainder and no rounding anywhere. `q1_0_transcode_is_bit_exact` pins that
+    /// the resulting blocks decode to values bit-identical to
+    /// [`decode_q1_0_tensor`] on the same wire bytes.
+    ///
+    /// WHY: every GPU-resident lane in this engine is gated on
+    /// `source_type == Q8_0` plus available blocks (`metal_resident_weight_eligible`).
+    /// Re-encoding at load puts Q1_0 files on that lane with NO new Metal/CUDA
+    /// kernels, and avoids the f32 materialization that the plain CPU loader would
+    /// pay (a 1.7B model is ~6.9 GB decoded to f32 vs ~1.9 GB as blocks).
+    ///
+    /// COST, stated plainly: Q8_0 blocks are 36 bytes per 32 values (9 bpw) against
+    /// Q1_0's 1.125 bpw, so this expands the weights ~8x in RAM and gives up the
+    /// footprint that is the entire point of a 1-bit format. It buys correctness and
+    /// the GPU lane today; a native Q1_0 resident kernel is what actually keeps the
+    /// 1.125 bpw at runtime.
+    ///
+    /// TRUTHFULNESS: the returned tensor reports `source_type = Q8_0` because that
+    /// describes its RUNTIME BLOCK REPRESENTATION, which is what every downstream
+    /// consumer keys off. The FILE's quantization is unaffected and still reports
+    /// Q1_0 everywhere it is disclosed — `general.file_type` (40) drives the receipt
+    /// and execution-plan labels, and those read the GGUF descriptors, not this
+    /// tensor. Nothing here may re-read the file bytes as Q8_0: the blocks are
+    /// materialized in RAM and `q8_0_file_backing` / wire-page paths stay `None`
+    /// (they would misread 18-byte Q1_0 blocks as 34-byte Q8_0 wire blocks).
+    pub fn load_q1_0_as_q8_0_blocks_linear(&self, name: &str) -> Result<CpuTensor> {
+        self.load_q1_0_as_q8_0_blocks_linear_as(name, name)
+    }
+
+    pub fn load_q1_0_as_q8_0_blocks_linear_as(
+        &self,
+        source_name: &str,
+        tensor_name: &str,
+    ) -> Result<CpuTensor> {
+        let desc = self.descriptor(source_name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        if desc.tensor_type != GgufTensorType::Q1_0 || shape.dims.len() != 2 {
+            let mut tensor = self.load_cpu_f32(source_name)?;
+            tensor.name = tensor_name.to_string();
+            return Ok(tensor);
+        }
+        let expected_elements = shape.element_count()?;
+        let bytes = self.tensor_bytes(source_name)?;
+        let blocks = q1_0_to_q8_0_blocks(source_name, &bytes, expected_elements)?;
+        CpuTensor::from_q8_0_blocks(tensor_name, shape, blocks)
+    }
+
     /// Load a 2-D K-quant (Q4_K / Q6_K) linear retaining ONLY the raw super-block wire
     /// bytes — NO f32 `data` materialization. This mirrors `from_q8_0_blocks` (which
     /// leaves `data` empty): an 8B model fully decoded to f32 is ~32 GB and OOMs a
@@ -4051,6 +4197,66 @@ impl TensorStore {
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
             tq2_0_wire_bytes: Some(std::sync::Arc::new(bytes.to_vec())),
+            iq4_xs_wire_bytes: None,
+            data: Vec::new(),
+        })
+    }
+
+    /// Retain a Prism Q1_0/Q2_0 rank-2 tensor exactly as packed in the GGUF.
+    /// This is the native Metal/CUDA handoff and deliberately carries no dense
+    /// or Q8 representation, so a backend cannot accidentally claim the low-bit
+    /// footprint while executing expanded weights.
+    pub fn load_prism_wire_linear(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        if !matches!(
+            desc.tensor_type,
+            GgufTensorType::Q1_0
+                | GgufTensorType::Q2_0G64
+                | GgufTensorType::Q2_0G128
+                | GgufTensorType::Pq2_0
+        ) || shape.dims.len() != 2
+        {
+            return self.load_cpu_f32(name);
+        }
+        let file = File::open(&self.path).map_err(|err| {
+            BackendError::InvalidTensorData(format!(
+                "Prism wire pages open failed for {}: {err}",
+                self.path.display()
+            ))
+        })?;
+        let wire_bytes = usize::try_from(desc.n_bytes).map_err(|_| {
+            BackendError::InvalidTensorData(format!(
+                "tensor {name} Prism wire length {} does not fit usize",
+                desc.n_bytes
+            ))
+        })?;
+        Ok(CpuTensor {
+            name: name.to_string(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(desc.tensor_type),
+            q8_0_blocks: None,
+            q8_0_shared_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            kquant_wire_pages: Some(crate::wire_mmap::WirePages::read_from_file(
+                &file,
+                desc.absolute_offset,
+                wire_bytes,
+            )?),
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
+            q5_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             iq4_xs_wire_bytes: None,
             data: Vec::new(),
         })
@@ -4344,9 +4550,15 @@ impl TensorStore {
             GgufTensorType::IQ4XS => decode_iq4_xs_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq1_0 => decode_tq1_0_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq2_0 => decode_tq2_0_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q1_0 => decode_q1_0_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q2_0G64
+            | GgufTensorType::Q2_0G128
+            | GgufTensorType::Pq2_0 => {
+                decode_q2_0_tensor(name, &bytes, expected_elements, desc.tensor_type)?
+            }
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0"
+                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, Q1_0, Q2_0G64, Q2_0G128, PQ2_0"
                 )))
             }
         };
@@ -5636,6 +5848,163 @@ pub(crate) fn decode_tq1_0_tensor(
     Ok(out)
 }
 
+// ---- Sign-only Q1_0 flat dequantization to f32 ----
+// Q1_0 stores one SIGN bit per weight against a shared f16 scale, so the
+// representable set is exactly {-d, +d} — there is no codebook, sub-scale or zero
+// point. The element ORDER is the silent-corruption surface (as with the ternary
+// and legacy split-half formats above): element `j` is bit `j % 8` of byte `j / 8`,
+// LSB-first and sequential — NOT the split-half interleave the legacy Q4/Q5 formats
+// use. A bit-order flip still dequantizes to plausible-looking weights, so this is
+// pinned by `q1_0_dequant_matches_the_reference_layout` (hand-built blocks) and by
+// `tests/q1_0_format.rs` (real blocks against the model vendor's own expansion of
+// the same weights).
+pub const Q1_0_BLOCK_ELEMENTS: usize = 128; // QK1_0
+pub const Q1_0_BLOCK_BYTES: usize = 18; // f16 d(2) + qs[16]  (1.125 bpw over 128 weights)
+
+pub const Q2_0_G64_BLOCK_ELEMENTS: usize = 64;
+pub const Q2_0_G64_BLOCK_BYTES: usize = 18; // f16 d(2) + 16 packed 2-bit bytes
+pub const Q2_0_G128_BLOCK_ELEMENTS: usize = 128;
+pub const Q2_0_G128_BLOCK_BYTES: usize = 34; // f16 d(2) + 32 packed 2-bit bytes
+
+pub fn decode_q1_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    if !expected_elements.is_multiple_of(Q1_0_BLOCK_ELEMENTS) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: Q1_0 element count {expected_elements} is not a multiple of \
+             {Q1_0_BLOCK_ELEMENTS}"
+        )));
+    }
+    let blocks = expected_elements / Q1_0_BLOCK_ELEMENTS;
+    let expected_bytes = blocks * Q1_0_BLOCK_BYTES;
+    if bytes.len() != expected_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: Q1_0 wire length {} != {blocks} blocks * {Q1_0_BLOCK_BYTES} bytes = \
+             {expected_bytes}",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in bytes.chunks_exact(Q1_0_BLOCK_BYTES) {
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        // Mirror the pin's `neg_d = -d` rather than multiplying by ±1.0: for a zero
+        // scale this yields +0.0 for set bits and -0.0 for clear bits, and the sign
+        // of zero is observable downstream.
+        let neg_d = -d;
+        let qs = &block[2..Q1_0_BLOCK_BYTES];
+        for j in 0..Q1_0_BLOCK_ELEMENTS {
+            let bit = (qs[j / 8] >> (j % 8)) & 1;
+            out.push(if bit == 1 { d } else { neg_d });
+        }
+    }
+    Ok(out)
+}
+
+/// Decode either currently deployed GGUF type-42 Q2_0 geometry.
+///
+/// Both dialects use the same code mapping (`00=-d`, `01=0`, `10=+d`,
+/// `11=+2d`) and differ only in how many codes share one f16 scale. The GGUF
+/// parser resolves the ambiguous type id into `Q2_0G64` or `Q2_0G128` before
+/// this function is called.
+pub fn decode_q2_0_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+    tensor_type: GgufTensorType,
+) -> Result<Vec<f32>> {
+    let (block_elements, block_bytes) = match tensor_type {
+        GgufTensorType::Q2_0G64 => (Q2_0_G64_BLOCK_ELEMENTS, Q2_0_G64_BLOCK_BYTES),
+        GgufTensorType::Q2_0G128 => (Q2_0_G128_BLOCK_ELEMENTS, Q2_0_G128_BLOCK_BYTES),
+        GgufTensorType::Pq2_0 => (Q2_0_G128_BLOCK_ELEMENTS, Q2_0_G128_BLOCK_BYTES),
+        GgufTensorType::Q2_0 => {
+            return Err(BackendError::InvalidTensorData(format!(
+                "{name}: unresolved Q2_0 dialect reached tensor decode"
+            )))
+        }
+        other => {
+            return Err(BackendError::InvalidTensorData(format!(
+                "{name}: Q2_0 decoder received non-Q2 tensor type {other:?}"
+            )))
+        }
+    };
+    if !expected_elements.is_multiple_of(block_elements) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: {tensor_type:?} element count {expected_elements} is not a multiple of {block_elements}"
+        )));
+    }
+    let blocks = expected_elements / block_elements;
+    let expected_bytes = blocks.checked_mul(block_bytes).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!("{name}: Q2_0 byte length overflow"))
+    })?;
+    if bytes.len() != expected_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: {tensor_type:?} wire length {} != {blocks} blocks * {block_bytes} bytes = {expected_bytes}",
+            bytes.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in bytes.chunks_exact(block_bytes) {
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = &block[2..];
+        for j in 0..block_elements {
+            let q = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            out.push((i32::from(q) - 1) as f32 * d);
+        }
+    }
+    Ok(out)
+}
+
+/// Losslessly re-encode Q1_0 wire bytes as Q8_0 blocks.
+///
+/// Each 128-value Q1_0 block becomes exactly 4 Q8_0 blocks of 32 that share its
+/// scale, with `qs = +1` where the sign bit is set and `-1` where it is clear.
+/// Q8_0 dequantizes as `qs as f32 * scale`, so `(+1) * d == +d` and
+/// `(-1) * d == -d` reproduce Q1_0's `{-d, +d}` EXACTLY — no rounding, no
+/// re-quantization, no error term. See `load_q1_0_as_q8_0_blocks_linear` for why
+/// this exists and what it costs.
+///
+/// The scale is widened f16 -> f32 (exact), matching `Q8_0Block::scale`. A zero
+/// scale stays zero in both encodings; the SIGN of a zero-scale value is the one
+/// place the two representations can differ (`-1.0 * 0.0` is `-0.0`, as is the
+/// decoder's `neg_d`), so they agree there too.
+pub(crate) fn q1_0_to_q8_0_blocks(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<Q8_0Block>> {
+    if !expected_elements.is_multiple_of(Q1_0_BLOCK_ELEMENTS) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: Q1_0 element count {expected_elements} is not a multiple of \
+             {Q1_0_BLOCK_ELEMENTS}"
+        )));
+    }
+    let q1_blocks = expected_elements / Q1_0_BLOCK_ELEMENTS;
+    let expected_bytes = q1_blocks * Q1_0_BLOCK_BYTES;
+    if bytes.len() != expected_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: Q1_0 wire length {} != {q1_blocks} blocks * {Q1_0_BLOCK_BYTES} bytes = \
+             {expected_bytes}",
+            bytes.len()
+        )));
+    }
+    // 128 values per Q1_0 block / 32 per Q8_0 block = 4, exactly.
+    const Q8_PER_Q1: usize = Q1_0_BLOCK_ELEMENTS / 32;
+    let mut out = Vec::with_capacity(q1_blocks * Q8_PER_Q1);
+    for block in bytes.chunks_exact(Q1_0_BLOCK_BYTES) {
+        let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = &block[2..Q1_0_BLOCK_BYTES];
+        for sub in 0..Q8_PER_Q1 {
+            let mut quants = [0i8; 32];
+            for (k, quant) in quants.iter_mut().enumerate() {
+                let j = sub * 32 + k;
+                let bit = (qs[j / 8] >> (j % 8)) & 1;
+                *quant = if bit == 1 { 1 } else { -1 };
+            }
+            out.push(Q8_0Block { scale, quants });
+        }
+    }
+    Ok(out)
+}
+
 fn decode_q4_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
     let blocks = decode_q4_1_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
@@ -6829,6 +7198,141 @@ mod tests {
         // instead of decoding would pass a laxer test but fail this.
         assert_eq!(out[240], -1.0);
         assert_eq!(out[255], -1.0);
+    }
+
+    #[test]
+    fn q1_0_dequant_matches_the_reference_layout() {
+        use super::{decode_q1_0_tensor, Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMENTS};
+
+        // d = 1.0 (f16 0x3C00) so each output is the raw sign.
+        let mut block = vec![0u8; Q1_0_BLOCK_BYTES];
+        block[0] = 0x00;
+        block[1] = 0x3C;
+        // qs[0] = 0b0000_0001: only element 0 is set.
+        block[2] = 0x01;
+        // qs[1] = 0b1000_0000: only element 15 is set.
+        block[3] = 0x80;
+        // qs[2] = 0b0000_1111: elements 16..19 set, 20..23 clear.
+        block[4] = 0x0F;
+
+        let out = decode_q1_0_tensor("t", &block, Q1_0_BLOCK_ELEMENTS).unwrap();
+        assert_eq!(
+            out.len(),
+            128,
+            "one Q1_0 block decodes QK1_0 = 128 elements"
+        );
+
+        // Element j is bit (j % 8) of byte (j / 8), LSB-FIRST. This is the assertion
+        // that fails on an MSB-first decoder: it would put the set bit of qs[0] at
+        // element 7 instead of element 0, and the set bit of qs[1] at element 8
+        // instead of element 15 — both still "plausible" weights, hence the pin.
+        assert_eq!(out[0], 1.0, "qs[0] bit 0 -> element 0");
+        assert_eq!(out[1..8], [-1.0; 7], "qs[0] bits 1..7 clear -> -d");
+        assert_eq!(out[8..15], [-1.0; 7], "qs[1] bits 0..6 clear -> -d");
+        assert_eq!(out[15], 1.0, "qs[1] bit 7 -> element 15");
+        assert_eq!(out[16..20], [1.0; 4], "qs[2] low nibble set -> +d");
+        assert_eq!(out[20..24], [-1.0; 4], "qs[2] high nibble clear -> -d");
+        // Bytes left at 0 decode to -d, not 0.0 — a decoder that zero-fills the tail
+        // instead of decoding it would pass a laxer test but fail this.
+        assert_eq!(out[127], -1.0);
+
+        // Sign-only means the representable set is exactly {-d, +d}: no code maps to
+        // zero, so no element may be 0.0 under a non-zero scale.
+        assert!(out.iter().all(|v| v.abs() == 1.0));
+
+        // A negative f16 scale is simply mirrored (pin: `neg_d = -d`), it is not
+        // normalised to a magnitude.
+        let mut neg = vec![0u8; Q1_0_BLOCK_BYTES];
+        neg[0] = 0x00;
+        neg[1] = 0xBC; // f16 -1.0
+        neg[2] = 0x01;
+        let out_neg = decode_q1_0_tensor("t", &neg, Q1_0_BLOCK_ELEMENTS).unwrap();
+        assert_eq!(
+            out_neg[0], -1.0,
+            "set bit under d = -1.0 yields -d's operand"
+        );
+        assert_eq!(out_neg[1], 1.0, "clear bit under d = -1.0 yields +1.0");
+
+        // Zero scale: set bits give +0.0 and clear bits give -0.0, matching the pin's
+        // `neg_d = -d` (rather than a `d * ±1.0` formulation collapsing the sign).
+        let zero = vec![0u8; Q1_0_BLOCK_BYTES];
+        let out_zero = decode_q1_0_tensor("t", &zero, Q1_0_BLOCK_ELEMENTS).unwrap();
+        assert!(
+            out_zero[0] == 0.0 && out_zero[0].is_sign_negative(),
+            "clear bit under d = 0.0 must be -0.0, not +0.0"
+        );
+    }
+
+    /// The load-time Q1_0 -> Q8_0 re-encoding must be LOSSLESS, because the whole
+    /// GPU-resident lane for Q1_0 files rests on it. Q8_0's representable set is a
+    /// superset of Q1_0's `{-d, +d}` (`qs = ±1` against the same scale), so this is
+    /// a re-encoding and any difference at all is a bug — compared on `to_bits()`
+    /// so a sign-of-zero divergence cannot hide.
+    #[test]
+    fn q1_0_transcode_is_bit_exact() {
+        use super::{decode_q1_0_tensor, q1_0_to_q8_0_blocks, Q1_0_BLOCK_BYTES};
+
+        // Three blocks with different scales and bit patterns, plus the zero-scale
+        // block where +0.0 / -0.0 is observable.
+        let mut wire = Vec::new();
+        for (lo, hi) in [(0x00u8, 0x3Cu8), (0x55, 0x30), (0x00, 0xBC), (0x00, 0x00)] {
+            let mut block = vec![0u8; Q1_0_BLOCK_BYTES];
+            block[0] = lo;
+            block[1] = hi;
+            for (k, b) in block[2..].iter_mut().enumerate() {
+                // A varied, asymmetric bit pattern so sub-block boundaries matter.
+                *b = (k as u8).wrapping_mul(37).wrapping_add(0x5A);
+            }
+            wire.extend_from_slice(&block);
+        }
+        let elements = 4 * 128;
+
+        let direct = decode_q1_0_tensor("t", &wire, elements).unwrap();
+        let blocks = q1_0_to_q8_0_blocks("t", &wire, elements).unwrap();
+        assert_eq!(blocks.len(), elements / 32, "128 values -> 4 Q8_0 blocks");
+
+        // Dequantize the Q8_0 blocks exactly as the engine does: qs as f32 * scale.
+        let via_q8: Vec<f32> = blocks
+            .iter()
+            .flat_map(|b| b.quants.iter().map(|q| *q as f32 * b.scale))
+            .collect();
+
+        assert_eq!(via_q8.len(), direct.len());
+        for (i, (a, b)) in direct.iter().zip(via_q8.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "element {i}: Q1_0 decode {a} != Q8_0 re-encode {b}"
+            );
+        }
+
+        // Every quant must be exactly ±1: any other magnitude means the re-encoding
+        // rescaled instead of re-encoding.
+        assert!(blocks
+            .iter()
+            .all(|b| b.quants.iter().all(|q| *q == 1 || *q == -1)));
+    }
+
+    #[test]
+    fn q1_0_dequant_refuses_a_length_mismatch() {
+        use super::{decode_q1_0_tensor, Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMENTS};
+
+        // Element counts must be whole blocks.
+        let err = decode_q1_0_tensor("t", &[0u8; Q1_0_BLOCK_BYTES], 64).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a multiple of"),
+            "partial-block element counts refuse: {err}"
+        );
+
+        // A short buffer refuses rather than decoding a truncated tail. Without the
+        // exact-length check this is the corruption the reader's contiguity check
+        // reports against the NEXT tensor.
+        let err =
+            decode_q1_0_tensor("t", &[0u8; Q1_0_BLOCK_BYTES - 1], Q1_0_BLOCK_ELEMENTS).unwrap_err();
+        assert!(
+            format!("{err}").contains("Q1_0 wire length"),
+            "short wire buffers refuse: {err}"
+        );
     }
 
     #[test]

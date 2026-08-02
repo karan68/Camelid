@@ -29,26 +29,23 @@ async fn post_chat(body: Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
-async fn multimodal_image_part_fails_closed_with_typed_error() {
+async fn multimodal_image_part_is_accepted_before_the_runtime_gate() {
     let (status, body) = post_chat(json!({
         "model": "gemma4_e2b_it_q8_0",
         "messages": [{
             "role": "user",
             "content": [
                 {"type": "text", "text": "What is in this picture?"},
-                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}}
             ]
         }]
     }))
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "unsupported_multimodal_content");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("image_url"), "names the part: {message}");
-    assert!(
-        message.contains("text-token"),
-        "states the text-only boundary: {message}"
-    );
+    // Image parts are now valid Chat Completions input for a loaded Prism
+    // vision lane. With no runtime this request must proceed past the old
+    // multimodal guard and fail later at model selection.
+    assert_ne!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_ne!(body["error"]["code"], "unsupported_multimodal_content");
 }
 
 #[tokio::test]

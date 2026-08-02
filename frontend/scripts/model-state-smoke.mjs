@@ -47,6 +47,7 @@ import {
 
 import { getChatGateState } from '../src/lib/chatGate.js'
 import { formatDurationMs } from '../src/lib/formatters.js'
+import { SUPPORTED_MODELS } from '../src/lib/supportedModels.js'
 
 const localLoadedReady = {
   id: 'tiny-generation',
@@ -255,6 +256,49 @@ assert.equal(genericExactRowHint.target.id, 'custom_exact_row_q8_0', 'generic ba
 assert.equal(isExactCompatibilityHint(genericExactRowHint), true, 'generic row-id matches should stay exact-row scoped')
 assert.equal(isCompatibilitySupportedForModel(genericExactRowFixture, { id: 'custom-exact-row-q8-0', quant: 'Q8_0' }), true, 'supported generic exact rows should unlock only through the exact row id and quant evidence')
 assert.equal(isCompatibilitySupportedForModel(genericExactRowFixture, { id: 'custom-exact-row-q4-0', quant: 'Q4_0' }), false, 'generic exact rows should not unlock neighboring quantized filenames')
+
+const prismCatalogRows = [
+  ['bonsai_4b_q1_0', 'Bonsai-4B-Q1_0.gguf', 'Q1_0'],
+  ['ternary_bonsai_4b_q2_0', 'Ternary-Bonsai-4B-Q2_0.gguf', 'Q2_0'],
+  ['ternary_bonsai_4b_pq2_0', 'Ternary-Bonsai-4B-PQ2_0.gguf', 'PQ2_0'],
+  ['bonsai_8b_q1_0', 'Bonsai-8B-Q1_0.gguf', 'Q1_0'],
+  ['ternary_bonsai_8b_q2_0', 'Ternary-Bonsai-8B-Q2_0.gguf', 'Q2_0'],
+  ['bonsai_27b_q1_0', 'Bonsai-27B-Q1_0.gguf', 'Q1_0'],
+  ['ternary_bonsai_27b_q2_0', 'Ternary-Bonsai-27B-Q2_0.gguf', 'Q2_0'],
+]
+const prismCapabilityFixture = {
+  model_compatibility: prismCatalogRows.map(([id, filename, quantization]) => ({
+    id,
+    family: 'qwen35_bonsai_metal',
+    quantization,
+    status: 'supported_exact_row_smoke',
+    frontend_readiness_gate: `green only for ${filename} on the checked Metal lane`,
+    evidence: 'Mac mini 2 exact-artifact receipt',
+  })),
+}
+for (const [id, filename, quant] of prismCatalogRows) {
+  const catalogItem = SUPPORTED_MODELS.find((item) => item.catalog_id === id)
+  assert.ok(catalogItem, `${id} must be visible in the frontend curated catalog decoration`)
+  assert.equal(catalogItem.filename, filename)
+  assert.equal(catalogItem.quant, quant)
+  assert.equal(
+    isCompatibilitySupportedForModel(prismCapabilityFixture, null, catalogItem),
+    true,
+    `${filename} must derive the Models-page Supported lane from its exact capability row`,
+  )
+}
+assert.equal(
+  isCompatibilitySupportedForModel(prismCapabilityFixture, null, {
+    catalog_id: 'ternary_bonsai_8b_pq2_0',
+    filename: 'Ternary-Bonsai-8B-PQ2_0.gguf',
+    quant: 'PQ2_0',
+  }),
+  false,
+  'neighboring Bonsai artifacts must remain experimental until their own exact support row is certified',
+)
+assert.equal(quantLabelFromGgufFileType(40), 'Q1_0')
+assert.equal(quantLabelFromGgufFileType(41), 'Q2_0')
+assert.equal(quantLabelFromGgufFileType(142), null, 'tensor type ids must not be mistaken for general.file_type ids')
 
 const trackedTargets = getTrackedCompatibilityTargets(capabilityFixture)
 assert.deepEqual(

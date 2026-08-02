@@ -92,10 +92,20 @@ pub(super) const API_CONFORMANCE_CASES: &[ApiConformanceCase] = &[
     ApiConformanceCase {
         id: "openai_chat_completions",
         status: SupportStatus::SupportedCurrentGate,
-        notes: "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows.",
+        notes: "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows. The exact Prism/Qwen3.5 row additionally accepts one OpenAI image_url content part containing a local PNG/JPEG data URL when its sibling mmproj is resident on macOS Metal; /v1/health advertises vision_ready.",
         routes: &[post("/v1/chat/completions")],
-        supported_modes: &["nonstreaming", "streaming", "function_tool_roundtrip"],
-        unsupported_modes: &["multimodal_input"],
+        supported_modes: &[
+            "nonstreaming",
+            "streaming",
+            "function_tool_roundtrip",
+            "prism_single_image_data_url_macos_metal",
+        ],
+        unsupported_modes: &[
+            "multiple_images",
+            "remote_image_urls",
+            "audio_or_video_input",
+            "vision_tool_combination",
+        ],
     },
     ApiConformanceCase {
         id: "openai_responses",

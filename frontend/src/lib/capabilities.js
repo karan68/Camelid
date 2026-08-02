@@ -38,6 +38,10 @@ const GGUF_FILE_TYPE_QUANT_LABELS = {
   38: 'MXFP4_MOE',
   39: 'NVFP4',
   40: 'Q1_0',
+  // general.file_type ids, not GGML tensor-type ids. Prism Q1_0 tensors
+  // carry tensor type 41 while their file_type is 40; both Prism Q2 block
+  // geometries declare file_type 41 and the backend refines the geometry.
+  41: 'Q2_0',
 }
 
 export function quantLabelFromGgufFileType(fileType) {
