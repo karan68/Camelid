@@ -63,7 +63,7 @@
     "avx512_hosts": "provably unaffected -- the new branch requires !use_vnni, so any host that selects the 512-bit inner never evaluates it.",
     "repack8": "untouched.",
     "non_avxvnni_hosts": "unaffected -- falls through to the same use_avx2 branch as before.",
-    "default_state": "the K-quant prefill owner itself remains env_flag_default_off (src/runtime_config.rs:80). This change makes the owner faster when it is switched on; it does not switch anything on."
+    "default_state": "the K-quant prefill owner itself remains env_flag_default_off (RuntimeConfig::kquant_prefill_owner, src/runtime_config.rs). This change makes the owner faster when it is switched on; it does not switch anything on."
   },
 
   "negative_controls": [
@@ -78,7 +78,7 @@
 
   "open_questions": [
     "q6_k_owner_prefill_tiled has no VNNI path on ANY host, 512-bit or 256-bit. That is a seventh of the owner's per-layer matmuls in a Q4_K_M mix and is the obvious next lever; it is not addressed here.",
-    "The Q8 owner gates on the same avx512f+bw+vnni triple (inference.rs:16880) and is ALREADY default-on. So every Q8 model on 12th-gen-and-later consumer Intel is running its AVX2 inner today. Same gap, wider blast radius, unmeasured here.",
+    "The Q8 owner gates on the same avx512f+bw+vnni triple (try_q8_matmul_owner_prefill in src/inference.rs, via q8_owner_avx512vnni_available) and its VNNI flag is ALREADY default-on (q8_matmul_owner_vnni, set by q8_0_env_flag_enabled_default_on_fail_closed in src/inference/q8_runtime.rs). So every Q8 model on 12th-gen-and-later consumer Intel is running its AVX2 microkernel today. Same gap, wider blast radius, unmeasured here.",
     "One host. AVX-VNNI is also present on Alder/Meteor/Arrow Lake and on Zen 5; the ratio on a part with a different cache hierarchy or without a P/E split is unmeasured.",
     "Q4_K only. Other K-quant widths in the owner were not swept.",
     "The taper with prompt length is reproducible but unexplained -- most likely the inner stops being the bottleneck as chunk count grows, but that was not instrumented."
