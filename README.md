@@ -2,7 +2,7 @@
 
 # 🐪 Camelid
 
-**Run supported GGUF language models locally with a Rust-native engine.**
+**Run supported GGUF language and vision models locally with a Rust-native engine.**
 
 Desktop app, browser chat, terminal UI, and an OpenAI-style API — all backed by the same local runtime.
 
@@ -27,6 +27,15 @@ distributed as a single Rust binary — no Python, Node.js, or Docker at runtime
 Camelid deliberately supports a curated set of exact model-and-quantization combinations. Each
 supported row is validated token-for-token against a pinned reference before it is presented as
 ready to use.
+
+> [!TIP]
+> **New: [PrismML](https://prismml.com/) Bonsai models are Supported on Apple Silicon Metal.**
+> Seven exact, hash-pinned 4B, 8B, and 27B GGUFs covering `Q1_0`, `Q2_0`, and `PQ2_0` are
+> downloadable from the Desktop **Models** page or with `camelid pull`. With the pinned Qwen3-VL
+> projector, the 27B Q1 row also supports local PNG/JPEG input through browser chat and the API;
+> the 27B Q2 row has a checked single-image CLI smoke. These rows are **Supported**, not
+> Experimental; the claim is limited to the listed artifacts on macOS Apple Silicon Metal.
+> [See the exact rows and vision setup.](#prismml--bonsai-macos-metal-support)
 
 ## Why Camelid
 
@@ -211,6 +220,8 @@ Not sure where to begin? Pick **Llama 3.2 3B** — the best balance of quality a
 | **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `3b_instruct_q8` |
 | Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
 | Reasoning + coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
+| PrismML compact model on Apple Silicon | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
+| PrismML browser/API vision on Apple Silicon (projector required) | Bonsai 27B Q1_0 | `bonsai_27b_q1` |
 
 ### Catalog models — `camelid pull`
 
