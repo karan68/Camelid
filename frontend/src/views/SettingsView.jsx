@@ -227,6 +227,7 @@ export default function SettingsView({
             onChange={(next) => handleMaxTokens(next)}
             model={selectedModel}
             capabilities={capabilities}
+            gemma4ServeLane={runtime?.gemma4_serve_lane}
           />
         </CardBody>
       </Card>

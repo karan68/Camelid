@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
-import { getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
+import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
@@ -480,9 +480,15 @@ export default function ChatWorkspace({
     const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
     return Math.max(1, Math.round(Math.max(pieces.length, text.length / 4)))
   }, [visibleMessages, composer])
+  const configuredMaxTokens = getConfiguredMaxTokens(selectedModelId)
+  const effectiveMaxTokens = applyGemma4GhostChatTokenCap(
+    configuredMaxTokens,
+    runtime?.gemma4_serve_lane,
+  )
+  const ghostBudgetCapped = effectiveMaxTokens < configuredMaxTokens
   const sendBudget = validateSendBudget({
     promptTokens: estimatedPromptTokens,
-    maxTokens: getConfiguredMaxTokens(selectedModelId),
+    maxTokens: effectiveMaxTokens,
     contextLength: modelContextLength(selectedModel),
   })
 
@@ -654,6 +660,11 @@ export default function ChatWorkspace({
       {sendBudget.level === 'notice' && (
         <p className="cxcomposer__budget-notice">
           <span aria-hidden="true">ⓘ</span> {sendBudget.message}
+        </p>
+      )}
+      {ghostBudgetCapped && (
+        <p className="cxcomposer__budget-notice">
+          <span aria-hidden="true">ⓘ</span> Ghost-MoE uses a {effectiveMaxTokens.toLocaleString()}-token WebUI reply ceiling so normal chats stay inside the default 4,096-position Metal common cache.
         </p>
       )}
       <div className={`cxcomposer__status is-${statusTone}`} role="status" aria-live="polite" title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>

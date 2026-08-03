@@ -18,6 +18,7 @@
     "smoke:model-deletion": "node scripts/model-deletion-smoke.mjs",
     "smoke:3b-closure": "node scripts/frontend-3b-closure-smoke.mjs",
     "smoke:ui": "node scripts/ui-regression-smoke.mjs",
+    "smoke:ghost-moe-execution": "node scripts/ghost-moe-execution-plan-smoke.mjs",
     "smoke:streaming": "node scripts/streaming-parser-smoke.mjs",
     "smoke:capability-readiness": "node scripts/capability-readiness-smoke.mjs",
     "smoke:observatory": "node scripts/observatory-smoke.mjs",

@@ -14,6 +14,137 @@ extern "C" {
     ) -> std::os::raw::c_int;
 }
 
+#[cfg(test)]
+mod ghost_moe_cli_tests {
+    use super::*;
+
+    fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("ghost-moe-cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn CLI parse test")
+            .join()
+            .expect("CLI parse test panicked");
+    }
+
+    #[test]
+    fn gpu_off_and_deterministic_resolve_before_model_load() {
+        assert_eq!(resolved_gpu_switch(GpuMode::Auto, false), None);
+        assert_eq!(resolved_gpu_switch(GpuMode::On, false), Some(true));
+        assert_eq!(resolved_gpu_switch(GpuMode::Off, false), Some(false));
+        assert_eq!(resolved_gpu_switch(GpuMode::Auto, true), Some(false));
+        assert_eq!(resolved_gpu_switch(GpuMode::On, true), Some(false));
+        assert_eq!(resolved_gpu_switch(GpuMode::Off, true), Some(false));
+    }
+
+    #[test]
+    fn ghost_run_parses_global_expert_cache_budget() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "ghost-run",
+                "gemma4.gguf",
+                "--cghost",
+                "gemma4.cghost",
+                "--expert-cache-mib",
+                "64",
+            ])
+            .expect("parse Ghost-MoE flags");
+            match cli.command {
+                Some(Command::GhostRun {
+                    model,
+                    cghost,
+                    expert_cache_mib,
+                    ..
+                }) => {
+                    assert_eq!(model, PathBuf::from("gemma4.gguf"));
+                    assert_eq!(cghost, PathBuf::from("gemma4.cghost"));
+                    assert_eq!(expert_cache_mib, 64);
+                }
+                other => panic!("expected GhostRun, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn ghost_run_defaults_to_1024_mib_global_expert_cache() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "ghost-run",
+                "model.gguf",
+                "--cghost",
+                "model.cghost",
+            ])
+            .expect("parse GhostRun defaults");
+            match cli.command {
+                Some(Command::GhostRun {
+                    expert_cache_mib, ..
+                }) => assert_eq!(expert_cache_mib, 1024),
+                other => panic!("expected GhostRun, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn serve_parses_ghost_moe_artifact_and_cache_budget() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "serve",
+                "--model",
+                "gemma4.gguf",
+                "--cghost",
+                "gemma4.cghost",
+                "--expert-cache-mib",
+                "2048",
+                "--ghost-strict-cache",
+                "--no-open",
+            ])
+            .expect("parse Ghost-MoE serve flags");
+            match cli.command {
+                Some(Command::Serve {
+                    model,
+                    cghost,
+                    expert_cache_mib,
+                    ghost_strict_cache,
+                    no_open,
+                    ..
+                }) => {
+                    assert_eq!(model, Some(PathBuf::from("gemma4.gguf")));
+                    assert_eq!(cghost, Some(PathBuf::from("gemma4.cghost")));
+                    assert_eq!(expert_cache_mib, 2048);
+                    assert!(ghost_strict_cache);
+                    assert!(no_open);
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn serve_uses_buffered_ghost_reads_by_default() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "serve",
+                "--model",
+                "gemma4.gguf",
+                "--cghost",
+                "gemma4.cghost",
+            ])
+            .expect("parse Ghost-MoE serve defaults");
+            match cli.command {
+                Some(Command::Serve {
+                    ghost_strict_cache, ..
+                }) => assert!(!ghost_strict_cache),
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        });
+    }
+}
+
 use camelid::{
     api, chat,
     cluster::{
@@ -75,6 +206,19 @@ fn default_launch_command() -> Command {
         spec_decode: None,
         spec_draft_model: None,
         spec_draft_tokens: None,
+        cghost: std::env::var_os("CAMELID_GEMMA4_GHOST_CGHOST").map(PathBuf::from),
+        expert_cache_mib: std::env::var("CAMELID_GEMMA4_GHOST_CACHE_MIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024),
+        ghost_strict_cache: std::env::var("CAMELID_GEMMA4_GHOST_STRICT_CACHE")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes" | "enabled"
+                )
+            })
+            .unwrap_or(false),
         no_open: false,
         deterministic: false,
         enable_thinking: false,
@@ -630,9 +774,9 @@ enum GaitAction {
 /// UI toggle (`POST /api/runtime/gpu`) can still flip state live afterwards.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum GpuMode {
-    /// Use the GPU when a CUDA device is detected; fall back to CPU otherwise (default).
-    /// Leaves the switches to lazy-seed exactly as today (gpu_accel from is_available(),
-    /// hybrid Q8 matmul from CAMELID_CUDA_Q8).
+    /// Use an available CUDA or Metal GPU; fall back to CPU otherwise (default).
+    /// Leaves the master switch to lazy-seed from platform capability and the
+    /// CUDA-only hybrid Q8 matmul from CAMELID_CUDA_Q8.
     Auto,
     /// Force the GPU path on (still no-ops at runtime without a device).
     On,
@@ -654,6 +798,19 @@ impl GpuMode {
             },
             Err(_) => GpuMode::Auto,
         }
+    }
+}
+
+/// Resolve the explicit startup value for the shared GPU switch. `None` keeps
+/// auto-detection lazy. Deterministic mode is authoritative over even `--gpu on`.
+fn resolved_gpu_switch(gpu: GpuMode, deterministic: bool) -> Option<bool> {
+    if deterministic {
+        return Some(false);
+    }
+    match gpu {
+        GpuMode::Auto => None,
+        GpuMode::On => Some(true),
+        GpuMode::Off => Some(false),
     }
 }
 
@@ -699,6 +856,24 @@ enum Command {
         /// Draft tokens proposed per speculation round (default: 5).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_TOKENS")]
         spec_draft_tokens: Option<usize>,
+        /// Gemma 4 MoE only: serve routed experts from this v2 `.cghost`
+        /// artifact while retaining tokenizer, router, attention, and shared
+        /// weights on the source GGUF path.
+        #[arg(long, env = "CAMELID_GEMMA4_GHOST_CGHOST")]
+        cghost: Option<PathBuf>,
+        /// Gemma 4 Ghost-MoE only: model-global routed-expert cache ceiling in
+        /// MiB. 1024 retains a little more than one Q4_0 token working set.
+        #[arg(long, env = "CAMELID_GEMMA4_GHOST_CACHE_MIB", default_value_t = 1024)]
+        expert_cache_mib: usize,
+        /// Gemma 4 Ghost-MoE only: bypass the OS page cache for `.cghost`
+        /// reads. This enforces a stricter memory ceiling but gives up buffered
+        /// reuse, so normal buffered positioned reads are the default.
+        #[arg(
+            long,
+            env = "CAMELID_GEMMA4_GHOST_STRICT_CACHE",
+            default_value_t = false
+        )]
+        ghost_strict_cache: bool,
         /// Do not open the web UI in a browser on startup. By default, when run
         /// interactively, `serve` opens the chat surface automatically.
         #[arg(long, env = "CAMELID_NO_OPEN", default_value_t = false)]
@@ -1592,6 +1767,10 @@ enum Command {
         /// Speculative draft length L (n-gram tokens proposed per verify sweep). Capped at 7.
         #[arg(long, default_value_t = 5)]
         draft_len: usize,
+        /// Ghost-MoE only: global routed-expert cache ceiling in MiB. The
+        /// budget is shared by every layer; 0 keeps no expert after its use.
+        #[arg(long, default_value_t = 1024)]
+        expert_cache_mib: usize,
         /// Strict memory ceiling mode: bypass the OS page cache for `.cghost` reads so
         /// streamed pages never accumulate (macOS F_NOCACHE; Windows FILE_FLAG_NO_BUFFERING).
         /// Leave off when the model fits in RAM and you want throughput (the cache is a free
@@ -1724,6 +1903,9 @@ async fn main() -> anyhow::Result<()> {
             spec_decode,
             spec_draft_model,
             spec_draft_tokens,
+            cghost,
+            expert_cache_mib,
+            ghost_strict_cache,
             no_open,
             deterministic,
             enable_thinking,
@@ -1745,6 +1927,17 @@ async fn main() -> anyhow::Result<()> {
                 metal_q8 && !deterministic,
             );
             apply_spec_decode_env(spec_decode, spec_draft_model, spec_draft_tokens);
+            if let Some(cghost) = cghost {
+                std::env::set_var("CAMELID_GEMMA4_GHOST_CGHOST", cghost);
+                std::env::set_var(
+                    "CAMELID_GEMMA4_GHOST_CACHE_MIB",
+                    expert_cache_mib.to_string(),
+                );
+                std::env::set_var(
+                    "CAMELID_GEMMA4_GHOST_STRICT_CACHE",
+                    ghost_strict_cache.to_string(),
+                );
+            }
             if !deterministic {
                 apply_serve_nocopy_default();
             }
@@ -1754,25 +1947,20 @@ async fn main() -> anyhow::Result<()> {
             // Seed the runtime GPU switches from --gpu / CAMELID_GPU before any model
             // load, for headless/agent runs with no Settings UI to click. `auto` (default)
             // leaves the atomics uninitialised so they lazy-seed exactly as today
-            // (gpu_accel from is_available(), hybrid Q8 from CAMELID_CUDA_Q8). `on`/`off`
-            // are authoritative at startup and override the env seed; the UI
+            // (master acceleration from CUDA-or-Metal capability, CUDA hybrid Q8 from
+            // CAMELID_CUDA_Q8). `on`/`off` are authoritative at startup and override the env seed; the UI
             // `POST /api/runtime/gpu` can still flip state live afterwards. Deterministic
             // mode and CAMELID_CUDA_RESIDENT_DECODE=0 still force the GPU off at their own
             // call sites regardless of this seed.
-            match gpu {
-                GpuMode::Auto => {}
-                GpuMode::On => {
-                    camelid::cuda::set_gpu_accel_enabled(true);
-                    camelid::cuda::set_runtime_enabled(true);
-                }
-                GpuMode::Off => {
-                    camelid::cuda::set_gpu_accel_enabled(false);
-                    camelid::cuda::set_runtime_enabled(false);
-                }
+            if let Some(enabled) = resolved_gpu_switch(gpu, deterministic) {
+                camelid::cuda::set_gpu_accel_enabled(enabled);
+                camelid::cuda::set_runtime_enabled(enabled);
             }
+            let gpu_info = camelid::cuda::gpu_acceleration_info();
             tracing::info!(
                 gpu_mode = ?gpu,
-                cuda_available = camelid::cuda::is_available(),
+                gpu_backend = gpu_info.backend,
+                gpu_available = gpu_info.available,
                 gpu_enabled = camelid::cuda::gpu_accel_enabled(),
                 "camelid gpu mode resolved"
             );
@@ -3108,6 +3296,7 @@ async fn main() -> anyhow::Result<()> {
             read_ahead,
             spec,
             draft_len,
+            expert_cache_mib,
             evict_page_cache,
         } => {
             run_ghost(
@@ -3121,6 +3310,7 @@ async fn main() -> anyhow::Result<()> {
                 read_ahead,
                 spec,
                 draft_len,
+                expert_cache_mib,
                 evict_page_cache,
             )?;
         }
@@ -3488,6 +3678,7 @@ fn run_ghost(
     read_ahead: usize,
     spec: bool,
     draft_len: usize,
+    expert_cache_mib: usize,
     evict_page_cache: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -3499,8 +3690,25 @@ fn run_ghost(
 
     println!("[ghost] loading GGUF metadata from {:?}...", model);
     let gguf = read_metadata(&model)?;
-    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+    if config.gemma4.is_some() && config.moe.is_some() {
+        anyhow::ensure!(
+            !stage_split && !spec,
+            "Ghost-MoE does not yet support --stage-split or --spec; routed experts are fetched after each layer's router decision"
+        );
+        return run_ghost_moe(
+            &model,
+            &cghost,
+            &prompt,
+            max_tokens,
+            expert_cache_mib,
+            // Buffered reads are the throughput default. Callers that need the
+            // strictest physical-memory accounting opt into F_NOCACHE explicitly
+            // with --evict-page-cache, matching the serve lane's policy.
+            evict_page_cache,
+        );
+    }
+    ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::CpuDenseOnly)?;
     let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&model, &gguf);
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
@@ -3657,6 +3865,72 @@ fn run_ghost(
         gib(phys_footprint_bytes()),
         gib(peak_rss_bytes()),
     );
+    Ok(())
+}
+
+fn run_ghost_moe(
+    model: &std::path::Path,
+    cghost: &std::path::Path,
+    prompt: &str,
+    max_tokens: usize,
+    expert_cache_mib: usize,
+    evict_page_cache: bool,
+) -> anyhow::Result<()> {
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let loaded = Instant::now();
+    let runtime = camelid::gemma4_runtime::Gemma4Runtime::load_ghost_moe(
+        model,
+        cghost,
+        expert_cache_mib,
+        evict_page_cache,
+    )?;
+    println!(
+        "[ghost-moe] shared Gemma 4 core loaded in {:.1}s; host expert cache {} MiB; {} expert reads; footprint {:.2} GiB",
+        loaded.elapsed().as_secs_f64(),
+        expert_cache_mib,
+        if evict_page_cache {
+            "strict no-page-cache"
+        } else {
+            "buffered page-cache"
+        },
+        gib(phys_footprint_bytes())
+    );
+    let started = Instant::now();
+    let (text, ids) = runtime.generate_greedy_streaming(prompt, max_tokens, |delta| {
+        print!("{delta}");
+        let _ = std::io::stdout().flush();
+    })?;
+    println!();
+    let secs = started.elapsed().as_secs_f64();
+    let stats = runtime.ghost_moe_cache_stats().unwrap_or_default();
+    let lookups = stats.hits + stats.misses;
+    let hit_rate = if lookups == 0 {
+        0.0
+    } else {
+        100.0 * stats.hits as f64 / lookups as f64
+    };
+    println!(
+        "[ghost-moe] {} tokens in {:.1}s = {:.2} tok/s; host cache {} hits / {} misses ({:.1}%), {} evictions, {:.2} GiB host-cache read",
+        ids.len(),
+        secs,
+        ids.len() as f64 / secs.max(f64::EPSILON),
+        stats.hits,
+        stats.misses,
+        hit_rate,
+        stats.evictions,
+        gib(stats.bytes_read)
+    );
+    println!(
+        "[ghost-moe] host cache resident: {} experts, {:.1}/{:.1} MiB; final footprint {:.2} GiB, peak RSS {:.2} GiB; token_ids={ids:?}",
+        stats.resident_experts,
+        stats.resident_bytes as f64 / (1024.0 * 1024.0),
+        stats.budget_bytes as f64 / (1024.0 * 1024.0),
+        gib(phys_footprint_bytes()),
+        gib(peak_rss_bytes())
+    );
+    // Keep the returned final string live through diagnostics so the optimizer
+    // cannot elide detokenization in benchmark builds.
+    let _ = text;
     Ok(())
 }
 
@@ -6209,9 +6483,16 @@ fn apply_deterministic_mode() {
         "CAMELID_HYBRID_Q8_RETAINED",
         "CAMELID_METAL_NOCOPY",
         "CAMELID_METAL_KQUANT",
+        "CAMELID_GEMMA4_GHOST_METAL_HEAD",
+        "CAMELID_GEMMA4_GHOST_METAL_SLOTS",
+        "CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST",
+        "CAMELID_GEMMA4_GHOST_METAL_COMMON",
+        "CAMELID_GEMMA4_GHOST_METAL",
     ] {
         std::env::set_var(key, "0");
     }
+    camelid::cuda::set_gpu_accel_enabled(false);
+    camelid::cuda::set_runtime_enabled(false);
     std::env::set_var("CAMELID_METAL_KV_DTYPE", "f32");
     std::env::set_var("CAMELID_NO_GPU_SAMPLE", "1");
     eprintln!(

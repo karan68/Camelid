@@ -46,6 +46,28 @@ struct MetalLinearKernel {
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
     quantize_q8k_rows_pipeline: ComputePipelineState,
+    /// Ordered Q4_0 x Q8_0 row dot used by disk-paged Gemma 4 experts. Unlike
+    /// the resident f32-activation Q4 kernel, this preserves the CPU Ghost-MoE
+    /// comparator's per-block integer dot and left-to-right f32 accumulation.
+    q4_0_q8_ordered_pipeline: ComputePipelineState,
+    /// Fused-fast sibling of `q4_0_q8_ordered_pipeline`: one 32-lane SIMD group
+    /// cooperatively reads one contiguous output row, while lane zero retains
+    /// the exact increasing-block f32 fold. Optional so a device/pipeline
+    /// admission miss falls back to the scalar ordered kernel.
+    q4_0_q8_ordered_simd_pipeline: Option<ComputePipelineState>,
+    /// Fixed-geometry Gemma 4 26B routed-expert lane. These three strict
+    /// pipelines consume caller-owned, persistent expert slot slabs: no weight
+    /// buffer is allocated or copied on the token hot path.
+    gemma4_q4_expert_gate_up_geglu_pipeline: ComputePipelineState,
+    gemma4_q4_expert_gate_up_geglu_simd_pipeline: Option<ComputePipelineState>,
+    gemma4_q4_expert_gate_up_split_pipeline: ComputePipelineState,
+    gemma4_q4_expert_quantize_pipeline: ComputePipelineState,
+    gemma4_q4_expert_down_reduce_pipeline: ComputePipelineState,
+    gemma4_q4_expert_down_reduce_simd_pipeline: Option<ComputePipelineState>,
+    /// Fast-math-disabled Q6_K x Q8_K tied-head GEMV. Integer work may be
+    /// partitioned across a SIMD group, but its f32 tail is the CPU oracle's
+    /// eight lane accumulators followed by a sequential lane fold.
+    q6k_linear_ordered_pipeline: ComputePipelineState,
     q4k_linear_simd_pipeline: ComputePipelineState,
     q6k_linear_simd_pipeline: ComputePipelineState,
     q4k_linear_tiled_pipeline: ComputePipelineState,
@@ -61,6 +83,7 @@ struct MetalLinearKernel {
     rms_norm_pipeline: ComputePipelineState,
     rms_norm_per_head_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
+    multiply_pipeline: ComputePipelineState,
     dense_f16_linear_pipeline: ComputePipelineState,
     dense_f32_linear_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
@@ -2361,6 +2384,489 @@ kernel void quantize_q8k_rows_strict(
             char(min(nearest_int_q8k_strict(iscale * input[base + i]), 127));
     }
 }
+
+// Gemma 4 Ghost-MoE expert GEMM, parity-first form. One GPU thread owns one
+// (token, output-row), performs the exact integer nibble x i8 dot for each
+// Q4_0/Q8_0 block, then accumulates block terms in increasing block order.
+// The shader library has fast math disabled, making the multiply chain and
+// sequential f32 accumulation match q4_0_wire_row_dot_scalar. Parallelism is
+// across the thousands of expert output rows (and prompt tokens), not within a
+// row; that is enough occupancy while retaining the comparator contract.
+kernel void q4_0_q8_ordered_rows(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& tokens [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const ulong total_rows = ulong(rows) * ulong(tokens);
+    if (ulong(gid) >= total_rows) return;
+    const uint token = gid / rows;
+    const uint row = gid - token * rows;
+    const ulong input_block0 = ulong(token) * blocks_per_row;
+    const ulong input_quant0 = input_block0 * 32ul;
+    const ulong weight_block0 = ulong(row) * blocks_per_row;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        device const uchar* block = weight_bytes + (weight_block0 + b) * 18ul;
+        const float weight_scale = float(*reinterpret_cast<device const half*>(block));
+        device const char* x = input_quants + input_quant0 + ulong(b) * 32ul;
+        int isum = 0;
+        for (uint j = 0; j < 16; ++j) {
+            const uint packed = uint(block[2 + j]);
+            const int lo = int(packed & 0x0fu) - 8;
+            const int hi = int(packed >> 4) - 8;
+            isum += lo * int(x[j]);
+            isum += hi * int(x[j + 16]);
+        }
+        const float term = float(isum) * weight_scale * input_scales[input_block0 + b];
+        acc = acc + term;
+    }
+    output[ulong(token) * rows + row] = acc;
+}
+
+// Fused-fast ordered Q4_0/Q8_0 row dot. One 32-lane SIMD group owns one
+// (token, output-row). Lanes fetch consecutive 18-byte weight blocks, making
+// the dominant weight traffic contiguous across the SIMD group. Each lane
+// computes one complete block's associative integer dot and exact two-step f32
+// term. Lane zero then replays those terms in increasing block order, retaining
+// the scalar comparator's load-bearing f32 left fold bit-for-bit.
+kernel void q4_0_q8_ordered_rows_simd(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& tokens [[buffer(6)]],
+    threadgroup float* block_terms [[threadgroup(0)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const ulong total_rows = ulong(rows) * ulong(tokens);
+    if (ulong(group) >= total_rows) return;
+    const uint token = group / rows;
+    const uint row = group - token * rows;
+    const ulong input_block0 = ulong(token) * blocks_per_row;
+    const ulong input_quant0 = input_block0 * 32ul;
+    const ulong weight_block0 = ulong(row) * blocks_per_row;
+
+    for (uint b = lane; b < blocks_per_row; b += 32u) {
+        device const uchar* block = weight_bytes + (weight_block0 + b) * 18ul;
+        const float weight_scale = float(*reinterpret_cast<device const half*>(block));
+        device const char* x = input_quants + input_quant0 + ulong(b) * 32ul;
+        int isum = 0;
+        for (uint j = 0; j < 16; ++j) {
+            const uint packed = uint(block[2 + j]);
+            const int lo = int(packed & 0x0fu) - 8;
+            const int hi = int(packed >> 4) - 8;
+            isum += lo * int(x[j]);
+            isum += hi * int(x[j + 16]);
+        }
+        block_terms[b] =
+            (float(isum) * weight_scale) * input_scales[input_block0 + b];
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float acc = 0.0f;
+        for (uint b = 0; b < blocks_per_row; ++b) {
+            acc = acc + block_terms[b];
+        }
+        output[ulong(token) * rows + row] = acc;
+    }
+}
+
+// Production Ghost-MoE geometry for Gemma 4 26B. The .cghost v2 record stores
+// gate||up first, then down. Each mutable slot starts on a 16 KiB boundary so a
+// positioned file read can target Metal-visible shared memory directly; padding
+// after the record is never read by a kernel.
+#define G4Q4_HIDDEN 2816u
+#define G4Q4_FF 704u
+#define G4Q4_ROUTES 8u
+#define G4Q4_GU_BLOCKS 88u
+#define G4Q4_DOWN_BLOCKS 22u
+#define G4Q4_WIRE 18ul
+#define G4Q4_GU_ROW_BYTES 1584ul
+#define G4Q4_DOWN_ROW_BYTES 396ul
+#define G4Q4_GATE_UP_BYTES 2230272ul
+#define G4Q4_RECORD_BYTES 3345408ul
+#define G4Q4_SLOT_STRIDE 3358720ul
+
+// The load-bearing comparator operation shared by all three expert stages.
+// `STRICT_Q8K_SHADER` is compiled with fast math disabled, so this remains the
+// CPU oracle's `(isum as f32 * weight_scale) * input_scale`, accumulated over
+// blocks from low to high without reassociation or contraction.
+inline float gemma4_q4_expert_row_dot(
+    device const uchar* weight_row,
+    device const float* input_scales,
+    device const char* input_quants,
+    uint blocks
+) {
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks; ++b) {
+        device const uchar* block = weight_row + ulong(b) * G4Q4_WIRE;
+        const float weight_scale =
+            float(*reinterpret_cast<device const half*>(block));
+        device const char* x = input_quants + ulong(b) * 32ul;
+        int isum = 0;
+        for (uint j = 0; j < 16; ++j) {
+            const uint packed = uint(block[2 + j]);
+            const int lo = int(packed & 0x0fu) - 8;
+            const int hi = int(packed >> 4) - 8;
+            isum += lo * int(x[j]);
+            isum += hi * int(x[j + 16]);
+        }
+        const float term =
+            (float(isum) * weight_scale) * input_scales[b];
+        acc = acc + term;
+    }
+    return acc;
+}
+
+// One complete block term for the cooperative expert graph. Keeping the
+// integer dot inside a lane preserves associativity while the caller decides
+// where the ordered f32 fold occurs.
+inline float gemma4_q4_expert_block_term_simd(
+    device const uchar* weight_row,
+    device const float* input_scales,
+    device const char* input_quants,
+    uint b
+) {
+    device const uchar* block = weight_row + ulong(b) * G4Q4_WIRE;
+    const float weight_scale =
+        float(*reinterpret_cast<device const half*>(block));
+    device const char* x = input_quants + ulong(b) * 32ul;
+    int isum = 0;
+    for (uint j = 0; j < 16; ++j) {
+        const uint packed = uint(block[2 + j]);
+        const int lo = int(packed & 0x0fu) - 8;
+        const int hi = int(packed >> 4) - 8;
+        isum += lo * int(x[j]);
+        isum += hi * int(x[j + 16]);
+    }
+    return (float(isum) * weight_scale) * input_scales[b];
+}
+
+// Parity boundary: the same ordered gate/up projections as the fused lane, but
+// materialized separately so Rust's scalar tanhf and established CPU Q8_0
+// quantizer can own the only cross-backend-nonidentical operation. This is the
+// default-safe validation path; the fully fused kernel below is the speed lane.
+kernel void gemma4_q4_expert_gate_up_split(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* slot_slab [[buffer(2)]],
+    device const uint* route_slots [[buffer(3)]],
+    device float* gate_up [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint total = G4Q4_ROUTES * G4Q4_FF;
+    if (gid >= total) return;
+    const uint route = gid / G4Q4_FF;
+    const uint row = gid - route * G4Q4_FF;
+    const ulong slot_base = ulong(route_slots[route]) * G4Q4_SLOT_STRIDE;
+    device const uchar* gate_row =
+        slot_slab + slot_base + ulong(row) * G4Q4_GU_ROW_BYTES;
+    device const uchar* up_row = slot_slab + slot_base
+        + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
+    const uint output_base = route * (2u * G4Q4_FF);
+    gate_up[output_base + row] = gemma4_q4_expert_row_dot(
+        gate_row, input_scales, input_quants, G4Q4_GU_BLOCKS);
+    gate_up[output_base + G4Q4_FF + row] = gemma4_q4_expert_row_dot(
+        up_row, input_scales, input_quants, G4Q4_GU_BLOCKS);
+}
+
+// Dispatch 1/3: every thread owns one (route, FF channel), evaluates BOTH
+// adjacent gate/up rows from the selected persistent slot, and writes GeGLU.
+// This removes one full activation launch and ensures each selected expert's
+// gate and up projection share the same input/scales while remaining ordered.
+kernel void gemma4_q4_expert_gate_up_geglu(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* slot_slab [[buffer(2)]],
+    device const uint* route_slots [[buffer(3)]],
+    device float* activated [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint total = G4Q4_ROUTES * G4Q4_FF;
+    if (gid >= total) return;
+    const uint route = gid / G4Q4_FF;
+    const uint row = gid - route * G4Q4_FF;
+    const ulong slot_base = ulong(route_slots[route]) * G4Q4_SLOT_STRIDE;
+    device const uchar* gate_row =
+        slot_slab + slot_base + ulong(row) * G4Q4_GU_ROW_BYTES;
+    device const uchar* up_row = slot_slab + slot_base
+        + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
+    const float gate = gemma4_q4_expert_row_dot(
+        gate_row, input_scales, input_quants, G4Q4_GU_BLOCKS);
+    const float up = gemma4_q4_expert_row_dot(
+        up_row, input_scales, input_quants, G4Q4_GU_BLOCKS);
+    const float inner =
+        0.7978845608f * (gate + 0.044715f * gate * gate * gate);
+    // CPU libm tanh saturates here. Clamping prevents Metal's exp-based tanh
+    // implementation from producing inf/inf for extreme, otherwise-valid rows.
+    const float gelu =
+        0.5f * gate * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+    activated[gid] = gelu * up;
+}
+
+// Fused-fast SIMDgroup variant. Gate and up use disjoint 88-term scratch
+// regions, so both can be staged before a single barrier. Lane zero then
+// performs their independent increasing-block folds and the GeGLU/write. The
+// scalar kernel above remains the fallback and parity reference.
+kernel void gemma4_q4_expert_gate_up_geglu_simd(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* slot_slab [[buffer(2)]],
+    device const uint* route_slots [[buffer(3)]],
+    device float* activated [[buffer(4)]],
+    threadgroup float* block_terms [[threadgroup(0)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint total = G4Q4_ROUTES * G4Q4_FF;
+    if (gid >= total) return;
+    const uint route = gid / G4Q4_FF;
+    const uint row = gid - route * G4Q4_FF;
+    const ulong slot_base = ulong(route_slots[route]) * G4Q4_SLOT_STRIDE;
+    device const uchar* gate_row =
+        slot_slab + slot_base + ulong(row) * G4Q4_GU_ROW_BYTES;
+    device const uchar* up_row = slot_slab + slot_base
+        + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
+    for (uint b = lane; b < G4Q4_GU_BLOCKS; b += 32u) {
+        block_terms[b] = gemma4_q4_expert_block_term_simd(
+            gate_row, input_scales, input_quants, b);
+        block_terms[G4Q4_GU_BLOCKS + b] =
+            gemma4_q4_expert_block_term_simd(
+                up_row, input_scales, input_quants, b);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint b = 0; b < G4Q4_GU_BLOCKS; ++b) {
+            gate = gate + block_terms[b];
+        }
+        for (uint b = 0; b < G4Q4_GU_BLOCKS; ++b) {
+            up = up + block_terms[G4Q4_GU_BLOCKS + b];
+        }
+        const float inner =
+            0.7978845608f * (gate + 0.044715f * gate * gate * gate);
+        const float gelu =
+            0.5f * gate * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+        activated[gid] = gelu * up;
+    }
+}
+
+// Dispatch 2/3: quantize all eight GeGLU rows in parallel. One thread owns one
+// 32-value block, retaining the CPU Q8_0 contract: unrounded max/127 controls
+// integer codes, while the separately stored scale is rounded through f16.
+kernel void gemma4_q4_expert_quantize_geglu(
+    device const float* activated [[buffer(0)]],
+    device float* output_scales [[buffer(1)]],
+    device char* output_quants [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint total = G4Q4_ROUTES * G4Q4_DOWN_BLOCKS;
+    if (gid >= total) return;
+    const uint route = gid / G4Q4_DOWN_BLOCKS;
+    const uint block = gid - route * G4Q4_DOWN_BLOCKS;
+    const uint base = route * G4Q4_FF + block * 32u;
+    float max_abs = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+        max_abs = max(max_abs, fabs(activated[base + i]));
+    }
+    const float unrounded = max_abs / 127.0f;
+    const float stored = float(half(unrounded));
+    const float inverse = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+    output_scales[gid] = stored;
+    for (uint i = 0; i < 32; ++i) {
+        int q = int(round(activated[base + i] * inverse));
+        q = clamp(q, -127, 127);
+        output_quants[base + i] = char(q);
+    }
+}
+
+// Dispatch 3/3: one thread owns one hidden output row. It performs all eight
+// down projections and folds their weighted values in router-rank order. This
+// is the CPU path's deterministic `moe_acc += y * scale` shape, but without
+// materializing eight 2816-value outputs or issuing eight tiny GPU launches.
+kernel void gemma4_q4_expert_down_reduce(
+    device const float* activation_scales [[buffer(0)]],
+    device const char* activation_quants [[buffer(1)]],
+    device const uchar* slot_slab [[buffer(2)]],
+    device const uint* route_slots [[buffer(3)]],
+    device const float* route_scales [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= G4Q4_HIDDEN) return;
+    float total = 0.0f;
+    for (uint route = 0; route < G4Q4_ROUTES; ++route) {
+        const ulong slot_base = ulong(route_slots[route]) * G4Q4_SLOT_STRIDE;
+        device const uchar* down_row = slot_slab + slot_base
+            + G4Q4_GATE_UP_BYTES + ulong(row) * G4Q4_DOWN_ROW_BYTES;
+        const float y = gemma4_q4_expert_row_dot(
+            down_row,
+            activation_scales + route * G4Q4_DOWN_BLOCKS,
+            activation_quants + route * G4Q4_FF,
+            G4Q4_DOWN_BLOCKS);
+        const float weighted = y * route_scales[route];
+        total = total + weighted;
+    }
+    output[row] = total;
+}
+
+// Fused-fast cooperative down/reduce. The eight routed rows remain serialized
+// in router-rank order, and lane zero preserves both each row's increasing-block
+// f32 fold and the outer `total += y * route_scale` fold.
+kernel void gemma4_q4_expert_down_reduce_simd(
+    device const float* activation_scales [[buffer(0)]],
+    device const char* activation_quants [[buffer(1)]],
+    device const uchar* slot_slab [[buffer(2)]],
+    device const uint* route_slots [[buffer(3)]],
+    device const float* route_scales [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    threadgroup float* block_terms [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (row >= G4Q4_HIDDEN) return;
+    const uint terms = G4Q4_ROUTES * G4Q4_DOWN_BLOCKS;
+    for (uint flat = lane; flat < terms; flat += 32u) {
+        const uint route = flat / G4Q4_DOWN_BLOCKS;
+        const uint b = flat - route * G4Q4_DOWN_BLOCKS;
+        const ulong slot_base = ulong(route_slots[route]) * G4Q4_SLOT_STRIDE;
+        device const uchar* down_row = slot_slab + slot_base
+            + G4Q4_GATE_UP_BYTES + ulong(row) * G4Q4_DOWN_ROW_BYTES;
+        device const uchar* block = down_row + ulong(b) * G4Q4_WIRE;
+        const float weight_scale =
+            float(*reinterpret_cast<device const half*>(block));
+        device const char* x = activation_quants
+            + route * G4Q4_FF + b * 32u;
+        int isum = 0;
+        for (uint j = 0; j < 16; ++j) {
+            const uint packed = uint(block[2 + j]);
+            const int lo = int(packed & 0x0fu) - 8;
+            const int hi = int(packed >> 4) - 8;
+            isum += lo * int(x[j]);
+            isum += hi * int(x[j + 16]);
+        }
+        block_terms[flat] = (float(isum) * weight_scale)
+            * activation_scales[route * G4Q4_DOWN_BLOCKS + b];
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float total = 0.0f;
+        for (uint route = 0; route < G4Q4_ROUTES; ++route) {
+            float y = 0.0f;
+            for (uint b = 0; b < G4Q4_DOWN_BLOCKS; ++b) {
+                y = y + block_terms[route * G4Q4_DOWN_BLOCKS + b];
+            }
+            const float weighted = y * route_scales[route];
+            total = total + weighted;
+        }
+        output[row] = total;
+    }
+}
+
+inline int q6k_code_ordered(device const uchar* block, uint index) {
+    const uint h = index >> 7;
+    const uint p = index & 127u;
+    const uint l = p & 31u;
+    const uint qlb = h * 64;
+    const uint qhb = 128 + h * 32;
+    if (p < 32) {
+        return int((block[qlb + l] & 0x0f) | ((block[qhb + l] & 3) << 4)) - 32;
+    }
+    if (p < 64) {
+        return int((block[qlb + 32 + l] & 0x0f)
+            | (((block[qhb + l] >> 2) & 3) << 4)) - 32;
+    }
+    if (p < 96) {
+        return int((block[qlb + l] >> 4)
+            | (((block[qhb + l] >> 4) & 3) << 4)) - 32;
+    }
+    return int((block[qlb + 32 + l] >> 4)
+        | (((block[qhb + l] >> 6) & 3) << 4)) - 32;
+}
+
+// Strict Q6_K x Q8_K decode GEMV. Four SIMD lanes build each superblock's
+// associative integer aux32[8], then lane zero replays q6_k_wire_row_dot's
+// load-bearing f32 shape: sums[l] += d*aux[l] in increasing superblock order,
+// followed by a left-to-right fold of the eight sums. This source is compiled
+// with fast math OFF so those multiply/add boundaries cannot be reassociated.
+kernel void q6k_linear_ordered(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    threadgroup int* scratch [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (row >= rows) return;
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint quarter = u & 3u;
+        int aux[8] = {0,0,0,0,0,0,0,0};
+        if (active) {
+            device const uchar* block = weight_blocks + (ulong(row) * n_sb + sb) * 210ul;
+            device const char* y = input_quants + sb * 256;
+            const uint h = quarter >> 1;
+            const uint s = quarter & 1u;
+            const uint base = h * 128 + s * 16;
+            device const char* scales = reinterpret_cast<device const char*>(block + 192);
+            const int s0 = int(scales[8 * h + s]);
+            const int s1 = int(scales[8 * h + s + 2]);
+            const int s2 = int(scales[8 * h + s + 4]);
+            const int s3 = int(scales[8 * h + s + 6]);
+            for (uint l = 0; l < 16; ++l) {
+                const uint al = l & 7u;
+                aux[al] += s0 * int(y[base + l])
+                    * q6k_code_ordered(block, base + l);
+                aux[al] += s1 * int(y[base + l + 32])
+                    * q6k_code_ordered(block, base + l + 32);
+                aux[al] += s2 * int(y[base + l + 64])
+                    * q6k_code_ordered(block, base + l + 64);
+                aux[al] += s3 * int(y[base + l + 96])
+                    * q6k_code_ordered(block, base + l + 96);
+            }
+        }
+        for (uint off = 2; off >= 1; off >>= 1) {
+            for (uint l = 0; l < 8; ++l) {
+                aux[l] += simd_shuffle_down(aux[l], off);
+            }
+        }
+        if (active && quarter == 0) {
+            for (uint l = 0; l < 8; ++l) scratch[sb * 8 + l] = aux[l];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        for (uint sb = 0; sb < n_sb; ++sb) {
+            device const uchar* block = weight_blocks + (ulong(row) * n_sb + sb) * 210ul;
+            const float weight_scale =
+                float(*reinterpret_cast<device const half*>(block + 208));
+            const float d = weight_scale * input_scales[sb];
+            for (uint l = 0; l < 8; ++l) {
+                const float term = d * float(scratch[sb * 8 + l]);
+                sums[l] = sums[l] + term;
+            }
+        }
+        float acc = 0.0f;
+        for (uint l = 0; l < 8; ++l) acc = acc + sums[l];
+        output[row] = acc;
+    }
+}
 "#;
 
 // Elementwise / norm building blocks for a GPU-resident forward pass. Each mirrors
@@ -2410,6 +2916,17 @@ kernel void residual_add_f32(
 ) {
     if (gid >= n) return;
     output[gid] = a[gid] + b[gid];
+}
+
+kernel void multiply_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    output[gid] = a[gid] * b[gid];
 }
 
 // Dense row-major projection for vision-tower F16/F32 weights. One SIMD group owns
@@ -6158,6 +6675,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let residual_add_pipeline = device
                 .new_compute_pipeline_state_with_function(&residual_add_function)
                 .ok()?;
+            let multiply_function = elementwise_library
+                .get_function("multiply_f32", None)
+                .ok()?;
+            let multiply_pipeline = device
+                .new_compute_pipeline_state_with_function(&multiply_function)
+                .ok()?;
             let dense_f16_linear_function = elementwise_library
                 .get_function("dense_f16_linear_f32", None)
                 .ok()?;
@@ -6639,6 +7162,66 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let quantize_q8k_rows_pipeline = device
                 .new_compute_pipeline_state_with_function(&quantize_q8k_rows_function)
                 .ok()?;
+            let q4_0_q8_ordered_function = strict_q8k_library
+                .get_function("q4_0_q8_ordered_rows", None)
+                .ok()?;
+            let q4_0_q8_ordered_pipeline = device
+                .new_compute_pipeline_state_with_function(&q4_0_q8_ordered_function)
+                .ok()?;
+            let q4_0_q8_ordered_simd_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_ordered_rows_simd", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let gemma4_q4_expert_gate_up_geglu_function = strict_q8k_library
+                .get_function("gemma4_q4_expert_gate_up_geglu", None)
+                .ok()?;
+            let gemma4_q4_expert_gate_up_geglu_pipeline = device
+                .new_compute_pipeline_state_with_function(&gemma4_q4_expert_gate_up_geglu_function)
+                .ok()?;
+            let gemma4_q4_expert_gate_up_geglu_simd_pipeline = strict_q8k_library
+                .get_function("gemma4_q4_expert_gate_up_geglu_simd", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let gemma4_q4_expert_gate_up_split_function = strict_q8k_library
+                .get_function("gemma4_q4_expert_gate_up_split", None)
+                .ok()?;
+            let gemma4_q4_expert_gate_up_split_pipeline = device
+                .new_compute_pipeline_state_with_function(&gemma4_q4_expert_gate_up_split_function)
+                .ok()?;
+            let gemma4_q4_expert_quantize_function = strict_q8k_library
+                .get_function("gemma4_q4_expert_quantize_geglu", None)
+                .ok()?;
+            let gemma4_q4_expert_quantize_pipeline = device
+                .new_compute_pipeline_state_with_function(&gemma4_q4_expert_quantize_function)
+                .ok()?;
+            let gemma4_q4_expert_down_reduce_function = strict_q8k_library
+                .get_function("gemma4_q4_expert_down_reduce", None)
+                .ok()?;
+            let gemma4_q4_expert_down_reduce_pipeline = device
+                .new_compute_pipeline_state_with_function(&gemma4_q4_expert_down_reduce_function)
+                .ok()?;
+            let gemma4_q4_expert_down_reduce_simd_pipeline = strict_q8k_library
+                .get_function("gemma4_q4_expert_down_reduce_simd", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q6k_linear_ordered_function = strict_q8k_library
+                .get_function("q6k_linear_ordered", None)
+                .ok()?;
+            let q6k_linear_ordered_pipeline = device
+                .new_compute_pipeline_state_with_function(&q6k_linear_ordered_function)
+                .ok()?;
             let q4k_linear_simd_function = library.get_function("q4k_linear_simd", None).ok()?;
             let q4k_linear_simd_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4k_linear_simd_function)
@@ -6718,6 +7301,15 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
                 quantize_q8k_rows_pipeline,
+                q4_0_q8_ordered_pipeline,
+                q4_0_q8_ordered_simd_pipeline,
+                gemma4_q4_expert_gate_up_geglu_pipeline,
+                gemma4_q4_expert_gate_up_geglu_simd_pipeline,
+                gemma4_q4_expert_gate_up_split_pipeline,
+                gemma4_q4_expert_quantize_pipeline,
+                gemma4_q4_expert_down_reduce_pipeline,
+                gemma4_q4_expert_down_reduce_simd_pipeline,
+                q6k_linear_ordered_pipeline,
                 q4k_linear_simd_pipeline,
                 q6k_linear_simd_pipeline,
                 q4k_linear_tiled_pipeline,
@@ -6733,6 +7325,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_pipeline,
                 rms_norm_per_head_pipeline,
                 residual_add_pipeline,
+                multiply_pipeline,
                 dense_f16_linear_pipeline,
                 dense_f32_linear_pipeline,
                 silu_mul_pipeline,
@@ -7938,6 +8531,839 @@ pub fn try_gemma4_q4_0_matmul_f32y(
     Some(out)
 }
 
+/// Batched Q4_0 expert projection against CPU-quantized Q8_0 activations.
+///
+/// This is the disk-paged Ghost-MoE bridge: one selected expert's wire matrix
+/// is uploaded once, every prompt row that selected it is dispatched together,
+/// and only the f32 outputs come back. The shader keeps the CPU comparator's
+/// exact per-block integer dot and increasing-block accumulation order; it does
+/// not use the resident lane's higher-throughput f32-activation reduction.
+#[cfg(target_os = "macos")]
+pub(crate) fn try_gemma4_q4_0_matmul_q8_batch(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+) -> Option<Vec<Vec<f32>>> {
+    try_gemma4_q4_0_matmul_q8_batch_impl(inputs, weight_wire, rows, false)
+}
+
+#[cfg(target_os = "macos")]
+fn try_gemma4_q4_0_matmul_q8_batch_impl(
+    inputs: &[&[crate::tensor::Q8_0Block]],
+    weight_wire: &[u8],
+    rows: usize,
+    prefer_simd: bool,
+) -> Option<Vec<Vec<f32>>> {
+    const WIRE: usize = 18;
+    let blocks_per_row = inputs.first()?.len();
+    let tokens = inputs.len();
+    if rows == 0
+        || blocks_per_row == 0
+        || inputs.iter().any(|input| input.len() != blocks_per_row)
+        || weight_wire.len() != rows.checked_mul(blocks_per_row)?.checked_mul(WIRE)?
+        || rows.checked_mul(tokens)? > u32::MAX as usize
+        || rows > u32::MAX as usize
+        || blocks_per_row > u32::MAX as usize
+        || tokens > u32::MAX as usize
+    {
+        return None;
+    }
+
+    let mut scales = Vec::with_capacity(tokens * blocks_per_row);
+    let mut quants = Vec::with_capacity(tokens * blocks_per_row * 32);
+    for input in inputs {
+        for block in *input {
+            scales.push(block.scale);
+            quants.extend(block.quants.iter().map(|&q| q as u8));
+        }
+    }
+
+    let k = metal_linear_kernel()?;
+    let scales_buf = k.device.new_buffer(
+        std::mem::size_of_val(scales.as_slice()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let quants_buf = k
+        .device
+        .new_buffer(quants.len() as u64, MTLResourceOptions::StorageModeShared);
+    let weight_buf = k.device.new_buffer(
+        weight_wire.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let output_buf = k.device.new_buffer(
+        (rows * tokens * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let scalar_buf = k
+        .device
+        .new_buffer(12, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&scales_buf, &scales);
+    write_buffer_u8(&quants_buf, &quants);
+    write_buffer_u8(&weight_buf, weight_wire);
+    unsafe {
+        let p = scalar_buf.contents() as *mut u32;
+        *p = blocks_per_row as u32;
+        *p.add(1) = rows as u32;
+        *p.add(2) = tokens as u32;
+    }
+
+    let simd_scratch_bytes = blocks_per_row.checked_mul(std::mem::size_of::<f32>())?;
+    let simd_pipeline = (prefer_simd && threadgroup_alloc_fits(&k.device, simd_scratch_bytes))
+        .then(|| admitted_32_lane_pipeline(k.q4_0_q8_ordered_simd_pipeline.as_ref()))
+        .flatten();
+    if prefer_simd && simd_pipeline.is_none() {
+        return None;
+    }
+    let pipeline = simd_pipeline.unwrap_or(&k.q4_0_q8_ordered_pipeline);
+    let command_buffer = k.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(&scales_buf), 0);
+    encoder.set_buffer(1, Some(&quants_buf), 0);
+    encoder.set_buffer(2, Some(&weight_buf), 0);
+    encoder.set_buffer(3, Some(&output_buf), 0);
+    encoder.set_buffer(4, Some(&scalar_buf), 0);
+    encoder.set_buffer(5, Some(&scalar_buf), 4);
+    encoder.set_buffer(6, Some(&scalar_buf), 8);
+    if simd_pipeline.is_some() {
+        encoder.set_threadgroup_memory_length(0, simd_scratch_bytes as u64);
+        dispatch_one_simdgroup_per_row(encoder, rows * tokens);
+    } else {
+        dispatch_1d(encoder, pipeline, rows * tokens);
+    }
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let mut flat = vec![0.0f32; rows * tokens];
+    read_buffer_f32(&output_buf, &mut flat);
+    Some(flat.chunks_exact(rows).map(<[f32]>::to_vec).collect())
+}
+
+/// Gemma 4 26B routed-expert geometry. One `.cghost` record is the fused
+/// gate/up Q4_0 matrix followed immediately by the down Q4_0 matrix.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_Q4_EXPERT_RECORD_BYTES: usize = 3_345_408;
+#[cfg(target_os = "macos")]
+const GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT: usize = 16 * 1024;
+#[cfg(target_os = "macos")]
+const GEMMA4_Q4_EXPERT_SLOT_STRIDE: usize = 3_358_720;
+#[cfg(target_os = "macos")]
+const GEMMA4_Q4_EXPERT_HIDDEN: usize = 2_816;
+#[cfg(target_os = "macos")]
+const GEMMA4_Q4_EXPERT_FF: usize = 704;
+#[cfg(target_os = "macos")]
+const GEMMA4_Q4_EXPERT_ROUTES: usize = 8;
+#[cfg(target_os = "macos")]
+const GEMMA4_Q4_EXPERT_INPUT_BLOCKS: usize = GEMMA4_Q4_EXPERT_HIDDEN / 32;
+#[cfg(target_os = "macos")]
+const GEMMA4_Q4_EXPERT_ACT_BLOCKS: usize = GEMMA4_Q4_EXPERT_FF / 32;
+
+/// Caller-owned persistent Metal-visible routed-expert slots.
+///
+/// The storage is one `StorageModeShared` slab rather than many independent
+/// buffers, allowing a single fixed-geometry kernel to select all top-8 experts
+/// by slot ID. Every slot begins at a 16 KiB boundary. The first
+/// [`GEMMA4_Q4_EXPERT_RECORD_BYTES`] bytes are writable expert payload; the tail
+/// is padding. A cache miss can therefore issue a positioned read directly into
+/// [`Self::slot_bytes_mut`] (or parallel disjoint reads through
+/// [`Self::slab_bytes_mut`]) with no staging allocation and no GPU upload.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q4ExpertSlots {
+    slab: Buffer,
+    slot_count: usize,
+    slab_bytes: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4ExpertSlots {
+    pub(crate) fn new(slot_count: usize) -> Option<Self> {
+        if slot_count == 0 || slot_count > u32::MAX as usize {
+            return None;
+        }
+        let slab_bytes = slot_count.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?;
+        let kernel = metal_linear_kernel()?;
+        if slab_bytes > kernel.device.max_buffer_length() as usize {
+            return None;
+        }
+        let slab = kernel
+            .device
+            .new_buffer(slab_bytes as u64, MTLResourceOptions::StorageModeShared);
+        // Direct-I/O-friendly slot offsets only help when the slab base itself
+        // is aligned. Apple shared buffers are page-aligned; fail closed if a
+        // future backend/device stops honoring that property.
+        if !(slab.contents() as usize).is_multiple_of(GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT) {
+            return None;
+        }
+        Some(Self {
+            slab,
+            slot_count,
+            slab_bytes,
+        })
+    }
+
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+
+    pub(crate) const fn slot_record_bytes(&self) -> usize {
+        GEMMA4_Q4_EXPERT_RECORD_BYTES
+    }
+
+    pub(crate) const fn slot_stride_bytes(&self) -> usize {
+        GEMMA4_Q4_EXPERT_SLOT_STRIDE
+    }
+
+    /// Entire aligned slab for safe disjoint parallel fills. Callers split with
+    /// `par_chunks_mut(slot_stride_bytes())` and pass only each chunk's leading
+    /// `slot_record_bytes()` bytes to `GhostFile::read_moe_expert_into`.
+    pub(crate) fn slab_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the shared buffer owns `slab_bytes` writable bytes for at
+        // least this borrow, and `&mut self` prevents concurrent safe GPU use.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.slab.contents().cast::<u8>(), self.slab_bytes)
+        }
+    }
+
+    pub(crate) fn slot_bytes_mut(&mut self, slot: usize) -> Option<&mut [u8]> {
+        if slot >= self.slot_count {
+            return None;
+        }
+        let start = slot * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
+        // SAFETY: `start + record` lies inside the checked slab allocation;
+        // `&mut self` makes the returned expert record uniquely borrowed.
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(
+                self.slab.contents().cast::<u8>().add(start),
+                GEMMA4_Q4_EXPERT_RECORD_BYTES,
+            )
+        })
+    }
+}
+
+/// One selected expert in router-rank order. `scale` is already the CPU
+/// runtime's `down_exps_scale[e] * (prob[e] / selected_probability_sum)`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Gemma4Q4ExpertRoute {
+    pub(crate) slot: usize,
+    pub(crate) scale: f32,
+}
+
+/// Per-call evidence that the persistent expert lane remained a compact GPU
+/// graph. `streamed_weight_bytes` is the useful Q4_0 traffic (top-8 complete
+/// records), excluding tiny activation/route buffers.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gemma4Q4ExpertDiagnostics {
+    pub(crate) wall_us: u128,
+    pub(crate) gpu_us: u128,
+    pub(crate) kernel_us: u128,
+    pub(crate) command_buffers: u32,
+    pub(crate) dispatches: u32,
+    pub(crate) streamed_weight_bytes: u64,
+    pub(crate) cpu_geglu_boundary: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4ExpertDiagnostics {
+    pub(crate) fn effective_gib_per_s(self) -> f64 {
+        if self.gpu_us == 0 {
+            return 0.0;
+        }
+        self.streamed_weight_bytes as f64
+            / (1024.0 * 1024.0 * 1024.0)
+            / (self.gpu_us as f64 / 1_000_000.0)
+    }
+}
+
+/// One committed fused expert+MoE-tail graph. The command owns its Metal
+/// command-buffer reference while the resident runtime owns every bound buffer.
+/// The caller may enqueue the next layer's attention/router command behind it
+/// on the singleton queue, then drain this handle after that later command has
+/// completed. That turns this wait into bookkeeping instead of a second GPU
+/// synchronization point per layer.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q4ExpertPending {
+    command_buffer: metal::CommandBuffer,
+    started: std::time::Instant,
+    dispatches: u32,
+    streamed_weight_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4ExpertPending {
+    pub(crate) fn wait(self) -> Option<Gemma4Q4ExpertDiagnostics> {
+        self.command_buffer.wait_until_completed();
+        if self.command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&self.command_buffer);
+        let diagnostics = Gemma4Q4ExpertDiagnostics {
+            wall_us: self.started.elapsed().as_micros(),
+            gpu_us,
+            kernel_us,
+            command_buffers: 1,
+            dispatches: self.dispatches,
+            streamed_weight_bytes: self.streamed_weight_bytes,
+            cpu_geglu_boundary: false,
+        };
+        Gemma4Q4ExpertMetal::maybe_report("common-fused-async", diagnostics);
+        Some(diagnostics)
+    }
+}
+
+/// Reusable scratch and execution state for the Gemma 4 26B Q4_0 top-8 routed
+/// expert branch. This object is deliberately independent of a layer's slot
+/// slab: one engine can serve all 30 layer-local caches serially while each
+/// layer retains its own LFU/LRU contents.
+///
+/// Neither execution method allocates an `MTLBuffer` or copies expert weights.
+/// [`Self::run_q8_into`] is the three-dispatch speed lane. Because Metal and
+/// Rust tanh differ by a few ULP, [`Self::run_q8_into_parity`] exposes that one
+/// boundary to the CPU oracle while keeping both dominant Q4_0 projections on
+/// Metal. The runtime keeps both lanes opt-in until real-model greedy parity.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q4ExpertMetal {
+    input_scales: Buffer,
+    input_quants: Buffer,
+    gate_up: Buffer,
+    activated: Buffer,
+    activation_scales: Buffer,
+    activation_quants: Buffer,
+    route_slots: Buffer,
+    route_scales: Buffer,
+    output: Buffer,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4ExpertMetal {
+    pub(crate) fn new() -> Option<Self> {
+        let kernel = metal_linear_kernel()?;
+        let shared = |bytes: usize| {
+            kernel
+                .device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        };
+        Some(Self {
+            input_scales: shared(GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>()),
+            input_quants: shared(GEMMA4_Q4_EXPERT_HIDDEN),
+            gate_up: shared(
+                GEMMA4_Q4_EXPERT_ROUTES * 2 * GEMMA4_Q4_EXPERT_FF * std::mem::size_of::<f32>(),
+            ),
+            activated: shared(
+                GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF * std::mem::size_of::<f32>(),
+            ),
+            activation_scales: shared(
+                GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS * std::mem::size_of::<f32>(),
+            ),
+            activation_quants: shared(GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF),
+            route_slots: shared(GEMMA4_Q4_EXPERT_ROUTES * std::mem::size_of::<u32>()),
+            route_scales: shared(GEMMA4_Q4_EXPERT_ROUTES * std::mem::size_of::<f32>()),
+            output: shared(GEMMA4_Q4_EXPERT_HIDDEN * std::mem::size_of::<f32>()),
+        })
+    }
+
+    fn prepare_routes(
+        &mut self,
+        slots: &Gemma4Q4ExpertSlots,
+        routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
+    ) -> Option<()> {
+        if routes
+            .iter()
+            .any(|route| route.slot >= slots.slot_count || !route.scale.is_finite())
+        {
+            return None;
+        }
+        unsafe {
+            let slot_out = self.route_slots.contents().cast::<u32>();
+            let route_scale_out = self.route_scales.contents().cast::<f32>();
+            for (route_idx, route) in routes.iter().enumerate() {
+                *slot_out.add(route_idx) = route.slot as u32;
+                *route_scale_out.add(route_idx) = route.scale;
+            }
+        }
+        Some(())
+    }
+
+    fn prepare(
+        &mut self,
+        input: &[crate::tensor::Q8_0Block],
+        slots: &Gemma4Q4ExpertSlots,
+        routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
+        output: &[f32],
+    ) -> Option<()> {
+        if input.len() != GEMMA4_Q4_EXPERT_INPUT_BLOCKS
+            || output.len() != GEMMA4_Q4_EXPERT_HIDDEN
+            || input.iter().any(|block| !block.scale.is_finite())
+        {
+            return None;
+        }
+        self.prepare_routes(slots, routes)?;
+        unsafe {
+            let scale_out = self.input_scales.contents().cast::<f32>();
+            let quant_out = self.input_quants.contents().cast::<i8>();
+            for (block_idx, block) in input.iter().enumerate() {
+                *scale_out.add(block_idx) = block.scale;
+                std::ptr::copy_nonoverlapping(
+                    block.quants.as_ptr(),
+                    quant_out.add(block_idx * 32),
+                    32,
+                );
+            }
+        }
+        Some(())
+    }
+
+    fn encode_down_reduce_to(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        kernel: &MetalLinearKernel,
+        slots: &Gemma4Q4ExpertSlots,
+        output: &Buffer,
+        simd_fast: bool,
+    ) {
+        let simd_pipeline = simd_fast
+            .then(|| {
+                admitted_32_lane_pipeline(
+                    kernel.gemma4_q4_expert_down_reduce_simd_pipeline.as_ref(),
+                )
+            })
+            .flatten();
+        let pipeline = simd_pipeline.unwrap_or(&kernel.gemma4_q4_expert_down_reduce_pipeline);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&self.activation_scales), 0);
+        encoder.set_buffer(1, Some(&self.activation_quants), 0);
+        encoder.set_buffer(2, Some(&slots.slab), 0);
+        encoder.set_buffer(3, Some(&self.route_slots), 0);
+        encoder.set_buffer(4, Some(&self.route_scales), 0);
+        encoder.set_buffer(5, Some(output), 0);
+        if simd_pipeline.is_some() {
+            encoder.set_threadgroup_memory_length(
+                0,
+                (GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS * std::mem::size_of::<f32>())
+                    as u64,
+            );
+            dispatch_one_simdgroup_per_row(encoder, GEMMA4_Q4_EXPERT_HIDDEN);
+        } else {
+            dispatch_1d(encoder, pipeline, GEMMA4_Q4_EXPERT_HIDDEN);
+        }
+    }
+
+    fn encode_down_reduce(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        kernel: &MetalLinearKernel,
+        slots: &Gemma4Q4ExpertSlots,
+        simd_fast: bool,
+    ) {
+        self.encode_down_reduce_to(encoder, kernel, slots, &self.output, simd_fast);
+    }
+
+    /// Full-speed lane: fused ordered gate/up+GeGLU, Q8_0 requantization, then
+    /// ordered down+route-scale+top-8 reduction in one command buffer. There is
+    /// no allocation, weight copy, or CPU readback between these three stages.
+    pub(crate) fn run_q8_into(
+        &mut self,
+        input: &[crate::tensor::Q8_0Block],
+        slots: &Gemma4Q4ExpertSlots,
+        routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
+        output: &mut [f32],
+    ) -> Option<Gemma4Q4ExpertDiagnostics> {
+        self.run_q8_into_fused(input, slots, routes, output, true)
+    }
+
+    fn run_q8_into_fused(
+        &mut self,
+        input: &[crate::tensor::Q8_0Block],
+        slots: &Gemma4Q4ExpertSlots,
+        routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
+        output: &mut [f32],
+        prefer_simd: bool,
+    ) -> Option<Gemma4Q4ExpertDiagnostics> {
+        self.prepare(input, slots, routes, output)?;
+        let kernel = metal_linear_kernel()?;
+        let simd_fast = prefer_simd && gemma4_q4_simd_fast_available(kernel);
+        let started = std::time::Instant::now();
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        let gate_pipeline = if simd_fast {
+            kernel
+                .gemma4_q4_expert_gate_up_geglu_simd_pipeline
+                .as_ref()
+                .expect("fused SIMD Q4 admission requires gate/up pipeline")
+        } else {
+            &kernel.gemma4_q4_expert_gate_up_geglu_pipeline
+        };
+        encoder.set_compute_pipeline_state(gate_pipeline);
+        encoder.set_buffer(0, Some(&self.input_scales), 0);
+        encoder.set_buffer(1, Some(&self.input_quants), 0);
+        encoder.set_buffer(2, Some(&slots.slab), 0);
+        encoder.set_buffer(3, Some(&self.route_slots), 0);
+        encoder.set_buffer(4, Some(&self.activated), 0);
+        if simd_fast {
+            encoder.set_threadgroup_memory_length(
+                0,
+                (2 * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>()) as u64,
+            );
+            dispatch_one_simdgroup_per_row(encoder, GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF);
+        } else {
+            dispatch_1d(
+                encoder,
+                gate_pipeline,
+                GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF,
+            );
+        }
+
+        encoder.set_compute_pipeline_state(&kernel.gemma4_q4_expert_quantize_pipeline);
+        encoder.set_buffer(0, Some(&self.activated), 0);
+        encoder.set_buffer(1, Some(&self.activation_scales), 0);
+        encoder.set_buffer(2, Some(&self.activation_quants), 0);
+        dispatch_1d(
+            encoder,
+            &kernel.gemma4_q4_expert_quantize_pipeline,
+            GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
+        );
+
+        self.encode_down_reduce(encoder, kernel, slots, simd_fast);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&command_buffer.to_owned());
+        read_buffer_f32(&self.output, output);
+        let diagnostics = Gemma4Q4ExpertDiagnostics {
+            wall_us: started.elapsed().as_micros(),
+            gpu_us,
+            kernel_us,
+            command_buffers: 1,
+            dispatches: 3,
+            streamed_weight_bytes: (GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_RECORD_BYTES) as u64,
+            cpu_geglu_boundary: false,
+        };
+        Self::maybe_report(
+            if simd_fast {
+                "fused-simd"
+            } else {
+                "fused-scalar"
+            },
+            diagnostics,
+        );
+        Some(diagnostics)
+    }
+
+    /// Parity lane: ordered gate/up projections run on Metal, Rust owns GeGLU
+    /// and Q8_0 activation quantization in persistent shared scratch, then the
+    /// ordered down/reduce kernel runs on Metal. This isolates Metal-vs-Rust
+    /// tanh drift while retaining the two bandwidth-dominant GPU sweeps.
+    pub(crate) fn run_q8_into_parity(
+        &mut self,
+        input: &[crate::tensor::Q8_0Block],
+        slots: &Gemma4Q4ExpertSlots,
+        routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
+        output: &mut [f32],
+    ) -> Option<Gemma4Q4ExpertDiagnostics> {
+        self.prepare(input, slots, routes, output)?;
+        let kernel = metal_linear_kernel()?;
+        let started = std::time::Instant::now();
+
+        let gate_command = kernel.queue.new_command_buffer();
+        let gate_encoder = gate_command.new_compute_command_encoder();
+        gate_encoder.set_compute_pipeline_state(&kernel.gemma4_q4_expert_gate_up_split_pipeline);
+        gate_encoder.set_buffer(0, Some(&self.input_scales), 0);
+        gate_encoder.set_buffer(1, Some(&self.input_quants), 0);
+        gate_encoder.set_buffer(2, Some(&slots.slab), 0);
+        gate_encoder.set_buffer(3, Some(&self.route_slots), 0);
+        gate_encoder.set_buffer(4, Some(&self.gate_up), 0);
+        dispatch_1d(
+            gate_encoder,
+            &kernel.gemma4_q4_expert_gate_up_split_pipeline,
+            GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF,
+        );
+        gate_encoder.end_encoding();
+        gate_command.commit();
+        gate_command.wait_until_completed();
+        if gate_command.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        self.cpu_geglu_quantize()?;
+
+        let down_command = kernel.queue.new_command_buffer();
+        let down_encoder = down_command.new_compute_command_encoder();
+        self.encode_down_reduce(down_encoder, kernel, slots, false);
+        down_encoder.end_encoding();
+        down_command.commit();
+        down_command.wait_until_completed();
+        if down_command.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        let (gate_gpu_us, gate_kernel_us) = command_buffer_gpu_times_us(&gate_command.to_owned());
+        let (down_gpu_us, down_kernel_us) = command_buffer_gpu_times_us(&down_command.to_owned());
+        read_buffer_f32(&self.output, output);
+        let diagnostics = Gemma4Q4ExpertDiagnostics {
+            wall_us: started.elapsed().as_micros(),
+            gpu_us: gate_gpu_us + down_gpu_us,
+            kernel_us: gate_kernel_us + down_kernel_us,
+            command_buffers: 2,
+            dispatches: 2,
+            streamed_weight_bytes: (GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_RECORD_BYTES) as u64,
+            cpu_geglu_boundary: true,
+        };
+        Self::maybe_report("parity", diagnostics);
+        Some(diagnostics)
+    }
+
+    /// Device-chained expert branch for the persistent Ghost common core. The
+    /// pre-normalized Q8 input is produced by `enqueue_router`; the expert reduce
+    /// writes the common routed buffer and the exact MoE tail is appended before
+    /// the command completes. No 2,816-value activation crosses to the host.
+    pub(crate) fn run_common_with_tail(
+        &mut self,
+        common: &mut Gemma4GhostCommonMetal,
+        layer_idx: usize,
+        slots: &Gemma4Q4ExpertSlots,
+        routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
+        fused_fast: bool,
+    ) -> Option<Gemma4Q4ExpertDiagnostics> {
+        if fused_fast {
+            return self
+                .enqueue_common_with_tail(common, layer_idx, slots, routes)?
+                .wait();
+        }
+
+        self.prepare_routes(slots, routes)?;
+        let kernel = metal_linear_kernel()?;
+        let started = std::time::Instant::now();
+
+        // Parity mode keeps Rust's established GeGLU/Q8_0 boundary while the
+        // hidden/routed/tail vectors remain device-resident.
+        let gate_command = kernel.queue.new_command_buffer();
+        let gate_encoder = gate_command.new_compute_command_encoder();
+        let scratch = common.moe.as_ref()?;
+        gate_encoder.set_compute_pipeline_state(&kernel.gemma4_q4_expert_gate_up_split_pipeline);
+        gate_encoder.set_buffer(0, Some(&scratch.expert_input_scales), 0);
+        gate_encoder.set_buffer(1, Some(&scratch.expert_input_quants), 0);
+        gate_encoder.set_buffer(2, Some(&slots.slab), 0);
+        gate_encoder.set_buffer(3, Some(&self.route_slots), 0);
+        gate_encoder.set_buffer(4, Some(&self.gate_up), 0);
+        dispatch_1d(
+            gate_encoder,
+            &kernel.gemma4_q4_expert_gate_up_split_pipeline,
+            GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF,
+        );
+        gate_encoder.end_encoding();
+        gate_command.commit();
+        gate_command.wait_until_completed();
+        if gate_command.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        self.cpu_geglu_quantize()?;
+
+        let down_command = kernel.queue.new_command_buffer();
+        let down_encoder = down_command.new_compute_command_encoder();
+        self.encode_down_reduce_to(down_encoder, kernel, slots, &common.routed_output, false);
+        let tail_dispatches = common.encode_moe_tail(down_encoder, kernel, layer_idx)?;
+        down_encoder.end_encoding();
+        down_command.commit();
+        down_command.wait_until_completed();
+        if down_command.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        let (gate_gpu_us, gate_kernel_us) = command_buffer_gpu_times_us(&gate_command.to_owned());
+        let (down_gpu_us, down_kernel_us) = command_buffer_gpu_times_us(&down_command.to_owned());
+        common.promote_tail_output();
+        let diagnostics = Gemma4Q4ExpertDiagnostics {
+            wall_us: started.elapsed().as_micros(),
+            gpu_us: gate_gpu_us + down_gpu_us,
+            kernel_us: gate_kernel_us + down_kernel_us,
+            command_buffers: 2,
+            dispatches: 2 + tail_dispatches,
+            streamed_weight_bytes: (GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_RECORD_BYTES) as u64,
+            cpu_geglu_boundary: true,
+        };
+        Self::maybe_report("common-parity", diagnostics);
+        Some(diagnostics)
+    }
+
+    /// Commit the fused expert reduce and exact MoE tail without waiting. The
+    /// tail output is promoted immediately after commit: Metal command encoders
+    /// retain the old output buffer, while the next layer observes that buffer
+    /// as its hidden input. FIFO queue ordering makes the dependency explicit
+    /// without a host readback or event.
+    pub(crate) fn enqueue_common_with_tail(
+        &mut self,
+        common: &mut Gemma4GhostCommonMetal,
+        layer_idx: usize,
+        slots: &Gemma4Q4ExpertSlots,
+        routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
+    ) -> Option<Gemma4Q4ExpertPending> {
+        self.prepare_routes(slots, routes)?;
+        let kernel = metal_linear_kernel()?;
+        let started = std::time::Instant::now();
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let scratch = common.moe.as_ref()?;
+        let simd_fast = common.q4_simd_fast && gemma4_q4_simd_fast_available(kernel);
+        let gate_pipeline = if simd_fast {
+            kernel
+                .gemma4_q4_expert_gate_up_geglu_simd_pipeline
+                .as_ref()
+                .expect("fused SIMD Q4 admission requires gate/up pipeline")
+        } else {
+            &kernel.gemma4_q4_expert_gate_up_geglu_pipeline
+        };
+        encoder.set_compute_pipeline_state(gate_pipeline);
+        encoder.set_buffer(0, Some(&scratch.expert_input_scales), 0);
+        encoder.set_buffer(1, Some(&scratch.expert_input_quants), 0);
+        encoder.set_buffer(2, Some(&slots.slab), 0);
+        encoder.set_buffer(3, Some(&self.route_slots), 0);
+        encoder.set_buffer(4, Some(&self.activated), 0);
+        if simd_fast {
+            encoder.set_threadgroup_memory_length(
+                0,
+                (2 * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>()) as u64,
+            );
+            dispatch_one_simdgroup_per_row(encoder, GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF);
+        } else {
+            dispatch_1d(
+                encoder,
+                gate_pipeline,
+                GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF,
+            );
+        }
+        encoder.set_compute_pipeline_state(&kernel.gemma4_q4_expert_quantize_pipeline);
+        encoder.set_buffer(0, Some(&self.activated), 0);
+        encoder.set_buffer(1, Some(&self.activation_scales), 0);
+        encoder.set_buffer(2, Some(&self.activation_quants), 0);
+        dispatch_1d(
+            encoder,
+            &kernel.gemma4_q4_expert_quantize_pipeline,
+            GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
+        );
+        self.encode_down_reduce_to(encoder, kernel, slots, &common.routed_output, simd_fast);
+        let tail_dispatches = common.encode_moe_tail(encoder, kernel, layer_idx)?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        common.promote_tail_output();
+        Some(Gemma4Q4ExpertPending {
+            command_buffer: command_buffer.to_owned(),
+            started,
+            dispatches: 3 + tail_dispatches,
+            streamed_weight_bytes: (GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_RECORD_BYTES) as u64,
+        })
+    }
+
+    fn cpu_geglu_quantize(&mut self) -> Option<()> {
+        let gate_up = self.gate_up.contents().cast::<f32>();
+        let activated = self.activated.contents().cast::<f32>();
+        let scales = self.activation_scales.contents().cast::<f32>();
+        let quants = self.activation_quants.contents().cast::<i8>();
+        unsafe {
+            for route in 0..GEMMA4_Q4_EXPERT_ROUTES {
+                let gate_base = route * 2 * GEMMA4_Q4_EXPERT_FF;
+                let up_base = gate_base + GEMMA4_Q4_EXPERT_FF;
+                let activation_base = route * GEMMA4_Q4_EXPERT_FF;
+                for i in 0..GEMMA4_Q4_EXPERT_FF {
+                    let value = crate::inference::gemma4::gelu_tanh(*gate_up.add(gate_base + i))
+                        * *gate_up.add(up_base + i);
+                    if !value.is_finite() {
+                        return None;
+                    }
+                    *activated.add(activation_base + i) = value;
+                }
+                for block in 0..GEMMA4_Q4_EXPERT_ACT_BLOCKS {
+                    let base = activation_base + block * 32;
+                    let mut max_abs = 0.0f32;
+                    for i in 0..32 {
+                        max_abs = max_abs.max((*activated.add(base + i)).abs());
+                    }
+                    let unrounded_scale = max_abs / 127.0;
+                    let stored_scale = f16_bits_to_f32(f32_to_f16_bits(unrounded_scale));
+                    let inverse = if unrounded_scale == 0.0 {
+                        0.0
+                    } else {
+                        1.0 / unrounded_scale
+                    };
+                    *scales.add(route * GEMMA4_Q4_EXPERT_ACT_BLOCKS + block) = stored_scale;
+                    for i in 0..32 {
+                        *quants.add(base + i) = ((*activated.add(base + i) * inverse)
+                            .round()
+                            .clamp(-128.0, 127.0))
+                            as i8;
+                    }
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn maybe_report(mode: &str, diagnostics: Gemma4Q4ExpertDiagnostics) {
+        if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            eprintln!(
+                "[gemma4-ghost-metal] mode={mode} cb={} dispatches={} wall={}us gpu={}us kernel={}us weights={:.2}MiB effective={:.2}GiB/s",
+                diagnostics.command_buffers,
+                diagnostics.dispatches,
+                diagnostics.wall_us,
+                diagnostics.gpu_us,
+                diagnostics.kernel_us,
+                diagnostics.streamed_weight_bytes as f64 / (1024.0 * 1024.0),
+                diagnostics.effective_gib_per_s(),
+            );
+        }
+    }
+}
+
+/// Encode the strict single-token Q6_K x Q8_K GEMV used by Gemma 4's tied
+/// head. `scalar` carries `n_superblocks` at byte 0 and `rows` at byte 4.
+/// `weight_offset` permits a file-backed, page-aligned Metal buffer window to
+/// expose a tensor that starts after the beginning of that window.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_q6k_ordered_single(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    scalar: &Buffer,
+    n_superblocks: usize,
+    rows: usize,
+) {
+    encoder.set_compute_pipeline_state(&kernel.q6k_linear_ordered_pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(1, Some(input_quants), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
+    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_buffer(4, Some(scalar), 0);
+    encoder.set_buffer(5, Some(scalar), 4);
+    let scratch_bytes = (n_superblocks * 8 * std::mem::size_of::<i32>()).next_multiple_of(16);
+    assert_threadgroup_fits(
+        &kernel.device,
+        scratch_bytes,
+        "ordered Gemma 4 Q6_K tied-head scratch",
+    );
+    encoder.set_threadgroup_memory_length(0, scratch_bytes as u64);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// NVFP4 wire GEMV on the GPU (GABBRO M3) — the NVFP4 counterpart of
 /// [`try_gemma4_q4_0_matmul_f32y`]. `weight_wire` is `rows * blocks_per_row`
 /// 36-byte NVFP4 superblocks; `y` is `blocks_per_row * 64` f32 activations (the
@@ -8405,6 +9831,203 @@ pub fn try_gemma4_head(
     read_buffer_f32(&logits_buf, &mut out);
     drop(keep);
     Some(out)
+}
+
+/// Persistent no-copy Metal tied head for Gemma 4 QAT models whose embedding /
+/// output table is Q6_K. The 26B Ghost-MoE artifact carries a 605 MB Q6_K tied
+/// table; evaluating it on the CPU streams those bytes once per generated token.
+/// This wrapper maps the GGUF tensor's file-backed pages directly into a Metal
+/// buffer and keeps its activation/logit scratch resident. The parity-sensitive,
+/// tiny stages stay on the CPU (2.8K-element RMSNorm + Q8_K quantization before
+/// dispatch, scalar soft-cap after readback); the 605 MB ordered Q6_K GEMV runs
+/// on Metal in one command buffer and is bit-exact with the CPU row-dot oracle.
+///
+/// The mapping is retained for the lifetime of the Metal buffer. There is no
+/// anonymous 605 MB weight copy: under memory pressure these pages remain clean,
+/// file-backed, and evictable. Calls are serialized because the scratch buffers
+/// are reused in place; the serving runtime is single-request today, but keeping
+/// that invariant here prevents accidental cross-request races later.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q6KHead {
+    inner: Mutex<Gemma4Q6KHeadInner>,
+    _mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+}
+
+#[cfg(target_os = "macos")]
+struct Gemma4Q6KHeadInner {
+    weight: Buffer,
+    weight_offset: usize,
+    q8k_scales: Buffer,
+    q8k_quants: Buffer,
+    logits: Buffer,
+    matmul_scalar: Buffer,
+    output_norm: Vec<f32>,
+    eps: f32,
+    hidden: usize,
+    vocab: usize,
+    softcap: f32,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q6KHead {
+    /// Wrap one vocab-major Q6_K tensor in the existing GGUF mmap. `absolute_offset`
+    /// and `byte_len` come from its descriptor. Returns `None` on unavailable Metal,
+    /// an invalid tensor shape/range, or a device buffer-size limit smaller than the
+    /// tensor. The caller then keeps the established CPU head as a safe fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        absolute_offset: u64,
+        byte_len: usize,
+        output_norm: &[f32],
+        vocab: usize,
+        softcap: f32,
+        eps: f32,
+    ) -> Option<Self> {
+        const Q6K_VALUES: usize = 256;
+        const Q6K_WIRE: usize = 210;
+        let hidden = output_norm.len();
+        if hidden == 0
+            || vocab == 0
+            || !hidden.is_multiple_of(Q6K_VALUES)
+            || byte_len
+                != vocab
+                    .checked_mul(hidden / Q6K_VALUES)?
+                    .checked_mul(Q6K_WIRE)?
+        {
+            return None;
+        }
+
+        let kernel = metal_linear_kernel()?;
+        let tensor = crate::wire_mmap::wire_mmap_tensors(
+            &mmap,
+            &[(absolute_offset, byte_len)],
+            kernel.device.max_buffer_length() as usize,
+        )
+        .ok()?
+        .pop()?;
+        // SAFETY: `wire_mmap_tensors` returns a page-aligned window entirely
+        // inside `mmap`, which this struct retains for the buffer's lifetime.
+        let weight_ptr = unsafe { mmap.base_ptr().add(tensor.window.aligned_offset as usize) };
+        let weight = kernel.device.new_buffer_with_bytes_no_copy(
+            weight_ptr.cast(),
+            tensor.window.len as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        let shared = |bytes: usize| {
+            kernel
+                .device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let n_superblocks = hidden / Q6K_VALUES;
+        let q8k_scales = shared(n_superblocks * std::mem::size_of::<f32>());
+        let q8k_quants = shared(hidden);
+        let logits = shared(vocab * std::mem::size_of::<f32>());
+        let matmul_scalar = shared(12);
+        unsafe {
+            let m = matmul_scalar.contents() as *mut u32;
+            *m = n_superblocks as u32;
+            *m.add(1) = vocab as u32;
+            *m.add(2) = 1;
+        }
+        Some(Self {
+            inner: Mutex::new(Gemma4Q6KHeadInner {
+                weight,
+                weight_offset: tensor.window_offset,
+                q8k_scales,
+                q8k_quants,
+                logits,
+                matmul_scalar,
+                output_norm: output_norm.to_vec(),
+                eps,
+                hidden,
+                vocab,
+                softcap,
+            }),
+            _mmap: mmap,
+        })
+    }
+
+    /// Evaluate the final hidden state through the tied head. `None` is a soft
+    /// failure: callers preserve the CPU implementation as the correctness path.
+    pub(crate) fn forward(&self, hidden: &[f32]) -> Option<Vec<f32>> {
+        let state = self.inner.lock().ok()?;
+        if hidden.len() != state.hidden {
+            return None;
+        }
+        let kernel = metal_linear_kernel()?;
+        // Keep the 2.8K-element norm on the CPU: its established scalar
+        // left-fold is the Gemma 4 parity oracle, whereas a tree-reduced GPU
+        // norm can move Q8_K scales by one ULP and flip a near-tied argmax.
+        // The 605 MB Q6_K projection remains entirely on Metal.
+        let normalized =
+            crate::gemma4_runtime::rms_norm(hidden, Some(&state.output_norm), state.eps);
+        // The strict Metal quantizer reproduces every Q8_K integer code, but its
+        // reciprocal can still differ by one ULP from Rust on Apple GPUs. Upload
+        // the CPU-oracle activation instead (11 scales + 2816 bytes on the 26B
+        // row) so exact ties retain the CPU greedy choice. The 605 MB projection
+        // itself remains entirely on Metal.
+        let q8 = crate::inference::quantize_q8_k_blocks(&normalized);
+        let scales: Vec<f32> = q8.iter().map(|block| block.d).collect();
+        let mut quants = Vec::with_capacity(state.hidden);
+        for block in &q8 {
+            quants.extend_from_slice(&block.qs);
+        }
+        write_buffer_f32(&state.q8k_scales, &scales);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                quants.as_ptr(),
+                state.q8k_quants.contents().cast::<i8>(),
+                quants.len(),
+            );
+        }
+        let started = std::time::Instant::now();
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        let n_superblocks = state.hidden / 256;
+        encode_q6k_ordered_single(
+            encoder,
+            kernel,
+            &state.q8k_scales,
+            &state.q8k_quants,
+            &state.weight,
+            state.weight_offset as u64,
+            &state.logits,
+            &state.matmul_scalar,
+            n_superblocks,
+            state.vocab,
+        );
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        if cb.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+
+        if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&cb.to_owned());
+            eprintln!(
+                "[gemma4-metal-head] Q6_K vocab={} wall={}us gpu={}us kernel={}us",
+                state.vocab,
+                started.elapsed().as_micros(),
+                gpu_us,
+                kernel_us,
+            );
+        }
+        let mut output = vec![0.0f32; state.vocab];
+        read_buffer_f32(&state.logits, &mut output);
+        // Rust's scalar tanh is the established Gemma 4 oracle. Metal's tanh
+        // differs by a few ULP and can alter the lowest-index tie-break after
+        // saturation, even when the pre-cap Q6_K projection agrees. This 1 MB
+        // elementwise tail is tiny beside the 605 MB matrix sweep.
+        if state.softcap.is_finite() && state.softcap > 0.0 {
+            crate::inference::gemma4::soft_cap_in_place(&mut output, state.softcap);
+        }
+        Some(output)
+    }
 }
 
 /// A resident gemma4 model ready to decode: all weights (layers + tied `token_embd`)
@@ -9653,6 +11276,49 @@ fn dispatch_1d(
     );
 }
 
+#[cfg(target_os = "macos")]
+fn admitted_32_lane_pipeline(
+    pipeline: Option<&ComputePipelineState>,
+) -> Option<&ComputePipelineState> {
+    pipeline.filter(|pipeline| {
+        pipeline.thread_execution_width() == 32
+            && pipeline.max_total_threads_per_threadgroup() >= 32
+    })
+}
+
+/// One admission decision covers the generic common-core row dot and both
+/// fixed-geometry expert row dots. Fused-fast falls back as a unit when any
+/// optional SIMD pipeline is unavailable or the device does not expose the
+/// 32-lane execution width compiled into their indexing contract.
+#[cfg(target_os = "macos")]
+fn gemma4_q4_simd_fast_available(kernel: &MetalLinearKernel) -> bool {
+    const MAX_COMMON_BLOCKS: usize = GEMMA4_GHOST_26B_HEADS * GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM / 32;
+    threadgroup_alloc_fits(
+        &kernel.device,
+        MAX_COMMON_BLOCKS * std::mem::size_of::<f32>(),
+    ) && admitted_32_lane_pipeline(kernel.q4_0_q8_ordered_simd_pipeline.as_ref()).is_some()
+        && admitted_32_lane_pipeline(kernel.gemma4_q4_expert_gate_up_geglu_simd_pipeline.as_ref())
+            .is_some()
+        && admitted_32_lane_pipeline(kernel.gemma4_q4_expert_down_reduce_simd_pipeline.as_ref())
+            .is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_one_simdgroup_per_row(encoder: &metal::ComputeCommandEncoderRef, rows: usize) {
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Fused rms_norm + Q8_0 quantize: reads `input`, emits the quantized normed row directly
 /// into `scales`/`quants` (one dispatch, no intermediate normed buffer). `scalar` holds
 /// width (u32) then eps (f32), like `encode_rms_norm`.
@@ -10535,6 +12201,53 @@ fn encode_gemma4_q4_0_matmul(
     );
 }
 
+/// Encode one ordered Q4_0 x Q8_0 GEMV for a single activation row.
+///
+/// This is the resident-buffer sibling of
+/// [`try_gemma4_q4_0_matmul_q8_batch`]. `scalar` is three consecutive u32s:
+/// `[blocks_per_row, rows, 1]`. The strict shader keeps the CPU Gemma 4 wire
+/// comparator's integer dot and increasing-block f32 accumulation order. Ghost
+/// common-core attention and the shared expert use this path instead of the
+/// older f32-activation Q4_0 reduction.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_q4_0_q8_ordered_single(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    weight: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+    blocks_per_row: usize,
+    fused_fast: bool,
+) {
+    let simd_scratch_bytes = blocks_per_row.checked_mul(std::mem::size_of::<f32>());
+    let simd_pipeline = (fused_fast
+        && simd_scratch_bytes.is_some_and(|bytes| threadgroup_alloc_fits(&k.device, bytes)))
+    .then(|| admitted_32_lane_pipeline(k.q4_0_q8_ordered_simd_pipeline.as_ref()))
+    .flatten();
+    let pipeline = simd_pipeline.unwrap_or(&k.q4_0_q8_ordered_pipeline);
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(input_scales), 0);
+    e.set_buffer(1, Some(input_quants), 0);
+    e.set_buffer(2, Some(weight), 0);
+    e.set_buffer(3, Some(output), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    if simd_pipeline.is_some() {
+        e.set_threadgroup_memory_length(
+            0,
+            simd_scratch_bytes.expect("admitted SIMD Q4 scratch length") as u64,
+        );
+        dispatch_one_simdgroup_per_row(e, rows);
+    } else {
+        dispatch_1d(e, pipeline, rows);
+    }
+}
+
 /// Encode one f32-activation × wire-NVFP4 GEMV (GABBRO M3). Same dispatch shape as
 /// the Q8/Q4_0 paths (128 threads/TG, NR0=2 rows/TG, 2*32*4 threadgroup mem); only
 /// the bound pipeline differs — it reads 36-byte NVFP4 superblocks (64 values:
@@ -11022,6 +12735,10 @@ pub struct Gemma4ResidentLayer {
     pub head_dim: usize,
     pub ffn_dim: usize,
     pub eps: f32,
+    /// Lifecycle-owned NoCopy backing used by reloadable Ghost common cores.
+    /// The ordinary resident-model constructor still uses the process cache;
+    /// this vector is empty there.
+    _owned_wire_pages: Vec<std::sync::Arc<crate::wire_mmap::WirePages>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -11078,6 +12795,7 @@ impl Gemma4ResidentLayer {
             head_dim,
             ffn_dim,
             eps,
+            _owned_wire_pages: Vec::new(),
         })
     }
 
@@ -11132,7 +12850,1606 @@ impl Gemma4ResidentLayer {
             head_dim,
             ffn_dim,
             eps,
+            _owned_wire_pages: Vec::new(),
         })
+    }
+
+    /// Reload-safe sibling of [`Self::from_wire_pages`]. Each Metal buffer wraps
+    /// the supplied page allocation directly and this layer owns the Arcs, so
+    /// dropping a partially built or unloaded Ghost runtime releases both the
+    /// buffers and their anonymous pages instead of pinning them in the global
+    /// linear cache for the lifetime of the process.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_wire_pages_owned(
+        fmt: GemmaWireFmt,
+        attn_norm: Vec<f32>,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+        post_attn_norm: Vec<f32>,
+        ffn_norm: Vec<f32>,
+        post_ffw_norm: Vec<f32>,
+        q_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        k_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        v_pages: Option<&std::sync::Arc<crate::wire_mmap::WirePages>>,
+        o_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        gate_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        up_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        down_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        ffn_dim: usize,
+        eps: f32,
+    ) -> Option<Self> {
+        let kernel = metal_linear_kernel()?;
+        let mut owned_wire_pages = Vec::with_capacity(7);
+        let mut buffer = |pages: &std::sync::Arc<crate::wire_mmap::WirePages>| {
+            owned_wire_pages.push(std::sync::Arc::clone(pages));
+            kernel.device.new_buffer_with_bytes_no_copy(
+                pages.base_ptr().cast(),
+                pages.alloc_len() as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        };
+        let q_w = buffer(q_pages);
+        let k_w = buffer(k_pages);
+        let v_w = v_pages.map(&mut buffer);
+        let o_w = buffer(o_pages);
+        let gate_w = buffer(gate_pages);
+        let up_w = buffer(up_pages);
+        let down_w = buffer(down_pages);
+        Some(Self {
+            attn_norm,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            post_ffw_norm,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            gate_w,
+            up_w,
+            down_w,
+            fmt,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
+            _owned_wire_pages: owned_wire_pages,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Gemma 4 26B Ghost-MoE resident common core (Phase 1)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_LAYERS: usize = 30;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_HIDDEN: usize = 2_816;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_HEADS: usize = 16;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_SHARED_FF: usize = 2_112;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_SLIDING_WINDOW: usize = 1_024;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_LOCAL_HEAD_DIM: usize = 256;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_LOCAL_KV_HEADS: usize = 8;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM: usize = 512;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_GLOBAL_KV_HEADS: usize = 2;
+#[cfg(target_os = "macos")]
+const GEMMA4_GHOST_26B_GLOBAL_LAYERS: [usize; 5] = [5, 11, 17, 23, 29];
+
+/// Host-visible command-buffer stage emitted by [`Gemma4GhostCommonMetal`].
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gemma4GhostCommonStage {
+    Attention,
+    AttentionRouter,
+    Router,
+    SharedBranch,
+}
+
+/// Timing and traffic evidence for one common-core command buffer. GPU/kernel
+/// timestamps exclude any overlapped expert I/O; `wall_us` intentionally includes
+/// the time between enqueue and wait so the caller can measure that overlap too.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gemma4GhostCommonDiagnostics {
+    pub(crate) stage: Gemma4GhostCommonStage,
+    pub(crate) layer: usize,
+    pub(crate) position: usize,
+    pub(crate) encode_us: u128,
+    pub(crate) wait_us: u128,
+    pub(crate) wall_us: u128,
+    pub(crate) gpu_us: u128,
+    pub(crate) kernel_us: u128,
+    pub(crate) command_buffers: u32,
+    pub(crate) dispatches: u32,
+    pub(crate) streamed_weight_bytes: u64,
+    pub(crate) readback_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4GhostCommonDiagnostics {
+    pub(crate) fn effective_gib_per_s(self) -> f64 {
+        if self.gpu_us == 0 {
+            return 0.0;
+        }
+        self.streamed_weight_bytes as f64
+            / (1024.0 * 1024.0 * 1024.0)
+            / (self.gpu_us as f64 / 1_000_000.0)
+    }
+}
+
+/// Exact resident KV geometry and allocation footprint admitted by the 26B
+/// common-core constructor.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gemma4GhostCommonGeometry {
+    pub(crate) layers: usize,
+    pub(crate) local_layers: usize,
+    pub(crate) global_layers: usize,
+    pub(crate) max_positions: usize,
+    pub(crate) kv_elements: usize,
+    pub(crate) kv_bytes: usize,
+}
+
+/// A fail-closed host-KV import refusal. The common-core cache is left byte-for-byte
+/// untouched when this is returned: every layer and row is validated before the
+/// first shared Metal buffer is written.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Gemma4GhostKvImportError(String);
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for Gemma4GhostKvImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for Gemma4GhostKvImportError {}
+
+#[cfg(target_os = "macos")]
+struct Gemma4GhostCommonNorms {
+    attn: Buffer,
+    q: Buffer,
+    k: Buffer,
+    post_attn: Buffer,
+    ffn: Buffer,
+    post_norm_1: Buffer,
+    // These argument blocks are immutable after construction. Keeping one set
+    // per layer lets the CPU encode layer N+1 while layer N's shared command is
+    // still consuming its arguments on the serial Metal queue.
+    shared_rms_scalar: Buffer,
+    shared_gate_up_mm_scalar: Buffer,
+    shared_down_mm_scalar: Buffer,
+    shared_activation_blocks: Buffer,
+    shared_geglu_count: Buffer,
+}
+
+/// Small f32 tensors that complete one exact 26B MoE layer around the Q4 common
+/// projections. The 128 routed expert records remain disk-paged; only the
+/// router and norms are uploaded here.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4GhostMoeLayerConfig {
+    pub(crate) router: Vec<f32>,
+    pub(crate) gate_input_scale: Vec<f32>,
+    pub(crate) pre_norm_2: Vec<f32>,
+    pub(crate) post_norm_2: Vec<f32>,
+    pub(crate) layer_output_scale: f32,
+}
+
+#[cfg(target_os = "macos")]
+struct Gemma4GhostMoeLayerResident {
+    router: Buffer,
+    gate_input_scale: Buffer,
+    pre_norm_2: Buffer,
+    post_norm_2: Buffer,
+    post_ffw_norm: Buffer,
+    layer_output_scale: f32,
+    // Router and tail commands can overlap host encoding across adjacent
+    // layers. These buffers must therefore never be rewritten in the hot path.
+    rms_scalar: Buffer,
+    layer_scale_scalar: Buffer,
+}
+
+/// Persistent router/expert-input/tail scratch. Only the 128 router logits are
+/// host-visible between stages; the 2,816-value hidden and expert activation
+/// stay on-device for the entire layer chain.
+#[cfg(target_os = "macos")]
+struct Gemma4GhostMoeScratch {
+    router_inv_weight: Buffer,
+    router_normed: Buffer,
+    router_input: Buffer,
+    router_logits: Buffer,
+    expert_input_scales: Buffer,
+    expert_input_quants: Buffer,
+    routed_normed: Buffer,
+    combined: Buffer,
+    combined_normed: Buffer,
+    router_mm_scalar: Buffer,
+    hidden_count: Buffer,
+}
+
+/// Persistent scratch for the exact ordered-Q4 attention graph. It is sized for
+/// the larger global Q width (16x512) and the larger local KV width (8x256), so
+/// every layer reuses the same allocation set without touching the buffer pool.
+#[cfg(target_os = "macos")]
+struct Gemma4GhostAttentionScratch {
+    input_scales: Buffer,
+    input_quants: Buffer,
+    query: Buffer,
+    key: Buffer,
+    value: Buffer,
+    query_normed: Buffer,
+    key_normed: Buffer,
+    value_normed: Buffer,
+    scores: Buffer,
+    denom: Buffer,
+    context: Buffer,
+    context_scales: Buffer,
+    context_quants: Buffer,
+    projection: Buffer,
+    projection_normed: Buffer,
+    cos: Buffer,
+    sin: Buffer,
+    rms_scalar: Buffer,
+    q_head_scalar: Buffer,
+    k_head_scalar: Buffer,
+    v_head_scalar: Buffer,
+    q_mm_scalar: Buffer,
+    kv_mm_scalar: Buffer,
+    o_mm_scalar: Buffer,
+    context_blocks: Buffer,
+    rope_q_scalar: Buffer,
+    rope_k_scalar: Buffer,
+    attention_scalar: Buffer,
+    attention_blocks: Buffer,
+    scatter_scalar: Buffer,
+    kv16_write: Buffer,
+    hidden_count: Buffer,
+}
+
+/// Persistent scratch for `ffn_norm -> ordered Q4 gate/up -> GeGLU -> ordered
+/// Q4 down -> post_norm_1`. Its output is deliberately not residual-added.
+#[cfg(target_os = "macos")]
+struct Gemma4GhostSharedScratch {
+    input_scales: Buffer,
+    input_quants: Buffer,
+    gate: Buffer,
+    up: Buffer,
+    activation: Buffer,
+    activation_scales: Buffer,
+    activation_quants: Buffer,
+    down: Buffer,
+}
+
+/// A committed, nonblocking common-core command. The shared branch is returned
+/// in this form so routed-expert `pread` can run while Metal consumes the dense
+/// weights. Calling [`Self::wait`] is only a synchronization/diagnostic boundary;
+/// no hidden-state readback is implicit.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4GhostCommonPending {
+    command_buffer: metal::CommandBuffer,
+    stage: Gemma4GhostCommonStage,
+    layer: usize,
+    position: usize,
+    dispatches: u32,
+    streamed_weight_bytes: u64,
+    readback_bytes: u64,
+    started: std::time::Instant,
+    encode_us: u128,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4GhostCommonPending {
+    pub(crate) fn wait(self) -> Option<Gemma4GhostCommonDiagnostics> {
+        let wait_started = std::time::Instant::now();
+        self.command_buffer.wait_until_completed();
+        let wait_us = wait_started.elapsed().as_micros();
+        if self.command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&self.command_buffer);
+        let diagnostics = Gemma4GhostCommonDiagnostics {
+            stage: self.stage,
+            layer: self.layer,
+            position: self.position,
+            encode_us: self.encode_us,
+            wait_us,
+            wall_us: self.started.elapsed().as_micros(),
+            gpu_us,
+            kernel_us,
+            command_buffers: 1,
+            dispatches: self.dispatches,
+            streamed_weight_bytes: self.streamed_weight_bytes,
+            readback_bytes: self.readback_bytes,
+        };
+        if std::env::var("CAMELID_GEMMA4_GHOST_COMMON_TIMING")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            eprintln!(
+                "[gemma4-ghost-common] stage={:?} layer={} pos={} cb=1 dispatches={} encode={}us wait={}us wall={}us gpu={}us kernel={}us weights={:.2}MiB effective={:.2}GiB/s",
+                diagnostics.stage,
+                diagnostics.layer,
+                diagnostics.position,
+                diagnostics.dispatches,
+                diagnostics.encode_us,
+                diagnostics.wait_us,
+                diagnostics.wall_us,
+                diagnostics.gpu_us,
+                diagnostics.kernel_us,
+                diagnostics.streamed_weight_bytes as f64 / (1024.0 * 1024.0),
+                diagnostics.effective_gib_per_s(),
+            );
+        }
+        Some(diagnostics)
+    }
+}
+
+/// Persistent Metal common core for the exact Gemma 4 26B-A4B Ghost-MoE row.
+///
+/// The 1.48 GiB non-expert Q4 weights live in the supplied
+/// [`Gemma4ResidentLayer`] objects (normally nocopy `WirePages`). Every one of
+/// the 30 layers owns f32 K and V storage; this row has no cross-layer KV
+/// sharing. Hidden, attention, shared, routed, and tail buffers remain on-device
+/// so the Phase-2 composition can chain layers without copying 2816 floats to
+/// the CPU. The readback helpers below exist for parity tests and diagnosis.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // Phase 1 API; gemma4_runtime integration lands separately.
+pub(crate) struct Gemma4GhostCommonMetal {
+    layers: Vec<Gemma4ResidentLayer>,
+    norms: Vec<Gemma4GhostCommonNorms>,
+    is_sliding: Vec<bool>,
+    cache_k: Vec<Buffer>,
+    cache_v: Vec<Buffer>,
+    hidden: Buffer,
+    attention_output: Buffer,
+    shared_output: Buffer,
+    routed_output: Buffer,
+    tail_output: Buffer,
+    attention: Gemma4GhostAttentionScratch,
+    shared: Gemma4GhostSharedScratch,
+    moe_layers: Option<Vec<Gemma4GhostMoeLayerResident>>,
+    moe: Option<Gemma4GhostMoeScratch>,
+    hidden_size: usize,
+    max_positions: usize,
+    sliding_window: usize,
+    next_position: Vec<usize>,
+    latest_attention_layer: Option<usize>,
+    geometry: Gemma4GhostCommonGeometry,
+    strict_26b: bool,
+    q4_simd_fast: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // Phase 1 API; gemma4_runtime integration lands separately.
+impl Gemma4GhostCommonMetal {
+    /// Admit only the exact 30-layer, no-PLE, no-shared-KV Gemma 4 26B-A4B row.
+    /// Every projection must be Q4_0 and every global layer is V-less.
+    pub(crate) fn new_26b(
+        layers: Vec<Gemma4ResidentLayer>,
+        post_norm_1: Vec<Vec<f32>>,
+        max_positions: usize,
+    ) -> Option<Self> {
+        Self::new_inner(
+            layers,
+            post_norm_1,
+            max_positions,
+            GEMMA4_GHOST_26B_SLIDING_WINDOW,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_synthetic(
+        layers: Vec<Gemma4ResidentLayer>,
+        post_norm_1: Vec<Vec<f32>>,
+        max_positions: usize,
+        sliding_window: usize,
+    ) -> Option<Self> {
+        Self::new_inner(layers, post_norm_1, max_positions, sliding_window, false)
+    }
+
+    fn new_inner(
+        layers: Vec<Gemma4ResidentLayer>,
+        post_norm_1: Vec<Vec<f32>>,
+        max_positions: usize,
+        sliding_window: usize,
+        strict_26b: bool,
+    ) -> Option<Self> {
+        if layers.is_empty()
+            || layers.len() != post_norm_1.len()
+            || max_positions == 0
+            || sliding_window == 0
+        {
+            return None;
+        }
+        let hidden = layers[0].attn_norm.len();
+        let n_heads = layers[0].n_heads;
+        if hidden == 0 || !hidden.is_multiple_of(32) || n_heads == 0 {
+            return None;
+        }
+        let q4_bytes = |rows: usize, input: usize| -> Option<usize> {
+            rows.checked_mul(input.checked_div(32)?)?.checked_mul(18)
+        };
+        let mut local_layers = 0usize;
+        let mut global_layers = 0usize;
+        let mut max_q_dim = 0usize;
+        let mut max_kv_dim = 0usize;
+        let mut max_head_dim = 0usize;
+        let mut max_ffn_dim = 0usize;
+        let mut kv_elements = 0usize;
+        let mut is_sliding = Vec::with_capacity(layers.len());
+        for (layer_idx, (layer, post1)) in layers.iter().zip(&post_norm_1).enumerate() {
+            let q_dim = layer.n_heads.checked_mul(layer.head_dim)?;
+            let kv_dim = layer.n_kv_heads.checked_mul(layer.head_dim)?;
+            let sliding = if strict_26b {
+                !GEMMA4_GHOST_26B_GLOBAL_LAYERS.contains(&layer_idx)
+            } else {
+                layer.v_w.is_some()
+            };
+            if layer.fmt != GemmaWireFmt::Q4_0
+                || layer.attn_norm.len() != hidden
+                || layer.post_attn_norm.len() != hidden
+                || layer.ffn_norm.len() != hidden
+                || layer.post_ffw_norm.len() != hidden
+                || post1.len() != hidden
+                || layer.q_norm.len() != layer.head_dim
+                || layer.k_norm.len() != layer.head_dim
+                || layer.n_heads != n_heads
+                || layer.n_kv_heads == 0
+                || !layer.n_heads.is_multiple_of(layer.n_kv_heads)
+                || layer.head_dim == 0
+                || !layer.head_dim.is_multiple_of(32)
+                || layer.ffn_dim == 0
+                || !layer.ffn_dim.is_multiple_of(32)
+                || !layer.eps.is_finite()
+                || layer.eps <= 0.0
+                || q_dim > u32::MAX as usize
+                || kv_dim > u32::MAX as usize
+                || layer.q_w.length() < q4_bytes(q_dim, hidden)? as u64
+                || layer.k_w.length() < q4_bytes(kv_dim, hidden)? as u64
+                || layer.v_w.as_ref().is_some_and(|v| {
+                    v.length() < q4_bytes(kv_dim, hidden).unwrap_or(usize::MAX) as u64
+                })
+                || layer.o_w.length() < q4_bytes(hidden, q_dim)? as u64
+                || layer.gate_w.length() < q4_bytes(layer.ffn_dim, hidden)? as u64
+                || layer.up_w.length() < q4_bytes(layer.ffn_dim, hidden)? as u64
+                || layer.down_w.length() < q4_bytes(hidden, layer.ffn_dim)? as u64
+                || [
+                    &layer.attn_norm,
+                    &layer.q_norm,
+                    &layer.k_norm,
+                    &layer.post_attn_norm,
+                    &layer.ffn_norm,
+                    &layer.post_ffw_norm,
+                    post1,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|value| !value.is_finite())
+            {
+                return None;
+            }
+            if sliding {
+                local_layers += 1;
+            } else {
+                global_layers += 1;
+            }
+            is_sliding.push(sliding);
+            max_q_dim = max_q_dim.max(q_dim);
+            max_kv_dim = max_kv_dim.max(kv_dim);
+            max_head_dim = max_head_dim.max(layer.head_dim);
+            max_ffn_dim = max_ffn_dim.max(layer.ffn_dim);
+            kv_elements = kv_elements.checked_add(
+                2usize
+                    .checked_mul(layer.n_kv_heads)?
+                    .checked_mul(max_positions)?
+                    .checked_mul(layer.head_dim)?,
+            )?;
+        }
+
+        if strict_26b
+            && (layers.len() != GEMMA4_GHOST_26B_LAYERS
+                || hidden != GEMMA4_GHOST_26B_HIDDEN
+                || n_heads != GEMMA4_GHOST_26B_HEADS
+                || local_layers != 25
+                || global_layers != 5
+                || layers.iter().enumerate().any(|(layer_idx, layer)| {
+                    let global = GEMMA4_GHOST_26B_GLOBAL_LAYERS.contains(&layer_idx);
+                    layer.ffn_dim != GEMMA4_GHOST_26B_SHARED_FF
+                        || layer.eps.to_bits() != 1.0e-6f32.to_bits()
+                        || if global {
+                            layer.head_dim != GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM
+                                || layer.n_kv_heads != GEMMA4_GHOST_26B_GLOBAL_KV_HEADS
+                                || layer.v_w.is_some()
+                        } else {
+                            layer.head_dim != GEMMA4_GHOST_26B_LOCAL_HEAD_DIM
+                                || layer.n_kv_heads != GEMMA4_GHOST_26B_LOCAL_KV_HEADS
+                                || layer.v_w.is_none()
+                        }
+                }))
+        {
+            return None;
+        }
+        if layers.iter().any(|layer| {
+            max_positions
+                .checked_mul(layer.head_dim)
+                .is_none_or(|stride| stride > u32::MAX as usize)
+        }) {
+            return None;
+        }
+
+        let kernel = metal_linear_kernel()?;
+        let buffer = |bytes: usize| {
+            kernel
+                .device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let f32_buffer = |elements: usize| Some(buffer(elements.checked_mul(4)?));
+        let upload = |values: &[f32]| -> Option<Buffer> {
+            let result = f32_buffer(values.len())?;
+            write_buffer_f32(&result, values);
+            Some(result)
+        };
+
+        let mut norms = Vec::with_capacity(layers.len());
+        for (layer, post1) in layers.iter().zip(&post_norm_1) {
+            let shared_rms_scalar = buffer(8);
+            let shared_gate_up_mm_scalar = buffer(12);
+            let shared_down_mm_scalar = buffer(12);
+            let shared_activation_blocks = buffer(4);
+            let shared_geglu_count = buffer(4);
+            let hidden_blocks = hidden / 32;
+            let activation_blocks = layer.ffn_dim / 32;
+            unsafe {
+                let rms = shared_rms_scalar.contents().cast::<u8>();
+                *rms.cast::<u32>() = hidden as u32;
+                *rms.add(4).cast::<f32>() = layer.eps;
+                let gate_up = shared_gate_up_mm_scalar.contents().cast::<u32>();
+                *gate_up = hidden_blocks as u32;
+                *gate_up.add(1) = layer.ffn_dim as u32;
+                *gate_up.add(2) = 1;
+                let down = shared_down_mm_scalar.contents().cast::<u32>();
+                *down = activation_blocks as u32;
+                *down.add(1) = hidden as u32;
+                *down.add(2) = 1;
+                *shared_activation_blocks.contents().cast::<u32>() = activation_blocks as u32;
+                *shared_geglu_count.contents().cast::<u32>() = layer.ffn_dim as u32;
+            }
+            norms.push(Gemma4GhostCommonNorms {
+                attn: upload(&layer.attn_norm)?,
+                q: upload(&layer.q_norm)?,
+                k: upload(&layer.k_norm)?,
+                post_attn: upload(&layer.post_attn_norm)?,
+                ffn: upload(&layer.ffn_norm)?,
+                post_norm_1: upload(post1)?,
+                shared_rms_scalar,
+                shared_gate_up_mm_scalar,
+                shared_down_mm_scalar,
+                shared_activation_blocks,
+                shared_geglu_count,
+            });
+        }
+        let mut cache_k = Vec::with_capacity(layers.len());
+        let mut cache_v = Vec::with_capacity(layers.len());
+        for layer in &layers {
+            let elements = layer
+                .n_kv_heads
+                .checked_mul(max_positions)?
+                .checked_mul(layer.head_dim)?;
+            cache_k.push(f32_buffer(elements)?);
+            cache_v.push(f32_buffer(elements)?);
+        }
+
+        let attention = Gemma4GhostAttentionScratch {
+            input_scales: f32_buffer(hidden / 32)?,
+            input_quants: buffer(hidden),
+            query: f32_buffer(max_q_dim)?,
+            key: f32_buffer(max_kv_dim)?,
+            value: f32_buffer(max_kv_dim)?,
+            query_normed: f32_buffer(max_q_dim)?,
+            key_normed: f32_buffer(max_kv_dim)?,
+            value_normed: f32_buffer(max_kv_dim)?,
+            scores: f32_buffer(n_heads.checked_mul(max_positions)?)?,
+            denom: f32_buffer(n_heads)?,
+            context: f32_buffer(max_q_dim)?,
+            context_scales: f32_buffer(max_q_dim / 32)?,
+            context_quants: buffer(max_q_dim),
+            projection: f32_buffer(hidden)?,
+            projection_normed: f32_buffer(hidden)?,
+            cos: f32_buffer(max_head_dim / 2)?,
+            sin: f32_buffer(max_head_dim / 2)?,
+            rms_scalar: buffer(8),
+            q_head_scalar: buffer(12),
+            k_head_scalar: buffer(12),
+            v_head_scalar: buffer(12),
+            q_mm_scalar: buffer(12),
+            kv_mm_scalar: buffer(12),
+            o_mm_scalar: buffer(12),
+            context_blocks: buffer(4),
+            rope_q_scalar: buffer(16),
+            rope_k_scalar: buffer(16),
+            attention_scalar: buffer(32),
+            attention_blocks: buffer(8),
+            scatter_scalar: buffer(16),
+            kv16_write: buffer(4),
+            hidden_count: buffer(4),
+        };
+        let shared = Gemma4GhostSharedScratch {
+            input_scales: f32_buffer(hidden / 32)?,
+            input_quants: buffer(hidden),
+            gate: f32_buffer(max_ffn_dim)?,
+            up: f32_buffer(max_ffn_dim)?,
+            activation: f32_buffer(max_ffn_dim)?,
+            activation_scales: f32_buffer(max_ffn_dim / 32)?,
+            activation_quants: buffer(max_ffn_dim),
+            down: f32_buffer(hidden)?,
+        };
+        let geometry = Gemma4GhostCommonGeometry {
+            layers: layers.len(),
+            local_layers,
+            global_layers,
+            max_positions,
+            kv_elements,
+            kv_bytes: kv_elements.checked_mul(std::mem::size_of::<f32>())?,
+        };
+        Some(Self {
+            next_position: vec![0; layers.len()],
+            layers,
+            norms,
+            is_sliding,
+            cache_k,
+            cache_v,
+            hidden: f32_buffer(hidden)?,
+            attention_output: f32_buffer(hidden)?,
+            shared_output: f32_buffer(hidden)?,
+            routed_output: f32_buffer(hidden)?,
+            tail_output: f32_buffer(hidden)?,
+            attention,
+            shared,
+            moe_layers: None,
+            moe: None,
+            hidden_size: hidden,
+            max_positions,
+            sliding_window,
+            latest_attention_layer: None,
+            geometry,
+            strict_26b,
+            q4_simd_fast: false,
+        })
+    }
+
+    pub(crate) fn geometry(&self) -> Gemma4GhostCommonGeometry {
+        self.geometry
+    }
+
+    /// Admit the cooperative Q4 row kernels only on the exact production row
+    /// and only when the generic plus both expert pipelines expose a 32-lane
+    /// execution width. Every refusal leaves the established scalar ordered
+    /// common core active.
+    pub(crate) fn enable_fused_fast_q4(&mut self, enabled: bool) -> bool {
+        self.q4_simd_fast = enabled
+            && self.strict_26b
+            && metal_linear_kernel().is_some_and(gemma4_q4_simd_fast_available);
+        self.q4_simd_fast
+    }
+
+    /// Upload the small resident MoE tensors and allocate the reusable router,
+    /// expert-input and tail buffers. This is separate from `new_26b` so Phase-1
+    /// attention/shared parity fixtures do not need synthetic router weights.
+    pub(crate) fn configure_moe(&mut self, configs: Vec<Gemma4GhostMoeLayerConfig>) -> bool {
+        const EXPERTS: usize = 128;
+        if self.moe_layers.is_some() || self.moe.is_some() || configs.len() != self.layers.len() {
+            return false;
+        }
+        let hidden = self.hidden_size;
+        if configs.iter().any(|config| {
+            config.router.len() != EXPERTS * hidden
+                || config.gate_input_scale.len() != hidden
+                || config.pre_norm_2.len() != hidden
+                || config.post_norm_2.len() != hidden
+                || !config.layer_output_scale.is_finite()
+                || config
+                    .router
+                    .iter()
+                    .chain(&config.gate_input_scale)
+                    .chain(&config.pre_norm_2)
+                    .chain(&config.post_norm_2)
+                    .any(|value| !value.is_finite())
+        }) {
+            return false;
+        }
+
+        let Some(kernel) = metal_linear_kernel() else {
+            return false;
+        };
+        let buffer = |bytes: usize| {
+            kernel
+                .device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let upload = |values: &[f32]| {
+            let result = buffer(std::mem::size_of_val(values));
+            write_buffer_f32(&result, values);
+            result
+        };
+
+        let mut resident = Vec::with_capacity(configs.len());
+        for (config, layer) in configs.into_iter().zip(&self.layers) {
+            let rms_scalar = buffer(8);
+            let layer_scale_scalar = buffer(8);
+            unsafe {
+                let rms = rms_scalar.contents().cast::<u8>();
+                *rms.cast::<u32>() = hidden as u32;
+                *rms.add(4).cast::<f32>() = layer.eps;
+                let scale = layer_scale_scalar.contents().cast::<u8>();
+                *scale.cast::<u32>() = hidden as u32;
+                *scale.add(4).cast::<f32>() = config.layer_output_scale;
+            }
+            resident.push(Gemma4GhostMoeLayerResident {
+                router: upload(&config.router),
+                gate_input_scale: upload(&config.gate_input_scale),
+                pre_norm_2: upload(&config.pre_norm_2),
+                post_norm_2: upload(&config.post_norm_2),
+                post_ffw_norm: upload(&layer.post_ffw_norm),
+                layer_output_scale: config.layer_output_scale,
+                rms_scalar,
+                layer_scale_scalar,
+            });
+        }
+        let f32_buffer = |elements: usize| buffer(elements * std::mem::size_of::<f32>());
+        let router_inv = 1.0f32 / (hidden as f32).sqrt();
+        let scratch = Gemma4GhostMoeScratch {
+            router_inv_weight: upload(&vec![router_inv; hidden]),
+            router_normed: f32_buffer(hidden),
+            router_input: f32_buffer(hidden),
+            router_logits: f32_buffer(EXPERTS),
+            expert_input_scales: f32_buffer(hidden / 32),
+            expert_input_quants: buffer(hidden),
+            routed_normed: f32_buffer(hidden),
+            combined: f32_buffer(hidden),
+            combined_normed: f32_buffer(hidden),
+            router_mm_scalar: buffer(8),
+            hidden_count: buffer(4),
+        };
+        unsafe {
+            let router = scratch.router_mm_scalar.contents().cast::<u32>();
+            *router = hidden as u32;
+            *router.add(1) = EXPERTS as u32;
+            *scratch.hidden_count.contents().cast::<u32>() = hidden as u32;
+        }
+        self.moe_layers = Some(resident);
+        self.moe = Some(scratch);
+        true
+    }
+
+    pub(crate) fn moe_configured(&self) -> bool {
+        self.moe_layers.is_some() && self.moe.is_some()
+    }
+
+    pub(crate) fn reset_sequence(&mut self) {
+        self.next_position.fill(0);
+        self.latest_attention_layer = None;
+    }
+
+    /// Seed a CPU-prefilled sequence into the persistent f32 KV buffers without
+    /// changing a single value bit.
+    ///
+    /// CPU Gemma 4 stores `[layer][position][kv_head * head_dim]`; Metal attention
+    /// reads `[layer][kv_head][max_positions][head_dim]`. Both sides are native f32,
+    /// so this is only a layout scatter through coherent `StorageModeShared`
+    /// memory—there is no quantization, conversion, or command-buffer dispatch.
+    /// The caller must serialize this against common-core commands (the runtime's
+    /// generation mutex provides that contract).
+    pub(crate) fn import_position_major_kv(
+        &mut self,
+        keys: &[Vec<Vec<f32>>],
+        values: &[Vec<Vec<f32>>],
+        positions: usize,
+    ) -> std::result::Result<(), Gemma4GhostKvImportError> {
+        let fail = |detail: String| Gemma4GhostKvImportError(detail);
+        if positions == 0 || positions > self.max_positions {
+            return Err(fail(format!(
+                "position count {positions} is outside 1..={}",
+                self.max_positions
+            )));
+        }
+        if keys.len() != self.layers.len() || values.len() != self.layers.len() {
+            return Err(fail(format!(
+                "KV layer count mismatch: keys={}, values={}, Metal={}",
+                keys.len(),
+                values.len(),
+                self.layers.len()
+            )));
+        }
+
+        // Complete validation first. This makes every refusal atomic even when a
+        // malformed later layer follows otherwise-valid earlier layers.
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let kv_dim = layer.n_kv_heads * layer.head_dim;
+            let key_rows = &keys[layer_idx];
+            let value_rows = &values[layer_idx];
+            if key_rows.len() != positions || value_rows.len() != positions {
+                return Err(fail(format!(
+                    "layer {layer_idx} position count mismatch: keys={}, values={}, expected={positions}",
+                    key_rows.len(),
+                    value_rows.len()
+                )));
+            }
+            for (position, (key, value)) in key_rows.iter().zip(value_rows).enumerate() {
+                if key.len() != kv_dim || value.len() != kv_dim {
+                    return Err(fail(format!(
+                        "layer {layer_idx} position {position} row width mismatch: keys={}, values={}, expected={kv_dim}",
+                        key.len(),
+                        value.len()
+                    )));
+                }
+                if key.iter().chain(value).any(|entry| !entry.is_finite()) {
+                    return Err(fail(format!(
+                        "layer {layer_idx} position {position} contains non-finite KV data"
+                    )));
+                }
+            }
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let key_dst = self.cache_k[layer_idx].contents().cast::<f32>();
+            let value_dst = self.cache_v[layer_idx].contents().cast::<f32>();
+            for position in 0..positions {
+                let key = &keys[layer_idx][position];
+                let value = &values[layer_idx][position];
+                for head in 0..layer.n_kv_heads {
+                    let src = head * layer.head_dim;
+                    let dst = (head * self.max_positions + position) * layer.head_dim;
+                    // SAFETY: all source row widths and destination capacity were
+                    // validated above. Each `(head, position)` destination is disjoint.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            key[src..src + layer.head_dim].as_ptr(),
+                            key_dst.add(dst),
+                            layer.head_dim,
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            value[src..src + layer.head_dim].as_ptr(),
+                            value_dst.add(dst),
+                            layer.head_dim,
+                        );
+                    }
+                }
+            }
+        }
+        self.next_position.fill(positions);
+        self.latest_attention_layer = None;
+        Ok(())
+    }
+
+    pub(crate) fn max_positions(&self) -> usize {
+        self.max_positions
+    }
+
+    pub(crate) fn hidden_buffer(&self) -> &Buffer {
+        &self.hidden
+    }
+
+    pub(crate) fn attention_output_buffer(&self) -> &Buffer {
+        &self.attention_output
+    }
+
+    pub(crate) fn shared_output_buffer(&self) -> &Buffer {
+        &self.shared_output
+    }
+
+    pub(crate) fn routed_output_buffer(&self) -> &Buffer {
+        &self.routed_output
+    }
+
+    pub(crate) fn tail_output_buffer(&self) -> &Buffer {
+        &self.tail_output
+    }
+
+    /// Promote the Phase-2 tail to the next layer's input by swapping buffer
+    /// handles. A previously committed tail command retains its original buffer,
+    /// and the serial Metal queue orders its write before the next attention read.
+    pub(crate) fn promote_tail_output(&mut self) {
+        std::mem::swap(&mut self.hidden, &mut self.tail_output);
+    }
+
+    pub(crate) fn write_hidden(&mut self, hidden: &[f32]) -> bool {
+        if hidden.len() != self.hidden_size || hidden.iter().any(|value| !value.is_finite()) {
+            return false;
+        }
+        write_buffer_f32(&self.hidden, hidden);
+        true
+    }
+
+    pub(crate) fn read_hidden(&self) -> Vec<f32> {
+        let mut output = vec![0.0f32; self.hidden_size];
+        read_buffer_f32(&self.hidden, &mut output);
+        output
+    }
+
+    pub(crate) fn read_attention_output(&self) -> Vec<f32> {
+        let mut output = vec![0.0f32; self.hidden_size];
+        read_buffer_f32(&self.attention_output, &mut output);
+        output
+    }
+
+    pub(crate) fn read_shared_output(&self) -> Vec<f32> {
+        let mut output = vec![0.0f32; self.hidden_size];
+        read_buffer_f32(&self.shared_output, &mut output);
+        output
+    }
+
+    fn write_attention_output_for_test(&mut self, hidden: &[f32], layer: usize) -> bool {
+        if hidden.len() != self.hidden_size || layer >= self.layers.len() {
+            return false;
+        }
+        write_buffer_f32(&self.attention_output, hidden);
+        self.latest_attention_layer = Some(layer);
+        true
+    }
+
+    /// Encode and commit one layer's attention graph. The output remains in
+    /// [`Self::attention_output_buffer`]; the returned command does not wait or
+    /// read it. The only accepted position is the next sequential KV slot for
+    /// this layer, preventing an unwritten cache gap from becoming visible.
+    pub(crate) fn enqueue_attention(
+        &mut self,
+        layer_idx: usize,
+        cos_t: &[f32],
+        sin_t: &[f32],
+        position: usize,
+    ) -> Option<Gemma4GhostCommonPending> {
+        self.enqueue_attention_inner(layer_idx, cos_t, sin_t, position, false)
+    }
+
+    /// Encode attention followed immediately by router preparation in one
+    /// command buffer. This is the production decode path: it preserves the
+    /// standalone stages' dispatch order while removing their command-buffer
+    /// boundary. Only the 128 router logits become host-visible after waiting.
+    pub(crate) fn enqueue_attention_router(
+        &mut self,
+        layer_idx: usize,
+        cos_t: &[f32],
+        sin_t: &[f32],
+        position: usize,
+    ) -> Option<Gemma4GhostCommonPending> {
+        self.enqueue_attention_inner(layer_idx, cos_t, sin_t, position, true)
+    }
+
+    fn enqueue_attention_inner(
+        &mut self,
+        layer_idx: usize,
+        cos_t: &[f32],
+        sin_t: &[f32],
+        position: usize,
+        include_router: bool,
+    ) -> Option<Gemma4GhostCommonPending> {
+        if include_router
+            && (self
+                .moe_layers
+                .as_ref()
+                .and_then(|layers| layers.get(layer_idx))
+                .is_none()
+                || self.moe.is_none())
+        {
+            // Fail before advancing KV state or committing partial attention.
+            return None;
+        }
+        let layer = self.layers.get(layer_idx)?;
+        let norms = self.norms.get(layer_idx)?;
+        let half_rope = layer.head_dim / 2;
+        if cos_t.len() != half_rope
+            || sin_t.len() != half_rope
+            || cos_t.iter().chain(sin_t).any(|value| !value.is_finite())
+            || position >= self.max_positions
+            || self.next_position.get(layer_idx).copied()? != position
+        {
+            return None;
+        }
+        let kernel = metal_linear_kernel()?;
+        let q_dim = layer.n_heads.checked_mul(layer.head_dim)?;
+        let kv_dim = layer.n_kv_heads.checked_mul(layer.head_dim)?;
+        let filled = position.checked_add(1)?;
+        let window_start = if self.is_sliding[layer_idx] {
+            filled.saturating_sub(self.sliding_window)
+        } else {
+            0
+        };
+        let position_count = filled.checked_sub(window_start)?;
+        let input_blocks = self.hidden_size / 32;
+        let context_blocks = q_dim / 32;
+        let group = layer.n_heads / layer.n_kv_heads;
+        let a = &self.attention;
+
+        write_buffer_f32(&a.cos, cos_t);
+        write_buffer_f32(&a.sin, sin_t);
+        unsafe {
+            let rms = a.rms_scalar.contents().cast::<u8>();
+            *rms.cast::<u32>() = self.hidden_size as u32;
+            *rms.add(4).cast::<f32>() = layer.eps;
+
+            let set_head = |buffer: &Buffer, use_weight: u32| {
+                let p = buffer.contents().cast::<u8>();
+                *p.cast::<u32>() = layer.head_dim as u32;
+                *p.add(4).cast::<f32>() = layer.eps;
+                *p.add(8).cast::<u32>() = use_weight;
+            };
+            set_head(&a.q_head_scalar, 1);
+            set_head(&a.k_head_scalar, 1);
+            set_head(&a.v_head_scalar, 0);
+
+            let set_mm = |buffer: &Buffer, blocks: usize, rows: usize| {
+                let p = buffer.contents().cast::<u32>();
+                *p = blocks as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = 1;
+            };
+            set_mm(&a.q_mm_scalar, input_blocks, q_dim);
+            set_mm(&a.kv_mm_scalar, input_blocks, kv_dim);
+            set_mm(&a.o_mm_scalar, context_blocks, self.hidden_size);
+            *a.context_blocks.contents().cast::<u32>() = context_blocks as u32;
+
+            let set_rope = |buffer: &Buffer, heads: usize| {
+                let p = buffer.contents().cast::<u32>();
+                *p = heads as u32;
+                *p.add(1) = layer.head_dim as u32;
+                *p.add(2) = half_rope as u32;
+                *p.add(3) = 1; // Gemma split-half/NeoX pairing.
+            };
+            set_rope(&a.rope_q_scalar, layer.n_heads);
+            set_rope(&a.rope_k_scalar, layer.n_kv_heads);
+
+            let attn = a.attention_scalar.contents().cast::<u8>();
+            *attn.cast::<u32>() = layer.n_heads as u32;
+            *attn.add(4).cast::<u32>() = layer.head_dim as u32;
+            *attn.add(8).cast::<u32>() = position_count as u32;
+            *attn.add(12).cast::<u32>() = group as u32;
+            *attn.add(16).cast::<f32>() = 1.0; // QK norm folds Gemma's scale.
+            *attn.add(20).cast::<u32>() = layer.head_dim as u32;
+            *attn.add(24).cast::<u32>() = (self.max_positions * layer.head_dim) as u32;
+            *attn.add(28).cast::<u32>() = (window_start * layer.head_dim) as u32;
+
+            let scatter = a.scatter_scalar.contents().cast::<u32>();
+            *scatter = layer.head_dim as u32;
+            *scatter.add(1) = self.max_positions as u32;
+            *scatter.add(2) = position as u32;
+            *scatter.add(3) = kv_dim as u32;
+            *a.kv16_write.contents().cast::<u32>() = 0;
+            *a.hidden_count.contents().cast::<u32>() = self.hidden_size as u32;
+        }
+
+        let started = std::time::Instant::now();
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        // The CPU wire oracle normalizes once, quantizes that activation once,
+        // and reuses it for Q/K/V. The fused normalization/quantization kernel is
+        // arithmetically the same chain without a transient f32 row.
+        encode_rms_norm_quantize(
+            encoder,
+            kernel,
+            &self.hidden,
+            &norms.attn,
+            &a.input_scales,
+            &a.input_quants,
+            &a.rms_scalar,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            encoder,
+            kernel,
+            &a.input_scales,
+            &a.input_quants,
+            &layer.q_w,
+            &a.query,
+            &a.q_mm_scalar,
+            q_dim,
+            self.hidden_size / 32,
+            self.q4_simd_fast,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            encoder,
+            kernel,
+            &a.input_scales,
+            &a.input_quants,
+            &layer.k_w,
+            &a.key,
+            &a.kv_mm_scalar,
+            kv_dim,
+            self.hidden_size / 32,
+            self.q4_simd_fast,
+        );
+        let value_source = if let Some(value_weight) = layer.v_w.as_ref() {
+            encode_gemma4_q4_0_q8_ordered_single(
+                encoder,
+                kernel,
+                &a.input_scales,
+                &a.input_quants,
+                value_weight,
+                &a.value,
+                &a.kv_mm_scalar,
+                kv_dim,
+                self.hidden_size / 32,
+                self.q4_simd_fast,
+            );
+            &a.value
+        } else {
+            // Exact global-layer rule: V is raw K, before K norm and RoPE.
+            &a.key
+        };
+        encode_rms_norm_per_head(
+            encoder,
+            kernel,
+            &a.query,
+            &norms.q,
+            &a.query_normed,
+            &a.q_head_scalar,
+            layer.n_heads,
+            0,
+        );
+        encode_rms_norm_per_head(
+            encoder,
+            kernel,
+            &a.key,
+            &norms.k,
+            &a.key_normed,
+            &a.k_head_scalar,
+            layer.n_kv_heads,
+            0,
+        );
+        encode_rms_norm_per_head(
+            encoder,
+            kernel,
+            value_source,
+            &norms.q, // dummy, use_weight=0
+            &a.value_normed,
+            &a.v_head_scalar,
+            layer.n_kv_heads,
+            0,
+        );
+        encode_rope(
+            encoder,
+            kernel,
+            &a.query_normed,
+            &a.cos,
+            &a.sin,
+            &a.rope_q_scalar,
+            layer.n_heads,
+            half_rope,
+            0,
+            0,
+        );
+        encode_rope(
+            encoder,
+            kernel,
+            &a.key_normed,
+            &a.cos,
+            &a.sin,
+            &a.rope_k_scalar,
+            layer.n_kv_heads,
+            half_rope,
+            0,
+            0,
+        );
+
+        encoder.set_compute_pipeline_state(&kernel.kv_scatter_pipeline);
+        encoder.set_buffer(0, Some(&a.key_normed), 0);
+        encoder.set_buffer(1, Some(&a.value_normed), 0);
+        encoder.set_buffer(2, Some(&self.cache_k[layer_idx]), 0);
+        encoder.set_buffer(3, Some(&self.cache_v[layer_idx]), 0);
+        encoder.set_buffer(4, Some(&a.scatter_scalar), 0);
+        encoder.set_buffer(5, Some(&a.scatter_scalar), 4);
+        encoder.set_buffer(6, Some(&a.scatter_scalar), 8);
+        encoder.set_buffer(7, Some(&a.scatter_scalar), 12);
+        // f32-only KV: mirror bindings are inert while kv16_write == 0.
+        encoder.set_buffer(8, Some(&a.scatter_scalar), 0);
+        encoder.set_buffer(9, Some(&a.scatter_scalar), 0);
+        encoder.set_buffer(10, Some(&a.kv16_write), 0);
+        dispatch_1d(encoder, &kernel.kv_scatter_pipeline, kv_dim);
+
+        // The exact 26B head widths (256/512) use the bit-identical split-three
+        // f32 attention implementation. Its denominator and block scalars are
+        // persistent here rather than borrowed from the global scratch pool.
+        encode_attention_split3(
+            encoder,
+            kernel,
+            &a.query_normed,
+            &self.cache_k[layer_idx],
+            &self.cache_v[layer_idx],
+            &a.scores,
+            &a.denom,
+            &a.context,
+            &a.attention_scalar,
+            &a.attention_blocks,
+            layer.n_heads,
+            layer.head_dim,
+            position_count,
+            0,
+            0,
+        );
+        encode_quantize(
+            encoder,
+            kernel,
+            &a.context,
+            &a.context_scales,
+            &a.context_quants,
+            &a.context_blocks,
+            context_blocks,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            encoder,
+            kernel,
+            &a.context_scales,
+            &a.context_quants,
+            &layer.o_w,
+            &a.projection,
+            &a.o_mm_scalar,
+            self.hidden_size,
+            context_blocks,
+            self.q4_simd_fast,
+        );
+        encode_rms_norm_f32(
+            encoder,
+            kernel,
+            &a.projection,
+            &norms.post_attn,
+            &a.projection_normed,
+            &a.rms_scalar,
+        );
+        encode_binary(
+            encoder,
+            &kernel.residual_add_pipeline,
+            &self.hidden,
+            &a.projection_normed,
+            &self.attention_output,
+            &a.hidden_count,
+            self.hidden_size,
+        );
+        if include_router {
+            self.encode_router_graph(encoder, kernel, layer_idx)?;
+        }
+        encoder.end_encoding();
+        command_buffer.commit();
+        let encode_us = started.elapsed().as_micros();
+
+        self.next_position[layer_idx] = filled;
+        self.latest_attention_layer = Some(layer_idx);
+        let q4_bytes = |rows: usize, input: usize| rows * (input / 32) * 18;
+        let streamed_weight_bytes = q4_bytes(q_dim, self.hidden_size)
+            + q4_bytes(kv_dim, self.hidden_size)
+            + usize::from(layer.v_w.is_some()) * q4_bytes(kv_dim, self.hidden_size)
+            + q4_bytes(self.hidden_size, q_dim);
+        let router_weight_bytes = usize::from(include_router) * 128 * self.hidden_size * 4;
+        Some(Gemma4GhostCommonPending {
+            command_buffer: command_buffer.to_owned(),
+            stage: if include_router {
+                Gemma4GhostCommonStage::AttentionRouter
+            } else {
+                Gemma4GhostCommonStage::Attention
+            },
+            layer: layer_idx,
+            position,
+            dispatches: (if layer.v_w.is_some() { 17 } else { 16 })
+                + if include_router { 4 } else { 0 },
+            streamed_weight_bytes: (streamed_weight_bytes + router_weight_bytes) as u64,
+            readback_bytes: if include_router { (128 * 4) as u64 } else { 0 },
+            started,
+            encode_us,
+        })
+    }
+
+    /// Validation convenience: write a host hidden row, run attention, wait, and
+    /// read its 2816-value post-attention residual. Production composition should
+    /// use [`Self::enqueue_attention`] and keep the buffer on-device.
+    pub(crate) fn execute_attention(
+        &mut self,
+        layer_idx: usize,
+        hidden: &[f32],
+        cos_t: &[f32],
+        sin_t: &[f32],
+        position: usize,
+    ) -> Option<(Vec<f32>, Gemma4GhostCommonDiagnostics)> {
+        if !self.write_hidden(hidden) {
+            return None;
+        }
+        let mut diagnostics = self
+            .enqueue_attention(layer_idx, cos_t, sin_t, position)?
+            .wait()?;
+        diagnostics.readback_bytes = (self.hidden_size * 4) as u64;
+        Some((self.read_attention_output(), diagnostics))
+    }
+
+    /// Append the router and expert-input preparation to an existing encoder.
+    /// Keeping this graph shared by the fused and standalone entry points pins
+    /// their operation order and arithmetic to the same implementation.
+    fn encode_router_graph(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        kernel: &MetalLinearKernel,
+        layer_idx: usize,
+    ) -> Option<()> {
+        const EXPERTS: usize = 128;
+        self.layers.get(layer_idx)?;
+        let moe_layers = self.moe_layers.as_ref()?;
+        let moe_layer = moe_layers.get(layer_idx)?;
+        let scratch = self.moe.as_ref()?;
+
+        // Preserve the CPU router's multiply association:
+        // ((x * rms_inv) * hidden^-0.5) * gate_input_scale.
+        encode_rms_norm_f32(
+            encoder,
+            kernel,
+            &self.attention_output,
+            &scratch.router_inv_weight,
+            &scratch.router_normed,
+            &moe_layer.rms_scalar,
+        );
+        encode_binary(
+            encoder,
+            &kernel.multiply_pipeline,
+            &scratch.router_normed,
+            &moe_layer.gate_input_scale,
+            &scratch.router_input,
+            &scratch.hidden_count,
+            self.hidden_size,
+        );
+        encode_linear_transposed_f32(
+            encoder,
+            kernel,
+            &scratch.router_input,
+            &moe_layer.router,
+            &scratch.router_logits,
+            &scratch.router_mm_scalar,
+            EXPERTS,
+        );
+        encode_rms_norm_quantize(
+            encoder,
+            kernel,
+            &self.attention_output,
+            &moe_layer.pre_norm_2,
+            &scratch.expert_input_scales,
+            &scratch.expert_input_quants,
+            &moe_layer.rms_scalar,
+        );
+        Some(())
+    }
+
+    /// Prepare the two consumers of the post-attention residual in one compact
+    /// command: the 128-way router logits and the Q8_0 `pre_norm_2` activation
+    /// consumed directly by the persistent expert engine. Only router logits
+    /// are read by the CPU; the full hidden activation stays on-device.
+    pub(crate) fn enqueue_router(&mut self, layer_idx: usize) -> Option<Gemma4GhostCommonPending> {
+        const EXPERTS: usize = 128;
+        if self.latest_attention_layer != Some(layer_idx) {
+            return None;
+        }
+        let kernel = metal_linear_kernel()?;
+        let started = std::time::Instant::now();
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_router_graph(encoder, kernel, layer_idx)?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        let encode_us = started.elapsed().as_micros();
+        Some(Gemma4GhostCommonPending {
+            command_buffer: command_buffer.to_owned(),
+            stage: Gemma4GhostCommonStage::Router,
+            layer: layer_idx,
+            position: self.next_position[layer_idx].saturating_sub(1),
+            dispatches: 4,
+            streamed_weight_bytes: (EXPERTS * self.hidden_size * 4) as u64,
+            readback_bytes: (EXPERTS * 4) as u64,
+            started,
+            encode_us,
+        })
+    }
+
+    pub(crate) fn read_router_logits(&self) -> Option<Vec<f32>> {
+        let scratch = self.moe.as_ref()?;
+        let mut logits = vec![0.0f32; 128];
+        read_buffer_f32(&scratch.router_logits, &mut logits);
+        Some(logits)
+    }
+
+    /// Append the exact two-branch MoE tail to an encoder whose expert reduce
+    /// has just written `routed_output`:
+    /// post_norm_2 -> add shared -> post_ffw_norm -> add attention residual.
+    fn encode_moe_tail(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        kernel: &MetalLinearKernel,
+        layer_idx: usize,
+    ) -> Option<u32> {
+        self.layers.get(layer_idx)?;
+        let moe_layer = self.moe_layers.as_ref()?.get(layer_idx)?;
+        let scratch = self.moe.as_ref()?;
+        encode_rms_norm_f32(
+            encoder,
+            kernel,
+            &self.routed_output,
+            &moe_layer.post_norm_2,
+            &scratch.routed_normed,
+            &moe_layer.rms_scalar,
+        );
+        encode_binary(
+            encoder,
+            &kernel.residual_add_pipeline,
+            &self.shared_output,
+            &scratch.routed_normed,
+            &scratch.combined,
+            &scratch.hidden_count,
+            self.hidden_size,
+        );
+        encode_rms_norm_f32(
+            encoder,
+            kernel,
+            &scratch.combined,
+            &moe_layer.post_ffw_norm,
+            &scratch.combined_normed,
+            &moe_layer.rms_scalar,
+        );
+        encode_binary(
+            encoder,
+            &kernel.residual_add_pipeline,
+            &self.attention_output,
+            &scratch.combined_normed,
+            &self.tail_output,
+            &scratch.hidden_count,
+            self.hidden_size,
+        );
+        if moe_layer.layer_output_scale != 1.0 {
+            encode_scale_f32(
+                encoder,
+                kernel,
+                &self.tail_output,
+                &self.tail_output,
+                &moe_layer.layer_scale_scalar,
+                self.hidden_size,
+            );
+            Some(5)
+        } else {
+            Some(4)
+        }
+    }
+
+    /// Encode and commit the dense shared-expert branch off the current
+    /// post-attention residual. This command is deliberately nonblocking so its
+    /// Q4 weight sweeps overlap selected-expert disk reads.
+    pub(crate) fn enqueue_shared_branch(
+        &mut self,
+        layer_idx: usize,
+    ) -> Option<Gemma4GhostCommonPending> {
+        if self.latest_attention_layer != Some(layer_idx) {
+            return None;
+        }
+        let kernel = metal_linear_kernel()?;
+        let layer = self.layers.get(layer_idx)?;
+        let norms = self.norms.get(layer_idx)?;
+        let ffn_dim = layer.ffn_dim;
+        let hidden_blocks = self.hidden_size / 32;
+        let activation_blocks = ffn_dim / 32;
+        let s = &self.shared;
+
+        let started = std::time::Instant::now();
+        let command_buffer = kernel.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_rms_norm_quantize(
+            encoder,
+            kernel,
+            &self.attention_output,
+            &norms.ffn,
+            &s.input_scales,
+            &s.input_quants,
+            &norms.shared_rms_scalar,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            encoder,
+            kernel,
+            &s.input_scales,
+            &s.input_quants,
+            &layer.gate_w,
+            &s.gate,
+            &norms.shared_gate_up_mm_scalar,
+            ffn_dim,
+            hidden_blocks,
+            self.q4_simd_fast,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            encoder,
+            kernel,
+            &s.input_scales,
+            &s.input_quants,
+            &layer.up_w,
+            &s.up,
+            &norms.shared_gate_up_mm_scalar,
+            ffn_dim,
+            hidden_blocks,
+            self.q4_simd_fast,
+        );
+        encode_binary(
+            encoder,
+            &kernel.gelu_mul_pipeline,
+            &s.gate,
+            &s.up,
+            &s.activation,
+            &norms.shared_geglu_count,
+            ffn_dim,
+        );
+        encode_quantize(
+            encoder,
+            kernel,
+            &s.activation,
+            &s.activation_scales,
+            &s.activation_quants,
+            &norms.shared_activation_blocks,
+            activation_blocks,
+        );
+        encode_gemma4_q4_0_q8_ordered_single(
+            encoder,
+            kernel,
+            &s.activation_scales,
+            &s.activation_quants,
+            &layer.down_w,
+            &s.down,
+            &norms.shared_down_mm_scalar,
+            self.hidden_size,
+            activation_blocks,
+            self.q4_simd_fast,
+        );
+        encode_rms_norm_f32(
+            encoder,
+            kernel,
+            &s.down,
+            &norms.post_norm_1,
+            &self.shared_output,
+            &norms.shared_rms_scalar,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        let encode_us = started.elapsed().as_micros();
+        let weight_bytes =
+            2 * ffn_dim * hidden_blocks * 18 + self.hidden_size * activation_blocks * 18;
+        Some(Gemma4GhostCommonPending {
+            command_buffer: command_buffer.to_owned(),
+            stage: Gemma4GhostCommonStage::SharedBranch,
+            layer: layer_idx,
+            position: self.next_position[layer_idx].saturating_sub(1),
+            dispatches: 7,
+            streamed_weight_bytes: weight_bytes as u64,
+            readback_bytes: 0,
+            started,
+            encode_us,
+        })
+    }
+
+    /// Validation convenience for the shared branch. It writes an already
+    /// computed post-attention residual, waits for the branch, and reads only the
+    /// branch output (never `h_attn + output`).
+    pub(crate) fn execute_shared_branch(
+        &mut self,
+        layer_idx: usize,
+        attention_output: &[f32],
+    ) -> Option<(Vec<f32>, Gemma4GhostCommonDiagnostics)> {
+        if !self.write_attention_output_for_test(attention_output, layer_idx) {
+            return None;
+        }
+        let mut diagnostics = self.enqueue_shared_branch(layer_idx)?.wait()?;
+        diagnostics.readback_bytes = (self.hidden_size * 4) as u64;
+        Some((self.read_shared_output(), diagnostics))
     }
 }
 
@@ -21512,6 +24829,264 @@ mod tests {
         }
     }
 
+    /// End-to-end tied-head gate: verifies RMSNorm, no-copy mmap offset binding,
+    /// Q8_K activation quantization, Q6_K projection, and final soft-cap against
+    /// the established CPU oracles.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_q6k_head_reads_nonzero_mmap_offset_and_matches_cpu() {
+        use std::io::Write;
+
+        if !detect_metal_device().available {
+            return;
+        }
+        const Q6K_WIRE: usize = 210;
+        let hidden = 512usize;
+        let n_sb = hidden / 256;
+        let vocab = 17usize;
+        let offset = 96usize; // GGUF tensors are aligned, but rarely page-aligned.
+        let mut wire = vec![0u8; vocab * n_sb * Q6K_WIRE];
+        for row in 0..vocab {
+            for sb in 0..n_sb {
+                let block =
+                    &mut wire[(row * n_sb + sb) * Q6K_WIRE..(row * n_sb + sb + 1) * Q6K_WIRE];
+                for (i, byte) in block[..192].iter_mut().enumerate() {
+                    *byte = ((row * 47 + sb * 13 + i * 41 + 7) & 0xff) as u8;
+                }
+                for (i, byte) in block[192..208].iter_mut().enumerate() {
+                    let scale = ((row as i32 * 7 + sb as i32 * 5 + i as i32 * 11) % 63) - 31;
+                    *byte = (scale as i8) as u8;
+                }
+                let d = 0.009 + row as f32 * 0.0005 + sb as f32 * 0.0004;
+                block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+            }
+        }
+        let mut file = tempfile::NamedTempFile::new().expect("temp Q6_K head file");
+        file.write_all(&vec![0xa5; offset]).unwrap();
+        file.write_all(&wire).unwrap();
+        file.flush().unwrap();
+        let mmap = crate::wire_mmap::GgufWireMmap::map(file.path()).unwrap();
+
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| (((i * 29 + 17) % 509) as f32 - 254.0) * 0.0073)
+            .collect();
+        let norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.8 + ((i * 11) % 37) as f32 * 0.01)
+            .collect();
+        let eps = 1.0e-6;
+        let cap = 30.0;
+        let head = Gemma4Q6KHead::new(
+            mmap.clone(),
+            offset as u64,
+            wire.len(),
+            &norm,
+            vocab,
+            cap,
+            eps,
+        )
+        .expect("Metal Q6_K head");
+        assert!(
+            Gemma4Q6KHead::new(mmap, offset as u64, wire.len() - 1, &norm, vocab, cap, eps,)
+                .is_none(),
+            "malformed tied-head byte length must fail closed"
+        );
+        let got = head.forward(&input).expect("Metal head forward");
+
+        let normalized = crate::gemma4_runtime::rms_norm(&input, Some(&norm), eps);
+        let q8 = crate::inference::quantize_q8_k_blocks(&normalized);
+        let mut expected = Vec::with_capacity(vocab);
+        for row in 0..vocab {
+            let row_wire = &wire[row * n_sb * Q6K_WIRE..(row + 1) * n_sb * Q6K_WIRE];
+            let logit = crate::inference::q6_k_wire_row_dot(row_wire, &q8);
+            expected.push(cap * (logit / cap).tanh());
+        }
+        assert_eq!(got.len(), expected.len());
+        for (row, (&actual, &want)) in got.iter().zip(&expected).enumerate() {
+            let tolerance = 4.0e-4 * want.abs().max(1.0);
+            assert!(
+                (actual - want).abs() <= tolerance,
+                "Q6_K tied-head row {row}: metal={actual} cpu={want} tolerance={tolerance}"
+            );
+        }
+        let argmax = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(index, _)| index)
+                .unwrap()
+        };
+        assert_eq!(argmax(&got), argmax(&expected));
+    }
+
+    /// Direct arithmetic gate for the strict ordered Q6_K head kernel.  Feed
+    /// identical, hand-built Q8_K blocks to Metal and the scalar wire oracle so
+    /// this test cannot hide a projection mismatch behind RMSNorm, activation
+    /// quantization, soft-cap, or a tolerance.  Nine and seventeen
+    /// superblocks cross the shader's eight-superblock SIMD work chunk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_q6k_ordered_is_bit_exact_for_adversarial_superblocks() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const WIRE: usize = crate::inference::Q6_K_WIRE_BYTES_PER_BLOCK;
+        const ROWS: usize = 11;
+        const HALF_SCALES: [u16; 8] = [
+            0x0000, // +0
+            0x1000, // small normal
+            0x2800, 0x3400, 0x3800, 0xb400, 0x3c00, // +1
+            0xbc00, // -1
+        ];
+        const Q8_SCALES: [f32; 8] = [
+            0.0,
+            1.0 / 256.0,
+            -1.0 / 128.0,
+            1.0 / 32.0,
+            -1.0 / 16.0,
+            0.5,
+            -2.0,
+            8.0,
+        ];
+
+        let kernel = metal_linear_kernel().expect("Metal ordered Q6_K pipeline");
+        for n_sb in [1usize, 8, 9, 17] {
+            let q8: Vec<crate::inference::Q8KBlock> = (0..n_sb)
+                .map(|sb| {
+                    let mut qs = [0i8; 256];
+                    for (i, q) in qs.iter_mut().enumerate() {
+                        *q = match sb % 6 {
+                            0 => {
+                                if i & 1 == 0 {
+                                    127
+                                } else {
+                                    -128
+                                }
+                            }
+                            1 => match i % 3 {
+                                0 => -1,
+                                1 => 0,
+                                _ => 1,
+                            },
+                            2 => {
+                                if i & 31 < 16 {
+                                    127
+                                } else {
+                                    -127
+                                }
+                            }
+                            3 => ((i * 73 + sb * 29 + 11) & 0xff) as u8 as i8,
+                            4 => {
+                                if i & 3 < 2 {
+                                    1
+                                } else {
+                                    -1
+                                }
+                            }
+                            _ => 0,
+                        };
+                    }
+                    crate::inference::Q8KBlock {
+                        d: Q8_SCALES[(sb * 5 + 3) % Q8_SCALES.len()],
+                        qs,
+                    }
+                })
+                .collect();
+
+            let mut wire = vec![0u8; ROWS * n_sb * WIRE];
+            for row in 0..ROWS {
+                for sb in 0..n_sb {
+                    let block = &mut wire[(row * n_sb + sb) * WIRE..(row * n_sb + sb + 1) * WIRE];
+                    for (i, byte) in block[..192].iter_mut().enumerate() {
+                        *byte = match row % 4 {
+                            0 => 0,
+                            1 => 0xff,
+                            2 => {
+                                if (i + sb) & 1 == 0 {
+                                    0x0f
+                                } else {
+                                    0xf0
+                                }
+                            }
+                            _ => ((row * 197 + sb * 101 + i * 53 + 17) & 0xff) as u8,
+                        };
+                    }
+                    const GROUP_SCALES: [i8; 8] = [-128, -127, -64, -1, 0, 1, 63, 127];
+                    for (i, byte) in block[192..208].iter_mut().enumerate() {
+                        *byte = GROUP_SCALES[(row * 3 + sb * 5 + i) % GROUP_SCALES.len()] as u8;
+                    }
+                    let half = HALF_SCALES[(row * 7 + sb * 3 + 1) % HALF_SCALES.len()];
+                    block[208..210].copy_from_slice(&half.to_le_bytes());
+                }
+            }
+
+            let scales: Vec<f32> = q8.iter().map(|block| block.d).collect();
+            let quants: Vec<i8> = q8
+                .iter()
+                .flat_map(|block| block.qs.iter().copied())
+                .collect();
+            let input_scales = kernel.device.new_buffer(
+                (scales.len() * std::mem::size_of::<f32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let input_quants = kernel
+                .device
+                .new_buffer(quants.len() as u64, MTLResourceOptions::StorageModeShared);
+            let weights = kernel
+                .device
+                .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+            let output = kernel.device.new_buffer(
+                (ROWS * std::mem::size_of::<f32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let scalar = kernel
+                .device
+                .new_buffer(8, MTLResourceOptions::StorageModeShared);
+            write_buffer_f32(&input_scales, &scales);
+            write_buffer_bytes(&input_quants, &quants);
+            write_buffer_u8(&weights, &wire);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = n_sb as u32;
+                *p.add(1) = ROWS as u32;
+            }
+
+            let command_buffer = kernel.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode_q6k_ordered_single(
+                encoder,
+                kernel,
+                &input_scales,
+                &input_quants,
+                &weights,
+                0,
+                &output,
+                &scalar,
+                n_sb,
+                ROWS,
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+
+            let mut actual = vec![0.0f32; ROWS];
+            read_buffer_f32(&output, &mut actual);
+            for row in 0..ROWS {
+                let row_wire = &wire[row * n_sb * WIRE..(row + 1) * n_sb * WIRE];
+                let expected = crate::inference::q6_k_wire_row_dot(row_wire, &q8);
+                assert_eq!(
+                    actual[row].to_bits(),
+                    expected.to_bits(),
+                    "ordered Q6_K mismatch at n_sb={n_sb} row={row}: metal={} ({:#010x}), cpu={} ({:#010x})",
+                    actual[row],
+                    actual[row].to_bits(),
+                    expected,
+                    expected.to_bits(),
+                );
+            }
+        }
+    }
+
     /// Correctness gate for the shared Q4_K/Q6_K resident projection used by decode,
     /// output projection, speculative verification, and prefill. The GPU performs the
     /// production Q8_K activation quantization and tiled K-quant dot; the expected values
@@ -21924,9 +25499,9 @@ mod tests {
         if !super::detect_metal_device().available {
             return;
         }
-        let model_path = std::env::var("CAMELID_TEST_GGUF").unwrap_or_else(|_| {
-            "/Volumes/Untitled/models/Llama-3.2-3B-Instruct-Q8_0.gguf".to_string()
-        });
+        let Ok(model_path) = std::env::var("CAMELID_TEST_GGUF") else {
+            return; // CI/local runs opt in with an explicit internal-drive fixture.
+        };
         let model_path = std::path::Path::new(&model_path);
         if !model_path.exists() {
             return; // CI runners carry no model files.
@@ -23066,6 +26641,332 @@ mod tests {
         );
     }
 
+    // Ghost-MoE does not use the resident f32-activation Q4 path above: its
+    // established comparator quantizes activations to Q8_0 first. The ordered
+    // Metal kernel must reproduce that row dot exactly for multiple prompt
+    // rows while sharing one expert-weight upload.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q4_0_q8_batch_is_bit_exact() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::{q4_0_wire_row_dot, quantize_q8_0_blocks};
+
+        for blocks_per_row in [5usize, 80] {
+            let rows = 11usize;
+            let inputs: Vec<Vec<crate::tensor::Q8_0Block>> = (0..3)
+                .map(|token| {
+                    let input: Vec<f32> = (0..blocks_per_row * 32)
+                        .map(|i| {
+                            ((((i * 17 + token * 13) % 97) as f32) - 48.0)
+                                * (0.003 + token as f32 * 0.001)
+                        })
+                        .collect();
+                    quantize_q8_0_blocks(&input)
+                })
+                .collect();
+            let input_refs: Vec<&[crate::tensor::Q8_0Block]> =
+                inputs.iter().map(Vec::as_slice).collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = 0.0025 * (1 + (row * 7 + block * 3) % 31) as f32;
+                    wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(((row * 43 + block * 19 + j * 11) % 256) as u8);
+                    }
+                }
+            }
+
+            let got = try_gemma4_q4_0_matmul_q8_batch(&input_refs, &wire, rows)
+                .expect("ordered Ghost Q4_0 Metal matmul");
+            for (token, input) in inputs.iter().enumerate() {
+                for row in 0..rows {
+                    let row_bytes = blocks_per_row * 18;
+                    let expected =
+                        q4_0_wire_row_dot(&wire[row * row_bytes..(row + 1) * row_bytes], input);
+                    assert_eq!(
+                        got[token][row].to_bits(),
+                        expected.to_bits(),
+                        "token={token} row={row} bpr={blocks_per_row}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The fused-fast sibling splits complete blocks across a 32-lane SIMD
+    // group, then lets lane zero replay every f32 term in increasing block
+    // order. Exercise both sides of the lane-stride boundary plus the three
+    // Q4 contractions used by the strict Gemma 4 26B common/expert graph.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q4_0_q8_simd_is_bit_exact_at_edges_and_26b_shapes() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::{q4_0_wire_row_dot, quantize_q8_0_blocks};
+
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        assert!(
+            admitted_32_lane_pipeline(kernel.q4_0_q8_ordered_simd_pipeline.as_ref()).is_some(),
+            "ordered Q4 SIMD pipeline must satisfy its 32-lane admission contract"
+        );
+
+        // (blocks/input width, output rows, tokens, shape label)
+        for &(blocks_per_row, rows, tokens, label) in &[
+            (1usize, 7usize, 2usize, "edge-1"),
+            (31, 7, 2, "edge-31"),
+            (32, 7, 2, "edge-32"),
+            (33, 7, 2, "edge-33"),
+            (88, 7, 2, "edge-88"),
+            (128, 7, 2, "edge-128"),
+            (256, 7, 2, "global-attention-8192"),
+            (88, 1_408, 1, "2816-to-1408"),
+            (88, 704, 1, "2816-to-704"),
+            (22, 2_816, 1, "704-to-2816"),
+        ] {
+            let inputs: Vec<Vec<crate::tensor::Q8_0Block>> = (0..tokens)
+                .map(|token| {
+                    let input: Vec<f32> = (0..blocks_per_row * 32)
+                        .map(|i| {
+                            ((((i * 17 + token * 13 + blocks_per_row) % 257) as f32) - 128.0)
+                                * (0.001_7 + token as f32 * 0.000_3)
+                        })
+                        .collect();
+                    quantize_q8_0_blocks(&input)
+                })
+                .collect();
+            let input_refs: Vec<&[crate::tensor::Q8_0Block]> =
+                inputs.iter().map(Vec::as_slice).collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 18);
+            for row in 0..rows {
+                for block in 0..blocks_per_row {
+                    let scale = 0.000_35 * (1 + (row * 7 + block * 3) % 61) as f32;
+                    wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for j in 0..16 {
+                        wire.push(((row * 43 + block * 19 + j * 11 + 5) % 256) as u8);
+                    }
+                }
+            }
+
+            let got = try_gemma4_q4_0_matmul_q8_batch_impl(&input_refs, &wire, rows, true)
+                .unwrap_or_else(|| panic!("ordered SIMD Q4 Metal matmul: {label}"));
+            let row_bytes = blocks_per_row * 18;
+            for (token, input) in inputs.iter().enumerate() {
+                for row in 0..rows {
+                    let expected =
+                        q4_0_wire_row_dot(&wire[row * row_bytes..(row + 1) * row_bytes], input);
+                    assert_eq!(
+                        got[token][row].to_bits(),
+                        expected.to_bits(),
+                        "shape={label} token={token} row={row} bpr={blocks_per_row}"
+                    );
+                }
+            }
+        }
+
+        // A dynamic scratch request that exceeds the device limit must never
+        // reach Metal. Forced SIMD refuses it, while the established ordered
+        // scalar lane remains a bit-exact fallback for the same valid row.
+        let oversized_blocks = (kernel.device.max_threadgroup_memory_length() as usize / 4) + 1;
+        let oversized_f32: Vec<f32> = (0..oversized_blocks * 32)
+            .map(|i| (((i * 17 % 257) as f32) - 128.0) * 0.001_7)
+            .collect();
+        let oversized_input = quantize_q8_0_blocks(&oversized_f32);
+        let oversized_refs = [oversized_input.as_slice()];
+        let mut oversized_wire = Vec::with_capacity(oversized_blocks * 18);
+        for block in 0..oversized_blocks {
+            let scale = 0.000_35 * (1 + block % 61) as f32;
+            oversized_wire.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+            for j in 0..16 {
+                oversized_wire.push(((block * 19 + j * 11 + 5) % 256) as u8);
+            }
+        }
+        assert!(
+            try_gemma4_q4_0_matmul_q8_batch_impl(&oversized_refs, &oversized_wire, 1, true,)
+                .is_none(),
+            "forced SIMD must reject an over-limit threadgroup allocation"
+        );
+        let fallback = try_gemma4_q4_0_matmul_q8_batch(&oversized_refs, &oversized_wire, 1)
+            .expect("ordered scalar fallback for over-limit SIMD scratch");
+        let expected = q4_0_wire_row_dot(&oversized_wire, &oversized_input);
+        assert_eq!(fallback[0][0].to_bits(), expected.to_bits());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q4_expert_slots_are_aligned_and_disjoint() {
+        if !detect_metal_device().available {
+            return;
+        }
+        assert!(Gemma4Q4ExpertSlots::new(0).is_none());
+        let mut slots = Gemma4Q4ExpertSlots::new(2).expect("two persistent expert slots");
+        assert_eq!(slots.slot_count(), 2);
+        assert_eq!(slots.slot_record_bytes(), GEMMA4_Q4_EXPERT_RECORD_BYTES);
+        assert!(slots
+            .slot_stride_bytes()
+            .is_multiple_of(GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT));
+        let stride = slots.slot_stride_bytes();
+        let record = slots.slot_record_bytes();
+        let slab = slots.slab_bytes_mut();
+        assert_eq!(slab.len(), 2 * stride);
+        assert!((slab.as_ptr() as usize).is_multiple_of(GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT));
+        slab[record - 1] = 0x51;
+        slab[stride] = 0xa7;
+        assert_eq!(slab[record - 1], 0x51);
+        assert_eq!(slab[stride], 0xa7);
+        assert_eq!(slots.slot_bytes_mut(0).unwrap().len(), record);
+        assert_eq!(slots.slot_bytes_mut(1).unwrap()[0], 0xa7);
+        assert!(slots.slot_bytes_mut(2).is_none());
+    }
+
+    // Full fixed-geometry expert gate. The parity lane must reproduce every
+    // output bit from the established CPU Q4_0/Q8_0 comparator, including the
+    // route-rank fold. The three-dispatch lane is intentionally measured rather
+    // than called exact: Metal tanh can differ from Rust tanhf by a few ULP.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q4_expert_pipeline_parity_and_fused_drift() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::{gemma4::gelu_tanh, q4_0_wire_row_dot, quantize_q8_0_blocks};
+
+        const WIRE: usize = 18;
+        const GU_ROWS: usize = 2 * GEMMA4_Q4_EXPERT_FF;
+        const GU_BLOCKS: usize = GEMMA4_Q4_EXPERT_HIDDEN / 32;
+        const GU_ROW_BYTES: usize = GU_BLOCKS * WIRE;
+        const GU_BYTES: usize = GU_ROWS * GU_ROW_BYTES;
+        const DOWN_BLOCKS: usize = GEMMA4_Q4_EXPERT_FF / 32;
+        const DOWN_ROW_BYTES: usize = DOWN_BLOCKS * WIRE;
+        assert_eq!(
+            GU_BYTES + GEMMA4_Q4_EXPERT_HIDDEN * DOWN_ROW_BYTES,
+            GEMMA4_Q4_EXPERT_RECORD_BYTES
+        );
+
+        let mut record = vec![0u8; GEMMA4_Q4_EXPERT_RECORD_BYTES];
+        let fill_matrix = |wire: &mut [u8], rows: usize, blocks: usize, seed: usize| {
+            for row in 0..rows {
+                for block in 0..blocks {
+                    let base = (row * blocks + block) * WIRE;
+                    let scale = 0.000_35 * (1 + (row * 7 + block * 3 + seed) % 11) as f32;
+                    wire[base..base + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for j in 0..16 {
+                        wire[base + 2 + j] = ((row * 43 + block * 19 + j * 11 + seed) % 256) as u8;
+                    }
+                }
+            }
+        };
+        fill_matrix(&mut record[..GU_BYTES], GU_ROWS, GU_BLOCKS, 5);
+        fill_matrix(
+            &mut record[GU_BYTES..],
+            GEMMA4_Q4_EXPERT_HIDDEN,
+            DOWN_BLOCKS,
+            29,
+        );
+
+        let input_f32: Vec<f32> = (0..GEMMA4_Q4_EXPERT_HIDDEN)
+            .map(|i| ((((i * 17 + 13) % 257) as f32) - 128.0) * 0.001_7)
+            .collect();
+        let input = quantize_q8_0_blocks(&input_f32);
+        assert_eq!(input.len(), GEMMA4_Q4_EXPERT_INPUT_BLOCKS);
+
+        let mut activated = Vec::with_capacity(GEMMA4_Q4_EXPERT_FF);
+        for row in 0..GEMMA4_Q4_EXPERT_FF {
+            let gate_start = row * GU_ROW_BYTES;
+            let up_start = (row + GEMMA4_Q4_EXPERT_FF) * GU_ROW_BYTES;
+            let gate = q4_0_wire_row_dot(&record[gate_start..gate_start + GU_ROW_BYTES], &input);
+            let up = q4_0_wire_row_dot(&record[up_start..up_start + GU_ROW_BYTES], &input);
+            activated.push(gelu_tanh(gate) * up);
+        }
+        let activated_q = quantize_q8_0_blocks(&activated);
+        let down: Vec<f32> = (0..GEMMA4_Q4_EXPERT_HIDDEN)
+            .map(|row| {
+                let start = GU_BYTES + row * DOWN_ROW_BYTES;
+                q4_0_wire_row_dot(&record[start..start + DOWN_ROW_BYTES], &activated_q)
+            })
+            .collect();
+        let route_scales = [0.31f32, 0.17, 0.13, 0.11, 0.09, 0.07, 0.05, 0.03];
+        let expected: Vec<f32> = down
+            .iter()
+            .map(|&y| {
+                let mut total = 0.0f32;
+                for &scale in &route_scales {
+                    total += y * scale;
+                }
+                total
+            })
+            .collect();
+
+        let mut slots = Gemma4Q4ExpertSlots::new(1).expect("persistent expert slot");
+        slots.slot_bytes_mut(0).unwrap().copy_from_slice(&record);
+        let routes = route_scales.map(|scale| Gemma4Q4ExpertRoute { slot: 0, scale });
+        let mut engine = Gemma4Q4ExpertMetal::new().expect("persistent Q4 expert engine");
+        let mut parity = vec![0.0f32; GEMMA4_Q4_EXPERT_HIDDEN];
+        let parity_diag = engine
+            .run_q8_into_parity(&input, &slots, &routes, &mut parity)
+            .expect("Q4 expert parity lane");
+        assert_eq!(parity_diag.command_buffers, 2);
+        assert_eq!(parity_diag.dispatches, 2);
+        assert!(parity_diag.cpu_geglu_boundary);
+        for (row, (&got, &want)) in parity.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "ordered persistent expert mismatch at output row {row}: {got} != {want}"
+            );
+        }
+
+        let kernel = metal_linear_kernel().expect("strict Metal kernel library");
+        assert!(
+            gemma4_q4_simd_fast_available(kernel),
+            "fixed-geometry expert SIMD pipelines must satisfy admission"
+        );
+        let mut scalar_fused = vec![0.0f32; GEMMA4_Q4_EXPERT_HIDDEN];
+        let scalar_fused_diag = engine
+            .run_q8_into_fused(&input, &slots, &routes, &mut scalar_fused, false)
+            .expect("Q4 expert scalar fused lane");
+        let mut fused = vec![0.0f32; GEMMA4_Q4_EXPERT_HIDDEN];
+        let fused_diag = engine
+            .run_q8_into(&input, &slots, &routes, &mut fused)
+            .expect("Q4 expert SIMD fused lane");
+        assert_eq!(fused_diag.command_buffers, 1);
+        assert_eq!(fused_diag.dispatches, 3);
+        assert!(!fused_diag.cpu_geglu_boundary);
+        for (row, (&simd, &scalar)) in fused.iter().zip(&scalar_fused).enumerate() {
+            assert_eq!(
+                simd.to_bits(),
+                scalar.to_bits(),
+                "SIMD/scalar fused expert mismatch at output row {row}: {simd} != {scalar}"
+            );
+        }
+        let mut differing_bits = 0usize;
+        let mut max_abs = 0.0f32;
+        for (&got, &want) in fused.iter().zip(&expected) {
+            differing_bits += usize::from(got.to_bits() != want.to_bits());
+            max_abs = max_abs.max((got - want).abs());
+        }
+        eprintln!(
+            "[gemma4-q4-expert-test] parity_gpu={}us scalar_fused_gpu={}us simd_fused_gpu={}us simd_fused={:.2}GiB/s differing_bits={differing_bits}/{} max_abs={max_abs:e}",
+            parity_diag.gpu_us,
+            scalar_fused_diag.gpu_us,
+            fused_diag.gpu_us,
+            fused_diag.effective_gib_per_s(),
+            GEMMA4_Q4_EXPERT_HIDDEN,
+        );
+        assert!(
+            max_abs <= 0.05,
+            "fused Metal GeGLU drift exceeded validation bound: {max_abs}"
+        );
+
+        let invalid_routes = route_scales.map(|scale| Gemma4Q4ExpertRoute { slot: 1, scale });
+        assert!(engine
+            .run_q8_into(&input, &slots, &invalid_routes, &mut fused)
+            .is_none());
+    }
+
     // GABBRO M3 parity gate: the Metal NVFP4 GEMV must match the CPU oracle
     // `nvfp4_wire_block_dequant` × f32 activation (self-parity, §3 leg 3). Reduction
     // order differs from the CPU dot, so the bar is a tolerance (like the q4_0 gate),
@@ -23987,6 +27888,930 @@ mod tests {
         .expect("gemma4 shared attention");
         for (a, b) in got.iter().zip(&want) {
             assert!((a - b).abs() < 2.0e-2, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct GhostCommonFixture {
+        layer: Gemma4ResidentLayer,
+        post_norm_1: Vec<f32>,
+        attn_norm: Vec<f32>,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+        post_attn_norm: Vec<f32>,
+        ffn_norm: Vec<f32>,
+        q_wire: Vec<u8>,
+        k_wire: Vec<u8>,
+        v_wire: Vec<u8>,
+        o_wire: Vec<u8>,
+        gate_wire: Vec<u8>,
+        up_wire: Vec<u8>,
+        down_wire: Vec<u8>,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ghost_common_q4_wire(rows: usize, input: usize, seed: usize) -> Vec<u8> {
+        let blocks = input / 32;
+        let mut wire = vec![0u8; rows * blocks * 18];
+        for row in 0..rows {
+            for block in 0..blocks {
+                let base = (row * blocks + block) * 18;
+                let scale = 0.000_7 * (1 + (row * 5 + block * 3 + seed) % 17) as f32;
+                wire[base..base + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                for nibble in 0..16 {
+                    wire[base + 2 + nibble] =
+                        ((row * 43 + block * 29 + nibble * 11 + seed * 7) & 0xff) as u8;
+                }
+            }
+        }
+        wire
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ghost_common_fixture(seed: usize) -> GhostCommonFixture {
+        ghost_common_fixture_with_kv_heads(seed, 1)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ghost_common_fixture_with_kv_heads(seed: usize, kv_heads: usize) -> GhostCommonFixture {
+        const HIDDEN: usize = 128;
+        const HEADS: usize = 2;
+        const HEAD_DIM: usize = 256;
+        const FFN: usize = 128;
+        assert!(kv_heads > 0 && HEADS.is_multiple_of(kv_heads));
+        let q_dim = HEADS * HEAD_DIM;
+        let kv_dim = kv_heads * HEAD_DIM;
+        let eps = 1.0e-6;
+        let attn_norm: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.73 + ((i * 7 + seed) % 19) as f32 * 0.013)
+            .collect();
+        let q_norm: Vec<f32> = (0..HEAD_DIM)
+            .map(|i| 0.69 + ((i * 5 + seed) % 23) as f32 * 0.009)
+            .collect();
+        let k_norm: Vec<f32> = (0..HEAD_DIM)
+            .map(|i| 0.67 + ((i * 3 + seed) % 17) as f32 * 0.011)
+            .collect();
+        let post_attn_norm: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.79 + ((i * 11 + seed) % 13) as f32 * 0.017)
+            .collect();
+        let ffn_norm: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.76 + ((i * 13 + seed) % 11) as f32 * 0.019)
+            .collect();
+        let post_ffw_norm: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.82 + ((i * 17 + seed) % 7) as f32 * 0.021)
+            .collect();
+        let post_norm_1: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.71 + ((i * 19 + seed) % 29) as f32 * 0.008)
+            .collect();
+        let q_wire = ghost_common_q4_wire(q_dim, HIDDEN, seed + 1);
+        let k_wire = ghost_common_q4_wire(kv_dim, HIDDEN, seed + 2);
+        let v_wire = ghost_common_q4_wire(kv_dim, HIDDEN, seed + 3);
+        let o_wire = ghost_common_q4_wire(HIDDEN, q_dim, seed + 4);
+        let gate_wire = ghost_common_q4_wire(FFN, HIDDEN, seed + 5);
+        let up_wire = ghost_common_q4_wire(FFN, HIDDEN, seed + 6);
+        let down_wire = ghost_common_q4_wire(HIDDEN, FFN, seed + 7);
+        let layer = Gemma4ResidentLayer::from_wire(
+            GemmaWireFmt::Q4_0,
+            attn_norm.clone(),
+            q_norm.clone(),
+            k_norm.clone(),
+            post_attn_norm.clone(),
+            ffn_norm.clone(),
+            post_ffw_norm,
+            &q_wire,
+            &k_wire,
+            Some(&v_wire),
+            &o_wire,
+            &gate_wire,
+            &up_wire,
+            &down_wire,
+            HEADS,
+            kv_heads,
+            HEAD_DIM,
+            FFN,
+            eps,
+        )
+        .expect("synthetic Ghost common Q4 layer");
+        GhostCommonFixture {
+            layer,
+            post_norm_1,
+            attn_norm,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            q_wire,
+            k_wire,
+            v_wire,
+            o_wire,
+            gate_wire,
+            up_wire,
+            down_wire,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ghost_common_cpu_q4_matvec(
+        wire: &[u8],
+        rows: usize,
+        input: &[crate::tensor::Q8_0Block],
+    ) -> Vec<f32> {
+        let row_bytes = input.len() * 18;
+        assert_eq!(wire.len(), rows * row_bytes);
+        (0..rows)
+            .map(|row| {
+                crate::inference::q4_0_wire_row_dot(
+                    &wire[row * row_bytes..(row + 1) * row_bytes],
+                    input,
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_common_26b_geometry_contract_is_exact() {
+        assert_eq!(GEMMA4_GHOST_26B_GLOBAL_LAYERS, [5, 11, 17, 23, 29]);
+        let schedule: Vec<bool> = (0..GEMMA4_GHOST_26B_LAYERS)
+            .map(|layer| !GEMMA4_GHOST_26B_GLOBAL_LAYERS.contains(&layer))
+            .collect();
+        assert_eq!(schedule.iter().filter(|&&local| local).count(), 25);
+        assert_eq!(schedule.iter().filter(|&&local| !local).count(), 5);
+        let local_bytes_per_position = 25
+            * 2
+            * GEMMA4_GHOST_26B_LOCAL_KV_HEADS
+            * GEMMA4_GHOST_26B_LOCAL_HEAD_DIM
+            * std::mem::size_of::<f32>();
+        let global_bytes_per_position = 5
+            * 2
+            * GEMMA4_GHOST_26B_GLOBAL_KV_HEADS
+            * GEMMA4_GHOST_26B_GLOBAL_HEAD_DIM
+            * std::mem::size_of::<f32>();
+        assert_eq!(
+            local_bytes_per_position + global_bytes_per_position,
+            450_560
+        );
+        assert_eq!(450_560usize * 4096, 1_845_493_760);
+        assert_eq!(GEMMA4_GHOST_26B_HIDDEN, 2_816);
+        assert_eq!(GEMMA4_GHOST_26B_SHARED_FF, 2_112);
+        assert_eq!(GEMMA4_GHOST_26B_SLIDING_WINDOW, 1_024);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_common_imports_position_major_kv_bit_exact_and_atomically() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 256;
+        const POSITIONS: usize = 3;
+        const CAPACITY: usize = 4;
+        let fixture = ghost_common_fixture_with_kv_heads(27, KV_HEADS);
+        let mut common = Gemma4GhostCommonMetal::new_synthetic(
+            vec![fixture.layer],
+            vec![fixture.post_norm_1],
+            CAPACITY,
+            CAPACITY,
+        )
+        .expect("multi-head common-core fixture");
+        let make_rows = |salt: usize| {
+            (0..POSITIONS)
+                .map(|position| {
+                    (0..KV_HEADS * HEAD_DIM)
+                        .map(|index| {
+                            let head = index / HEAD_DIM;
+                            let dim = index % HEAD_DIM;
+                            (salt + position * 10_000 + head * 1_000 + dim) as f32 * 0.001
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let keys = vec![make_rows(17)];
+        let values = vec![make_rows(53)];
+        common
+            .import_position_major_kv(&keys, &values, POSITIONS)
+            .expect("bit-preserving CPU KV import");
+        assert_eq!(common.next_position, vec![POSITIONS]);
+        assert_eq!(common.latest_attention_layer, None);
+
+        let assert_layout = |buffer: &Buffer, rows: &[Vec<f32>]| unsafe {
+            let actual = buffer.contents().cast::<f32>();
+            for head in 0..KV_HEADS {
+                for (position, row) in rows.iter().enumerate().take(POSITIONS) {
+                    for dim in 0..HEAD_DIM {
+                        let source = row[head * HEAD_DIM + dim];
+                        let destination =
+                            *actual.add((head * CAPACITY + position) * HEAD_DIM + dim);
+                        assert_eq!(
+                            destination.to_bits(),
+                            source.to_bits(),
+                            "head={head} position={position} dim={dim}"
+                        );
+                    }
+                }
+            }
+        };
+        assert_layout(&common.cache_k[0], &keys[0]);
+        assert_layout(&common.cache_v[0], &values[0]);
+
+        // A malformed later validation must not disturb either cache or the
+        // sequential-position watermark established by the successful import.
+        let snapshot = |buffer: &Buffer| unsafe {
+            let source = buffer.contents().cast::<f32>();
+            (0..KV_HEADS * CAPACITY * HEAD_DIM)
+                .map(|index| (*source.add(index)).to_bits())
+                .collect::<Vec<_>>()
+        };
+        let key_before = snapshot(&common.cache_k[0]);
+        let value_before = snapshot(&common.cache_v[0]);
+        let mut invalid_keys = keys.clone();
+        invalid_keys[0][2][9] = f32::NAN;
+        let error = common
+            .import_position_major_kv(&invalid_keys, &values, POSITIONS)
+            .expect_err("non-finite KV must refuse");
+        assert!(error.to_string().contains("non-finite"));
+        assert_eq!(snapshot(&common.cache_k[0]), key_before);
+        assert_eq!(snapshot(&common.cache_v[0]), value_before);
+        assert_eq!(common.next_position, vec![POSITIONS]);
+
+        // The imported watermark is the next legal decode position. Reject a
+        // rewind without mutation, then consume the imported history at exactly N.
+        let hidden: Vec<f32> = (0..128).map(|index| index as f32 * 0.0007).collect();
+        let cos = vec![1.0f32; HEAD_DIM / 2];
+        let sin = vec![0.0f32; HEAD_DIM / 2];
+        assert!(common.write_hidden(&hidden));
+        assert!(common
+            .enqueue_attention(0, &cos, &sin, POSITIONS - 1)
+            .is_none());
+        let diagnostics = common
+            .enqueue_attention(0, &cos, &sin, POSITIONS)
+            .and_then(Gemma4GhostCommonPending::wait)
+            .expect("decode at the first post-import position");
+        assert_eq!(diagnostics.position, POSITIONS);
+        assert_eq!(common.next_position, vec![POSITIONS + 1]);
+        assert!(common
+            .read_attention_output()
+            .iter()
+            .all(|value| value.is_finite()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ghost_common_owned_wire_pages_release_on_drop() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use std::io::{Seek, SeekFrom, Write};
+        let page = crate::wire_mmap::page_size();
+        let mut file = tempfile::tempfile().expect("temporary wire file");
+        file.write_all(&vec![0x5au8; page])
+            .expect("write temporary wire bytes");
+        file.seek(SeekFrom::Start(0)).expect("rewind wire file");
+        let pages = crate::wire_mmap::WirePages::read_from_file(&file, 0, page)
+            .expect("page-aligned wire allocation");
+        let baseline = std::sync::Arc::strong_count(&pages);
+        let layer = Gemma4ResidentLayer::from_wire_pages_owned(
+            GemmaWireFmt::Q4_0,
+            vec![1.0; 32],
+            vec![1.0; 32],
+            vec![1.0; 32],
+            vec![1.0; 32],
+            vec![1.0; 32],
+            vec![1.0; 32],
+            &pages,
+            &pages,
+            Some(&pages),
+            &pages,
+            &pages,
+            &pages,
+            &pages,
+            1,
+            1,
+            32,
+            32,
+            1.0e-6,
+        )
+        .expect("reload-safe resident layer");
+        assert_eq!(std::sync::Arc::strong_count(&pages), baseline + 7);
+        drop(layer);
+        assert_eq!(
+            std::sync::Arc::strong_count(&pages),
+            baseline,
+            "dropping the Ghost layer must release every lifecycle-owned WirePages Arc"
+        );
+    }
+
+    // Phase-1 attention parity: the reusable common core must follow the CPU wire
+    // lane's RMS -> Q8 activation -> ordered Q4 projection order, persist its f32
+    // KV slot, and stop exactly at the post-attention residual.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_common_attention_matches_cpu_wire_oracle() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::quantize_q8_0_blocks;
+        const HIDDEN: usize = 128;
+        const HEADS: usize = 2;
+        const HEAD_DIM: usize = 256;
+        const Q_DIM: usize = HEADS * HEAD_DIM;
+        let fixture = ghost_common_fixture(31);
+        let h: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 37 + 17) % 211) as f32 - 105.0) * 0.0061)
+            .collect();
+        let cos_t = vec![1.0f32; HEAD_DIM / 2];
+        let sin_t = vec![0.0f32; HEAD_DIM / 2];
+
+        // At position zero every query head attends exactly one value row, so
+        // context is the weightless-normalized V row repeated across GQA heads.
+        // Q/K still execute and populate persistent K, but cannot obscure the O
+        // projection and sandwich-norm parity this test is targeting.
+        let normed = crate::gemma4_runtime::rms_norm(&h, Some(&fixture.attn_norm), 1.0e-6);
+        let normed_q8 = quantize_q8_0_blocks(&normed);
+        let value = ghost_common_cpu_q4_matvec(&fixture.v_wire, HEAD_DIM, &normed_q8);
+        let value = crate::gemma4_runtime::rms_norm(&value, None, 1.0e-6);
+        let mut context = Vec::with_capacity(Q_DIM);
+        context.extend_from_slice(&value);
+        context.extend_from_slice(&value);
+        let context_q8 = quantize_q8_0_blocks(&context);
+        let projection = ghost_common_cpu_q4_matvec(&fixture.o_wire, HIDDEN, &context_q8);
+        let projection =
+            crate::gemma4_runtime::rms_norm(&projection, Some(&fixture.post_attn_norm), 1.0e-6);
+        let expected: Vec<f32> = h
+            .iter()
+            .zip(&projection)
+            .map(|(residual, projected)| residual + projected)
+            .collect();
+
+        let mut common = Gemma4GhostCommonMetal::new_synthetic(
+            vec![fixture.layer],
+            vec![fixture.post_norm_1],
+            2,
+            2,
+        )
+        .expect("synthetic persistent Ghost common core");
+        let geometry = common.geometry();
+        assert_eq!(geometry.layers, 1);
+        assert_eq!(geometry.local_layers, 1);
+        assert_eq!(geometry.global_layers, 0);
+        assert_eq!(geometry.kv_bytes, 2 * HEAD_DIM * 2 * 4);
+        let (actual, diagnostics) = common
+            .execute_attention(0, &h, &cos_t, &sin_t, 0)
+            .expect("persistent ordered-Q4 attention");
+        assert_eq!(diagnostics.stage, Gemma4GhostCommonStage::Attention);
+        assert_eq!(diagnostics.command_buffers, 1);
+        assert_eq!(diagnostics.dispatches, 17);
+        assert_eq!(diagnostics.readback_bytes, (HIDDEN * 4) as u64);
+        assert!(diagnostics.streamed_weight_bytes > 0);
+        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = 3.0e-2 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "attention row {index}: metal={got} cpu={want} tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_common_attention_reads_prior_kv_history() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::quantize_q8_0_blocks;
+        const HIDDEN: usize = 128;
+        const HEADS: usize = 2;
+        const HEAD_DIM: usize = 256;
+        const Q_DIM: usize = HEADS * HEAD_DIM;
+        let fixture = ghost_common_fixture(49);
+        let h0: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 29 + 13) % 181) as f32 - 90.0) * 0.0049)
+            .collect();
+        let h1: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 43 + 19) % 227) as f32 - 113.0) * 0.0041)
+            .collect();
+        let cos_t = vec![1.0f32; HEAD_DIM / 2];
+        let sin_t = vec![0.0f32; HEAD_DIM / 2];
+
+        let qkv = |hidden: &[f32]| {
+            let normalized =
+                crate::gemma4_runtime::rms_norm(hidden, Some(&fixture.attn_norm), 1.0e-6);
+            let input = quantize_q8_0_blocks(&normalized);
+            let mut q = ghost_common_cpu_q4_matvec(&fixture.q_wire, Q_DIM, &input);
+            for head in 0..HEADS {
+                let base = head * HEAD_DIM;
+                let normalized_head = crate::gemma4_runtime::rms_norm(
+                    &q[base..base + HEAD_DIM],
+                    Some(&fixture.q_norm),
+                    1.0e-6,
+                );
+                q[base..base + HEAD_DIM].copy_from_slice(&normalized_head);
+            }
+            let k_raw = ghost_common_cpu_q4_matvec(&fixture.k_wire, HEAD_DIM, &input);
+            let k = crate::gemma4_runtime::rms_norm(&k_raw, Some(&fixture.k_norm), 1.0e-6);
+            let v_raw = ghost_common_cpu_q4_matvec(&fixture.v_wire, HEAD_DIM, &input);
+            let v = crate::gemma4_runtime::rms_norm(&v_raw, None, 1.0e-6);
+            (q, k, v)
+        };
+        let (_, k0, v0) = qkv(&h0);
+        let (q1, k1, v1) = qkv(&h1);
+        let mut context = vec![0.0f32; Q_DIM];
+        for head in 0..HEADS {
+            let qh = &q1[head * HEAD_DIM..(head + 1) * HEAD_DIM];
+            let score0 = qh.iter().zip(&k0).map(|(a, b)| a * b).sum::<f32>();
+            let score1 = qh.iter().zip(&k1).map(|(a, b)| a * b).sum::<f32>();
+            let maximum = score0.max(score1);
+            let weight0 = (score0 - maximum).exp();
+            let weight1 = (score1 - maximum).exp();
+            let denominator = weight0 + weight1;
+            for d in 0..HEAD_DIM {
+                context[head * HEAD_DIM + d] = (weight0 * v0[d] + weight1 * v1[d]) / denominator;
+            }
+        }
+        let context_q8 = quantize_q8_0_blocks(&context);
+        let projection = ghost_common_cpu_q4_matvec(&fixture.o_wire, HIDDEN, &context_q8);
+        let projection =
+            crate::gemma4_runtime::rms_norm(&projection, Some(&fixture.post_attn_norm), 1.0e-6);
+        let expected: Vec<f32> = h1
+            .iter()
+            .zip(&projection)
+            .map(|(residual, attention)| residual + attention)
+            .collect();
+
+        let mut common = Gemma4GhostCommonMetal::new_synthetic(
+            vec![fixture.layer],
+            vec![fixture.post_norm_1],
+            3,
+            3,
+        )
+        .expect("synthetic persistent Ghost common core");
+        common
+            .execute_attention(0, &h0, &cos_t, &sin_t, 0)
+            .expect("position-zero KV write");
+        let (actual, diagnostics) = common
+            .execute_attention(0, &h1, &cos_t, &sin_t, 1)
+            .expect("position-one history attention");
+        assert_eq!(diagnostics.position, 1);
+        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = 3.0e-2 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "history attention {index}: metal={got} cpu={want} tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_common_attention_router_fusion_matches_standalone() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const HIDDEN: usize = 128;
+        const EXPERTS: usize = 128;
+        const HEAD_DIM: usize = 256;
+        let split_fixture = ghost_common_fixture(61);
+        let fused_fixture = ghost_common_fixture(61);
+        let hidden: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 47 + 29) % 239) as f32 - 119.0) * 0.0047)
+            .collect();
+        let cos_t = vec![1.0f32; HEAD_DIM / 2];
+        let sin_t = vec![0.0f32; HEAD_DIM / 2];
+        let router: Vec<f32> = (0..EXPERTS * HIDDEN)
+            .map(|i| (((i * 19 + 5) % 83) as f32 - 41.0) * 0.0007)
+            .collect();
+        let gate_input_scale: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.78 + (i % 17) as f32 * 0.006)
+            .collect();
+        let pre_norm_2: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.72 + (i % 11) as f32 * 0.009)
+            .collect();
+        let post_norm_2: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.75 + (i % 13) as f32 * 0.008)
+            .collect();
+        let config = || Gemma4GhostMoeLayerConfig {
+            router: router.clone(),
+            gate_input_scale: gate_input_scale.clone(),
+            pre_norm_2: pre_norm_2.clone(),
+            post_norm_2: post_norm_2.clone(),
+            layer_output_scale: 1.0,
+        };
+
+        let mut split = Gemma4GhostCommonMetal::new_synthetic(
+            vec![split_fixture.layer],
+            vec![split_fixture.post_norm_1],
+            2,
+            2,
+        )
+        .expect("standalone common core");
+        assert!(split.configure_moe(vec![config()]));
+        assert!(split.write_hidden(&hidden));
+        let attention_diagnostics = split
+            .enqueue_attention(0, &cos_t, &sin_t, 0)
+            .and_then(Gemma4GhostCommonPending::wait)
+            .expect("standalone attention");
+        let router_diagnostics = split
+            .enqueue_router(0)
+            .and_then(Gemma4GhostCommonPending::wait)
+            .expect("standalone router");
+        let expected_attention = split.read_attention_output();
+        let expected_logits = split.read_router_logits().expect("standalone logits");
+
+        let mut fused = Gemma4GhostCommonMetal::new_synthetic(
+            vec![fused_fixture.layer],
+            vec![fused_fixture.post_norm_1],
+            2,
+            2,
+        )
+        .expect("fused common core");
+        assert!(fused.configure_moe(vec![config()]));
+        assert!(fused.write_hidden(&hidden));
+        let fused_diagnostics = fused
+            .enqueue_attention_router(0, &cos_t, &sin_t, 0)
+            .and_then(Gemma4GhostCommonPending::wait)
+            .expect("fused attention/router");
+        let actual_attention = fused.read_attention_output();
+        let actual_logits = fused.read_router_logits().expect("fused logits");
+
+        assert_eq!(
+            fused_diagnostics.stage,
+            Gemma4GhostCommonStage::AttentionRouter
+        );
+        assert_eq!(fused_diagnostics.command_buffers, 1);
+        assert_eq!(
+            fused_diagnostics.dispatches,
+            attention_diagnostics.dispatches + router_diagnostics.dispatches
+        );
+        assert_eq!(
+            fused_diagnostics.streamed_weight_bytes,
+            attention_diagnostics.streamed_weight_bytes + router_diagnostics.streamed_weight_bytes
+        );
+        assert_eq!(fused_diagnostics.readback_bytes, (EXPERTS * 4) as u64);
+        assert_eq!(fused_diagnostics.position, 0);
+        assert!(actual_attention
+            .iter()
+            .zip(&expected_attention)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+        assert!(actual_logits
+            .iter()
+            .zip(&expected_logits)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_common_attention_router_requires_moe_before_kv_advance() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const HIDDEN: usize = 128;
+        const HEAD_DIM: usize = 256;
+        let fixture = ghost_common_fixture(67);
+        let hidden = vec![0.125f32; HIDDEN];
+        let cos_t = vec![1.0f32; HEAD_DIM / 2];
+        let sin_t = vec![0.0f32; HEAD_DIM / 2];
+        let mut common = Gemma4GhostCommonMetal::new_synthetic(
+            vec![fixture.layer],
+            vec![fixture.post_norm_1],
+            2,
+            2,
+        )
+        .expect("unconfigured common core");
+        assert!(common.write_hidden(&hidden));
+        assert!(common
+            .enqueue_attention_router(0, &cos_t, &sin_t, 0)
+            .is_none());
+        let diagnostics = common
+            .enqueue_attention(0, &cos_t, &sin_t, 0)
+            .and_then(Gemma4GhostCommonPending::wait)
+            .expect("position zero remains available after fused preflight refusal");
+        assert_eq!(diagnostics.stage, Gemma4GhostCommonStage::Attention);
+        assert_eq!(diagnostics.position, 0);
+    }
+
+    // Phase-1 shared-branch parity and split-point gate. This branch returns
+    // post_norm_1(down(GeGLU(...))) and must NOT add the attention residual; the
+    // two-branch MoE tail owns that composition later.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_common_shared_branch_matches_cpu_without_residual() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::{gemma4::gelu_tanh, quantize_q8_0_blocks};
+        const HIDDEN: usize = 128;
+        const FFN: usize = 128;
+        let fixture = ghost_common_fixture(73);
+        let attention_output: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 41 + 23) % 251) as f32 - 125.0) * 0.0057)
+            .collect();
+        let normalized =
+            crate::gemma4_runtime::rms_norm(&attention_output, Some(&fixture.ffn_norm), 1.0e-6);
+        let normalized_q8 = quantize_q8_0_blocks(&normalized);
+        let gate = ghost_common_cpu_q4_matvec(&fixture.gate_wire, FFN, &normalized_q8);
+        let up = ghost_common_cpu_q4_matvec(&fixture.up_wire, FFN, &normalized_q8);
+        let activated: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&gate, &up)| gelu_tanh(gate) * up)
+            .collect();
+        let activated_q8 = quantize_q8_0_blocks(&activated);
+        let down = ghost_common_cpu_q4_matvec(&fixture.down_wire, HIDDEN, &activated_q8);
+        let expected = crate::gemma4_runtime::rms_norm(&down, Some(&fixture.post_norm_1), 1.0e-6);
+
+        let mut common = Gemma4GhostCommonMetal::new_synthetic(
+            vec![fixture.layer],
+            vec![fixture.post_norm_1],
+            2,
+            2,
+        )
+        .expect("synthetic persistent Ghost common core");
+        let (actual, diagnostics) = common
+            .execute_shared_branch(0, &attention_output)
+            .expect("enqueue/wait shared branch");
+        assert_eq!(diagnostics.stage, Gemma4GhostCommonStage::SharedBranch);
+        assert_eq!(diagnostics.command_buffers, 1);
+        assert_eq!(diagnostics.dispatches, 7);
+        assert_eq!(diagnostics.readback_bytes, (HIDDEN * 4) as u64);
+        let mut max_expected_error = 0.0f32;
+        let mut max_residual_error = 0.0f32;
+        for ((&got, &want), &residual) in actual.iter().zip(&expected).zip(&attention_output) {
+            max_expected_error = max_expected_error.max((got - want).abs());
+            max_residual_error = max_residual_error.max((got - (want + residual)).abs());
+            let tolerance = 3.0e-2 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "shared branch metal={got} cpu={want} tolerance={tolerance}"
+            );
+        }
+        assert!(
+            max_residual_error > max_expected_error + 0.1,
+            "shared output appears residual-added: oracle_error={max_expected_error} residual_error={max_residual_error}"
+        );
+
+        // The production constructor must fail closed on this reduced synthetic
+        // geometry before allocating any 26B-sized KV buffers.
+        let reduced = ghost_common_fixture(91);
+        assert!(
+            Gemma4GhostCommonMetal::new_26b(vec![reduced.layer], vec![reduced.post_norm_1], 2,)
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_router_and_tail_keep_hidden_on_device() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const HIDDEN: usize = 128;
+        const EXPERTS: usize = 128;
+        let fixture = ghost_common_fixture(117);
+        let post_ffw_norm = fixture.layer.post_ffw_norm.clone();
+        let attention: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 31 + 7) % 199) as f32 - 99.0) * 0.0043)
+            .collect();
+        let gate_scale: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.81 + (i % 13) as f32 * 0.007)
+            .collect();
+        let router: Vec<f32> = (0..EXPERTS * HIDDEN)
+            .map(|i| (((i * 17 + 3) % 71) as f32 - 35.0) * 0.0009)
+            .collect();
+        let pre_norm_2: Vec<f32> = (0..HIDDEN).map(|i| 0.74 + (i % 9) as f32 * 0.011).collect();
+        let post_norm_2: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.77 + (i % 11) as f32 * 0.009)
+            .collect();
+        let mut common = Gemma4GhostCommonMetal::new_synthetic(
+            vec![fixture.layer],
+            vec![fixture.post_norm_1],
+            2,
+            2,
+        )
+        .expect("synthetic persistent Ghost common core");
+        assert!(common.configure_moe(vec![Gemma4GhostMoeLayerConfig {
+            router: router.clone(),
+            gate_input_scale: gate_scale.clone(),
+            pre_norm_2,
+            post_norm_2: post_norm_2.clone(),
+            layer_output_scale: 1.0,
+        }]));
+        assert!(common.moe_configured());
+        assert!(common.write_attention_output_for_test(&attention, 0));
+        let router_diagnostics = common
+            .enqueue_router(0)
+            .and_then(Gemma4GhostCommonPending::wait)
+            .expect("router command");
+        assert_eq!(router_diagnostics.stage, Gemma4GhostCommonStage::Router);
+        assert_eq!(router_diagnostics.readback_bytes, (EXPERTS * 4) as u64);
+        let actual_logits = common.read_router_logits().expect("router logits");
+        let mut router_input = crate::gemma4_runtime::rms_norm(&attention, None, 1.0e-6);
+        let hidden_inv = 1.0 / (HIDDEN as f32).sqrt();
+        for (value, scale) in router_input.iter_mut().zip(&gate_scale) {
+            *value = *value * hidden_inv * scale;
+        }
+        let expected_logits =
+            crate::gemma4_runtime::f32_matvec(&router, HIDDEN, EXPERTS, &router_input);
+        for (index, (&got, &want)) in actual_logits.iter().zip(&expected_logits).enumerate() {
+            assert!(
+                (got - want).abs() <= 2.0e-4f32.max(want.abs() * 2.0e-3),
+                "router logit {index}: metal={got} cpu={want}"
+            );
+        }
+
+        let shared: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 23 + 5) % 149) as f32 - 74.0) * 0.0037)
+            .collect();
+        let routed: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 19 + 11) % 163) as f32 - 81.0) * 0.0041)
+            .collect();
+        write_buffer_f32(&common.shared_output, &shared);
+        write_buffer_f32(&common.routed_output, &routed);
+        let kernel = metal_linear_kernel().expect("Metal kernel");
+        let command = kernel.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        assert_eq!(common.encode_moe_tail(encoder, kernel, 0), Some(4));
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+        common.promote_tail_output();
+        let actual_tail = common.read_hidden();
+        let routed_normed = crate::gemma4_runtime::rms_norm(&routed, Some(&post_norm_2), 1.0e-6);
+        let combined: Vec<f32> = shared
+            .iter()
+            .zip(&routed_normed)
+            .map(|(shared, routed)| shared + routed)
+            .collect();
+        let combined_normed =
+            crate::gemma4_runtime::rms_norm(&combined, Some(&post_ffw_norm), 1.0e-6);
+        let expected_tail: Vec<f32> = attention
+            .iter()
+            .zip(&combined_normed)
+            .map(|(residual, ffn)| residual + ffn)
+            .collect();
+        for (index, (&got, &want)) in actual_tail.iter().zip(&expected_tail).enumerate() {
+            assert!(
+                (got - want).abs() <= 3.0e-3f32.max(want.abs() * 3.0e-3),
+                "tail value {index}: metal={got} cpu={want}"
+            );
+        }
+    }
+
+    /// Encode-ahead queues the next layer before the host has explicitly
+    /// drained the previous layer. Prove that shared and MoE argument blocks
+    /// remain layer-local under that schedule, and that immediate tail-buffer
+    /// promotion still exposes the second queued result after the FIFO fence.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ghost_two_layer_encode_ahead_keeps_arguments_immutable() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::{gemma4::gelu_tanh, quantize_q8_0_blocks};
+
+        const HIDDEN: usize = 128;
+        const FFN: usize = 128;
+        const EXPERTS: usize = 128;
+        let first = ghost_common_fixture(211);
+        let second = ghost_common_fixture(223);
+        let second_post_ffw = second.layer.post_ffw_norm.clone();
+        let second_post_norm_1 = second.post_norm_1.clone();
+        let second_gate_wire = second.gate_wire.clone();
+        let second_up_wire = second.up_wire.clone();
+        let second_down_wire = second.down_wire.clone();
+        let attention: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 37 + 9) % 181) as f32 - 90.0) * 0.0039)
+            .collect();
+
+        let normalized =
+            crate::gemma4_runtime::rms_norm(&attention, Some(&second.ffn_norm), 1.0e-6);
+        let normalized_q8 = quantize_q8_0_blocks(&normalized);
+        let gate = ghost_common_cpu_q4_matvec(&second_gate_wire, FFN, &normalized_q8);
+        let up = ghost_common_cpu_q4_matvec(&second_up_wire, FFN, &normalized_q8);
+        let activated: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&gate, &up)| gelu_tanh(gate) * up)
+            .collect();
+        let activated_q8 = quantize_q8_0_blocks(&activated);
+        let down = ghost_common_cpu_q4_matvec(&second_down_wire, HIDDEN, &activated_q8);
+        let expected_shared =
+            crate::gemma4_runtime::rms_norm(&down, Some(&second_post_norm_1), 1.0e-6);
+
+        let first_post_1 = first.post_norm_1;
+        let first_layer = first.layer;
+        let second_layer = second.layer;
+        let mut common = Gemma4GhostCommonMetal::new_synthetic(
+            vec![first_layer, second_layer],
+            vec![first_post_1, second.post_norm_1],
+            2,
+            2,
+        )
+        .expect("two-layer synthetic common core");
+        let first_post_norm_2 = vec![0.83f32; HIDDEN];
+        let second_post_norm_2: Vec<f32> = (0..HIDDEN)
+            .map(|i| 0.71 + (i % 13) as f32 * 0.011)
+            .collect();
+        let config = |post_norm_2: Vec<f32>, layer_output_scale: f32| Gemma4GhostMoeLayerConfig {
+            router: vec![0.0; EXPERTS * HIDDEN],
+            gate_input_scale: vec![1.0; HIDDEN],
+            pre_norm_2: vec![1.0; HIDDEN],
+            post_norm_2,
+            layer_output_scale,
+        };
+        assert!(common.configure_moe(vec![
+            config(first_post_norm_2, 0.5),
+            config(second_post_norm_2.clone(), 0.75),
+        ]));
+
+        // A pointer check catches any future refactor that accidentally folds
+        // these immutable blocks back into shared hot scratch.
+        assert_ne!(
+            common.norms[0].shared_rms_scalar.contents(),
+            common.norms[1].shared_rms_scalar.contents()
+        );
+        let moe_layers = common.moe_layers.as_ref().expect("configured MoE");
+        assert_ne!(
+            moe_layers[0].rms_scalar.contents(),
+            moe_layers[1].rms_scalar.contents()
+        );
+        assert_ne!(
+            moe_layers[0].layer_scale_scalar.contents(),
+            moe_layers[1].layer_scale_scalar.contents()
+        );
+
+        assert!(common.write_attention_output_for_test(&attention, 0));
+        let first_shared = common.enqueue_shared_branch(0).expect("first shared");
+        // Production reaches this state through the queued next-layer
+        // attention command; the test keeps the common input unchanged so only
+        // argument-buffer isolation is under test.
+        common.latest_attention_layer = Some(1);
+        let second_shared = common.enqueue_shared_branch(1).expect("second shared");
+        assert!(second_shared.wait().is_some());
+        assert!(first_shared.wait().is_some());
+        let actual_shared = common.read_shared_output();
+        for (index, (&got, &want)) in actual_shared.iter().zip(&expected_shared).enumerate() {
+            let tolerance = 3.0e-2 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "encode-ahead shared value {index}: metal={got} cpu={want} tolerance={tolerance}"
+            );
+        }
+
+        let routed: Vec<f32> = (0..HIDDEN)
+            .map(|i| (((i * 29 + 17) % 173) as f32 - 86.0) * 0.0041)
+            .collect();
+        write_buffer_f32(&common.routed_output, &routed);
+        let kernel = metal_linear_kernel().expect("Metal kernel");
+        let first_tail = kernel.queue.new_command_buffer();
+        let first_encoder = first_tail.new_compute_command_encoder();
+        assert_eq!(common.encode_moe_tail(first_encoder, kernel, 0), Some(5));
+        first_encoder.end_encoding();
+        first_tail.commit();
+        common.promote_tail_output();
+
+        let second_tail = kernel.queue.new_command_buffer();
+        let second_encoder = second_tail.new_compute_command_encoder();
+        assert_eq!(common.encode_moe_tail(second_encoder, kernel, 1), Some(5));
+        second_encoder.end_encoding();
+        second_tail.commit();
+        common.promote_tail_output();
+
+        // Waiting on the later FIFO command first mirrors the runtime's next
+        // attention/router fence; the earlier command must already be terminal.
+        second_tail.wait_until_completed();
+        assert_eq!(
+            second_tail.status(),
+            metal::MTLCommandBufferStatus::Completed
+        );
+        first_tail.wait_until_completed();
+        assert_eq!(
+            first_tail.status(),
+            metal::MTLCommandBufferStatus::Completed
+        );
+
+        let routed_normed =
+            crate::gemma4_runtime::rms_norm(&routed, Some(&second_post_norm_2), 1.0e-6);
+        let combined: Vec<f32> = actual_shared
+            .iter()
+            .zip(&routed_normed)
+            .map(|(shared, routed)| shared + routed)
+            .collect();
+        let combined_normed =
+            crate::gemma4_runtime::rms_norm(&combined, Some(&second_post_ffw), 1.0e-6);
+        let expected_tail: Vec<f32> = attention
+            .iter()
+            .zip(&combined_normed)
+            .map(|(residual, ffn)| (residual + ffn) * 0.75)
+            .collect();
+        let actual_tail = common.read_hidden();
+        for (index, (&got, &want)) in actual_tail.iter().zip(&expected_tail).enumerate() {
+            assert!(
+                (got - want).abs() <= 4.0e-3f32.max(want.abs() * 4.0e-3),
+                "encode-ahead tail value {index}: metal={got} cpu={want}"
+            );
         }
     }
 

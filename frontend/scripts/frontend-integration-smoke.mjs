@@ -254,7 +254,8 @@ try {
   assert.match(streamingMarkup, /aria-busy="true"/, 'streaming rows and code cards should be marked busy while backend generation is active')
   assert.match(streamingMarkup, /message-code-card is-generating/, 'open streaming code should render as the real ForgeLocal-derived code card, not fallback prose')
   assert.match(streamingMarkup, /Generation details \(client-measured telemetry\)/, 'the meta footer should render during streaming as the live tok/s readout')
-  assert.match(streamingMarkup, /13 tok\/s/, 'the streaming footer should show the live-patched decode rate')
+  assert.match(streamingMarkup, /13 tok\/s/, 'the streaming footer should show the live-patched output rate')
+  assert.match(streamingMarkup, /End-to-end output rate, measured in this browser/, 'the browser output-rate hover must not imply decode-only timing')
   assert.doesNotMatch(streamingMarkup, /cxturn__meta--reserve/, 'the invisible footer placeholder must not render; the live footer holds the layout slot itself')
 
   const activeSendStreamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
@@ -419,6 +420,21 @@ try {
     capabilities,
   }))
   assert.match(cudaSystemMarkup, /Selected device at load[\s\S]*CUDA GPU[\s\S]*cuda resident q8 runtime/, 'System should render a consistent CUDA load plan without implying current effective execution')
+  const ghostHybridSystemMarkup = renderToStaticMarkup(React.createElement(SystemView, {
+    runtime: {
+      ...readyRuntime,
+      backend: 'gemma4-runtime',
+      gemma4_serve_lane: 'ghost_moe',
+      gemma4_ghost_execution_mode: 'hybrid_metal',
+      gemma4_ghost_common_metal_active: false,
+      gemma4_ghost_experts_metal_active: true,
+      gemma4_ghost_head_metal_active: true,
+    },
+    selectedModel,
+    capabilities,
+  }))
+  assert.match(ghostHybridSystemMarkup, /Available Ghost acceleration[\s\S]*Hybrid Metal \+ local SSD[\s\S]*Ghost serving lane[\s\S]*Ghost-MoE/, 'System should label the live Ghost component report instead of calling it a load-time device plan')
+  assert.match(ghostHybridSystemMarkup, /Common core: CPU\.[\s\S]*Persistent Q4_0 expert slots: Metal\.[\s\S]*Q6_K tied head: Metal\./, 'System should identify every hybrid Ghost Metal component')
   const idleSystemMarkup = renderToStaticMarkup(React.createElement(SystemView, {
     runtime: { api_base: 'http://127.0.0.1:8181', status: 'online', loaded_now: false, generation_ready: false },
     selectedModel: null,

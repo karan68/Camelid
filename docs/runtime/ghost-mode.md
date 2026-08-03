@@ -1,12 +1,10 @@
 # Ghost mode: memory-constrained layer-streaming execution (EXPERIMENTAL)
 
-Ghost mode runs models that are far larger than RAM by executing one transformer block at a
-time: only a tiny active working window (one layer's weights) plus the embedding/output ends
-and the KV cache are materialized; everything else streams sequentially from disk every
-token. It deliberately trades throughput for a strict memory ceiling — the inverse of the
-primary inference paths, which hard-require RAM-resident weights. The two paths share
-kernels but are otherwise isolated: ghost lives behind the dedicated `ghost-run` subcommand
-and the `repack-ghost` tool, and touches none of the resident decode loops.
+Ghost mode runs models that are far larger than RAM with one of two bounded-storage plans.
+Dense models execute one transformer block at a time. Sparse MoE models keep the shared core
+available and read only the experts selected by the current layer's router. Both deliberately
+trade throughput for a strict application-owned memory ceiling. They live behind the dedicated
+`ghost-run` subcommand and the `repack-ghost` tool.
 
 ## Why a custom container (`.cghost`)
 
@@ -34,6 +32,148 @@ FFN interiors to hit a ~1.65 bit/param average for 70B-on-16GB) is a planned v2 
 a *quality* trade, and can never be parity-gated against a different-quant baseline. Note
 that sub-2-bit formats (IQ1_S / IQ2_XXS class) are not yet supported by the runtime's
 loader/kernels; that support is a prerequisite for the v2 map.
+
+## Ghost-MoE v2: Gemma 4 26B-A4B
+
+Gemma 4 26B-A4B has 30 layers, 128 routed experts per layer, and selects 8 experts for each
+token. Its shared attention, router, dense shared-expert branch, embedding/head, and norms are
+about 1.35 GB in the target 4-bit checkpoint; routed expert tensors account for roughly another
+12 GB. Reading a whole layer would discard the architectural advantage of MoE.
+
+For this row `repack-ghost` automatically writes a version-2 `moe_experts` layout instead of the
+dense layout:
+
+```text
+[magic "CGHOST1\0"][u64 index_offset][pad]
+[blk.0.exp.0: fused gate+up slice, down slice]
+[blk.0.exp.1: fused gate+up slice, down slice]
+...
+[blk.29.exp.127: fused gate+up slice, down slice]
+[v2 index JSON: layout, model shape, groups]
+```
+
+This expert-splicing layout is informed by
+[TurboFieldfare](https://github.com/drumih/turbo-fieldfare); Camelid keeps its existing GGUF
+binding, tokenizer, router, KV cache, and quantized row kernels around the bounded expert reader.
+
+Every expert group begins on a 16 KiB boundary and contains source-quantized bytes copied directly
+from the GGUF. Repacking uses a 1 MiB scratch buffer and never materializes a complete expert
+tensor. One cache miss is one sequential positioned read containing both expert projections.
+
+At generation time:
+
+1. The existing Gemma 4 runtime computes attention and the 128-way router from shared GGUF weights.
+2. The router chooses the exact same top 8 experts as the normal path.
+3. Cache hits reuse the selected expert's wire bytes. Misses `pread` one v2 expert group.
+4. Existing Q4/Q8/K-quant row kernels consume the cached bytes without converting them to dense f32.
+5. A model-global byte budget evicts old entries; retained expert bytes cannot exceed
+   `--expert-cache-mib` regardless of the number of layers or experts visited.
+6. Expert reads use normal buffered positioned I/O by default, allowing the OS page cache to
+   reuse hot records. `serve --ghost-strict-cache` (or
+   `CAMELID_GEMMA4_GHOST_STRICT_CACHE=1`) opts into macOS `F_NOCACHE` for a stricter memory
+   ceiling at the cost of that reuse. The original expert tensors in the GGUF are excluded from
+   `MADV_WILLNEED` and are never touched by the Ghost-MoE forward path.
+
+The GGUF remains necessary for the tokenizer, metadata, and common weights. The `.cghost` is a
+second on-disk artifact containing only routed experts; it does not duplicate the shared core.
+
+New v2 repacks bind those two artifacts with a bounded sampled SHA-256 identity. Camelid samples
+every routed expert and every bound common tensor, so startup reads roughly a megabyte of identity
+bytes rather than hashing the full 14+ GiB GGUF. The same samples are checked lazily in each
+`.cghost` record on first use. Sparse legacy v2 files do not prove artifact identity and are refused
+by default. `CAMELID_GHOST_ALLOW_LEGACY_SPARSE=1` is an explicitly unsafe, shape-only recovery
+override; full, non-sparse legacy GGUF files remain compatible.
+
+The repacker can make an offset-compatible sparse common-core shadow so the runtime working pair
+contains no duplicate routed-expert payload:
+
+```bash
+cargo run --release --bin repack-ghost -- \
+  archives/gemma-4-26B_q4_0-it.gguf \
+  --out models/gemma-4-26B_q4_0-it.cghost \
+  --hot-shadow models/gemma-4-26B_q4_0-it.gguf
+```
+
+The shadow preserves tiny deterministic identity islands inside the otherwise sparse expert
+ranges. It therefore proves that it matches the `.cghost` without restoring the routed weights;
+it is not a valid standalone model and must always be used with that matching expert artifact.
+
+### Run Gemma 4 26B-A4B
+
+```bash
+camelid pull gemma4_26b
+
+cargo run --release --bin repack-ghost -- \
+  models/gemma-4-26B_q4_0-it.gguf \
+  --out models/gemma-4-26B_q4_0-it.cghost
+
+cargo run --release --bin camelid -- ghost-run \
+  models/gemma-4-26B_q4_0-it.gguf \
+  --cghost models/gemma-4-26B_q4_0-it.cghost \
+  --expert-cache-mib 1024 \
+  --prompt "The capital of France is" \
+  --max-tokens 32
+```
+
+On Apple silicon, the browser UI/API can use persistent routed-expert slots, fused expert kernels,
+and the file-backed Q6_K tied head. This is the fastest measured profile on the tested 16 GiB M4:
+
+```bash
+CAMELID_GEMMA4_GHOST_METAL_SLOTS=1 \
+CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST=1 \
+CAMELID_GEMMA4_GHOST_METAL_COMMON=0 \
+CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER=24 \
+CAMELID_GEMMA4_GHOST_READ_THREADS=4 \
+cargo run --release --bin camelid -- serve --gpu on \
+  --model models/gemma-4-26B_q4_0-it.gguf \
+  --cghost models/gemma-4-26B_q4_0-it.cghost \
+  --expert-cache-mib 1024
+```
+
+The profile above is hybrid: common-core math stays on CPU while the selected Q4_0 experts and
+exact ordered Q6_K head run on Metal. To exercise the complete Metal common core and its
+4,096-position f32 KV cache, set `CAMELID_GEMMA4_GHOST_METAL_COMMON=1` and
+`CAMELID_GEMMA4_GHOST_METAL_CONTEXT=4096`. Both modes retain the same fail-closed CPU fallback.
+With fused-fast enabled, the strict 26B Q4_0 projections admit a 32-lane SIMDgroup row kernel that
+keeps the comparator's increasing-block f32 fold; devices or shapes that miss admission stay on
+the scalar ordered kernel.
+
+`CAMELID_GEMMA4_GHOST_METAL_STATS=1` prints one compact per-generation slot hit/I/O summary.
+`CAMELID_GEMMA4_GHOST_READ_THREADS` controls concurrent positioned reads (default 4, range 1–8).
+`--ghost-strict-cache` asks macOS not to retain `.cghost` reads in its file cache; this can reduce
+duplicate memory pressure on a 16 GiB unified-memory machine, but should be benchmarked on the
+target system because it gives up OS cache reuse.
+
+The 1 GiB default can retain a little more than one token's 240-expert routed working set on the
+tracked Q4_0 row. `--expert-cache-mib 0` retains no routed expert after the current use and gives
+the smallest application-owned footprint; smaller budgets may cyclically evict every expert
+before the next token revisits its layer. Larger budgets trade memory for hits. The runner reports
+hits, misses, evictions, bytes read, retained cache bytes, physical footprint, and peak RSS.
+
+### Real 26B Apple-silicon Metal lane
+
+The tracked 14,439,361,440-byte `gemma-4-26B_q4_0-it.gguf` was repacked into 3,840 expert
+groups with 11.96 GiB of routed payload. The production pair is strongly fingerprinted and the
+sparse GGUF shadow occupies about 1.5 GiB physically. On the strict 26B geometry, Camelid can keep
+attention, router, the shared expert, the selected Q4_0 experts, the exact ordered Q6_K head, and a
+4,096-position f32 KV cache on Metal. Persistent expert residency is configurable from 8 through
+32 slots per layer; 24 slots use 2.25 GiB and 32 use 3.00 GiB.
+
+The greedy full-common Metal and hybrid lanes produced the same 32 token IDs on the acceptance
+prompt, `In one sentence, explain why local AI is useful.` On a 16 GiB Apple M4 with both artifacts
+on the internal SSD, 24 slots per layer, four read threads, buffered file I/O, and the final
+SIMDgroup release, three hybrid runs with a 1 GiB host expert cache completed 32 visible tokens in
+8.42–9.04 seconds (3.54–3.80 end-to-end output tokens/second). The fastest warm repeat's
+persistent-slot hit rate was 71.3%; it read 6,674 MiB from `.cghost` (215.3 MiB per routed
+position), while 44 other slot fills came from the host cache. Full-common Metal with a 256 MiB
+host cache took 10.85–11.08 seconds after its SIMDgroup kernel was admitted. A 2 GiB host cache,
+strict/no-cache I/O, and eight read threads were all slower on this machine, so none is enabled in
+the recommended profile. These are exact-machine, exact-prompt measurements rather than a general
+throughput claim.
+
+Current boundary: this is an experimental single-node lane. Dense ghost's `--stage-split` and
+`--spec` options are refused because a routed expert cannot be prefetched until that layer's router
+has produced its IDs.
 
 ## v1 runner (synchronous)
 

@@ -29,8 +29,19 @@ const healthExecutionPlan = { selected_backend: 'cpu_reference' }
 assert.deepEqual(executionRuntimeFields({ execution_plan: healthExecutionPlan, backend: 'llama' }), {
   execution_plan: healthExecutionPlan,
   backend: 'llama',
+  gemma4_ghost_execution_mode: null,
+  gemma4_ghost_common_metal_active: null,
+  gemma4_ghost_experts_metal_active: null,
+  gemma4_ghost_head_metal_active: null,
 }, 'dashboard normalization should preserve health execution plan identity and serving backend')
-assert.deepEqual(executionRuntimeFields(null), { execution_plan: null, backend: 'none' }, 'missing health should fail closed to no plan and no backend')
+assert.deepEqual(executionRuntimeFields(null), {
+  execution_plan: null,
+  backend: 'none',
+  gemma4_ghost_execution_mode: null,
+  gemma4_ghost_common_metal_active: null,
+  gemma4_ghost_experts_metal_active: null,
+  gemma4_ghost_head_metal_active: null,
+}, 'missing health should fail closed to no plan and no backend')
 
 assert.deepEqual(describeExecutionPlan({ status: 'offline' }), {
   state: 'offline', device: 'Unavailable', backend: 'Backend offline', summary: 'Execution details are unavailable while the Camelid backend is offline.',
@@ -108,6 +119,7 @@ const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8')
 const readmeSource = read('../../README.md')
 const chatWorkspaceSource = read('../src/views/ChatWorkspace.jsx')
 const messageTurnSource = read('../src/components/chat/MessageTurn.jsx')
+const diagnosticsSource = read('../src/components/chat/render/Diagnostics.jsx')
 const markdownSource = read('../src/lib/markdown.jsx')
 const dashboardHookSource = read('../src/hooks/useDashboardData.js')
 const executionPlanSource = read('../src/lib/executionPlan.js')
@@ -162,6 +174,9 @@ assert.match(messageTurnSource, /data-streaming-state=\{assistantStreaming \? 'a
 assert.match(messageTurnSource, /\$\{assistantStreaming \? 'is-streaming' : ''\}/, 'only assistant rows that are actively streaming should receive the animated streaming class')
 assert.doesNotMatch(messageTurnSource, /\$\{message\.streaming \? 'is-streaming' : ''\}/, 'raw message.streaming should not keep completed/non-assistant rows visually active')
 assert.match(messageTurnSource, /\{message\.role === 'assistant' && <MessageMetaFooter message=\{message\} \/>\}/, 'the assistant meta footer should render during streaming too — it is the live tok/s readout (tokens_out_per_sec is live-patched per frame)')
+assert.match(messageTurnSource, /title="End-to-end output rate, measured in this browser"/, 'the browser whole-request output metric must not be mislabeled as model decode throughput')
+assert.doesNotMatch(messageTurnSource, /title="Decode rate, measured in this browser"/, 'the footer must not call its end-to-end browser timing a decode-only rate')
+assert.match(diagnosticsSource, /End-to-end Output Rate/, 'developer diagnostics must use the same truthful browser-rate label')
 assert.doesNotMatch(messageTurnSource, /cxturn__meta--reserve/, 'the invisible footer placeholder is gone; the live footer itself holds the layout slot')
 assert.doesNotMatch(read('../src/styles/chat.css'), /cxturn__meta--reserve/, 'the reserved-footer spacer css must not outlive the placeholder it styled')
 assert.match(messageTurnSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
@@ -175,7 +190,12 @@ assert.doesNotMatch(messageTurnSource, /dangerouslySetInnerHTML/, 'message rows 
 
 /* ---- Dashboard data hook ---- */
 assert.match(dashboardHookSource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
-assert.match(dashboardHookSource, /max_tokens:\s*localChatMaxTokens\(history, requestModelId\)/, 'local chat sends should choose the per-model token budget (Phase 9)')
+assert.match(
+  dashboardHookSource,
+  /max_tokens:\s*applyGemma4GhostChatTokenCap\(\s*applyGemma4ChatTokenFloor\(\s*localChatMaxTokens\(history, requestModelId\),\s*sendGate\.hint\?\.target\?\.family,\s*\),\s*runtime\?\.gemma4_serve_lane,\s*\)/,
+  'local chat sends should apply the Gemma 4 visible-output floor and then the Ghost-only Metal-context ceiling',
+)
+assert.match(dashboardHookSource, /const outputElapsedMs = liveElapsedMs[\s\S]*tokensPerSecond\(realTokens, outputElapsedMs\)/, 'live output rate must use wall time from request start, matching its end-to-end label')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
 assert.match(dashboardHookSource, /readStreamingChatCompletion\(response/, 'dashboard chat send should use the centralized stream parser')
@@ -361,8 +381,25 @@ assert.match(appSource, /ensureInferenceTelemetryConnected/, 'the app shell must
 /* ---- Response-length control (Phase 9) ---- */
 const responseLimitsSource = read('../src/lib/responseLimits.js')
 const rlcSource = read('../src/components/settings/ResponseLengthControl.jsx')
-const { validateResponseLength, validateSendBudget, verifiedContextBound, sliderToTokens, tokensToSlider } = await import('../src/lib/responseLimits.js')
+const {
+  applyGemma4ChatTokenFloor,
+  applyGemma4GhostChatTokenCap,
+  GEMMA4_GHOST_WEBUI_MAX_TOKENS,
+  validateResponseLength,
+  validateSendBudget,
+  verifiedContextBound,
+  sliderToTokens,
+  tokensToSlider,
+} = await import('../src/lib/responseLimits.js')
 {
+  assert.equal(applyGemma4ChatTokenFloor(3, 'gemma4_decoder'), 8, 'Gemma 4 chat should raise only undersized budgets to the visible-output floor')
+  assert.equal(applyGemma4ChatTokenFloor(2048, 'gemma4_decoder'), 2048, 'Gemma 4 chat should preserve a configured budget already above the floor')
+  assert.equal(applyGemma4ChatTokenFloor(3, 'llama_bpe_decoder'), 3, 'the Gemma 4 floor must not widen another model family\'s configured budget')
+  assert.equal(applyGemma4GhostChatTokenCap(8192, 'ghost_moe'), GEMMA4_GHOST_WEBUI_MAX_TOKENS, 'Ghost-MoE should cap the global 8K default below its 4K Metal common context')
+  assert.equal(applyGemma4GhostChatTokenCap(256, 'ghost_moe'), 256, 'Ghost-MoE should preserve a smaller user-selected budget')
+  assert.equal(applyGemma4GhostChatTokenCap(8192, 'distributed'), 8192, 'the Ghost cap must not shrink distributed Gemma 4')
+  assert.equal(applyGemma4GhostChatTokenCap(8192, 'local'), 8192, 'the Ghost cap must not shrink another local Gemma lane')
+  assert.equal(applyGemma4GhostChatTokenCap(8192, ''), 8192, 'the global default must remain unchanged without an explicit Ghost lane')
   const overCtx = validateResponseLength({ value: 8192, contextLength: 64, verifiedBound: null, modelName: 'fixture' })
   assert.equal(overCtx.level, 'caution', 'above the model context is a non-blocking caution now (backend auto-limits, does not reject)')
   assert.match(overCtx.message, /auto-limit|room left|shorter/, 'over-context copy must explain the auto-limit, not claim rejection')

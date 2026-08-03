@@ -62,7 +62,7 @@ function MessageMetaFooter({ message }) {
         </span>
       )}
       {ttft && <span className="cxturn__meta-item" title="Time to first content, measured in this browser">TTFT {ttft}</span>}
-      {rate && <span className="cxturn__meta-item" title="Decode rate, measured in this browser">{rate}</span>}
+      {rate && <span className="cxturn__meta-item" title="End-to-end output rate, measured in this browser">{rate}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
       <span className="cxturn__meta-item cxturn__meta-note">client-measured</span>
     </footer>
@@ -144,7 +144,11 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
   const liveStatusLabel = streamingStatusLabel(streamingPhase, generationElapsedSeconds, isOpenStreamingCode)
   const showStreamingStatus = assistantStreaming && !messageContent
   const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
-  const showLengthWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'length'
+  const noVisibleResponse = message.role === 'assistant' && !assistantStreaming && !String(messageContent || '').trim()
+  const hiddenTokenLimit = noVisibleResponse
+    && message.finish_reason === 'length'
+    && Number(message.usage?.completion_tokens || 0) > 0
+  const showLengthWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'length' && !hiddenTokenLimit
   const showErrorWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'error'
   const showInterruptedWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'interrupted'
   const showReusePromptAction = Boolean(priorUserPrompt) && (showErrorWarning || showInterruptedWarning)
@@ -189,6 +193,14 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
         {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
+
+        {noVisibleResponse && (
+          <div className="cxturn__warning" role="status">
+            {hiddenTokenLimit
+              ? 'No visible text was produced before the token limit. Gemma used the budget on hidden channel tokens; increase Settings → Chat → Response length.'
+              : '(empty response)'}
+          </div>
+        )}
 
         {showLengthWarning && (
           <div className="cxturn__warning" role="status">Stopped before completing. Ask “continue” for a complete file.</div>

@@ -102,24 +102,73 @@ pub fn set_runtime_enabled(enabled: bool) {
     );
 }
 
-// Master "GPU acceleration" switch as the user sees it in the UI. This gates the
-// GPU-RESIDENT decode engine — the primary, fast GPU path (the legacy `RUNTIME_STATE`
-// above only gates the opt-in hybrid Q8 *matmul* used on the CPU-forward fallback, so
-// reporting that as "GPU acceleration" read as OFF even while the resident engine ran
-// the whole model on the GPU). Defaults ON whenever a CUDA device is present so the
-// app uses the GPU out of the box; the UI toggle flips it. 0 = uninitialised,
-// 1 = disabled, 2 = enabled.
+/// Platform-neutral GPU capability selected for the user-facing acceleration control.
+/// CUDA wins on a host that exposes both backends because the resident CUDA runtime is
+/// the primary path there; Apple Metal is selected on macOS when CUDA is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuAccelerationInfo {
+    pub available: bool,
+    pub device_name: Option<String>,
+    pub backend: &'static str,
+}
+
+fn select_gpu_acceleration_info(
+    cuda_available: bool,
+    cuda_device_name: Option<String>,
+    metal_available: bool,
+    metal_device_name: Option<String>,
+) -> GpuAccelerationInfo {
+    if cuda_available {
+        GpuAccelerationInfo {
+            available: true,
+            device_name: cuda_device_name,
+            backend: "cuda",
+        }
+    } else if metal_available {
+        GpuAccelerationInfo {
+            available: true,
+            device_name: metal_device_name,
+            backend: "metal",
+        }
+    } else {
+        GpuAccelerationInfo {
+            available: false,
+            device_name: None,
+            backend: "none",
+        }
+    }
+}
+
+/// Detect the GPU backend represented by the single CLI/UI acceleration switch.
+/// This is deliberately broader than [`is_available`], which remains the CUDA-only
+/// capability predicate used by CUDA dispatch code.
+pub fn gpu_acceleration_info() -> GpuAccelerationInfo {
+    let cuda = detect_cuda_device();
+    let metal = crate::metal::detect_metal_device();
+    select_gpu_acceleration_info(
+        cuda.available,
+        cuda.device_name,
+        metal.available,
+        metal.device_name,
+    )
+}
+
+// Master "GPU acceleration" switch as the user sees it in the UI. This gates both
+// CUDA-resident decode and the opt-in Apple Metal paths. The legacy `RUNTIME_STATE`
+// above only gates the CUDA hybrid Q8 *matmul* used on the CPU-forward fallback.
+// Defaults ON whenever either supported GPU backend is present, so the app uses the
+// accelerator out of the box. 0 = uninitialised, 1 = disabled, 2 = enabled.
 static GPU_ACCEL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Whether GPU acceleration (the resident decode engine) is enabled. On by default
-/// when a CUDA device is present; flipped by the UI toggle. Independent of the hybrid
-/// `runtime_enabled()` switch. Deterministic mode and `CAMELID_CUDA_RESIDENT_DECODE=0`
-/// still force it off at their own call sites.
+/// Whether the platform-neutral GPU acceleration control is enabled. On by default
+/// when CUDA or Metal is present; flipped by the UI toggle. Independent of the CUDA
+/// hybrid `runtime_enabled()` switch. Deterministic mode and backend-specific opt-outs
+/// still force individual lanes off at their own call sites.
 pub fn gpu_accel_enabled() -> bool {
     use std::sync::atomic::Ordering;
     match GPU_ACCEL_STATE.load(Ordering::Relaxed) {
         0 => {
-            let on = is_available();
+            let on = gpu_acceleration_info().available;
             GPU_ACCEL_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
@@ -128,9 +177,9 @@ pub fn gpu_accel_enabled() -> bool {
     }
 }
 
-/// Turn GPU acceleration (the resident decode engine) on or off at runtime — the UI
-/// "GPU acceleration" toggle calls this. A no-op effect on a host without a CUDA
-/// device, since inference falls back to the CPU reference either way.
+/// Turn GPU acceleration on or off at runtime — the CLI and UI share this switch.
+/// Dispatch still checks backend capability, so enabling it on a host without CUDA
+/// or Metal is harmless.
 pub fn set_gpu_accel_enabled(enabled: bool) {
     GPU_ACCEL_STATE.store(
         if enabled { 2 } else { 1 },
@@ -1132,7 +1181,7 @@ extern "C" __global__ void q8_0_block_linear_row(
 
 #[cfg(test)]
 mod device_mask_tests {
-    use super::devices_masked;
+    use super::{devices_masked, select_gpu_acceleration_info, GpuAccelerationInfo};
 
     #[test]
     fn only_an_explicit_no_devices_value_masks_cuda() {
@@ -1149,5 +1198,38 @@ mod device_mask_tests {
         assert!(!devices_masked(Some("0,1")));
         // Not a mask value, and must not be parsed as one.
         assert!(!devices_masked(Some("-1,0")));
+    }
+
+    #[test]
+    fn user_facing_gpu_selection_recognizes_metal_and_prefers_cuda() {
+        assert_eq!(
+            select_gpu_acceleration_info(false, None, true, Some("Apple M4 Max".to_string()),),
+            GpuAccelerationInfo {
+                available: true,
+                device_name: Some("Apple M4 Max".to_string()),
+                backend: "metal",
+            }
+        );
+        assert_eq!(
+            select_gpu_acceleration_info(
+                true,
+                Some("NVIDIA RTX".to_string()),
+                true,
+                Some("Apple GPU".to_string()),
+            ),
+            GpuAccelerationInfo {
+                available: true,
+                device_name: Some("NVIDIA RTX".to_string()),
+                backend: "cuda",
+            }
+        );
+        assert_eq!(
+            select_gpu_acceleration_info(false, None, false, Some("ignored".to_string())),
+            GpuAccelerationInfo {
+                available: false,
+                device_name: None,
+                backend: "none",
+            }
+        );
     }
 }

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { formatDurationMs, formatRate } from '../../../lib/formatters'
 
 /* Developer diagnostics panel — extracted verbatim from ChatWorkspace.
-   Surfaces TTFT, decode rate, generation time, weight-load, and a per-layer
+   Surfaces TTFT, end-to-end output rate, generation time, weight-load, and a per-layer
    attention-vs-FFN latency breakdown from the camelid generation diagnostics. */
 export function DeveloperDiagnosticsBlock({ message }) {
   const [isOpen, setIsOpen] = useState(false)
@@ -16,7 +16,7 @@ export function DeveloperDiagnosticsBlock({ message }) {
   const ttft = message.first_content_ms !== null && message.first_content_ms !== undefined
     ? `${(Number(message.first_content_ms) / 1000).toFixed(2)}s`
     : null
-  const decodeRate = formatRate(message.tokens_out_per_sec)
+  const outputRate = formatRate(message.tokens_out_per_sec)
 
   const weightLoadTime = metrics.weight_load ? formatDurationMs(metrics.weight_load) : null
   const totalGenTime = metrics.generate ? formatDurationMs(metrics.generate) : null
@@ -30,7 +30,7 @@ export function DeveloperDiagnosticsBlock({ message }) {
       >
         <span className="trigger-icon" aria-hidden="true">📊</span>
         <span>Developer Diagnostics</span>
-        {decodeRate && <span className="trigger-badge">{decodeRate}</span>}
+        {outputRate && <span className="trigger-badge">{outputRate}</span>}
       </button>
 
       {isOpen && (
@@ -42,10 +42,10 @@ export function DeveloperDiagnosticsBlock({ message }) {
                 <strong className="card-value">{ttft}</strong>
               </div>
             )}
-            {decodeRate && (
+            {outputRate && (
               <div className="summary-card">
-                <span className="card-label">Decode Speed</span>
-                <strong className="card-value">{decodeRate}</strong>
+                <span className="card-label">End-to-end Output Rate</span>
+                <strong className="card-value">{outputRate}</strong>
               </div>
             )}
             {totalGenTime && (

@@ -9,7 +9,40 @@ import { findCompatibilityHint, isExactCompatibilityHint } from './capabilities.
 
 export const MAX_RESPONSE_TOKENS = 1000000
 export const MIN_RESPONSE_TOKENS = 1
+export const GEMMA4_MIN_CHAT_TOKENS = 8
+// Ghost's default common-core Metal cache holds 4,096 positions. Keeping the
+// WebUI reply allowance at 512 leaves a conservative 3,584-position envelope
+// for ordinary prompts/history instead of letting the global 8,192 default
+// force CPU common execution before position zero.
+export const GEMMA4_GHOST_WEBUI_MAX_TOKENS = 512
 export const DETENTS = [256, 1000, 4000, 16000, 64000, 256000, 1000000]
+
+export function applyGemma4ChatTokenFloor(value, compatibilityFamily = '') {
+  const configured = Number.isFinite(Number(value)) ? Math.round(Number(value)) : MIN_RESPONSE_TOKENS
+  return String(compatibilityFamily).startsWith('gemma4_')
+    ? Math.max(configured, GEMMA4_MIN_CHAT_TOKENS)
+    : configured
+}
+
+export function gemma4ChatTokenFloorForModel(capabilities, model) {
+  const hint = findCompatibilityHint(capabilities, model)
+  return isExactCompatibilityHint(hint) && String(hint?.target?.family || '').startsWith('gemma4_')
+    ? GEMMA4_MIN_CHAT_TOKENS
+    : null
+}
+
+export function gemma4GhostChatTokenCap(serveLane = '') {
+  const lane = String(serveLane || '').trim().toLowerCase().replace(/-/g, '_')
+  return lane === 'ghost_moe' ? GEMMA4_GHOST_WEBUI_MAX_TOKENS : null
+}
+
+export function applyGemma4GhostChatTokenCap(value, serveLane = '') {
+  const configured = Number.isFinite(Number(value))
+    ? Math.max(MIN_RESPONSE_TOKENS, Math.round(Number(value)))
+    : MIN_RESPONSE_TOKENS
+  const cap = gemma4GhostChatTokenCap(serveLane)
+  return cap === null ? configured : Math.min(configured, cap)
+}
 
 export function modelContextLength(model) {
   const value = Number(model?.meta?.n_ctx_train)

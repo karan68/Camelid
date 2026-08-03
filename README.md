@@ -273,6 +273,72 @@ The two Gemma 4 rows marked *two-Mac distributed* are validated on the layer-sha
 they are memory-infeasible on a single 16 GB machine. Command R is listed for completeness; at
 37 GB it needs a workstation-class host.
 
+#### Experimental Ghost-MoE Metal: Gemma 4 26B on one Apple-silicon Mac
+
+The 26B-A4B row can use the v2 Ghost-MoE path. `repack-ghost` splices the 128 routed experts in
+each of 30 layers into one-read records while a sparse GGUF shadow retains the tokenizer, router,
+attention, shared expert, embedding/head, and norm tensors. A sampled SHA-256 identity binds the
+two artifacts, including every routed expert; mismatched or legacy sparse pairs fail closed.
+
+On macOS, the fast lane keeps a bounded set of routed experts in persistent, 16-KiB-aligned Metal
+slots and runs the tied Q6_K vocabulary head through an exact file-backed Metal kernel. An optional
+full-common mode also keeps attention, router, shared expert, tail, and a 4,096-position KV cache on
+Metal. Fused-fast Q4_0 projections use an exact 32-lane SIMDgroup kernel with scalar fallback.
+Neither mode materializes the other routed experts in RAM. Slot misses are concurrent,
+positioned reads directly from `.cghost` into shared Metal buffers—there is no staging allocation
+or GPU upload copy. The splice-and-page design is informed by
+[TurboFieldfare](https://github.com/drumih/turbo-fieldfare) and is integrated with Camelid's GGUF
+binding, artifact validation, API cancellation, and browser UI.
+
+```bash
+camelid pull gemma4_26b
+
+cargo run --release --bin repack-ghost -- \
+  models/gemma-4-26B_q4_0-it.gguf \
+  --out models/gemma-4-26B_q4_0-it.cghost
+
+cargo run --release --bin camelid -- ghost-run \
+  models/gemma-4-26B_q4_0-it.gguf \
+  --cghost models/gemma-4-26B_q4_0-it.cghost \
+  --expert-cache-mib 1024 \
+  --prompt "Explain why sparse MoE models can use less memory." \
+  --max-tokens 64
+```
+
+To run the fastest measured 16 GiB Apple-silicon lane through Camelid's browser UI and
+OpenAI-compatible API:
+
+```bash
+CAMELID_GEMMA4_GHOST_METAL_SLOTS=1 \
+CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST=1 \
+CAMELID_GEMMA4_GHOST_METAL_COMMON=0 \
+CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER=24 \
+CAMELID_GEMMA4_GHOST_READ_THREADS=4 \
+cargo run --release --bin camelid -- serve --gpu on \
+  --model models/gemma-4-26B_q4_0-it.gguf \
+  --cghost models/gemma-4-26B_q4_0-it.cghost \
+  --expert-cache-mib 1024
+```
+
+The 24-slot setting retains 2.25 GiB of routed experts across the 30 layer-local slabs. The 1 GiB
+host cache retains prompt-fetched experts that can refill later slot misses without another SSD
+read. Eight slots is the correctness floor and 32 is the current maximum; larger values reduce
+storage reads but increase unified-memory pressure. The server skips an irrelevant resident-engine
+warm-up and reports `gemma4_serve_lane: "ghost_moe"` in `/v1/health` when the lane is ready. The
+original/sparse GGUF and matching `.cghost` must both stay on fast local storage.
+
+This hybrid uses CPU common-core math with persistent Metal Q4_0 expert slots and the exact Metal
+Q6_K head. Set `CAMELID_GEMMA4_GHOST_METAL_COMMON=1` and
+`CAMELID_GEMMA4_GHOST_METAL_CONTEXT=4096` to opt into the complete common-core Metal path. On the
+tested 16 GiB M4, the hybrid was faster because it avoided enough per-layer launch and
+unified-memory pressure to outweigh the extra CPU work. The final acceptance runs completed the
+fixed 32-token response in 8.42–9.04 seconds while full-common Metal took 10.85–11.08 seconds.
+
+This remains an experimental exact-row lane, with a CPU fallback if Metal admission fails. Dense
+ghost's stage-split and speculative flags are refused because expert IDs do not exist until each
+layer's router has run. Format details, safety invariants, and the current real-model receipt are in
+[docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gemma-4-26b-a4b).
+
 ### Also parity-certified
 
 These exact rows carry committed parity receipts but are **not** in the `camelid pull` catalog —

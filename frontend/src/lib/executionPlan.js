@@ -24,10 +24,29 @@ const SPECIALIZED_BACKENDS = new Set([
   'diffusion-gemma-runtime',
 ])
 
+const GHOST_EXECUTION_MODES = new Set([
+  'full_common_metal',
+  'hybrid_metal',
+  'cpu_storage',
+])
+
+function optionalBoolean(value) {
+  return typeof value === 'boolean' ? value : null
+}
+
+function ghostComponentSummary({ common, experts, head }) {
+  return `Common core: ${common ? 'Metal' : 'CPU'}. Persistent Q4_0 expert slots: ${experts ? 'Metal' : 'CPU/storage'}. Q6_K tied head: ${head ? 'Metal' : 'CPU'}. Routed expert records page from the local SSD.`
+}
+
 export function executionRuntimeFields(health) {
+  const executionMode = String(health?.gemma4_ghost_execution_mode || '')
   return {
     execution_plan: health?.execution_plan || null,
     backend: health?.backend || 'none',
+    gemma4_ghost_execution_mode: GHOST_EXECUTION_MODES.has(executionMode) ? executionMode : null,
+    gemma4_ghost_common_metal_active: optionalBoolean(health?.gemma4_ghost_common_metal_active),
+    gemma4_ghost_experts_metal_active: optionalBoolean(health?.gemma4_ghost_experts_metal_active),
+    gemma4_ghost_head_metal_active: optionalBoolean(health?.gemma4_ghost_head_metal_active),
   }
 }
 
@@ -56,6 +75,42 @@ export function describeExecutionPlan(runtime) {
       device: 'Not active',
       backend: 'Model not generation-ready',
       summary: 'A model is loaded, but Camelid is not generation-ready, so no execution claim is shown.',
+    }
+  }
+
+  if (runtime?.backend === 'gemma4-runtime' && runtime?.gemma4_serve_lane === 'ghost_moe') {
+    const common = runtime?.gemma4_ghost_common_metal_active === true
+    const experts = runtime?.gemma4_ghost_experts_metal_active === true
+    const head = runtime?.gemma4_ghost_head_metal_active === true
+    const componentMode = common ? 'full_common_metal' : (experts || head) ? 'hybrid_metal' : 'cpu_storage'
+    // The explicit mode is accepted only when its component booleans agree.
+    // This prevents a malformed/stale string from manufacturing a GPU claim.
+    const reportedMode = GHOST_EXECUTION_MODES.has(runtime?.gemma4_ghost_execution_mode)
+      ? runtime.gemma4_ghost_execution_mode
+      : null
+    const mode = reportedMode === componentMode ? reportedMode : componentMode
+    const summary = ghostComponentSummary({ common, experts, head })
+    if (mode === 'full_common_metal') {
+      return {
+        state: 'metal',
+        device: 'Full-common Metal + local SSD',
+        backend: 'Ghost-MoE',
+        summary,
+      }
+    }
+    if (mode === 'hybrid_metal') {
+      return {
+        state: 'metal',
+        device: 'Hybrid Metal + local SSD',
+        backend: 'Ghost-MoE',
+        summary,
+      }
+    }
+    return {
+      state: 'cpu',
+      device: 'CPU + local SSD',
+      backend: 'Ghost-MoE',
+      summary,
     }
   }
 

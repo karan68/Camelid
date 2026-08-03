@@ -43,6 +43,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const supportContractCurrentGate = frontendSupportContractCopy(capabilities)
   const compatibilityTargets = capabilities?.model_compatibility || []
   const execution = describeExecutionPlan(runtime)
+  const ghostExecution = runtime?.backend === 'gemma4-runtime' && runtime?.gemma4_serve_lane === 'ghost_moe'
   const supportedCompatibilityCount = compatibilityTargets.filter((target) => isSupportedCapabilityStatus(target.status)).length
   const apiFeatures = capabilities?.api_features || []
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
@@ -136,8 +137,8 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
             )}
             <div><span>Loaded model</span><strong>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</strong></div>
             <div><span>Generation ready</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong></div>
-            <div><span>Selected device at load</span><strong>{execution.device}</strong></div>
-            <div><span>Selected backend at load</span><strong>{execution.backend}</strong></div>
+            <div><span>{ghostExecution ? 'Available Ghost acceleration' : 'Selected device at load'}</span><strong>{execution.device}</strong></div>
+            <div><span>{ghostExecution ? 'Ghost serving lane' : 'Selected backend at load'}</span><strong>{execution.backend}</strong></div>
             <div><span>Selected exact-row gate</span><strong>{selectedExactRowReady ? 'Ready for chat/API' : selectedChatGate.runtimeReady ? 'Runtime ready; support gated' : selectedChatGate.label}</strong></div>
             <div><span>Q8 storage</span><strong>{q8RuntimeLabel}</strong></div>
             <div><span>Next chat selection</span><strong>{selectedModelName}</strong></div>
