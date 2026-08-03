@@ -46,6 +46,61 @@ camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral>
 On window close the sidecar is terminated cleanly. On Windows, a **job object** with
 `KILL_ON_JOB_CLOSE` also prevents a desktop crash from orphaning a `camelid` process.
 
+## Windows in-place upgrades
+
+The NSIS installer overwrites the files it ships but, like any overwrite-only installer, cannot
+by itself remove a file an **older** version installed that the current one no longer ships.
+`windows/installer-hooks.nsh` supplies an `NSIS_HOOK_PREINSTALL` that deletes the NVRTC
+redistributables (`nvrtc64_*.dll`, `nvrtc-builtins64_*.dll`) from `sidecar\` before the file
+copy, so every upgrade re-lays exactly the set that version ships. That covers both the
+`nvrtc64_120_0.alt.dll` orphan left by pre-filter releases and any future CUDA version bump,
+which renames these DLLs and would otherwise strand the previous ones.
+
+The hook is deliberately narrow, and widening it to clear `sidecar\` wholesale would **destroy
+user data**: the desktop's model store is the `models\` folder beside the engine binary
+(`sidecar_models_dir` in `src/engine.rs`), i.e. `sidecar\models\`, holding multi-GB downloaded
+GGUF weights. Only files the packaging scripts stage may be removed there.
+
+## Windows code signing
+
+Release artifacts are signed with Azure Artifact Signing. The subtlety is that
+`camelid-desktop.exe` exists as **two distinct copies**, and only one of them is reachable
+from an ordinary post-build signing pass:
+
+| copy | signed by | when |
+| --- | --- | --- |
+| `sidecar\camelid.exe` | signing action, folder pass | before bundling; copied verbatim as a resource |
+| the exe **inside** the installer | `bundle.windows.signCommand` | during bundling |
+| portable exe + NSIS installer | signing action, folder pass | after bundling |
+
+The middle row needs its own mechanism because Tauri patches the binary with the bundle type,
+rewriting `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed app knows how it was
+installed, and signs only afterwards. A signature applied before `tauri build` is invalidated by
+that rewrite, and one applied afterwards cannot reach a binary already sealed inside the
+installer. `windows/sign-artifact-signing.ps1` runs in the only window where the bytes are final.
+
+Three shipped releases got some part of this wrong, which is why the guards below exist:
+
+| release | what users got |
+| --- | --- |
+| v0.4.6 | installed exe `NotSigned` — signed only after bundling |
+| v0.4.7 | installed exe `HashMismatch` — signed only before bundling; a broken signature is worse than none |
+| v0.4.8 | **no Windows installer at all** — `signCommand` used a project-relative script path |
+
+**`signCommand` paths must be absolute, and the release workflow generates them.** Tauri invokes
+the hook **seven times** per bundle — the app binary, five NSIS plugin DLLs, and the uninstaller
+staged as a `%TEMP%\nst*.tmp` — and the working directory is *not* constant: six run from the
+Tauri project directory, but the uninstaller call runs from `target\release\nsis\x64`. A
+project-relative path resolves for six of seven and fails the build on the last. The workflow
+therefore writes `tauri.signing.conf.json` at release time with absolute paths (and re-states
+`installerHooks`, read from `tauri.conf.json`, so the overlay cannot drop it), and passes it as an
+extra `--config`. It is deliberately absent from the committed config so a developer's
+`tauri build` needs no signing tooling; the script also no-ops when its environment is unset.
+
+Two independent guards close the loop: the release workflow installs the built installer on the
+runner and asserts the unpacked binary verifies, and `verify-release-assets` demotes any release
+whose asset set is incomplete so `releases/latest` can never point at one.
+
 ## Startup failures
 
 The splash is fail-closed: it stays visible until the sidecar returns `200` from

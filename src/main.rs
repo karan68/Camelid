@@ -934,6 +934,19 @@ enum Command {
         /// Override Rayon worker threads
         #[arg(long, env = "CAMELID_THREADS")]
         threads: Option<usize>,
+        /// Shared secret the coordinator must present to this worker. Required before a
+        /// worker will bind a non-loopback address, unless the risk is explicitly
+        /// acknowledged with --allow-unauthenticated-remote. Prefer the file option on
+        /// shared machines so the secret is not present in the process command line.
+        #[arg(
+            long,
+            env = "CAMELID_DISTRIBUTED_TOKEN",
+            conflicts_with = "distributed_token_file"
+        )]
+        distributed_token: Option<String>,
+        /// Read the distributed shared secret from a text file.
+        #[arg(long, env = "CAMELID_DISTRIBUTED_TOKEN_FILE")]
+        distributed_token_file: Option<PathBuf>,
         #[command(flatten)]
         server: ServerPolicyArgs,
     },
@@ -1345,6 +1358,30 @@ enum Command {
         /// Slower than the default GPU path; the default path is unchanged.
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
+    },
+    /// Hidden: end-to-end Prism Qwen3-VL image encode plus Qwen3.5 Metal decode.
+    #[command(hide = true)]
+    BenchGenerateVision {
+        /// Qwen3.5 Bonsai GGUF model path.
+        model: PathBuf,
+        /// Matching Prism qwen3vl_merger GGUF.
+        #[arg(long)]
+        mmproj: PathBuf,
+        /// PNG or JPEG image.
+        #[arg(long)]
+        image: PathBuf,
+        /// Text placed after the image.
+        #[arg(long, default_value = "Describe this image briefly.")]
+        prompt: String,
+        /// Maximum generated tokens.
+        #[arg(long, default_value_t = 32)]
+        max_tokens: usize,
+        /// Minimum merged image-token budget.
+        #[arg(long, default_value_t = 1)]
+        image_min_tokens: usize,
+        /// Maximum merged image-token budget.
+        #[arg(long, default_value_t = 1024)]
+        image_max_tokens: usize,
     },
     /// Hidden: in-process INTERLEAVED owner-microkernel prefill sweep. Loads the model ONCE, then
     /// rotates owner configs (off / avx2 / vnni4x4 / vnni4x8) round-by-round so every config shares
@@ -1902,9 +1939,16 @@ async fn main() -> anyhow::Result<()> {
             layer_range,
             model,
             threads,
+            distributed_token,
+            distributed_token_file,
             server,
         } => {
             configure_rayon_threads(threads)?;
+            let distributed_token = camelid::distributed::resolve_distributed_token(
+                distributed_token,
+                distributed_token_file.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?;
 
             let parts: Vec<&str> = layer_range.split("..").collect();
             anyhow::ensure!(
@@ -1925,8 +1969,25 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::anyhow!("--worker-addr is required in coordinator mode")
                 })?;
 
+                let gguf = camelid::gguf::read_metadata(&model)?;
+                let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+                camelid::distributed::PipelineRole::Coordinator.validate_layer_range(
+                    layer_start,
+                    layer_end,
+                    config.block_count as usize,
+                )?;
+                let identity = camelid::distributed::NodeIdentity::for_model(
+                    &model,
+                    config.block_count,
+                    config.embedding_length,
+                    (layer_end as u32)..(config.block_count),
+                )?
+                .with_token(distributed_token.clone());
+                let distributed_model_sha256 = identity.model_sha256.clone();
+
                 tracing::info!(worker_addr = %worker_addr_str, "Coordinator connecting to worker");
-                let client = camelid::distributed::DistributedClient::connect(&worker_addr_str)?;
+                let client =
+                    camelid::distributed::DistributedClient::connect(&worker_addr_str, &identity)?;
                 camelid::distributed::DISTRIBUTED_CLIENT
                     .set(client)
                     .map_err(|_| anyhow::anyhow!("Failed to set global distributed client lock"))?;
@@ -1939,7 +2000,10 @@ async fn main() -> anyhow::Result<()> {
                 api::serve(
                     addr,
                     threads,
-                    Some(api::StartupModel::explicit(model)),
+                    Some(api::StartupModel::distributed(
+                        model,
+                        distributed_model_sha256,
+                    )),
                     false,
                     false,
                     None,
@@ -1953,6 +2017,11 @@ async fn main() -> anyhow::Result<()> {
                     DenseLaneWindowedForward::CpuDenseOnly,
                 )?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+                camelid::distributed::PipelineRole::Worker.validate_layer_range(
+                    layer_start,
+                    layer_end,
+                    config.block_count as usize,
+                )?;
                 let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
                 let store = camelid::tensor::TensorStore::open(&model, &gguf);
 
@@ -1961,16 +2030,24 @@ async fn main() -> anyhow::Result<()> {
                     layer_start,
                     layer_end
                 );
+                let (load_embedding, load_output) =
+                    camelid::distributed::PipelineRole::Worker.tensor_ownership();
                 let weights = camelid::inference::LlamaLoadedWeights::load_distributed(
                     &store,
                     &binding,
                     layer_start,
                     layer_end,
-                    false,
-                    false,
+                    load_embedding,
+                    load_output,
                 )?;
 
                 tracing::info!("Worker weights loaded successfully. Initializing session.");
+                let identity = camelid::distributed::NodeIdentity::for_model(
+                    &model,
+                    config.block_count,
+                    config.embedding_length,
+                    (layer_start as u32)..(layer_end as u32),
+                )?;
                 let session = camelid::inference::LlamaInferenceSession::new(config, weights)?;
 
                 let addr_str = addr.to_string();
@@ -1978,7 +2055,13 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
                 }
-                camelid::distributed::run_worker_loop(&addr_str, session)?;
+                camelid::distributed::run_worker_loop(
+                    &addr_str,
+                    session,
+                    identity,
+                    distributed_token,
+                    server.allow_unauthenticated_remote,
+                )?;
             } else {
                 anyhow::bail!("Invalid role: {role}. Must be 'coordinator' or 'worker'");
             }
@@ -2790,6 +2873,26 @@ async fn main() -> anyhow::Result<()> {
                 iterations,
                 warmup,
                 threads,
+            )?;
+        }
+        Command::BenchGenerateVision {
+            model,
+            mmproj,
+            image,
+            prompt,
+            max_tokens,
+            image_min_tokens,
+            image_max_tokens,
+        } => {
+            apply_serve_nocopy_default();
+            run_bench_generate_vision(
+                model,
+                mmproj,
+                image,
+                prompt,
+                max_tokens,
+                image_min_tokens,
+                image_max_tokens,
             )?;
         }
         Command::BenchOwnerSweep {
@@ -4606,7 +4709,49 @@ fn run_bench_owner_sweep(
     // the owner default-on for win-x86_64 — an empty env would measure the
     // default (owner on), not the baseline.
     type SweepConfig<'a> = (&'a str, bool, &'a [(&'a str, &'a str)]);
-    let q8_configs: &[SweepConfig] = &[
+    #[cfg(target_arch = "x86_64")]
+    let avx512_vnni = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx512_vnni = false;
+    #[cfg(target_arch = "x86_64")]
+    let avx_vnni = std::arch::is_x86_feature_detected!("avxvnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx_vnni = false;
+
+    // Lane A (Q8).
+    let vnni4x4: SweepConfig = (
+        "owner_vnni4x4",
+        true,
+        &[
+            ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
+        ],
+    );
+    let vnni4x8: SweepConfig = (
+        "owner_vnni4x8",
+        true,
+        &[
+            ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "1"),
+        ],
+    );
+    // Same env as vnni4x4, but on a host without AVX-512 that env selects the 256-bit inner. The
+    // label has to say which kernel actually ran: calling it "vnni4x4" here would be a fake null,
+    // since the 512-bit arms silently degrade to the AVX2 inner on these parts.
+    let avxvnni256: SweepConfig = (
+        "owner_avxvnni256",
+        true,
+        &[
+            ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
+        ],
+    );
+    let mut q8_configs: Vec<SweepConfig> = vec![
         ("off", false, &[("CAMELID_X86_Q8_MATMUL_OWNER", "off")]),
         (
             "owner_avx2",
@@ -4616,25 +4761,14 @@ fn run_bench_owner_sweep(
                 ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "0"),
             ],
         ),
-        (
-            "owner_vnni4x4",
-            true,
-            &[
-                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
-            ],
-        ),
-        (
-            "owner_vnni4x8",
-            true,
-            &[
-                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "1"),
-            ],
-        ),
     ];
+    if avx512_vnni {
+        q8_configs.push(vnni4x4);
+        q8_configs.push(vnni4x8);
+    } else if avx_vnni {
+        q8_configs.push(avxvnni256);
+    }
+
     // Lane B. The 512-bit inner and the 8-row repack need AVX-512; the 256-bit
     // inner needs only `vpdpbusd`. Both answer the same env flag, so which one
     // runs is a property of the host — hence the label is picked from the
@@ -4651,16 +4785,6 @@ fn run_bench_owner_sweep(
         true,
         &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_REPACK8, "1")],
     );
-    #[cfg(target_arch = "x86_64")]
-    let avx512_vnni = std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512vnni");
-    #[cfg(not(target_arch = "x86_64"))]
-    let avx512_vnni = false;
-    #[cfg(target_arch = "x86_64")]
-    let avx_vnni = std::arch::is_x86_feature_detected!("avxvnni");
-    #[cfg(not(target_arch = "x86_64"))]
-    let avx_vnni = false;
     let mut kquant_configs: Vec<SweepConfig> = vec![kq_off, kq_avx2];
     if avx512_vnni {
         kquant_configs.push(kq_vnni512);
@@ -4669,7 +4793,7 @@ fn run_bench_owner_sweep(
         kquant_configs.push(kq_avxvnni);
     }
     let configs: Vec<SweepConfig> = match lane {
-        Lane::Q8 => q8_configs.to_vec(),
+        Lane::Q8 => q8_configs,
         Lane::KQuant => kquant_configs,
     };
     let configs = configs.as_slice();
@@ -4693,10 +4817,11 @@ fn run_bench_owner_sweep(
         },
         configs.len()
     );
-    if lane == Lane::KQuant && !avx512_vnni {
+    // Both lanes are capability-aware now, so this applies to either one.
+    if !avx512_vnni {
         if avx_vnni {
             eprintln!(
-                "[bench-owner-sweep] no avx512f/bw/vnni: measuring the 256-bit AVX-VNNI inner in place of the 512-bit one"
+                "[bench-owner-sweep] no avx512f/bw/vnni: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
             );
         } else {
             eprintln!("[bench-owner-sweep] no vpdpbusd at all: only the AVX2 inner is measured");
@@ -4756,6 +4881,7 @@ fn run_bench_owner_sweep(
                 "prefill_tok_s": r3(prefill_tok_s),
                 "decode_tok_s": r3(decode_tok_s),
                 "owner_prefill_taken": owner_taken,
+                "q8_avxvnni256_taken": telemetry_snapshot.matmul_owner_avxvnni_taken,
                 "kquant_vnni512_taken": telemetry_snapshot.kquant_owner_vnni_taken,
                 "kquant_avxvnni256_taken": telemetry_snapshot.kquant_owner_avxvnni_taken,
             });
@@ -4793,6 +4919,18 @@ fn run_bench_generate(
     // Load the model once; this cost is measured separately from generation.
     let load_start = Instant::now();
     let gguf = read_metadata(&model)?;
+    if camelid::model::file_requires_runnable_bridge(&gguf) {
+        return run_bench_generate_runnable(
+            model,
+            prompt_text,
+            max_tokens,
+            temperature,
+            iterations,
+            warmup,
+            gguf,
+            load_start,
+        );
+    }
     ensure_arch_has_direct_dense_session(&gguf, DenseLaneWindowedForward::ViaSessionDecode)?;
     // Apply the model's execution plan (as serve/chat do) BEFORE loading weights so the
     // CPU Q8 runtime repack + packed-rows4 fast path is selected at load time. Without
@@ -4820,7 +4958,7 @@ fn run_bench_generate(
     };
 
     let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
-    let quantization = infer_quantization(&model);
+    let quantization = camelid::receipt::quantization_label(&gguf);
     let model_label = model.display().to_string();
 
     if warmup {
@@ -4891,6 +5029,198 @@ fn run_bench_generate(
     }
     // Per-stage CPU decode profile (no-op unless CAMELID_STAGE_TIMINGS=1).
     camelid::inference::dump_stage_timings();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_generate_runnable(
+    model: PathBuf,
+    prompt_text: String,
+    max_tokens: usize,
+    temperature: f32,
+    iterations: usize,
+    warmup: bool,
+    gguf: camelid::gguf::GgufFile,
+    load_start: Instant,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        temperature <= 0.0,
+        "the runnable benchmark bridge currently supports greedy generation only; use --temperature 0"
+    );
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let runnable = camelid::runnable::RunnableModel::load(&model.to_string_lossy())?;
+    let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    let prompt_tokens = prompt_token_ids.len();
+    anyhow::ensure!(prompt_tokens >= 1, "prompt encoded to zero tokens");
+
+    eprintln!(
+        "[bench-generate] architecture '{}' uses the runnable hybrid graph",
+        gguf.architecture().unwrap_or("unknown")
+    );
+    if warmup {
+        eprintln!("[bench-generate] warmup iteration (unmeasured)...");
+        let _ = runnable.generate(&prompt_token_ids, max_tokens)?;
+    }
+
+    let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let quantization = camelid::receipt::quantization_label(&gguf);
+    let model_label = model.display().to_string();
+    let stdout = std::io::stdout();
+    for iteration in 0..iterations {
+        let started = Instant::now();
+        let mut first_token_ms = None;
+        let generated = runnable.generate_stopping_streaming(
+            &prompt_token_ids,
+            max_tokens,
+            &[],
+            &mut |_| {
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                }
+            },
+        )?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let ttft_ms = first_token_ms.unwrap_or(elapsed_ms);
+        let decode_ms = (elapsed_ms - ttft_ms).max(0.0);
+        let generated_tokens = generated.len();
+        let decode_tokens = generated_tokens.saturating_sub(1);
+        let tokens_per_second = if decode_ms > 0.0 && decode_tokens > 0 {
+            decode_tokens as f64 / (decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let output_text = tokenizer.decode(&generated, true).unwrap_or_default();
+        let record = BenchGenerateRecord {
+            runtime: "camelid",
+            commit: commit.clone(),
+            model: model_label.clone(),
+            quantization: quantization.clone(),
+            iteration,
+            prompt_tokens,
+            generated_tokens,
+            load_ms,
+            prefill_ms: ttft_ms,
+            ttft_ms,
+            decode_ms,
+            tokens_per_second,
+            peak_memory_bytes: peak_rss_bytes(),
+            offload: camelid::offload::offload_run_status(),
+            output_text,
+            output_token_ids: generated,
+        };
+        {
+            let mut handle = stdout.lock();
+            writeln!(handle, "{}", serde_json::to_string(&record)?)?;
+            handle.flush()?;
+        }
+        eprintln!(
+            "[bench-generate] iter {} | prompt {} tok | gen {} tok | ttft {:.1} ms | decode {:.1} ms | {:.2} tok/s | peak {:.2} GB",
+            iteration,
+            prompt_tokens,
+            generated_tokens,
+            record.ttft_ms,
+            record.decode_ms,
+            record.tokens_per_second,
+            record.peak_memory_bytes as f64 / 1.073_741_824e9,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_generate_vision(
+    model: PathBuf,
+    mmproj: PathBuf,
+    image: PathBuf,
+    prompt: String,
+    max_tokens: usize,
+    image_min_tokens: usize,
+    image_max_tokens: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        image_min_tokens > 0 && image_max_tokens >= image_min_tokens,
+        "image token bounds must satisfy 0 < min <= max"
+    );
+    let total_started = Instant::now();
+    let gguf = read_metadata(&model)?;
+    anyhow::ensure!(
+        gguf.architecture() == Some("qwen35"),
+        "Prism vision currently requires a qwen35 Bonsai model"
+    );
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let load_started = Instant::now();
+    let runnable = camelid::runnable::RunnableModel::load(&model.to_string_lossy())?;
+    let projector = camelid::runnable::PrismVisionProjector::load(&mmproj)?;
+    anyhow::ensure!(
+        projector.projection_dim() == 5120,
+        "mmproj output width {} is not the Bonsai 27B width 5120",
+        projector.projection_dim()
+    );
+    let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+
+    let vision_started = Instant::now();
+    let image_embedding = projector.encode_image(&image, image_min_tokens, image_max_tokens)?;
+    let vision_ms = vision_started.elapsed().as_secs_f64() * 1000.0;
+    // Single-user-turn rendering of the model's embedded Jinja chat template.
+    // The image-pad token is replaced by the projected embedding grid between
+    // these two text chunks.
+    let prefix = tokenizer.encode("<|im_start|>user\n<|vision_start|>", true, true)?;
+    let suffix = tokenizer.encode(
+        &format!("<|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+        false,
+        true,
+    )?;
+    anyhow::ensure!(
+        !prefix.is_empty() && !suffix.is_empty(),
+        "vision marker prompt tokenized to an empty sequence"
+    );
+    let stop: Vec<u32> = tokenizer.special.eog.iter().copied().collect();
+
+    let decode_started = Instant::now();
+    let mut first_token_ms = None;
+    let generated = runnable.generate_vision_stopping_streaming(
+        &prefix,
+        &image_embedding,
+        &suffix,
+        max_tokens,
+        &stop,
+        &mut |_| {
+            if first_token_ms.is_none() {
+                first_token_ms = Some(decode_started.elapsed().as_secs_f64() * 1000.0);
+            }
+        },
+    )?;
+    let generation_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+    let output_text = tokenizer.decode(&generated, true)?;
+    let record = serde_json::json!({
+        "runtime": "camelid-prism-metal",
+        "model": model,
+        "mmproj": mmproj,
+        "image": image,
+        "image_grid": [image_embedding.grid_width, image_embedding.grid_height],
+        "image_tokens": image_embedding.embeddings.len(),
+        "text_prompt_tokens": prefix.len() + suffix.len(),
+        "generated_tokens": generated.len(),
+        "load_ms": load_ms,
+        "vision_encode_ms": vision_ms,
+        "ttft_ms": first_token_ms.unwrap_or(generation_ms),
+        "generation_ms": generation_ms,
+        "total_ms": total_started.elapsed().as_secs_f64() * 1000.0,
+        "peak_memory_bytes": peak_rss_bytes(),
+        "output_text": output_text,
+        "output_token_ids": generated,
+    });
+    println!("{}", serde_json::to_string(&record)?);
+    eprintln!(
+        "[bench-vision] {}x{} image tokens={} | vision {:.1} ms | generation {:.1} ms | peak {:.2} GB",
+        image_embedding.grid_width,
+        image_embedding.grid_height,
+        image_embedding.embeddings.len(),
+        vision_ms,
+        generation_ms,
+        peak_rss_bytes() as f64 / 1.073_741_824e9,
+    );
     Ok(())
 }
 
@@ -5713,7 +6043,7 @@ fn run_bench_speculative(
         workload,
         model: model.display().to_string(),
         draft_model: draft_model.as_ref().map(|p| p.display().to_string()),
-        quantization: infer_quantization(&model),
+        quantization: camelid::receipt::quantization_label(&gguf),
         drafter: drafter_kind,
         cpu_draft,
         spec_only,
@@ -5795,24 +6125,6 @@ fn first_divergence(a: &[u32], b: &[u32]) -> i64 {
     } else {
         n as i64
     }
-}
-
-/// Best-effort quantization label from the GGUF filename.
-fn infer_quantization(path: &std::path::Path) -> String {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_uppercase();
-    for q in [
-        "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_0", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q2_K",
-        "BF16", "F16", "F32",
-    ] {
-        if name.contains(q) {
-            return q.to_string();
-        }
-    }
-    "unknown".to_string()
 }
 
 /// Fail closed BEFORE weights load on every CLI lane that would construct a

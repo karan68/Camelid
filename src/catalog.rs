@@ -38,12 +38,24 @@ pub fn run_pull(query: Option<&str>, models_dir: &Path) -> anyhow::Result<()> {
 /// an ambiguous match rather than guessing.
 fn resolve(entries: &[CatalogItem], query: &str) -> anyhow::Result<CatalogItem> {
     let needle = normalize(query);
+
     let matches: Vec<&CatalogItem> = entries
         .iter()
         .filter(|item| {
             normalize(item.catalog_id).contains(&needle) || normalize(item.name).contains(&needle)
         })
         .collect();
+
+    // A fully-typed id wins outright. Substring matching alone makes any id that
+    // is a prefix of a longer one unresolvable — the user who spelled the whole
+    // thing out has already been as specific as the CLI allows, and answering
+    // "be more specific" to an exact id would be a dead end.
+    if let Some(exact) = matches
+        .iter()
+        .find(|item| normalize(item.catalog_id) == needle || normalize(item.name) == needle)
+    {
+        return Ok((*exact).clone());
+    }
 
     match matches.as_slice() {
         [] => {
@@ -278,8 +290,72 @@ mod tests {
     #[test]
     fn resolves_by_id_fragment_ignoring_separators() {
         let entries = curated_catalog();
-        let item = resolve(&entries, "llama32-3b").unwrap();
+        let item = resolve(&entries, "3b-instruct-q8").unwrap();
         assert_eq!(item.catalog_id, "llama32_3b_instruct_q8_0");
+    }
+
+    #[test]
+    fn a_family_fragment_spanning_several_quants_refuses_to_guess() {
+        // BEHAVIOR CHANGE: `llama32_3b` was the README quickstart id and resolved
+        // to the Q8_0 row while that file was the only Llama 3.2 3B in the
+        // catalog. The certified Q4_K_M and Q5_K_M rows are now pullable too, so
+        // the fragment names three different multi-GB downloads and no longer
+        // resolves. Keeping the historical winner would be a guess dressed as
+        // resolution; the docs moved to quant-qualified ids instead
+        // (`3b_instruct_q8`). The error must list every candidate so the next
+        // command is obvious.
+        let entries = curated_catalog();
+        for ambiguous in ["llama32-3b", "3b-instruct"] {
+            let err = resolve(&entries, ambiguous).expect_err("family fragment is ambiguous");
+            let message = err.to_string();
+            for expected in [
+                "llama32_3b_instruct_q8_0",
+                "llama_3_2_3b_instruct_q4_k_m",
+                "llama_3_2_3b_instruct_q5_k_m",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "{expected} missing from {ambiguous:?} error: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_documented_quant_qualified_ids_all_resolve() {
+        // Every pull id printed in the README table must resolve to exactly the
+        // row it names -- that table is the only place most users look.
+        let entries = curated_catalog();
+        for (id, expected) in [
+            ("1b_instruct_q8", "llama32_1b_instruct_q8_0"),
+            ("iq4_xs", "llama3_2_1b_instruct_iq4_xs"),
+            ("3b_instruct_q8", "llama32_3b_instruct_q8_0"),
+            ("3b_instruct_q4", "llama_3_2_3b_instruct_q4_k_m"),
+            ("3b_instruct_q5", "llama_3_2_3b_instruct_q5_k_m"),
+            ("ornith", "Ornith 1.0 9B"),
+        ] {
+            let item =
+                resolve(&entries, id).unwrap_or_else(|err| panic!("id {id} must resolve: {err}"));
+            assert_eq!(item.catalog_id, expected, "id {id}");
+        }
+    }
+
+    #[test]
+    fn a_fully_typed_id_beats_a_longer_id_that_contains_it() {
+        // Exactness is the tie-break, not row order: the whole id is the most
+        // specific thing a user can type, so it must never lose to a longer id
+        // that merely contains it as a substring.
+        let entries = vec![
+            synthetic("qwen3_4b_q4_k_m", "Q4_K_M", 1, "Qwen3 4B Q4_K_M"),
+            synthetic(
+                "qwen3_4b_q4_k_m_imatrix",
+                "Q4_K_M",
+                2,
+                "Qwen3 4B Q4_K_M imatrix",
+            ),
+        ];
+        let item = resolve(&entries, "qwen3_4b_q4_k_m").expect("exact id resolves");
+        assert_eq!(item.catalog_id, "qwen3_4b_q4_k_m");
     }
 
     #[test]

@@ -6,7 +6,7 @@ import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
-import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
+import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconEdit, IconImage, IconClose } from '../components/ui/icons'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
@@ -41,6 +41,68 @@ const FOLLOW_UP_PROMPTS = [
   'Tighten that into a shorter final answer.',
   'Turn this into a checklist I can execute.',
 ]
+
+const MAX_VISION_UPLOAD_BYTES = 3 * 1024 * 1024
+const MAX_VISION_EDGE = 1600
+
+const readAsDataUrl = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => resolve(String(reader.result || ''))
+  reader.onerror = () => reject(reader.error || new Error('Could not read the image.'))
+  reader.readAsDataURL(blob)
+})
+
+const loadBrowserImage = (file) => new Promise((resolve, reject) => {
+  const url = URL.createObjectURL(file)
+  const image = new Image()
+  image.onload = () => {
+    URL.revokeObjectURL(url)
+    resolve(image)
+  }
+  image.onerror = () => {
+    URL.revokeObjectURL(url)
+    reject(new Error('The selected file is not a readable PNG or JPEG image.'))
+  }
+  image.src = url
+})
+
+const canvasBlob = (canvas, quality) => new Promise((resolve) => {
+  canvas.toBlob(resolve, 'image/jpeg', quality)
+})
+
+async function prepareVisionAttachment(file) {
+  if (!['image/png', 'image/jpeg'].includes(file.type)) {
+    throw new Error('Choose a PNG or JPEG image.')
+  }
+  const image = await loadBrowserImage(file)
+  let blob = file
+  let type = file.type
+  if (file.size > MAX_VISION_UPLOAD_BYTES || Math.max(image.naturalWidth, image.naturalHeight) > MAX_VISION_EDGE) {
+    const scale = Math.min(1, MAX_VISION_EDGE / Math.max(image.naturalWidth, image.naturalHeight))
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+    const context = canvas.getContext('2d')
+    context.fillStyle = '#fff'
+    context.fillRect(0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    blob = await canvasBlob(canvas, 0.9)
+    if (blob?.size > MAX_VISION_UPLOAD_BYTES) blob = await canvasBlob(canvas, 0.72)
+    if (!blob) throw new Error('Could not prepare the selected image.')
+    type = 'image/jpeg'
+  }
+  if (blob.size > MAX_VISION_UPLOAD_BYTES) {
+    throw new Error('The prepared image is still too large. Choose an image under 3 MB.')
+  }
+  return {
+    name: file.name,
+    type,
+    size: blob.size,
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+    data_url: await readAsDataUrl(blob),
+  }
+}
 
 export default function ChatWorkspace({
   selectedConversation,
@@ -77,12 +139,17 @@ export default function ChatWorkspace({
   // keyed on `selectedModelRunnable`; the experimental lane gets its own banner and
   // never borrows the supported badge.
   const canChat = selectedModelRunnable || selectedModelExperimental
+  const experimentalChatReady = selectedModelExperimental && !selectedModelRunnable
+  const visionReady = canChat && Boolean(runtime?.vision_ready)
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
   const [showControls, setShowControls] = useState(false)
   const [showAllMessages, setShowAllMessages] = useState(false)
   const [userScrolledAway, setUserScrolledAway] = useState(false)
+  const [composerImage, setComposerImage] = useState(null)
+  const [imageError, setImageError] = useState('')
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
+  const imageInputRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
   const composerReadinessId = 'camelid-chat-readiness-note'
 
@@ -137,6 +204,8 @@ export default function ChatWorkspace({
     ? 'API unavailable'
     : selectedModelRunnable
       ? 'Local chat ready'
+      : experimentalChatReady
+        ? 'Experimental chat ready'
       : selectedRuntimeReady
         ? 'Runtime ready, support gated'
         : runtime?.loaded_now
@@ -146,6 +215,8 @@ export default function ChatWorkspace({
     ? 'Camelid did not respond. Start the server or check the API base before loading a model.'
     : selectedModelRunnable
       ? `${selectedModelName} is loaded now and generation_ready=true.`
+      : experimentalChatReady
+        ? `${selectedModelName} is loaded and generation_ready=true on the experimental lane.`
       : selectedRuntimeReady
         ? 'The runtime is ready; Camelid still needs an exact supported row before chat unlocks.'
         : runtime?.loaded_now
@@ -167,6 +238,8 @@ export default function ChatWorkspace({
         : 'Camelid does not infer broad support from filenames, families, or saved paths.'
   const readinessFinePrint = selectedModelRunnable
     ? `${selectedCompatibilityLabel}. Ready for this loaded exact row.`
+    : experimentalChatReady
+      ? 'Ready for experimental chat; replies are unverified and carry no supported-row or parity claim.'
     : apiUnavailable
       ? 'Drafts stay editable while the Camelid API reconnects.'
       : selectedModel
@@ -178,6 +251,8 @@ export default function ChatWorkspace({
           : 'Choose a model, then Camelid will show what still needs to pass before send unlocks.'
   const selectedModelReadinessCopy = selectedModelRunnable
     ? 'Selected model is ready for Camelid chat.'
+    : experimentalChatReady
+      ? 'Selected model is ready for experimental Camelid chat.'
     : apiUnavailable
       ? 'The API is offline, so readiness cannot be checked yet.'
       : selectedModelIssue
@@ -192,12 +267,16 @@ export default function ChatWorkspace({
   const selectedModelGateSummary = selectedModel
     ? selectedModelRunnable
       ? 'Selected model is ready for Camelid chat.'
+      : experimentalChatReady
+        ? 'Selected model is ready for experimental Camelid chat.'
       : selectedModelIssue || selectedModelReadinessCopy
     : 'Choose a model before starting a Camelid chat.'
 
-  const productHeroTitle = selectedModelRunnable ? 'How can I help?' : "Hi there, let's get into it"
+  const productHeroTitle = canChat ? 'How can I help?' : "Hi there, let's get into it"
   const productHeroSummary = selectedModelRunnable
     ? 'Local chat is ready. Ask anything — responses stay grounded in the loaded model.'
+    : experimentalChatReady
+      ? 'Experimental local chat is ready. Replies are unverified and have no parity guarantee.'
     : apiUnavailable
       ? 'Keep writing here. Send unlocks again once the local API responds.'
       : supportBlocked
@@ -210,12 +289,14 @@ export default function ChatWorkspace({
             ? 'Camelid answers with a model running on this machine. Set one up above and this becomes a chat.'
             : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
-  const readinessState = selectedModelRunnable ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
+  const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const runtimeTone = readinessTone({ ready: selectedModelRunnable, offline: apiUnavailable, waiting: Boolean(runtime?.loaded_now || selectedModel) })
-  const statusTone = selectedModelRunnable ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
+  const statusTone = selectedModelRunnable ? 'ready' : experimentalChatReady ? 'warn' : apiUnavailable ? 'offline' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
 
   const selectionSummaryCopy = selectedModelRunnable
     ? `${selectedModelName} is loaded now and generation_ready=true. The current exact-row contract is unlocked.`
+    : experimentalChatReady
+      ? `${selectedModelName} is loaded now and generation_ready=true on the experimental lane. Replies remain unverified.`
     : apiUnavailable
       ? 'The frontend is available, but the Camelid API must respond before model readiness can be checked.'
       : selectedModelIssue
@@ -269,9 +350,9 @@ export default function ChatWorkspace({
             ? 'Load a model first'
             : 'Choose a ready model first'
   const composerStopLabel = stoppingGeneration ? 'Stopping…' : 'Stop'
-  const secondaryActionLabel = selectedModelRunnable ? 'Save to memory' : (apiUnavailable ? 'Open API' : 'Open Models')
-  const secondaryAction = selectedModelRunnable ? saveToMemory : () => setTab(apiUnavailable ? 'api' : 'library')
-  const secondaryActionDisabled = selectedModelRunnable ? generationActive : false
+  const secondaryActionLabel = canChat ? 'Save to memory' : (apiUnavailable ? 'Open API' : 'Open Models')
+  const secondaryAction = canChat ? saveToMemory : () => setTab(apiUnavailable ? 'api' : 'library')
+  const secondaryActionDisabled = canChat ? generationActive : false
 
   // ----- Effects -----
   useEffect(() => {
@@ -286,6 +367,13 @@ export default function ChatWorkspace({
     }, 1000)
     return () => window.clearInterval(interval)
   }, [generationActive])
+
+  useEffect(() => {
+    if (!visionReady) {
+      setComposerImage(null)
+      setImageError('')
+    }
+  }, [visionReady, selectedModelId])
 
   useEffect(() => {
     if (!generationActive) return undefined
@@ -329,6 +417,27 @@ export default function ChatWorkspace({
     return () => window.cancelAnimationFrame(frame)
   }, [composerDraftUnlocked, generationActive, isFreshThread, selectedConversation?.id])
 
+  const handleSendMessage = async () => {
+    const image = composerImage
+    setComposerImage(null)
+    setImageError('')
+    await sendMessage({ overrideImage: image })
+  }
+
+  const handleVisionFile = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    setImageError('')
+    try {
+      setComposerImage(await prepareVisionAttachment(file))
+      composerRef.current?.focus()
+    } catch (error) {
+      setComposerImage(null)
+      setImageError(error?.message || 'Could not attach the image.')
+    }
+  }
+
   const handleComposerKeyDown = async (event) => {
     if (event.key === 'Escape' && generationActive) {
       event.preventDefault()
@@ -337,7 +446,7 @@ export default function ChatWorkspace({
     }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
-      if (canSubmit) await sendMessage()
+      if (canSubmit) await handleSendMessage()
     }
   }
 
@@ -347,12 +456,14 @@ export default function ChatWorkspace({
   }
 
   // ----- Model picker -----
-  const runnableModels = models.filter((model) => getChatGateState(capabilities, model, runtime).chatUnlocked)
-  const waitingModels = models.filter((model) => !getChatGateState(capabilities, model, runtime).chatUnlocked)
+  const modelCanChat = (model) => ['supported', 'experimental'].includes(getChatGateState(capabilities, model, runtime).chatMode)
+  const runnableModels = models.filter(modelCanChat)
+  const waitingModels = models.filter((model) => !modelCanChat(model))
   const selectedPickerModelId = models.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
   const modelOptionLabel = (model) => {
     const gate = getChatGateState(capabilities, model, runtime)
     if (gate.chatUnlocked) return `${model.name} · Ready`
+    if (gate.chatMode === 'experimental') return `${model.name} · Experimental ready`
     if (apiUnavailable) return `${model.name} · API unavailable`
     if (gate.runtimeReady) return `${model.name} · Support gated`
     if (gate.runtimeLoaded) return `${model.name} · Loading`
@@ -375,7 +486,7 @@ export default function ChatWorkspace({
     contextLength: modelContextLength(selectedModel),
   })
 
-  const detailCopy = selectedModelRunnable ? selectionSummaryCopy : (supportBlocked || selectedModelIssue ? selectedCompatibilityCopy : readinessFinePrint)
+  const detailCopy = canChat ? selectionSummaryCopy : (supportBlocked || selectedModelIssue ? selectedCompatibilityCopy : readinessFinePrint)
 
   const renderComposer = () => (
     <div className={`cxcomposer is-${readinessState}`}>
@@ -387,6 +498,23 @@ export default function ChatWorkspace({
         />
       )}
       <div className="cxcomposer__box">
+        {composerImage && (
+          <div className="cxcomposer__image" role="status">
+            <img src={composerImage.data_url} alt={`Attached ${composerImage.name}`} />
+            <div className="cxcomposer__image-copy">
+              <strong>{composerImage.name}</strong>
+              <span>{Math.round(composerImage.size / 1024)} KB · ready for Prism vision</span>
+            </div>
+            <button
+              type="button"
+              className="cxcomposer__image-remove"
+              aria-label="Remove attached image"
+              onClick={() => setComposerImage(null)}
+            >
+              <IconClose size={16} />
+            </button>
+          </div>
+        )}
         <textarea
           ref={composerRef}
           className="cxcomposer__input"
@@ -434,6 +562,27 @@ export default function ChatWorkspace({
               </label>
             ) : (
               <button type="button" className="cxcomposer__tool" onClick={() => setTab('library')}>Add a model</button>
+            )}
+            {visionReady && (
+              <>
+                <input
+                  ref={imageInputRef}
+                  className="sr-only"
+                  type="file"
+                  accept="image/png,image/jpeg"
+                  onChange={handleVisionFile}
+                  tabIndex={-1}
+                />
+                <button
+                  type="button"
+                  className={`cxcomposer__tool ${composerImage ? 'is-on' : ''}`}
+                  onClick={() => imageInputRef.current?.click()}
+                  disabled={generationActive}
+                  title="Attach one PNG or JPEG for the loaded Prism vision model"
+                >
+                  <IconImage size={16} /> {composerImage ? 'Image ready' : 'Image'}
+                </button>
+              </>
             )}
             {!demoMode && setReceiptMode && (
               <button
@@ -486,7 +635,7 @@ export default function ChatWorkspace({
               aria-label="Send message"
               data-send-ready={canSubmit ? 'true' : 'false'}
               title={!canSubmit ? sendDisabledReason : 'Send message to Camelid'}
-              onClick={sendMessage}
+              onClick={handleSendMessage}
               disabled={!canSubmit || sendBudget.level === 'error'}
             >
               <IconSend size={20} />
@@ -494,6 +643,8 @@ export default function ChatWorkspace({
           </div>
         </div>
       </div>
+
+      {imageError && <p className="cxcomposer__image-error" role="alert">{imageError}</p>}
 
       {sendBudget.level === 'error' && (
         <p className="cxcomposer__budget-error" role="alert">
@@ -563,7 +714,7 @@ export default function ChatWorkspace({
             </div>
           ) : (
             <div className="cxchat__thread">
-              {visibleMessages.length > 0 && !generationActive && selectedModelRunnable && (
+              {visibleMessages.length > 0 && !generationActive && canChat && (
                 <div className="cxchat__followups" aria-label="Follow-up prompts">
                   {FOLLOW_UP_PROMPTS.map((prompt) => (
                     <button key={prompt} type="button" className="cxchat__followup" onClick={() => handleSuggestion(prompt)}>{prompt}</button>

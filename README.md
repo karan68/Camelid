@@ -2,7 +2,7 @@
 
 # 🐪 Camelid
 
-**Run supported GGUF language models locally with a Rust-native engine.**
+**Run supported GGUF language and vision models locally with a Rust-native engine.**
 
 Desktop app, browser chat, terminal UI, and an OpenAI-style API — all backed by the same local runtime.
 
@@ -28,6 +28,17 @@ Camelid deliberately supports a curated set of exact model-and-quantization comb
 supported row is validated token-for-token against a pinned reference before it is presented as
 ready to use.
 
+> [!TIP]
+> **New: [PrismML](https://prismml.com/) Bonsai models are Supported on Apple Silicon Metal.**
+> Seven exact, hash-pinned 4B, 8B, and 27B GGUFs covering `Q1_0`, `Q2_0`, and `PQ2_0` are
+> downloadable from the Desktop **Models** page or with `camelid pull`. With the pinned Qwen3-VL
+> projector, the 27B Q1 row also supports local PNG/JPEG input through browser chat and the API;
+> the 27B Q2 row has a checked single-image CLI smoke. These rows are **Supported**, not
+> Experimental; the claim is limited to the listed artifacts on macOS Apple Silicon Metal.
+> [See the exact rows and vision setup.](#prismml--bonsai-macos-metal-support)
+> Also make sure to download [Ternary-Bonsai-27B-mmproj-Q8_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf)
+> and drop it in your models directory for vision projector. I will have this automated in the next release.
+
 ## Why Camelid
 
 - **Local by default.** Models and inference stay on your machine unless you choose to expose the server.
@@ -46,17 +57,19 @@ ready to use.
 
 #### Windows
 
-Paste one command into PowerShell — it downloads the signed installer from the latest release,
-verifies its Authenticode signature, installs the app per-user (no admin rights) under
-`%LOCALAPPDATA%\Camelid Desktop`, and launches it. No toolchain required; it needs 64-bit
-Windows 10 or 11.
+Paste one command into PowerShell — it downloads the signed installer from the newest release
+that publishes one, verifies its Authenticode signature, installs the app per-user (no admin
+rights) under `%LOCALAPPDATA%\Camelid Desktop`, and launches it. No toolchain required; it needs
+64-bit Windows 10 or 11.
 
 ```powershell
 irm https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-windows.ps1 | iex
 ```
 
-To update later, run the same command again; models and settings are preserved. To pin a
-version, set `CAMELID_DESKTOP_TAG` first (for example `$env:CAMELID_DESKTOP_TAG = 'v0.4.5'`).
+To update later, run the same command again; models and settings are preserved. The upgrade also
+drops superseded CUDA runtime files that an older version installed and the current one no longer
+ships, so an in-place update cannot accumulate dead weight. To pin a version, set
+`CAMELID_DESKTOP_TAG` first (for example `$env:CAMELID_DESKTOP_TAG = 'v0.4.5'`).
 
 Prefer to install by hand? Download either artifact from the [latest release][latest-release]:
 
@@ -129,7 +142,7 @@ binary, clear the quarantine attribute once: `xattr -d com.apple.quarantine ./ca
 ### First chat in two commands
 
 ```bash
-camelid pull llama32_3b
+camelid pull 3b_instruct_q8
 camelid serve --model models/Llama-3.2-3B-Instruct-Q8_0.gguf
 ```
 
@@ -206,22 +219,29 @@ Not sure where to begin? Pick **Llama 3.2 3B** — the best balance of quality a
 | Goal | Model | Pull id |
 |---|---|---|
 | Smallest end-to-end test (~1.2 GB) | TinyLlama 1.1B Chat Q8_0 | `tinyllama` |
-| **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `llama32_3b` |
+| **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `3b_instruct_q8` |
 | Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
 | Reasoning + coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
+| PrismML compact model on Apple Silicon | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
+| PrismML browser/API vision on Apple Silicon (projector required) | Bonsai 27B Q1_0 | `bonsai_27b_q1` |
 
 ### Catalog models — `camelid pull`
 
-Twenty-one curated rows ship in the `camelid pull` catalog. Run `camelid pull` with no argument to
+Thirty-two curated rows ship in the `camelid pull` catalog. Run `camelid pull` with no argument to
 print the list, or `camelid pull <id>` to download into `./models`. Ids resolve by **unique
-substring**, so the short ids below are all you need — `camelid pull llama32_3b` works exactly like
-the full `llama32_3b_instruct_q8_0`.
+substring**, so the short ids below are all you need — `camelid pull 3b_instruct_q8` works exactly
+like the full `llama32_3b_instruct_q8_0`. Where a model ships in several quantizations the id has to
+name one: a bare family fragment like `llama32_3b` matches all three Llama 3.2 3B rows, and `pull`
+lists them rather than guessing which multi-GB file you meant.
 
 | Model | Quant | Arch | Size | Pull id | GGUF file |
 |---|---|---|---:|---|---|
 | **TinyLlama 1.1B Chat** | `Q8_0` | `llama` | 1.2 GB | `tinyllama` | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` |
-| **Llama 3.2 1B Instruct** | `Q8_0` | `llama` | 1.3 GB | `llama32_1b` | `Llama-3.2-1B-Instruct-Q8_0.gguf` |
-| **Llama 3.2 3B Instruct** | `Q8_0` | `llama` | 3.4 GB | `llama32_3b` | `Llama-3.2-3B-Instruct-Q8_0.gguf` |
+| **Llama 3.2 1B Instruct** | `Q8_0` | `llama` | 1.3 GB | `1b_instruct_q8` | `Llama-3.2-1B-Instruct-Q8_0.gguf` |
+| **Llama 3.2 1B Instruct** | `IQ4_XS` | `llama` | 0.7 GB | `iq4_xs` | `Llama-3.2-1B-Instruct-IQ4_XS.gguf` |
+| **Llama 3.2 3B Instruct** | `Q8_0` | `llama` | 3.4 GB | `3b_instruct_q8` | `Llama-3.2-3B-Instruct-Q8_0.gguf` |
+| **Llama 3.2 3B Instruct** | `Q4_K_M` | `llama` | 2.0 GB | `3b_instruct_q4` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` |
+| **Llama 3.2 3B Instruct** | `Q5_K_M` | `llama` | 2.3 GB | `3b_instruct_q5` | `Llama-3.2-3B-Instruct-Q5_K_M.gguf` |
 | **Llama 3 8B Instruct** | `Q8_0` | `llama` | 8.5 GB | `llama3_8b` | `Meta-Llama-3-8B-Instruct.Q8_0.gguf` |
 | **Llama 3.1 8B Instruct** | `Q8_0` | `llama` | 8.5 GB | `llama31_8b` | `Meta-Llama-3.1-8B-Instruct-Q8_0.gguf` |
 | **Gemma 3 1B-It** | `Q8_0` | `gemma3` | 1.1 GB | `gemma_3_1b` | `gemma-3-1b-it-Q8_0.gguf` |
@@ -240,6 +260,14 @@ the full `llama32_3b_instruct_q8_0`.
 | **DeepSeek R1 Distill Llama 8B** | `Q8_0` | `llama` | 8.5 GB | `distill_llama` | `DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf` |
 | **Qwen2.5 Coder 7B** | `Q8_0` | `qwen25` | 8.1 GB | `qwen25_coder` | `qwen2.5-coder-7b-instruct-q8_0.gguf` |
 | **Cohere Command R v01** | `Q8_0` | `command-r` | 37.2 GB | `command_r` | `c4ai-command-r-v01-Q8_0.gguf` |
+| **Ornith 1.0 9B** — hybrid DeltaNet, `tool_capable` | `Q8_0` | `qwen35` | 9.5 GB | `ornith` | `ornith-1.0-9b-Q8_0.gguf` |
+| **Bonsai 4B** | `Q1_0` | `qwen35` | 0.6 GB | `bonsai_4b_q1` | `Bonsai-4B-Q1_0.gguf` |
+| **Ternary Bonsai 4B** | `Q2_0` | `qwen35` | 1.1 GB | `bonsai_4b_q2` | `Ternary-Bonsai-4B-Q2_0.gguf` |
+| **Ternary Bonsai 4B** | `PQ2_0` | `qwen35` | 1.1 GB | `bonsai_4b_pq2` | `Ternary-Bonsai-4B-PQ2_0.gguf` |
+| **Bonsai 8B** | `Q1_0` | `qwen35` | 1.2 GB | `bonsai_8b_q1` | `Bonsai-8B-Q1_0.gguf` |
+| **Ternary Bonsai 8B** | `Q2_0` | `qwen35` | 2.2 GB | `bonsai_8b_q2` | `Ternary-Bonsai-8B-Q2_0.gguf` |
+| **Bonsai 27B** | `Q1_0` | `qwen35` | 3.8 GB | `bonsai_27b_q1` | `Bonsai-27B-Q1_0.gguf` |
+| **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
 The two Gemma 4 rows marked *two-Mac distributed* are validated on the layer-sharded two-host lane —
 they are memory-infeasible on a single 16 GB machine. Command R is listed for completeness; at
@@ -248,17 +276,15 @@ they are memory-infeasible on a single 16 GB machine. Command R is listed for co
 ### Also parity-certified
 
 These exact rows carry committed parity receipts but are **not** in the `camelid pull` catalog —
-point `--model` at the file yourself. Several are local requantizations rather than a single
-canonical upstream upload, which is precisely why they aren't offered as a one-command download.
+point `--model` at the file yourself. Every one of them is a local requantization or a file with no
+resolved upstream upload, which is precisely why they aren't offered as a one-command download: the
+certified bytes exist nowhere to pull them from. (Where a public upload *does* carry the certified
+bytes — the 3B K-quants, the 1B IQ4_XS, Ornith Q8_0 — the row is in the pull table above instead.)
 
 | Model | Quant | Arch | GGUF file | Lane |
 |---|---|---|---|---|
-| **Llama 3.2 1B Instruct** | `IQ4_XS` | `llama` | `Llama-3.2-1B-Instruct-IQ4_XS.gguf` | First i-quant row — GPU-resident + CPU wire-streamed raw-decode parity smoke |
-| **Llama 3.2 1B Instruct** | `Q4_K_M` | `llama` | `Llama-3.2-1B-Instruct-Q4_K_M.gguf` | GPU-resident K-quant raw greedy decode (16/16 layers VRAM-resident) |
-| **Llama 3.2 3B Instruct** | `Q4_K_M` | `llama` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | GPU-resident K-quant raw greedy decode (28/28 layers VRAM-resident) |
-| **Llama 3.2 3B Instruct** | `Q5_K_M` | `llama` | `Llama-3.2-3B-Instruct-Q5_K_M.gguf` | GPU-resident Q5 certification, token-and-text identical at 1/5/50 |
-| **Ornith 1.0 9B** | `Q8_0` | `qwen35` | `ornith-1.0-9b-Q8_0.gguf` | Hybrid DeltaNet + sparse attention on the runnable serve lane; `tool_capable` |
-| **Ornith 1.0 9B** | `Q4_K_M` | `qwen35` | `ornith-1.0-9b-Q4_K_M.gguf` | Fully GPU-resident CUDA lane (in-house requant); `tool_capable` |
+| **Llama 3.2 1B Instruct** | `Q4_K_M` | `llama` | `Llama-3.2-1B-Instruct-Q4_K_M.gguf` | GPU-resident K-quant raw greedy decode (16/16 layers VRAM-resident); certified bytes match no surveyed publisher upload |
+| **Ornith 1.0 9B** | `Q4_K_M` | `qwen35` | `ornith-1.0-9b-Q4_K_M.gguf` | Fully GPU-resident CUDA lane (in-house requant — the HF Q4_K_M is a *different* file); `tool_capable` |
 | **Ornith 1.0 9B** | `Q3_K_M` | `qwen35` | `ornith-1.0-9b-Q3_K_M.gguf` | Fully GPU-resident at 16K context on a 6 GiB card (imatrix requant) |
 | **Ternary Bonsai 4B** | `TQ2_0` | `qwen3` | `Ternary-Bonsai-4B-TQ2_0.gguf` | Ternary 2.06 bpw, single-node CPU completion smoke (~3.1 GB RSS) |
 | **Gemma 4 E4B-It** | `NVFP4` | `gemma4` | `gemma-4-E4B-it-NVFP4-mm.gguf` | BASALT / GABBRO NVFP4 pilot — Windows CUDA + macOS Metal, fails closed elsewhere |
@@ -266,6 +292,41 @@ canonical upstream upload, which is precisely why they aren't offered as a one-c
 Each row's exact envelope — which surfaces are certified, which contexts were checked, and what is
 explicitly not claimed — lives in [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md).
 [COMPATIBILITY.md](COMPATIBILITY.md) is the complete, authoritative supported-row ledger.
+
+### PrismML / Bonsai macOS Metal support
+
+Seven exact PrismML Bonsai GGUFs are supported exact-row smoke on Apple Silicon Metal
+without expanding their Q1_0, legacy Q2_0, or PQ2_0 linears into dense weights.
+The checked Mac mini 2 matrix covers 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2.
+The 27B row can pair with `Ternary-Bonsai-27B-mmproj-Q8_0.gguf` for Qwen3-VL
+image input. Exact hashes and results are recorded in
+[`qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json`](qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json).
+
+All seven language-model files are available from the Models page or with
+`camelid pull <id>`. The vision projector is a companion file rather than a
+loadable model, so download it separately from Prism ML and place it beside the
+27B GGUF:
+
+```bash
+hf download prism-ml/Ternary-Bonsai-27B-gguf \
+  Ternary-Bonsai-27B-mmproj-Q8_0.gguf --local-dir /path/to/model-directory
+```
+
+Place the projector beside the language-model GGUF (its filename must contain
+`mmproj`) or set `CAMELID_MMPROJ` explicitly, then start the normal browser UI:
+
+```bash
+camelid serve --model /path/to/Bonsai-27B-Q1_0.gguf
+```
+
+When `/v1/health` reports `vision_ready: true`, Chat shows an **Image** control.
+It accepts one local PNG/JPEG, keeps that image active for follow-up turns, and
+sends an OpenAI-compatible `image_url` data part. The same shape works directly
+with `/v1/chat/completions`, including SSE streaming. Remote URLs, multiple
+images, audio/video, and vision combined with tools fail closed; multimodal
+input on `/v1/responses` remains unsupported. Support is limited to the seven
+hash-pinned artifacts on macOS Apple Silicon Metal; it is not yet a Windows,
+bounded-context, broad-qwen35, quant-wide, or production-throughput claim.
 
 ## Ways to use Camelid
 

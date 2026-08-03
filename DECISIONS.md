@@ -582,6 +582,120 @@ the existing SSE `decode_tps` real generation event, rendered unavailable when a
 release job is additive and independently skippable; existing server artifacts are untouched.
 See `camelid-desktop/README.md`.
 
+### D11 (cont.) — NSIS in-place upgrades must remove sidecar files the version no longer ships (2026-07-31)
+
+An overwrite-only installer has a blind spot: it rewrites the files it ships and leaves
+everything else alone, so a file installed by an **older** version that the current one dropped
+survives every future upgrade. Found in the field on a v0.4.6 box — `sidecar\nvrtc64_120_0.alt.dll`,
+85.7 MB, from an install predating the `.alt` filter in `scripts/package-windows-cuda.ps1`. The
+published v0.4.6 artifact correctly contains no `.alt` entry and
+`scripts/check-release-artifact.mjs` has a forbidden rule for it, so **the packaging and artifact
+gates were both already correct** — the defect was only ever in the upgrade path, which is why
+neither gate could see it and why re-running the one-command installer never cleared it.
+
+**Fix: `NSIS_HOOK_PREINSTALL`** (`camelid-desktop/windows/installer-hooks.nsh`, wired via
+`bundle.windows.nsis.installerHooks`), deleting `nvrtc64_*.dll` and `nvrtc-builtins64_*.dll` from
+`$INSTDIR\sidecar` before the file copy re-lays the current set.
+
+Deleting the whole NVRTC family rather than blacklisting `.alt` is the deliberate choice: these
+filenames encode the CUDA version (`nvrtc-builtins64_129.dll` is 12.9; `nvrtc64_120_0.dll` the
+12.x ABI), so a `CUDA_VERSION` bump renames them and strands the previous ones identically. A
+rename is exactly what an overwrite cannot fix, so the blacklist would have to be extended by
+hand every bump; re-laying the family is self-healing. Cost is that the good DLLs are deleted and
+immediately re-extracted — verified below.
+
+**Rejected: clearing `sidecar\` wholesale before extracting.** It looks safe because `sidecar\`
+is shipped content, but it is not: `sidecar_models_dir` (`camelid-desktop/src/engine.rs`) makes
+the desktop's model store `models\` *beside the engine binary* — i.e. `sidecar\models\`. The box
+that reported the orphan had **4.42 GB of user GGUF weights there**. A wholesale clear is
+therefore a data-loss bug, not a cleanup.
+
+**Verified against a real in-place upgrade,** not by reading the template: installer built from
+this config, planted `sidecar\nvrtc64_120_0.alt.dll`, upgraded over the existing install. The
+`.alt` orphan is gone, the shipped NVRTC pair is present and re-extracted at full size, the
+`models\` subtree survives byte-for-byte, and the app relaunches and health-gates.
+
+Failure is non-fatal by construction: `Delete` on a missing or locked file sets the error flag
+without aborting, so the worst case is the orphan surviving to the next upgrade — never a broken
+install.
+
+## D11 cont. — the binary inside the Windows installer is signed by the bundler, not by a folder pass (2026-08-01)
+
+`camelid-desktop.exe` exists as **two distinct copies**, and a folder-based signing pass can
+only ever reach one of them. Tauri stamps the bundle type into the copy it stages for the
+installer, rewriting `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed app knows how
+it was installed — and it rewrites a *staged copy*, leaving `target/release` untouched.
+
+That gives a window with exactly one entrance. A signature applied **before** `tauri build` is
+invalidated by the rewrite; a signature applied **after** cannot reach a binary already sealed
+inside the installer. Two releases shipped from the two sides of it:
+
+| release | when the desktop exe was signed | what users installed |
+| --- | --- | --- |
+| v0.4.6 | after bundling only | `NotSigned` |
+| v0.4.7 | before bundling only | `HashMismatch` — a *broken* signature |
+
+v0.4.7 was the worse outcome: an invalid signature earns no SmartScreen reputation and reads
+as tampering, where an unsigned binary merely reads as unsigned. It was diagnosed by byte-diffing
+the two published copies, which differ in exactly two places — the 3-byte marker at `0x8043c8`
+and the PE CheckSum, which Authenticode excludes from its hash.
+
+**Fix: `bundle.windows.signCommand`** (`camelid-desktop/windows/sign-artifact-signing.ps1`),
+the only hook Tauri invokes between the rewrite and packaging. It drives `signtool` through
+`Azure.CodeSigning.Dlib`.
+
+**Rejected: `artifact-signing-cli`,** which Tauri's own documentation suggests for Azure. It
+requires `AZURE_CLIENT_SECRET`, and this repo authenticates to Artifact Signing with OIDC
+federated credentials and stores no secret. Adopting it would have traded a short-lived
+federated token for a long-lived secret purely for convenience. The dlib authenticates through
+`DefaultAzureCredential`, which resolves the `azure/login` session the workflow already
+establishes, so OIDC is preserved.
+
+**The gate matters more than the fix.** Every prior signing check inspected a file handed to
+the signer; none could see the installer's payload, which is why two consecutive releases
+shipped defects there. `Prove the INSTALLED binary is signed` silently installs the built
+installer on the runner and asserts the unpacked binary verifies. Runners are ephemeral, so
+this costs nothing, and it would have caught both defects before publishing.
+
+## D11 cont. — signCommand paths must be absolute, and an incomplete release must never be `latest` (2026-08-01)
+
+v0.4.8 published with **no Windows desktop installer**. `desktop-windows` died with
+`failed to bundle project: failed to run powershell`, the server artifacts published anyway, the
+release became `latest`, and the documented one-command install broke for every user with an
+error they could do nothing about.
+
+**Cause: `signCommand` is invoked seven times per bundle with a working directory that is not
+constant.** Measured on a real bundle — the app binary, five NSIS plugin DLLs, and the
+uninstaller staged as `%TEMP%\nst*.tmp`. Six run from the Tauri project directory; the
+uninstaller call runs from `target\release\nsis\x64`. The project-relative script path resolved
+for six and failed the build on the seventh. A bare `powershell` also failed to spawn on the
+runner, so the interpreter is resolved to a full path too.
+
+**Fix:** the release workflow generates `camelid-desktop/tauri.signing.conf.json` at release
+time with absolute paths, passed as an extra `--config`. It is gitignored and deliberately
+absent from the committed `tauri.conf.json`, so a developer's `tauri build` needs no signing
+tooling. The overlay re-states `installerHooks` — read out of `tauri.conf.json`, derived rather
+than duplicated — so it cannot silently drop the NVRTC-orphan cleanup if Tauri's config merge is
+ever shallower than a deep merge at `bundle.windows`.
+
+**Verified by a real bundle, not an assertion.** Text checks are what let v0.4.8 through: the
+config was present, the script parsed, and its path resolved *from the project directory*. The
+fix was proven by running `tauri build` with the generated config and observing all seven
+invocations spawn.
+
+**Two guards, because the fix alone only covers this bug:**
+
+1. `verify-release-assets` (`if: always()`, needs every publishing job) checks the published
+   asset set and, if anything is missing, flips the release to a **prerelease** so
+   `releases/latest` skips it and the previous complete release keeps serving installs. It then
+   fails loudly. The desktop jobs stay independent — they still cannot block server artifacts —
+   but their failure can no longer reach users. **Rejected:** making the desktop jobs blocking,
+   which would let a desktop-only failure withhold the server release.
+2. `scripts/get-desktop-windows.ps1` no longer binds to `releases/latest`. It walks back to the
+   most recent release that actually publishes an installer and warns which it chose. An
+   explicit `CAMELID_DESKTOP_TAG` still fails hard rather than silently substituting a version
+   the user did not ask for.
+
 ## D12 — CPU KV cache: f16-rounded values were stored in f32 buffers; f16 storage + head-major layout lanes (2026-07-01)
 
 Measured finding (Item-3 recon): the CPU KV write path has rounded every stored

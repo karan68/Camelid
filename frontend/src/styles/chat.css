@@ -86,6 +86,14 @@
   color: var(--color-text);
 }
 .cxturn__user-chip p { white-space: pre-wrap; word-break: break-word; }
+.cxturn__user-image {
+  display: block;
+  width: min(360px, 62vw);
+  max-height: 320px;
+  margin-bottom: var(--space-3);
+  border-radius: var(--radius-md);
+  object-fit: contain;
+}
 .cxturn--assistant { align-items: flex-start; }
 .cxturn__avatar { flex: none; }
 .cxturn__body { flex: 1; min-width: 0; padding-top: 3px; }
@@ -288,6 +296,29 @@
   transition: border-color var(--dur-fast) var(--ease-standard), box-shadow var(--dur-fast) var(--ease-standard);
 }
 .cxcomposer__box:focus-within { border-color: var(--color-border-strong); box-shadow: var(--shadow-3); }
+.cxcomposer__image {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0 var(--space-2) var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+.cxcomposer__image img {
+  width: 64px;
+  height: 48px;
+  flex: none;
+  border-radius: var(--radius-md);
+  object-fit: cover;
+}
+.cxcomposer__image-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
+.cxcomposer__image-copy strong { overflow: hidden; font-size: var(--text-sm); text-overflow: ellipsis; white-space: nowrap; }
+.cxcomposer__image-copy span { color: var(--color-text-faint); font-size: var(--text-xs); }
+.cxcomposer__image-remove { display: grid; width: 30px; height: 30px; flex: none; place-items: center; border-radius: 50%; color: var(--color-text-muted); }
+.cxcomposer__image-remove:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.cxcomposer__image-error { margin: var(--space-2) var(--space-2) 0; color: var(--color-error); font-size: var(--text-xs); }
 .cxcomposer__input {
   width: 100%;
   border: none;

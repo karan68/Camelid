@@ -4,12 +4,12 @@ use tempfile::tempdir;
 use camelid::{
     distributed::{
         run_network_benchmark_worker_on_listener, run_worker_loop_on_listener, DistributedClient,
-        DISTRIBUTED_CLIENT, DISTRIBUTED_RANGE,
+        NodeIdentity, PipelineRole, DISTRIBUTED_CLIENT, DISTRIBUTED_RANGE,
     },
     gguf::read_metadata,
     inference::{LlamaInferenceSession, LlamaLoadedWeights},
     model::{LlamaModelConfig, LlamaTensorBinding},
-    tensor::TensorStore,
+    tensor::{CpuTensor, TensorStore},
 };
 
 /// Bind loopback on an OS-assigned free port.
@@ -56,8 +56,10 @@ fn test_distributed_pipeline_parallel_inference() {
     // coordinator below can connect immediately.
     let listener = bind_ephemeral();
     let worker_addr = listener.local_addr().unwrap().to_string();
+    let worker_identity = NodeIdentity::for_model(&model_path, 2, 8, 1..2).unwrap();
     let _worker_handle = std::thread::spawn(move || {
-        if let Err(e) = run_worker_loop_on_listener(listener, worker_session) {
+        if let Err(e) = run_worker_loop_on_listener(listener, worker_session, worker_identity, None)
+        {
             // Surface the worker's own failure. Without this the only symptom is
             // an unexplained EOF on the coordinator's read.
             eprintln!("distributed worker loop exited with error: {e:#}");
@@ -65,7 +67,8 @@ fn test_distributed_pipeline_parallel_inference() {
     });
 
     // 2. Coordinator Setup (Loads layer 0..1)
-    let client = DistributedClient::connect(&worker_addr).unwrap();
+    let coordinator_identity = NodeIdentity::for_model(&model_path, 2, 8, 1..2).unwrap();
+    let client = DistributedClient::connect(&worker_addr, &coordinator_identity).unwrap();
     let _ = DISTRIBUTED_CLIENT.set(client);
     let _ = DISTRIBUTED_RANGE.set((0, 1));
 
@@ -178,9 +181,113 @@ fn pipeline_load_puts_output_weights_on_last_node() {
     last.validate_dense_shapes(&config).unwrap();
 }
 
+/// Regression for defect D1. `serve-distributed` computes logits on the **coordinator** —
+/// `run_worker_loop`'s `forward_worker_layers` returns a bare hidden state, applying
+/// neither `output_norm` nor the output projection — so a coordinator holding a head shard
+/// must still own the output head. That is what `PipelineRole::Coordinator` encodes, and
+/// what `test_distributed_pipeline_parallel_inference` above has always assumed.
+///
+/// The shipped API loader instead derived ownership positionally through
+/// `LlamaLoadedWeights::load`, which reserves the output head for the LAST shard (see
+/// `pipeline_load_puts_output_weights_on_last_node`, correct for that other topology).
+/// The second half here is the negative control: it reproduces in-process the exact
+/// failure that mismatch produced over HTTP.
+#[test]
+fn distributed_coordinator_head_shard_owns_the_output_head() {
+    let dir = tempdir().unwrap();
+    let model_path = dir.path().join("tiny_model.gguf");
+    write_tiny_llama_gguf(&model_path);
+    let gguf = read_metadata(&model_path).unwrap();
+    let binding =
+        LlamaTensorBinding::bind(&gguf, &LlamaModelConfig::from_gguf(&gguf).unwrap()).unwrap();
+    let store = TensorStore::open(&model_path, &gguf);
+
+    // Shaped like a hidden state the worker hands back: [seq, hidden].
+    let from_worker = CpuTensor::from_f32("wire_activation", vec![1, 8], vec![0.0; 8]).unwrap();
+
+    let (load_embedding, load_output) = PipelineRole::Coordinator.tensor_ownership();
+    let coordinator =
+        LlamaLoadedWeights::load_distributed(&store, &binding, 0, 1, load_embedding, load_output)
+            .unwrap();
+    let coordinator =
+        LlamaInferenceSession::new(LlamaModelConfig::from_gguf(&gguf).unwrap(), coordinator)
+            .unwrap();
+    let logits = coordinator
+        .forward_final_norm_and_logits(&from_worker)
+        .expect("a coordinator owning the output head can finalize the forward pass");
+    assert_eq!(logits.shape.dims, vec![1, 16], "[seq, vocab]");
+
+    let positional = LlamaLoadedWeights::load(&store, &binding, Some(0..1)).unwrap();
+    assert_eq!(
+        positional.output_norm.shape.dims,
+        vec![0],
+        "positional ownership leaves a head shard without output_norm"
+    );
+    assert_eq!(
+        positional.output.as_ref().map(|o| o.shape.dims.clone()),
+        Some(vec![0]),
+        "positional ownership leaves a head shard without the output projection"
+    );
+    let positional =
+        LlamaInferenceSession::new(LlamaModelConfig::from_gguf(&gguf).unwrap(), positional)
+            .unwrap();
+    let err = positional
+        .forward_final_norm_and_logits(&from_worker)
+        .expect_err("positional ownership cannot finalize; this was the shipped defect");
+    // Which check trips first depends on the finalize path and on whether the model ties
+    // its output to the embedding; the served 1B model reported the projection
+    // (`token_embd.weight, got [0]`), this untied fixture reports the norm. Both are the
+    // same missing output head, so assert the empty shape rather than one message.
+    assert!(
+        err.to_string().contains("[0]"),
+        "expected a missing-output-head shape error, got: {err}"
+    );
+}
+
+/// The handshake has to hold over a real socket, not just as a pure comparison: a
+/// coordinator carrying a different model must be refused at connect, before it can ship a
+/// single activation, and the worker must stay up to serve the next caller.
+#[test]
+fn a_coordinator_with_a_different_model_is_refused_over_the_wire() {
+    let dir = tempdir().unwrap();
+    let model_path = dir.path().join("tiny_model.gguf");
+    write_tiny_llama_gguf(&model_path);
+    let gguf = read_metadata(&model_path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
+    let store = TensorStore::open(&model_path, &gguf);
+    let (load_embedding, load_output) = PipelineRole::Worker.tensor_ownership();
+    let weights =
+        LlamaLoadedWeights::load_distributed(&store, &binding, 1, 2, load_embedding, load_output)
+            .unwrap();
+    let session = LlamaInferenceSession::new(config, weights).unwrap();
+
+    let listener = bind_ephemeral();
+    let worker_addr = listener.local_addr().unwrap().to_string();
+    let worker_identity = NodeIdentity::for_model(&model_path, 2, 8, 1..2).unwrap();
+    std::thread::spawn(move || {
+        let _ = run_worker_loop_on_listener(listener, session, worker_identity, None);
+    });
+
+    let mut impostor = NodeIdentity::for_model(&model_path, 2, 8, 1..2).unwrap();
+    impostor.model_sha256 = "0".repeat(64);
+    let err = match DistributedClient::connect(&worker_addr, &impostor) {
+        Err(err) => err,
+        Ok(_) => panic!("a coordinator holding a different model must not be admitted"),
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("model_sha256"), "{err}");
+
+    // The worker survived the refusal and still serves a legitimate coordinator.
+    let honest = NodeIdentity::for_model(&model_path, 2, 8, 1..2).unwrap();
+    DistributedClient::connect(&worker_addr, &honest)
+        .expect("a refusal must not take the worker down");
+}
+
 fn write_tiny_llama_gguf(path: &Path) {
     // 2 layers, tiny dimensions: hidden=8, vocab=16, ffn=16, heads=2, kv_heads=2
     // We have exactly 21 tensors: token_embedding, output_norm, output + 9 tensors per layer (18 total) = 21 tensors.
+    // 2 layers, tiny dimensions: hidden=8, vocab=16, ffn=16, heads=2, kv_heads=2
     let mut b = header(21, 13);
 
     // Model hparams metadata

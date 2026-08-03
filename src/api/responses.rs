@@ -242,6 +242,8 @@ impl ResponsesRequest {
             camelid_context_budget_tokens: None,
             camelid_receipt: None,
             camelid_enable_thinking: None,
+            camelid_image_min_tokens: None,
+            camelid_image_max_tokens: None,
             tools,
             tool_choice: self.tool_choice.clone(),
             parallel_tool_calls: self.parallel_tool_calls,
@@ -749,6 +751,7 @@ fn text_message(role: &str, content: String) -> ChatMessage {
     ChatMessage {
         role: role.to_string(),
         content,
+        image_urls: Vec::new(),
         unsupported_content_parts: Vec::new(),
     }
 }

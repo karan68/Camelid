@@ -14,10 +14,38 @@
 // /api/models/tokenizer/encode compared in phase 2 (the runnable lane has no
 // dense-diagnostics prompt echo).
 //
+// TOKEN IDENTITY IS READ FROM THE ENGINE, NOT RE-DERIVED FROM TEXT.
+// `token_match` compares the oracle's generated ids against camelid's OWN
+// `camelid.generated_token_ids` (the same field scripts/chat-parity-llama3.mjs
+// reads). It used to compare against camelid's output STRING re-encoded by
+// camelid's tokenizer, which is lossy in BOTH directions on this 262k SPM vocab
+// and therefore both manufactured and masked divergences:
+//   * manufactured — a run of spaces re-encodes as single-space tokens (236743)
+//     where the engine emitted the merged whitespace tokens (138 = two spaces,
+//     140 = four), so an identical token stream reported token_match:false (the
+//     Phase 4 bundle had to add camelid-raw-probe.json to unpick exactly this);
+//   * masked — any two distinct id sequences that decode to the same string, or
+//     that the tokenizer re-merges to the SAME canonical ids, compare EQUAL. A
+//     batched-prefill defect that changes an id but not the rendered text is
+//     invisible to a text round-trip, and that is the defect class this campaign
+//     is built to catch.
+// The old re-encode is kept as `text_reencode_token_match`, a DIAGNOSTIC only —
+// it is reported, never scored, and a mismatch between it and `token_match`
+// localizes a tokenizer round-trip artifact instead of hiding one.
+//
+// MARGINS (--top-logprobs N, default 0 = off): when armed, phase 1 asks the
+// oracle for `n_probs: N` and phase 2 asks camelid for `logprobs:true,
+// top_logprobs:N`, and every generated position records its top-2 gap in nats.
+// Default OFF on purpose: arming it changes the request both engines answer, and
+// a harness must not silently alter what it measures. Arm it explicitly for a
+// receipt run — a parity result with no recorded margin cannot have its
+// sensitivity estimated after the fact.
+//
 //   Phase 1 (ONLY llama-server running):
 //     node scripts/chat-parity-gemma3.mjs --mode capture \
 //       --llama http://127.0.0.1:8090 --oracle <oracle.json> \
-//       [--prompts-file qa/prompt-packs/gemma3-chat-gate-pack-v1.json] [--token-counts 1,5,50]
+//       [--prompts-file qa/prompt-packs/gemma3-chat-gate-pack-v1.json] [--token-counts 1,5,50] \
+//       [--top-logprobs 2]
 //
 //   ... stop llama-server, start camelid serve (CAMELID_RUNNABLE_SERVE=1) ...
 //
@@ -27,7 +55,11 @@
 //       --model-id "<served id>" [--row-id gemma_3_1b_it_q8_0] \
 //       --display-name "Gemma 3 1B-It Q8_0" --comparator "llama.cpp 9632 ..." \
 //       [--lane-label gemma3_marker_chat_greedy_metal_resident_serve] \
-//       [--request-timeout-ms 3600000] --out <parity.json>
+//       [--request-timeout-ms 3600000] [--top-logprobs 2] --out <parity.json>
+//
+// A pack file may be a bare JSON array, or an object with `prompts` (strings) —
+// the window-edge pack additionally carries per-item metadata, which the harness
+// ignores and the mutation harness reads.
 
 import { writeFile, readFile, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -58,12 +90,22 @@ const outPath = args.get('out') || null
 const tokenCounts = (args.get('token-counts') || '1,5,50').split(',').map((s) => Number.parseInt(s.trim(), 10))
 // Socket idle timeout for both engines (default 30 min); see postJson below.
 const requestTimeoutMs = Number.parseInt(args.get('request-timeout-ms') || '1800000', 10)
+// Top-N logprob capture on BOTH engines. 0 = off (the request shape the frozen
+// bundles were captured with); >=2 records per-position top-2 margins.
+const topLogprobs = Number.parseInt(args.get('top-logprobs') || '0', 10)
 // gemma3 EOG ids in this row's vocab: <eos>=1, <end_of_turn>=106.
 const STOP = new Set([1, 106])
 let PROMPTS
 if (args.get('prompts-file')) {
   const pack = JSON.parse(await readFile(args.get('prompts-file'), 'utf8'))
-  PROMPTS = Array.isArray(pack) ? pack : pack.prompts
+  const raw = Array.isArray(pack) ? pack : pack.prompts || pack.items
+  // A pack entry is either a bare prompt string (every pack before v1 of the
+  // window-edge pack) or an item object that carries its user turn plus the
+  // metadata documenting what the item targets.
+  PROMPTS = raw.map((p) => (typeof p === 'string' ? p : p.user_content))
+  if (PROMPTS.some((p) => typeof p !== 'string')) {
+    throw new Error('prompts-file: every entry must be a string or carry a `user_content` string')
+  }
 } else if (args.get('prompts-json')) {
   PROMPTS = JSON.parse(args.get('prompts-json'))
 } else {
@@ -127,8 +169,46 @@ async function referenceCompletion(promptText, nPredict) {
     cache_prompt: false,
     samplers: ['top_k'],
     return_tokens: true,
+    ...(topLogprobs > 0 ? { n_probs: topLogprobs, post_sampling_probs: false } : {}),
   })
-  return { text: r.content, tokens: r.tokens }
+  return {
+    text: r.content,
+    tokens: r.tokens,
+    margins: topLogprobs > 0 ? marginsFromLlamaProbs(r.completion_probabilities) : null,
+  }
+}
+
+// Per-position top-2 gap in nats from llama-server's `completion_probabilities`
+// (each entry carries the chosen token plus its `top_logprobs` list). A null
+// entry means the server returned fewer than 2 candidates at that position.
+function marginsFromLlamaProbs(probs) {
+  if (!Array.isArray(probs)) return null
+  return probs.map((p) => {
+    const list = p?.top_logprobs || p?.probs || []
+    const lp = list
+      .map((e) => (typeof e.logprob === 'number' ? e.logprob : Math.log(e.prob ?? 0)))
+      .filter((v) => Number.isFinite(v))
+      .sort((a, b) => b - a)
+    return lp.length >= 2 ? lp[0] - lp[1] : null
+  })
+}
+
+// Same shape from an OpenAI-style `choices[0].logprobs.content[]`.
+function marginsFromOpenAiLogprobs(logprobs) {
+  const content = logprobs?.content
+  if (!Array.isArray(content)) return null
+  return content.map((step) => {
+    const lp = (step.top_logprobs || [])
+      .map((e) => e.logprob)
+      .filter((v) => Number.isFinite(v))
+      .sort((a, b) => b - a)
+    return lp.length >= 2 ? lp[0] - lp[1] : null
+  })
+}
+
+function minFinite(values) {
+  const finite = (values || []).filter((v) => Number.isFinite(v))
+  return finite.length ? Math.min(...finite) : null
 }
 
 async function referenceTokenize(promptText) {
@@ -154,12 +234,38 @@ async function camelidChat(userContent, maxTokens) {
     top_k: 1,
     seed: 0,
     stream: false,
+    ...(topLogprobs > 0 ? { logprobs: true, top_logprobs: topLogprobs } : {}),
   })
-  return { text: r.choices[0].message.content, promptTokens: r.usage?.prompt_tokens ?? null }
+  return {
+    text: r.choices[0].message.content,
+    promptTokens: r.usage?.prompt_tokens ?? null,
+    // The ENGINE's own emitted ids. Absent only on a lane that ships no
+    // diagnostics block; the harness fails loudly rather than falling back to a
+    // text round-trip, because a silent fallback is how the old comparison lost
+    // its power in the first place.
+    generatedTokenIds: r.camelid?.generated_token_ids ?? null,
+    promptTokenIds: r.camelid?.prompt_token_ids ?? null,
+    margins: topLogprobs > 0 ? marginsFromOpenAiLogprobs(r.choices[0].logprobs) : null,
+  }
 }
 
 function arraysEqual(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i])
+}
+
+// Drop trailing EOG ids so the two engines' generated streams are compared on
+// content only: llama-server strips EOG from `content` but returns it in
+// `tokens`, and camelid's diagnostics echo may or may not carry it depending on
+// the stop path. Applied IDENTICALLY to both sides, and both raw arrays are kept
+// in the receipt so the stripping is auditable.
+function stripTrailingStops(tokens) {
+  const out = [...(tokens || [])]
+  let stripped = 0
+  while (out.length && STOP.has(out[out.length - 1])) {
+    out.pop()
+    stripped++
+  }
+  return { tokens: out, stripped }
 }
 
 async function capture() {
@@ -170,7 +276,11 @@ async function capture() {
     const perCount = {}
     for (const n of tokenCounts) {
       const ref = await referenceCompletion(rendered, n)
-      perCount[n] = { reference_text: ref.text, reference_tokens: ref.tokens }
+      perCount[n] = {
+        reference_text: ref.text,
+        reference_tokens: ref.tokens,
+        ...(ref.margins ? { reference_top2_margins_nats: ref.margins } : {}),
+      }
       process.stderr.write(`captured ${JSON.stringify(userContent)} n=${n}: ${JSON.stringify(ref.text)}\n`)
     }
     captured.push({ prompt: userContent, rendered, reference_prompt_tokens: promptTokens, generations: perCount })
@@ -180,6 +290,7 @@ async function capture() {
     comparator: comparatorLabel,
     llama_base: llamaBase,
     token_counts: tokenCounts,
+    top_logprobs: topLogprobs,
     prompts: PROMPTS,
     captured,
   }
@@ -203,20 +314,57 @@ async function compare() {
       const ref = cap.generations[n]
       const cam = await camelidChat(userContent, n)
       usagePromptTokens = cam.promptTokens
-      const camTokens = await encodeCamelid(cam.text, false, false)
-      const refContentTokens = [...ref.reference_tokens]
-      while (refContentTokens.length && STOP.has(refContentTokens[refContentTokens.length - 1])) refContentTokens.pop()
+      if (!Array.isArray(cam.generatedTokenIds)) {
+        throw new Error(
+          `camelid returned no camelid.generated_token_ids for ${JSON.stringify(userContent)} n=${n}. ` +
+            'This harness scores TOKEN identity on the engine\'s own ids and will not fall back to ' +
+            're-encoding the output text (lossy on this vocab in both directions). Drive a lane ' +
+            'that emits the diagnostics block.',
+        )
+      }
+      // Diagnostic only — the old text round-trip, kept so a tokenizer artifact
+      // is visible and attributable instead of silently scored.
+      const reencoded = await encodeCamelid(cam.text, false, false)
+      const refStripped = stripTrailingStops(ref.reference_tokens)
+      const camStripped = stripTrailingStops(cam.generatedTokenIds)
       const textMatch = ref.reference_text === cam.text
-      const tokenMatch = arraysEqual(refContentTokens, camTokens)
+      const tokenMatch = arraysEqual(refStripped.tokens, camStripped.tokens)
+      const reencodeMatch = arraysEqual(refStripped.tokens, reencoded)
+      // First index at which the two id streams part company (-1 = never).
+      let firstDivergence = -1
+      const lim = Math.max(refStripped.tokens.length, camStripped.tokens.length)
+      for (let i = 0; i < lim; i++) {
+        if (refStripped.tokens[i] !== camStripped.tokens[i]) {
+          firstDivergence = i
+          break
+        }
+      }
       perCount[n] = {
         reference_text: ref.reference_text,
         reference_tokens: ref.reference_tokens,
-        reference_content_tokens: refContentTokens,
+        reference_content_tokens: refStripped.tokens,
         camelid_text: cam.text,
-        camelid_content_tokens: camTokens,
+        // The ENGINE's ids — what token_match is scored on.
+        camelid_generated_token_ids: cam.generatedTokenIds,
+        camelid_content_tokens: camStripped.tokens,
+        camelid_prompt_token_ids: cam.promptTokenIds,
+        // The old text->tokenizer round-trip, reported and never scored.
+        camelid_text_reencoded_tokens: reencoded,
+        text_reencode_token_match: reencodeMatch,
+        text_reencode_artifact: tokenMatch && !reencodeMatch,
+        stop_tokens_stripped: { reference: refStripped.stripped, camelid: camStripped.stripped },
         text_match: textMatch,
         token_match: tokenMatch,
+        first_divergence_index: firstDivergence,
         stopped_early_at_eos: ref.reference_tokens.length < n,
+        ...(oracle.top_logprobs > 0 || topLogprobs > 0
+          ? {
+              reference_top2_margins_nats: ref.reference_top2_margins_nats ?? null,
+              camelid_top2_margins_nats: cam.margins,
+              reference_min_top2_margin_nats: minFinite(ref.reference_top2_margins_nats),
+              camelid_min_top2_margin_nats: minFinite(cam.margins),
+            }
+          : {}),
       }
       if (!textMatch || !tokenMatch) allPass = false
     }
@@ -242,6 +390,11 @@ async function compare() {
     camelid_base: camelidBase,
     llama_base: oracle.llama_base,
     token_counts: oracle.token_counts,
+    // How token identity was scored, stated in the receipt so a reader never has
+    // to guess whether a `token_match` came from the engine or from a re-encode.
+    token_identity_source: 'camelid.generated_token_ids (engine-emitted)',
+    text_reencode_scored: false,
+    top_logprobs: { oracle: oracle.top_logprobs ?? 0, camelid: topLogprobs },
     all_pass: allPass,
     results,
   }
@@ -256,8 +409,14 @@ async function compare() {
     process.stderr.write(`  prompt-token parity (cross-engine): ${r.prompt_token_match ? 'PASS' : 'FAIL'}\n`)
     for (const n of oracle.token_counts) {
       const g = r.generations[n]
+      const margin =
+        typeof g.camelid_min_top2_margin_nats === 'number'
+          ? ` | min top-2 margin ${g.camelid_min_top2_margin_nats.toFixed(4)} nat`
+          : ''
+      const artifact = g.text_reencode_artifact ? ' | text-reencode artifact (diagnostic only)' : ''
+      const at = g.first_divergence_index >= 0 ? ` @${g.first_divergence_index}` : ''
       process.stderr.write(
-        `  n=${n}: text ${g.text_match ? 'PASS' : 'FAIL'} | tokens ${g.token_match ? 'PASS' : 'FAIL'} | camelid=${JSON.stringify(g.camelid_text)}\n`,
+        `  n=${n}: text ${g.text_match ? 'PASS' : 'FAIL'} | tokens ${g.token_match ? 'PASS' : `FAIL${at}`}${margin}${artifact} | camelid=${JSON.stringify(g.camelid_text)}\n`,
       )
     }
   }

@@ -23,6 +23,36 @@ export const SUPPORTED_MODELS = [
     blurb: 'A small, fast model for quick chat and simple tasks.',
   },
   {
+    catalog_id: 'llama3_2_1b_instruct_iq4_xs',
+    name: 'Llama 3.2 1B Instruct (IQ4_XS)',
+    repo_id: 'bartowski/Llama-3.2-1B-Instruct-GGUF',
+    filename: 'Llama-3.2-1B-Instruct-IQ4_XS.gguf',
+    size_bytes: 743141504,
+    quant: 'IQ4_XS',
+    blurb: 'The same small model at under half the size — quickest to download.',
+  },
+  {
+    /* The certified 3B K-quants are bartowski's exact uploads. Unsloth ships
+       same-named files at different sizes, so repo_id is evidence here, not a
+       preference — see the matching note in curated_catalog() (src/api/mod.rs). */
+    catalog_id: 'llama_3_2_3b_instruct_q4_k_m',
+    name: 'Llama 3.2 3B Instruct (Q4_K_M)',
+    repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+    filename: 'Llama-3.2-3B-Instruct-Q4_K_M.gguf',
+    size_bytes: 2019377696,
+    quant: 'Q4_K_M',
+    blurb: 'The all-rounder at about half the size, with a small quality tradeoff.',
+  },
+  {
+    catalog_id: 'llama_3_2_3b_instruct_q5_k_m',
+    name: 'Llama 3.2 3B Instruct (Q5_K_M)',
+    repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+    filename: 'Llama-3.2-3B-Instruct-Q5_K_M.gguf',
+    size_bytes: 2322154016,
+    quant: 'Q5_K_M',
+    blurb: 'A middle ground between the Q4_K_M download and the full-size Q8_0.',
+  },
+  {
     catalog_id: 'tinyllama_1_1b_chat_q8_0',
     name: 'TinyLlama 1.1B Chat',
     repo_id: 'TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF',
@@ -134,5 +164,86 @@ export const SUPPORTED_MODELS = [
     size_bytes: 14439361440,
     quant: 'Q4_0',
     blurb: 'A large mixture-of-experts Gemma — strongest reasoning and quality.',
+  },
+  {
+    /* The one Ornith artifact that is HF-pristine; its supported Q4_K_M/Q3_K_M
+       siblings are in-house requants with no upstream file, so they stay
+       download-free (NON_CATALOG_SUPPORTED_ARTIFACTS in src/api/mod.rs).
+
+       The spaces in this id are deliberate and load-bearing — the ledger's
+       bare-name row id must stay verbatim for the chat --agent gate. Note that
+       check-ledger-drift.mjs Check C only parses `[a-z0-9_]+` ids, so this row is
+       skipped there rather than validated; the Rust catalog is the surface that
+       enforces the join. */
+    catalog_id: 'Ornith 1.0 9B',
+    name: 'Ornith 1.0 9B',
+    repo_id: 'deepreinforce-ai/Ornith-1.0-9B-GGUF',
+    filename: 'ornith-1.0-9b-Q8_0.gguf',
+    size_bytes: 9527500992,
+    quant: 'Q8_0',
+    blurb: 'A large tool-capable model — the strongest agent lane, and a 9.5 GB download.',
+  },
+  {
+    catalog_id: 'bonsai_4b_q1_0',
+    name: 'Bonsai 4B Q1_0',
+    repo_id: 'prism-ml/Bonsai-4B-gguf',
+    filename: 'Bonsai-4B-Q1_0.gguf',
+    size_bytes: 572270624,
+    quant: 'Q1_0',
+    blurb: 'Prism ML’s compact 1-bit Bonsai model, supported on Apple Silicon Metal.',
+  },
+  {
+    catalog_id: 'ternary_bonsai_4b_q2_0',
+    name: 'Ternary Bonsai 4B Q2_0',
+    repo_id: 'prism-ml/Ternary-Bonsai-4B-gguf',
+    filename: 'Ternary-Bonsai-4B-Q2_0.gguf',
+    size_bytes: 1074969344,
+    quant: 'Q2_0',
+    blurb: 'The higher-quality ternary 4B pack, supported on Apple Silicon Metal.',
+  },
+  {
+    catalog_id: 'ternary_bonsai_4b_pq2_0',
+    name: 'Ternary Bonsai 4B PQ2_0',
+    repo_id: 'prism-ml/Ternary-Bonsai-4B-gguf',
+    filename: 'Ternary-Bonsai-4B-PQ2_0.gguf',
+    size_bytes: 1074969344,
+    quant: 'PQ2_0',
+    blurb: 'The packed PQ2_0 variant of Ternary Bonsai 4B, supported on Apple Silicon Metal.',
+  },
+  {
+    catalog_id: 'bonsai_8b_q1_0',
+    name: 'Bonsai 8B Q1_0',
+    repo_id: 'prism-ml/Bonsai-8B-gguf',
+    filename: 'Bonsai-8B-Q1_0.gguf',
+    size_bytes: 1158654496,
+    quant: 'Q1_0',
+    blurb: 'An 8B Bonsai model in a roughly 1.2 GB 1-bit pack, supported on Apple Silicon Metal.',
+  },
+  {
+    catalog_id: 'ternary_bonsai_8b_q2_0',
+    name: 'Ternary Bonsai 8B Q2_0',
+    repo_id: 'prism-ml/Ternary-Bonsai-8B-gguf',
+    filename: 'Ternary-Bonsai-8B-Q2_0.gguf',
+    size_bytes: 2182184672,
+    quant: 'Q2_0',
+    blurb: 'The higher-quality ternary 8B pack, supported on Apple Silicon Metal.',
+  },
+  {
+    catalog_id: 'bonsai_27b_q1_0',
+    name: 'Bonsai 27B Q1_0',
+    repo_id: 'prism-ml/Bonsai-27B-gguf',
+    filename: 'Bonsai-27B-Q1_0.gguf',
+    size_bytes: 3803452480,
+    quant: 'Q1_0',
+    blurb: 'The full 27B reasoning model in a compact 1-bit pack; vision needs its companion mmproj.',
+  },
+  {
+    catalog_id: 'ternary_bonsai_27b_q2_0',
+    name: 'Ternary Bonsai 27B Q2_0',
+    repo_id: 'prism-ml/Ternary-Bonsai-27B-gguf',
+    filename: 'Ternary-Bonsai-27B-Q2_0.gguf',
+    size_bytes: 7165121600,
+    quant: 'Q2_0',
+    blurb: 'The higher-quality 27B ternary pack; vision needs its companion mmproj.',
   },
 ]

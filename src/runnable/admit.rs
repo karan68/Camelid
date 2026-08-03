@@ -235,6 +235,21 @@ fn check_tokenizer(file: &GgufFile) -> Result<TokenizerFamily, AdmissionReject> 
 /// interleave split-half (low nibble of `qs[j]` is element `j`, high nibble is
 /// element `j + 16`), and TQ2_0's four 2-bit codes decode 32 apart.
 ///
+/// Q1_0 (2026-08-01): sign-only 1-bit quantization, GGUF tensor type id 41, a
+/// 128-element / 18-byte block `{ f16 d; u8 qs[16] }` at 1.125 bpw. Admitted on the
+/// same terms as the six above: a decoder in `crate::tensor` (`decode_q1_0_tensor`)
+/// behind a per-format dequant-parity receipt,
+/// `tensor::tests::q1_0_dequant_matches_the_reference_layout`, plus
+/// `tests/q1_0_format.rs`, which checks real blocks from a shipped artifact against
+/// the model vendor's own expansion of the same weights. The covered axis here is
+/// again element ORDER — Q1_0 packs bits LSB-first and sequentially (element `j` is
+/// bit `j % 8` of byte `j / 8`), NOT the split-half interleave of the legacy
+/// formats, and an MSB-first decode still produces plausible-looking weights.
+///
+/// Prism Q1_0 and both resolved Q2_0 dialects also have packed native Metal lanes.
+/// Runnable admission remains a loadability claim only; model-level support still
+/// requires the architecture and end-to-end gates documented by the support matrix.
+///
 /// **Q5_1 additionally required a reader fix**: `GgufTensorType::layout` folded it
 /// in with Q5_0 at 22 bytes, but Q5_1 carries an extra f16 `m` and its block is 24.
 /// Until that was corrected, admitting Q5_1 would have turned an honest parse-time
@@ -266,6 +281,10 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::IQ4NL
             | GgufTensorType::Tq1_0
             | GgufTensorType::Tq2_0
+            | GgufTensorType::Q1_0
+            | GgufTensorType::Q2_0G64
+            | GgufTensorType::Q2_0G128
+            | GgufTensorType::Pq2_0
     )
 }
 
@@ -303,7 +322,8 @@ fn check_quants(
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
                      F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, \
-                     Q5_K, Q6_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0",
+                     Q5_K, Q6_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, Q1_0, \
+                     Q2_0_G64, Q2_0_G128, PQ2_0",
                     tensor.tensor_type, tensor.name
                 ),
             });
@@ -516,6 +536,20 @@ mod tests {
         // TQ2_0, a wire-streaming block-dot lane, while the gate still refused
         // them. Pinned by the dequant-parity receipts in tensor::tests.
         for tt in [GgufTensorType::Tq1_0, GgufTensorType::Tq2_0] {
+            let mut file = base_fixture();
+            file.tensors.push(tensor("blk.0.ffn_down.weight", tt));
+            let ok = admit(&file).unwrap_or_else(|e| panic!("{tt:?} must admit: {e}"));
+            assert!(ok.quants.contains(&tt));
+        }
+    }
+
+    #[test]
+    fn accepts_both_resolved_prism_q2_dialects() {
+        for tt in [
+            GgufTensorType::Q2_0G64,
+            GgufTensorType::Q2_0G128,
+            GgufTensorType::Pq2_0,
+        ] {
             let mut file = base_fixture();
             file.tensors.push(tensor("blk.0.ffn_down.weight", tt));
             let ok = admit(&file).unwrap_or_else(|e| panic!("{tt:?} must admit: {e}"));
@@ -835,7 +869,9 @@ mod tests {
         assert_eq!(reject.offending_value, "Q8K");
         assert_eq!(reject.tensor.as_deref(), Some("blk.12.ffn_down.weight"));
         assert!(
-            reject.message.ends_with("TQ1_0, TQ2_0"),
+            reject
+                .message
+                .ends_with("TQ1_0, TQ2_0, Q1_0, Q2_0_G64, Q2_0_G128, PQ2_0"),
             "generic covered-set message must name its complete supported tail: {}",
             reject.message
         );

@@ -8,6 +8,9 @@
     "source": "committed llama.cpp parity reports",
     "evidence_bundle": "qa/evidence-bundles/tinyllama-broader-template-context-perf-rss-20260505T044519Z-head-864e07b51f36/manifest.json",
     "tool": "llama.cpp llama-tokenize via chat-parity harness",
+    "invocation": "llama-tokenize -m tinyllama-1.1b-chat-v1.0.Q8_0.gguf --ids --log-disable -p <expected_prompt>",
+    "harness": "scripts/chat-parity-llama3.mjs --render-mode tinyllama-marker (tokenizeExpectedPrompt)",
+    "add_special_provenance": "No --no-bos and no --no-parse-special were passed, so llama-tokenize used add_bos = llama_vocab_get_add_bos(vocab) and parse_special = true. This GGUF carries tokenizer.ggml.model=llama (SPM) and no tokenizer.ggml.add_bos_token override, so add_bos resolved to true and every tokens array below leads with 1 (<s>). The per-case add_special field therefore records true; it read false until 2026-07-31, which contradicted the arrays it was filed alongside.",
     "generated_utc": "2026-05-05T04:49:26.998Z"
   },
   "notes": "Tokenizer/chat-template edge-case reference pack for the already-supported TinyLlama Q8_0 row. This hardens the current supported gate only and does not promote any neighboring row, quantization, tokenizer family, or generation support.",
@@ -19,7 +22,7 @@
       "expected_prompt": "<|user|>\nReply with the word camelid and preserve this prompt's trailing spaces.</s>\n<|assistant|>\n",
       "reference_prompt_token_count": 34,
       "prompt_tokens_match": true,
-      "add_special": false,
+      "add_special": true,
       "parse_special": true,
       "tokens": [
         1,
@@ -65,7 +68,7 @@
       "expected_prompt": "<|user|>\nEcho a compact summary of these symbols: []{}<>|~^`\\ and emoji alpaca 🦙.</s>\n<|assistant|>\n",
       "reference_prompt_token_count": 47,
       "prompt_tokens_match": true,
-      "add_special": false,
+      "add_special": true,
       "parse_special": true,
       "tokens": [
         1,
@@ -124,7 +127,7 @@
       "expected_prompt": "<|system|>\nKeep the response concise and deterministic.</s>\n<|user|>\nLine one asks for a tiny checklist.\n\n  Line two is indented and mentions TinyLlama Q8_0.\nLine three asks for exactly three terse bullets about evidence hygiene.</s>\n<|assistant|>\n",
       "reference_prompt_token_count": 82,
       "prompt_tokens_match": true,
-      "add_special": false,
+      "add_special": true,
       "parse_special": true,
       "tokens": [
         1,
@@ -218,7 +221,7 @@
       "expected_prompt": "<|user|>\nComplete the word: cam</s>\n<|assistant|>\nelid</s>\n",
       "reference_prompt_token_count": 27,
       "prompt_tokens_match": true,
-      "add_special": false,
+      "add_special": true,
       "parse_special": true,
       "tokens": [
         1,
@@ -257,7 +260,7 @@
       "expected_prompt": "<|system|>\nPreserve line breaks in reasoning inputs.</s>\n<|user|>\nLine one.\n\n  Indented line two.  </s>\n<|assistant|>\n",
       "reference_prompt_token_count": 46,
       "prompt_tokens_match": true,
-      "add_special": false,
+      "add_special": true,
       "parse_special": true,
       "tokens": [
         1,

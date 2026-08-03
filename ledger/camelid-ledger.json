@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "24252207",
+    "source_head": "c7dcf7a",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -15,7 +15,7 @@
     "hf_catalog_install": true,
     "execution_plan": null,
     "support_contract": {
-      "current_gate": "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+      "current_gate": "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal after the Mac mini 2 text and vision matrix; the claim is exact-file and platform-scoped, with Windows, broader qwen35 or quant support, bounded context, and production throughput still unclaimed.",
       "support_policy": "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
       "unsupported_policy": "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior."
     },
@@ -54,6 +54,21 @@
         "id": "TQ2_0",
         "status": "supported_named_exact_rows_only",
         "notes": "ternary_bonsai_4b_tq2_0 only: single-node CPU completion smoke (receipt qa/ternary/tq2_0-bonsai-parity-receipt.json). Other TQ2_0 files load to the unverified experimental lane only; no ternary-wide claim."
+      },
+      {
+        "id": "Q1_0",
+        "status": "supported_named_exact_rows_only",
+        "notes": "Bonsai 4B, 8B, and 27B Q1_0 are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No Q1_0-wide, Windows, bounded-context, or production-throughput claim is implied."
+      },
+      {
+        "id": "Q2_0",
+        "status": "supported_named_exact_rows_only",
+        "notes": "Ternary Bonsai 4B, 8B, and 27B Prism Q2_0-G128 artifacts are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. Upstream Q2_0-G64 remains structurally distinct and unclaimed."
+      },
+      {
+        "id": "PQ2_0",
+        "status": "supported_named_exact_rows_only",
+        "notes": "Ternary Bonsai 4B PQ2_0 is supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hash in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No PQ2_0-wide, Windows, bounded-context, or production-throughput claim is implied."
       },
       {
         "id": "IQ4_XS",
@@ -103,6 +118,11 @@
         "id": "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
         "status": "supported_exact_row_smoke_lanes",
         "notes": "exact dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking DISABLED) have row-specific smoke support: qwen2 BPE pre-tokenizer + hardcoded ChatML renderer, per-head QK-norm + NEOX (split-half) RoPE, and token-AND-text-identical greedy parity vs llama.cpp at 1/5/50 tokens on macOS/Ubuntu and on Windows x86_64 CPU (both the cpu_reference scalar path and the x86_q8 AVX2 runtime-repack path, bit-identical). 1.7B additionally runs the GPU-resident decode+prefill path and a 15,373-token single-shot prefill lane on macOS, with opt-in thinking-mode leading-trace parity. Exact rows only; other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the validated envelope, and broad Qwen-family support are not implied."
+      },
+      {
+        "id": "prism_bonsai_qwen35_exact_4b_8b_27b_metal",
+        "status": "supported_exact_row_smoke_lanes",
+        "notes": "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal. The exact 27B Q1_0 row additionally has browser and API single-image smoke with the checked Q8_0 projector. Exact rows and platform only; Windows, neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied."
       }
     ],
     "planned_model_families": [
@@ -146,7 +166,7 @@
       {
         "id": "openai_chat_completions",
         "status": "supported_current_gate",
-        "notes": "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows."
+        "notes": "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows. The exact Prism/Qwen3.5 row additionally accepts one OpenAI image_url content part containing a local PNG/JPEG data URL when its sibling mmproj is resident on macOS Metal; /v1/health advertises vision_ready."
       },
       {
         "id": "openai_responses",
@@ -460,18 +480,18 @@
         "family": "gemma3_windowed_decoder",
         "quantization": "Q8_0",
         "status": "supported_exact_row_smoke",
-        "support_scope": "exact_row_metal_gpu_resident_windowed_chat_smoke_only",
+        "support_scope": "exact_row_gpu_resident_windowed_chat_smoke_only_metal_or_cuda",
         "full_support_status": "blocked_pending_normalized_full_support",
-        "full_support_blockers": "context above 2,403 prompt tokens (the file's native 32,768 is UNMEASURED, as is everything between ~2.4k and 32k); token-exact raw /v1/completions at depth 50 (three disclosed near-tie flips, one of them a 0.4471-nat stable-oracle near-tie — the clean raw-decode claim stops at DEPTH 5, while the chat lane is clean at 1/5/50); the repo's bounded-context ladder packs (512/1024/2048/4096/8192) were NOT run for this row — the windowed pack is a different artifact; throughput/performance (NOT claimed and NOT measured for release on this lane — a separate measurement phase owes it); the RUNNABLE CPU BRIDGE lane, which serves this row wherever the Metal resident lane cannot run and implements no window mask, so on THAT lane context above the 512-token sliding window remains mathematically wrong by construction (demonstrated: 1.667-nat disagreement with the pinned oracle at the divergence position of a 606-token prompt); tool capability (no gemma3 tools branch and no certified grammar on any lane — tools fail closed with a typed 422); multi-turn, streaming, speculative decode (declined for windowed archs) and the prompt-prefix cache (bypassed for windowed archs); neighbouring gemma3 sizes/quants (a non-Q8_0 gemma3 file is declined by resident admission and falls back to the runnable bridge); frontend load-path promotion; portability; and durable repeated current-head bundles remain missing",
+        "full_support_blockers": "the CUDA-resident windowed lane is NOT token-exact below the window — it is 10/15 on the sub-512 gate pack where the Metal lane is 15/15, with five disclosed divergences across three prompts (one from the FIRST generated token) attributed to lane numerics rather than structure by a per-layer hidden-state trace showing no step change at any layer and 1.89% worst relative L2; that attribution is one-sided, since confirming the flips as genuine near-ties from the ORACLE's side needs a live llama.cpp re-score which was NOT run, so the CUDA lane's sub-512 envelope is DISCLOSED, not adjudicated; context above 2,403 prompt tokens (the file's native 32,768 is UNMEASURED, as is everything between ~2.4k and 32k); token-exact raw /v1/completions at depth 50 (three disclosed near-tie flips, one of them a 0.4471-nat stable-oracle near-tie — the clean raw-decode claim stops at DEPTH 5, while the chat lane is clean at 1/5/50); the repo's bounded-context ladder packs (512/1024/2048/4096/8192) were NOT run for this row — the windowed pack is a different artifact; throughput/performance (NOT claimed and NOT measured for release on this lane — a separate measurement phase owes it); the RUNNABLE CPU BRIDGE lane, which serves this row wherever NEITHER GPU-resident lane can run and implements no window mask, so on THAT lane context above the 512-token sliding window remains mathematically wrong by construction (demonstrated: 1.667-nat disagreement with the pinned oracle at the divergence position of a 606-token prompt); tool capability (no gemma3 tools branch and no certified grammar on any lane — tools fail closed with a typed 422); multi-turn, streaming, speculative decode (declined for windowed archs) and the prompt-prefix cache (bypassed for windowed archs); neighbouring gemma3 sizes/quants (a non-Q8_0 gemma3 file is declined by resident admission and falls back to the runnable bridge); frontend load-path promotion; portability; and durable repeated current-head bundles remain missing",
         "metadata_parses": "validated",
         "tokenizer_works": "validated_cross_engine_prompt_tokenization_identical_5_of_5_sub512_plus_3_of_3_windowed_606_1205_2403_spm_llama_262k_vocab",
-        "tensors_load": "validated_183_q8_0_plus_157_f32_tied_embedding_metal_gpu_resident",
-        "generation_runs": "metal_gpu_resident_serve_chat_greedy_with_eog_stop_default_lane_on_metal_hosts_runnable_bridge_fallback_elsewhere",
-        "parity_audited": "gemma3_metal_resident_chat_token_and_text_identical_15_of_15_legs_at_1_5_50_sub512_plus_9_of_9_legs_at_606_1205_2403_prompt_tokens_zero_flips_vs_llamacpp_acd79d603_raw_completions_clean_through_depth_5_only",
+        "tensors_load": "validated_183_q8_0_plus_157_f32_tied_embedding_gpu_resident_on_metal_and_cuda",
+        "generation_runs": "gpu_resident_serve_chat_greedy_with_eog_stop_default_lane_on_metal_and_cuda_hosts_runnable_bridge_fallback_elsewhere",
+        "parity_audited": "METAL lane: token_and_text_identical_15_of_15_legs_at_1_5_50_sub512_plus_9_of_9_legs_at_606_1205_2403_prompt_tokens_zero_flips. CUDA lane: 9_of_9_legs_at_606_1205_2403_prompt_tokens_token_and_text_identical_zero_flips_above_the_window_but_only_10_of_15_sub512_legs_five_disclosed_divergences_across_three_prompts_attributed_to_lane_numerics_by_a_per_layer_hidden_state_trace_no_step_change_worst_relative_l2_1_89_percent. Both vs llamacpp_acd79d603",
         "performance_measured": "not_claimed_resident_lane_throughput_is_a_separate_unshipped_measurement_phase",
         "frontend_load_path_verified": "not_promoted",
-        "frontend_readiness_gate": "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, and served on the Metal GPU-resident lane (selected_backend=metal_resident_q8_runtime, decode_path=q8_0_metal_resident_decode) — on by default on a Metal host, opt-out CAMELID_METAL_RESIDENT_DECODE=0. Off that lane the runnable CPU bridge serves the row and only the sub-512 envelope is green; the windowed claim below does not travel to it",
-        "tested_context": "gemma3_chat_greedy_1_5_50_at_606_1205_and_2403_prompt_tokens_plus_50_generated_all_above_the_512_token_sliding_window_metal_resident_lane_only",
+        "frontend_readiness_gate": "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, and served on EITHER GPU-resident windowed lane: Metal (selected_backend=metal_resident_q8_runtime, decode_path=q8_0_metal_resident_decode; default on a Metal host, opt-out CAMELID_METAL_RESIDENT_DECODE=0) or CUDA (selected_backend=cuda_resident_windowed_runtime, decode_path=q8_0_cuda_resident_windowed_decode; default on a CUDA host, opt-out CAMELID_GEMMA3_CUDA_RESIDENT=0). Off both lanes the runnable CPU bridge serves the row and only the sub-512 envelope is green; the windowed claim does not travel to it. NOTE the two GPU lanes do not carry the same claim below the window — see parity_audited",
+        "tested_context": "gemma3_chat_greedy_1_5_50_at_606_1205_and_2403_prompt_tokens_plus_50_generated_all_above_the_512_token_sliding_window_metal_resident_lane_and_cuda_resident_windowed_lane_independently",
         "chat_template_renderer": "gemma3_marker_native_byte_locked_by_shapes_pack",
         "chat_template_shape_pack": "validated_in_src_pack_lock_test",
         "chat_template_shape_pack_id": "gemma3-chat-template-shapes-v1",
@@ -493,8 +513,8 @@
         "latest_checked_bucket": "metal_gpu_resident_windowed_chat_parity_606_1205_2403_prompt_tokens",
         "latest_checked_result": "pass",
         "latest_checked_output": "qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053/README.md",
-        "evidence": "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding. LANE: on a Metal host the row is served by DEFAULT on the GPU-resident Q8_0 lane (selected_backend metal_resident_q8_runtime, decode_path q8_0_metal_resident_decode, prefill_path q8_0_metal_resident_prefill), the first gemma3 forward in-tree carrying the 5:1 local/global schedule and the 512-token sliding-window mask; the gemma3 marker renderer (byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test) is shared with the dense lane, and decode stops on EOG. ORACLE: pinned llama.cpp acd79d603 (llama-server build 9632, CPU backend, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096, binary sha256 prefix 382096b1), two-phase throughout — the two engines were never resident together. SUB-512 CHAT: committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at greedy depths 1/5/50 — 15/15 generation legs token-AND-text IDENTICAL, zero flips, with cross-engine prompt tokenization identical 5/5. ABOVE THE WINDOW (the claim this lane exists for): committed pack qa/prompt-packs/gemma3-windowed-context-pack-v1.json, three prompts rendering to 606 / 1205 / 2403 tokens (1.18x / 2.35x / 4.69x the file's own gemma3.attention.sliding_window=512), each answerable only from its first sentence — 3/3 prompt tokenization identical and 9/9 generation legs at 1/5/50 token-AND-text IDENTICAL, ZERO flips. That the window is REAL and not decorative is shown by the contrast leg: on the same 606-token prompt and the same oracle capture, the runnable CPU bridge (no window mask) diverges at generated index 2 and never resynchronises, and re-fed the identical prefix the oracle ranks the runnable lane's token 1.667 nats behind its own — four times the largest disclosed near-tie in the bundle, so not a near-tie. That leg is ONE prompt at ONE depth: a demonstration, not a runnable-lane receipt. DETERMINISM: two fresh camelid serve processes with a full stop/start between them produce byte-identical receipt files (6 chat legs incl. the 2403-token prompt plus 5 raw-completion legs carrying actual emitted ids; sha256 prefix 632992c6). RAW /v1/completions is a SEPARATE harness over its own 4-prompt set (not the 5-prompt chat pack above), committed as-is with all_pass=false and DISCLOSED rather than hidden: depths 1 and 5 are clean 4/4, and at depth 50 three legs flip — camelid's token is the oracle's rank 1 on two of them when the oracle decodes continuously rather than from a re-fed prefix, while the third ('Once upon a time,') has a rank-1-stable oracle and camelid's token at 0.4471 nat, ABOVE both the Ornith 0.33-nat line and the frozen runnable bundle's 0.3416; a separate harness artifact (SPM whitespace re-encode) is identified and excluded from that count rather than tuned away. Bundle qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053 (README + manifest + SHA256SUMS, 20 artifacts). The frozen runnable-lane bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb stands as history for that other lane and is NOT re-adjudicated here. NOT claimed: any throughput or speed number on this lane, any comparison against another engine's speed, token-exact raw completions at depth 50, any context above 2,403 prompt tokens, the bounded-context ladder packs, multi-turn, streaming, tools (fail closed, typed 422), speculative decode or the prompt-prefix cache (both fail closed for windowed archs), neighbouring gemma3 sizes/quants, or the gemma4 family.",
-        "next_step": "measure and publish the resident lane's throughput as its own receipt before any perf wording appears on this row; extend the windowed pack past 2,403 prompt tokens toward the file's native 32,768 before widening tested_context; adjudicate the three depth-50 raw-completion near-ties with a chat-shaped raw pack or an oracle-side reduction-order study before any raw token-exactness claim past depth 5; run the bounded-context ladder packs; a runnable-lane sliding-window mask (or removing that fallback) before any >512 claim travels to non-Metal hosts; agent-eval battery before any tool_capable claim"
+        "evidence": "exact row gemma-3-1b-it-Q8_0.gguf (sha256 b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5, 1,069,306,368 bytes, ggml-org/gemma-3-1b-it-GGUF upstream-verified exact, license gemma): 183 Q8_0 + 157 F32 tensors, tied embedding. LANE: the row is served by DEFAULT on a GPU-resident windowed lane on BOTH GPU backends — Metal (selected_backend metal_resident_q8_runtime, decode_path q8_0_metal_resident_decode, prefill_path q8_0_metal_resident_prefill) and CUDA (selected_backend cuda_resident_windowed_runtime, decode_path q8_0_cuda_resident_windowed_decode, prefill windowed_token_by_token_resident_prefill; opt-out CAMELID_GEMMA3_CUDA_RESIDENT=0) — each carrying the 5:1 local/global schedule and the 512-token sliding-window mask. The CUDA lane reuses kernels the gemma4 port had already landed in the generic resident kernel set (attention_decode_sw, geglu_mul) and declines batched prefill, batched and tree speculative verify, and CUDA graph capture, none of which carry a window; the gemma3 marker renderer (byte-locked against the pinned oracle's /apply-template output by qa/prompt-packs/gemma3-chat-template-shapes-v1.json and an in-src pack-lock test) is shared with the dense lane, and decode stops on EOG. ORACLE: pinned llama.cpp acd79d603 (llama-server build 9632, CPU backend, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096, binary sha256 prefix 382096b1), two-phase throughout — the two engines were never resident together. SUB-512 CHAT: committed 5-prompt gate pack (qa/prompt-packs/gemma3-chat-gate-pack-v1.json) at greedy depths 1/5/50 — 15/15 generation legs token-AND-text IDENTICAL, zero flips, with cross-engine prompt tokenization identical 5/5. ABOVE THE WINDOW (the claim this lane exists for): committed pack qa/prompt-packs/gemma3-windowed-context-pack-v1.json, three prompts rendering to 606 / 1205 / 2403 tokens (1.18x / 2.35x / 4.69x the file's own gemma3.attention.sliding_window=512), each answerable only from its first sentence — 3/3 prompt tokenization identical and 9/9 generation legs at 1/5/50 token-AND-text IDENTICAL, ZERO flips. That the window is REAL and not decorative is shown by the contrast leg: on the same 606-token prompt and the same oracle capture, the runnable CPU bridge (no window mask) diverges at generated index 2 and never resynchronises, and re-fed the identical prefix the oracle ranks the runnable lane's token 1.667 nats behind its own — four times the largest disclosed near-tie in the bundle, so not a near-tie. That leg is ONE prompt at ONE depth: a demonstration, not a runnable-lane receipt. DETERMINISM: two fresh camelid serve processes with a full stop/start between them produce byte-identical receipt files (6 chat legs incl. the 2403-token prompt plus 5 raw-completion legs carrying actual emitted ids; sha256 prefix 632992c6). RAW /v1/completions is a SEPARATE harness over its own 4-prompt set (not the 5-prompt chat pack above), committed as-is with all_pass=false and DISCLOSED rather than hidden: depths 1 and 5 are clean 4/4, and at depth 50 three legs flip — camelid's token is the oracle's rank 1 on two of them when the oracle decodes continuously rather than from a re-fed prefix, while the third ('Once upon a time,') has a rank-1-stable oracle and camelid's token at 0.4471 nat, ABOVE both the Ornith 0.33-nat line and the frozen runnable bundle's 0.3416; a separate harness artifact (SPM whitespace re-encode) is identified and excluded from that count rather than tuned away. Bundle qa/evidence-bundles/gemma3-1b-q8-gpu-resident-parity-20260730-head-6eaf9053 (README + manifest + SHA256SUMS, 20 artifacts). CUDA LANE (RTX 3060 Laptop, Windows), compared against the SAME pinned captures REPLAYED from that bundle rather than a fresh llama.cpp run: above the window 9/9 legs at 606/1205/2403 prompt tokens token-AND-text identical with tokenization 3/3, all_pass; below the window 10/15, with five divergent legs across three prompts enumerated in qa/gemma3-cuda/phase4/RESULT.md. A control run pins the attribution — the runnable CPU bridge on the SAME host against the SAME replayed capture is 10/10 at depths 1 and 5, so the capture travels and the in-tree CPU reference reproduces it exactly. The divergence is numerical, not structural: a per-layer hidden-state trace of both lanes on the failing prompt shows worst relative L2 1.89% across all 494 (position, layer) pairs and smooth 0.15%->0.67% growth with depth, with NO step change at any layer. The CUDA engine quantizes activations to Q8_0 per GEMV and stores KV as f16 while the oracle is f32 throughout, which is true of every CUDA row here. Replaying a committed capture is NOT a re-run: the prompts and depths are frozen and the oracle cannot be probed from its own side, so the CUDA lane's sub-512 flips are disclosed rather than adjudicated. The frozen runnable-lane bundle qa/evidence-bundles/gemma3-1b-q8-runnable-serve-chat-parity-20260716-head-6d0d57eb stands as history for that other lane and is NOT re-adjudicated here. NOT claimed: any throughput or speed number on this lane, any comparison against another engine's speed, token-exact raw completions at depth 50, any context above 2,403 prompt tokens, the bounded-context ladder packs, multi-turn, streaming, tools (fail closed, typed 422), speculative decode or the prompt-prefix cache (both fail closed for windowed archs), neighbouring gemma3 sizes/quants, token-exactness below the window ON THE CUDA LANE (10/15, disclosed above), or the gemma4 family.",
+        "next_step": "adjudicate the CUDA lane's five sub-512 divergences against a LIVE llama.cpp (re-score the divergent positions from the oracle's side) before that lane's sub-512 envelope is claimed rather than merely disclosed; measure and publish each resident lane's throughput as its own receipt before any perf wording appears on this row; extend the windowed pack past 2,403 prompt tokens toward the file's native 32,768 before widening tested_context; adjudicate the three depth-50 raw-completion near-ties with a chat-shaped raw pack or an oracle-side reduction-order study before any raw token-exactness claim past depth 5; run the bounded-context ladder packs; a runnable-lane sliding-window mask (or removing that fallback) before any >512 claim travels to non-Metal hosts; agent-eval battery before any tool_capable claim"
       }
     },
     {
@@ -1160,6 +1180,398 @@
     },
     {
       "identity": {
+        "id": "bonsai_4b_q1_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q1_0",
+        "gguf_filename": "Bonsai-4B-Q1_0.gguf",
+        "sha256": "4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168"
+      },
+      "contract": {
+        "id": "bonsai_4b_q1_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q1_0",
+        "status": "supported_exact_row_smoke",
+        "tool_capable": false,
+        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "full_support_status": "blocked_pending_portability_and_bounded_context",
+        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+        "metadata_parses": "validated_qwen35_hybrid_metadata",
+        "tokenizer_works": "validated_qwen35_bpe_chatml",
+        "tensors_load": "validated_all_tensors_packed_q1_0_wire_resident",
+        "generation_runs": "validated_chat_completions_on_macos_metal",
+        "parity_audited": "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "performance_measured": "recorded_smoke_only_not_a_portable_sla",
+        "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
+        "frontend_readiness_gate": "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+        "chat_template_renderer": "qwen35_chatml",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "deterministic_eight_token_probe",
+        "evidence": "Bonsai-4B-Q1_0.gguf sha256 4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        }
+      ]
+    },
+    {
+      "identity": {
+        "id": "ternary_bonsai_4b_q2_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q2_0/Q2_0_G128",
+        "gguf_filename": "Ternary-Bonsai-4B-Q2_0.gguf",
+        "sha256": "4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b"
+      },
+      "contract": {
+        "id": "ternary_bonsai_4b_q2_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q2_0/Q2_0_G128",
+        "status": "supported_exact_row_smoke",
+        "tool_capable": false,
+        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "full_support_status": "blocked_pending_portability_and_bounded_context",
+        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+        "metadata_parses": "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
+        "tokenizer_works": "validated_qwen35_bpe_chatml",
+        "tensors_load": "validated_all_tensors_packed_q2_0_wire_resident",
+        "generation_runs": "validated_chat_completions_on_macos_metal",
+        "parity_audited": "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "performance_measured": "recorded_smoke_only_not_a_portable_sla",
+        "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+        "chat_template_renderer": "qwen35_chatml",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "deterministic_eight_token_probe",
+        "evidence": "Ternary-Bonsai-4B-Q2_0.gguf sha256 4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        }
+      ]
+    },
+    {
+      "identity": {
+        "id": "ternary_bonsai_4b_pq2_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "PQ2_0",
+        "gguf_filename": "Ternary-Bonsai-4B-PQ2_0.gguf",
+        "sha256": "829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb"
+      },
+      "contract": {
+        "id": "ternary_bonsai_4b_pq2_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "PQ2_0",
+        "status": "supported_exact_row_smoke",
+        "tool_capable": false,
+        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "full_support_status": "blocked_pending_portability_and_bounded_context",
+        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
+        "metadata_parses": "validated_qwen35_hybrid_metadata_and_prism_pq2_type_142",
+        "tokenizer_works": "validated_qwen35_bpe_chatml",
+        "tensors_load": "validated_all_tensors_packed_pq2_0_wire_resident",
+        "generation_runs": "validated_chat_completions_on_macos_metal",
+        "parity_audited": "pq2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "performance_measured": "recorded_smoke_only_not_a_portable_sla",
+        "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+        "chat_template_renderer": "qwen35_chatml",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "deterministic_eight_token_probe",
+        "evidence": "Ternary-Bonsai-4B-PQ2_0.gguf sha256 829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        }
+      ]
+    },
+    {
+      "identity": {
+        "id": "bonsai_8b_q1_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q1_0",
+        "gguf_filename": "Bonsai-8B-Q1_0.gguf",
+        "sha256": "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54"
+      },
+      "contract": {
+        "id": "bonsai_8b_q1_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q1_0",
+        "status": "supported_exact_row_smoke",
+        "tool_capable": false,
+        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "full_support_status": "blocked_pending_portability_and_bounded_context",
+        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+        "metadata_parses": "validated_qwen35_hybrid_metadata",
+        "tokenizer_works": "validated_qwen35_bpe_chatml",
+        "tensors_load": "validated_all_tensors_packed_q1_0_wire_resident",
+        "generation_runs": "validated_chat_completions_on_macos_metal",
+        "parity_audited": "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "performance_measured": "recorded_smoke_only_not_a_portable_sla",
+        "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
+        "frontend_readiness_gate": "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+        "chat_template_renderer": "qwen35_chatml",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "deterministic_eight_token_probe",
+        "evidence": "Bonsai-8B-Q1_0.gguf sha256 284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        }
+      ]
+    },
+    {
+      "identity": {
+        "id": "ternary_bonsai_8b_q2_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q2_0/Q2_0_G128",
+        "gguf_filename": "Ternary-Bonsai-8B-Q2_0.gguf",
+        "sha256": "3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b"
+      },
+      "contract": {
+        "id": "ternary_bonsai_8b_q2_0",
+        "family": "qwen35_bonsai_metal",
+        "quantization": "Q2_0/Q2_0_G128",
+        "status": "supported_exact_row_smoke",
+        "tool_capable": false,
+        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "full_support_status": "blocked_pending_portability_and_bounded_context",
+        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+        "metadata_parses": "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
+        "tokenizer_works": "validated_qwen35_bpe_chatml",
+        "tensors_load": "validated_all_tensors_packed_q2_0_wire_resident",
+        "generation_runs": "validated_chat_completions_on_macos_metal",
+        "parity_audited": "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "performance_measured": "recorded_smoke_only_not_a_portable_sla",
+        "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
+        "chat_template_renderer": "qwen35_chatml",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "deterministic_eight_token_probe",
+        "evidence": "Ternary-Bonsai-8B-Q2_0.gguf sha256 3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
+        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        }
+      ]
+    },
+    {
+      "identity": {
+        "id": "bonsai_27b_q1_0",
+        "family": "qwen35_bonsai_metal_vision",
+        "quantization": "Q1_0",
+        "gguf_filename": "Bonsai-27B-Q1_0.gguf",
+        "sha256": "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0"
+      },
+      "contract": {
+        "id": "bonsai_27b_q1_0",
+        "family": "qwen35_bonsai_metal_vision",
+        "quantization": "Q1_0",
+        "status": "supported_exact_row_smoke",
+        "tool_capable": false,
+        "support_scope": "exact_row_macos_apple_silicon_metal_text_and_single_image_chat_smoke_only",
+        "full_support_status": "blocked_pending_portability_bounded_context_and_multimodal_expansion",
+        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+        "metadata_parses": "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
+        "tokenizer_works": "validated_qwen35_bpe_chatml_and_single_image_token_injection",
+        "tensors_load": "validated_packed_q1_0_wire_resident_model_plus_q8_0_vision_projector",
+        "generation_runs": "validated_text_nonstreaming_sse_and_single_local_png_chat_completions_on_macos_metal",
+        "parity_audited": "q1_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_deterministic_vision_probe_passes",
+        "performance_measured": "optimized_small_image_8_91_end_to_end_output_tokens_per_second_and_full_resolution_4_9_recorded_not_a_portable_sla",
+        "frontend_load_path_verified": "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
+        "frontend_readiness_gate": "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
+        "tested_context": "short_text_and_single_image_chat_smoke_with_runtime_capacity_capped_at_4096",
+        "chat_template_renderer": "qwen35_chatml_with_qwen3_vl_image_token",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "mac_mini_2_text_vision_and_browser_acceptance",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "coherent_full_resolution_image_description_and_128_token_text_completion",
+        "evidence": "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the projector hash-pinned separately in the receipt passed text, nonstreaming and SSE image Chat Completions, browser image upload, projector CPU to Metal parity, and coherent full-resolution vision on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
+        "next_step": "run the Windows kernel, projector, API, and browser matrix, then add bounded-context, multi-image policy, and normalized throughput packs before widening this exact-row scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        }
+      ]
+    },
+    {
+      "identity": {
+        "id": "ternary_bonsai_27b_q2_0",
+        "family": "qwen35_bonsai_metal_vision",
+        "quantization": "Q2_0/Q2_0_G128",
+        "gguf_filename": "Ternary-Bonsai-27B-Q2_0.gguf",
+        "sha256": "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757"
+      },
+      "contract": {
+        "id": "ternary_bonsai_27b_q2_0",
+        "family": "qwen35_bonsai_metal_vision",
+        "quantization": "Q2_0/Q2_0_G128",
+        "status": "supported_exact_row_smoke",
+        "tool_capable": false,
+        "support_scope": "exact_row_macos_apple_silicon_metal_text_and_single_image_cli_smoke_only",
+        "full_support_status": "blocked_pending_portability_bounded_context_and_multimodal_expansion",
+        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, browser image Chat Completions on this exact quant, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+        "metadata_parses": "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
+        "tokenizer_works": "validated_qwen35_bpe_chatml_and_single_image_token_injection",
+        "tensors_load": "validated_packed_q2_0_wire_resident_model_plus_q8_0_vision_projector",
+        "generation_runs": "validated_text_chat_completions_and_single_local_png_cli_vision_on_macos_metal",
+        "parity_audited": "q2_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_cli_vision_probe_passes",
+        "performance_measured": "recorded_smoke_only_not_a_portable_sla",
+        "frontend_load_path_verified": "curated_model_catalog_entry_and_text_chat_smoke_validated",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match; image support remains scoped to the checked CLI probe and separately installed Q8_0 mmproj",
+        "tested_context": "short_text_and_single_image_cli_smoke_with_runtime_capacity_capped_at_4096",
+        "chat_template_renderer": "qwen35_chatml_with_qwen3_vl_image_token",
+        "chat_template_shape_pack": "not_promoted",
+        "chat_template_shape_pack_id": "not_selected",
+        "bounded_context_512_pack": "not_promoted",
+        "bounded_context_512_pack_id": "not_selected",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_promoted",
+        "bounded_context_1024_pack_id": "not_selected",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_promoted",
+        "bounded_context_2048_pack_id": "not_selected",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_promoted",
+        "bounded_context_4096_pack_id": "not_selected",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "mac_mini_2_text_and_cli_vision_smoke",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "coherent_text_and_checked_single_image_cli_output",
+        "evidence": "Ternary-Bonsai-27B-Q2_0.gguf sha256 868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757 plus the projector hash-pinned separately in the receipt passed text Chat Completions, single-image CLI vision, and projector CPU to Metal parity on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
+        "next_step": "run the Windows kernel, projector, API, and browser matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+      },
+      "receipts": [
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        }
+      ]
+    },
+    {
+      "identity": {
         "id": "llama3_2_1b_instruct_iq4_xs",
         "family": "llama_bpe_iq4_xs_resident",
         "quantization": "IQ4_XS",
@@ -1174,7 +1586,7 @@
         "status": "supported_exact_row_smoke",
         "support_scope": "exact_row_gpu_resident_raw_decode_parity_smoke_only",
         "full_support_status": "blocked_pending_normalized_full_support",
-        "full_support_blockers": "raw-completion greedy parity only (no chat-template/serve/WebUI closure); greedy flips at low-bit near-ties (GPU-resident 2/4 probe prompts 24-token identical, 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie where the reference token is camelid's immediate #2); CPU-deterministic path 1/4 identical; no bounded-context bucket, perf/RSS gate, runnable-smoke oracle qualification, or curated-catalog entry yet; the model is community-sourced (bartowski/Llama-3.2-1B-Instruct-GGUF), not a canonical row",
+        "full_support_blockers": "raw-completion greedy parity only (no chat-template/serve/WebUI closure); greedy flips at low-bit near-ties (GPU-resident 2/4 probe prompts 24-token identical, 2/4 match a probe-verified prefix then diverge at a knife-edge near-tie where the reference token is camelid's immediate #2); CPU-deterministic path 1/4 identical; no bounded-context bucket, perf/RSS gate, or runnable-smoke oracle qualification yet; the model is community-sourced (bartowski/Llama-3.2-1B-Instruct-GGUF), not a canonical row",
         "metadata_parses": "validated_llama_arch",
         "tokenizer_works": "validated_llama3_bpe_128k_bos_128000",
         "tensors_load": "validated_streaming_iq4_xs_136b_wire_superblocks_no_f32_materialisation_gpu_resident_and_cpu_plus_kquant_tied_head",

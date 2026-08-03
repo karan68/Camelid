@@ -310,15 +310,35 @@ jobs:
   # release camelid.exe as a loopback sidecar, signs its artifacts with the same Azure
   # Trusted Signing identity as build-windows, and attaches them to the release itself.
   #
-  # Signing layout (azure/artifact-signing-action is folder-based / post-build; Tauri
-  # PATCHES camelid-desktop.exe during bundling so it can only be signed after the bundle):
-  #   - sidecar camelid.exe  -> signed BEFORE bundling (so it is signed inside the installer
-  #                             and the portable zip)
-  #   - camelid-desktop.exe  -> signed AFTER bundling (portable copy)
-  #   - NSIS installer       -> signed AFTER bundling
-  # Accepted v1 limitation: the camelid-desktop.exe baked INSIDE the installer is unsigned
-  # (the installer itself, the portable exe, and the sidecar are signed).
-  # See camelid-desktop/README.md, DECISIONS.md D11.
+  # Signing layout. There are TWO distinct copies of camelid-desktop.exe, and they are signed
+  # by different mechanisms because only one of them is reachable from a folder-based pass:
+  #   - sidecar camelid.exe   -> signed BEFORE bundling, by the action (a folder pass over
+  #                              camelid-desktop/sidecar). The bundler copies it verbatim as a
+  #                              resource, so the signature survives into both artifacts.
+  #   - the exe INSIDE the     -> signed by the bundler itself, through
+  #     installer                 bundle.windows.signCommand (camelid-desktop/windows/
+  #                              sign-artifact-signing.ps1). Nothing else can sign this copy.
+  #   - portable exe + the     -> signed AFTER bundling, by the action (a folder pass over the
+  #     NSIS installer            assembled portable layout).
+  #
+  # WHY signCommand IS REQUIRED. Tauri stamps the bundle type into the binary it stages for
+  # the installer, rewriting `__TAURI_BUNDLE_TYPE_VAR_UNK` to `..._NSS` so the installed app
+  # knows how it was installed. It rewrites a STAGED COPY, not target/release. Any signature
+  # applied before `tauri build` is therefore invalidated by that rewrite, and no signature
+  # applied afterwards can reach a binary already sealed inside the installer. signCommand is
+  # the only hook that runs in between.
+  #
+  # Both shipped defects lived in exactly that copy:
+  #   v0.4.6 - signed only after bundling  -> installed exe NotSigned
+  #   v0.4.7 - signed only before bundling -> installed exe HashMismatch (a BROKEN signature,
+  #            a worse posture than unsigned). Diagnosed on the published artifacts: the
+  #            installed and portable copies differ in exactly two places, the 3-byte marker
+  #            at 0x8043c8 and the PE CheckSum, which Authenticode excludes.
+  #
+  # `Prove the INSTALLED binary is signed` below is the check that closes this class of bug
+  # for good: it silently installs the built installer on the runner and asserts the unpacked
+  # binary verifies. It would have caught both defects before publishing.
+  # See DECISIONS.md D11 for the desktop app's design record.
   desktop-windows:
     if: ${{ github.event.inputs.skip_desktop != 'true' }}
     runs-on: windows-latest
@@ -407,17 +427,135 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      # The dlib that lets signtool reach Artifact Signing is a .NET 8 component.
+      - name: Install .NET 8 runtime (Artifact Signing dlib dependency)
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+
+      # Assemble the toolchain that camelid-desktop/windows/sign-artifact-signing.ps1 drives,
+      # and hand it over through the environment. That script is Tauri's
+      # `bundle.windows.signCommand`, so the bundler signs each binary AFTER it finishes
+      # rewriting it -- which is the fix. See the header comment on this job.
+      #
+      # signtool must come from the SDK Build Tools package: the dlib documents a minimum of
+      # 10.0.2261.755 and explicitly does not work with the 20348 SDK, so the runner's
+      # preinstalled signtool is not safe to assume.
+      - name: Prepare Artifact Signing tooling for the bundler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $tools = Join-Path $env:GITHUB_WORKSPACE 'signing-tools'
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+
+          Invoke-WebRequest -Uri https://dist.nuget.org/win-x86-commandline/latest/nuget.exe -OutFile "$tools/nuget.exe"
+          & "$tools/nuget.exe" install Microsoft.Windows.SDK.BuildTools -x -OutputDirectory $tools
+          if ($LASTEXITCODE -ne 0) { throw "nuget install Microsoft.Windows.SDK.BuildTools failed ($LASTEXITCODE)" }
+          & "$tools/nuget.exe" install Microsoft.ArtifactSigning.Client -x -OutputDirectory $tools
+          if ($LASTEXITCODE -ne 0) { throw "nuget install Microsoft.ArtifactSigning.Client failed ($LASTEXITCODE)" }
+
+          $signtool = Get-ChildItem -Path $tools -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe (x64) not found in the SDK Build Tools package' }
+          $dlib = Get-ChildItem -Path $tools -Recurse -Filter Azure.CodeSigning.Dlib.dll |
+            Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          if (-not $dlib) { throw 'Azure.CodeSigning.Dlib.dll (x64) not found in the Artifact Signing client package' }
+
+          # Endpoint/account/profile are the same repo vars the signing action uses, so the
+          # hook and the action always sign against one identity.
+          $metadata = Join-Path $tools 'metadata.json'
+          @{
+            Endpoint               = '${{ vars.SIGNING_ENDPOINT }}'
+            CodeSigningAccountName = '${{ vars.SIGNING_ACCOUNT }}'
+            CertificateProfileName = '${{ vars.SIGNING_PROFILE }}'
+            CorrelationId          = "${{ github.run_id }}-${{ github.run_attempt }}"
+          } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8
+
+          # Tauri discards the sign command's output when it exits non-zero, so the hook also
+          # writes to this log and the step below prints it unconditionally. Three releases
+          # failed here with nothing but `failed to run <cmd>` to go on.
+          $signLog = Join-Path $env:RUNNER_TEMP 'camelid-sign.log'
+          New-Item -ItemType File -Force -Path $signLog | Out-Null
+
+          "CAMELID_SIGNTOOL=$($signtool.FullName)"     | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+          "CAMELID_SIGN_DLIB=$($dlib.FullName)"        | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+          "CAMELID_SIGN_METADATA=$metadata"            | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+          "CAMELID_SIGN_LOG=$signLog"                  | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+          Write-Host "signtool: $($signtool.FullName)"
+          Write-Host "dlib    : $($dlib.FullName)"
+          Write-Host "sign log: $signLog"
+
+          # Print the metadata the dlib will read. Endpoint/account/profile come from repo vars;
+          # if any were empty the signing would fail with an opaque error, so surface them.
+          Write-Host "metadata.json:"
+          (Get-Content $metadata -Raw) -split "`n" | ForEach-Object { Write-Host "  $_" }
+
+          # Generate the signCommand overlay with ABSOLUTE paths.
+          #
+          # Everything here must be absolute. Tauri calls signCommand seven times per bundle
+          # (app binary, five NSIS plugin DLLs, uninstaller temp file) and the working
+          # directory is NOT constant: the uninstaller call runs from target\release\nsis\x64,
+          # not the Tauri project dir. v0.4.8 wired this relatively and died there with
+          # `failed to bundle project: failed to run powershell`, publishing no Windows
+          # installer at all. `powershell` is resolved to its full path for the same reason --
+          # a bare name failed to spawn on the runner.
+          #
+          # installerHooks is RE-STATED here, read out of tauri.conf.json rather than
+          # hardcoded, so this overlay cannot silently drop the NVRTC-orphan cleanup if
+          # Tauri's config merge is ever shallower than a deep merge at bundle.windows.
+          # Derived, not duplicated -- it cannot drift from the source of truth.
+          $script = (Resolve-Path 'camelid-desktop/windows/sign-artifact-signing.ps1').Path
+          $pwshExe = (Get-Command powershell.exe).Source
+          $baseConf = Get-Content 'camelid-desktop/tauri.conf.json' -Raw | ConvertFrom-Json
+          $hooks = $baseConf.bundle.windows.nsis.installerHooks
+          if (-not $hooks) { throw 'tauri.conf.json no longer declares bundle.windows.nsis.installerHooks' }
+
+          $signingConf = [ordered]@{
+            bundle = [ordered]@{
+              windows = [ordered]@{
+                signCommand = [ordered]@{
+                  cmd  = $pwshExe
+                  args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '%1')
+                }
+                nsis = [ordered]@{ installerHooks = $hooks }
+              }
+            }
+          }
+          $signingConf | ConvertTo-Json -Depth 8 |
+            Set-Content -Path 'camelid-desktop/tauri.signing.conf.json' -Encoding utf8
+          Write-Host "signCommand : $pwshExe -File $script %1"
+          Write-Host "installerHooks carried through: $hooks"
+
+      # One pass. The binary is signed from inside the bundler via signCommand, at the only
+      # moment its bytes are final.
       - name: Build desktop bundle (NSIS installer)
         working-directory: camelid-desktop
-        # The bundle-only config overlay adds the staged sidecar/* as resources. It is
-        # kept out of the base tauri.conf.json so a plain `cargo build -p camelid-desktop`
-        # (no sidecar staged) never hits the empty-glob error.
-        run: npx tauri build --config tauri.bundle.conf.json
+        # tauri.bundle.conf.json adds the staged sidecar/* as resources; it is kept out of the
+        # base config so a plain `cargo build -p camelid-desktop` never hits the empty-glob
+        # error. tauri.signing.conf.json is generated above and carries the absolute-path
+        # signCommand. Later --config wins on conflict, so signing is applied last.
+        run: npx tauri build --config tauri.bundle.conf.json --config tauri.signing.conf.json
+
+      # ALWAYS print the sign log, pass or fail. Tauri discards the hook's output on a non-zero
+      # exit and reports only `failed to bundle project: failed to run <cmd>`, which is what made
+      # three consecutive release failures undiagnosable from CI alone.
+      - name: Sign-command log
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:CAMELID_SIGN_LOG -and (Test-Path $env:CAMELID_SIGN_LOG)) {
+            Write-Host "----- $env:CAMELID_SIGN_LOG -----"
+            Get-Content $env:CAMELID_SIGN_LOG
+            Write-Host "----- end -----"
+          } else {
+            Write-Host "no sign log at '$($env:CAMELID_SIGN_LOG)' - the hook never ran"
+          }
 
       # Assemble the portable layout, and stage the installer INTO it so a single post-build
       # signing pass covers both the portable camelid-desktop.exe and the NSIS installer.
-      # (Tauri patches camelid-desktop.exe during bundling, so it can only be signed now —
-      # after the bundle. The sidecar camelid.exe was already signed above.)
+      # (The desktop exe is already signed above; re-signing it here is harmless and keeps
+      # the installer -- which can only exist after bundling -- covered by the same pass.)
       - name: Assemble portable layout (+ stage installer for signing)
         shell: pwsh
         run: |
@@ -492,6 +630,61 @@ jobs:
           if (-not $setup) { throw 'no NSIS installer was produced' }
           if ($setup.Length -le 0) { throw "installer $($setup.Name) is zero bytes" }
           Write-Host "installer: $($setup.Name) ($([math]::Round($setup.Length / 1MB, 1)) MB)"
+
+      # Open the installer the way a USER does, and check what it actually delivers.
+      #
+      # Every other signing check in this job inspects a file we hand to the signer. None of
+      # them can see the binary sealed INSIDE the installer, which is a different copy -- and
+      # that is precisely where both shipped defects lived: v0.4.6 delivered it unsigned, and
+      # v0.4.7 delivered it HashMismatch because the bundler rewrote the bundle-type marker
+      # after signing. A silent install into a scratch directory is the only check that sees
+      # what the user gets. The runner is ephemeral, so installing on it costs nothing.
+      - name: Prove the INSTALLED binary is signed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          $target = Join-Path $env:RUNNER_TEMP 'installed-check'
+          Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+
+          # /S = NSIS silent, /D = install directory (must be last, unquoted, no trailing slash).
+          $p = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$target" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
+
+          $exe = Join-Path $target 'camelid-desktop.exe'
+          if (-not (Test-Path $exe)) { throw "installer did not place camelid-desktop.exe in $target" }
+
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Host "installed camelid-desktop.exe -> $($sig.Status)"
+          # `Valid` is the goal; `NotSigned` is tolerated; anything else FAILS.
+          #
+          # A BROKEN signature is the one outcome worse than no signature: Windows reports a
+          # tampered chain, it earns no SmartScreen reputation, and it cannot be explained as
+          # "unsigned". That is what v0.4.7 shipped (HashMismatch on every installed copy).
+          # `NotSigned` is a known, previously accepted posture (v0.4.6) and, crucially, still
+          # produces an installer that works -- failing the release over it is how users ended up
+          # with NO Windows installer at all on v0.4.8 and v0.5.0, which is strictly worse.
+          if ($sig.Status -eq 'Valid') {
+            Write-Host 'OK: the installer delivers a correctly signed camelid-desktop.exe'
+          } elseif ($sig.Status -eq 'NotSigned') {
+            Write-Warning ("the installer delivers camelid-desktop.exe UNSIGNED. The release still " +
+              "ships and installs, but signing did not run -- see the Sign-command log step above.")
+          } else {
+            throw ("the installer delivers camelid-desktop.exe as '$($sig.Status)' -- a BROKEN " +
+              "signature, which is worse than none. Refusing to publish it.")
+          }
+
+          # The sidecar is signed before bundling by the signing action, which is a proven path,
+          # so the same three-way rule applies but a regression here is far more suspicious.
+          $side = Join-Path $target 'sidecar\camelid.exe'
+          if (-not (Test-Path $side)) { throw "installer did not place sidecar\camelid.exe in $target" }
+          $ss = (Get-AuthenticodeSignature $side).Status
+          Write-Host "installed sidecar camelid.exe -> $ss"
+          if ($ss -notin @('Valid', 'NotSigned')) {
+            throw "the installer delivers sidecar\camelid.exe as '$ss' -- a broken signature"
+          }
+
+          Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
 
       - name: Upload desktop artifacts (CI)
         uses: actions/upload-artifact@v4
@@ -725,3 +918,74 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # ---------------------------------------------------------------------------------
+  # An incomplete release must never become `latest`.
+  #
+  # The desktop jobs are deliberately independent -- they are in no other job's `needs`,
+  # so a desktop failure cannot block the server artifacts. v0.4.8 showed the cost of that
+  # independence with nothing watching it: `desktop-windows` failed, the release published
+  # anyway, became `latest`, and the documented one-command install broke for every user
+  # with an error they could do nothing about.
+  #
+  # This job closes that gap without re-coupling the builds. It runs after everything
+  # (`if: always()`), and if the published release is missing any expected asset it flips the
+  # release to a PRERELEASE. GitHub's `releases/latest` skips prereleases, so the previous
+  # complete release stays `latest` and the install path keeps working while the gap is fixed.
+  # The run still fails loudly -- this hides nothing, it just stops the damage reaching users.
+  verify-release-assets:
+    needs: [release, desktop-windows, desktop-macos]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Require a complete asset set, or demote the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.RELEASE_TAG }}
+          SKIP_DESKTOP: ${{ github.event.inputs.skip_desktop }}
+        run: |
+          set -euo pipefail
+          names="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          echo "published assets:"; echo "$names" | sed 's/^/  /'
+
+          missing=""
+          require() {
+            if ! echo "$names" | grep -qx -- "$1"; then missing="$missing $1"; fi
+          }
+          require camelid-linux-x86_64.tar.gz
+          require camelid-linux-x86_64.tar.gz.sha256
+          require camelid-macos-arm64.tar.gz
+          require camelid-macos-arm64.tar.gz.sha256
+          require camelid-windows-x64.zip
+          require camelid-windows-x64.zip.sha256
+
+          # The desktop artifacts are only expected when the desktop jobs were meant to run.
+          if [ "${SKIP_DESKTOP:-false}" != "true" ]; then
+            require camelid-desktop-windows-x64.zip
+            require camelid-desktop-windows-x64.zip.sha256
+            require camelid-desktop-macos-arm64.dmg
+            require camelid-desktop-macos-arm64.dmg.sha256
+            # The NSIS installer keeps its versioned Tauri name, so match by suffix. This is
+            # the asset scripts/get-desktop-windows.ps1 resolves; without it the documented
+            # one-command install has nothing to download.
+            setup_count="$(echo "$names" | grep -c 'x64-setup\.exe$' || true)"
+            if [ "$setup_count" != "1" ]; then
+              missing="$missing <exactly-one-x64-setup.exe (found $setup_count)>"
+            fi
+          fi
+
+          if [ -n "$missing" ]; then
+            echo "::error::release $TAG is INCOMPLETE, missing:$missing"
+            echo "Demoting $TAG to a prerelease so releases/latest keeps pointing at the last complete release."
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease --latest=false
+            exit 1
+          fi
+
+          echo "release $TAG publishes the complete asset set."

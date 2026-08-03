@@ -502,7 +502,7 @@ fn na_cells_carry_live_structural_anchors() {
 
 const UNKNOWN_TYPE_FIXTURE: &str = "nvfp4_unknown_type_trip.gguf";
 const UNKNOWN_TYPE_SHA256: &str =
-    "69ecd545663630dca0ec856f649e6ee7853232d50e34e305235f83d063d782a2";
+    "23a93ec4973746af71086bfe891fc0f7218c0acea892a42224e15d2c39771791";
 const K_DIV_FIXTURE: &str = "nvfp4_k_div_trip.gguf";
 const K_DIV_SHA256: &str = "f05c7fbcc3440051c3e727ba514eee963bacc99dcaa7b0a4de213fd143ff8152";
 const SIDECAR_ADMIT_FIXTURE: &str = "nvfp4_sidecar_admit_trip.gguf";
@@ -559,22 +559,31 @@ fn s2_fixtures_are_byte_pinned_and_listed_in_sha256sums() {
 }
 
 /// I-unknown-type, file boundary (shared by every lane whose loads begin at
-/// `read_metadata`): a GGML type id that does not exist at the pin (41) must
+/// `read_metadata`): a GGML type id that does not exist upstream (99) must
 /// refuse AT PARSE with the named unknown-type message — never a silent
 /// fall-through into admission or binding.
+///
+/// The fixture carried id 41 until 2026-08-01. That was a MIS-SPECIFICATION from
+/// the day it was authored — the same campaign's pin receipt
+/// (`qa/evidence-bundles/basalt/phase0/pin_extraction_receipts.md`) already listed
+/// 41 as allocated — and it kept tripping this refusal only because Camelid had
+/// not implemented 41 yet. Implementing it (the 1-bit Q1_0 format) is what turned
+/// 41 into a KNOWN type and left this test passing on a defused fixture. Id 99 is
+/// far outside the range any real file uses, so the next type to be implemented
+/// cannot quietly defuse it again.
 #[test]
 fn unknown_type_fixture_trips_parse_refusal() {
     assert_fixture_pinned(UNKNOWN_TYPE_FIXTURE, UNKNOWN_TYPE_SHA256);
     let msg = match camelid::gguf::read_metadata(fixture_path(UNKNOWN_TYPE_FIXTURE)) {
         Err(e) => e.to_string(),
-        Ok(_) => panic!("type id 41 must refuse at parse (fail closed)"),
+        Ok(_) => panic!("type id 99 must refuse at parse (fail closed)"),
     };
     assert!(
         msg.contains("unknown or removed GGML type"),
         "must be the named parse refusal: {msg}"
     );
     assert!(
-        msg.contains("Unknown(41)"),
+        msg.contains("Unknown(99)"),
         "must name the offending id: {msg}"
     );
     assert!(

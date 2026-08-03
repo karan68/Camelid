@@ -1649,6 +1649,86 @@ fn nope_config_disqualifies_the_resident_gpu_path() {
 /// when a resident backend is armed, and by the backend-enabled gate when
 /// none is (either way, never admitted). The positive admission is proven by
 /// the env-keyed real-row gates in `src/metal.rs`.
+/// gemma3 long-prompt TTFT campaign, Phase 2 — the zero-behaviour-change claim for
+/// every OTHER architecture, asserted rather than argued.
+///
+/// The Tier A batched windowed prefill arms on
+/// `config.gemma3.is_some() && CAMELID_GEMMA3_BATCH_PREFILL`. The conjunction is what
+/// makes the flag inert for a Llama-family row: no matter what the (process-latched)
+/// env flag says, a session with no gemma3 metadata must never take the new path. The
+/// flag's state cannot be forced from inside a test — it is a `OnceLock` — so the
+/// assertion is written to hold in EITHER state, which is exactly the claim.
+#[test]
+fn batched_windowed_prefill_never_arms_for_a_non_gemma3_arch() {
+    let (mut session, _temp) = tiny_kv_budget_session(64);
+    assert!(
+        session.config.gemma3.is_none(),
+        "the tiny fixture is a Llama-family row"
+    );
+    assert!(
+        !session.gemma3_batched_prefill_armed(),
+        "CAMELID_GEMMA3_BATCH_PREFILL must be inert for a non-gemma3 arch, in any env state"
+    );
+
+    // The same session, given gemma3 metadata, follows the flag — so the arch is the
+    // ONLY thing standing between the flag and the new path.
+    session.config.architecture = "gemma3".to_string();
+    session.config.gemma3 = Some(crate::model::Gemma3Metadata {
+        sliding_window: 512,
+        sliding_window_pattern: 6,
+        rope_freq_base_global: 1_000_000.0,
+        rope_freq_base_local: 10_000.0,
+        layer_is_sliding: vec![true],
+        embed_scale: 2.0,
+        ffn_geglu: true,
+        rope_neox_pairing: true,
+    });
+    assert_eq!(
+        session.gemma3_batched_prefill_armed(),
+        crate::metal::gemma3_batch_prefill_enabled(),
+        "for a gemma3 row the predicate must be exactly the campaign flag"
+    );
+
+    // Phases 3 and 4 ride INSIDE that path: the tiled simdgroup-matmul prefill GEMM and
+    // the batched windowed attention are only reachable from `prefill_tokens_windowed`,
+    // whose only production caller is the predicate above. So the assertion that the
+    // predicate is false for a Llama-family row is the zero-behaviour-change proof for
+    // all three flags at once, in every env state — which is what lets them ship
+    // default-ON without touching any other row.
+    //
+    // What is additionally checked here is the POSTURE, which changed in Phase 4: all
+    // three are now default-ON with `=0` as the operator opt-out, and `=0` must actually
+    // be honoured (a default-on flag that ignores its opt-out is a flag with no off
+    // switch). Each clause is guarded on the env var's own state because these are
+    // process-latched `OnceLock`s that a test cannot force.
+    for (var, read) in [
+        (
+            "CAMELID_GEMMA3_BATCH_PREFILL",
+            crate::metal::gemma3_batch_prefill_enabled as fn() -> bool,
+        ),
+        (
+            "CAMELID_GEMMA3_PREFILL_MM",
+            crate::metal::gemma3_prefill_mm_enabled as fn() -> bool,
+        ),
+        (
+            "CAMELID_GEMMA3_PREFILL_ATTN_MM",
+            crate::metal::gemma3_prefill_attn_mm_enabled as fn() -> bool,
+        ),
+    ] {
+        match std::env::var(var).ok().as_deref() {
+            None => assert!(
+                read(),
+                "{var} must default ON since Phase 4 (long-prompt TTFT campaign, §19c)"
+            ),
+            Some("0") | Some("false") | Some("False") | Some("FALSE") => assert!(
+                !read(),
+                "{var}=0 is the operator opt-out and must be honoured"
+            ),
+            Some(_) => assert!(read(), "{var} set to anything but 0/false means ON"),
+        }
+    }
+}
+
 #[test]
 fn arch_disqualifiers_refuse_the_resident_gpu_path() {
     let (mut session, _temp) = tiny_kv_budget_session(64);
@@ -14758,4 +14838,76 @@ fn windowed_arch_q8_pin_rejects_any_non_q8_layer_linear() {
         &[base.clone(), base, bad],
         false
     ));
+}
+
+/// The 256-bit AVX-VNNI Q8 owner microkernel must agree bit for bit with BOTH the scalar oracle and
+/// the AVX2 kernel it replaces. `dpbusd` forces an unsigned first operand, so the weight sign is
+/// folded onto the input; the boundary quants pinned below (0, -127, 127) are what that folding is
+/// most likely to get wrong. The accumulator is seeded non-zero so the `+=` contract is covered too.
+/// Called directly rather than through the dispatch, so it cannot pass vacuously.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn q8_0_owner_avxvnni_microkernel_is_bit_identical() {
+    if !std::arch::is_x86_feature_detected!("avxvnni")
+        || !std::arch::is_x86_feature_detected!("avx2")
+    {
+        return;
+    }
+
+    let make_block = |seed: u32, scales: [f32; 4]| -> Q8_0PackedRows4Block {
+        let mut quants = [0_i8; 128];
+        for (i, q) in quants.iter_mut().enumerate() {
+            let h = (i as u32).wrapping_add(seed).wrapping_mul(2_654_435_761);
+            *q = (((h >> 24) as i32) - 128).clamp(-127, 127) as i8;
+        }
+        quants[0] = 0;
+        quants[1] = -127;
+        quants[2] = 127;
+        quants[8] = -127;
+        quants[9] = 0;
+        Q8_0PackedRows4Block { scales, quants }
+    };
+
+    let input = make_block(1, [0.5, -0.25, 1.0, 0.000_976_562_5]);
+    let weight = make_block(7, [0.125, 2.0, -0.031_25, 1.0]);
+    let seed_sums = [[1.5_f32, -2.25, 0.0, 7.125]; 4];
+
+    let int_sums = q8_0_packed_rows4_gemm4_block_scalar(&input, &weight);
+    let mut expected = seed_sums;
+    for (input_lane, row) in expected.iter_mut().enumerate() {
+        let input_scale = input.scales[input_lane];
+        for (output_lane, cell) in row.iter_mut().enumerate() {
+            *cell +=
+                int_sums[input_lane][output_lane] as f32 * weight.scales[output_lane] * input_scale;
+        }
+    }
+
+    let mut actual = seed_sums;
+    // SAFETY: avx2 + avxvnni confirmed present above.
+    unsafe {
+        q8_0_packed_rows4_gemm4_accumulate_block_avxvnni(&input, &weight, &mut actual);
+    }
+    for (actual_row, expected_row) in actual.iter().zip(expected.iter()) {
+        for (a, e) in actual_row.iter().zip(expected_row.iter()) {
+            assert_eq!(a.to_bits(), e.to_bits(), "avxvnni inner vs scalar oracle");
+        }
+    }
+
+    let mut avx2 = seed_sums;
+    // SAFETY: avx2 confirmed present above; the blocks are complete rows4/I8 blocks and `avx2` is a
+    // contiguous 4x4 f32 accumulator.
+    unsafe {
+        q8_0_packed_rows4_gemm4_accumulate_block_avx2(
+            input.quants.as_ptr(),
+            input.scales.as_ptr(),
+            weight.quants.as_ptr(),
+            weight.scales.as_ptr(),
+            avx2.as_mut_ptr().cast::<f32>(),
+        );
+    }
+    for (actual_row, avx2_row) in actual.iter().zip(avx2.iter()) {
+        for (a, b) in actual_row.iter().zip(avx2_row.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "avxvnni inner vs avx2 inner");
+        }
+    }
 }

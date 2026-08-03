@@ -38,6 +38,7 @@ export const IconSystem = (p) => <Svg {...p}><path d="M3 17v2h6v-2H3zM3 5v2h10V5
 export const IconApi = (p) => <Svg {...p}><path d="M9.4 16.6 4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0L19.2 12l-4.6-4.6L16 6l6 6-6 6-1.4-1.4z" /></Svg>
 export const IconAnalytics = (p) => <Svg {...p}><path d="M4 9h4v11H4V9zm6-5h4v16h-4V4zm6 8h4v8h-4v-8z" /></Svg>
 export const IconMemory = (p) => <Svg {...p}><path d="M17 3H7a2 2 0 0 0-2 2v16l7-3 7 3V5a2 2 0 0 0-2-2z" /></Svg>
+export const IconImage = (p) => <Svg {...p} strokeIcon><rect x="3" y="4" width="18" height="16" rx="2.5" /><circle cx="8.5" cy="9" r="1.5" /><path d="m5 17 4.5-4.5 3.2 3.2 2.1-2.1L19 17" /></Svg>
 export const IconSend = (p) => <Svg {...p}><path d="M12 4 6 10l1.4 1.4L11 7.8V20h2V7.8l3.6 3.6L18 10l-6-6z" /></Svg>
 export const IconStop = (p) => <Svg {...p}><rect x="6" y="6" width="12" height="12" rx="2.5" /></Svg>
 export const IconCopy = (p) => <Svg {...p}><path d="M16 1H4a2 2 0 0 0-2 2v12h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" /></Svg>

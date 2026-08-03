@@ -21,7 +21,10 @@
 pub mod agent;
 pub mod audit;
 pub mod distributed;
+pub mod gguf_hash_cache;
 pub mod verify;
+
+pub use gguf_hash_cache::sha256_file_hex_cached;
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -31,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::gguf::{GgufFile, GgufMetadataValue};
+use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorType};
 
 /// Schema identifier stamped into every v1 receipt.
 pub const RECEIPT_SCHEMA_V1: &str = "camelid.parity-receipt/v1";
@@ -201,6 +204,32 @@ impl LaneIdentity {
 /// Human label for the GGUF's quantization: `general.file_type` when present
 /// (llama.cpp ftype naming), else the dominant tensor type by count.
 pub fn quantization_label(gguf: &GgufFile) -> String {
+    if gguf
+        .tensors
+        .iter()
+        .any(|tensor| tensor.tensor_type == GgufTensorType::Pq2_0)
+    {
+        return "PQ2_0".to_string();
+    }
+    // Prism uses the same general.file_type (41) for both deployed Q2_0
+    // dialects. The reader resolves that ambiguity from the complete tensor
+    // directory, so preserve the resolved block geometry in every receipt.
+    // Checking this before the declared file type is intentional: metadata
+    // cannot distinguish g64 from g128 and filenames are not authoritative.
+    if gguf
+        .tensors
+        .iter()
+        .any(|tensor| tensor.tensor_type == GgufTensorType::Q2_0G64)
+    {
+        return "Q2_0_G64".to_string();
+    }
+    if gguf
+        .tensors
+        .iter()
+        .any(|tensor| tensor.tensor_type == GgufTensorType::Q2_0G128)
+    {
+        return "Q2_0_G128".to_string();
+    }
     if let Some(label) = declared_file_type_label(gguf) {
         return label.to_string();
     }
@@ -258,6 +287,15 @@ fn file_type_label(value: &GgufMetadataValue) -> Option<&'static str> {
         // a GGUF. NOT 26: that is GGML_FTYPE_MOSTLY_NVFP4, a different (ggml) enum that
         // never lands in GGUF metadata (BASALT_RECON.md §5).
         39 => "NVFP4",
+        // 40 is the FILE-TYPE id Q1_0 GGUFs carry in `general.file_type`. Same
+        // enum-namespace caveat as NVFP4 above: this is the file-type enum, NOT the
+        // tensor type id 41 that Q1_0 tensor descriptors carry. The two are adjacent
+        // for Q1_0, which makes confusing them easy. Verified against the shipped
+        // artifact: Bonsai-1.7B-Q1_0.gguf declares file_type 40 with type-41 tensors.
+        40 => "Q1_0",
+        // Prism's LLAMA_FTYPE_MOSTLY_Q2_0. Both deployed block geometries use
+        // this id; `quantization_label` refines it from resolved tensor types.
+        41 => "Q2_0",
         _ => return None,
     })
 }
@@ -1191,6 +1229,35 @@ mod tests {
             quantization_label(&gguf_for_lane_tests(BTreeMap::new(), Vec::new())),
             "unknown"
         );
+    }
+
+    #[test]
+    fn prism_q2_receipt_uses_resolved_geometry_not_ambiguous_file_type() {
+        use crate::gguf::{GgufTensorDescriptor, GgufTensorType};
+        let gguf = |tensor_type| {
+            let mut metadata = BTreeMap::new();
+            metadata.insert("general.file_type".into(), GgufMetadataValue::U32(41));
+            gguf_for_lane_tests(
+                metadata,
+                vec![GgufTensorDescriptor {
+                    name: "blk.0.attn_q.weight".into(),
+                    dimensions: vec![128, 128],
+                    tensor_type,
+                    relative_offset: 0,
+                    absolute_offset: 0,
+                    n_bytes: 0,
+                }],
+            )
+        };
+        assert_eq!(
+            quantization_label(&gguf(GgufTensorType::Q2_0G64)),
+            "Q2_0_G64"
+        );
+        assert_eq!(
+            quantization_label(&gguf(GgufTensorType::Q2_0G128)),
+            "Q2_0_G128"
+        );
+        assert_eq!(quantization_label(&gguf(GgufTensorType::Pq2_0)), "PQ2_0");
     }
 
     #[test]

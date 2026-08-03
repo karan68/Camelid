@@ -400,6 +400,9 @@ mod tests {
         ram_free_bytes: u64,
     ) -> HardwareProfile {
         HardwareProfile {
+            metal_available: false,
+            metal_device_name: None,
+            metal_unified_memory: false,
             cuda_available,
             cuda_device_count: if cuda_available { 1 } else { 0 },
             cuda_device_name: None,

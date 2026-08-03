@@ -25,6 +25,19 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const runtimePill = runtimeReadinessLabel(runtime)
   const selectedModelName = selectedModel?.name || 'No next-chat model selected'
   const apiBase = runtime?.api_base || 'Local API unavailable'
+  // Version comes from /v1/health, so it names the engine actually answering rather than
+  // whatever this bundle was built alongside. Unknown until health responds.
+  const engineVersion = runtime?.version || null
+  const engineBuild = runtime?.build || null
+  const engineVersionLabel = engineVersion ? `v${engineVersion}` : 'Unknown until /v1/health responds'
+  // A build identity that is not just the version restated means this engine is not a
+  // released binary — worth showing rather than hiding behind a matching version number.
+  const engineBuildDetail = engineBuild && engineBuild !== engineVersion && engineBuild !== `v${engineVersion}`
+    ? engineBuild
+    : null
+  const engineLabel = runtime?.engine
+    ? (engineVersion ? `${runtime.engine} v${engineVersion}` : runtime.engine)
+    : 'engine unknown'
   const modelId = getRuntimeRequestModelId(selectedModel, runtime, '<loaded-model-id>') || '<loaded-model-id>'
   const supportContract = capabilities?.support_contract
   const supportContractCurrentGate = frontendSupportContractCopy(capabilities)
@@ -104,7 +117,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
       )}
 
       <div className="cxv-stat-grid">
-        <div className="cxv-stat"><span>Runtime</span><strong>{runtimeState}</strong><small>{runtime?.engine || 'engine unknown'}</small></div>
+        <div className="cxv-stat"><span>Runtime</span><strong>{runtimeState}</strong><small title={engineBuildDetail || undefined}>{engineLabel}</small></div>
         <div className="cxv-stat"><span>Generation</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong><small>{runtimePill}</small></div>
         <div className="cxv-stat"><span>Loaded model</span><strong>{runtime?.loaded_now ? 'Active' : 'None'}</strong><small title={runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</small></div>
         <div className="cxv-stat"><span>Selected gate</span><strong>{gateStat}</strong><small>{gateStatSub}</small></div>
@@ -117,6 +130,10 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
           <div className="sys-defs">
             <div><span>Runtime state</span><strong>{runtime?.generation_ready ? 'Generation-ready' : runtime?.loaded_now ? 'Loaded, not generation-ready' : runtime?.status === 'offline' ? 'Backend offline' : 'Online, no model loaded'}</strong></div>
             <div><span>Local engine</span><strong>{runtime?.engine || 'Unknown'}</strong></div>
+            <div><span>Engine version</span><strong title={engineBuildDetail || undefined}>{engineVersionLabel}</strong></div>
+            {engineBuildDetail && (
+              <div><span>Build</span><strong>{engineBuildDetail}</strong></div>
+            )}
             <div><span>Loaded model</span><strong>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</strong></div>
             <div><span>Generation ready</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong></div>
             <div><span>Selected device at load</span><strong>{execution.device}</strong></div>

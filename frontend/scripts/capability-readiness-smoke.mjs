@@ -31,14 +31,15 @@ check(
   classifyCapabilityRow({ id: 'mixtral_8x7b_instruct_v0_1_q8_0', status: 'active_validation_partial_runtime' }),
   READINESS.ACTIVE_VALIDATION,
 )
-// Real shipped row (gemma3 -> Metal campaign): the Metal GPU-resident lane is
-// the default serve lane for this row, and the row carries NO throughput claim.
+// Real shipped row (gemma3 -> Metal, then -> CUDA): a GPU-resident windowed
+// lane is the default serve lane for this row on BOTH GPU backends, and the row
+// carries NO throughput claim on either.
 // `performance_measured` must therefore never read as measured evidence — a row
 // that declines to claim perf must not be classified as GPU-experimental or
 // promoted to a throughput-ready lane. Field values copied from the shipped
 // /api/capabilities contract, not paraphrased.
 check(
-  'supported exact row: gemma3 1B Q8_0 on the Metal resident lane',
+  'supported exact row: gemma3 1B Q8_0 on a GPU-resident windowed lane',
   classifyCapabilityRow({
     id: 'gemma_3_1b_it_q8_0',
     status: 'supported_exact_row_smoke',

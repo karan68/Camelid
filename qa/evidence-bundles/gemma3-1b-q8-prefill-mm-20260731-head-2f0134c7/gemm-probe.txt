@@ -1,0 +1,11 @@
+[gemm-probe] batched gemv (Phase 2)    14.682s   12.235 ms/token  0.114 TFLOPS  load 3.03
+[gemm-probe] batched mm (Phase 3)       3.045s    2.538 ms/token  0.550 TFLOPS  load 2.87
+[gemm-probe] token-by-token (today)    21.432s   17.860 ms/token  0.078 TFLOPS  load 3.05
+
+[chunk-probe] rows=  16  n=1200    5.044s   4.203 ms/token  load 4.02
+[chunk-probe] rows=  32  n=1200    3.814s   3.178 ms/token  load 4.02
+[chunk-probe] rows=  64  n=1200    3.330s   2.775 ms/token  load 4.02
+[chunk-probe] rows= 128  n=1200    3.090s   2.575 ms/token  load 4.02
+[chunk-probe] rows= 256  n=1200    3.061s   2.551 ms/token  load 4.02
+[chunk-probe] rows= 512  n=1200    3.076s   2.563 ms/token  load 4.02
+[chunk-probe] token-by-token  n=1200   16.375s  13.646 ms/token  load 3.99

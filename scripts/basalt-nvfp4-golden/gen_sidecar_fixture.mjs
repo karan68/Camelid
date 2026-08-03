@@ -26,10 +26,12 @@
 //       these bytes and documents that ordering (honest cells only).
 //
 // S2 quartet (§2.6, tripped by tests/invariant_matrix_binding.rs):
-//   nvfp4_unknown_type_trip.gguf — one tensor with GGML type id 41 (no such
-//       type at the pin): trips the PARSE-level fail-closed refusal
+//   nvfp4_unknown_type_trip.gguf — one tensor with GGML type id 99 (not an
+//       allocated tensor type): trips the PARSE-level fail-closed refusal
 //       (src/gguf/reader.rs tensor_nbytes -> "unknown or removed GGML type"),
 //       the file-boundary guard shared by every lane (I-unknown-type).
+//       (Was id 41 until 2026-08-01 — see the inline note at that fixture for
+//       why 41 was the wrong choice from the start.)
 //   nvfp4_k_div_trip.gguf — one NVFP4 tensor with first dim 48 (48 % 64 != 0):
 //       trips the PARSE-level divisibility refusal ("not divisible by block
 //       size 64") — never a silent pad (I-k-div).
@@ -190,12 +192,24 @@ const fixtures = [
     file: "nvfp4_unknown_type_trip.gguf",
     tensors: [
       {
-        // Type id 41 does not exist at the pin: read_metadata must refuse at
-        // tensor_nbytes with the named unknown-type message. Data bytes are
-        // present but never reached (the descriptor refuses first).
+        // Type id 99 is not an allocated GGUF tensor type:
+        // read_metadata must refuse at tensor_nbytes with the named unknown-type
+        // message. Data bytes are present but never reached (the descriptor
+        // refuses first).
+        //
+        // This was id 41 until 2026-08-01. Picking 41 was a MIS-SPECIFICATION on
+        // the day this fixture was authored: the same campaign's own pin receipt
+        // (qa/evidence-bundles/basalt/phase0/pin_extraction_receipts.md:21-24,
+        // committed the same day) already listed 41 as an allocated type. The
+        // fixture kept tripping the refusal only because Camelid had not
+        // implemented 41 yet; implementing it (the 1-bit Q1_0 format) is what
+        // exposed the mis-specification. The id was moved far outside the range any
+        // real file uses, rather than to the next free slot, so the next type to be
+        // implemented cannot silently defuse it again. LESSON: check the pin receipt
+        // before declaring a type id free.
         name: "blk.0.mystery.weight",
         dims: [64],
-        type: 41,
+        type: 99,
         data: Buffer.from(nvfp4Block({ nanSentinel: false })),
       },
     ],

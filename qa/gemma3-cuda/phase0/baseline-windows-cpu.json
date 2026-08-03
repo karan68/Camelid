@@ -1,0 +1,49 @@
+{
+  "campaign": "gemma3-cuda-windows",
+  "phase": "0 — baseline",
+  "purpose": "Prove, on the target host, that the gemma3 row decodes on the CPU on Windows even with a working CUDA device, and record the lane + cadence the CUDA lane will be compared against.",
+  "host": {
+    "os": "Windows 11",
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU (compute capability 8.6)",
+    "vram_total_mib": 6143,
+    "vram_free_at_load_mib": 5122,
+    "driver": "576.83",
+    "cpu_features": ["avx2", "avx512f"],
+    "threads": 16
+  },
+  "binary": "target/release/camelid.exe @ 05984826 (origin/main, PR #560 merged)",
+  "row": {
+    "id": "gemma_3_1b_it_q8_0",
+    "path": "models/gemma-3-1b-it-Q8_0.gguf",
+    "sha256": "b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5"
+  },
+  "observed": {
+    "cuda_resident_active": true,
+    "cuda_device_selected": true,
+    "gpu_warmup_ran": true,
+    "selected_backend": "cpu_reference",
+    "prefill_path": "safe_cpu_prefill",
+    "decode_path": "safe_cpu_decode",
+    "support_level": "supported_exact_row_smoke_sub512",
+    "served_lane": "runnable",
+    "response_id_prefix": "chatcmpl-runnable",
+    "plan_reason": "windowed-attention row (gemma3): the only validated dense lane is Metal-resident; no CPU dense plan exists for this arch — serve chats via the runnable bridge on this host; failing closed to safe path"
+  },
+  "cadence_probe": {
+    "prompt": "Name the capital of France in one word.",
+    "greedy": true,
+    "temperature": 0,
+    "prompt_tokens": 18,
+    "completion_tokens": 2,
+    "generated_token_ids": [50429, 107],
+    "text": "Paris\n",
+    "wall_seconds": 52.094,
+    "note": "Wall time covers prefill of 18 tokens plus 2 generated tokens on the runnable CPU bridge. Recorded as an OBSERVATION of the baseline lane on this host, not as a benchmark: no thread pinning, no repeat runs, no isolation discipline. It is here to size the gap, not to be quoted."
+  },
+  "conclusion": "The premise holds. CUDA is present, selected, and the resident engine is even warmed — the gemma3 row is refused by routing, not by the absence of a device. Both the plan disclosure and the served response independently name the runnable CPU lane.",
+  "not_claimed": [
+    "No throughput claim for either lane.",
+    "No parity claim — this phase captures a lane identity and a cadence observation only.",
+    "No statement about any gemma3 row or quant other than 1B Q8_0."
+  ]
+}
