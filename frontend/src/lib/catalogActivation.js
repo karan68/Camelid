@@ -4,6 +4,7 @@ function failureMessage(body, fallback) {
 
 export function catalogDownloadSettlement({
   downloading,
+  failed = false,
   installed,
   sawDownload,
   settledAt = 0,
@@ -12,6 +13,7 @@ export function catalogDownloadSettlement({
   localScanGraceMs = 30000,
 }) {
   if (downloading) return { action: 'wait', sawDownload: true, settledAt: 0 }
+  if (failed) return { action: 'failed', sawDownload: true, settledAt: 0 }
   if (installed) return { action: 'landed', sawDownload, settledAt: 0 }
   if (sawDownload && settledAt === 0) {
     return { action: 'wait', sawDownload, settledAt: now }

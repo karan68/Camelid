@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
-import { dirname, join, relative, resolve } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 
 const args = parseArgs(process.argv.slice(2))
 const rootDir = resolve(args.get('root') || 'qa/evidence-bundles')
@@ -29,6 +29,12 @@ const patterns = [
     description: 'macOS mounted-volume path leaked into durable bundle content',
     shouldScan: (text) => text.includes('/Volumes/'),
     regex: /\/Volumes\/[^/\n]+\/[^"]*/g,
+  },
+  {
+    id: 'windows_home_path',
+    description: 'Windows user-home path leaked into durable bundle content',
+    shouldScan: (text) => /[A-Za-z]:\\{1,2}Users\\{1,2}/i.test(text),
+    regex: /\b[A-Za-z]:\\{1,2}Users\\{1,2}[^\\/\s"']+(?:\\{1,2}[^\s"']*)?/gi,
   },
   {
     id: 'ipv4_literal',
@@ -117,7 +123,7 @@ async function walk(currentDir) {
 }
 
 async function scanFile(fullPath) {
-  const relPath = relative(rootDir, fullPath)
+  const relPath = relative(rootDir, fullPath).split(sep).join('/')
   const bundle = relPath.split('/')[0] || relPath
   const text = await readFile(fullPath, 'utf8')
   const lineStarts = [0]

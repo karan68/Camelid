@@ -19,6 +19,10 @@ use cudarc::nvrtc::{CompileOptions, Ptx};
 /// CUDA C source for every resident-decode kernel. Compiled once via NVRTC with
 /// `--fmad=false` and `arch=compute_61` (for `__dp4a`).
 const KERNELS: &str = r#"
+#ifdef CAMELID_HAS_WMMA
+#include <mma.h>
+#endif
+
 // ---- f16 round-trip (header-free) ------------------------------------------
 // Bit-exact port of inference.rs f32_to_f16_bits / f16_bits_to_f32 (IEEE-754
 // round-half-to-even). Used wherever the CPU reference rounds a value through
@@ -169,6 +173,34 @@ extern "C" __global__ void quantize_q8_0(
     }
 }
 
+// Lossless bit-sliced view of the existing Q8/32 activation. One warp owns one
+// chunk; input scales stay in their authoritative f32 buffer.
+extern "C" __global__ void prism_q8_32_bitplanes_qsum(
+    const signed char* __restrict__ quants,
+    unsigned int* __restrict__ bitplanes,
+    int* __restrict__ qsums,
+    int n_chunks
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int chunk = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (chunk >= n_chunks) return;
+    int q = (int)quants[(long)chunk * 32 + lane];
+    unsigned int uq = (unsigned int)q & 0xffu;
+    unsigned int mask = 0xffffffffu;
+    #pragma unroll
+    for (int plane = 0; plane < 8; plane++) {
+        unsigned int bits = __ballot_sync(mask, ((uq >> plane) & 1u) != 0u);
+        if (lane == 0) bitplanes[(long)chunk * 8 + plane] = bits;
+    }
+    q += __shfl_down_sync(mask, q, 16);
+    q += __shfl_down_sync(mask, q, 8);
+    q += __shfl_down_sync(mask, q, 4);
+    q += __shfl_down_sync(mask, q, 2);
+    q += __shfl_down_sync(mask, q, 1);
+    if (lane == 0) qsums[chunk] = q;
+}
+
 // ---- Fused RMS-norm + Q8_0 quantize (F1) -----------------------------------
 // One block stages the row in shared, thread 0 does the in-order sum-of-squares
 // (bit-identical to rms_norm_f32), every thread applies norm*weight back into shared,
@@ -306,6 +338,1613 @@ extern "C" __global__ void q8_gemv(
         // output[row] (old hidden) + acc == hidden + projection, the same f32 sum.
         output[row] = residual ? (output[row] + acc) : acc;
     }
+}
+
+// Resolve one logical Q1 row/K-block in either stock row-major wire or the
+// same-size Q1T128 upload layout. Q1T128 groups every <=128-row tile/K-block as
+// [nr*16 signs][nr*2 scales]; only the final row tile may have nr < 128.
+__device__ __forceinline__ const unsigned char* prism_q1_sign_ptr(
+    const unsigned char* weight_bytes, int rows, int blocks_per_row,
+    int row, int weight_block, int q1_tiled
+) {
+    if (!q1_tiled)
+        return weight_bytes + ((long)row * blocks_per_row + weight_block) * 18 + 2;
+    int tile = row >> 7;
+    int row0 = tile << 7;
+    int nr = rows - row0;
+    if (nr > 128) nr = 128;
+    long tile_base = (long)tile * 128 * blocks_per_row * 18;
+    long group = tile_base + (long)weight_block * nr * 18;
+    return weight_bytes + group + (row - row0) * 16;
+}
+
+__device__ __forceinline__ const unsigned char* prism_q1_scale_ptr(
+    const unsigned char* weight_bytes, int rows, int blocks_per_row,
+    int row, int weight_block, int q1_tiled
+) {
+    if (!q1_tiled)
+        return weight_bytes + ((long)row * blocks_per_row + weight_block) * 18;
+    int tile = row >> 7;
+    int row0 = tile << 7;
+    int nr = rows - row0;
+    if (nr > 128) nr = 128;
+    long tile_base = (long)tile * 128 * blocks_per_row * 18;
+    long group = tile_base + (long)weight_block * nr * 18;
+    return weight_bytes + group + (long)nr * 16 + (row - row0) * 2;
+}
+
+// Prism decode GEMV over the original f32 activation. This mirrors the three
+// parity-locked Metal kernels in metal.rs rather than quantizing the activation
+// to Q8_0 first. The lane/block association is intentional: ultra-low-bit rows
+// can change greedy logits when an algebraically equivalent reduction order is
+// substituted.
+extern "C" __global__ void prism_low_bit_f32_gemv(
+    const float* __restrict__ input, const unsigned char* __restrict__ weight_bytes,
+    int rows, int blocks_per_row, int bits, int weight_block_elements, int q1_tiled,
+    float* __restrict__ output, int residual
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int work = blockIdx.x * warps_per_block + warp;
+    unsigned mask = 0xffffffffu;
+
+    if (bits == 1) {
+        // Q1_0: one warp evaluates eight rows; four 128-value blocks are in
+        // flight and eight lanes own the sixteen-value slices of each block.
+        // All eight warps in the CTA consume the SAME activation blocks. Stage
+        // each four-block window cooperatively once, with fully coalesced global
+        // loads, instead of having every warp issue the same strided loads. The
+        // per-lane slice and b=lane_group+4*k order stay unchanged, preserving
+        // the parity-locked accumulation and reduction exactly.
+        int first_row = work * 8;
+        int block_lane = lane >> 3;
+        int slice = (lane & 7) << 4;
+        float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        extern __shared__ float staged_input[];
+        for (int chunk = 0; chunk < blocks_per_row; chunk += 4) {
+            int remaining = blocks_per_row - chunk;
+            int staged_values = (remaining < 4 ? remaining : 4) * 128;
+            for (int i = threadIdx.x; i < staged_values; i += blockDim.x)
+                staged_input[i] = input[chunk * 128 + i];
+            __syncthreads();
+            int b = chunk + block_lane;
+            if (first_row < rows && b < blocks_per_row) {
+                int input_base = block_lane * 128 + slice;
+                float values[16];
+                float input_sum = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    values[i] = staged_input[input_base + i];
+                    input_sum += values[i];
+                }
+                #pragma unroll
+                for (int ro = 0; ro < 8; ro++) {
+                    int row = first_row + ro;
+                    if (row < rows) {
+                        const unsigned char* scale_ptr = prism_q1_scale_ptr(
+                            weight_bytes, rows, blocks_per_row, row, b, q1_tiled);
+                        float d = f16_bits_to_f32(
+                            (unsigned short)scale_ptr[0]
+                            | ((unsigned short)scale_ptr[1] << 8));
+                        const unsigned char* qs = prism_q1_sign_ptr(
+                            weight_bytes, rows, blocks_per_row, row, b, q1_tiled)
+                            + (slice >> 3);
+                        unsigned char b0 = qs[0], b1 = qs[1];
+                        float selected = 0.0f;
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++)
+                            selected += (b0 & (1u << i)) ? values[i] : 0.0f;
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++)
+                            selected += (b1 & (1u << i)) ? values[i + 8] : 0.0f;
+                        sums[ro] += d * (2.0f * selected - input_sum);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int ro = 0; ro < 8; ro++) {
+            float total = sums[ro];
+            total += __shfl_down_sync(mask, total, 16);
+            total += __shfl_down_sync(mask, total, 8);
+            total += __shfl_down_sync(mask, total, 4);
+            total += __shfl_down_sync(mask, total, 2);
+            total += __shfl_down_sync(mask, total, 1);
+            int row = first_row + ro;
+            if (lane == 0 && row < rows)
+                output[row] = residual ? output[row] + total : total;
+        }
+        return;
+    }
+
+    // Both Q2 geometries reuse one activation slice across eight output rows,
+    // matching the Q1 launch geometry. Each row still accumulates and reduces
+    // in exactly the same lane/block order as the former one-row-per-warp path.
+    int first_row = work * 8;
+    if (first_row >= rows) return;
+    float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    if (weight_block_elements == 64) {
+        // Q2_0-G64: each lane owns indices lane and lane+32 in every block.
+        for (int b = 0; b < blocks_per_row; b++) {
+            int input_base = b * 64;
+            float values[2] = { input[input_base + lane], input[input_base + lane + 32] };
+            #pragma unroll
+            for (int ro = 0; ro < 8; ro++) {
+                int row = first_row + ro;
+                if (row < rows) {
+                    const unsigned char* block = weight_bytes
+                        + ((long)row * blocks_per_row + b) * 18;
+                    float d = f16_bits_to_f32(
+                        (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+                    const unsigned char* qs = block + 2;
+                    #pragma unroll
+                    for (int half = 0; half < 2; half++) {
+                        int i = lane + half * 32;
+                        int q = (qs[i >> 2] >> ((i & 3) << 1)) & 3;
+                        sums[ro] += values[half] * (float)(q - 1) * d;
+                    }
+                }
+            }
+        }
+    } else {
+        // Q2_0-G128: four blocks in flight, eight lanes per 16-value slice.
+        int block_lane = lane >> 3;
+        int slice = (lane & 7) << 4;
+        for (int b = block_lane; b < blocks_per_row; b += 4) {
+            int input_base = b * 128 + slice;
+            float values[16];
+            float input_sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                values[i] = input[input_base + i];
+                input_sum += values[i];
+            }
+            #pragma unroll
+            for (int ro = 0; ro < 8; ro++) {
+                int row = first_row + ro;
+                if (row < rows) {
+                    const unsigned char* block = weight_bytes
+                        + ((long)row * blocks_per_row + b) * 34;
+                    float d = f16_bits_to_f32(
+                        (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+                    const unsigned char* qs = block + 2 + (slice >> 2);
+                    float acc_lo = 0.0f;
+                    float acc_hi = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < 16; i++) {
+                        unsigned char packed = qs[i >> 2];
+                        acc_lo += (packed & (1u << ((i & 3) * 2))) ? values[i] : 0.0f;
+                        acc_hi += (packed & (1u << ((i & 3) * 2 + 1))) ? values[i] : 0.0f;
+                    }
+                    sums[ro] += d * (acc_lo + 2.0f * acc_hi - input_sum);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int ro = 0; ro < 8; ro++) {
+        float total = sums[ro];
+        total += __shfl_down_sync(mask, total, 16);
+        total += __shfl_down_sync(mask, total, 8);
+        total += __shfl_down_sync(mask, total, 4);
+        total += __shfl_down_sync(mask, total, 2);
+        total += __shfl_down_sync(mask, total, 1);
+        int row = first_row + ro;
+        if (lane == 0 && row < rows)
+            output[row] = residual ? output[row] + total : total;
+    }
+}
+
+// Fast Prism Q1 decode: one warp owns eight output rows and reuses each Q8_0
+// activation chunk across all eight. Packed signs are expanded four bytes at a
+// time with byte_perm and contracted by DP4A. The current exact-f32 kernel uses
+// the same eight-row geometry, but spends scalar float work selecting 128
+// activation values; this lane trades activation quantization for the integer
+// dot product used by the proven CUDA Q1 implementations.
+extern "C" __global__ void prism_q1_q8_gemv(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int cols, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int first_row = (blockIdx.x * warps_per_block + warp) * 8;
+    if (first_row >= rows) return;
+
+    float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f,
+                      0.0f, 0.0f, 0.0f, 0.0f };
+    int chunks_per_row = blocks_per_row * 4;
+    for (int chunk_index = lane; chunk_index < chunks_per_row; chunk_index += 32) {
+        int weight_block = chunk_index >> 2;
+        int chunk = chunk_index & 3;
+        const int* aq = (const int*)(input_quants + (long)chunk_index * 32);
+        float da = input_scales[chunk_index];
+
+        #pragma unroll
+        for (int ro = 0; ro < 8; ro++) {
+            int row = first_row + ro;
+            if (row < rows) {
+                const unsigned char* block = weight_bytes
+                    + ((long)row * blocks_per_row + weight_block) * 18;
+                float dw = f16_bits_to_f32((unsigned short)block[0]
+                    | ((unsigned short)block[1] << 8));
+                const unsigned short* qs =
+                    (const unsigned short*)(block + 2 + chunk * 4);
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    int q = (int)qs[j];
+                    int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+                    int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+                    int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+                    int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+                    int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+                    int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+                    sumi = __dp4a((int)__byte_perm(s0, s1, 0x5410), aq[j * 4 + 0], sumi);
+                    sumi = __dp4a((int)__byte_perm(s0, s1, 0x7632), aq[j * 4 + 1], sumi);
+                    sumi = __dp4a((int)__byte_perm(s2, s3, 0x5410), aq[j * 4 + 2], sumi);
+                    sumi = __dp4a((int)__byte_perm(s2, s3, 0x7632), aq[j * 4 + 3], sumi);
+                }
+                sums[ro] += (float)sumi * dw * da;
+            }
+        }
+    }
+
+    unsigned mask = 0xffffffffu;
+    #pragma unroll
+    for (int ro = 0; ro < 8; ro++) {
+        float total = sums[ro];
+        total += __shfl_down_sync(mask, total, 16);
+        total += __shfl_down_sync(mask, total, 8);
+        total += __shfl_down_sync(mask, total, 4);
+        total += __shfl_down_sync(mask, total, 2);
+        total += __shfl_down_sync(mask, total, 1);
+        int row = first_row + ro;
+        if (lane == 0 && row < rows)
+            output[row] = residual ? output[row] + total : total;
+    }
+}
+
+// Q1T128 decode: one four-lane subgroup owns one output row. For every K=128
+// block the warp's 32 lanes consume the eight rows' contiguous 128-byte sign
+// slab; each subgroup lane contracts one K=32 quarter and the four scaled terms
+// reduce within the subgroup. This replaces eight per-thread row accumulators
+// and the stock row-major 18-byte gathers without expanding the model.
+extern "C" __global__ void prism_q1t128_q8_gemv(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int cols, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row_in_warp = lane >> 2;
+    int quarter = lane & 3;
+    int first_row = (blockIdx.x * warps_per_block + warp) * 8;
+    int row = first_row + row_in_warp;
+    if (first_row >= rows) return;
+
+    float sum = 0.0f;
+    for (int weight_block = 0; weight_block < blocks_per_row; weight_block++) {
+        int chunk_index = weight_block * 4 + quarter;
+        const int* aq = (const int*)(input_quants + (long)chunk_index * 32);
+        const unsigned char* signs_ptr = row < rows
+            ? prism_q1_sign_ptr(weight_bytes, rows, blocks_per_row, row, weight_block, 1)
+                + quarter * 4
+            : weight_bytes;
+        unsigned int signs = row < rows
+            ? ((unsigned int)signs_ptr[0]
+                | ((unsigned int)signs_ptr[1] << 8)
+                | ((unsigned int)signs_ptr[2] << 16)
+                | ((unsigned int)signs_ptr[3] << 24))
+            : 0u;
+        int sumi = 0;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int q = (int)((signs >> (j * 16)) & 0xffffu);
+            int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+            int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+            int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+            int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+            int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+            int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+            sumi = __dp4a((int)__byte_perm(s0, s1, 0x5410), aq[j * 4 + 0], sumi);
+            sumi = __dp4a((int)__byte_perm(s0, s1, 0x7632), aq[j * 4 + 1], sumi);
+            sumi = __dp4a((int)__byte_perm(s2, s3, 0x5410), aq[j * 4 + 2], sumi);
+            sumi = __dp4a((int)__byte_perm(s2, s3, 0x7632), aq[j * 4 + 3], sumi);
+        }
+        unsigned int scale_bits = 0u;
+        if (quarter == 0 && row < rows) {
+            const unsigned char* scale_ptr = prism_q1_scale_ptr(
+                weight_bytes, rows, blocks_per_row, row, weight_block, 1);
+            scale_bits = (unsigned int)scale_ptr[0] | ((unsigned int)scale_ptr[1] << 8);
+        }
+        scale_bits = __shfl_sync(0xffffffffu, scale_bits, 0, 4);
+        float dw = f16_bits_to_f32((unsigned short)scale_bits);
+        sum += ((float)sumi * dw) * input_scales[chunk_index];
+    }
+    sum += __shfl_down_sync(0xffffffffu, sum, 2, 4);
+    sum += __shfl_down_sync(0xffffffffu, sum, 1, 4);
+    if (quarter == 0 && row < rows)
+        output[row] = residual ? output[row] + sum : sum;
+}
+
+__device__ __forceinline__ unsigned int prism_q1_popc_load_word(
+    const unsigned char* p
+) {
+    return (unsigned int)p[0]
+        | ((unsigned int)p[1] << 8)
+        | ((unsigned int)p[2] << 16)
+        | ((unsigned int)p[3] << 24);
+}
+
+__device__ __forceinline__ int prism_q1_q8_popc_dot32(
+    unsigned int signs, const unsigned int planes[8], int qsum
+) {
+    int selected = -__popc(signs & planes[7]);
+    #pragma unroll
+    for (int plane = 6; plane >= 0; plane--)
+        selected = 2 * selected + __popc(signs & planes[plane]);
+    return 2 * selected - qsum;
+}
+
+// Two rows per four-lane subgroup; eight warps cover one complete Q1T tile.
+// Direct activation loads intentionally rely on the warp's 8-way multicast.
+extern "C" __global__ void prism_q1t128_q8_popc_gemv_m16(
+    const unsigned int* __restrict__ input_bitplanes,
+    const int* __restrict__ input_qsums,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int group = lane >> 2;
+    int quarter = lane & 3;
+    int row_base = blockIdx.x * 128 + warp * 16;
+    if (row_base >= rows) return;
+    int row0 = row_base + group;
+    int row1 = row0 + 8;
+    unsigned int mask = 0xffffffffu;
+    float sum0 = 0.0f, sum1 = 0.0f;
+
+    for (int weight_block = 0; weight_block < blocks_per_row; weight_block++) {
+        int chunk = weight_block * 4 + quarter;
+        unsigned int planes[8];
+        #pragma unroll
+        for (int plane = 0; plane < 8; plane++)
+            planes[plane] = input_bitplanes[(long)chunk * 8 + plane];
+        int qsum = input_qsums[chunk];
+        float da = input_scales[chunk];
+
+        unsigned int signs0 = 0u, signs1 = 0u;
+        if (row0 < rows) {
+            const unsigned char* p = prism_q1_sign_ptr(
+                weight_bytes, rows, blocks_per_row, row0, weight_block, 1)
+                + quarter * 4;
+            signs0 = prism_q1_popc_load_word(p);
+        }
+        if (row1 < rows) {
+            const unsigned char* p = prism_q1_sign_ptr(
+                weight_bytes, rows, blocks_per_row, row1, weight_block, 1)
+                + quarter * 4;
+            signs1 = prism_q1_popc_load_word(p);
+        }
+        int dot0 = prism_q1_q8_popc_dot32(signs0, planes, qsum);
+        int dot1 = prism_q1_q8_popc_dot32(signs1, planes, qsum);
+        unsigned int scale0_bits = 0u, scale1_bits = 0u;
+        if (quarter == 0 && row0 < rows) {
+            const unsigned char* p = prism_q1_scale_ptr(
+                weight_bytes, rows, blocks_per_row, row0, weight_block, 1);
+            scale0_bits = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+        }
+        if (quarter == 0 && row1 < rows) {
+            const unsigned char* p = prism_q1_scale_ptr(
+                weight_bytes, rows, blocks_per_row, row1, weight_block, 1);
+            scale1_bits = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+        }
+        scale0_bits = __shfl_sync(mask, scale0_bits, 0, 4);
+        scale1_bits = __shfl_sync(mask, scale1_bits, 0, 4);
+        sum0 += ((float)dot0 * f16_bits_to_f32((unsigned short)scale0_bits)) * da;
+        sum1 += ((float)dot1 * f16_bits_to_f32((unsigned short)scale1_bits)) * da;
+    }
+    sum0 += __shfl_down_sync(mask, sum0, 2, 4);
+    sum0 += __shfl_down_sync(mask, sum0, 1, 4);
+    sum1 += __shfl_down_sync(mask, sum1, 2, 4);
+    sum1 += __shfl_down_sync(mask, sum1, 1, 4);
+    if (quarter == 0) {
+        if (row0 < rows) output[row0] = residual ? output[row0] + sum0 : sum0;
+        if (row1 < rows) output[row1] = residual ? output[row1] + sum1 : sum1;
+    }
+}
+
+// Exact Bonsai-27B gate+up fusion: 17,408 rows, 5,120 columns, forty K=128
+// blocks. The activation bitplanes/qsum/scale are loaded once and applied to
+// both Q1T weights; all per-row block and quarter accumulation stays unchanged.
+extern "C" __global__ void prism_q1t128_q8_popc_fused_ffn_bonsai27b(
+    const unsigned int* __restrict__ input_bitplanes,
+    const int* __restrict__ input_qsums,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ gate_weight,
+    const unsigned char* __restrict__ up_weight,
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int group = lane >> 2;
+    int quarter = lane & 3;
+    int row0 = blockIdx.x * 128 + warp * 16 + group;
+    int row1 = row0 + 8;
+    unsigned int mask = 0xffffffffu;
+    float gate0 = 0.0f, gate1 = 0.0f;
+    float up0 = 0.0f, up1 = 0.0f;
+
+    #pragma unroll 1
+    for (int block = 0; block < 40; block++) {
+        int chunk = block * 4 + quarter;
+        unsigned int planes[8];
+        #pragma unroll
+        for (int plane = 0; plane < 8; plane++)
+            planes[plane] = input_bitplanes[(long)chunk * 8 + plane];
+        int qsum = input_qsums[chunk];
+        float da = input_scales[chunk];
+
+        long group0 = ((long)(row0 >> 7) * 40 + block) * 2304;
+        long group1 = ((long)(row1 >> 7) * 40 + block) * 2304;
+        const unsigned int* gs0 = (const unsigned int*)(gate_weight + group0
+            + (row0 & 127) * 16 + quarter * 4);
+        const unsigned int* gs1 = (const unsigned int*)(gate_weight + group1
+            + (row1 & 127) * 16 + quarter * 4);
+        const unsigned int* us0 = (const unsigned int*)(up_weight + group0
+            + (row0 & 127) * 16 + quarter * 4);
+        const unsigned int* us1 = (const unsigned int*)(up_weight + group1
+            + (row1 & 127) * 16 + quarter * 4);
+        int gate_dot0 = prism_q1_q8_popc_dot32(*gs0, planes, qsum);
+        int gate_dot1 = prism_q1_q8_popc_dot32(*gs1, planes, qsum);
+        int up_dot0 = prism_q1_q8_popc_dot32(*us0, planes, qsum);
+        int up_dot1 = prism_q1_q8_popc_dot32(*us1, planes, qsum);
+
+        unsigned int gate_scale0 = 0u, gate_scale1 = 0u;
+        unsigned int up_scale0 = 0u, up_scale1 = 0u;
+        if (quarter == 0) {
+            const unsigned char* g0 = gate_weight + group0 + 2048 + (row0 & 127) * 2;
+            const unsigned char* g1 = gate_weight + group1 + 2048 + (row1 & 127) * 2;
+            const unsigned char* u0 = up_weight + group0 + 2048 + (row0 & 127) * 2;
+            const unsigned char* u1 = up_weight + group1 + 2048 + (row1 & 127) * 2;
+            gate_scale0 = (unsigned int)g0[0] | ((unsigned int)g0[1] << 8);
+            gate_scale1 = (unsigned int)g1[0] | ((unsigned int)g1[1] << 8);
+            up_scale0 = (unsigned int)u0[0] | ((unsigned int)u0[1] << 8);
+            up_scale1 = (unsigned int)u1[0] | ((unsigned int)u1[1] << 8);
+        }
+        gate_scale0 = __shfl_sync(mask, gate_scale0, 0, 4);
+        gate_scale1 = __shfl_sync(mask, gate_scale1, 0, 4);
+        up_scale0 = __shfl_sync(mask, up_scale0, 0, 4);
+        up_scale1 = __shfl_sync(mask, up_scale1, 0, 4);
+        gate0 += ((float)gate_dot0 * f16_bits_to_f32((unsigned short)gate_scale0)) * da;
+        gate1 += ((float)gate_dot1 * f16_bits_to_f32((unsigned short)gate_scale1)) * da;
+        up0 += ((float)up_dot0 * f16_bits_to_f32((unsigned short)up_scale0)) * da;
+        up1 += ((float)up_dot1 * f16_bits_to_f32((unsigned short)up_scale1)) * da;
+    }
+    gate0 += __shfl_down_sync(mask, gate0, 2, 4);
+    gate0 += __shfl_down_sync(mask, gate0, 1, 4);
+    gate1 += __shfl_down_sync(mask, gate1, 2, 4);
+    gate1 += __shfl_down_sync(mask, gate1, 1, 4);
+    up0 += __shfl_down_sync(mask, up0, 2, 4);
+    up0 += __shfl_down_sync(mask, up0, 1, 4);
+    up1 += __shfl_down_sync(mask, up1, 2, 4);
+    up1 += __shfl_down_sync(mask, up1, 1, 4);
+    if (quarter == 0) {
+        gate_out[row0] = gate0;
+        gate_out[row1] = gate1;
+        up_out[row0] = up0;
+        up_out[row1] = up1;
+    }
+}
+
+// Exact POPC full-attention fusion. One CTA owns one complete 128-row Q1T tile:
+// 96 qgate tiles followed by eight K and eight V tiles. The M16 mapping doubles
+// the rows produced by each four-lane subgroup while preserving the exact
+// per-quarter and per-K-block accumulation order of the production DP4A lane.
+extern "C" __global__ void prism_q1t128_q8_popc_fused_full_bonsai27b(
+    const unsigned int* __restrict__ input_bitplanes,
+    const int* __restrict__ input_qsums,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ qgate_weight,
+    const unsigned char* __restrict__ k_weight,
+    const unsigned char* __restrict__ v_weight,
+    float* __restrict__ qgate_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out
+) {
+    int task = (int)blockIdx.x;
+    const unsigned char* weight;
+    float* output;
+    int tile;
+    if (task < 96) {
+        weight = qgate_weight;
+        output = qgate_out;
+        tile = task;
+    } else if (task < 104) {
+        weight = k_weight;
+        output = k_out;
+        tile = task - 96;
+    } else {
+        weight = v_weight;
+        output = v_out;
+        tile = task - 104;
+    }
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int group = lane >> 2;
+    int quarter = lane & 3;
+    int row0 = tile * 128 + warp * 16 + group;
+    int row1 = row0 + 8;
+    unsigned int mask = 0xffffffffu;
+    float sum0 = 0.0f, sum1 = 0.0f;
+
+    #pragma unroll 1
+    for (int block = 0; block < 40; block++) {
+        int chunk = block * 4 + quarter;
+        unsigned int planes[8];
+        #pragma unroll
+        for (int plane = 0; plane < 8; plane++)
+            planes[plane] = input_bitplanes[(long)chunk * 8 + plane];
+        int qsum = input_qsums[chunk];
+        float da = input_scales[chunk];
+        long group0 = ((long)(row0 >> 7) * 40 + block) * 2304;
+        long group1 = ((long)(row1 >> 7) * 40 + block) * 2304;
+        const unsigned int* signs0 = (const unsigned int*)(weight + group0
+            + (row0 & 127) * 16 + quarter * 4);
+        const unsigned int* signs1 = (const unsigned int*)(weight + group1
+            + (row1 & 127) * 16 + quarter * 4);
+        int dot0 = prism_q1_q8_popc_dot32(*signs0, planes, qsum);
+        int dot1 = prism_q1_q8_popc_dot32(*signs1, planes, qsum);
+        unsigned int scale0 = 0u, scale1 = 0u;
+        if (quarter == 0) {
+            const unsigned char* s0 = weight + group0 + 2048 + (row0 & 127) * 2;
+            const unsigned char* s1 = weight + group1 + 2048 + (row1 & 127) * 2;
+            scale0 = (unsigned int)s0[0] | ((unsigned int)s0[1] << 8);
+            scale1 = (unsigned int)s1[0] | ((unsigned int)s1[1] << 8);
+        }
+        scale0 = __shfl_sync(mask, scale0, 0, 4);
+        scale1 = __shfl_sync(mask, scale1, 0, 4);
+        sum0 += ((float)dot0 * f16_bits_to_f32((unsigned short)scale0)) * da;
+        sum1 += ((float)dot1 * f16_bits_to_f32((unsigned short)scale1)) * da;
+    }
+    sum0 += __shfl_down_sync(mask, sum0, 2, 4);
+    sum0 += __shfl_down_sync(mask, sum0, 1, 4);
+    sum1 += __shfl_down_sync(mask, sum1, 2, 4);
+    sum1 += __shfl_down_sync(mask, sum1, 1, 4);
+    if (quarter == 0) {
+        output[row0] = sum0;
+        output[row1] = sum1;
+    }
+}
+
+// Exact POPC SSM-input fusion. The first 128 CTAs use M16 over the 80 wqkv and
+// 48 z Q1T tiles; the final two CTAs use the tail-safe M8 mapping for the 48-row
+// beta and alpha tiles. Keeping the short tails separate avoids speculative
+// reads past their compact 864-byte-per-K-block layout.
+extern "C" __global__ void prism_q1t128_q8_popc_fused_ssm_bonsai27b(
+    const unsigned int* __restrict__ input_bitplanes,
+    const int* __restrict__ input_qsums,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ wqkv_weight,
+    const unsigned char* __restrict__ z_weight,
+    const unsigned char* __restrict__ beta_weight,
+    const unsigned char* __restrict__ alpha_weight,
+    float* __restrict__ wqkv_out,
+    float* __restrict__ z_out,
+    float* __restrict__ beta_out,
+    float* __restrict__ alpha_out
+) {
+    int task = (int)blockIdx.x;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int group = lane >> 2;
+    int quarter = lane & 3;
+    unsigned int mask = 0xffffffffu;
+
+    if (task < 128) {
+        const unsigned char* weight = task < 80 ? wqkv_weight : z_weight;
+        float* output = task < 80 ? wqkv_out : z_out;
+        int tile = task < 80 ? task : task - 80;
+        int row0 = tile * 128 + warp * 16 + group;
+        int row1 = row0 + 8;
+        float sum0 = 0.0f, sum1 = 0.0f;
+        #pragma unroll 1
+        for (int block = 0; block < 40; block++) {
+            int chunk = block * 4 + quarter;
+            unsigned int planes[8];
+            #pragma unroll
+            for (int plane = 0; plane < 8; plane++)
+                planes[plane] = input_bitplanes[(long)chunk * 8 + plane];
+            int qsum = input_qsums[chunk];
+            float da = input_scales[chunk];
+            long group0 = ((long)(row0 >> 7) * 40 + block) * 2304;
+            long group1 = ((long)(row1 >> 7) * 40 + block) * 2304;
+            const unsigned int* signs0 = (const unsigned int*)(weight + group0
+                + (row0 & 127) * 16 + quarter * 4);
+            const unsigned int* signs1 = (const unsigned int*)(weight + group1
+                + (row1 & 127) * 16 + quarter * 4);
+            int dot0 = prism_q1_q8_popc_dot32(*signs0, planes, qsum);
+            int dot1 = prism_q1_q8_popc_dot32(*signs1, planes, qsum);
+            unsigned int scale0 = 0u, scale1 = 0u;
+            if (quarter == 0) {
+                const unsigned char* s0 = weight + group0 + 2048 + (row0 & 127) * 2;
+                const unsigned char* s1 = weight + group1 + 2048 + (row1 & 127) * 2;
+                scale0 = (unsigned int)s0[0] | ((unsigned int)s0[1] << 8);
+                scale1 = (unsigned int)s1[0] | ((unsigned int)s1[1] << 8);
+            }
+            scale0 = __shfl_sync(mask, scale0, 0, 4);
+            scale1 = __shfl_sync(mask, scale1, 0, 4);
+            sum0 += ((float)dot0 * f16_bits_to_f32((unsigned short)scale0)) * da;
+            sum1 += ((float)dot1 * f16_bits_to_f32((unsigned short)scale1)) * da;
+        }
+        sum0 += __shfl_down_sync(mask, sum0, 2, 4);
+        sum0 += __shfl_down_sync(mask, sum0, 1, 4);
+        sum1 += __shfl_down_sync(mask, sum1, 2, 4);
+        sum1 += __shfl_down_sync(mask, sum1, 1, 4);
+        if (quarter == 0) {
+            output[row0] = sum0;
+            output[row1] = sum1;
+        }
+        return;
+    }
+
+    const unsigned char* weight = task == 128 ? beta_weight : alpha_weight;
+    float* output = task == 128 ? beta_out : alpha_out;
+    int row = warp * 8 + group;
+    if (row >= 48) return;
+    float sum = 0.0f;
+    #pragma unroll 1
+    for (int block = 0; block < 40; block++) {
+        int chunk = block * 4 + quarter;
+        unsigned int planes[8];
+        #pragma unroll
+        for (int plane = 0; plane < 8; plane++)
+            planes[plane] = input_bitplanes[(long)chunk * 8 + plane];
+        int qsum = input_qsums[chunk];
+        float da = input_scales[chunk];
+        const unsigned int* signs = (const unsigned int*)(weight
+            + (long)block * 864 + row * 16 + quarter * 4);
+        int dot = prism_q1_q8_popc_dot32(*signs, planes, qsum);
+        unsigned int scale = 0u;
+        if (quarter == 0) {
+            const unsigned char* s = weight + (long)block * 864 + 768 + row * 2;
+            scale = (unsigned int)s[0] | ((unsigned int)s[1] << 8);
+        }
+        scale = __shfl_sync(mask, scale, 0, 4);
+        sum += ((float)dot * f16_bits_to_f32((unsigned short)scale)) * da;
+    }
+    sum += __shfl_down_sync(mask, sum, 2, 4);
+    sum += __shfl_down_sync(mask, sum, 1, 4);
+    if (quarter == 0) output[row] = sum;
+}
+
+// Shape-specialized Bonsai-27B projection fusion. These kernels only merge
+// read-only projections that consume the same Q8 activation; every output keeps
+// the Q1T128 decode kernel's 4-lane row ownership, 40-block accumulation order,
+// DP4A contraction, scale multiplication, and subgroup reduction. Epilogues
+// deliberately remain separate.
+__device__ __forceinline__ int prism_q1t_bonsai_dp4a_16(
+    unsigned int q, int a0, int a1, int a2, int a3, int acc
+) {
+    int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+    int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+    int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+    int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+    int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+    int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+    acc = __dp4a((int)__byte_perm(s0, s1, 0x5410), a0, acc);
+    acc = __dp4a((int)__byte_perm(s0, s1, 0x7632), a1, acc);
+    acc = __dp4a((int)__byte_perm(s2, s3, 0x5410), a2, acc);
+    acc = __dp4a((int)__byte_perm(s2, s3, 0x7632), a3, acc);
+    return acc;
+}
+
+__device__ __forceinline__ unsigned int prism_q1t_bonsai_signs(
+    const unsigned char* weight, int row, int block, int quarter
+) {
+    long group = ((long)(row >> 7) * 40 + block) * 2304;
+    const unsigned int* signs = (const unsigned int*)(weight + group
+        + (row & 127) * 16 + quarter * 4);
+    return *signs;
+}
+
+__device__ __forceinline__ float prism_q1t_bonsai_scale(
+    const unsigned char* weight, int row, int block, int quarter
+) {
+    unsigned int bits = 0u;
+    if (quarter == 0) {
+        long group = ((long)(row >> 7) * 40 + block) * 2304;
+        const unsigned char* scale = weight + group + 2048 + (row & 127) * 2;
+        bits = (unsigned int)scale[0] | ((unsigned int)scale[1] << 8);
+    }
+    bits = __shfl_sync(0xffffffffu, bits, 0, 4);
+    return f16_bits_to_f32((unsigned short)bits);
+}
+
+// The 48-row beta/alpha tensors have one short Q1T row tile per K block:
+// [48*16 signs][48*2 scales] == 864 bytes.
+__device__ __forceinline__ unsigned int prism_q1t_bonsai_tail48_signs(
+    const unsigned char* weight, int row, int block, int quarter
+) {
+    const unsigned int* signs = (const unsigned int*)(weight
+        + (long)block * 864 + row * 16 + quarter * 4);
+    return *signs;
+}
+
+__device__ __forceinline__ float prism_q1t_bonsai_tail48_scale(
+    const unsigned char* weight, int row, int block, int quarter
+) {
+    unsigned int bits = 0u;
+    if (quarter == 0) {
+        const unsigned char* scale = weight + (long)block * 864 + 768 + row * 2;
+        bits = (unsigned int)scale[0] | ((unsigned int)scale[1] << 8);
+    }
+    bits = __shfl_sync(0xffffffffu, bits, 0, 4);
+    return f16_bits_to_f32((unsigned short)bits);
+}
+
+// Full-attention projections: all 192 CTAs produce one 64-row qgate tile.
+// Every sixth CTA also produces one of sixteen K or sixteen V tiles, spreading
+// the secondary work across the anchor grid instead of front-loading it.
+extern "C" __global__ void prism_q1t128_fused_full_bonsai27b(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ qgate_weight,
+    const unsigned char* __restrict__ k_weight,
+    const unsigned char* __restrict__ v_weight,
+    float* __restrict__ qgate_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row_in_warp = lane >> 2;
+    int quarter = lane & 3;
+    int local_row = warp * 8 + row_in_warp;
+    int qgate_row = (int)blockIdx.x * 64 + local_row;
+
+    bool paired = ((int)blockIdx.x % 6) == 0;
+    int paired_rank = (int)blockIdx.x / 6;
+    bool paired_k = paired_rank < 16;
+    int secondary_row = (paired_rank & 15) * 64 + local_row;
+    const unsigned char* secondary_weight = paired_k ? k_weight : v_weight;
+    float* secondary_out = paired_k ? k_out : v_out;
+
+    float qgate_sum = 0.0f;
+    float secondary_sum = 0.0f;
+    #pragma unroll 1
+    for (int block = 0; block < 40; block++) {
+        const int* aq = (const int*)(input_quants + (long)(block * 4 + quarter) * 32);
+        unsigned int qgate_signs = prism_q1t_bonsai_signs(
+            qgate_weight, qgate_row, block, quarter);
+        unsigned int secondary_signs = paired
+            ? prism_q1t_bonsai_signs(secondary_weight, secondary_row, block, quarter)
+            : 0u;
+        int qgate_dot = 0;
+        int secondary_dot = 0;
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            int a0 = aq[half * 4 + 0];
+            int a1 = aq[half * 4 + 1];
+            int a2 = aq[half * 4 + 2];
+            int a3 = aq[half * 4 + 3];
+            qgate_dot = prism_q1t_bonsai_dp4a_16(
+                qgate_signs >> (half * 16), a0, a1, a2, a3, qgate_dot);
+            if (paired) {
+                secondary_dot = prism_q1t_bonsai_dp4a_16(
+                    secondary_signs >> (half * 16), a0, a1, a2, a3, secondary_dot);
+            }
+        }
+        float da = input_scales[block * 4 + quarter];
+        float qgate_scale = prism_q1t_bonsai_scale(
+            qgate_weight, qgate_row, block, quarter);
+        qgate_sum += ((float)qgate_dot * qgate_scale) * da;
+        if (paired) {
+            float secondary_scale = prism_q1t_bonsai_scale(
+                secondary_weight, secondary_row, block, quarter);
+            secondary_sum += ((float)secondary_dot * secondary_scale) * da;
+        }
+    }
+    qgate_sum += __shfl_down_sync(0xffffffffu, qgate_sum, 2, 4);
+    qgate_sum += __shfl_down_sync(0xffffffffu, qgate_sum, 1, 4);
+    if (paired) {
+        secondary_sum += __shfl_down_sync(0xffffffffu, secondary_sum, 2, 4);
+        secondary_sum += __shfl_down_sync(0xffffffffu, secondary_sum, 1, 4);
+    }
+    if (quarter == 0) {
+        qgate_out[qgate_row] = qgate_sum;
+        if (paired) secondary_out[secondary_row] = secondary_sum;
+    }
+}
+
+// SSM input projections: all 160 CTAs produce wqkv. In each five-CTA group,
+// three also produce consecutive z tiles (96 total); the last CTA additionally
+// contracts both 48-row beta/alpha tails.
+extern "C" __global__ void prism_q1t128_fused_ssm_bonsai27b(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ wqkv_weight,
+    const unsigned char* __restrict__ z_weight,
+    const unsigned char* __restrict__ beta_weight,
+    const unsigned char* __restrict__ alpha_weight,
+    float* __restrict__ wqkv_out,
+    float* __restrict__ z_out,
+    float* __restrict__ beta_out,
+    float* __restrict__ alpha_out
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row_in_warp = lane >> 2;
+    int quarter = lane & 3;
+    int local_row = warp * 8 + row_in_warp;
+    int cta = (int)blockIdx.x;
+    int wqkv_row = cta * 64 + local_row;
+
+    int group_slot = cta % 5;
+    bool paired_z = group_slot < 3;
+    int z_row = ((cta / 5) * 3 + group_slot) * 64 + local_row;
+    bool paired_tail = cta == 159 && warp < 6;
+    int tail_row = local_row;
+
+    float wqkv_sum = 0.0f;
+    float z_sum = 0.0f;
+    float beta_sum = 0.0f;
+    float alpha_sum = 0.0f;
+    #pragma unroll 1
+    for (int block = 0; block < 40; block++) {
+        const int* aq = (const int*)(input_quants + (long)(block * 4 + quarter) * 32);
+        unsigned int wqkv_signs = prism_q1t_bonsai_signs(
+            wqkv_weight, wqkv_row, block, quarter);
+        unsigned int z_signs = paired_z
+            ? prism_q1t_bonsai_signs(z_weight, z_row, block, quarter)
+            : 0u;
+        unsigned int beta_signs = paired_tail
+            ? prism_q1t_bonsai_tail48_signs(beta_weight, tail_row, block, quarter)
+            : 0u;
+        unsigned int alpha_signs = paired_tail
+            ? prism_q1t_bonsai_tail48_signs(alpha_weight, tail_row, block, quarter)
+            : 0u;
+        int wqkv_dot = 0;
+        int z_dot = 0;
+        int beta_dot = 0;
+        int alpha_dot = 0;
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            int a0 = aq[half * 4 + 0];
+            int a1 = aq[half * 4 + 1];
+            int a2 = aq[half * 4 + 2];
+            int a3 = aq[half * 4 + 3];
+            wqkv_dot = prism_q1t_bonsai_dp4a_16(
+                wqkv_signs >> (half * 16), a0, a1, a2, a3, wqkv_dot);
+            if (paired_z) {
+                z_dot = prism_q1t_bonsai_dp4a_16(
+                    z_signs >> (half * 16), a0, a1, a2, a3, z_dot);
+            }
+            if (paired_tail) {
+                beta_dot = prism_q1t_bonsai_dp4a_16(
+                    beta_signs >> (half * 16), a0, a1, a2, a3, beta_dot);
+                alpha_dot = prism_q1t_bonsai_dp4a_16(
+                    alpha_signs >> (half * 16), a0, a1, a2, a3, alpha_dot);
+            }
+        }
+        float da = input_scales[block * 4 + quarter];
+        float wqkv_scale = prism_q1t_bonsai_scale(
+            wqkv_weight, wqkv_row, block, quarter);
+        wqkv_sum += ((float)wqkv_dot * wqkv_scale) * da;
+        if (paired_z) {
+            float z_scale = prism_q1t_bonsai_scale(z_weight, z_row, block, quarter);
+            z_sum += ((float)z_dot * z_scale) * da;
+        }
+        if (paired_tail) {
+            float beta_scale = prism_q1t_bonsai_tail48_scale(
+                beta_weight, tail_row, block, quarter);
+            float alpha_scale = prism_q1t_bonsai_tail48_scale(
+                alpha_weight, tail_row, block, quarter);
+            beta_sum += ((float)beta_dot * beta_scale) * da;
+            alpha_sum += ((float)alpha_dot * alpha_scale) * da;
+        }
+    }
+    wqkv_sum += __shfl_down_sync(0xffffffffu, wqkv_sum, 2, 4);
+    wqkv_sum += __shfl_down_sync(0xffffffffu, wqkv_sum, 1, 4);
+    if (paired_z) {
+        z_sum += __shfl_down_sync(0xffffffffu, z_sum, 2, 4);
+        z_sum += __shfl_down_sync(0xffffffffu, z_sum, 1, 4);
+    }
+    if (paired_tail) {
+        beta_sum += __shfl_down_sync(0xffffffffu, beta_sum, 2, 4);
+        beta_sum += __shfl_down_sync(0xffffffffu, beta_sum, 1, 4);
+        alpha_sum += __shfl_down_sync(0xffffffffu, alpha_sum, 2, 4);
+        alpha_sum += __shfl_down_sync(0xffffffffu, alpha_sum, 1, 4);
+    }
+    if (quarter == 0) {
+        wqkv_out[wqkv_row] = wqkv_sum;
+        if (paired_z) z_out[z_row] = z_sum;
+        if (paired_tail) {
+            beta_out[tail_row] = beta_sum;
+            alpha_out[tail_row] = alpha_sum;
+        }
+    }
+}
+
+// FFN gate/up have identical 17,408-row geometry. Each subgroup owns the same
+// row in both matrices and reuses each of the eight Q8 words loaded per K block.
+extern "C" __global__ void prism_q1t128_fused_ffn_bonsai27b(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ gate_weight,
+    const unsigned char* __restrict__ up_weight,
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row_in_warp = lane >> 2;
+    int quarter = lane & 3;
+    int row = (int)blockIdx.x * 64 + warp * 8 + row_in_warp;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    #pragma unroll 1
+    for (int block = 0; block < 40; block++) {
+        const int* aq = (const int*)(input_quants + (long)(block * 4 + quarter) * 32);
+        unsigned int gate_signs = prism_q1t_bonsai_signs(
+            gate_weight, row, block, quarter);
+        unsigned int up_signs = prism_q1t_bonsai_signs(
+            up_weight, row, block, quarter);
+        int gate_dot = 0;
+        int up_dot = 0;
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            int a0 = aq[half * 4 + 0];
+            int a1 = aq[half * 4 + 1];
+            int a2 = aq[half * 4 + 2];
+            int a3 = aq[half * 4 + 3];
+            gate_dot = prism_q1t_bonsai_dp4a_16(
+                gate_signs >> (half * 16), a0, a1, a2, a3, gate_dot);
+            up_dot = prism_q1t_bonsai_dp4a_16(
+                up_signs >> (half * 16), a0, a1, a2, a3, up_dot);
+        }
+        float da = input_scales[block * 4 + quarter];
+        float gate_scale = prism_q1t_bonsai_scale(gate_weight, row, block, quarter);
+        float up_scale = prism_q1t_bonsai_scale(up_weight, row, block, quarter);
+        gate_sum += ((float)gate_dot * gate_scale) * da;
+        up_sum += ((float)up_dot * up_scale) * da;
+    }
+    gate_sum += __shfl_down_sync(0xffffffffu, gate_sum, 2, 4);
+    gate_sum += __shfl_down_sync(0xffffffffu, gate_sum, 1, 4);
+    up_sum += __shfl_down_sync(0xffffffffu, up_sum, 2, 4);
+    up_sum += __shfl_down_sync(0xffffffffu, up_sum, 1, 4);
+    if (quarter == 0) {
+        gate_out[row] = gate_sum;
+        up_out[row] = up_sum;
+    }
+}
+
+// Q1_0 prompt GEMM. One warp owns four output rows and evaluates one or two
+// token-major activation rows while each packed weight block is hot in
+// registers. This preserves the decode kernel's per-token lane/block reduction
+// exactly, but amortizes the dominant weight read over the prompt tile. A CTA
+// stages the same four-block activation window for all eight row warps.
+extern "C" __global__ void prism_q1_f32_gemm_batched(
+    const float* __restrict__ input, const unsigned char* __restrict__ weight_bytes,
+    int rows, int cols, int blocks_per_row, int k_tokens, int q1_tiled,
+    float* __restrict__ output
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int first_row = (blockIdx.x * warps_per_block + warp) * 4;
+    int block_lane = lane >> 3;
+    int slice = (lane & 7) << 4;
+    unsigned mask = 0xffffffffu;
+    float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    extern __shared__ float staged_input[]; // [k_tokens<=2][4 * 128]
+
+    for (int chunk = 0; chunk < blocks_per_row; chunk += 4) {
+        int remaining = blocks_per_row - chunk;
+        int staged_values = (remaining < 4 ? remaining : 4) * 128;
+        int all_values = k_tokens * staged_values;
+        for (int i = threadIdx.x; i < all_values; i += blockDim.x) {
+            int token = i / staged_values;
+            int within = i - token * staged_values;
+            staged_input[token * 512 + within] =
+                input[(long)token * cols + chunk * 128 + within];
+        }
+        __syncthreads();
+
+        int b = chunk + block_lane;
+        if (first_row < rows && b < blocks_per_row) {
+            int input_base = block_lane * 128 + slice;
+            float values[2][16];
+            float input_sums[2] = { 0.0f, 0.0f };
+            #pragma unroll
+            for (int token = 0; token < 2; token++) {
+                if (token < k_tokens) {
+                    #pragma unroll
+                    for (int i = 0; i < 16; i++) {
+                        float value = staged_input[token * 512 + input_base + i];
+                        values[token][i] = value;
+                        input_sums[token] += value;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int ro = 0; ro < 4; ro++) {
+                int row = first_row + ro;
+                if (row < rows) {
+                    const unsigned char* scale_ptr = prism_q1_scale_ptr(
+                        weight_bytes, rows, blocks_per_row, row, b, q1_tiled);
+                    float d = f16_bits_to_f32(
+                        (unsigned short)scale_ptr[0]
+                        | ((unsigned short)scale_ptr[1] << 8));
+                    const unsigned char* qs = prism_q1_sign_ptr(
+                        weight_bytes, rows, blocks_per_row, row, b, q1_tiled)
+                        + (slice >> 3);
+                    unsigned char b0 = qs[0], b1 = qs[1];
+                    #pragma unroll
+                    for (int token = 0; token < 2; token++) {
+                        if (token < k_tokens) {
+                            float selected = 0.0f;
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++)
+                                selected += (b0 & (1u << i)) ? values[token][i] : 0.0f;
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++)
+                                selected += (b1 & (1u << i)) ? values[token][i + 8] : 0.0f;
+                            sums[token * 4 + ro] +=
+                                d * (2.0f * selected - input_sums[token]);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int token = 0; token < 2; token++) {
+        if (token < k_tokens) {
+            #pragma unroll
+            for (int ro = 0; ro < 4; ro++) {
+                float total = sums[token * 4 + ro];
+                total += __shfl_down_sync(mask, total, 16);
+                total += __shfl_down_sync(mask, total, 8);
+                total += __shfl_down_sync(mask, total, 4);
+                total += __shfl_down_sync(mask, total, 2);
+                total += __shfl_down_sync(mask, total, 1);
+                int row = first_row + ro;
+                if (lane == 0 && row < rows)
+                    output[(long)token * rows + row] = total;
+            }
+        }
+    }
+}
+
+// Ampere prompt MMQ prototype: packed Q1_0 weights times Q8_0 activations.
+// One warp owns one output row and an eight-token tile. Each lane walks a
+// disjoint subset of the row's 32-element chunks, expands the 1-bit signs into
+// four packed int8 lanes with __byte_perm, and evaluates them with __dp4a.
+// Weight decode is amortized across all eight prompt tokens without expanding
+// the resident model. This deliberately follows llama.cpp's Q1_0 x Q8_1 MMQ
+// arithmetic; unlike the f32 parity lane above it is a fast, quantized-activation
+// prompt path and therefore has a separate correctness/performance gate.
+extern "C" __global__ void prism_q1_q8_gemm_batched(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int cols, int blocks_per_row, int k_tokens, int q1_tiled,
+    float* __restrict__ output, int residual
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int token_base = blockIdx.y * 8;
+    if (row >= rows || token_base >= k_tokens) return;
+
+    float sums[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    int chunks_per_row = blocks_per_row * 4;
+    int activation_blocks_per_row = cols >> 5;
+
+    for (int chunk_index = lane; chunk_index < chunks_per_row; chunk_index += 32) {
+        int weight_block = chunk_index >> 2;
+        int chunk = chunk_index & 3;
+        const unsigned char* scale_ptr = prism_q1_scale_ptr(
+            weight_bytes, rows, blocks_per_row, row, weight_block, q1_tiled);
+        float dw = f16_bits_to_f32(
+            (unsigned short)scale_ptr[0] | ((unsigned short)scale_ptr[1] << 8));
+        const unsigned short* qs = (const unsigned short*)(prism_q1_sign_ptr(
+            weight_bytes, rows, blocks_per_row, row, weight_block, q1_tiled)
+            + chunk * 4);
+
+        int packed_weights[8];
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            int q = (int)qs[j];
+            int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+            int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+            int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+            int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+            int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+            int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+            packed_weights[j * 4 + 0] = __byte_perm(s0, s1, 0x5410);
+            packed_weights[j * 4 + 1] = __byte_perm(s0, s1, 0x7632);
+            packed_weights[j * 4 + 2] = __byte_perm(s2, s3, 0x5410);
+            packed_weights[j * 4 + 3] = __byte_perm(s2, s3, 0x7632);
+        }
+
+        #pragma unroll
+        for (int token_offset = 0; token_offset < 8; token_offset++) {
+            int token = token_base + token_offset;
+            if (token < k_tokens) {
+                const int* aq = (const int*)(input_quants
+                    + (long)token * cols + (long)chunk_index * 32);
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; j++)
+                    sumi = __dp4a(packed_weights[j], aq[j], sumi);
+                float da = input_scales[(long)token * activation_blocks_per_row + chunk_index];
+                sums[token_offset] += dw * da * (float)sumi;
+            }
+        }
+    }
+
+    unsigned mask = 0xffffffffu;
+    #pragma unroll
+    for (int token_offset = 0; token_offset < 8; token_offset++) {
+        int token = token_base + token_offset;
+        if (token < k_tokens) {
+            float total = sums[token_offset];
+            total += __shfl_down_sync(mask, total, 16);
+            total += __shfl_down_sync(mask, total, 8);
+            total += __shfl_down_sync(mask, total, 4);
+            total += __shfl_down_sync(mask, total, 2);
+            total += __shfl_down_sync(mask, total, 1);
+            if (lane == 0) {
+                long oi = (long)token * rows + row;
+                output[oi] = residual ? output[oi] + total : total;
+            }
+        }
+    }
+}
+
+// Ampere/Turing tensor-core prompt MMQ. A 256-thread CTA owns 128 output rows
+// by as many as 128 prompt tokens. Warp w owns its 16-token column tile and
+// walks the eight 16-row tiles; all warps reuse the same expanded 128x32 Q1 A
+// tile, while all row tiles reuse the same 32x128 Q8 B tile. This I=128/J=128
+// geometry is deliberately large: prompt performance is governed by reading
+// the 27B weights and activations once per broad tile, not by issuing many tiny
+// GEMVs. Two signed-int8 WMMA operations cover each K=32 activation block;
+// scaling remains outside MMA to preserve the Q1_0 x Q8_0 formula.
+extern "C" __global__ void prism_q1_q8_wmma_gemm_batched(
+    const signed char* __restrict__ input_quants,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int cols, int blocks_per_row, int k_tokens, int q1_tiled,
+    float* __restrict__ output, int residual
+) {
+#if defined(CAMELID_HAS_WMMA) && __CUDA_ARCH__ >= 750
+    using namespace nvcuda;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row_base = blockIdx.x * 128;
+    int token_base = blockIdx.y * 128 + warp * 16;
+    int activation_blocks_per_row = cols >> 5;
+    bool token_active = token_base < k_tokens;
+
+    __shared__ __align__(32) signed char tile_a[128 * 32];
+    __shared__ __align__(32) signed char tile_b[8 * 16 * 32];
+    __shared__ float weight_scales[128];
+    __shared__ float activation_scales[128];
+    float sums[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) sums[i] = 0.0f;
+
+    for (int weight_block = 0; weight_block < blocks_per_row; weight_block++) {
+        if (threadIdx.x < 128) {
+            int row = row_base + threadIdx.x;
+            float scale = 0.0f;
+            if (row < rows) {
+                const unsigned char* scale_ptr = prism_q1_scale_ptr(
+                    weight_bytes, rows, blocks_per_row, row, weight_block, q1_tiled);
+                scale = f16_bits_to_f32((unsigned short)scale_ptr[0]
+                    | ((unsigned short)scale_ptr[1] << 8));
+            }
+            weight_scales[threadIdx.x] = scale;
+        }
+        for (int chunk = 0; chunk < 4; chunk++) {
+            // Cooperatively expand 4096 Q1 signs. Each warp walks contiguous
+            // K=32 rows, so the compact bytes stay hot despite the row stride.
+            for (int ai = threadIdx.x; ai < 128 * 32; ai += blockDim.x) {
+                int ar = ai >> 5;
+                int ak = ai & 31;
+                int row = row_base + ar;
+                signed char av = 0;
+                if (row < rows) {
+                    int within = chunk * 32 + ak;
+                    const unsigned char* signs = prism_q1_sign_ptr(
+                        weight_bytes, rows, blocks_per_row, row, weight_block, q1_tiled);
+                    av = (signs[within >> 3] & (1u << (within & 7))) ? 1 : -1;
+                }
+                tile_a[ai] = av;
+            }
+
+            // Each warp stages one K=32 by N=16 B tile in column-major order.
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                int bi = lane + j * 32;
+                int token_col = bi >> 5;
+                int bk = bi & 31;
+                int token = token_base + token_col;
+                signed char bv = 0;
+                if (token < k_tokens) {
+                    bv = input_quants[(long)token * cols
+                        + weight_block * 128 + chunk * 32 + bk];
+                }
+                tile_b[warp * 512 + bi] = bv;
+            }
+            if (threadIdx.x < 128) {
+                int token = blockIdx.y * 128 + threadIdx.x;
+                activation_scales[threadIdx.x] = token < k_tokens
+                    ? input_scales[(long)token * activation_blocks_per_row
+                        + weight_block * 4 + chunk]
+                    : 0.0f;
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int row_group = 0; row_group < 8; row_group++) {
+                bool active = token_active && row_base + row_group * 16 < rows;
+                if (active) {
+                    // ldmatrix loads the 16x32 row-major A tile into the exact
+                    // four-register layout consumed by Ampere's m16n8k32 IMMA.
+                    // This avoids two WMMA k16 instructions and, critically,
+                    // keeps the four int32 outputs in registers instead of
+                    // store-to-shared/read-back round trips.
+                    int a0, a1, a2, a3;
+                    const int* a_row = (const int*)(tile_a + row_group * 16 * 32);
+                    const int* a_src = a_row
+                        + (lane % 16) * 8 + (lane / 16) * 4;
+                    asm volatile(
+                        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+                        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                        : "l"(a_src));
+
+                    const int* b_row = (const int*)(tile_b + warp * 512);
+                    #pragma unroll
+                    for (int token_half = 0; token_half < 2; token_half++) {
+                        const int* b_half = b_row + token_half * 8 * 8;
+                        int b0 = b_half[(lane / 4) * 8 + (lane % 4)];
+                        int b1 = b_half[(lane / 4) * 8 + (lane % 4) + 4];
+                        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+                            "{%0, %1, %2, %3};"
+                            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                              "r"(b0), "r"(b1));
+                        int cv[4] = { c0, c1, c2, c3 };
+                        #pragma unroll
+                        for (int l = 0; l < 4; l++) {
+                            int cr = (l / 2) * 8 + lane / 4;
+                            int token_col = token_half * 8
+                                + (lane % 4) * 2 + (l % 2);
+                            int row_in_tile = row_group * 16 + cr;
+                            int row = row_base + row_in_tile;
+                            int token = token_base + token_col;
+                            if (row < rows && token < k_tokens) {
+                                float dw = weight_scales[row_in_tile];
+                                float da = activation_scales[warp * 16 + token_col];
+                                sums[row_group * 8 + token_half * 4 + l] +=
+                                    (float)cv[l] * dw * da;
+                            }
+                        }
+                    }
+                }
+            }
+            // The next K=32 chunk overwrites CTA-wide A/B. This is the sole
+            // block-wide fence needed after the independent row-group sweep.
+            __syncthreads();
+        }
+    }
+
+    if (token_active) {
+        #pragma unroll
+        for (int row_group = 0; row_group < 8; row_group++) {
+            #pragma unroll
+            for (int token_half = 0; token_half < 2; token_half++) {
+                #pragma unroll
+                for (int l = 0; l < 4; l++) {
+                    int cr = (l / 2) * 8 + lane / 4;
+                    int token_col = token_half * 8
+                        + (lane % 4) * 2 + (l % 2);
+                    int row = row_base + row_group * 16 + cr;
+                    int token = token_base + token_col;
+                    if (row < rows && token < k_tokens)
+                    {
+                        long oi = (long)token * rows + row;
+                        float value = sums[row_group * 8 + token_half * 4 + l];
+                        output[oi] = residual ? output[oi] + value : value;
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
+// Experimental Ampere binary-MMA prompt lane. Activations are quantized in
+// 128-value blocks and stored as eight two's-complement bitplanes. This makes
+// one Q1_0 weight block and one activation block line up exactly with
+// m16n8k128.b1.b1.xor.popc. Production dispatch admits this lane only on SM80+
+// after strict-mode, force-disable, shape, and measured-crossover gates pass.
+//
+// Packed activation layout (u32 words):
+//   [k_block][bit_plane][token][word_in_128]
+// A token/block occupies 8 * 4 words == 128 bytes, the same payload as int8.
+extern "C" __global__ void prism_q8_b128_bitpack(
+    const float* __restrict__ input,
+    unsigned int* __restrict__ bitplanes,
+    float* __restrict__ scales,
+    int cols, int k_tokens
+) {
+    int k_block = blockIdx.x;
+    int token = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int within = warp * 32 + lane;
+    if (token >= k_tokens || within >= 128) return;
+
+    float value = input[(long)token * cols + k_block * 128 + within];
+    float amax = fabsf(value);
+    unsigned mask = 0xffffffffu;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_down_sync(mask, amax, offset));
+
+    __shared__ float warp_max[4];
+    __shared__ float unrounded_scale;
+    if (lane == 0) warp_max[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        float block_max = lane < 4 ? warp_max[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            block_max = fmaxf(block_max, __shfl_down_sync(mask, block_max, offset));
+        if (lane == 0) {
+            unrounded_scale = block_max / 127.0f;
+            scales[(long)k_block * k_tokens + token] = f16_round(unrounded_scale);
+        }
+    }
+    __syncthreads();
+
+    float scale = unrounded_scale;
+    float qf = scale == 0.0f ? 0.0f : rintf(value / scale);
+    if (qf > 127.0f) qf = 127.0f;
+    if (qf < -127.0f) qf = -127.0f;
+    int q = (int)qf;
+    unsigned int uq = (unsigned int)q & 0xffu;
+    #pragma unroll
+    for (int plane = 0; plane < 8; plane++) {
+        unsigned int bits = __ballot_sync(mask, ((uq >> plane) & 1u) != 0u);
+        if (lane == 0) {
+            long dst = (((long)k_block * 8 + plane) * k_tokens + token) * 4 + warp;
+            bitplanes[dst] = bits;
+        }
+    }
+}
+
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ unsigned int prism_load_u32_le(const unsigned char* p) {
+    return (unsigned int)p[0]
+        | ((unsigned int)p[1] << 8)
+        | ((unsigned int)p[2] << 16)
+        | ((unsigned int)p[3] << 24);
+}
+
+__device__ __forceinline__ void prism_bmma_xor_m16n8k128(
+    unsigned int a0, unsigned int a1, unsigned int b,
+    int& d0, int& d1, int& d2, int& d3
+) {
+    int zero = 0;
+    asm volatile(
+        "mma.sync.aligned.m16n8k128.row.col.s32.b1.b1.s32.xor.popc "
+        "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+        : "r"(a0), "r"(a1), "r"(b),
+          "r"(zero), "r"(zero), "r"(zero), "r"(zero));
+}
+#endif
+
+// One 256-thread CTA computes a 128-row by 128-token output tile. Warp w owns
+// rows [16*w, 16*w+16) and walks sixteen N=8 BMMA fragments. For each K=128
+// block, the CTA stages compact A bits and B bitplanes once; each thread keeps
+// its 64 output accumulators in registers across the complete K loop.
+extern "C" __global__ void prism_q1_q8_b128_bmma_gemm_batched(
+    const unsigned int* __restrict__ input_bitplanes,
+    const float* __restrict__ input_scales,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int cols, int blocks_per_row, int k_tokens, int q1_tiled,
+    float* __restrict__ output, int residual
+) {
+#if __CUDA_ARCH__ >= 800
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int group = lane >> 2;
+    int thread_in_group = lane & 3;
+    int row_base = blockIdx.x * 128;
+    int token_base = blockIdx.y * 128;
+    int token_count = k_tokens - token_base;
+    if (token_count > 128) token_count = 128;
+    int n_tiles = (token_count + 7) >> 3;
+    int warp_row = warp * 16;
+    unsigned mask = 0xffffffffu;
+
+    extern __shared__ unsigned int tile_a[];
+    __shared__ __align__(16) unsigned int tile_b[8 * 128 * 4];
+    __shared__ float weight_scales[128];
+    __shared__ float activation_scales[128];
+
+    float sums[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) sums[i] = 0.0f;
+
+    for (int k_block = 0; k_block < blocks_per_row; k_block++) {
+        // Raw Q1 needs an aligned shared staging tile. Q1T128 already stores the
+        // complete 128-row sign slab contiguously, so its fragments load direct
+        // from global and tile_a is untouched.
+        if (tid < 128) {
+            int row = row_base + tid;
+            float dw = 0.0f;
+            if (!q1_tiled) {
+                #pragma unroll
+                for (int word = 0; word < 4; word++) tile_a[tid * 4 + word] = 0u;
+            }
+            if (row < rows) {
+                const unsigned char* scale_ptr = prism_q1_scale_ptr(
+                    weight_bytes, rows, blocks_per_row, row, k_block, q1_tiled);
+                dw = f16_bits_to_f32((unsigned short)scale_ptr[0]
+                    | ((unsigned short)scale_ptr[1] << 8));
+                if (!q1_tiled) {
+                    const unsigned char* signs = prism_q1_sign_ptr(
+                        weight_bytes, rows, blocks_per_row, row, k_block, 0);
+                    #pragma unroll
+                    for (int word = 0; word < 4; word++)
+                        tile_a[tid * 4 + word] = prism_load_u32_le(signs + word * 4);
+                }
+            }
+            weight_scales[tid] = dw;
+
+            int token = token_base + tid;
+            activation_scales[tid] = token < k_tokens
+                ? input_scales[(long)k_block * k_tokens + token]
+                : 0.0f;
+        }
+
+        // Only stage live columns for a tail prompt tile. The shared stride
+        // remains 128 so the BMMA fragment address math is identical for full
+        // and partial tiles, but N=8/16 no longer pays the N=128 copy cost.
+        int live_plane_words = 8 * token_count * 4;
+        for (int index = tid; index < live_plane_words; index += blockDim.x) {
+            int word = index & 3;
+            int plane_token = index >> 2;
+            int token_in_tile = plane_token % token_count;
+            int plane = plane_token / token_count;
+            int token = token_base + token_in_tile;
+            tile_b[(plane * 128 + token_in_tile) * 4 + word] =
+                input_bitplanes[(((long)k_block * 8 + plane) * k_tokens + token) * 4 + word];
+        }
+        __syncthreads();
+
+        int fragment_row0 = row_base + warp_row + group;
+        int fragment_row1 = fragment_row0 + 8;
+        unsigned int a0 = 0u, a1 = 0u;
+        if (q1_tiled) {
+            if (fragment_row0 < rows) {
+                const unsigned char* signs0 = prism_q1_sign_ptr(
+                    weight_bytes, rows, blocks_per_row, fragment_row0, k_block, 1);
+                a0 = prism_load_u32_le(signs0 + thread_in_group * 4);
+            }
+            if (fragment_row1 < rows) {
+                const unsigned char* signs1 = prism_q1_sign_ptr(
+                    weight_bytes, rows, blocks_per_row, fragment_row1, k_block, 1);
+                a1 = prism_load_u32_le(signs1 + thread_in_group * 4);
+            }
+        } else {
+            a0 = tile_a[(warp_row + group) * 4 + thread_in_group];
+            a1 = tile_a[(warp_row + group + 8) * 4 + thread_in_group];
+        }
+        int pop0 = __popc(a0);
+        int pop1 = __popc(a1);
+        pop0 += __shfl_xor_sync(mask, pop0, 1, 4);
+        pop1 += __shfl_xor_sync(mask, pop1, 1, 4);
+        pop0 += __shfl_xor_sync(mask, pop0, 2, 4);
+        pop1 += __shfl_xor_sync(mask, pop1, 2, 4);
+
+        // For two's-complement q = -128*b7 + sum(2^p*bp), and Q1 sign
+        // s=2*w-1, Xp=popc(w xor bp) gives
+        //   dot(s,q) = 128*X7 - 64*X6 - ... - X0 - popc(w).
+        // Horner evaluation needs only four transient integer registers.
+        #pragma unroll
+        for (int n_tile = 0; n_tile < n_tiles; n_tile++) {
+            int d0, d1, d2, d3;
+            unsigned int b = tile_b[(7 * 128 + n_tile * 8 + group) * 4
+                + thread_in_group];
+            prism_bmma_xor_m16n8k128(a0, a1, b, d0, d1, d2, d3);
+            int v0 = d0, v1 = d1, v2 = d2, v3 = d3;
+            #pragma unroll
+            for (int plane = 6; plane >= 0; plane--) {
+                b = tile_b[(plane * 128 + n_tile * 8 + group) * 4
+                    + thread_in_group];
+                prism_bmma_xor_m16n8k128(a0, a1, b, d0, d1, d2, d3);
+                v0 = 2 * v0 - d0;
+                v1 = 2 * v1 - d1;
+                v2 = 2 * v2 - d2;
+                v3 = 2 * v3 - d3;
+            }
+            v0 -= pop0;
+            v1 -= pop0;
+            v2 -= pop1;
+            v3 -= pop1;
+
+            int token0 = n_tile * 8 + thread_in_group * 2;
+            int token1 = token0 + 1;
+            float dw0 = weight_scales[warp_row + group];
+            float dw1 = weight_scales[warp_row + group + 8];
+            float da0 = activation_scales[token0];
+            float da1 = activation_scales[token1];
+            sums[n_tile * 4 + 0] += ((float)v0 * dw0) * da0;
+            sums[n_tile * 4 + 1] += ((float)v1 * dw0) * da1;
+            sums[n_tile * 4 + 2] += ((float)v2 * dw1) * da0;
+            sums[n_tile * 4 + 3] += ((float)v3 * dw1) * da1;
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int n_tile = 0; n_tile < n_tiles; n_tile++) {
+        int token0 = token_base + n_tile * 8 + thread_in_group * 2;
+        int token1 = token0 + 1;
+        int row0 = row_base + warp_row + group;
+        int row1 = row0 + 8;
+        if (row0 < rows && token0 < k_tokens) {
+            long oi = (long)token0 * rows + row0;
+            float value = sums[n_tile * 4 + 0];
+            output[oi] = residual ? output[oi] + value : value;
+        }
+        if (row0 < rows && token1 < k_tokens) {
+            long oi = (long)token1 * rows + row0;
+            float value = sums[n_tile * 4 + 1];
+            output[oi] = residual ? output[oi] + value : value;
+        }
+        if (row1 < rows && token0 < k_tokens) {
+            long oi = (long)token0 * rows + row1;
+            float value = sums[n_tile * 4 + 2];
+            output[oi] = residual ? output[oi] + value : value;
+        }
+        if (row1 < rows && token1 < k_tokens) {
+            long oi = (long)token1 * rows + row1;
+            float value = sums[n_tile * 4 + 3];
+            output[oi] = residual ? output[oi] + value : value;
+        }
+    }
+#endif
 }
 
 // ---- Q4_0 GEMV: one warp per output row, raw 18-byte wire, Q8_0 activation ----
@@ -2223,6 +3862,98 @@ extern "C" __global__ void rms_norm_batched(
     for (int i = tid; i < n; i += blockDim.x) outt[i] = xs[i] * sc * weight[i];
 }
 
+// Prism/Bonsai fast RMSNorm -> Q8 activation. One CTA owns one token. The
+// reduction is parallel (the fast Q1 lane already has a quantized-activation
+// contract), and each warp quantizes a 32-value block directly from x/weight.
+// No normalized f32 row is written to global memory.
+extern "C" __global__ void prism_rms_norm_q8_batched(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    signed char* __restrict__ quants, float* __restrict__ scales,
+    int n, float eps, int k_tokens
+) {
+    int token = blockIdx.x;
+    if (token >= k_tokens) return;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    const float* xt = x + (long)token * n;
+    __shared__ float warp_sums[8];
+    __shared__ float norm_scale;
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += 256) {
+        float v = xt[i];
+        sum += v * v;
+    }
+    sum += __shfl_down_sync(0xffffffffu, sum, 16);
+    sum += __shfl_down_sync(0xffffffffu, sum, 8);
+    sum += __shfl_down_sync(0xffffffffu, sum, 4);
+    sum += __shfl_down_sync(0xffffffffu, sum, 2);
+    sum += __shfl_down_sync(0xffffffffu, sum, 1);
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        float total = lane < 8 ? warp_sums[lane] : 0.0f;
+        total += __shfl_down_sync(0xffffffffu, total, 16);
+        total += __shfl_down_sync(0xffffffffu, total, 8);
+        total += __shfl_down_sync(0xffffffffu, total, 4);
+        total += __shfl_down_sync(0xffffffffu, total, 2);
+        total += __shfl_down_sync(0xffffffffu, total, 1);
+        if (lane == 0) norm_scale = 1.0f / sqrtf(total / (float)n + eps);
+    }
+    __syncthreads();
+
+    int n_blocks = n >> 5;
+    long token_q = (long)token * n;
+    long token_s = (long)token * n_blocks;
+    for (int qb = warp; qb < n_blocks; qb += 8) {
+        int i = qb * 32 + lane;
+        float v = xt[i] * norm_scale * weight[i];
+        float max_abs = fabsf(v);
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 16));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 8));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 4));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 2));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 1));
+        max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
+        float unrounded = max_abs / 127.0f;
+        if (lane == 0) scales[token_s + qb] = f16_round(unrounded);
+        float inv = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+        float qv = rintf(v * inv);
+        if (qv > 127.0f) qv = 127.0f;
+        if (qv < -128.0f) qv = -128.0f;
+        quants[token_q + i] = (signed char)qv;
+    }
+}
+
+// Prism/Bonsai fast SwiGLU -> Q8 activation. Eight warps quantize eight Q8
+// blocks per CTA; SiLU, amax and quantization are all lane-parallel.
+extern "C" __global__ void prism_silu_mul_q8_batched(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    signed char* __restrict__ quants, float* __restrict__ scales, int n_blocks
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int qb = blockIdx.x * 8 + warp;
+    if (qb >= n_blocks) return;
+    long i = (long)qb * 32 + lane;
+    float g = gate[i];
+    float v = (g / (1.0f + expf(-g))) * up[i];
+    float max_abs = fabsf(v);
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 16));
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 8));
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 4));
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 2));
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 1));
+    max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
+    float unrounded = max_abs / 127.0f;
+    if (lane == 0) scales[qb] = f16_round(unrounded);
+    float inv = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+    float qv = rintf(v * inv);
+    if (qv > 127.0f) qv = 127.0f;
+    if (qv < -128.0f) qv = -128.0f;
+    quants[i] = (signed char)qv;
+}
+
 // RoPE for K tokens; cos/sin are per-token tables [token][rope_dim/2].
 extern "C" __global__ void rope_batched(
     float* __restrict__ vec, const float* __restrict__ cos_t, const float* __restrict__ sin_t,
@@ -3083,13 +4814,14 @@ extern "C" __global__ void ssm_conv1d(
 // ---- Gated delta-rule recurrence (one decode step) + gated RMSNorm ---------
 // One block per value-head (gridDim.x = nv), blockDim.x = d_state (== head_v_dim).
 // Thread j owns column j of the [d_state x d_state] state S (row-major [i*d_state+j]).
-//   decay:  S[i,j] *= exp(glog[h])
+//   decay:  S[i,j] *= decay[h]
 //   sk[j]   = sum_i S[i,j]*k[i]                 (fused with decay, i-order)
 //   d[j]    = (v[j] - sk[j]) * beta[h]
 //   S[i,j] += k[i]*d[j];  o[j] = sum_i S[i,j]*(q[i]*qscale)   (fused, i-order)
 //   gated RMSNorm: out = RMSNorm(o, ssm_norm) * SiLU(z)       (j-order serial sum)
 // k_conv/q_conv are L2-normed; GQA tile-repeat key head = h % nk. beta is already
-// sigmoid'd; glog is pre-exp. Bit-identical order to the CPU reference.
+// sigmoid'd; decay is already exponentiated. Bit-identical update order to the
+// CPU reference.
 extern "C" __global__ void ssm_delta_rule(
     float* __restrict__ state,           // [nv*d_state*d_state], updated in place
     const float* __restrict__ k_conv,    // [nk*d_state]
@@ -3097,7 +4829,7 @@ extern "C" __global__ void ssm_delta_rule(
     const float* __restrict__ v_conv,    // [nv*d_state]
     const float* __restrict__ z,         // [nv*d_state]
     const float* __restrict__ beta,      // [nv] (post-sigmoid)
-    const float* __restrict__ glog,      // [nv] (pre-exp)
+    const float* __restrict__ decay,     // [nv] (post-exp)
     const float* __restrict__ ssm_norm,  // [d_state]
     float* __restrict__ out,             // [nv*d_state]
     int d_state, int nk, float eps
@@ -3113,7 +4845,7 @@ extern "C" __global__ void ssm_delta_rule(
     sq_[j] = q_conv[(long)hk * d_state + j];
     __syncthreads();
     float* St = state + (long)h * d_state * d_state;
-    float g = expf(glog[h]);
+    float g = decay[h];
     float bh = beta[h];
     float qscale = 1.0f / sqrtf((float)d_state);
     float skj = 0.0f;
@@ -3282,6 +5014,44 @@ extern "C" __global__ void embed_gather_q8_0(
     float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
     out[e] = d * (float)((signed char)blk[2 + j]);
 }
+__device__ __forceinline__ float prism_embed_value(
+    const unsigned char* table, unsigned int token, int dim, int e,
+    int bits, int block_elements
+) {
+    int block_bytes = 2 + ((block_elements * bits) >> 3);
+    int row_bytes = (dim / block_elements) * block_bytes;
+    const unsigned char* block = table + (long)token * row_bytes
+        + (long)(e / block_elements) * block_bytes;
+    int j = e % block_elements;
+    float d = f16_bits_to_f32((unsigned short)block[0] | ((unsigned short)block[1] << 8));
+    if (bits == 1) {
+        int bit = (block[2 + (j >> 3)] >> (j & 7)) & 1;
+        return bit ? d : -d;
+    }
+    int q = (block[2 + (j >> 2)] >> ((j & 3) << 1)) & 3;
+    return (float)(q - 1) * d;
+}
+extern "C" __global__ void embed_gather_q1_0(
+    const unsigned char* __restrict__ table, const unsigned int* __restrict__ token,
+    int dim, float* __restrict__ out
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e < dim) out[e] = prism_embed_value(table, *token, dim, e, 1, 128);
+}
+extern "C" __global__ void embed_gather_q2_0_g64(
+    const unsigned char* __restrict__ table, const unsigned int* __restrict__ token,
+    int dim, float* __restrict__ out
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e < dim) out[e] = prism_embed_value(table, *token, dim, e, 2, 64);
+}
+extern "C" __global__ void embed_gather_q2_0_g128(
+    const unsigned char* __restrict__ table, const unsigned int* __restrict__ token,
+    int dim, float* __restrict__ out
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e < dim) out[e] = prism_embed_value(table, *token, dim, e, 2, 128);
+}
 // rope_select: copy position `pos`'s precomputed cos/sin row (half = rope_dim/2
 // values each) out of the resident all-positions tables into the small per-token
 // buffers the rope kernel reads — the tables are built once on the host with the
@@ -3297,20 +5067,24 @@ extern "C" __global__ void rope_select(
     sin_out[i] = sin_all[(long)pos * half + i];
 }
 
-// ---- SSM gates: beta = sigmoid(beta_raw); glog = softplus(alpha_raw+dt_bias)*a -
-// One thread per value-head (nv). Feeds ssm_delta_rule (beta post-sigmoid, glog
-// pre-exp). softplus matches the CPU's (1+exp(x)).ln() with the x>20 passthrough.
+// ---- SSM gates: beta = sigmoid(beta_raw); decay = exp(softplus(alpha+bias)*a)
+// One thread per value-head (nv). Feeds ssm_delta_rule with both values ready.
+// `decay_out` is the already exponentiated recurrence multiplier.  Computing it
+// here is important for qwen35: the delta-rule kernel has one thread per state
+// column, so exponentiating there would repeat the exact same transcendental
+// operation `d_state` times for every token and value head.
+// softplus matches the CPU's (1+exp(x)).ln() with the x>20 passthrough.
 extern "C" __global__ void ssm_gates(
     const float* __restrict__ beta_raw, const float* __restrict__ alpha_raw,
     const float* __restrict__ dt_bias, const float* __restrict__ a,
-    float* __restrict__ beta_out, float* __restrict__ glog_out, int nv
+    float* __restrict__ beta_out, float* __restrict__ decay_out, int nv
 ) {
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= nv) return;
     beta_out[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
     float x = alpha_raw[h] + dt_bias[h];
     float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
-    glog_out[h] = sp * a[h];
+    decay_out[h] = expf(sp * a[h]);
 }
 
 // ---- Deinterleave fused per-head [query(hd) | gate(hd)] x n_heads ----------
@@ -3328,6 +5102,392 @@ extern "C" __global__ void deinterleave_qgate(
     q_out[idx] = qg[src + d];
     gate_out[idx] = qg[src + head_dim + d];
 }
+
+// Batched qwen35 helpers. Dense projections stay token-major; only the causal
+// conv and delta-rule recurrence loop over tokens inside one launch so state is
+// updated in exactly the same order as tokenwise prefill.
+extern "C" __global__ void deinterleave_qgate_batched(
+    const float* __restrict__ qg, float* __restrict__ q_out,
+    float* __restrict__ gate_out, int n_heads, int head_dim, int k_tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int q_width = n_heads * head_dim;
+    if (idx >= k_tokens * q_width) return;
+    int token = idx / q_width;
+    int within = idx - token * q_width;
+    int head = within / head_dim;
+    int d = within - head * head_dim;
+    long src = (long)token * 2 * q_width + (long)head * 2 * head_dim;
+    q_out[idx] = qg[src + d];
+    gate_out[idx] = qg[src + head_dim + d];
+}
+
+extern "C" __global__ void ssm_gates_batched(
+    const float* __restrict__ beta_raw, const float* __restrict__ alpha_raw,
+    const float* __restrict__ dt_bias, const float* __restrict__ a,
+    float* __restrict__ beta_out, float* __restrict__ decay_out,
+    int nv, int k_tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= k_tokens * nv) return;
+    int h = idx % nv;
+    beta_out[idx] = 1.0f / (1.0f + expf(-beta_raw[idx]));
+    float x = alpha_raw[idx] + dt_bias[h];
+    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+    decay_out[idx] = expf(sp * a[h]);
+}
+
+extern "C" __global__ void ssm_conv1d_batched(
+    const float* __restrict__ conv_w, const float* __restrict__ x,
+    float* __restrict__ conv_state, float* __restrict__ conv_out,
+    int conv_dim, int d_conv, int k_tokens
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    int cm1 = d_conv - 1;
+    const float* w = conv_w + (long)c * d_conv;
+    float* st = conv_state + (long)c * cm1;
+    for (int token = 0; token < k_tokens; token++) {
+        float xc = x[(long)token * conv_dim + c];
+        float acc = 0.0f;
+        for (int t = 0; t < cm1; t++) acc += w[t] * st[t];
+        acc += w[cm1] * xc;
+        conv_out[(long)token * conv_dim + c] = acc / (1.0f + expf(-acc));
+        for (int t = 0; t < cm1 - 1; t++) st[t] = st[t + 1];
+        st[cm1 - 1] = xc;
+    }
+}
+
+extern "C" __global__ void ssm_l2_norm_per_head_batched(
+    float* __restrict__ buf, int token_stride, int offset,
+    int n_heads, int head_dim, int k_tokens, float eps
+) {
+    int token_head = blockIdx.x;
+    int token = token_head / n_heads;
+    int head = token_head - token * n_heads;
+    if (token >= k_tokens) return;
+    int tid = threadIdx.x;
+    extern __shared__ float xs[];
+    __shared__ float s_scale;
+    long base = (long)token * token_stride + offset + (long)head * head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) xs[i] = buf[base + i];
+    __syncthreads();
+    if (tid == 0) {
+        double ss = 0.0;
+        for (int i = 0; i < head_dim; i++) {
+            double v = (double)xs[i];
+            ss += v * v;
+        }
+        float denom = sqrtf((float)ss);
+        if (denom < eps) denom = eps;
+        s_scale = 1.0f / denom;
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = tid; i < head_dim; i += blockDim.x) buf[base + i] = xs[i] * scale;
+}
+
+extern "C" __global__ void ssm_delta_rule_batched(
+    float* __restrict__ state, const float* __restrict__ conv,
+    const float* __restrict__ z, const float* __restrict__ beta,
+    const float* __restrict__ decay, const float* __restrict__ ssm_norm,
+    float* __restrict__ out, int d_state, int nk, int nv,
+    int key_dim, int value_dim, int conv_dim, int k_tokens, float eps
+) {
+    int h = blockIdx.x;
+    int j = threadIdx.x;
+    int hk = h % nk;
+    extern __shared__ float sh[];
+    float* sk_ = sh;
+    float* sq_ = sh + d_state;
+    float* so_ = sh + 2 * d_state;
+    float* St = state + (long)h * d_state * d_state;
+    float qscale = 1.0f / sqrtf((float)d_state);
+    __shared__ float s_scale;
+
+    for (int token = 0; token < k_tokens; token++) {
+        const float* token_conv = conv + (long)token * conv_dim;
+        sk_[j] = token_conv[key_dim + (long)hk * d_state + j];
+        sq_[j] = token_conv[(long)hk * d_state + j];
+        __syncthreads();
+        float g = decay[(long)token * nv + h];
+        float bh = beta[(long)token * nv + h];
+        float skj = 0.0f;
+        for (int i = 0; i < d_state; i++) {
+            float sv = St[(long)i * d_state + j] * g;
+            St[(long)i * d_state + j] = sv;
+            skj += sv * sk_[i];
+        }
+        float dj = (token_conv[2 * key_dim + (long)h * d_state + j] - skj) * bh;
+        float oj = 0.0f;
+        for (int i = 0; i < d_state; i++) {
+            float sv = St[(long)i * d_state + j] + sk_[i] * dj;
+            St[(long)i * d_state + j] = sv;
+            oj += sv * (sq_[i] * qscale);
+        }
+        so_[j] = oj;
+        __syncthreads();
+        if (j == 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < d_state; i++) sum += so_[i] * so_[i];
+            s_scale = 1.0f / sqrtf(sum / (float)d_state + eps);
+        }
+        __syncthreads();
+        float normed = so_[j] * s_scale * ssm_norm[j];
+        float zj = z[(long)token * value_dim + (long)h * d_state + j];
+        float silu_z = zj / (1.0f + expf(-zj));
+        out[(long)token * value_dim + (long)h * d_state + j] = normed * silu_z;
+        __syncthreads();
+    }
+}
+
+// ---- Qwen3.5/Bonsai D=128 SSM kernels ------------------------------------
+// These are not generic compatibility kernels.  They encode the geometry used
+// by the Bonsai family (128 state channels and a four-tap causal convolution)
+// so the compiler can keep the recurrent state and convolution history in
+// registers across the complete prompt chunk.
+
+// Four-tap causal convolution with register-resident history.  The generic
+// implementation updates global conv_state after every token; this version
+// loads the three history values and four weights once per channel and writes
+// the final history once after the complete chunk.
+extern "C" __global__ void qwen35_ssm_conv1d_d4_batched(
+    const float* __restrict__ conv_w, const float* __restrict__ x,
+    float* __restrict__ conv_state, float* __restrict__ conv_out,
+    int conv_dim, int k_tokens
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    const float* w = conv_w + (long)c * 4;
+    float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+    float* history = conv_state + (long)c * 3;
+    float s0 = history[0], s1 = history[1], s2 = history[2];
+    for (int token = 0; token < k_tokens; token++) {
+        float xc = x[(long)token * conv_dim + c];
+        float acc = 0.0f;
+        acc += w0 * s0;
+        acc += w1 * s1;
+        acc += w2 * s2;
+        acc += w3 * xc;
+        conv_out[(long)token * conv_dim + c] = acc / (1.0f + expf(-acc));
+        s0 = s1;
+        s1 = s2;
+        s2 = xc;
+    }
+    history[0] = s0;
+    history[1] = s1;
+    history[2] = s2;
+}
+
+// Normalize the paired Q/K vectors in one launch.  One block owns one
+// (token,key-head), and the serial double-precision sums intentionally retain
+// the reference kernel's arithmetic while eliminating the second launch.
+extern "C" __global__ void qwen35_ssm_qk_l2_norm_d128_batched(
+    float* __restrict__ conv, int conv_dim, int key_dim,
+    int n_key_heads, int k_tokens, float eps
+) {
+    int token_head = blockIdx.x;
+    int token = token_head / n_key_heads;
+    int head = token_head - token * n_key_heads;
+    if (token >= k_tokens) return;
+    int j = threadIdx.x;
+    __shared__ float qv[128];
+    __shared__ float kv[128];
+    __shared__ float q_scale;
+    __shared__ float k_scale;
+    long q_base = (long)token * conv_dim + (long)head * 128;
+    long k_base = q_base + key_dim;
+    qv[j] = conv[q_base + j];
+    kv[j] = conv[k_base + j];
+    __syncthreads();
+    if (j == 0) {
+        double qss = 0.0;
+        double kss = 0.0;
+        #pragma unroll
+        for (int i = 0; i < 128; i++) {
+            double q = (double)qv[i];
+            double k = (double)kv[i];
+            qss += q * q;
+            kss += k * k;
+        }
+        float qden = sqrtf((float)qss);
+        float kden = sqrtf((float)kss);
+        if (qden < eps) qden = eps;
+        if (kden < eps) kden = eps;
+        q_scale = 1.0f / qden;
+        k_scale = 1.0f / kden;
+    }
+    __syncthreads();
+    conv[q_base + j] = qv[j] * q_scale;
+    conv[k_base + j] = kv[j] * k_scale;
+}
+
+__device__ __forceinline__ float qwen35_warp_sum(float value) {
+    value += __shfl_down_sync(0xffffffffu, value, 16);
+    value += __shfl_down_sync(0xffffffffu, value, 8);
+    value += __shfl_down_sync(0xffffffffu, value, 4);
+    value += __shfl_down_sync(0xffffffffu, value, 2);
+    value += __shfl_down_sync(0xffffffffu, value, 1);
+    return value;
+}
+
+// Register-sharded gated delta rule for D=128. Fast-mode state is persistently
+// transposed as [head][column][row]. Each of eight warps owns four columns and
+// each lane keeps four rows from every owned column in registers, so a block
+// advances 32 columns through the complete prompt chunk. Four blocks cover a
+// value head. This avoids the 128-register/thread cliff of one-thread/column,
+// retains high occupancy, and moves each state element exactly once in and once
+// out for the whole chunk.
+extern "C" __global__ __launch_bounds__(256, 2)
+void qwen35_ssm_delta_rule_d128_batched(
+    float* __restrict__ state_t, const float* __restrict__ conv,
+    const float* __restrict__ beta, const float* __restrict__ decay,
+    float* __restrict__ raw_out, int nk, int nv, int key_dim,
+    int value_dim, int conv_dim, int k_tokens
+) {
+    int lane = threadIdx.x;
+    int warp = threadIdx.y;
+    int flat = warp * 32 + lane;
+    int h = blockIdx.x;
+    if (h >= nv) return;
+    int hk = h % nk;
+    int col0 = blockIdx.z * 32 + warp * 4;
+    __shared__ float sk_[128];
+    __shared__ float sq_[128];
+    __shared__ float s_decay;
+    __shared__ float s_beta;
+    float st[4][4];
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        int col = col0 + c;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            int row = lane + 32 * r;
+            st[c][r] = state_t[((long)h * 128 + col) * 128 + row];
+        }
+    }
+    const float qscale = 0.08838834764831845f; // 1/sqrt(128)
+
+    for (int token = 0; token < k_tokens; token++) {
+        const float* token_conv = conv + (long)token * conv_dim;
+        if (flat < 128) {
+            sk_[flat] = token_conv[key_dim + (long)hk * 128 + flat];
+            sq_[flat] = token_conv[(long)hk * 128 + flat];
+        }
+        if (flat == 0) {
+            s_decay = decay[(long)token * nv + h];
+            s_beta = beta[(long)token * nv + h];
+        }
+        __syncthreads();
+
+        float kr[4];
+        float qr[4];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            int row = lane + 32 * r;
+            kr[r] = sk_[row];
+            qr[r] = sq_[row] * qscale;
+        }
+
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            int col = col0 + c;
+            float sk_partial = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                st[c][r] *= s_decay;
+                sk_partial += st[c][r] * kr[r];
+            }
+            float sk = qwen35_warp_sum(sk_partial);
+            float dj = 0.0f;
+            if (lane == 0) {
+                float v = token_conv[2 * key_dim + (long)h * 128 + col];
+                dj = (v - sk) * s_beta;
+            }
+            dj = __shfl_sync(0xffffffffu, dj, 0);
+            float o_partial = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                st[c][r] += kr[r] * dj;
+                o_partial += st[c][r] * qr[r];
+            }
+            float o = qwen35_warp_sum(o_partial);
+            if (lane == 0)
+                raw_out[(long)token * value_dim + (long)h * 128 + col] = o;
+        }
+        // No warp may replace the shared Q/K tile while another warp still
+        // consumes it for the current token.
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int c = 0; c < 4; c++) {
+        int col = col0 + c;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            int row = lane + 32 * r;
+            state_t[((long)h * 128 + col) * 128 + row] = st[c][r];
+        }
+    }
+}
+
+// Complete the register recurrence with Bonsai's gated RMSNorm and write the
+// Q8 activation consumed by the Q1 ssm_out projection. Fusing quantization here
+// avoids materializing the gated f32 mix and removes the following generic
+// quantize launch entirely.
+extern "C" __global__ void qwen35_ssm_rmsnorm_gate_q8_d128_batched(
+    const float* __restrict__ raw, const float* __restrict__ z,
+    const float* __restrict__ ssm_norm, signed char* __restrict__ quants,
+    float* __restrict__ scales, int nv, int value_dim, int k_tokens, float eps
+) {
+    int token_head = blockIdx.x;
+    int token = token_head / nv;
+    int h = token_head - token * nv;
+    if (token >= k_tokens) return;
+    int j = threadIdx.x;
+    long base = (long)token * value_dim + (long)h * 128;
+    __shared__ float values[128];
+    __shared__ float s_scale;
+    __shared__ float warp_sums[4];
+    float raw_j = raw[base + j];
+    values[j] = raw_j;
+    float ss = raw_j * raw_j;
+    ss = qwen35_warp_sum(ss);
+    int lane = j & 31;
+    int warp = j >> 5;
+    if (lane == 0) warp_sums[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float sum = lane < 4 ? warp_sums[lane] : 0.0f;
+        sum = qwen35_warp_sum(sum);
+        if (lane == 0)
+            s_scale = 1.0f / sqrtf(sum * (1.0f / 128.0f) + eps);
+    }
+    __syncthreads();
+    float zj = z[base + j];
+    float silu_z = zj / (1.0f + expf(-zj));
+    values[j] = values[j] * s_scale * ssm_norm[j] * silu_z;
+    __syncthreads();
+
+    {
+        int qb = warp;
+        float v = values[qb * 32 + lane];
+        float max_abs = fabsf(v);
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 16));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 8));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 4));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 2));
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, 1));
+        max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
+        float unrounded = max_abs / 127.0f;
+        if (lane == 0) scales[(base >> 5) + qb] = f16_round(unrounded);
+        float inv = (unrounded == 0.0f) ? 0.0f : 1.0f / unrounded;
+        float qv = rintf(v * inv);
+        if (qv > 127.0f) qv = 127.0f;
+        if (qv < -128.0f) qv = -128.0f;
+        quants[base + qb * 32 + lane] = (signed char)qv;
+    }
+}
 "#;
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
@@ -3339,11 +5499,38 @@ extern "C" __global__ void deinterleave_qgate(
 pub struct CudaResidentKernels {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
+    /// POPC decode kernels are promoted only on the benchmarked Ampere SM86 lane.
+    pub(crate) sm86: bool,
+    /// Immutable fast/strict arithmetic contract for this kernel/engine instance.
+    /// Read once at construction so a later model reload can choose independently.
+    pub(crate) fast_q1: bool,
+    /// Immutable Q1 projection layout contract for this kernel/engine instance.
+    /// Standalone kernel users default to raw GGUF; resident model construction
+    /// selects this before any weight upload.
+    pub(crate) q1_tiled: bool,
     pub(crate) rms_norm: CudaFunction,
     pub(crate) rms_norm_per_head: CudaFunction,
     pub(crate) quantize: CudaFunction,
     pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
+    pub(crate) prism_low_bit_f32_gemv: CudaFunction,
+    pub(crate) prism_q1_q8_gemv: CudaFunction,
+    pub(crate) prism_q1t128_q8_gemv: CudaFunction,
+    pub(crate) prism_q8_32_bitplanes_qsum: CudaFunction,
+    pub(crate) prism_q1t128_q8_popc_gemv_m16: CudaFunction,
+    pub(crate) prism_q1t128_q8_popc_fused_ffn_bonsai27b: CudaFunction,
+    pub(crate) prism_q1t128_q8_popc_fused_full_bonsai27b: CudaFunction,
+    pub(crate) prism_q1t128_q8_popc_fused_ssm_bonsai27b: CudaFunction,
+    pub(crate) prism_q1t128_fused_full_bonsai27b: CudaFunction,
+    pub(crate) prism_q1t128_fused_ssm_bonsai27b: CudaFunction,
+    pub(crate) prism_q1t128_fused_ffn_bonsai27b: CudaFunction,
+    pub(crate) prism_q1_f32_gemm_batched: CudaFunction,
+    pub(crate) prism_q1_q8_gemm_batched: CudaFunction,
+    pub(crate) prism_q1_q8_wmma_gemm_batched: Option<CudaFunction>,
+    /// Optional SM80+ Q8/128 bit-slice packer and binary-MMA prompt lane.
+    /// Production dispatch uses them only after the strict/env/shape gates pass.
+    pub(crate) prism_q8_b128_bitpack: Option<CudaFunction>,
+    pub(crate) prism_q1_q8_b128_bmma_gemm_batched: Option<CudaFunction>,
     pub(crate) q4_0_gemv: CudaFunction,
     pub(crate) q4_1_gemv: CudaFunction,
     pub(crate) nvfp4_gemv: CudaFunction,
@@ -3374,6 +5561,8 @@ pub struct CudaResidentKernels {
     pub(crate) sample_gumbel: CudaFunction,
     pub(crate) gemm_batched: CudaFunction,
     pub(crate) rms_norm_batched: CudaFunction,
+    pub(crate) prism_rms_norm_q8_batched: CudaFunction,
+    pub(crate) prism_silu_mul_q8_batched: CudaFunction,
     pub(crate) rope_batched: CudaFunction,
     pub(crate) kv_scatter_batched: CudaFunction,
     pub(crate) attention_batched: CudaFunction,
@@ -3390,16 +5579,28 @@ pub struct CudaResidentKernels {
     pub(crate) flash_pref_partial_k8: CudaFunction,
     // qwen35 (Ornith) gated-delta-net SSM kernels.
     pub(crate) ssm_l2_norm_per_head: CudaFunction,
+    pub(crate) ssm_l2_norm_per_head_batched: CudaFunction,
+    pub(crate) qwen35_ssm_qk_l2_norm_d128_batched: CudaFunction,
     pub(crate) ssm_conv1d: CudaFunction,
+    pub(crate) ssm_conv1d_batched: CudaFunction,
+    pub(crate) qwen35_ssm_conv1d_d4_batched: CudaFunction,
     pub(crate) ssm_delta_rule: CudaFunction,
+    pub(crate) ssm_delta_rule_batched: CudaFunction,
+    pub(crate) qwen35_ssm_delta_rule_d128_batched: CudaFunction,
+    pub(crate) qwen35_ssm_rmsnorm_gate_q8_d128_batched: CudaFunction,
     pub(crate) sigmoid_mul: CudaFunction,
     pub(crate) embed_gather_q4k: CudaFunction,
     pub(crate) embed_gather_q6k: CudaFunction,
     pub(crate) embed_gather_q3k: CudaFunction,
     pub(crate) embed_gather_q8_0: CudaFunction,
+    pub(crate) embed_gather_q1_0: CudaFunction,
+    pub(crate) embed_gather_q2_0_g64: CudaFunction,
+    pub(crate) embed_gather_q2_0_g128: CudaFunction,
     pub(crate) rope_select: CudaFunction,
     pub(crate) ssm_gates: CudaFunction,
+    pub(crate) ssm_gates_batched: CudaFunction,
     pub(crate) deinterleave_qgate: CudaFunction,
+    pub(crate) deinterleave_qgate_batched: CudaFunction,
     /// Env-gated (CAMELID_ATTN_COALESCED) dispatch of the coalesced K-dot in
     /// split-K pass 1. Read ONCE at construction; default OFF so the shipped
     /// path stays byte-identical.
@@ -3408,6 +5609,10 @@ pub struct CudaResidentKernels {
 
 impl CudaResidentKernels {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_q1_policy(false, prism_cuda_fast_from_env())
+    }
+
+    fn new_with_q1_policy(q1_tiled: bool, fast_q1: bool) -> Result<Self, String> {
         let ordinal = crate::cuda::selected_device_ordinal();
         let ctx =
             CudaContext::new(ordinal).map_err(|e| format!("CudaContext::new({ordinal}): {e}"))?;
@@ -3420,9 +5625,56 @@ impl CudaResidentKernels {
         let stream = ctx
             .new_stream()
             .map_err(|e| format!("engine stream: {e}"))?;
+        // The resident engine owns this context's stream ordering. On Windows the
+        // dedicated stream otherwise flips cudarc into automatic multi-stream mode,
+        // making every safe kernel argument enqueue redundant wait/record events on
+        // the SAME stream. Besides multiplying WDDM submission work, those external
+        // event dependencies make stream capture fail with CAPTURE_ISOLATION. No
+        // resident allocation exists yet, so disabling here also avoids allocating
+        // per-slice tracking events. Offload and overlap use explicit CUDA events.
+        // CAMELID_CUDA_SAFE_EVENTS=1 is the diagnostic escape hatch.
+        if cuda_manual_stream_order_enabled() {
+            // SAFETY: all same-stream dependencies are ordered by `stream`; the only
+            // side streams (offload / overlap) are explicitly event-joined below.
+            unsafe { ctx.disable_event_tracking() };
+        }
+        let cc_major = ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .unwrap_or(0);
+        let cc_minor = ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .unwrap_or(0);
+        // Compile the resident module for the selected device generation. Int8
+        // WMMA needs sm_75+; older CUDA devices retain the portable compute_61
+        // lane and simply do not load the optional tensor-core function.
+        let arch = if cc_major >= 8 {
+            "compute_80"
+        } else if cc_major == 7 && cc_minor >= 5 {
+            "compute_75"
+        } else {
+            "compute_61"
+        };
+        let cuda_include = ["CUDA_PATH", "CUDA_HOME"]
+            .into_iter()
+            .filter_map(|name| std::env::var_os(name))
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("include"))
+            .chain([std::path::PathBuf::from("/usr/local/cuda/include")])
+            .find(|include| include.join("mma.h").is_file());
+        let tensor_core_q1 =
+            (cc_major > 7 || (cc_major == 7 && cc_minor >= 5)) && cuda_include.is_some();
+        let binary_tensor_core_q1 = cc_major >= 8;
+        let mut include_paths = Vec::new();
+        let mut options = Vec::new();
+        if let Some(include) = cuda_include {
+            include_paths.push(include.to_string_lossy().into_owned());
+            options.push("-DCAMELID_HAS_WMMA=1".to_string());
+        }
         let opts = CompileOptions {
             fmad: Some(false),
-            arch: Some("compute_61"),
+            arch: Some(arch),
+            include_paths,
+            options,
             ..Default::default()
         };
         // cudarc panics from inside its lazy NVRTC loader when libnvrtc is absent,
@@ -3442,11 +5694,42 @@ impl CudaResidentKernels {
                 .map_err(|e| format!("load {name}: {e}"))
         };
         Ok(Self {
+            sm86: cc_major == 8 && cc_minor == 6,
+            fast_q1,
+            q1_tiled,
             rms_norm: f("rms_norm_f32")?,
             rms_norm_per_head: f("rms_norm_per_head_f32")?,
             quantize: f("quantize_q8_0")?,
             rms_norm_quantize: f("rms_norm_quantize")?,
             gemv: f("q8_gemv")?,
+            prism_low_bit_f32_gemv: f("prism_low_bit_f32_gemv")?,
+            prism_q1_q8_gemv: f("prism_q1_q8_gemv")?,
+            prism_q1t128_q8_gemv: f("prism_q1t128_q8_gemv")?,
+            prism_q8_32_bitplanes_qsum: f("prism_q8_32_bitplanes_qsum")?,
+            prism_q1t128_q8_popc_gemv_m16: f("prism_q1t128_q8_popc_gemv_m16")?,
+            prism_q1t128_q8_popc_fused_ffn_bonsai27b: f(
+                "prism_q1t128_q8_popc_fused_ffn_bonsai27b",
+            )?,
+            prism_q1t128_q8_popc_fused_full_bonsai27b: f(
+                "prism_q1t128_q8_popc_fused_full_bonsai27b",
+            )?,
+            prism_q1t128_q8_popc_fused_ssm_bonsai27b: f(
+                "prism_q1t128_q8_popc_fused_ssm_bonsai27b",
+            )?,
+            prism_q1t128_fused_full_bonsai27b: f("prism_q1t128_fused_full_bonsai27b")?,
+            prism_q1t128_fused_ssm_bonsai27b: f("prism_q1t128_fused_ssm_bonsai27b")?,
+            prism_q1t128_fused_ffn_bonsai27b: f("prism_q1t128_fused_ffn_bonsai27b")?,
+            prism_q1_f32_gemm_batched: f("prism_q1_f32_gemm_batched")?,
+            prism_q1_q8_gemm_batched: f("prism_q1_q8_gemm_batched")?,
+            prism_q1_q8_wmma_gemm_batched: tensor_core_q1
+                .then(|| f("prism_q1_q8_wmma_gemm_batched"))
+                .transpose()?,
+            prism_q8_b128_bitpack: binary_tensor_core_q1
+                .then(|| f("prism_q8_b128_bitpack"))
+                .transpose()?,
+            prism_q1_q8_b128_bmma_gemm_batched: binary_tensor_core_q1
+                .then(|| f("prism_q1_q8_b128_bmma_gemm_batched"))
+                .transpose()?,
             q4_0_gemv: f("q4_0_gemv")?,
             q4_1_gemv: f("q4_1_gemv")?,
             nvfp4_gemv: f("nvfp4_gemv")?,
@@ -3477,6 +5760,8 @@ impl CudaResidentKernels {
             sample_gumbel: f("sample_gumbel")?,
             gemm_batched: f("q8_gemm_batched")?,
             rms_norm_batched: f("rms_norm_batched")?,
+            prism_rms_norm_q8_batched: f("prism_rms_norm_q8_batched")?,
+            prism_silu_mul_q8_batched: f("prism_silu_mul_q8_batched")?,
             rope_batched: f("rope_batched")?,
             kv_scatter_batched: f("kv_scatter_batched")?,
             attention_batched: f("attention_batched")?,
@@ -3492,16 +5777,28 @@ impl CudaResidentKernels {
             flash_pref_scores_k8: f("flash_pref_scores_k8")?,
             flash_pref_partial_k8: f("flash_pref_partial_k8")?,
             ssm_l2_norm_per_head: f("ssm_l2_norm_per_head")?,
+            ssm_l2_norm_per_head_batched: f("ssm_l2_norm_per_head_batched")?,
+            qwen35_ssm_qk_l2_norm_d128_batched: f("qwen35_ssm_qk_l2_norm_d128_batched")?,
             ssm_conv1d: f("ssm_conv1d")?,
+            ssm_conv1d_batched: f("ssm_conv1d_batched")?,
+            qwen35_ssm_conv1d_d4_batched: f("qwen35_ssm_conv1d_d4_batched")?,
             ssm_delta_rule: f("ssm_delta_rule")?,
+            ssm_delta_rule_batched: f("ssm_delta_rule_batched")?,
+            qwen35_ssm_delta_rule_d128_batched: f("qwen35_ssm_delta_rule_d128_batched")?,
+            qwen35_ssm_rmsnorm_gate_q8_d128_batched: f("qwen35_ssm_rmsnorm_gate_q8_d128_batched")?,
             sigmoid_mul: f("sigmoid_mul")?,
             embed_gather_q4k: f("embed_gather_q4k")?,
             embed_gather_q6k: f("embed_gather_q6k")?,
             embed_gather_q3k: f("embed_gather_q3k")?,
             embed_gather_q8_0: f("embed_gather_q8_0")?,
+            embed_gather_q1_0: f("embed_gather_q1_0")?,
+            embed_gather_q2_0_g64: f("embed_gather_q2_0_g64")?,
+            embed_gather_q2_0_g128: f("embed_gather_q2_0_g128")?,
             rope_select: f("rope_select")?,
             ssm_gates: f("ssm_gates")?,
+            ssm_gates_batched: f("ssm_gates_batched")?,
             deinterleave_qgate: f("deinterleave_qgate")?,
+            deinterleave_qgate_batched: f("deinterleave_qgate_batched")?,
             attn_coalesced: std::env::var("CAMELID_ATTN_COALESCED")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
@@ -3554,22 +5851,111 @@ pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Tile Q1_0 into a same-size row-supertile layout. For every <=128-row tile and
+/// K=128 block the bytes are `[nr * 16 signs][nr * 2 scales]`. Full tiles make
+/// every eight-row decode sign slab one aligned/coalesced 128-byte transaction;
+/// tail tiles retain only their live rows, so the tensor stays exactly 18 bytes
+/// per logical row/block with no padding or duplicate VRAM copy.
+pub(crate) fn repack_q1_t128(bytes: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String> {
+    if cols == 0 || !cols.is_multiple_of(128) {
+        return Err(format!(
+            "Q1T128 cols {cols} must be a non-zero multiple of 128"
+        ));
+    }
+    let blocks_per_row = cols / 128;
+    let expected = rows
+        .checked_mul(blocks_per_row)
+        .and_then(|blocks| blocks.checked_mul(18))
+        .ok_or_else(|| "Q1T128 shape byte count overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "Q1T128 wire length {} != rows {rows} * blocks {blocks_per_row} * 18 = {expected}",
+            bytes.len()
+        ));
+    }
+    let mut out = vec![0u8; expected];
+    let mut dst_group = 0usize;
+    for row0 in (0..rows).step_by(128) {
+        let nr = (rows - row0).min(128);
+        for block in 0..blocks_per_row {
+            let signs = dst_group;
+            let scales = signs + nr * 16;
+            for row_in_tile in 0..nr {
+                let src = ((row0 + row_in_tile) * blocks_per_row + block) * 18;
+                out[signs + row_in_tile * 16..signs + (row_in_tile + 1) * 16]
+                    .copy_from_slice(&bytes[src + 2..src + 18]);
+                out[scales + row_in_tile * 2..scales + (row_in_tile + 1) * 2]
+                    .copy_from_slice(&bytes[src..src + 2]);
+            }
+            dst_group += nr * 18;
+        }
+    }
+    debug_assert_eq!(dst_group, expected);
+    Ok(out)
+}
+
+#[cfg(test)]
+pub(crate) fn unpack_q1_t128(bytes: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String> {
+    if cols == 0 || !cols.is_multiple_of(128) {
+        return Err(format!(
+            "Q1T128 cols {cols} must be a non-zero multiple of 128"
+        ));
+    }
+    let blocks_per_row = cols / 128;
+    let expected = rows * blocks_per_row * 18;
+    if bytes.len() != expected {
+        return Err(format!("Q1T128 tiled length {} != {expected}", bytes.len()));
+    }
+    let mut out = vec![0u8; expected];
+    let mut src_group = 0usize;
+    for row0 in (0..rows).step_by(128) {
+        let nr = (rows - row0).min(128);
+        for block in 0..blocks_per_row {
+            let signs = src_group;
+            let scales = signs + nr * 16;
+            for row_in_tile in 0..nr {
+                let dst = ((row0 + row_in_tile) * blocks_per_row + block) * 18;
+                out[dst..dst + 2].copy_from_slice(
+                    &bytes[scales + row_in_tile * 2..scales + (row_in_tile + 1) * 2],
+                );
+                out[dst + 2..dst + 18].copy_from_slice(
+                    &bytes[signs + row_in_tile * 16..signs + (row_in_tile + 1) * 16],
+                );
+            }
+            src_group += nr * 18;
+        }
+    }
+    Ok(out)
+}
+
 /// Repack one projection's wire bytes into the GPU layout its lane reads. Q8_0 is
 /// repacked to the SoA layout `q8_gemv` reads; the K-quant lanes pass the RAW GGUF
 /// super-block wire bytes straight through — `q4k_gemv` (144 B/sb) and `q6k_gemv`
 /// (210 B/sb) expand the nibbles / unpack the packed scales on the fly. Keeping the
 /// nibbles PACKED in VRAM is what lets 8B-Q4_K_M fit a 6 GB card: a host-side nibble
 /// expansion to i8 would near-double the Q4_K footprint (256 vs 128 bytes/sb).
-fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
-    match q {
+fn repack_for_lane(
+    bytes: &[u8],
+    q: ProjQuant,
+    rows: usize,
+    cols: usize,
+    q1_tiled: bool,
+) -> Result<Vec<u8>, String> {
+    let repacked = match q {
         ProjQuant::Q8_0 => repack_q8_soa(bytes),
         ProjQuant::Q6K => pad_q6k_blocks(bytes),
         ProjQuant::Q4K => swz_q4k_blocks(bytes),
         ProjQuant::Q5K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
+        ProjQuant::Q1_0 if q1_tiled => {
+            return repack_q1_t128(bytes, rows, cols);
+        }
         // IQ4_XS is read straight from the 136-byte GGUF wire (raw passthrough, like
         // Q5_K/Q2_K/Q3_K): the kernel unpacks nibbles/codebook on the fly.
-        ProjQuant::IQ4XS => bytes.to_vec(),
-    }
+        ProjQuant::IQ4XS | ProjQuant::Q1_0 | ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128 => {
+            bytes.to_vec()
+        }
+    };
+    Ok(repacked)
 }
 
 /// GPU-side Q4_K quant-byte swizzle (VRAM size unchanged, 144 B/sb): within each
@@ -3753,6 +6139,608 @@ pub(crate) fn launch_gemv_residual(
         .arg(weight)
         .arg(&r)
         .arg(&bpr)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Packed Prism Q1_0/Q2_0 GEMV over the original f32 activation. Grid geometry
+/// follows the Metal parity kernels, with each warp reusing one activation slice
+/// across eight Q1 or Q2 output rows without changing per-row reduction order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_low_bit_f32_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    bits: usize,
+    weight_block_elements: usize,
+    q1_tiled: bool,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let work_items = rows.div_ceil(8) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (work_items.div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: if bits == 1 { 4 * 128 * 4 } else { 0 },
+    };
+    let (rows, blocks_per_row, bits, elements, q1_tiled) = (
+        rows as i32,
+        (cols / weight_block_elements) as i32,
+        bits as i32,
+        weight_block_elements as i32,
+        i32::from(q1_tiled),
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(input)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&blocks_per_row)
+        .arg(&bits)
+        .arg(&elements)
+        .arg(&q1_tiled)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Packed Prism Q1_0 by Q8_0 decode GEMV. One warp computes eight output rows
+/// while reusing every activation chunk across them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1_q8_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    input_scales: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let work_items = rows.div_ceil(8) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (work_items.div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (rows, cols, blocks_per_row) = (rows as i32, cols as i32, (cols / 128) as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants)
+        .arg(input_scales)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&cols)
+        .arg(&blocks_per_row)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_prism_q8_32_bitplanes_qsum(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    bitplanes: &mut CudaSlice<u32>,
+    qsums: &mut CudaSlice<i32>,
+    n_chunks: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(input_quants.len() >= n_chunks * 32);
+    debug_assert!(bitplanes.len() >= n_chunks * 8);
+    debug_assert!(qsums.len() >= n_chunks);
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n_chunks as u32).div_ceil(block / 32), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_chunks = n_chunks as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants).arg(bitplanes).arg(qsums).arg(&n_chunks);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1t128_q8_popc_gemv_m16(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_bitplanes: &CudaSlice<u32>,
+    input_qsums: &CudaSlice<i32>,
+    input_scales: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert_eq!(cols % 128, 0);
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(128), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (rows, blocks_per_row) = (rows as i32, (cols / 128) as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(input_bitplanes)
+        .arg(input_qsums)
+        .arg(input_scales)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&blocks_per_row)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1t128_q8_popc_fused_ffn_bonsai27b(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_bitplanes: &CudaSlice<u32>,
+    input_qsums: &CudaSlice<i32>,
+    input_scales: &CudaSlice<f32>,
+    gate_weight: &CudaView<u8>,
+    up_weight: &CudaView<u8>,
+    gate_out: &mut CudaSlice<f32>,
+    up_out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(input_bitplanes.len() >= 5_120 / 4);
+    debug_assert!(input_qsums.len() >= 5_120 / 32);
+    debug_assert!(input_scales.len() >= 5_120 / 32);
+    debug_assert!(gate_weight.len() >= 17_408 * 40 * 18);
+    debug_assert!(up_weight.len() >= 17_408 * 40 * 18);
+    debug_assert!(gate_out.len() >= 17_408);
+    debug_assert!(up_out.len() >= 17_408);
+    let cfg = LaunchConfig {
+        grid_dim: (17_408u32 / 128, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = s.launch_builder(f);
+    b.arg(input_bitplanes)
+        .arg(input_qsums)
+        .arg(input_scales)
+        .arg(gate_weight)
+        .arg(up_weight)
+        .arg(gate_out)
+        .arg(up_out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1t128_q8_popc_fused_full_bonsai27b(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_bitplanes: &CudaSlice<u32>,
+    input_qsums: &CudaSlice<i32>,
+    input_scales: &CudaSlice<f32>,
+    qgate_weight: &CudaView<u8>,
+    k_weight: &CudaView<u8>,
+    v_weight: &CudaView<u8>,
+    qgate_out: &mut CudaSlice<f32>,
+    k_out: &mut CudaSlice<f32>,
+    v_out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(input_bitplanes.len() >= 5_120 / 4);
+    debug_assert!(input_qsums.len() >= 5_120 / 32);
+    debug_assert!(input_scales.len() >= 5_120 / 32);
+    debug_assert!(qgate_weight.len() >= 12_288 * 40 * 18);
+    debug_assert!(k_weight.len() >= 1_024 * 40 * 18);
+    debug_assert!(v_weight.len() >= 1_024 * 40 * 18);
+    debug_assert!(qgate_out.len() >= 12_288);
+    debug_assert!(k_out.len() >= 1_024);
+    debug_assert!(v_out.len() >= 1_024);
+    let cfg = LaunchConfig {
+        grid_dim: (112, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = s.launch_builder(f);
+    b.arg(input_bitplanes)
+        .arg(input_qsums)
+        .arg(input_scales)
+        .arg(qgate_weight)
+        .arg(k_weight)
+        .arg(v_weight)
+        .arg(qgate_out)
+        .arg(k_out)
+        .arg(v_out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1t128_q8_popc_fused_ssm_bonsai27b(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_bitplanes: &CudaSlice<u32>,
+    input_qsums: &CudaSlice<i32>,
+    input_scales: &CudaSlice<f32>,
+    wqkv_weight: &CudaView<u8>,
+    z_weight: &CudaView<u8>,
+    beta_weight: &CudaView<u8>,
+    alpha_weight: &CudaView<u8>,
+    wqkv_out: &mut CudaSlice<f32>,
+    z_out: &mut CudaSlice<f32>,
+    beta_out: &mut CudaSlice<f32>,
+    alpha_out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(input_bitplanes.len() >= 5_120 / 4);
+    debug_assert!(input_qsums.len() >= 5_120 / 32);
+    debug_assert!(input_scales.len() >= 5_120 / 32);
+    debug_assert!(wqkv_weight.len() >= 10_240 * 40 * 18);
+    debug_assert!(z_weight.len() >= 6_144 * 40 * 18);
+    debug_assert!(beta_weight.len() >= 48 * 40 * 18);
+    debug_assert!(alpha_weight.len() >= 48 * 40 * 18);
+    debug_assert!(wqkv_out.len() >= 10_240);
+    debug_assert!(z_out.len() >= 6_144);
+    debug_assert!(beta_out.len() >= 48);
+    debug_assert!(alpha_out.len() >= 48);
+    let cfg = LaunchConfig {
+        grid_dim: (130, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = s.launch_builder(f);
+    b.arg(input_bitplanes)
+        .arg(input_qsums)
+        .arg(input_scales)
+        .arg(wqkv_weight)
+        .arg(z_weight)
+        .arg(beta_weight)
+        .arg(alpha_weight)
+        .arg(wqkv_out)
+        .arg(z_out)
+        .arg(beta_out)
+        .arg(alpha_out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Decode-only projection fusion for the exact Bonsai-27B full-attention
+/// geometry: qgate=12,288 rows and K/V=1,024 rows, all with K=5,120 Q1T128.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1t128_fused_full_bonsai27b(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    input_scales: &CudaSlice<f32>,
+    qgate_weight: &CudaView<u8>,
+    k_weight: &CudaView<u8>,
+    v_weight: &CudaView<u8>,
+    qgate_out: &mut CudaSlice<f32>,
+    k_out: &mut CudaSlice<f32>,
+    v_out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(input_quants.len() >= 5_120);
+    debug_assert!(input_scales.len() >= 160);
+    debug_assert!(qgate_weight.len() >= 12_288 * 40 * 18);
+    debug_assert!(k_weight.len() >= 1_024 * 40 * 18);
+    debug_assert!(v_weight.len() >= 1_024 * 40 * 18);
+    debug_assert!(qgate_out.len() >= 12_288);
+    debug_assert!(k_out.len() >= 1_024);
+    debug_assert!(v_out.len() >= 1_024);
+    let cfg = LaunchConfig {
+        grid_dim: (192, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants)
+        .arg(input_scales)
+        .arg(qgate_weight)
+        .arg(k_weight)
+        .arg(v_weight)
+        .arg(qgate_out)
+        .arg(k_out)
+        .arg(v_out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Decode-only projection fusion for the exact Bonsai-27B SSM input geometry:
+/// wqkv=10,240, z=6,144, beta=48, alpha=48 rows, all with K=5,120 Q1T128.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1t128_fused_ssm_bonsai27b(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    input_scales: &CudaSlice<f32>,
+    wqkv_weight: &CudaView<u8>,
+    z_weight: &CudaView<u8>,
+    beta_weight: &CudaView<u8>,
+    alpha_weight: &CudaView<u8>,
+    wqkv_out: &mut CudaSlice<f32>,
+    z_out: &mut CudaSlice<f32>,
+    beta_out: &mut CudaSlice<f32>,
+    alpha_out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(input_quants.len() >= 5_120);
+    debug_assert!(input_scales.len() >= 160);
+    debug_assert!(wqkv_weight.len() >= 10_240 * 40 * 18);
+    debug_assert!(z_weight.len() >= 6_144 * 40 * 18);
+    debug_assert!(beta_weight.len() >= 48 * 40 * 18);
+    debug_assert!(alpha_weight.len() >= 48 * 40 * 18);
+    debug_assert!(wqkv_out.len() >= 10_240);
+    debug_assert!(z_out.len() >= 6_144);
+    debug_assert!(beta_out.len() >= 48);
+    debug_assert!(alpha_out.len() >= 48);
+    let cfg = LaunchConfig {
+        grid_dim: (160, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants)
+        .arg(input_scales)
+        .arg(wqkv_weight)
+        .arg(z_weight)
+        .arg(beta_weight)
+        .arg(alpha_weight)
+        .arg(wqkv_out)
+        .arg(z_out)
+        .arg(beta_out)
+        .arg(alpha_out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Decode-only projection fusion for the exact Bonsai-27B FFN geometry:
+/// gate/up=17,408 rows with K=5,120 Q1T128.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1t128_fused_ffn_bonsai27b(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    input_scales: &CudaSlice<f32>,
+    gate_weight: &CudaView<u8>,
+    up_weight: &CudaView<u8>,
+    gate_out: &mut CudaSlice<f32>,
+    up_out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(input_quants.len() >= 5_120);
+    debug_assert!(input_scales.len() >= 160);
+    debug_assert!(gate_weight.len() >= 17_408 * 40 * 18);
+    debug_assert!(up_weight.len() >= 17_408 * 40 * 18);
+    debug_assert!(gate_out.len() >= 17_408);
+    debug_assert!(up_out.len() >= 17_408);
+    let cfg = LaunchConfig {
+        grid_dim: (272, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants)
+        .arg(input_scales)
+        .arg(gate_weight)
+        .arg(up_weight)
+        .arg(gate_out)
+        .arg(up_out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Packed Prism Q1_0 prompt GEMM over `k_tokens` token-major f32 rows. The
+/// kernel supports one or two tokens and writes token-major output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1_f32_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    k_tokens: usize,
+    q1_tiled: bool,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!((1..=2).contains(&k_tokens));
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows.div_ceil(4) as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: (k_tokens * 4 * 128 * std::mem::size_of::<f32>()) as u32,
+    };
+    let (rows, cols, blocks_per_row, k_tokens, q1_tiled) = (
+        rows as i32,
+        cols as i32,
+        (cols / 128) as i32,
+        k_tokens as i32,
+        i32::from(q1_tiled),
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(input)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&cols)
+        .arg(&blocks_per_row)
+        .arg(&k_tokens)
+        .arg(&q1_tiled)
+        .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Packed Prism Q1_0 by Q8_0 activation MMQ over up to eight token-major rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1_q8_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    input_scales: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    k_tokens: usize,
+    q1_tiled: bool,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!((1..=MAX_PRISM_PREFILL_K).contains(&k_tokens));
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (rows as u32).div_ceil(warps_per_block),
+            (k_tokens as u32).div_ceil(8),
+            1,
+        ),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (rows, cols, blocks_per_row, k_tokens, q1_tiled) = (
+        rows as i32,
+        cols as i32,
+        (cols / 128) as i32,
+        k_tokens as i32,
+        i32::from(q1_tiled),
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants)
+        .arg(input_scales)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&cols)
+        .arg(&blocks_per_row)
+        .arg(&k_tokens)
+        .arg(&q1_tiled)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Packed Prism Q1_0 by Q8_0 prompt MMQ using signed-int8 tensor cores. A CTA
+/// evaluates 16 output rows by as many as 128 tokens, so the packed Q1 tile is
+/// fetched and decoded once for eight WMMA warps.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1_q8_wmma_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_quants: &CudaSlice<i8>,
+    input_scales: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    k_tokens: usize,
+    q1_tiled: bool,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!((1..=128).contains(&k_tokens));
+    // A short multimodal tail uses only one 16-token warp.  Halving the CTA
+    // keeps the same 128-row weight tile and fragment mapping while allowing
+    // twice as many independent row CTAs to reside on an SM; the four inactive
+    // prompt warps in the 256-thread shape only consumed registers.
+    let block_threads = if k_tokens <= 16 { 128 } else { 256 };
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (rows as u32).div_ceil(128),
+            (k_tokens as u32).div_ceil(128),
+            1,
+        ),
+        block_dim: (block_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (rows, cols, blocks_per_row, k_tokens, q1_tiled) = (
+        rows as i32,
+        cols as i32,
+        (cols / 128) as i32,
+        k_tokens as i32,
+        i32::from(q1_tiled),
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(input_quants)
+        .arg(input_scales)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&cols)
+        .arg(&blocks_per_row)
+        .arg(&k_tokens)
+        .arg(&q1_tiled)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Production f32 -> Q8/128 two's-complement bit-slice packer for the SM80
+/// BMMA prompt lane. `bitplanes` holds exactly one byte per
+/// activation value, arranged `[k_block][plane][token][u32_word]`; scales are
+/// f16-rounded f32 values arranged `[k_block][token]`.
+pub(crate) fn launch_prism_q8_b128_bitpack(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input: &CudaSlice<f32>,
+    bitplanes: &mut CudaSlice<u32>,
+    scales: &mut CudaSlice<f32>,
+    cols: usize,
+    k_tokens: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert_eq!(cols % 128, 0);
+    debug_assert!(k_tokens > 0);
+    debug_assert!(bitplanes.len() >= k_tokens * cols / std::mem::size_of::<u32>());
+    debug_assert!(scales.len() >= k_tokens * (cols / 128));
+    let cfg = LaunchConfig {
+        grid_dim: ((cols / 128) as u32, k_tokens as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (cols, k_tokens) = (cols as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(input)
+        .arg(bitplanes)
+        .arg(scales)
+        .arg(&cols)
+        .arg(&k_tokens);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// SM80+ Q1_0 x Q8/128 binary-MMA prompt kernel. Dispatch is guarded by the
+/// measured token crossover and retains DP4A/IMMA fallbacks for every other
+/// device, shape, or A/B configuration.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_q1_q8_b128_bmma_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    input_bitplanes: &CudaSlice<u32>,
+    input_scales: &CudaSlice<f32>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    k_tokens: usize,
+    q1_tiled: bool,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert_eq!(cols % 128, 0);
+    debug_assert!((1..=MAX_PRISM_PREFILL_K).contains(&k_tokens));
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (rows as u32).div_ceil(128),
+            (k_tokens as u32).div_ceil(128),
+            1,
+        ),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: if q1_tiled { 0 } else { 128 * 16 },
+    };
+    let (rows, cols, blocks_per_row, k_tokens, q1_tiled) = (
+        rows as i32,
+        cols as i32,
+        (cols / 128) as i32,
+        k_tokens as i32,
+        i32::from(q1_tiled),
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(input_bitplanes)
+        .arg(input_scales)
+        .arg(weight)
+        .arg(&rows)
+        .arg(&cols)
+        .arg(&blocks_per_row)
+        .arg(&k_tokens)
+        .arg(&q1_tiled)
         .arg(out)
         .arg(&residual);
     unsafe { b.launch(cfg) }.map(|_| ())
@@ -4151,6 +7139,7 @@ fn dispatch_gemv(
     s: &Arc<CudaStream>,
     kern: &CudaResidentKernels,
     lane: ProjQuant,
+    input_f32: &CudaSlice<f32>,
     q8_0_scales: &CudaSlice<f32>,
     q8_0_quants: &CudaSlice<i8>,
     q8k_scales: &CudaSlice<f32>,
@@ -4253,6 +7242,42 @@ fn dispatch_gemv(
             out,
             residual,
         ),
+        ProjQuant::Q1_0 if kern.fast_q1 => {
+            let function = if kern.q1_tiled {
+                &kern.prism_q1t128_q8_gemv
+            } else {
+                &kern.prism_q1_q8_gemv
+            };
+            launch_prism_q1_q8_gemv(
+                s,
+                function,
+                q8_0_quants,
+                q8_0_scales,
+                weight,
+                rows,
+                cols,
+                out,
+                residual,
+            )
+        }
+        ProjQuant::Q1_0 | ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128 => {
+            let (bits, block_elements) = lane
+                .prism_layout()
+                .expect("Prism projection lane has a wire layout");
+            launch_prism_low_bit_f32_gemv(
+                s,
+                &kern.prism_low_bit_f32_gemv,
+                input_f32,
+                weight,
+                rows,
+                cols,
+                bits,
+                block_elements,
+                lane == ProjQuant::Q1_0 && kern.q1_tiled,
+                out,
+                residual,
+            )
+        }
     }
 }
 
@@ -4263,8 +7288,12 @@ fn dispatch_gemm_batched(
     s: &Arc<CudaStream>,
     kern: &CudaResidentKernels,
     lane: ProjQuant,
+    input_f32: &CudaSlice<f32>,
     q8_0_scales: &CudaSlice<f32>,
     q8_0_quants: &CudaSlice<i8>,
+    q8_b128_bitplanes: &CudaSlice<u32>,
+    q8_b128_scales: &CudaSlice<f32>,
+    bmma_ready: bool,
     q8k_scales: &CudaSlice<f32>,
     q8k_quants: &CudaSlice<i8>,
     weight: &CudaSlice<u8>,
@@ -4272,7 +7301,12 @@ fn dispatch_gemm_batched(
     cols: usize,
     k_tokens: usize,
     out: &mut CudaSlice<f32>,
+    residual: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert!(
+        residual == 0 || (lane == ProjQuant::Q1_0 && kern.fast_q1),
+        "batched residual epilogue is implemented by the fast Q1 kernels"
+    );
     match lane {
         ProjQuant::Q8_0 => launch_gemm_batched(
             s,
@@ -4309,6 +7343,78 @@ fn dispatch_gemm_batched(
             8,
             out,
         ),
+        ProjQuant::Q1_0 if bmma_ready && prism_bmma_shape_enabled(kern, cols, k_tokens) => {
+            launch_prism_q1_q8_b128_bmma_gemm_batched(
+                s,
+                kern.prism_q1_q8_b128_bmma_gemm_batched
+                    .as_ref()
+                    .expect("BMMA policy requires the SM80 function"),
+                q8_b128_bitplanes,
+                q8_b128_scales,
+                &weight.slice(0..weight.len()),
+                rows,
+                cols,
+                k_tokens,
+                kern.q1_tiled,
+                out,
+                residual,
+            )
+        }
+        ProjQuant::Q1_0 if kern.fast_q1 && k_tokens >= 32 => {
+            if let Some(f) = &kern.prism_q1_q8_wmma_gemm_batched {
+                launch_prism_q1_q8_wmma_gemm_batched(
+                    s,
+                    f,
+                    q8_0_quants,
+                    q8_0_scales,
+                    &weight.slice(0..weight.len()),
+                    rows,
+                    cols,
+                    k_tokens,
+                    kern.q1_tiled,
+                    out,
+                    residual,
+                )
+            } else {
+                launch_prism_q1_q8_gemm_batched(
+                    s,
+                    &kern.prism_q1_q8_gemm_batched,
+                    q8_0_quants,
+                    q8_0_scales,
+                    &weight.slice(0..weight.len()),
+                    rows,
+                    cols,
+                    k_tokens,
+                    kern.q1_tiled,
+                    out,
+                    residual,
+                )
+            }
+        }
+        ProjQuant::Q1_0 if kern.fast_q1 => launch_prism_q1_q8_gemm_batched(
+            s,
+            &kern.prism_q1_q8_gemm_batched,
+            q8_0_quants,
+            q8_0_scales,
+            &weight.slice(0..weight.len()),
+            rows,
+            cols,
+            k_tokens,
+            kern.q1_tiled,
+            out,
+            residual,
+        ),
+        ProjQuant::Q1_0 => launch_prism_q1_f32_gemm_batched(
+            s,
+            &kern.prism_q1_f32_gemm_batched,
+            input_f32,
+            &weight.slice(0..weight.len()),
+            rows,
+            cols,
+            k_tokens,
+            kern.q1_tiled,
+            out,
+        ),
         _ => unreachable!("unsupported batched projection lane: {lane:?}"),
     }
 }
@@ -4320,13 +7426,35 @@ fn quantize_batched_for_lanes(
     x: &CudaSlice<f32>,
     q8_0_quants: &mut CudaSlice<i8>,
     q8_0_scales: &mut CudaSlice<f32>,
+    q8_b128_bitplanes: &mut CudaSlice<u32>,
+    q8_b128_scales: &mut CudaSlice<f32>,
     q8k_quants: &mut CudaSlice<i8>,
     q8k_scales: &mut CudaSlice<f32>,
     cols: usize,
     k_tokens: usize,
     lanes: &[ProjQuant],
-) -> Result<(), cudarc::driver::DriverError> {
-    if lanes.contains(&ProjQuant::Q8_0) {
+) -> Result<bool, cudarc::driver::DriverError> {
+    let bmma_ready = lanes.iter().any(|q| *q == ProjQuant::Q1_0)
+        && prism_bmma_shape_enabled(kern, cols, k_tokens);
+    if bmma_ready {
+        launch_prism_q8_b128_bitpack(
+            s,
+            kern.prism_q8_b128_bitpack
+                .as_ref()
+                .expect("BMMA policy requires the SM80 packer"),
+            x,
+            q8_b128_bitplanes,
+            q8_b128_scales,
+            cols,
+            k_tokens,
+        )?;
+    }
+    // A Q1-only BMMA group does not need the legacy Q8/32 copy. Mixed groups
+    // still prepare it once for any Q8_0 projection sharing this activation.
+    if lanes
+        .iter()
+        .any(|q| q.needs_q8_0(kern.fast_q1) && !(*q == ProjQuant::Q1_0 && bmma_ready))
+    {
         launch_quantize(
             s,
             &kern.quantize,
@@ -4346,7 +7474,7 @@ fn quantize_batched_for_lanes(
             k_tokens * (cols / 256),
         )?;
     }
-    Ok(())
+    Ok(bmma_ready)
 }
 
 /// Standalone Q8_K activation quantize: f32 row `[n_sb*256]` -> `n_sb` Q8_K blocks
@@ -4548,6 +7676,59 @@ pub(crate) fn launch_rms_norm_batched(
     let (n_i, k_i) = (n as i32, k as i32);
     let mut b = s.launch_builder(f);
     b.arg(x).arg(w).arg(out).arg(&n_i).arg(&eps).arg(&k_i);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Bonsai fast RMSNorm -> Q8 activation for `k` token rows. This intentionally
+/// uses a parallel reduction and is therefore part of the approximate fast Q1
+/// contract, never the strict parity lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_prism_rms_norm_q8_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n: usize,
+    eps: f32,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (k as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (n, k) = (n as i32, k as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(x)
+        .arg(w)
+        .arg(quants)
+        .arg(scales)
+        .arg(&n)
+        .arg(&eps)
+        .arg(&k);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Bonsai fast lane-parallel SwiGLU -> Q8 activation.
+pub(crate) fn launch_prism_silu_mul_q8_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n_blocks: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n_blocks as u32).div_ceil(8), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_blocks = n_blocks as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(gate).arg(up).arg(quants).arg(scales).arg(&n_blocks);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -4869,7 +8050,7 @@ pub(crate) fn launch_ssm_gates(
     dt_bias: &CudaSlice<f32>,
     a: &CudaSlice<f32>,
     beta_out: &mut CudaSlice<f32>,
-    glog_out: &mut CudaSlice<f32>,
+    decay_out: &mut CudaSlice<f32>,
     nv: usize,
 ) -> Result<(), cudarc::driver::DriverError> {
     let cfg = LaunchConfig {
@@ -4884,7 +8065,7 @@ pub(crate) fn launch_ssm_gates(
         .arg(dt_bias)
         .arg(a)
         .arg(beta_out)
-        .arg(glog_out)
+        .arg(decay_out)
         .arg(&nvi);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
@@ -4950,7 +8131,7 @@ pub(crate) fn launch_ssm_delta_rule(
     value_dim: usize,
     z: &CudaSlice<f32>,
     beta: &CudaSlice<f32>,
-    glog: &CudaSlice<f32>,
+    decay: &CudaSlice<f32>,
     ssm_norm: &CudaSlice<f32>,
     out: &mut CudaSlice<f32>,
     d_state: usize,
@@ -4974,7 +8155,7 @@ pub(crate) fn launch_ssm_delta_rule(
         .arg(&vv)
         .arg(z)
         .arg(beta)
-        .arg(glog)
+        .arg(decay)
         .arg(ssm_norm)
         .arg(out)
         .arg(&dsi)
@@ -5020,6 +8201,321 @@ pub(crate) fn launch_sigmoid_mul(
     let ni = n as i32;
     let mut b = s.launch_builder(f);
     b.arg(out).arg(gate).arg(&ni);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_ssm_gates_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    beta_raw: &CudaSlice<f32>,
+    alpha_raw: &CudaSlice<f32>,
+    dt_bias: &CudaSlice<f32>,
+    a: &CudaSlice<f32>,
+    beta_out: &mut CudaSlice<f32>,
+    decay_out: &mut CudaSlice<f32>,
+    nv: usize,
+    k_tokens: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = nv * k_tokens;
+    let cfg = LaunchConfig {
+        grid_dim: ((total as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nvi, ki) = (nv as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(beta_raw)
+        .arg(alpha_raw)
+        .arg(dt_bias)
+        .arg(a)
+        .arg(beta_out)
+        .arg(decay_out)
+        .arg(&nvi)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_ssm_conv1d_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    conv_w: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    conv_state: &mut CudaSlice<f32>,
+    conv_out: &mut CudaSlice<f32>,
+    conv_dim: usize,
+    d_conv: usize,
+    k_tokens: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((conv_dim as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (cdi, dci, ki) = (conv_dim as i32, d_conv as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(conv_w)
+        .arg(x)
+        .arg(conv_state)
+        .arg(conv_out)
+        .arg(&cdi)
+        .arg(&dci)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_ssm_l2_norm_per_head_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    buf: &mut CudaSlice<f32>,
+    token_stride: usize,
+    offset: usize,
+    head_count: usize,
+    head_dim: usize,
+    k_tokens: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((k_tokens * head_count) as u32, 1, 1),
+        block_dim: (head_dim as u32, 1, 1),
+        shared_mem_bytes: (head_dim as u32) * 4,
+    };
+    let (stride, off, heads, dim, ki) = (
+        token_stride as i32,
+        offset as i32,
+        head_count as i32,
+        head_dim as i32,
+        k_tokens as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(buf)
+        .arg(&stride)
+        .arg(&off)
+        .arg(&heads)
+        .arg(&dim)
+        .arg(&ki)
+        .arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_ssm_delta_rule_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    state: &mut CudaSlice<f32>,
+    conv_out: &CudaSlice<f32>,
+    z: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    decay: &CudaSlice<f32>,
+    ssm_norm: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    d_state: usize,
+    nk: usize,
+    nv: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_dim: usize,
+    k_tokens: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (nv as u32, 1, 1),
+        block_dim: (d_state as u32, 1, 1),
+        shared_mem_bytes: (3 * d_state as u32) * 4,
+    };
+    let (ds, nk, nv, kd, vd, cd, ki) = (
+        d_state as i32,
+        nk as i32,
+        nv as i32,
+        key_dim as i32,
+        value_dim as i32,
+        conv_dim as i32,
+        k_tokens as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(state)
+        .arg(conv_out)
+        .arg(z)
+        .arg(beta)
+        .arg(decay)
+        .arg(ssm_norm)
+        .arg(out)
+        .arg(&ds)
+        .arg(&nk)
+        .arg(&nv)
+        .arg(&kd)
+        .arg(&vd)
+        .arg(&cd)
+        .arg(&ki)
+        .arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Bonsai/Qwen3.5 four-tap convolution.  The history stays in registers for
+/// every token in the prompt chunk and is committed once at the end.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_qwen35_ssm_conv1d_d4_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    conv_w: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    conv_state: &mut CudaSlice<f32>,
+    conv_out: &mut CudaSlice<f32>,
+    conv_dim: usize,
+    k_tokens: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((conv_dim as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (cd, kt) = (conv_dim as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(conv_w)
+        .arg(x)
+        .arg(conv_state)
+        .arg(conv_out)
+        .arg(&cd)
+        .arg(&kt);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Paired Q/K L2 normalization for the D=128 Bonsai SSM geometry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_qwen35_ssm_qk_l2_norm_d128_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    conv: &mut CudaSlice<f32>,
+    conv_dim: usize,
+    key_dim: usize,
+    n_key_heads: usize,
+    k_tokens: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((k_tokens * n_key_heads) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (cd, kd, nkh, kt) = (
+        conv_dim as i32,
+        key_dim as i32,
+        n_key_heads as i32,
+        k_tokens as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(conv).arg(&cd).arg(&kd).arg(&nkh).arg(&kt).arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Register-sharded D=128 delta rule.  This launch is valid only for the
+/// Qwen3.5/Bonsai state geometry checked by the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_qwen35_ssm_delta_rule_d128_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    state: &mut CudaSlice<f32>,
+    conv_out: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    decay: &CudaSlice<f32>,
+    raw_out: &mut CudaSlice<f32>,
+    nk: usize,
+    nv: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_dim: usize,
+    k_tokens: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (nv as u32, 1, 4),
+        block_dim: (32, 8, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nk, nv, kd, vd, cd, kt) = (
+        nk as i32,
+        nv as i32,
+        key_dim as i32,
+        value_dim as i32,
+        conv_dim as i32,
+        k_tokens as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(state)
+        .arg(conv_out)
+        .arg(beta)
+        .arg(decay)
+        .arg(raw_out)
+        .arg(&nk)
+        .arg(&nv)
+        .arg(&kd)
+        .arg(&vd)
+        .arg(&cd)
+        .arg(&kt);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Fused D=128 gated RMSNorm and Q8 activation writer for the Q1 ssm_out
+/// projection. The recurrence's raw f32 result is never materialized again.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_qwen35_ssm_rmsnorm_gate_q8_d128_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    raw: &CudaSlice<f32>,
+    z: &CudaSlice<f32>,
+    ssm_norm: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    nv: usize,
+    value_dim: usize,
+    k_tokens: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((k_tokens * nv) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nv, vd, kt) = (nv as i32, value_dim as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(raw)
+        .arg(z)
+        .arg(ssm_norm)
+        .arg(quants)
+        .arg(scales)
+        .arg(&nv)
+        .arg(&vd)
+        .arg(&kt)
+        .arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_deinterleave_qgate_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    qg: &CudaSlice<f32>,
+    q_out: &mut CudaSlice<f32>,
+    gate_out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    head_dim: usize,
+    k_tokens: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = k_tokens * n_heads * head_dim;
+    let cfg = LaunchConfig {
+        grid_dim: ((total as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nh, hd, ki) = (n_heads as i32, head_dim as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(qg)
+        .arg(q_out)
+        .arg(gate_out)
+        .arg(&nh)
+        .arg(&hd)
+        .arg(&ki);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -5742,6 +9238,9 @@ struct StreamOverlap {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProjQuant {
     Q8_0,
+    Q1_0,
+    Q2_0G64,
+    Q2_0G128,
     Q4K,
     Q5K,
     Q6K,
@@ -5751,6 +9250,28 @@ pub enum ProjQuant {
 }
 
 impl ProjQuant {
+    /// Whether this projection consumes the compact Q8_0 activation buffers.
+    fn needs_q8_0(self, fast_q1: bool) -> bool {
+        self == ProjQuant::Q8_0 || (self == ProjQuant::Q1_0 && fast_q1)
+    }
+
+    /// Whether this is one of Prism's packed low-bit rows. These projections
+    /// consume the original f32 activation to preserve the Metal oracle's
+    /// reduction association.
+    fn is_prism_low_bit(self, fast_q1: bool) -> bool {
+        matches!(self, ProjQuant::Q2_0G64 | ProjQuant::Q2_0G128)
+            || (self == ProjQuant::Q1_0 && !fast_q1)
+    }
+
+    fn prism_layout(self) -> Option<(usize, usize)> {
+        match self {
+            ProjQuant::Q1_0 => Some((1, 128)),
+            ProjQuant::Q2_0G64 => Some((2, 64)),
+            ProjQuant::Q2_0G128 => Some((2, 128)),
+            _ => None,
+        }
+    }
+
     /// Whether the GEMV reads a Q8_K activation (true for the K-quant lanes).
     fn needs_q8k(self) -> bool {
         matches!(
@@ -5768,7 +9289,10 @@ impl ProjQuant {
     /// retain the proven serial prefill path until they receive parity-checked
     /// batched kernels of their own.
     fn supports_batched(self) -> bool {
-        matches!(self, ProjQuant::Q8_0 | ProjQuant::Q4K | ProjQuant::Q6K)
+        matches!(
+            self,
+            ProjQuant::Q8_0 | ProjQuant::Q1_0 | ProjQuant::Q4K | ProjQuant::Q6K
+        )
     }
 
     /// Whether a device-side `embed_gather_*` kernel exists for this family. The
@@ -5780,7 +9304,13 @@ impl ProjQuant {
     pub(crate) fn has_device_embed_gather(self) -> bool {
         matches!(
             self,
-            ProjQuant::Q8_0 | ProjQuant::Q4K | ProjQuant::Q6K | ProjQuant::Q3K
+            ProjQuant::Q8_0
+                | ProjQuant::Q1_0
+                | ProjQuant::Q2_0G64
+                | ProjQuant::Q2_0G128
+                | ProjQuant::Q4K
+                | ProjQuant::Q6K
+                | ProjQuant::Q3K
         )
     }
 }
@@ -5873,7 +9403,7 @@ struct Qwen35Gpu {
     d_conv_out: CudaSlice<f32>,  // conv_dim  (post-conv, sliced into q|k|v)
     d_z: CudaSlice<f32>,         // value_dim (wqkv_gate output)
     d_beta: CudaSlice<f32>,      // num_v_heads (post-sigmoid)
-    d_glog: CudaSlice<f32>,      // num_v_heads (pre-exp)
+    d_decay: CudaSlice<f32>,     // num_v_heads (post-exp)
     d_ssm_mix: CudaSlice<f32>,   // value_dim (delta-rule output, before ssm_out)
     d_qgate: CudaSlice<f32>,     // 2*q_width (full-attn fused query+gate projection)
     d_gate_attn: CudaSlice<f32>, // q_width (deinterleaved attention gate)
@@ -5920,6 +9450,7 @@ unsafe impl Send for SendCudaGraph {}
 /// `forward_token` call runs the whole per-token forward with a single sync.
 pub struct CudaResidentDecode {
     k: CudaResidentKernels,
+    artifact: ResidentCudaArtifact,
     n_layers: usize,
     n_heads: usize,
     n_kv_heads: usize,
@@ -5933,6 +9464,10 @@ pub struct CudaResidentDecode {
     q_width: usize,
     kv_width: usize,
     split_half_pairing: bool,
+    /// Exact Bonsai-27B projection fusion policy paired with `k.q1_tiled`.
+    bonsai27b_fused_projections: bool,
+    /// Exact Q8 bitplane+POPC decode policy for the SHA-pinned Windows SM86 lane.
+    bonsai27b_popc: bool,
     layers: Vec<ResidentLayer>,
     final_norm: CudaSlice<f32>,
     output_weight: CudaSlice<u8>,
@@ -5979,6 +9514,10 @@ pub struct CudaResidentDecode {
     d_ffn_act: CudaSlice<f32>,
     d_in_scales: CudaSlice<f32>,
     d_in_quants: CudaSlice<i8>,
+    /// Persistent lossless bit-sliced view of `d_in_quants`, packed once per
+    /// activation and reused by every Q1 projection consuming that activation.
+    d_in_bitplanes: CudaSlice<u32>,
+    d_in_qsums: CudaSlice<i32>,
     /// Q8_K activation scratch (K-quant lanes): `max_in/256` f32 scales + `max_in` i8
     /// quants. Separate from the Q8_0 `d_in_*` so the Q8_0 path stays byte-identical.
     d_q8k_scales: CudaSlice<f32>,
@@ -6011,12 +9550,20 @@ pub struct CudaResidentDecode {
     /// position) are written to device buffers BEFORE replay, so the frozen graph
     /// reads fresh values each step. Captured at the engine's `eps`/`scale`/`max_pos`.
     decode_graph: Option<SendCudaGraph>,
+    /// Qwen3.5 device-loop graph containing the resident layer stack, final norm,
+    /// and lm_head. Token gather, RoPE row selection, and ring argmax stay outside
+    /// because their source/destination views change per step. This still collapses
+    /// the hundreds of stable transformer/SSM launches to one graph submission.
+    device_forward_graph: Option<SendCudaGraph>,
     /// Phase 6 multi-stream overlap (side streams + join events). `None` unless
     /// `CAMELID_CUDA_STREAMS` was on at build — the flag-off path constructs
     /// nothing and stays in cudarc's single-stream mode.
     overlap: Option<StreamOverlap>,
     /// Lazily-allocated K-batched scratch for the speculative-verify forward.
     verify_scratch: Option<VerifyScratch>,
+    /// Wider prompt-only scratch. Keeping it separate preserves the small,
+    /// bounded speculative-verify allocation while Q1 prefill uses J=128.
+    prefill_scratch: Option<VerifyScratch>,
     /// Lazily-allocated TREE-verify scratch (sized to `TREE_MAX_NODES`, wider than
     /// the linear `verify_scratch`) plus the per-node KV-slot / ancestor-bitset
     /// device buffers the tree kernels read. Allocated by `ensure_tree_scratch`.
@@ -6051,6 +9598,191 @@ pub struct CudaResidentDecode {
 /// lets each weight read verify more drafts per round, raising the ceiling on
 /// repetitive/structured output where n-gram acceptance is high.
 pub(crate) const MAX_VERIFY_K: usize = 8;
+const MAX_PRISM_PREFILL_K: usize = 128;
+const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
+
+/// Fast Q1 CUDA is the production default. It matches the established
+/// Q1-by-Q8 contraction used by optimized CUDA runtimes and is deterministic,
+/// but activation quantization means it is not bit-identical to Camelid's
+/// original f32 reduction. Set `CAMELID_PRISM_CUDA_STRICT=1` for the exact lane.
+fn prism_cuda_fast_policy(strict: Option<&str>) -> bool {
+    !env_switch_enabled(strict)
+}
+
+fn prism_cuda_fast_from_env() -> bool {
+    prism_cuda_fast_policy(std::env::var("CAMELID_PRISM_CUDA_STRICT").ok().as_deref())
+}
+
+/// Artifact identity for CUDA paths whose kernels/layouts are validated against
+/// one exact model file rather than inferred from a potentially shared geometry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ResidentCudaArtifact {
+    #[default]
+    Generic,
+    PrismBonsai27bQ1,
+}
+
+const PRISM_BONSAI27B_Q1_SHA256: &str =
+    "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0";
+
+pub(crate) fn resident_cuda_artifact_from_sha256(sha256: &str) -> ResidentCudaArtifact {
+    if sha256.eq_ignore_ascii_case(PRISM_BONSAI27B_Q1_SHA256) {
+        ResidentCudaArtifact::PrismBonsai27bQ1
+    } else {
+        ResidentCudaArtifact::Generic
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrismQ1ModelPolicy {
+    /// Projection bytes are stored in the same-size Q1T128 tiled layout. This is
+    /// immutable for the engine lifetime: every uploader and reader must agree.
+    q1_tiled: bool,
+    /// The three exact-shape Bonsai projection fusions may consume that layout.
+    fused_projections: bool,
+}
+
+fn env_switch_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("on") | Some("yes"))
+}
+
+fn is_bonsai27b_geometry(
+    n_layers: usize,
+    hidden: usize,
+    ffn_dim: usize,
+    q_width: usize,
+    kv_width: usize,
+) -> bool {
+    n_layers == 64 && hidden == 5_120 && ffn_dim == 17_408 && q_width == 6_144 && kv_width == 1_024
+}
+
+/// Pure policy seam for the model-local Q1 upload/reader contract. The exact
+/// Bonsai-27B Windows fast-Q1 lane defaults to Q1T128 and its matching projection
+/// fusions together. Positive flags retain the diagnostic/bring-up paths; negative
+/// flags always win so a single process can construct a fresh engine with a
+/// different layout after a model reload.
+#[allow(clippy::too_many_arguments)]
+fn prism_q1_model_policy(
+    fast_q1: bool,
+    windows: bool,
+    artifact: ResidentCudaArtifact,
+    exact_geometry: bool,
+    q1t128_opt_in: bool,
+    q1t128_opt_out: bool,
+    fused_opt_in: bool,
+    fused_opt_out: bool,
+) -> PrismQ1ModelPolicy {
+    let exact_bonsai27b = artifact == ResidentCudaArtifact::PrismBonsai27bQ1 && exact_geometry;
+    let exact_default = fast_q1 && windows && exact_bonsai27b;
+    let q1_tiled = !q1t128_opt_out && (q1t128_opt_in || exact_default);
+    let fused_projections =
+        fast_q1 && exact_bonsai27b && q1_tiled && !fused_opt_out && (fused_opt_in || exact_default);
+    PrismQ1ModelPolicy {
+        q1_tiled,
+        fused_projections,
+    }
+}
+
+fn prism_q1_model_policy_for_geometry(
+    fast_q1: bool,
+    artifact: ResidentCudaArtifact,
+    n_layers: usize,
+    hidden: usize,
+    ffn_dim: usize,
+    q_width: usize,
+    kv_width: usize,
+) -> PrismQ1ModelPolicy {
+    let flag = |name: &str| env_switch_enabled(std::env::var(name).ok().as_deref());
+    prism_q1_model_policy(
+        fast_q1,
+        cfg!(target_os = "windows"),
+        artifact,
+        is_bonsai27b_geometry(n_layers, hidden, ffn_dim, q_width, kv_width),
+        flag("CAMELID_PRISM_CUDA_Q1T128"),
+        flag("CAMELID_PRISM_CUDA_NO_Q1T128"),
+        flag("CAMELID_PRISM_CUDA_FUSED_PROJECTIONS"),
+        flag("CAMELID_PRISM_CUDA_NO_FUSED_PROJECTIONS"),
+    )
+}
+
+/// Promotion gate for the exact POPC decode lane. This is intentionally a pure,
+/// per-engine decision: model reloads re-read the negative escape and an opt-in
+/// Q1T layout on another artifact/device can never accidentally inherit it.
+#[allow(clippy::too_many_arguments)]
+fn prism_cuda_popc_policy(
+    fast_q1: bool,
+    windows: bool,
+    artifact: ResidentCudaArtifact,
+    exact_geometry: bool,
+    q1_tiled: bool,
+    sm86: bool,
+    no_popc: bool,
+) -> bool {
+    fast_q1
+        && windows
+        && artifact == ResidentCudaArtifact::PrismBonsai27bQ1
+        && exact_geometry
+        && q1_tiled
+        && sm86
+        && !no_popc
+}
+
+fn parse_prism_bmma_min_tokens(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PRISM_BMMA_MIN_TOKENS)
+        .clamp(1, MAX_PRISM_PREFILL_K)
+}
+
+/// Binary tensor-core prompt acceleration is default-on independently of the
+/// broader fast-Q1 gate. This negative flag provides a stable A/B escape hatch
+/// without opting the entire Q1 CUDA path back into strict f32 arithmetic.
+fn prism_cuda_bmma_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CAMELID_PRISM_CUDA_NO_BMMA").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        )
+    })
+}
+
+fn prism_cuda_bmma_min_tokens() -> usize {
+    static MIN_TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN_TOKENS.get_or_init(|| {
+        parse_prism_bmma_min_tokens(
+            std::env::var("CAMELID_PRISM_CUDA_BMMA_MIN_TOKENS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn prism_bmma_dispatch_policy(
+    fast_q1: bool,
+    bmma_enabled: bool,
+    functions_available: bool,
+    cols: usize,
+    k_tokens: usize,
+    min_tokens: usize,
+) -> bool {
+    fast_q1
+        && bmma_enabled
+        && functions_available
+        && cols % 128 == 0
+        && (min_tokens..=MAX_PRISM_PREFILL_K).contains(&k_tokens)
+}
+
+fn prism_bmma_shape_enabled(kern: &CudaResidentKernels, cols: usize, k_tokens: usize) -> bool {
+    prism_bmma_dispatch_policy(
+        kern.fast_q1,
+        prism_cuda_bmma_enabled(),
+        kern.prism_q8_b128_bitpack.is_some() && kern.prism_q1_q8_b128_bmma_gemm_batched.is_some(),
+        cols,
+        k_tokens,
+        prism_cuda_bmma_min_tokens(),
+    )
+}
 
 /// K-batched scratch buffers for `verify_batch`, sized `MAX_VERIFY_K * dim`.
 struct VerifyScratch {
@@ -6060,6 +9792,10 @@ struct VerifyScratch {
     vis: CudaSlice<f32>,
     viqk: CudaSlice<i8>,
     visk: CudaSlice<f32>,
+    /// Q8/128 two's-complement bitplanes and one f16-rounded scale per
+    /// token/block. Shared by every Q1 projection consuming the same activation.
+    vibits: CudaSlice<u32>,
+    vibscales: CudaSlice<f32>,
     vq: CudaSlice<f32>,
     vk: CudaSlice<f32>,
     vv: CudaSlice<f32>,
@@ -6099,6 +9835,34 @@ fn cuda_graphs_enabled() -> bool {
         std::env::var("CAMELID_CUDA_GRAPHS").ok().as_deref(),
         Some("1") | Some("true") | Some("on") | Some("yes")
     )
+}
+
+/// The fully-resident Bonsai-27B Q1 device loop is graph-safe and materially
+/// reduces Windows/WDDM submission overhead. The shape gate lives at engagement;
+/// keep the broader legacy graph switch opt-in for other architectures. This exact
+/// lane defaults on only for Windows and has its own negative A/B escape hatch.
+fn qwen35_device_graphs_enabled() -> bool {
+    let disabled = matches!(
+        std::env::var("CAMELID_PRISM_CUDA_NO_GRAPH").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    );
+    !disabled && (cfg!(target_os = "windows") || cuda_graphs_enabled())
+}
+
+/// Use explicit resident-engine ordering instead of cudarc's per-slice automatic
+/// events. This is the Windows default because the engine already owns one dedicated
+/// stream and WDDM makes hundreds of redundant event API calls per token expensive.
+/// CUDA graph capture also requires it: a wait on an event recorded before capture is
+/// an external dependency and CUDA correctly rejects the graph as isolated.
+fn cuda_manual_stream_order_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let safe_events = matches!(
+            std::env::var("CAMELID_CUDA_SAFE_EVENTS").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
+        !safe_events && (cfg!(target_os = "windows") || cuda_graphs_enabled())
+    })
 }
 
 /// Whether decode overlaps the independent K/V and FFN-up GEMV chains of each Full
@@ -6142,10 +9906,54 @@ impl CudaResidentDecode {
         eps: f32,
         split_half_pairing: bool,
     ) -> Result<Self, String> {
-        let k = CudaResidentKernels::new()?;
-        let s = &k.stream;
+        Self::new_for_artifact(
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            split_half_pairing,
+            ResidentCudaArtifact::Generic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_artifact(
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        ffn_dim: usize,
+        rope_dim: usize,
+        max_pos: usize,
+        vocab: usize,
+        eps: f32,
+        split_half_pairing: bool,
+        artifact: ResidentCudaArtifact,
+    ) -> Result<Self, String> {
         let q_width = n_heads * head_dim;
         let kv_width = n_kv_heads * head_dim;
+        let fast_q1 = prism_cuda_fast_from_env();
+        let q1_policy = prism_q1_model_policy_for_geometry(
+            fast_q1, artifact, n_layers, hidden, ffn_dim, q_width, kv_width,
+        );
+        let k = CudaResidentKernels::new_with_q1_policy(q1_policy.q1_tiled, fast_q1)?;
+        let bonsai27b_popc = prism_cuda_popc_policy(
+            fast_q1,
+            cfg!(target_os = "windows"),
+            artifact,
+            is_bonsai27b_geometry(n_layers, hidden, ffn_dim, q_width, kv_width),
+            q1_policy.q1_tiled,
+            k.sm86,
+            env_switch_enabled(std::env::var("CAMELID_PRISM_CUDA_NO_POPC").ok().as_deref()),
+        );
+        let s = &k.stream;
         let max_in = hidden.max(ffn_dim).max(q_width); // widest quantize input
         let alloc_f = |n: usize| s.alloc_zeros::<f32>(n).map_err(|e| format!("alloc: {e}"));
         let cache_k = (0..n_layers)
@@ -6206,6 +10014,7 @@ impl CudaResidentDecode {
             None
         };
         Ok(Self {
+            artifact,
             n_layers,
             n_heads,
             n_kv_heads,
@@ -6219,6 +10028,8 @@ impl CudaResidentDecode {
             q_width,
             kv_width,
             split_half_pairing,
+            bonsai27b_fused_projections: q1_policy.fused_projections,
+            bonsai27b_popc,
             layers: Vec::with_capacity(n_layers),
             final_norm: alloc_f(hidden)?,
             output_weight: s.alloc_zeros::<u8>(1).map_err(|e| format!("alloc: {e}"))?,
@@ -6266,6 +10077,12 @@ impl CudaResidentDecode {
             d_in_quants: s
                 .alloc_zeros::<i8>(max_in)
                 .map_err(|e| format!("alloc: {e}"))?,
+            d_in_bitplanes: s
+                .alloc_zeros::<u32>(max_in / 4)
+                .map_err(|e| format!("alloc: {e}"))?,
+            d_in_qsums: s
+                .alloc_zeros::<i32>(max_in / 32)
+                .map_err(|e| format!("alloc: {e}"))?,
             d_q8k_scales: alloc_f(max_in.div_ceil(256).max(1))?,
             d_q8k_quants: s
                 .alloc_zeros::<i8>(max_in)
@@ -6276,8 +10093,10 @@ impl CudaResidentDecode {
             d_sin: alloc_f(rope_dim / 2)?,
             d_position: s.alloc_zeros::<i32>(1).map_err(|e| format!("alloc: {e}"))?,
             decode_graph: None,
+            device_forward_graph: None,
             overlap,
             verify_scratch: None,
+            prefill_scratch: None,
             tree_scratch: None,
             offload: None,
             qwen35: None,
@@ -6350,6 +10169,20 @@ impl CudaResidentDecode {
         let s = &self.k.stream;
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
         let projections = [q, kk, v, o, gate, up, down];
+        let q_rows = if self.qwen35.is_some() {
+            2 * self.q_width
+        } else {
+            self.q_width
+        };
+        let projection_shapes = [
+            (q_rows, self.hidden),
+            (self.kv_width, self.hidden),
+            (self.kv_width, self.hidden),
+            (self.hidden, self.q_width),
+            (self.ffn_dim, self.hidden),
+            (self.ffn_dim, self.hidden),
+            (self.hidden, self.ffn_dim),
+        ];
         let (attn_norm, ffn_norm) = (up_f(attn_norm)?, up_f(ffn_norm)?);
         let q_norm_gpu = q_norm.map(up_f).transpose()?;
         let k_norm_gpu = k_norm.map(up_f).transpose()?;
@@ -6358,8 +10191,10 @@ impl CudaResidentDecode {
             // Resident: each projection uploaded once to its own VRAM slice (repacked
             // into the layout its quant lane reads); no offload metadata.
             let vram = |i: usize| -> Result<CudaSlice<u8>, String> {
-                s.clone_htod(&repack_for_lane(projections[i], quants[i]))
-                    .map_err(|e| format!("htod: {e}"))
+                let (rows, cols) = projection_shapes[i];
+                let repacked =
+                    repack_for_lane(projections[i], quants[i], rows, cols, self.k.q1_tiled)?;
+                s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))
             };
             self.layers.push(ResidentLayer {
                 q: vram(0)?,
@@ -6388,8 +10223,11 @@ impl CudaResidentDecode {
         let repacked: Vec<Vec<u8>> = projections
             .iter()
             .enumerate()
-            .map(|(i, b)| repack_for_lane(b, quants[i]))
-            .collect();
+            .map(|(i, b)| {
+                let (rows, cols) = projection_shapes[i];
+                repack_for_lane(b, quants[i], rows, cols, self.k.q1_tiled)
+            })
+            .collect::<Result<_, _>>()?;
         // 16-byte-align each projection start so the resident GEMV kernels' wide
         // (uint4) wire loads are legal off any projection's view base (the q4k_gemv
         // super-block is 144 B = 9*16, so every block in a row stays 16-aligned once
@@ -6546,9 +10384,14 @@ impl CudaResidentDecode {
     ) -> Result<(), String> {
         let s = &self.k.stream;
         self.final_norm = s.clone_htod(final_norm).map_err(|e| format!("htod: {e}"))?;
-        self.output_weight = s
-            .clone_htod(&repack_for_lane(output_weight, output_quant))
-            .map_err(|e| format!("htod: {e}"))?;
+        let repacked = repack_for_lane(
+            output_weight,
+            output_quant,
+            self.vocab,
+            self.hidden,
+            self.k.q1_tiled,
+        )?;
+        self.output_weight = s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))?;
         self.output_quant = output_quant;
         Ok(())
     }
@@ -6584,7 +10427,7 @@ impl CudaResidentDecode {
             d_conv_out: af(conv_dim)?,
             d_z: af(value_dim)?,
             d_beta: af(num_v_heads)?,
-            d_glog: af(num_v_heads)?,
+            d_decay: af(num_v_heads)?,
             d_ssm_mix: af(value_dim)?,
             d_qgate: af(2 * self.q_width)?,
             d_gate_attn: af(self.q_width)?,
@@ -6761,35 +10604,95 @@ impl CudaResidentDecode {
         ssm_norm: &[f32],
         ssm_quants: [ProjQuant; 5],
         ffn_quants: [ProjQuant; 3],
+        resident_ffn: bool,
         conv_dim: usize,
         d_conv: usize,
         nv: usize,
         d_state: usize,
     ) -> Result<(), String> {
         let s = self.k.stream.clone();
-        let up_u8 = |b: &[u8], q: ProjQuant| -> Result<CudaSlice<u8>, String> {
-            s.clone_htod(&repack_for_lane(b, q))
-                .map_err(|e| format!("htod: {e}"))
-        };
+        let value_dim = self
+            .qwen35
+            .as_ref()
+            .ok_or_else(|| "set_layer_ssm_qwen35 called before set_qwen35".to_string())?
+            .value_dim;
+        let up_u8 =
+            |b: &[u8], q: ProjQuant, rows: usize, cols: usize| -> Result<CudaSlice<u8>, String> {
+                let repacked = repack_for_lane(b, q, rows, cols, self.k.q1_tiled)?;
+                s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))
+            };
         let up_f = |b: &[f32]| -> Result<CudaSlice<f32>, String> {
             s.clone_htod(b).map_err(|e| format!("htod: {e}"))
         };
         let ph = || s.clone_htod(&[0u8]).map_err(|e| format!("htod: {e}"));
         let ssm = SsmResident {
-            wqkv: up_u8(wqkv, ssm_quants[0])?,
-            wqkv_gate: up_u8(wqkv_gate, ssm_quants[1])?,
-            beta: up_u8(beta, ssm_quants[2])?,
-            alpha: up_u8(alpha, ssm_quants[3])?,
-            ssm_out: up_u8(ssm_out, ssm_quants[4])?,
+            wqkv: up_u8(wqkv, ssm_quants[0], conv_dim, self.hidden)?,
+            wqkv_gate: up_u8(wqkv_gate, ssm_quants[1], value_dim, self.hidden)?,
+            beta: up_u8(beta, ssm_quants[2], nv, self.hidden)?,
+            alpha: up_u8(alpha, ssm_quants[3], nv, self.hidden)?,
+            ssm_out: up_u8(ssm_out, ssm_quants[4], self.hidden, value_dim)?,
             quants: ssm_quants,
             conv1d: up_f(conv1d)?,
             dt_bias: up_f(dt_bias)?,
             a: up_f(a)?,
             ssm_norm: up_f(ssm_norm)?,
         };
-        let gate_g = up_u8(gate, ffn_quants[0])?;
-        let up_g = up_u8(up, ffn_quants[1])?;
-        let down_g = up_u8(down, ffn_quants[2])?;
+        let (gate_g, up_g, down_g, offloaded) = if resident_ffn {
+            (
+                up_u8(gate, ffn_quants[0], self.ffn_dim, self.hidden)?,
+                up_u8(up, ffn_quants[1], self.ffn_dim, self.hidden)?,
+                up_u8(down, ffn_quants[2], self.hidden, self.ffn_dim)?,
+                None,
+            )
+        } else {
+            // Capacity path for large qwen35 Prism rows: the recurrent mixer and
+            // state remain resident, while the three large FFN projections stream
+            // through the existing per-layer offload scratch. Slots q/k/v/o are
+            // empty because the SSM branch reads its dedicated resident weights;
+            // the shared FFN tail consumes slots gate/up/down exactly as a full
+            // attention layer does.
+            let ctx = &self.k.ctx;
+            let repacked = [
+                repack_for_lane(
+                    gate,
+                    ffn_quants[0],
+                    self.ffn_dim,
+                    self.hidden,
+                    self.k.q1_tiled,
+                )?,
+                repack_for_lane(
+                    up,
+                    ffn_quants[1],
+                    self.ffn_dim,
+                    self.hidden,
+                    self.k.q1_tiled,
+                )?,
+                repack_for_lane(
+                    down,
+                    ffn_quants[2],
+                    self.hidden,
+                    self.ffn_dim,
+                    self.k.q1_tiled,
+                )?,
+            ];
+            let mut off = [0usize; 8];
+            for (i, bytes) in repacked.iter().enumerate() {
+                let slot = i + 4;
+                off[slot + 1] = (off[slot] + bytes.len() + 15) & !15;
+            }
+            let mut packed = vec![0u8; off[7]];
+            for (i, bytes) in repacked.iter().enumerate() {
+                let slot = i + 4;
+                packed[off[slot]..off[slot] + bytes.len()].copy_from_slice(bytes);
+            }
+            let pinned = CacheablePinned::from_bytes(ctx, &packed)?;
+            (
+                ph()?,
+                ph()?,
+                ph()?,
+                Some(OffloadedLayer { host: pinned, off }),
+            )
+        };
         let attn_norm_g = up_f(attn_norm)?;
         let ffn_norm_g = up_f(ffn_norm)?;
         // layer.quants drives the shared attn-norm+quantize (cols 0..3 = the SSM
@@ -6818,7 +10721,7 @@ impl CudaResidentDecode {
             // qwen35 SSM layers are never windowed; gemma3 has no SSM layers.
             post_attn_norm: None,
             post_ffn_norm: None,
-            offloaded: None,
+            offloaded,
             quants,
             kind: LayerKind::Ssm(Box::new(ssm)),
         });
@@ -6851,10 +10754,25 @@ impl CudaResidentDecode {
     }
 
     fn batched_layer_token_cap(&self) -> usize {
+        if self.layers.iter().any(|layer| {
+            layer.quants.contains(&ProjQuant::Q1_0)
+                || matches!(&layer.kind, LayerKind::Ssm(ssm) if ssm.quants.contains(&ProjQuant::Q1_0))
+        }) {
+            let max = if self.k.fast_q1 {
+                MAX_PRISM_PREFILL_K
+            } else {
+                2
+            };
+            return std::env::var("CAMELID_PRISM_BATCH_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(max)
+                .clamp(1, max);
+        }
         let has_kquant = self
             .layers
             .iter()
-            .any(|layer| layer.quants.iter().any(|q| *q != ProjQuant::Q8_0));
+            .any(|layer| layer.quants.iter().any(|q| q.needs_q8k()));
         if !has_kquant {
             return MAX_VERIFY_K;
         }
@@ -6907,17 +10825,29 @@ impl CudaResidentDecode {
     /// quant families safely retain serial prefill.
     pub fn supports_batched_prefill(&self) -> bool {
         self.supports_batched_layer_stack()
+            || (!self.is_windowed()
+                && !self.is_offloaded()
+                && self.qwen35.is_some()
+                && self.layers.iter().all(|layer| {
+                    layer.quants.iter().all(|q| q.supports_batched())
+                        && match &layer.kind {
+                            LayerKind::Full => true,
+                            LayerKind::Ssm(ssm) => ssm.quants.iter().all(|q| q.supports_batched()),
+                        }
+                }))
     }
 
     /// Default policy after same-host Windows/WDDM benchmarking. Q8_0 batching
     /// remains a clear win; the parity-correct Q4_K/Q6_K tiles stay opt-in until
     /// a device shows a sustained gain over the mature serial GEMVs.
     pub fn prefers_batched_prefill(&self) -> bool {
-        self.supports_batched_layer_stack()
-            && self
-                .layers
-                .iter()
-                .all(|layer| layer.quants.iter().all(|q| *q == ProjQuant::Q8_0))
+        self.supports_batched_prefill()
+            && self.layers.iter().all(|layer| {
+                layer
+                    .quants
+                    .iter()
+                    .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
+            })
     }
 
     /// Whether linear speculative verification can use the batched stack,
@@ -7208,6 +11138,16 @@ impl CudaResidentDecode {
                 }
             });
         }
+        let bonsai27b_fused_projections = self.bonsai27b_fused_projections
+            && ov_streams.is_none()
+            && self.hidden == 5_120
+            && self.ffn_dim == 17_408
+            && self.q_width == 6_144
+            && self.kv_width == 1_024
+            && self.qwen35.as_ref().is_some_and(|q| {
+                q.conv_dim == 10_240 && q.value_dim == 6_144 && q.num_v_heads == 48
+            });
+        let bonsai27b_popc = self.bonsai27b_popc && bonsai27b_fused_projections;
         let hb = self.hidden / 32; // hidden blocks
         let fb = self.ffn_dim / 32; // ffn blocks
         let qb = self.q_width / 32; // q_width blocks
@@ -7311,10 +11251,45 @@ impl CudaResidentDecode {
             } else {
                 3
             };
-            let attn_need_q8_0 = lq[..n_attn_consumers].contains(&ProjQuant::Q8_0);
+            let attn_need_q8_0 = lq[..n_attn_consumers]
+                .iter()
+                .any(|q| q.needs_q8_0(self.k.fast_q1));
             let attn_need_q8k = lq[..n_attn_consumers].iter().any(|q| q.needs_q8k());
-            if attn_need_q8_0 {
-                if fused {
+            let attn_need_f32 = lq[..n_attn_consumers]
+                .iter()
+                .any(|q| q.is_prism_low_bit(self.k.fast_q1));
+            let attn_q1 = self.k.fast_q1
+                && lq[..n_attn_consumers]
+                    .iter()
+                    .all(|lane| *lane == ProjQuant::Q1_0);
+            if attn_q1 {
+                launch_prism_rms_norm_q8_batched(
+                    &s,
+                    &self.k.prism_rms_norm_q8_batched,
+                    &self.d_hidden,
+                    &self.layers[li].attn_norm,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    self.hidden,
+                    self.eps,
+                    1,
+                )
+                .map_err(map)?;
+            }
+            if !attn_q1 && attn_need_f32 {
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_hidden,
+                    &self.layers[li].attn_norm,
+                    &mut self.d_normed,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            }
+            if !attn_q1 && attn_need_q8_0 {
+                if fused && !attn_need_f32 {
                     launch_rmsnorm_quantize(
                         &s,
                         &self.k.rms_norm_quantize,
@@ -7327,16 +11302,18 @@ impl CudaResidentDecode {
                     )
                     .map_err(map)?;
                 } else {
-                    launch_rmsnorm(
-                        &s,
-                        &self.k.rms_norm,
-                        &self.d_hidden,
-                        &self.layers[li].attn_norm,
-                        &mut self.d_normed,
-                        self.hidden,
-                        self.eps,
-                    )
-                    .map_err(map)?;
+                    if !attn_need_f32 {
+                        launch_rmsnorm(
+                            &s,
+                            &self.k.rms_norm,
+                            &self.d_hidden,
+                            &self.layers[li].attn_norm,
+                            &mut self.d_normed,
+                            self.hidden,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                    }
                     launch_quantize(
                         &s,
                         &self.k.quantize,
@@ -7348,7 +11325,7 @@ impl CudaResidentDecode {
                     .map_err(map)?;
                 }
             }
-            if attn_need_q8k {
+            if !attn_q1 && attn_need_q8k {
                 launch_rmsnorm_quantize_q8k(
                     &s,
                     &self.k.rms_norm_quantize_q8k,
@@ -7358,6 +11335,17 @@ impl CudaResidentDecode {
                     &mut self.d_q8k_scales,
                     self.hidden,
                     self.eps,
+                )
+                .map_err(map)?;
+            }
+            if bonsai27b_popc {
+                launch_prism_q8_32_bitplanes_qsum(
+                    &s,
+                    &self.k.prism_q8_32_bitplanes_qsum,
+                    &self.d_in_quants,
+                    &mut self.d_in_bitplanes,
+                    &mut self.d_in_qsums,
+                    hb,
                 )
                 .map_err(map)?;
             }
@@ -7382,23 +11370,43 @@ impl CudaResidentDecode {
                         } else {
                             (&s, &s)
                         };
-                    // Q,K,V  (qwen35 full-attn: wq is the fused [query|gate] projection -> 2*q_width)
-                    if let Some(q) = self.qwen35.as_mut() {
-                        dispatch_gemv(
-                            &s,
-                            &self.k,
-                            lq[0],
-                            &self.d_in_scales,
-                            &self.d_in_quants,
-                            &self.d_q8k_scales,
-                            &self.d_q8k_quants,
-                            &wq,
-                            2 * self.q_width,
-                            self.hidden,
-                            &mut q.d_qgate,
-                            0,
-                        )
-                        .map_err(map)?;
+                    // Q,K,V (qwen35 full-attn: wq is fused [query|gate]). The
+                    // opt-in Bonsai kernel only merges these read-only projections;
+                    // deinterleave and every attention epilogue stay unchanged.
+                    let fused_full = bonsai27b_fused_projections
+                        && lq[..3].iter().all(|lane| *lane == ProjQuant::Q1_0);
+                    if fused_full {
+                        let q = self.qwen35.as_mut().expect("Bonsai fusion requires qwen35");
+                        if bonsai27b_popc {
+                            launch_prism_q1t128_q8_popc_fused_full_bonsai27b(
+                                &s,
+                                &self.k.prism_q1t128_q8_popc_fused_full_bonsai27b,
+                                &self.d_in_bitplanes,
+                                &self.d_in_qsums,
+                                &self.d_in_scales,
+                                &wq,
+                                &wk,
+                                &wv,
+                                &mut q.d_qgate,
+                                &mut self.d_k,
+                                &mut self.d_v,
+                            )
+                            .map_err(map)?;
+                        } else {
+                            launch_prism_q1t128_fused_full_bonsai27b(
+                                &s,
+                                &self.k.prism_q1t128_fused_full_bonsai27b,
+                                &self.d_in_quants,
+                                &self.d_in_scales,
+                                &wq,
+                                &wk,
+                                &wv,
+                                &mut q.d_qgate,
+                                &mut self.d_k,
+                                &mut self.d_v,
+                            )
+                            .map_err(map)?;
+                        }
                         launch_deinterleave_qgate(
                             &s,
                             &self.k.deinterleave_qgate,
@@ -7410,52 +11418,84 @@ impl CudaResidentDecode {
                         )
                         .map_err(map)?;
                     } else {
+                        if let Some(q) = self.qwen35.as_mut() {
+                            dispatch_gemv(
+                                &s,
+                                &self.k,
+                                lq[0],
+                                &self.d_normed,
+                                &self.d_in_scales,
+                                &self.d_in_quants,
+                                &self.d_q8k_scales,
+                                &self.d_q8k_quants,
+                                &wq,
+                                2 * self.q_width,
+                                self.hidden,
+                                &mut q.d_qgate,
+                                0,
+                            )
+                            .map_err(map)?;
+                            launch_deinterleave_qgate(
+                                &s,
+                                &self.k.deinterleave_qgate,
+                                &q.d_qgate,
+                                &mut self.d_q,
+                                &mut q.d_gate_attn,
+                                self.n_heads,
+                                self.head_dim,
+                            )
+                            .map_err(map)?;
+                        } else {
+                            dispatch_gemv(
+                                &s,
+                                &self.k,
+                                lq[0],
+                                &self.d_normed,
+                                &self.d_in_scales,
+                                &self.d_in_quants,
+                                &self.d_q8k_scales,
+                                &self.d_q8k_quants,
+                                &wq,
+                                self.q_width,
+                                self.hidden,
+                                &mut self.d_q,
+                                0,
+                            )
+                            .map_err(map)?;
+                        }
                         dispatch_gemv(
-                            &s,
+                            s_k,
                             &self.k,
-                            lq[0],
+                            lq[1],
+                            &self.d_normed,
                             &self.d_in_scales,
                             &self.d_in_quants,
                             &self.d_q8k_scales,
                             &self.d_q8k_quants,
-                            &wq,
-                            self.q_width,
+                            &wk,
+                            self.kv_width,
                             self.hidden,
-                            &mut self.d_q,
+                            &mut self.d_k,
+                            0,
+                        )
+                        .map_err(map)?;
+                        dispatch_gemv(
+                            s_v,
+                            &self.k,
+                            lq[2],
+                            &self.d_normed,
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &wv,
+                            self.kv_width,
+                            self.hidden,
+                            &mut self.d_v,
                             0,
                         )
                         .map_err(map)?;
                     }
-                    dispatch_gemv(
-                        s_k,
-                        &self.k,
-                        lq[1],
-                        &self.d_in_scales,
-                        &self.d_in_quants,
-                        &self.d_q8k_scales,
-                        &self.d_q8k_quants,
-                        &wk,
-                        self.kv_width,
-                        self.hidden,
-                        &mut self.d_k,
-                        0,
-                    )
-                    .map_err(map)?;
-                    dispatch_gemv(
-                        s_v,
-                        &self.k,
-                        lq[2],
-                        &self.d_in_scales,
-                        &self.d_in_quants,
-                        &self.d_q8k_scales,
-                        &self.d_q8k_quants,
-                        &wv,
-                        self.kv_width,
-                        self.hidden,
-                        &mut self.d_v,
-                        0,
-                    )
-                    .map_err(map)?;
                     // Qwen3 QK-norm: per-head RMSNorm on Q and K after projection, before RoPE
                     if let (Some(ref qn), Some(ref kn)) =
                         (&self.layers[li].q_norm, &self.layers[li].k_norm)
@@ -7715,38 +11755,52 @@ impl CudaResidentDecode {
                             self.hidden,
                         )
                         .map_err(map)?;
-                    } else if lq[3] == ProjQuant::Q8_0 {
-                        launch_quantize(
-                            &s,
-                            &self.k.quantize,
-                            &self.d_attn,
-                            &mut self.d_in_quants,
-                            &mut self.d_in_scales,
-                            qb,
-                        )
-                        .map_err(map)?;
-                        if fused {
-                            launch_gemv_residual(
+                    } else if lq[3].needs_q8_0(self.k.fast_q1)
+                        || lq[3].is_prism_low_bit(self.k.fast_q1)
+                    {
+                        if lq[3].needs_q8_0(self.k.fast_q1) {
+                            launch_quantize(
                                 &s,
-                                &self.k.gemv,
+                                &self.k.quantize,
+                                &self.d_attn,
+                                &mut self.d_in_quants,
+                                &mut self.d_in_scales,
+                                qb,
+                            )
+                            .map_err(map)?;
+                        }
+                        if fused {
+                            dispatch_gemv(
+                                &s,
+                                &self.k,
+                                lq[3],
+                                &self.d_attn,
                                 &self.d_in_scales,
                                 &self.d_in_quants,
+                                &self.d_q8k_scales,
+                                &self.d_q8k_quants,
                                 &wo,
                                 self.hidden,
-                                qb,
+                                self.q_width,
                                 &mut self.d_hidden,
+                                1,
                             )
                             .map_err(map)?;
                         } else {
-                            launch_gemv(
+                            dispatch_gemv(
                                 &s,
-                                &self.k.gemv,
+                                &self.k,
+                                lq[3],
+                                &self.d_attn,
                                 &self.d_in_scales,
                                 &self.d_in_quants,
+                                &self.d_q8k_scales,
+                                &self.d_q8k_quants,
                                 &wo,
                                 self.hidden,
-                                qb,
+                                self.q_width,
                                 &mut self.d_proj,
+                                0,
                             )
                             .map_err(map)?;
                             launch_residual(
@@ -7774,6 +11828,7 @@ impl CudaResidentDecode {
                             &s,
                             &self.k,
                             lq[3],
+                            &self.d_attn,
                             &self.d_in_scales,
                             &self.d_in_quants,
                             &self.d_q8k_scales,
@@ -7807,66 +11862,109 @@ impl CudaResidentDecode {
                     };
                     let sq = ssm.quants;
                     let q = self.qwen35.as_mut().unwrap();
-                    dispatch_gemv(
-                        &s,
-                        &self.k,
-                        sq[0],
-                        &self.d_in_scales,
-                        &self.d_in_quants,
-                        &self.d_q8k_scales,
-                        &self.d_q8k_quants,
-                        &ssm.wqkv.as_view(),
-                        conv_dim,
-                        self.hidden,
-                        &mut q.d_qkv,
-                        0,
-                    )
-                    .map_err(map)?;
-                    dispatch_gemv(
-                        &s,
-                        &self.k,
-                        sq[1],
-                        &self.d_in_scales,
-                        &self.d_in_quants,
-                        &self.d_q8k_scales,
-                        &self.d_q8k_quants,
-                        &ssm.wqkv_gate.as_view(),
-                        value_dim,
-                        self.hidden,
-                        &mut q.d_z,
-                        0,
-                    )
-                    .map_err(map)?;
-                    dispatch_gemv(
-                        &s,
-                        &self.k,
-                        sq[2],
-                        &self.d_in_scales,
-                        &self.d_in_quants,
-                        &self.d_q8k_scales,
-                        &self.d_q8k_quants,
-                        &ssm.beta.as_view(),
-                        nv,
-                        self.hidden,
-                        &mut self.d_k,
-                        0,
-                    )
-                    .map_err(map)?;
-                    dispatch_gemv(
-                        &s,
-                        &self.k,
-                        sq[3],
-                        &self.d_in_scales,
-                        &self.d_in_quants,
-                        &self.d_q8k_scales,
-                        &self.d_q8k_quants,
-                        &ssm.alpha.as_view(),
-                        nv,
-                        self.hidden,
-                        &mut self.d_v,
-                        0,
-                    )
-                    .map_err(map)?;
+                    let fused_ssm = bonsai27b_fused_projections
+                        && sq[..4].iter().all(|lane| *lane == ProjQuant::Q1_0);
+                    if fused_ssm {
+                        if bonsai27b_popc {
+                            launch_prism_q1t128_q8_popc_fused_ssm_bonsai27b(
+                                &s,
+                                &self.k.prism_q1t128_q8_popc_fused_ssm_bonsai27b,
+                                &self.d_in_bitplanes,
+                                &self.d_in_qsums,
+                                &self.d_in_scales,
+                                &ssm.wqkv.as_view(),
+                                &ssm.wqkv_gate.as_view(),
+                                &ssm.beta.as_view(),
+                                &ssm.alpha.as_view(),
+                                &mut q.d_qkv,
+                                &mut q.d_z,
+                                &mut self.d_k,
+                                &mut self.d_v,
+                            )
+                            .map_err(map)?;
+                        } else {
+                            launch_prism_q1t128_fused_ssm_bonsai27b(
+                                &s,
+                                &self.k.prism_q1t128_fused_ssm_bonsai27b,
+                                &self.d_in_quants,
+                                &self.d_in_scales,
+                                &ssm.wqkv.as_view(),
+                                &ssm.wqkv_gate.as_view(),
+                                &ssm.beta.as_view(),
+                                &ssm.alpha.as_view(),
+                                &mut q.d_qkv,
+                                &mut q.d_z,
+                                &mut self.d_k,
+                                &mut self.d_v,
+                            )
+                            .map_err(map)?;
+                        }
+                    } else {
+                        dispatch_gemv(
+                            &s,
+                            &self.k,
+                            sq[0],
+                            &self.d_normed,
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &ssm.wqkv.as_view(),
+                            conv_dim,
+                            self.hidden,
+                            &mut q.d_qkv,
+                            0,
+                        )
+                        .map_err(map)?;
+                        dispatch_gemv(
+                            &s,
+                            &self.k,
+                            sq[1],
+                            &self.d_normed,
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &ssm.wqkv_gate.as_view(),
+                            value_dim,
+                            self.hidden,
+                            &mut q.d_z,
+                            0,
+                        )
+                        .map_err(map)?;
+                        dispatch_gemv(
+                            &s,
+                            &self.k,
+                            sq[2],
+                            &self.d_normed,
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &ssm.beta.as_view(),
+                            nv,
+                            self.hidden,
+                            &mut self.d_k,
+                            0,
+                        )
+                        .map_err(map)?;
+                        dispatch_gemv(
+                            &s,
+                            &self.k,
+                            sq[3],
+                            &self.d_normed,
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &ssm.alpha.as_view(),
+                            nv,
+                            self.hidden,
+                            &mut self.d_v,
+                            0,
+                        )
+                        .map_err(map)?;
+                    }
                     launch_ssm_gates(
                         &s,
                         &self.k.ssm_gates,
@@ -7875,63 +11973,120 @@ impl CudaResidentDecode {
                         &ssm.dt_bias,
                         &ssm.a,
                         &mut q.d_beta,
-                        &mut q.d_glog,
+                        &mut q.d_decay,
                         nv,
                     )
                     .map_err(map)?;
-                    launch_ssm_conv1d(
-                        &s,
-                        &self.k.ssm_conv1d,
-                        &ssm.conv1d,
-                        &q.d_qkv,
-                        &mut self.ssm_conv_state[li],
-                        &mut q.d_conv_out,
-                        conv_dim,
-                        d_conv,
-                    )
-                    .map_err(map)?;
-                    launch_ssm_l2_norm_per_head(
-                        &s,
-                        &self.k.ssm_l2_norm_per_head,
-                        &mut q.d_conv_out,
-                        0,
-                        nk,
-                        ds,
-                        self.eps,
-                    )
-                    .map_err(map)?;
-                    launch_ssm_l2_norm_per_head(
-                        &s,
-                        &self.k.ssm_l2_norm_per_head,
-                        &mut q.d_conv_out,
-                        key_dim,
-                        nk,
-                        ds,
-                        self.eps,
-                    )
-                    .map_err(map)?;
-                    launch_ssm_delta_rule(
-                        &s,
-                        &self.k.ssm_delta_rule,
-                        &mut self.ssm_state[li],
-                        &q.d_conv_out,
-                        key_dim,
-                        value_dim,
-                        &q.d_z,
-                        &q.d_beta,
-                        &q.d_glog,
-                        &ssm.ssm_norm,
-                        &mut q.d_ssm_mix,
-                        ds,
-                        nk,
-                        nv,
-                        self.eps,
-                    )
-                    .map_err(map)?;
+                    let bonsai_ssm_q8 =
+                        self.k.fast_q1 && ds == 128 && d_conv == 4 && sq[4] == ProjQuant::Q1_0;
+                    if bonsai_ssm_q8 {
+                        launch_qwen35_ssm_conv1d_d4_batched(
+                            &s,
+                            &self.k.qwen35_ssm_conv1d_d4_batched,
+                            &ssm.conv1d,
+                            &q.d_qkv,
+                            &mut self.ssm_conv_state[li],
+                            &mut q.d_conv_out,
+                            conv_dim,
+                            1,
+                        )
+                        .map_err(map)?;
+                        launch_qwen35_ssm_qk_l2_norm_d128_batched(
+                            &s,
+                            &self.k.qwen35_ssm_qk_l2_norm_d128_batched,
+                            &mut q.d_conv_out,
+                            conv_dim,
+                            key_dim,
+                            nk,
+                            1,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                        launch_qwen35_ssm_delta_rule_d128_batched(
+                            &s,
+                            &self.k.qwen35_ssm_delta_rule_d128_batched,
+                            &mut self.ssm_state[li],
+                            &q.d_conv_out,
+                            &q.d_beta,
+                            &q.d_decay,
+                            &mut q.d_ssm_mix,
+                            nk,
+                            nv,
+                            key_dim,
+                            value_dim,
+                            conv_dim,
+                            1,
+                        )
+                        .map_err(map)?;
+                        launch_qwen35_ssm_rmsnorm_gate_q8_d128_batched(
+                            &s,
+                            &self.k.qwen35_ssm_rmsnorm_gate_q8_d128_batched,
+                            &q.d_ssm_mix,
+                            &q.d_z,
+                            &ssm.ssm_norm,
+                            &mut self.d_in_quants,
+                            &mut self.d_in_scales,
+                            nv,
+                            value_dim,
+                            1,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_ssm_conv1d(
+                            &s,
+                            &self.k.ssm_conv1d,
+                            &ssm.conv1d,
+                            &q.d_qkv,
+                            &mut self.ssm_conv_state[li],
+                            &mut q.d_conv_out,
+                            conv_dim,
+                            d_conv,
+                        )
+                        .map_err(map)?;
+                        launch_ssm_l2_norm_per_head(
+                            &s,
+                            &self.k.ssm_l2_norm_per_head,
+                            &mut q.d_conv_out,
+                            0,
+                            nk,
+                            ds,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                        launch_ssm_l2_norm_per_head(
+                            &s,
+                            &self.k.ssm_l2_norm_per_head,
+                            &mut q.d_conv_out,
+                            key_dim,
+                            nk,
+                            ds,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                        launch_ssm_delta_rule(
+                            &s,
+                            &self.k.ssm_delta_rule,
+                            &mut self.ssm_state[li],
+                            &q.d_conv_out,
+                            key_dim,
+                            value_dim,
+                            &q.d_z,
+                            &q.d_beta,
+                            &q.d_decay,
+                            &ssm.ssm_norm,
+                            &mut q.d_ssm_mix,
+                            ds,
+                            nk,
+                            nv,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                    }
                     // ssm_out projection + residual into d_hidden. Quantize the SSM mix to
                     // the activation format ssm_out's lane reads: Q8_K for a K-quant
                     // (Q4_K/Q6_K) ssm_out, Q8_0 otherwise.
-                    if sq[4].needs_q8k() {
+                    if !bonsai_ssm_q8 && sq[4].needs_q8k() {
                         launch_quantize_q8k(
                             &s,
                             &self.k.quantize_q8k,
@@ -7941,7 +12096,7 @@ impl CudaResidentDecode {
                             value_dim / 256,
                         )
                         .map_err(map)?;
-                    } else {
+                    } else if !bonsai_ssm_q8 && sq[4].needs_q8_0(self.k.fast_q1) {
                         launch_quantize(
                             &s,
                             &self.k.quantize,
@@ -7956,6 +12111,7 @@ impl CudaResidentDecode {
                         &s,
                         &self.k,
                         sq[4],
+                        &q.d_ssm_mix,
                         &self.d_in_scales,
                         &self.d_in_quants,
                         &self.d_q8k_scales,
@@ -7972,10 +12128,40 @@ impl CudaResidentDecode {
             // ffn norm + gate/up + silu + down + residual. gate/up consume the ffn-norm
             // activation; down consumes the silu(gate)*up activation. Each is produced in
             // the format its consumers read (Q8_0 path byte-identical for an all-Q8_0 layer).
-            let ffn_need_q8_0 = lq[4] == ProjQuant::Q8_0 || lq[5] == ProjQuant::Q8_0;
+            let ffn_need_q8_0 =
+                lq[4].needs_q8_0(self.k.fast_q1) || lq[5].needs_q8_0(self.k.fast_q1);
             let ffn_need_q8k = lq[4].needs_q8k() || lq[5].needs_q8k();
-            if ffn_need_q8_0 {
-                if fused {
+            let ffn_need_f32 =
+                lq[4].is_prism_low_bit(self.k.fast_q1) || lq[5].is_prism_low_bit(self.k.fast_q1);
+            let ffn_q1 = self.k.fast_q1 && lq[4..6].iter().all(|lane| *lane == ProjQuant::Q1_0);
+            if ffn_q1 {
+                launch_prism_rms_norm_q8_batched(
+                    &s,
+                    &self.k.prism_rms_norm_q8_batched,
+                    &self.d_hidden,
+                    &self.layers[li].ffn_norm,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    self.hidden,
+                    self.eps,
+                    1,
+                )
+                .map_err(map)?;
+            }
+            if !ffn_q1 && ffn_need_f32 {
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_hidden,
+                    &self.layers[li].ffn_norm,
+                    &mut self.d_normed,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            }
+            if !ffn_q1 && ffn_need_q8_0 {
+                if fused && !ffn_need_f32 {
                     launch_rmsnorm_quantize(
                         &s,
                         &self.k.rms_norm_quantize,
@@ -7988,16 +12174,18 @@ impl CudaResidentDecode {
                     )
                     .map_err(map)?;
                 } else {
-                    launch_rmsnorm(
-                        &s,
-                        &self.k.rms_norm,
-                        &self.d_hidden,
-                        &self.layers[li].ffn_norm,
-                        &mut self.d_normed,
-                        self.hidden,
-                        self.eps,
-                    )
-                    .map_err(map)?;
+                    if !ffn_need_f32 {
+                        launch_rmsnorm(
+                            &s,
+                            &self.k.rms_norm,
+                            &self.d_hidden,
+                            &self.layers[li].ffn_norm,
+                            &mut self.d_normed,
+                            self.hidden,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                    }
                     launch_quantize(
                         &s,
                         &self.k.quantize,
@@ -8009,7 +12197,7 @@ impl CudaResidentDecode {
                     .map_err(map)?;
                 }
             }
-            if ffn_need_q8k {
+            if !ffn_q1 && ffn_need_q8k {
                 launch_rmsnorm_quantize_q8k(
                     &s,
                     &self.k.rms_norm_quantize_q8k,
@@ -8019,6 +12207,17 @@ impl CudaResidentDecode {
                     &mut self.d_q8k_scales,
                     self.hidden,
                     self.eps,
+                )
+                .map_err(map)?;
+            }
+            if bonsai27b_popc {
+                launch_prism_q8_32_bitplanes_qsum(
+                    &s,
+                    &self.k.prism_q8_32_bitplanes_qsum,
+                    &self.d_in_quants,
+                    &mut self.d_in_bitplanes,
+                    &mut self.d_in_qsums,
+                    hb,
                 )
                 .map_err(map)?;
             }
@@ -8036,36 +12235,70 @@ impl CudaResidentDecode {
             } else {
                 &s
             };
-            dispatch_gemv(
-                &s,
-                &self.k,
-                lq[4],
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &self.d_q8k_scales,
-                &self.d_q8k_quants,
-                &wgate,
-                self.ffn_dim,
-                self.hidden,
-                &mut self.d_gate,
-                0,
-            )
-            .map_err(map)?;
-            dispatch_gemv(
-                s_up,
-                &self.k,
-                lq[5],
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &self.d_q8k_scales,
-                &self.d_q8k_quants,
-                &wup,
-                self.ffn_dim,
-                self.hidden,
-                &mut self.d_up,
-                0,
-            )
-            .map_err(map)?;
+            let fused_ffn = bonsai27b_fused_projections
+                && !ffn_overlap
+                && lq[4..6].iter().all(|lane| *lane == ProjQuant::Q1_0);
+            if fused_ffn {
+                if bonsai27b_popc {
+                    launch_prism_q1t128_q8_popc_fused_ffn_bonsai27b(
+                        &s,
+                        &self.k.prism_q1t128_q8_popc_fused_ffn_bonsai27b,
+                        &self.d_in_bitplanes,
+                        &self.d_in_qsums,
+                        &self.d_in_scales,
+                        &wgate,
+                        &wup,
+                        &mut self.d_gate,
+                        &mut self.d_up,
+                    )
+                    .map_err(map)?;
+                } else {
+                    launch_prism_q1t128_fused_ffn_bonsai27b(
+                        &s,
+                        &self.k.prism_q1t128_fused_ffn_bonsai27b,
+                        &self.d_in_quants,
+                        &self.d_in_scales,
+                        &wgate,
+                        &wup,
+                        &mut self.d_gate,
+                        &mut self.d_up,
+                    )
+                    .map_err(map)?;
+                }
+            } else {
+                dispatch_gemv(
+                    &s,
+                    &self.k,
+                    lq[4],
+                    &self.d_normed,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &self.d_q8k_scales,
+                    &self.d_q8k_quants,
+                    &wgate,
+                    self.ffn_dim,
+                    self.hidden,
+                    &mut self.d_gate,
+                    0,
+                )
+                .map_err(map)?;
+                dispatch_gemv(
+                    s_up,
+                    &self.k,
+                    lq[5],
+                    &self.d_normed,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &self.d_q8k_scales,
+                    &self.d_q8k_quants,
+                    &wup,
+                    self.ffn_dim,
+                    self.hidden,
+                    &mut self.d_up,
+                    0,
+                )
+                .map_err(map)?;
+            }
             // Join: silu on main reads d_up, so it waits on the side up gemv. The
             // wait also transitively orders silu's write of the shared d_in_*
             // (/d_q8k_*) scratch after the up gemv's read of it (WAR), and the next
@@ -8156,8 +12389,29 @@ impl CudaResidentDecode {
                     self.hidden,
                 )
                 .map_err(map)?;
-            } else if lq[6] == ProjQuant::Q8_0 {
-                if fused {
+            } else if lq[6].needs_q8_0(self.k.fast_q1) || lq[6].is_prism_low_bit(self.k.fast_q1) {
+                if self.k.fast_q1 && lq[6] == ProjQuant::Q1_0 {
+                    launch_prism_silu_mul_q8_batched(
+                        &s,
+                        &self.k.prism_silu_mul_q8_batched,
+                        &self.d_gate,
+                        &self.d_up,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        fb,
+                    )
+                    .map_err(map)?;
+                } else if lq[6].is_prism_low_bit(self.k.fast_q1) {
+                    launch_silu_mul(
+                        &s,
+                        &self.k.silu_mul,
+                        &self.d_gate,
+                        &self.d_up,
+                        &mut self.d_ffn_act,
+                        self.ffn_dim,
+                    )
+                    .map_err(map)?;
+                } else if fused {
                     launch_silu_mul_quantize(
                         &s,
                         &self.k.silu_mul_quantize,
@@ -8189,27 +12443,37 @@ impl CudaResidentDecode {
                     .map_err(map)?;
                 }
                 if fused {
-                    launch_gemv_residual(
+                    dispatch_gemv(
                         &s,
-                        &self.k.gemv,
+                        &self.k,
+                        lq[6],
+                        &self.d_ffn_act,
                         &self.d_in_scales,
                         &self.d_in_quants,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
                         &wdown,
                         self.hidden,
-                        fb,
+                        self.ffn_dim,
                         &mut self.d_hidden,
+                        1,
                     )
                     .map_err(map)?;
                 } else {
-                    launch_gemv(
+                    dispatch_gemv(
                         &s,
-                        &self.k.gemv,
+                        &self.k,
+                        lq[6],
+                        &self.d_ffn_act,
                         &self.d_in_scales,
                         &self.d_in_quants,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
                         &wdown,
                         self.hidden,
-                        fb,
+                        self.ffn_dim,
                         &mut self.d_proj,
+                        0,
                     )
                     .map_err(map)?;
                     launch_residual(
@@ -8236,6 +12500,7 @@ impl CudaResidentDecode {
                     &s,
                     &self.k,
                     lq[6],
+                    &self.d_ffn_act,
                     &self.d_in_scales,
                     &self.d_in_quants,
                     &self.d_q8k_scales,
@@ -8298,7 +12563,31 @@ impl CudaResidentDecode {
         }
         // final norm + output (lm_head) projection -> d_logits (no argmax / no sync).
         // Produce the activation in the lm_head lane's format (Q6_K for Q4_K_M).
-        if self.output_quant == ProjQuant::Q8_0 {
+        if self.k.fast_q1 && self.output_quant == ProjQuant::Q1_0 {
+            launch_prism_rms_norm_q8_batched(
+                &s,
+                &self.k.prism_rms_norm_q8_batched,
+                &self.d_hidden,
+                &self.final_norm,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                self.hidden,
+                self.eps,
+                1,
+            )
+            .map_err(map)?;
+        } else if self.output_quant.is_prism_low_bit(self.k.fast_q1) {
+            launch_rmsnorm(
+                &s,
+                &self.k.rms_norm,
+                &self.d_hidden,
+                &self.final_norm,
+                &mut self.d_normed,
+                self.hidden,
+                self.eps,
+            )
+            .map_err(map)?;
+        } else if self.output_quant.needs_q8_0(self.k.fast_q1) {
             if fused {
                 launch_rmsnorm_quantize(
                     &s,
@@ -8346,21 +12635,47 @@ impl CudaResidentDecode {
             .map_err(map)?;
         }
         let out_w = self.output_weight.as_view();
-        dispatch_gemv(
-            &s,
-            &self.k,
-            self.output_quant,
-            &self.d_in_scales,
-            &self.d_in_quants,
-            &self.d_q8k_scales,
-            &self.d_q8k_quants,
-            &out_w,
-            self.vocab,
-            self.hidden,
-            &mut self.d_logits,
-            0,
-        )
-        .map_err(map)?;
+        if bonsai27b_popc && self.output_quant == ProjQuant::Q1_0 {
+            launch_prism_q8_32_bitplanes_qsum(
+                &s,
+                &self.k.prism_q8_32_bitplanes_qsum,
+                &self.d_in_quants,
+                &mut self.d_in_bitplanes,
+                &mut self.d_in_qsums,
+                hb,
+            )
+            .map_err(map)?;
+            launch_prism_q1t128_q8_popc_gemv_m16(
+                &s,
+                &self.k.prism_q1t128_q8_popc_gemv_m16,
+                &self.d_in_bitplanes,
+                &self.d_in_qsums,
+                &self.d_in_scales,
+                &out_w,
+                self.vocab,
+                self.hidden,
+                &mut self.d_logits,
+                0,
+            )
+            .map_err(map)?;
+        } else {
+            dispatch_gemv(
+                &s,
+                &self.k,
+                self.output_quant,
+                &self.d_normed,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.d_q8k_scales,
+                &self.d_q8k_quants,
+                &out_w,
+                self.vocab,
+                self.hidden,
+                &mut self.d_logits,
+                0,
+            )
+            .map_err(map)?;
+        }
         Ok(())
     }
 
@@ -8491,7 +12806,13 @@ impl CudaResidentDecode {
     }
 
     pub(crate) fn device_decode_ready(&self) -> bool {
-        self.embd_table.is_some()
+        let disabled = matches!(
+            std::env::var("CAMELID_PRISM_CUDA_NO_DEVICE_DECODE")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
+        !disabled && self.embd_table.is_some()
     }
 
     /// One fully device-side forward: the input token id comes from
@@ -8501,18 +12822,22 @@ impl CudaResidentDecode {
     /// (bit-identical elementwise mirror of the CPU dequant), then the standard
     /// per-launch forward runs; when `out_step` is Some the greedy argmax lands
     /// in d_out_tokens[out_step] — which the NEXT call can consume directly.
+    /// `kv_position` is the physical cache slot/attention depth, while
+    /// `rope_position` selects the logical RoPE row. They are equal for text and
+    /// intentionally diverge after a multimodal image span.
     /// NO host synchronization: the caller syncs once per readback chunk.
     pub(crate) fn forward_token_device(
         &mut self,
         prev_step: Option<usize>,
         host_token: Option<u32>,
-        position: usize,
+        kv_position: usize,
+        rope_position: usize,
         scale: f32,
         out_step: Option<usize>,
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda device-decode: {e}");
         let s = self.k.stream.clone();
-        s.memcpy_htod(&[position as i32], &mut self.d_position)
+        s.memcpy_htod(&[kv_position as i32], &mut self.d_position)
             .map_err(map)?;
         if let Some(tok) = host_token {
             let tin = self
@@ -8537,7 +12862,7 @@ impl CudaResidentDecode {
                 &this.k.rope_select,
                 cos_all,
                 sin_all,
-                position,
+                rope_position,
                 half,
                 &mut this.d_cos,
                 &mut this.d_sin,
@@ -8560,6 +12885,9 @@ impl CudaResidentDecode {
                     .slice(0..1),
             };
             let f = match family {
+                ProjQuant::Q1_0 => &this.k.embed_gather_q1_0,
+                ProjQuant::Q2_0G64 => &this.k.embed_gather_q2_0_g64,
+                ProjQuant::Q2_0G128 => &this.k.embed_gather_q2_0_g128,
                 ProjQuant::Q4K => &this.k.embed_gather_q4k,
                 ProjQuant::Q6K => &this.k.embed_gather_q6k,
                 ProjQuant::Q3K => &this.k.embed_gather_q3k,
@@ -8571,16 +12899,20 @@ impl CudaResidentDecode {
             let dim = this.hidden;
             launch_embed_gather(&s, f, table, &tok_view, dim, &mut this.d_hidden).map_err(map)?;
         }
-        self.forward_pass(
-            &[],
-            &[],
-            &[],
-            position,
-            scale,
-            out_step.is_some(),
-            false,
-            true,
-        )?;
+        if self.device_forward_graph_eligible() && out_step.is_some() {
+            self.forward_device_pass_graphed(kv_position, scale)?;
+        } else {
+            self.forward_pass(
+                &[],
+                &[],
+                &[],
+                kv_position,
+                scale,
+                out_step.is_some(),
+                false,
+                true,
+            )?;
+        }
         if let Some(st) = out_step {
             let this = &mut *self;
             let mut view = this
@@ -8592,6 +12924,65 @@ impl CudaResidentDecode {
                 .map_err(map)?;
         }
         Ok(())
+    }
+
+    fn device_forward_graph_eligible(&self) -> bool {
+        qwen35_device_graphs_enabled()
+            && cuda_manual_stream_order_enabled()
+            && self.artifact == ResidentCudaArtifact::PrismBonsai27bQ1
+            && self.qwen35.is_some()
+            && self.n_layers == 64
+            && self.hidden == 5120
+            && self.ffn_dim == 17_408
+            && self.q_width == 6144
+            && self.offload.is_none()
+            && self.overlap.is_none()
+            && self.gemma3.is_none()
+            && std::env::var_os("CAMELID_LAYER_DUMP").is_none()
+    }
+
+    /// Capture/replay only the stable Qwen3.5 forward body. The device loop has
+    /// already populated hidden/RoPE/position buffers. Keeping gather/select and
+    /// the variable output-ring view outside lets one graph serve every token and
+    /// both the text and multimodal physical/logical position clocks.
+    fn forward_device_pass_graphed(&mut self, position: usize, scale: f32) -> Result<(), String> {
+        use cudarc::driver::sys;
+        let map = |step: &'static str| {
+            move |e: cudarc::driver::DriverError| format!("cuda device graph {step}: {e}")
+        };
+        let s = self.k.stream.clone();
+
+        if self.device_forward_graph.is_none() {
+            // All input preparation precedes capture and must be complete. With
+            // cudarc automatic event tracking disabled, the captured kernels have
+            // no dependency on events recorded outside this capture graph.
+            s.synchronize().map_err(map("pre-capture sync"))?;
+            s.begin_capture(sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(map("begin"))?;
+            let recorded = self.forward_pass(&[], &[], &[], position, scale, true, true, true);
+            let flags = unsafe { std::mem::transmute::<u32, sys::CUgraphInstantiate_flags>(0) };
+            let captured = s.end_capture(flags);
+            recorded?;
+            match captured.map_err(map("end"))? {
+                Some(graph) => {
+                    graph.upload().map_err(map("upload"))?;
+                    self.device_forward_graph = Some(SendCudaGraph(graph));
+                    if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                        eprintln!(
+                            "[cuda-graph] Qwen3.5 device forward captured: layer stack + norm + lm_head"
+                        );
+                    }
+                }
+                None => return Err("device forward graph capture produced no graph".into()),
+            }
+        }
+
+        self.device_forward_graph
+            .as_ref()
+            .expect("device forward graph present")
+            .0
+            .launch()
+            .map_err(map("replay"))
     }
 
     /// Sync once and read `len` generated ids starting at ring slot `start`.
@@ -8839,36 +13230,61 @@ impl CudaResidentDecode {
             .map_err(map)?;
 
         self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale, false)?;
-        launch_rms_norm_batched(
-            &s,
-            &self.k.rms_norm_batched,
-            &sc.vh,
-            &self.final_norm,
-            &mut sc.vn,
-            hidden,
-            eps,
-            k,
-        )
-        .map_err(map)?;
-        quantize_batched_for_lanes(
-            &s,
-            &self.k,
-            &sc.vn,
-            &mut sc.viq,
-            &mut sc.vis,
-            &mut sc.viqk,
-            &mut sc.visk,
-            hidden,
-            k,
-            std::slice::from_ref(&self.output_quant),
-        )
-        .map_err(map)?;
+        let output_bmma = if self.k.fast_q1
+            && self.output_quant == ProjQuant::Q1_0
+            && !prism_bmma_shape_enabled(&self.k, hidden, k)
+        {
+            launch_prism_rms_norm_q8_batched(
+                &s,
+                &self.k.prism_rms_norm_q8_batched,
+                &sc.vh,
+                &self.final_norm,
+                &mut sc.viq,
+                &mut sc.vis,
+                hidden,
+                eps,
+                k,
+            )
+            .map_err(map)?;
+            false
+        } else {
+            launch_rms_norm_batched(
+                &s,
+                &self.k.rms_norm_batched,
+                &sc.vh,
+                &self.final_norm,
+                &mut sc.vn,
+                hidden,
+                eps,
+                k,
+            )
+            .map_err(map)?;
+            quantize_batched_for_lanes(
+                &s,
+                &self.k,
+                &sc.vn,
+                &mut sc.viq,
+                &mut sc.vis,
+                &mut sc.vibits,
+                &mut sc.vibscales,
+                &mut sc.viqk,
+                &mut sc.visk,
+                hidden,
+                k,
+                std::slice::from_ref(&self.output_quant),
+            )
+            .map_err(map)?
+        };
         dispatch_gemm_batched(
             &s,
             &self.k,
             self.output_quant,
+            &sc.vn,
             &sc.vis,
             &sc.viq,
+            &sc.vibits,
+            &sc.vibscales,
+            output_bmma,
             &sc.visk,
             &sc.viqk,
             &self.output_weight,
@@ -8876,6 +13292,7 @@ impl CudaResidentDecode {
             hidden,
             k,
             &mut sc.vlogits,
+            0,
         )
         .map_err(map)?;
         launch_argmax_batched(
@@ -8903,6 +13320,14 @@ impl CudaResidentDecode {
             return Ok(());
         }
         self.verify_scratch = Some(self.alloc_verify_scratch(MAX_VERIFY_K)?);
+        Ok(())
+    }
+
+    fn ensure_prefill_scratch(&mut self, cap: usize) -> Result<(), String> {
+        if self.prefill_scratch.is_some() {
+            return Ok(());
+        }
+        self.prefill_scratch = Some(self.alloc_verify_scratch(cap)?);
         Ok(())
     }
 
@@ -8936,6 +13361,13 @@ impl CudaResidentDecode {
                 .alloc_zeros::<i8>(mk * max_in)
                 .map_err(|e| format!("verify alloc: {e}"))?,
             visk: af(mk * max_in.div_ceil(256))?,
+            // One byte per activation stored as u32 bitplanes, plus one scale
+            // per 128 values. Round up here; dispatch still requires an exact
+            // 128-divisible projection width before it can consume the lane.
+            vibits: st
+                .alloc_zeros::<u32>(mk * max_in.div_ceil(128) * 32)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            vibscales: af(mk * max_in.div_ceil(128))?,
             vq: af(mk * q_width)?,
             vk: af(mk * kv_width)?,
             vv: af(mk * kv_width)?,
@@ -8994,233 +13426,699 @@ impl CudaResidentDecode {
         for li in 0..self.n_layers {
             let layer = &self.layers[li];
             let lq = layer.quants;
-            launch_rms_norm_batched(
-                &s,
-                &self.k.rms_norm_batched,
-                &sc.vh,
-                &layer.attn_norm,
-                &mut sc.vn,
-                hidden,
-                eps,
-                k,
-            )
-            .map_err(map)?;
-            quantize_batched_for_lanes(
-                &s,
-                &self.k,
-                &sc.vn,
-                &mut sc.viq,
-                &mut sc.vis,
-                &mut sc.viqk,
-                &mut sc.visk,
-                hidden,
-                k,
-                &lq[..3],
-            )
-            .map_err(map)?;
-            dispatch_gemm_batched(
-                &s, &self.k, lq[0], &sc.vis, &sc.viq, &sc.visk, &sc.viqk, &layer.q, q_width,
-                hidden, k, &mut sc.vq,
-            )
-            .map_err(map)?;
-            dispatch_gemm_batched(
-                &s, &self.k, lq[1], &sc.vis, &sc.viq, &sc.visk, &sc.viqk, &layer.k, kv_width,
-                hidden, k, &mut sc.vk,
-            )
-            .map_err(map)?;
-            dispatch_gemm_batched(
-                &s, &self.k, lq[2], &sc.vis, &sc.viq, &sc.visk, &sc.viqk, &layer.v, kv_width,
-                hidden, k, &mut sc.vv,
-            )
-            .map_err(map)?;
-            // Qwen3 QK-norm (batched): per-head RMSNorm on Q and K
-            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm)
-            {
-                launch_rms_norm_per_head(
+            let mixer_lane_count = if matches!(&layer.kind, LayerKind::Ssm(_)) {
+                4
+            } else {
+                3
+            };
+            let mixer_q1 = self.k.fast_q1
+                && lq[..mixer_lane_count]
+                    .iter()
+                    .all(|lane| *lane == ProjQuant::Q1_0);
+            let mixer_bmma = if mixer_q1 && !prism_bmma_shape_enabled(&self.k, hidden, k) {
+                launch_prism_rms_norm_q8_batched(
                     &s,
-                    &self.k.rms_norm_per_head,
-                    &mut sc.vq,
-                    qn,
-                    k * n_heads,
-                    head_dim,
+                    &self.k.prism_rms_norm_q8_batched,
+                    &sc.vh,
+                    &layer.attn_norm,
+                    &mut sc.viq,
+                    &mut sc.vis,
+                    hidden,
                     eps,
+                    k,
                 )
                 .map_err(map)?;
-                launch_rms_norm_per_head(
+                false
+            } else {
+                launch_rms_norm_batched(
                     &s,
-                    &self.k.rms_norm_per_head,
-                    &mut sc.vk,
-                    kn,
-                    k * n_kv,
-                    head_dim,
+                    &self.k.rms_norm_batched,
+                    &sc.vh,
+                    &layer.attn_norm,
+                    &mut sc.vn,
+                    hidden,
                     eps,
+                    k,
                 )
                 .map_err(map)?;
-            }
-            let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
-            launch_rope_batched(
-                &s,
-                &self.k.rope_batched,
-                &mut sc.vq,
-                &sc.vcos,
-                &sc.vsin,
-                n_heads,
-                head_dim,
-                rope_dim,
-                q_width,
-                k,
-                pairing,
-            )
-            .map_err(map)?;
-            launch_rope_batched(
-                &s,
-                &self.k.rope_batched,
-                &mut sc.vk,
-                &sc.vcos,
-                &sc.vsin,
-                n_kv,
-                head_dim,
-                rope_dim,
-                kv_width,
-                k,
-                pairing,
-            )
-            .map_err(map)?;
-            launch_kv_scatter_batched(
-                &s,
-                &self.k.kv_scatter_batched,
-                &sc.vk,
-                &mut self.cache_k[li],
-                base_position,
-                n_kv,
-                head_dim,
-                max_pos,
-                kv_width,
-                k,
-            )
-            .map_err(map)?;
-            launch_kv_scatter_batched(
-                &s,
-                &self.k.kv_scatter_batched,
-                &sc.vv,
-                &mut self.cache_v[li],
-                base_position,
-                n_kv,
-                head_dim,
-                max_pos,
-                kv_width,
-                k,
-            )
-            .map_err(map)?;
-            if flash_ok
-                && flash_prefill_enabled()
-                && q_width == n_heads * head_dim
-                && k <= MAX_VERIFY_K
-                && base_position + k > SPLITK_THRESHOLD
-            {
-                // SIROCCO Phase P M1: flash prefill attention (opt-in). K/V read once per key, reused
-                // across the k query rows of the head. Token-parity (gated by the oracle); prefill-only.
-                launch_attention_flash_prefill(
+                quantize_batched_for_lanes(
                     &s,
                     &self.k,
-                    &sc.vq,
-                    &self.cache_k[li],
-                    &self.cache_v[li],
-                    &mut sc.vattn,
-                    &mut self.d_flash_scores,
-                    &mut self.d_flash_chunkmax,
-                    &mut self.d_flash_lsum,
-                    &mut self.d_flash_acc,
-                    n_heads,
-                    n_kv,
-                    head_dim,
-                    base_position,
+                    &sc.vn,
+                    &mut sc.viq,
+                    &mut sc.vis,
+                    &mut sc.vibits,
+                    &mut sc.vibscales,
+                    &mut sc.viqk,
+                    &mut sc.visk,
+                    hidden,
                     k,
-                    q_width,
-                    max_pos,
-                    scale,
+                    &lq[..mixer_lane_count],
                 )
-                .map_err(map)?;
-            } else {
-                launch_attention_batched(
-                    &s,
-                    &self.k.attention_batched,
-                    &sc.vq,
-                    &self.cache_k[li],
-                    &self.cache_v[li],
-                    &mut sc.vattn,
-                    n_heads,
-                    n_kv,
-                    head_dim,
-                    base_position,
-                    max_pos,
-                    scale,
-                    q_width,
-                    k,
-                    if splitk_verify_active() { 1 } else { 0 },
-                )
-                .map_err(map)?;
+                .map_err(map)?
+            };
+            match &layer.kind {
+                LayerKind::Full => {
+                    if self.qwen35.is_some() {
+                        dispatch_gemm_batched(
+                            &s,
+                            &self.k,
+                            lq[0],
+                            &sc.vn,
+                            &sc.vis,
+                            &sc.viq,
+                            &sc.vibits,
+                            &sc.vibscales,
+                            mixer_bmma,
+                            &sc.visk,
+                            &sc.viqk,
+                            &layer.q,
+                            2 * q_width,
+                            hidden,
+                            k,
+                            &mut sc.vgate,
+                            0,
+                        )
+                        .map_err(map)?;
+                        launch_deinterleave_qgate_batched(
+                            &s,
+                            &self.k.deinterleave_qgate_batched,
+                            &sc.vgate,
+                            &mut sc.vq,
+                            &mut sc.vup,
+                            n_heads,
+                            head_dim,
+                            k,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        dispatch_gemm_batched(
+                            &s,
+                            &self.k,
+                            lq[0],
+                            &sc.vn,
+                            &sc.vis,
+                            &sc.viq,
+                            &sc.vibits,
+                            &sc.vibscales,
+                            mixer_bmma,
+                            &sc.visk,
+                            &sc.viqk,
+                            &layer.q,
+                            q_width,
+                            hidden,
+                            k,
+                            &mut sc.vq,
+                            0,
+                        )
+                        .map_err(map)?;
+                    }
+                    dispatch_gemm_batched(
+                        &s,
+                        &self.k,
+                        lq[1],
+                        &sc.vn,
+                        &sc.vis,
+                        &sc.viq,
+                        &sc.vibits,
+                        &sc.vibscales,
+                        mixer_bmma,
+                        &sc.visk,
+                        &sc.viqk,
+                        &layer.k,
+                        kv_width,
+                        hidden,
+                        k,
+                        &mut sc.vk,
+                        0,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemm_batched(
+                        &s,
+                        &self.k,
+                        lq[2],
+                        &sc.vn,
+                        &sc.vis,
+                        &sc.viq,
+                        &sc.vibits,
+                        &sc.vibscales,
+                        mixer_bmma,
+                        &sc.visk,
+                        &sc.viqk,
+                        &layer.v,
+                        kv_width,
+                        hidden,
+                        k,
+                        &mut sc.vv,
+                        0,
+                    )
+                    .map_err(map)?;
+                    if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                        launch_rms_norm_per_head(
+                            &s,
+                            &self.k.rms_norm_per_head,
+                            &mut sc.vq,
+                            qn,
+                            k * n_heads,
+                            head_dim,
+                            eps,
+                        )
+                        .map_err(map)?;
+                        launch_rms_norm_per_head(
+                            &s,
+                            &self.k.rms_norm_per_head,
+                            &mut sc.vk,
+                            kn,
+                            k * n_kv,
+                            head_dim,
+                            eps,
+                        )
+                        .map_err(map)?;
+                    }
+                    let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
+                    launch_rope_batched(
+                        &s,
+                        &self.k.rope_batched,
+                        &mut sc.vq,
+                        &sc.vcos,
+                        &sc.vsin,
+                        n_heads,
+                        head_dim,
+                        rope_dim,
+                        q_width,
+                        k,
+                        pairing,
+                    )
+                    .map_err(map)?;
+                    launch_rope_batched(
+                        &s,
+                        &self.k.rope_batched,
+                        &mut sc.vk,
+                        &sc.vcos,
+                        &sc.vsin,
+                        n_kv,
+                        head_dim,
+                        rope_dim,
+                        kv_width,
+                        k,
+                        pairing,
+                    )
+                    .map_err(map)?;
+                    launch_kv_scatter_batched(
+                        &s,
+                        &self.k.kv_scatter_batched,
+                        &sc.vk,
+                        &mut self.cache_k[li],
+                        base_position,
+                        n_kv,
+                        head_dim,
+                        max_pos,
+                        kv_width,
+                        k,
+                    )
+                    .map_err(map)?;
+                    launch_kv_scatter_batched(
+                        &s,
+                        &self.k.kv_scatter_batched,
+                        &sc.vv,
+                        &mut self.cache_v[li],
+                        base_position,
+                        n_kv,
+                        head_dim,
+                        max_pos,
+                        kv_width,
+                        k,
+                    )
+                    .map_err(map)?;
+                    if flash_ok
+                        && flash_prefill_enabled()
+                        && q_width == n_heads * head_dim
+                        && k <= MAX_VERIFY_K
+                        && base_position + k > SPLITK_THRESHOLD
+                    {
+                        launch_attention_flash_prefill(
+                            &s,
+                            &self.k,
+                            &sc.vq,
+                            &self.cache_k[li],
+                            &self.cache_v[li],
+                            &mut sc.vattn,
+                            &mut self.d_flash_scores,
+                            &mut self.d_flash_chunkmax,
+                            &mut self.d_flash_lsum,
+                            &mut self.d_flash_acc,
+                            n_heads,
+                            n_kv,
+                            head_dim,
+                            base_position,
+                            k,
+                            q_width,
+                            max_pos,
+                            scale,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_attention_batched(
+                            &s,
+                            &self.k.attention_batched,
+                            &sc.vq,
+                            &self.cache_k[li],
+                            &self.cache_v[li],
+                            &mut sc.vattn,
+                            n_heads,
+                            n_kv,
+                            head_dim,
+                            base_position,
+                            max_pos,
+                            scale,
+                            q_width,
+                            k,
+                            if splitk_verify_active() { 1 } else { 0 },
+                        )
+                        .map_err(map)?;
+                    }
+                    if self.qwen35.is_some() {
+                        launch_sigmoid_mul(
+                            &s,
+                            &self.k.sigmoid_mul,
+                            &mut sc.vattn,
+                            &sc.vup,
+                            k * q_width,
+                        )
+                        .map_err(map)?;
+                    }
+                    let attention_bmma = quantize_batched_for_lanes(
+                        &s,
+                        &self.k,
+                        &sc.vattn,
+                        &mut sc.viq,
+                        &mut sc.vis,
+                        &mut sc.vibits,
+                        &mut sc.vibscales,
+                        &mut sc.viqk,
+                        &mut sc.visk,
+                        q_width,
+                        k,
+                        &lq[3..4],
+                    )
+                    .map_err(map)?;
+                    if self.k.fast_q1 && lq[3] == ProjQuant::Q1_0 {
+                        dispatch_gemm_batched(
+                            &s,
+                            &self.k,
+                            lq[3],
+                            &sc.vattn,
+                            &sc.vis,
+                            &sc.viq,
+                            &sc.vibits,
+                            &sc.vibscales,
+                            attention_bmma,
+                            &sc.visk,
+                            &sc.viqk,
+                            &layer.o,
+                            hidden,
+                            q_width,
+                            k,
+                            &mut sc.vh,
+                            1,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        dispatch_gemm_batched(
+                            &s,
+                            &self.k,
+                            lq[3],
+                            &sc.vattn,
+                            &sc.vis,
+                            &sc.viq,
+                            &sc.vibits,
+                            &sc.vibscales,
+                            attention_bmma,
+                            &sc.visk,
+                            &sc.viqk,
+                            &layer.o,
+                            hidden,
+                            q_width,
+                            k,
+                            &mut sc.vproj,
+                            0,
+                        )
+                        .map_err(map)?;
+                        launch_residual(
+                            &s,
+                            &self.k.residual_add,
+                            &mut sc.vh,
+                            &sc.vproj,
+                            k * hidden,
+                        )
+                        .map_err(map)?;
+                    }
+                }
+                LayerKind::Ssm(ssm) => {
+                    let q = self
+                        .qwen35
+                        .as_ref()
+                        .expect("SSM layer requires qwen35 state");
+                    let (ds, nk, nv, key_dim, value_dim, conv_dim, d_conv) = (
+                        q.d_state,
+                        q.num_k_heads,
+                        q.num_v_heads,
+                        q.key_dim,
+                        q.value_dim,
+                        q.conv_dim,
+                        q.d_conv,
+                    );
+                    let sq = ssm.quants;
+                    dispatch_gemm_batched(
+                        &s,
+                        &self.k,
+                        sq[0],
+                        &sc.vn,
+                        &sc.vis,
+                        &sc.viq,
+                        &sc.vibits,
+                        &sc.vibscales,
+                        mixer_bmma,
+                        &sc.visk,
+                        &sc.viqk,
+                        &ssm.wqkv,
+                        conv_dim,
+                        hidden,
+                        k,
+                        &mut sc.vgate,
+                        0,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemm_batched(
+                        &s,
+                        &self.k,
+                        sq[1],
+                        &sc.vn,
+                        &sc.vis,
+                        &sc.viq,
+                        &sc.vibits,
+                        &sc.vibscales,
+                        mixer_bmma,
+                        &sc.visk,
+                        &sc.viqk,
+                        &ssm.wqkv_gate,
+                        value_dim,
+                        hidden,
+                        k,
+                        &mut sc.vact,
+                        0,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemm_batched(
+                        &s,
+                        &self.k,
+                        sq[2],
+                        &sc.vn,
+                        &sc.vis,
+                        &sc.viq,
+                        &sc.vibits,
+                        &sc.vibscales,
+                        mixer_bmma,
+                        &sc.visk,
+                        &sc.viqk,
+                        &ssm.beta,
+                        nv,
+                        hidden,
+                        k,
+                        &mut sc.vk,
+                        0,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemm_batched(
+                        &s,
+                        &self.k,
+                        sq[3],
+                        &sc.vn,
+                        &sc.vis,
+                        &sc.viq,
+                        &sc.vibits,
+                        &sc.vibscales,
+                        mixer_bmma,
+                        &sc.visk,
+                        &sc.viqk,
+                        &ssm.alpha,
+                        nv,
+                        hidden,
+                        k,
+                        &mut sc.vv,
+                        0,
+                    )
+                    .map_err(map)?;
+                    launch_ssm_gates_batched(
+                        &s,
+                        &self.k.ssm_gates_batched,
+                        &sc.vk,
+                        &sc.vv,
+                        &ssm.dt_bias,
+                        &ssm.a,
+                        &mut sc.vq,
+                        &mut sc.vattn,
+                        nv,
+                        k,
+                    )
+                    .map_err(map)?;
+                    let bonsai_ssm_q8 =
+                        self.k.fast_q1 && ds == 128 && d_conv == 4 && sq[4] == ProjQuant::Q1_0;
+                    if bonsai_ssm_q8 {
+                        // Bonsai's hot SSM lane: fixed-geometry convolution,
+                        // paired Q/K norm, and register-resident recurrence.
+                        // No generic SSM kernel is allowed on this path.
+                        launch_qwen35_ssm_conv1d_d4_batched(
+                            &s,
+                            &self.k.qwen35_ssm_conv1d_d4_batched,
+                            &ssm.conv1d,
+                            &sc.vgate,
+                            &mut self.ssm_conv_state[li],
+                            &mut sc.vup,
+                            conv_dim,
+                            k,
+                        )
+                        .map_err(map)?;
+                        launch_qwen35_ssm_qk_l2_norm_d128_batched(
+                            &s,
+                            &self.k.qwen35_ssm_qk_l2_norm_d128_batched,
+                            &mut sc.vup,
+                            conv_dim,
+                            key_dim,
+                            nk,
+                            k,
+                            eps,
+                        )
+                        .map_err(map)?;
+                        launch_qwen35_ssm_delta_rule_d128_batched(
+                            &s,
+                            &self.k.qwen35_ssm_delta_rule_d128_batched,
+                            &mut self.ssm_state[li],
+                            &sc.vup,
+                            &sc.vq,
+                            &sc.vattn,
+                            &mut sc.vgate,
+                            nk,
+                            nv,
+                            key_dim,
+                            value_dim,
+                            conv_dim,
+                            k,
+                        )
+                        .map_err(map)?;
+                        launch_qwen35_ssm_rmsnorm_gate_q8_d128_batched(
+                            &s,
+                            &self.k.qwen35_ssm_rmsnorm_gate_q8_d128_batched,
+                            &sc.vgate,
+                            &sc.vact,
+                            &ssm.ssm_norm,
+                            &mut sc.viq,
+                            &mut sc.vis,
+                            nv,
+                            value_dim,
+                            k,
+                            eps,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_ssm_conv1d_batched(
+                            &s,
+                            &self.k.ssm_conv1d_batched,
+                            &ssm.conv1d,
+                            &sc.vgate,
+                            &mut self.ssm_conv_state[li],
+                            &mut sc.vup,
+                            conv_dim,
+                            d_conv,
+                            k,
+                        )
+                        .map_err(map)?;
+                        launch_ssm_l2_norm_per_head_batched(
+                            &s,
+                            &self.k.ssm_l2_norm_per_head_batched,
+                            &mut sc.vup,
+                            conv_dim,
+                            0,
+                            nk,
+                            ds,
+                            k,
+                            eps,
+                        )
+                        .map_err(map)?;
+                        launch_ssm_l2_norm_per_head_batched(
+                            &s,
+                            &self.k.ssm_l2_norm_per_head_batched,
+                            &mut sc.vup,
+                            conv_dim,
+                            key_dim,
+                            nk,
+                            ds,
+                            k,
+                            eps,
+                        )
+                        .map_err(map)?;
+                        launch_ssm_delta_rule_batched(
+                            &s,
+                            &self.k.ssm_delta_rule_batched,
+                            &mut self.ssm_state[li],
+                            &sc.vup,
+                            &sc.vact,
+                            &sc.vq,
+                            &sc.vattn,
+                            &ssm.ssm_norm,
+                            &mut sc.vgate,
+                            ds,
+                            nk,
+                            nv,
+                            key_dim,
+                            value_dim,
+                            conv_dim,
+                            k,
+                            eps,
+                        )
+                        .map_err(map)?;
+                    }
+                    let ssm_out_bmma = if !bonsai_ssm_q8 {
+                        quantize_batched_for_lanes(
+                            &s,
+                            &self.k,
+                            &sc.vgate,
+                            &mut sc.viq,
+                            &mut sc.vis,
+                            &mut sc.vibits,
+                            &mut sc.vibscales,
+                            &mut sc.viqk,
+                            &mut sc.visk,
+                            value_dim,
+                            k,
+                            &sq[4..5],
+                        )
+                        .map_err(map)?
+                    } else {
+                        // The fused Bonsai gated-RMSNorm kernel materializes
+                        // Q8/32 directly, so no f32 row exists to bit-pack.
+                        false
+                    };
+                    if bonsai_ssm_q8 {
+                        dispatch_gemm_batched(
+                            &s,
+                            &self.k,
+                            sq[4],
+                            &sc.vgate,
+                            &sc.vis,
+                            &sc.viq,
+                            &sc.vibits,
+                            &sc.vibscales,
+                            ssm_out_bmma,
+                            &sc.visk,
+                            &sc.viqk,
+                            &ssm.ssm_out,
+                            hidden,
+                            value_dim,
+                            k,
+                            &mut sc.vh,
+                            1,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        dispatch_gemm_batched(
+                            &s,
+                            &self.k,
+                            sq[4],
+                            &sc.vgate,
+                            &sc.vis,
+                            &sc.viq,
+                            &sc.vibits,
+                            &sc.vibscales,
+                            ssm_out_bmma,
+                            &sc.visk,
+                            &sc.viqk,
+                            &ssm.ssm_out,
+                            hidden,
+                            value_dim,
+                            k,
+                            &mut sc.vn,
+                            0,
+                        )
+                        .map_err(map)?;
+                        launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vn, k * hidden)
+                            .map_err(map)?;
+                    }
+                }
             }
-            quantize_batched_for_lanes(
-                &s,
-                &self.k,
-                &sc.vattn,
-                &mut sc.viq,
-                &mut sc.vis,
-                &mut sc.viqk,
-                &mut sc.visk,
-                q_width,
-                k,
-                &lq[3..4],
-            )
-            .map_err(map)?;
-            dispatch_gemm_batched(
-                &s,
-                &self.k,
-                lq[3],
-                &sc.vis,
-                &sc.viq,
-                &sc.visk,
-                &sc.viqk,
-                &layer.o,
-                hidden,
-                q_width,
-                k,
-                &mut sc.vproj,
-            )
-            .map_err(map)?;
-            launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
+            let ffn_q1 = self.k.fast_q1 && lq[4..6].iter().all(|lane| *lane == ProjQuant::Q1_0);
+            let ffn_bmma = if ffn_q1 && !prism_bmma_shape_enabled(&self.k, hidden, k) {
+                launch_prism_rms_norm_q8_batched(
+                    &s,
+                    &self.k.prism_rms_norm_q8_batched,
+                    &sc.vh,
+                    &layer.ffn_norm,
+                    &mut sc.viq,
+                    &mut sc.vis,
+                    hidden,
+                    eps,
+                    k,
+                )
                 .map_err(map)?;
-            launch_rms_norm_batched(
-                &s,
-                &self.k.rms_norm_batched,
-                &sc.vh,
-                &layer.ffn_norm,
-                &mut sc.vn,
-                hidden,
-                eps,
-                k,
-            )
-            .map_err(map)?;
-            quantize_batched_for_lanes(
-                &s,
-                &self.k,
-                &sc.vn,
-                &mut sc.viq,
-                &mut sc.vis,
-                &mut sc.viqk,
-                &mut sc.visk,
-                hidden,
-                k,
-                &lq[4..6],
-            )
-            .map_err(map)?;
+                false
+            } else {
+                launch_rms_norm_batched(
+                    &s,
+                    &self.k.rms_norm_batched,
+                    &sc.vh,
+                    &layer.ffn_norm,
+                    &mut sc.vn,
+                    hidden,
+                    eps,
+                    k,
+                )
+                .map_err(map)?;
+                quantize_batched_for_lanes(
+                    &s,
+                    &self.k,
+                    &sc.vn,
+                    &mut sc.viq,
+                    &mut sc.vis,
+                    &mut sc.vibits,
+                    &mut sc.vibscales,
+                    &mut sc.viqk,
+                    &mut sc.visk,
+                    hidden,
+                    k,
+                    &lq[4..6],
+                )
+                .map_err(map)?
+            };
             dispatch_gemm_batched(
                 &s,
                 &self.k,
                 lq[4],
+                &sc.vn,
                 &sc.vis,
                 &sc.viq,
+                &sc.vibits,
+                &sc.vibscales,
+                ffn_bmma,
                 &sc.visk,
                 &sc.viqk,
                 &layer.gate,
@@ -9228,14 +14126,19 @@ impl CudaResidentDecode {
                 hidden,
                 k,
                 &mut sc.vgate,
+                0,
             )
             .map_err(map)?;
             dispatch_gemm_batched(
                 &s,
                 &self.k,
                 lq[5],
+                &sc.vn,
                 &sc.vis,
                 &sc.viq,
+                &sc.vibits,
+                &sc.vibscales,
+                ffn_bmma,
                 &sc.visk,
                 &sc.viqk,
                 &layer.up,
@@ -9243,47 +14146,93 @@ impl CudaResidentDecode {
                 hidden,
                 k,
                 &mut sc.vup,
+                0,
             )
             .map_err(map)?;
-            launch_silu_mul(
-                &s,
-                &self.k.silu_mul,
-                &sc.vgate,
-                &sc.vup,
-                &mut sc.vact,
-                k * ffn_dim,
-            )
-            .map_err(map)?;
-            quantize_batched_for_lanes(
-                &s,
-                &self.k,
-                &sc.vact,
-                &mut sc.viq,
-                &mut sc.vis,
-                &mut sc.viqk,
-                &mut sc.visk,
-                ffn_dim,
-                k,
-                &lq[6..7],
-            )
-            .map_err(map)?;
-            dispatch_gemm_batched(
-                &s,
-                &self.k,
-                lq[6],
-                &sc.vis,
-                &sc.viq,
-                &sc.visk,
-                &sc.viqk,
-                &layer.down,
-                hidden,
-                ffn_dim,
-                k,
-                &mut sc.vproj,
-            )
-            .map_err(map)?;
-            launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
+            let down_q1 = self.k.fast_q1 && lq[6] == ProjQuant::Q1_0;
+            let down_bmma = if down_q1 && !prism_bmma_shape_enabled(&self.k, ffn_dim, k) {
+                launch_prism_silu_mul_q8_batched(
+                    &s,
+                    &self.k.prism_silu_mul_q8_batched,
+                    &sc.vgate,
+                    &sc.vup,
+                    &mut sc.viq,
+                    &mut sc.vis,
+                    k * (ffn_dim / 32),
+                )
                 .map_err(map)?;
+                false
+            } else {
+                launch_silu_mul(
+                    &s,
+                    &self.k.silu_mul,
+                    &sc.vgate,
+                    &sc.vup,
+                    &mut sc.vact,
+                    k * ffn_dim,
+                )
+                .map_err(map)?;
+                quantize_batched_for_lanes(
+                    &s,
+                    &self.k,
+                    &sc.vact,
+                    &mut sc.viq,
+                    &mut sc.vis,
+                    &mut sc.vibits,
+                    &mut sc.vibscales,
+                    &mut sc.viqk,
+                    &mut sc.visk,
+                    ffn_dim,
+                    k,
+                    &lq[6..7],
+                )
+                .map_err(map)?
+            };
+            if down_q1 {
+                dispatch_gemm_batched(
+                    &s,
+                    &self.k,
+                    lq[6],
+                    &sc.vact,
+                    &sc.vis,
+                    &sc.viq,
+                    &sc.vibits,
+                    &sc.vibscales,
+                    down_bmma,
+                    &sc.visk,
+                    &sc.viqk,
+                    &layer.down,
+                    hidden,
+                    ffn_dim,
+                    k,
+                    &mut sc.vh,
+                    1,
+                )
+                .map_err(map)?;
+            } else {
+                dispatch_gemm_batched(
+                    &s,
+                    &self.k,
+                    lq[6],
+                    &sc.vact,
+                    &sc.vis,
+                    &sc.viq,
+                    &sc.vibits,
+                    &sc.vibscales,
+                    down_bmma,
+                    &sc.visk,
+                    &sc.viqk,
+                    &layer.down,
+                    hidden,
+                    ffn_dim,
+                    k,
+                    &mut sc.vproj,
+                    0,
+                )
+                .map_err(map)?;
+                launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
+                    .map_err(map)?;
+            }
         }
         Ok(())
     }
@@ -9821,11 +14770,11 @@ impl CudaResidentDecode {
         if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
             return Err("prefill_batched: input slices too short".into());
         }
-        self.ensure_verify_scratch()?;
-        let s = self.k.stream.clone();
-        let mut sc = self.verify_scratch.take().expect("allocated above");
-        let mut base = 0usize;
         let batch_cap = self.batched_layer_token_cap();
+        self.ensure_prefill_scratch(batch_cap)?;
+        let s = self.k.stream.clone();
+        let mut sc = self.prefill_scratch.take().expect("allocated above");
+        let mut base = 0usize;
         while base < n {
             let kk = (n - base).min(batch_cap);
             // Stage this chunk's embeddings + RoPE tables into the shared scratch at
@@ -9854,7 +14803,7 @@ impl CudaResidentDecode {
             .ctx
             .synchronize()
             .map_err(|e| format!("cuda prefill sync: {e}"))?;
-        self.verify_scratch = Some(sc);
+        self.prefill_scratch = Some(sc);
         Ok(())
     }
 }

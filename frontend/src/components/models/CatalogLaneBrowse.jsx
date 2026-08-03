@@ -2,6 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
 import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition, reserveCatalogAcquisition } from '../../lib/catalogActivation'
 import {
+  catalogBundleInstalled,
+  catalogCompanionArtifacts,
+  missingCatalogArtifacts,
+} from '../../lib/catalogCompanions'
+import {
   defaultFileIndex,
   fitDetail,
   fitIsRecheckable,
@@ -196,6 +201,7 @@ function CatalogRow({
   item,
   capabilities,
   installed,
+  missingArtifacts = [],
   activeDownload,
   apiBase,
   installAvailable,
@@ -242,8 +248,16 @@ function CatalogRow({
     && item.oracle_qualified
   const acquisitionMode = downloadAndStart ? 'start' : smokeAfterDownload ? 'smoke' : 'download'
   const downloading = activeDownload?.status === 'downloading'
+  const downloadFailed = activeDownload?.status === 'failed'
   const rejoinableDownload = downloading || activeDownload?.status === 'completed'
   const operationBusy = phase === 'checking' || phase === 'loading'
+  const companions = catalogCompanionArtifacts(item)
+  const primaryInstalled = !missingArtifacts.some((artifact) => artifact.role === 'model')
+  const onlyCompanionsMissing = primaryInstalled && missingArtifacts.length > 0
+  const missingBytes = missingArtifacts.reduce(
+    (total, artifact) => total + Number(artifact.size_bytes || 0),
+    0,
+  )
 
   useEffect(() => {
     onOperationBusy?.(item.catalog_id, operationBusy)
@@ -347,6 +361,7 @@ function CatalogRow({
     }
     const settlement = catalogDownloadSettlement({
       downloading,
+      failed: downloadFailed,
       installed,
       sawDownload: sawDownloadRef.current,
       settledAt: settledAtRef.current,
@@ -364,7 +379,7 @@ function CatalogRow({
       setMessage('Download did not complete (canceled or failed). It can be retried.')
       onAcquisitionSettled?.(item.catalog_id)
     }
-  }, [phase, downloading, installed, canceled, settlementTick, finishLanded, item.catalog_id, onAcquisitionSettled])
+  }, [phase, downloading, downloadFailed, installed, canceled, settlementTick, finishLanded, item.catalog_id, onAcquisitionSettled])
 
   const confirmDownload = async () => {
     setPhase('starting')
@@ -464,14 +479,18 @@ function CatalogRow({
               : phase === 'loading'
                 ? 'Check passed — loading the model for Chat…'
                 : downloading
-                  ? 'Downloading — live progress is shown above.'
+                  ? activeDownload?.current_artifact_role === 'vision_projector'
+                    ? 'Downloading the vision projector — live progress is shown above.'
+                    : 'Downloading the model — live progress is shown above.'
                   : 'Starting download…'}
           </p>
         </div>
       ) : phase === 'failed' ? (
         <div className="catalog-start-failure" role="alert">
           <p className="catalog-row-error">{message}</p>
-          <p className="catalog-row-faint">The file is still on disk. Camelid has not opened Chat.</p>
+          <p className="catalog-row-faint">
+            Any completed file remains on disk, but Camelid has not opened Chat without the complete bundle.
+          </p>
           <button type="button" className="catalog-row-action" onClick={retryAcquisition}>
             {failedStage === 'checking' ? 'Retry check' : 'Retry start'}
           </button>
@@ -482,6 +501,11 @@ function CatalogRow({
         <p className="catalog-row-faint">Already on disk — shown in its section above.</p>
       ) : phase === 'idle' ? (
         <>
+          {onlyCompanionsMissing ? (
+            <p className="catalog-row-faint">
+              The model is on disk, but its required vision projector is missing. Download it to enable image prompts.
+            </p>
+          ) : null}
           {item.group !== 'experimental' && lane === 'not_anchored' ? (
             <p className="catalog-row-faint">
               Its {item.architecture}/{item.quant} combo is not yet in the runnable lane — still
@@ -497,7 +521,13 @@ function CatalogRow({
               disabled={acquisitionLocked}
               title={acquisitionLocked ? 'Wait for the current model acquisition to finish' : undefined}
             >
-              {downloadAndStart ? 'Download and start…' : 'Download…'}
+              {onlyCompanionsMissing
+                ? downloadAndStart
+                  ? 'Download vision projector and start…'
+                  : 'Download vision projector…'
+                : downloadAndStart
+                  ? 'Download and start…'
+                  : 'Download…'}
             </button>
           ) : (
             <>
@@ -510,11 +540,27 @@ function CatalogRow({
         </>
       ) : phase === 'confirm' ? (
         <div className="catalog-confirm">
-          <p>
-            Download <strong>{item.filename}</strong> from <code>{item.repo_id}</code> (
-            {prettySize(item.size_bytes)})? This pulls from HuggingFace into your local models folder.
-            {downloadAndStart ? ' Camelid will check it, load it, and open Chat after the download.' : ''}
-          </p>
+          {onlyCompanionsMissing ? (
+            <p>
+              Download the required vision projector <strong>{missingArtifacts[0]?.filename}</strong> from{' '}
+              <code>{missingArtifacts[0]?.repo_id}</code> ({prettySize(missingBytes)})? The model is already on disk;
+              Camelid will reuse it without downloading it again.
+              {downloadAndStart ? ' Camelid will load the model and open Chat after the projector lands.' : ''}
+            </p>
+          ) : companions.length ? (
+            <p>
+              Download <strong>{item.filename}</strong> plus its required vision projector{' '}
+              <strong>{companions[0].filename}</strong> ({prettySize(missingBytes)})? Camelid downloads both into your
+              local models folder and enables image prompts only after both files land.
+              {downloadAndStart ? ' It will then check the model, load it, and open Chat.' : ''}
+            </p>
+          ) : (
+            <p>
+              Download <strong>{item.filename}</strong> from <code>{item.repo_id}</code> (
+              {prettySize(item.size_bytes)})? This pulls from HuggingFace into your local models folder.
+              {downloadAndStart ? ' Camelid will check it, load it, and open Chat after the download.' : ''}
+            </p>
+          )}
           <div className="catalog-confirm-actions">
             <button type="button" className="catalog-row-action" onClick={confirmDownload}>
               Confirm download
@@ -802,7 +848,8 @@ export function CatalogLaneBrowse({
       key={item.catalog_id}
       item={item}
       capabilities={capabilities}
-      installed={localFilenames.has(item.filename)}
+      installed={catalogBundleInstalled(item, localFilenames)}
+      missingArtifacts={missingCatalogArtifacts(item, localFilenames)}
       activeDownload={downloads.find((download) => download.id === item.catalog_id)}
       apiBase={base}
       installAvailable={installAvailable}

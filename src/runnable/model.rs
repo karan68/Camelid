@@ -107,6 +107,16 @@ impl Mat {
 }
 
 impl RawMat {
+    fn is_prism_low_bit(&self) -> bool {
+        matches!(
+            self.tt,
+            GgufTensorType::Q1_0
+                | GgufTensorType::Q2_0G64
+                | GgufTensorType::Q2_0G128
+                | GgufTensorType::Pq2_0
+        )
+    }
+
     fn row_bytes(&self) -> usize {
         self.bytes.len() / self.out_features
     }
@@ -454,6 +464,10 @@ pub struct RunnableModel {
     /// layers have no K/V attention). When set, the forward path is routed to the
     /// dedicated `*_qwen35` methods and `layers` is empty. See [`Qwen35Runtime`].
     qwen35: Option<Qwen35Runtime>,
+    /// Exact artifact identity used to admit hash-pinned CUDA specializations.
+    /// Geometry alone is not sufficient because unrelated qwen35 files can share it.
+    #[cfg(feature = "cuda")]
+    resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact,
     /// Lazily-built GPU resident decode engine for the qwen35 lane, gated by
     /// `CAMELID_QWEN35_CUDA=1`. `Mutex` gives the `&mut` the per-token forward needs
     /// while `generate_*` take `&self`; built on first use and reused, with the SSM/conv
@@ -654,6 +668,45 @@ impl RunnableModel {
                 });
             }
 
+            #[cfg(feature = "cuda")]
+            let resident_cuda_artifact = {
+                use crate::cuda_resident::{
+                    resident_cuda_artifact_from_sha256, ResidentCudaArtifact,
+                };
+
+                // Hash only the plausible exact Q1 row. API loads normally hit the
+                // receipt hash cache; direct CLI loads still prove identity before
+                // admitting kernels/layouts validated against one concrete artifact.
+                let ffn_dim = q35_layers
+                    .first()
+                    .map(|layer| layer.ffn_gate.out_features)
+                    .unwrap_or(0);
+                let has_q1_projection = q35_layers.iter().any(|layer| {
+                    [layer.ffn_gate.tt, layer.ffn_up.tt, layer.ffn_down.tt]
+                        .contains(&GgufTensorType::Q1_0)
+                });
+                let candidate = n_layers == 64
+                    && d_model == 5_120
+                    && ffn_dim == 17_408
+                    && n_heads * head_dim == 6_144
+                    && n_kv_heads * head_dim == 1_024
+                    && has_q1_projection;
+
+                if candidate {
+                    match crate::receipt::sha256_file_hex_cached(std::path::Path::new(path)) {
+                        Ok(sha256) => resident_cuda_artifact_from_sha256(&sha256),
+                        Err(err) => {
+                            eprintln!(
+                                "[qwen35] CUDA artifact identity unavailable; exact Bonsai-27B Q1 specializations disabled: {err}"
+                            );
+                            ResidentCudaArtifact::Generic
+                        }
+                    }
+                } else {
+                    ResidentCudaArtifact::Generic
+                }
+            };
+
             return Ok(Self {
                 architecture: arch,
                 d_model,
@@ -688,6 +741,8 @@ impl RunnableModel {
                     value_dim,
                     conv_dim,
                 }),
+                #[cfg(feature = "cuda")]
+                resident_cuda_artifact,
                 #[cfg(feature = "cuda")]
                 cuda: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
@@ -800,6 +855,8 @@ impl RunnableModel {
             output_norm,
             layers,
             qwen35: None,
+            #[cfg(feature = "cuda")]
+            resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact::Generic,
             #[cfg(feature = "cuda")]
             cuda: std::sync::Mutex::new(None),
             #[cfg(target_os = "macos")]
@@ -955,10 +1012,19 @@ impl RunnableModel {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (prefix, image, suffix, max_new, stop, on_token);
-            Err(BackendError::UnsupportedGguf(
-                "Prism image generation currently requires macOS Metal".into(),
-            ))
+            #[cfg(feature = "cuda")]
+            {
+                self.generate_qwen35_vision_cuda(
+                    prefix, image, suffix, max_new, stop, None, on_token,
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (prefix, image, suffix, max_new, stop, on_token);
+                Err(BackendError::UnsupportedGguf(
+                    "Prism image generation requires Metal or CUDA".into(),
+                ))
+            }
         }
     }
 
@@ -982,10 +1048,20 @@ impl RunnableModel {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (prefix, image, suffix, max_new, stop, sampling, on_token);
-            Err(BackendError::UnsupportedGguf(
-                "Prism image generation currently requires macOS Metal".into(),
-            ))
+            #[cfg(feature = "cuda")]
+            {
+                let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
+                self.generate_qwen35_vision_cuda(
+                    prefix, image, suffix, max_new, stop, sampling, on_token,
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (prefix, image, suffix, max_new, stop, sampling, on_token);
+                Err(BackendError::UnsupportedGguf(
+                    "Prism image generation requires Metal or CUDA".into(),
+                ))
+            }
         }
     }
 
@@ -1652,12 +1728,19 @@ impl RunnableModel {
         }
         #[cfg(feature = "cuda")]
         {
-            if sampling.is_none()
-                && std::env::var("CAMELID_QWEN35_CUDA")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-            {
-                match self.generate_qwen35_cuda(prompt, max_new, stop, on_token) {
+            let cuda_enabled = match std::env::var("CAMELID_QWEN35_CUDA") {
+                Ok(value) => matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                ),
+                // Prism's Windows port is the packed resident CUDA graph. Keep
+                // Ornith's established opt-in policy, while selecting CUDA by
+                // default for Prism rows on Windows; CAMELID_QWEN35_CUDA=0 is
+                // still an explicit CPU fallback/debug override.
+                Err(_) => cfg!(windows) && self.output.is_prism_low_bit(),
+            };
+            if cuda_enabled {
+                match self.generate_qwen35_cuda(prompt, max_new, stop, sampling, on_token) {
                     Ok(v) => return Ok(v),
                     Err(e) => {
                         eprintln!("[qwen35] CUDA lane failed ({e}); falling back to CPU");
@@ -1809,7 +1892,13 @@ impl RunnableModel {
                 "qwen35 row has no height/width multimodal RoPE sections".into(),
             ));
         }
-        let prompt_slots = prefix.len() + image.embeddings.len() + suffix.len();
+        let decode_cursor = qwen35_vision_decode_cursor(
+            prefix.len(),
+            image.grid_width,
+            image.grid_height,
+            suffix.len(),
+        );
+        let prompt_slots = decode_cursor.kv_position;
         if prompt_slots == 0 {
             return Err(BackendError::InvalidTensorData(
                 "empty multimodal prompt".into(),
@@ -1859,13 +1948,17 @@ impl RunnableModel {
             prompt_inputs.push((embedding.clone(), cos, sin));
         }
 
-        let mut logical_position = image_position + image.grid_width.max(image.grid_height);
-        for &token in suffix {
+        let suffix_logical_start = decode_cursor.rope_position - suffix.len();
+        for (suffix_offset, &token) in suffix.iter().enumerate() {
             let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
-            let (cos, sin) = qwen35_rope_tables(logical_position, self.rope_base, self.rope_dim);
+            let (cos, sin) = qwen35_rope_tables(
+                suffix_logical_start + suffix_offset,
+                self.rope_base,
+                self.rope_dim,
+            );
             prompt_inputs.push((embedding, cos, sin));
-            logical_position += 1;
         }
+        let mut logical_position = decode_cursor.rope_position;
 
         let (last_input, prior_inputs) = prompt_inputs.split_last().ok_or_else(|| {
             BackendError::InvalidTensorData("multimodal prompt produced no inputs".into())
@@ -1940,6 +2033,276 @@ impl RunnableModel {
         Ok(generated)
     }
 
+    /// Windows/Linux multimodal counterpart to the Metal path. The image tower
+    /// supplies language-width embeddings and this method feeds them through the
+    /// same resident CUDA Qwen3.5 graph as text tokens, with Qwen3-VL's 3-axis
+    /// IMRoPE tables and physical KV slots preserved exactly.
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    #[allow(clippy::too_many_arguments)]
+    fn generate_qwen35_vision_cuda(
+        &self,
+        prefix: &[u32],
+        image: &super::vision::PrismVisionEmbedding,
+        suffix: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: Option<&SamplingConfig>,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let runtime = self
+            .qwen35
+            .as_ref()
+            .ok_or_else(|| BackendError::UnsupportedGguf("vision requires qwen35".into()))?;
+        if image.grid_width == 0
+            || image.grid_height == 0
+            || image.embeddings.len() != image.grid_width * image.grid_height
+            || image
+                .embeddings
+                .iter()
+                .any(|embedding| embedding.len() != self.d_model)
+        {
+            return Err(BackendError::InvalidTensorData(format!(
+                "vision embedding/grid shape is incompatible with Qwen3.5 width {}",
+                self.d_model
+            )));
+        }
+        if runtime.rope_sections[1] == 0 || runtime.rope_sections[2] == 0 {
+            return Err(BackendError::InvalidModelMetadata(
+                "qwen35 row has no height/width multimodal RoPE sections".into(),
+            ));
+        }
+        let decode_cursor = qwen35_vision_decode_cursor(
+            prefix.len(),
+            image.grid_width,
+            image.grid_height,
+            suffix.len(),
+        );
+        let prompt_slots = decode_cursor.kv_position;
+        if prompt_slots == 0 {
+            return Err(BackendError::InvalidTensorData(
+                "empty multimodal prompt".into(),
+            ));
+        }
+        let max_positions: usize = std::env::var("CAMELID_QWEN35_CUDA_MAXPOS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8192);
+        let max_new = qwen35_generation_budget(prompt_slots, max_new, max_positions, "multimodal")?;
+
+        let mut guard = self
+            .cuda
+            .lock()
+            .map_err(|_| BackendError::InvalidTensorData("qwen35 cuda mutex poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(
+                self.build_qwen35_resident(max_positions)
+                    .map_err(BackendError::InvalidTensorData)?,
+            );
+            eprintln!("[qwen35] multimodal CUDA graph active (Prism image embeddings + IMRoPE)");
+        }
+        let engine = guard.as_mut().expect("Qwen3.5 CUDA engine initialized");
+        engine
+            .reset_qwen35_state()
+            .map_err(BackendError::InvalidTensorData)?;
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let sampler = sampling.map(|config| LlamaSampler::Sampling(config.clone()));
+        let mut token_history = Vec::with_capacity(prefix.len() + suffix.len() + max_new);
+        token_history.extend_from_slice(prefix);
+        token_history.extend_from_slice(suffix);
+        let mut prompt_inputs = Vec::with_capacity(prompt_slots);
+
+        for (logical_position, &token) in prefix.iter().enumerate() {
+            let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
+            let (cos, sin) = qwen35_rope_tables(logical_position, self.rope_base, self.rope_dim);
+            prompt_inputs.push((embedding, cos, sin));
+        }
+        let image_position = prefix.len();
+        for (index, embedding) in image.embeddings.iter().enumerate() {
+            let row = index / image.grid_width;
+            let column = index % image.grid_width;
+            let positions = [
+                image_position,
+                image_position + row,
+                image_position + column,
+                0,
+            ];
+            let (cos, sin) = qwen35_imrope_tables(
+                positions,
+                runtime.rope_sections,
+                self.rope_base,
+                self.rope_dim,
+            );
+            prompt_inputs.push((embedding.clone(), cos, sin));
+        }
+        let suffix_logical_start = decode_cursor.rope_position - suffix.len();
+        for (suffix_offset, &token) in suffix.iter().enumerate() {
+            let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
+            let (cos, sin) = qwen35_rope_tables(
+                suffix_logical_start + suffix_offset,
+                self.rope_base,
+                self.rope_dim,
+            );
+            prompt_inputs.push((embedding, cos, sin));
+        }
+        let mut logical_position = decode_cursor.rope_position;
+
+        let (last_input, prior_inputs) = prompt_inputs.split_last().ok_or_else(|| {
+            BackendError::InvalidTensorData("multimodal prompt produced no inputs".into())
+        })?;
+        if !prior_inputs.is_empty() {
+            // Match the Metal optimization pass: enqueue every non-final slot in
+            // physical-order and synchronize once after the burst. `prefill` runs
+            // the exact same token graph and preserves recurrent/KV dependencies on
+            // the CUDA stream; it only removes the per-slot WDDM round trip that made
+            // a full-resolution image prompt dramatically slower than Metal.
+            let half = self.rope_dim / 2;
+            let mut embeddings = Vec::with_capacity(prior_inputs.len() * self.d_model);
+            let mut cos_all = Vec::with_capacity(prior_inputs.len() * half);
+            let mut sin_all = Vec::with_capacity(prior_inputs.len() * half);
+            for (embedding, cos, sin) in prior_inputs {
+                embeddings.extend_from_slice(embedding);
+                cos_all.extend_from_slice(cos);
+                sin_all.extend_from_slice(sin);
+            }
+            if engine.prefers_batched_prefill() {
+                engine
+                    .prefill_batched(&embeddings, &cos_all, &sin_all, prior_inputs.len(), scale)
+                    .map_err(BackendError::InvalidTensorData)?;
+            } else {
+                engine
+                    .prefill(&embeddings, &cos_all, &sin_all, prior_inputs.len(), scale)
+                    .map_err(BackendError::InvalidTensorData)?;
+            }
+        }
+        let final_slot = prior_inputs.len();
+        let mut next = match &sampler {
+            Some(sampler) => qwen35_sample_logits(
+                engine
+                    .forward_token_logits(
+                        &last_input.0,
+                        &last_input.1,
+                        &last_input.2,
+                        final_slot,
+                        scale,
+                    )
+                    .map_err(BackendError::InvalidTensorData)?,
+                sampler,
+                &token_history,
+            )?,
+            None => engine
+                .forward_token(
+                    &last_input.0,
+                    &last_input.1,
+                    &last_input.2,
+                    final_slot,
+                    scale,
+                    true,
+                )
+                .map_err(BackendError::InvalidTensorData)?
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData(
+                        "no logits on final multimodal prompt slot".into(),
+                    )
+                })?,
+        };
+
+        if sampler.is_none() && engine.device_decode_ready() {
+            // The multimodal prompt has already been evaluated with its exact
+            // per-slot IMRoPE tables. From this point on every input is a text
+            // token, so use the same resident embedding table + generated-token
+            // ring as text greedy decode. Physical KV slots and logical RoPE
+            // positions advance together but start at different offsets after
+            // the image span; `forward_token_device` keeps those coordinates
+            // separate. As in the text loop, a chunk may speculatively advance
+            // reset-per-request state past a stop token without changing output.
+            let mut generated = Vec::with_capacity(max_new);
+            if max_new == 0 || stop.contains(&next) {
+                return Ok(generated);
+            }
+            generated.push(next);
+            token_history.push(next);
+            on_token(next);
+            if generated.len() >= max_new || qwen35_repetition_loop(&generated) {
+                return Ok(generated);
+            }
+
+            let chunk_len = qwen35_device_decode_chunk_len();
+            let mut produced = 0usize;
+            'device: while generated.len() < max_new {
+                let want = chunk_len.min(max_new - generated.len());
+                for step in
+                    qwen35_device_decode_steps(produced, want, prompt_slots, logical_position)
+                {
+                    engine
+                        .forward_token_device(
+                            step.previous_output_step,
+                            step.uses_host_seed.then_some(next),
+                            step.kv_position,
+                            step.rope_position,
+                            scale,
+                            Some(step.output_step),
+                        )
+                        .map_err(BackendError::InvalidTensorData)?;
+                }
+                let ids = engine
+                    .read_out_tokens(produced, want)
+                    .map_err(BackendError::InvalidTensorData)?;
+                for id in ids {
+                    if stop.contains(&id) {
+                        break 'device;
+                    }
+                    generated.push(id);
+                    token_history.push(id);
+                    on_token(id);
+                    if generated.len() >= max_new || qwen35_repetition_loop(&generated) {
+                        break 'device;
+                    }
+                }
+                produced += want;
+            }
+            return Ok(generated);
+        }
+
+        let mut slot = prompt_slots;
+        let mut generated = Vec::with_capacity(max_new);
+        for index in 0..max_new {
+            if stop.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            token_history.push(next);
+            on_token(next);
+            if qwen35_repetition_loop(&generated) {
+                break;
+            }
+            if index + 1 < max_new {
+                let embedding = self.token_embd.dequant_row(next as usize, "token_embd")?;
+                let (cos, sin) =
+                    qwen35_rope_tables(logical_position, self.rope_base, self.rope_dim);
+                next = match &sampler {
+                    Some(sampler) => qwen35_sample_logits(
+                        engine
+                            .forward_token_logits(&embedding, &cos, &sin, slot, scale)
+                            .map_err(BackendError::InvalidTensorData)?,
+                        sampler,
+                        &token_history,
+                    )?,
+                    None => engine
+                        .forward_token(&embedding, &cos, &sin, slot, scale, true)
+                        .map_err(BackendError::InvalidTensorData)?
+                        .ok_or_else(|| {
+                            BackendError::InvalidTensorData(
+                                "no logits on multimodal decode step".into(),
+                            )
+                        })?,
+                };
+                logical_position += 1;
+                slot += 1;
+            }
+        }
+        Ok(generated)
+    }
+
     fn generate_qwen35_cpu(
         &self,
         prompt: &[u32],
@@ -1983,16 +2346,16 @@ impl RunnableModel {
         Ok(out)
     }
 
-    /// GPU resident greedy decode for qwen35. Builds the engine on first use (cached in
-    /// `self.cuda`), resets the recurrent SSM/conv state, then prefills the prompt and
-    /// greedily decodes via `forward_token`. Token-parity with the CPU lane (not
-    /// bit-identical: int8 activation quant + FP-reassociated attention).
+    /// GPU resident decode for qwen35. Greedy requests use the device-side token
+    /// loop when available; sampled requests keep the layer graph on CUDA and
+    /// copy one logits row per token to the CPU sampler.
     #[cfg(feature = "cuda")]
     fn generate_qwen35_cuda(
         &self,
         prompt: &[u32],
         max_new: usize,
         stop: &[u32],
+        sampling: Option<&SamplingConfig>,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         // Sparse KV: only the 8 full-attention layers keep a real KV buffer (the 24 SSM
@@ -2020,7 +2383,9 @@ impl RunnableModel {
             .reset_qwen35_state()
             .map_err(BackendError::InvalidTensorData)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        if engine.device_decode_ready() {
+        let sampler = sampling.map(|config| LlamaSampler::Sampling(config.clone()));
+        let mut token_history = prompt.to_vec();
+        if sampler.is_none() && engine.device_decode_ready() {
             // ---- Device-side decode loop ----------------------------------
             // Every per-token input is produced ON the GPU: the embedding row
             // is gathered from the resident quantized table (fed by the
@@ -2041,16 +2406,13 @@ impl RunnableModel {
                         None,
                         Some(tok),
                         i,
+                        i,
                         scale,
                         if last { Some(0) } else { None },
                     )
                     .map_err(BackendError::InvalidTensorData)?;
             }
-            let chunk_len: usize = std::env::var("CAMELID_DEVICE_DECODE_CHUNK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|&c| c >= 1)
-                .unwrap_or(8);
+            let chunk_len = qwen35_device_decode_chunk_len();
             let mut out = Vec::with_capacity(max_new);
             let mut t = 0usize; // generated candidates confirmed so far
             'outer: while t < max_new {
@@ -2067,7 +2429,7 @@ impl RunnableModel {
                         break;
                     }
                     engine
-                        .forward_token_device(Some(t + j), None, pos, scale, Some(t + j + 1))
+                        .forward_token_device(Some(t + j), None, pos, pos, scale, Some(t + j + 1))
                         .map_err(BackendError::InvalidTensorData)?;
                     scheduled += 1;
                 }
@@ -2092,22 +2454,55 @@ impl RunnableModel {
             }
             return Ok(out);
         }
-        // ---- Host-fed fallback loop (device tables unavailable) -----------
-        // Prefill: only the final prompt token needs logits.
-        let mut next = 0u32;
-        for (i, &tok) in prompt.iter().enumerate() {
-            let emb = self.token_embd.dequant_row(tok as usize, "token_embd")?;
-            let (cos, sin) = qwen35_rope_tables(i, self.rope_base, self.rope_dim);
-            let last = i == prompt.len() - 1;
-            let out = engine
-                .forward_token(&emb, &cos, &sin, i, scale, last)
-                .map_err(BackendError::InvalidTensorData)?;
-            if last {
-                next = out.ok_or_else(|| {
-                    BackendError::InvalidTensorData("no logits on final prompt token".into())
-                })?;
+        // ---- Host-fed loop ------------------------------------------------
+        // Used when device tables are unavailable and for sampled generation.
+        // Sampling still runs every transformer/SSM layer on CUDA; only the
+        // final logits row crosses to the CPU sampler.
+        let (&last_prompt_token, prior_prompt) = prompt
+            .split_last()
+            .ok_or_else(|| BackendError::InvalidTensorData("empty prompt".into()))?;
+        if !prior_prompt.is_empty() {
+            let half = self.rope_dim / 2;
+            let mut embeddings = Vec::with_capacity(prior_prompt.len() * self.d_model);
+            let mut cos_all = Vec::with_capacity(prior_prompt.len() * half);
+            let mut sin_all = Vec::with_capacity(prior_prompt.len() * half);
+            for (position, &token) in prior_prompt.iter().enumerate() {
+                embeddings
+                    .extend_from_slice(&self.token_embd.dequant_row(token as usize, "token_embd")?);
+                let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
+                cos_all.extend_from_slice(&cos);
+                sin_all.extend_from_slice(&sin);
+            }
+            if engine.prefers_batched_prefill() {
+                engine
+                    .prefill_batched(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
+                    .map_err(BackendError::InvalidTensorData)?;
+            } else {
+                engine
+                    .prefill(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
+                    .map_err(BackendError::InvalidTensorData)?;
             }
         }
+        let last_position = prior_prompt.len();
+        let emb = self
+            .token_embd
+            .dequant_row(last_prompt_token as usize, "token_embd")?;
+        let (cos, sin) = qwen35_rope_tables(last_position, self.rope_base, self.rope_dim);
+        let mut next = match &sampler {
+            Some(sampler) => qwen35_sample_logits(
+                engine
+                    .forward_token_logits(&emb, &cos, &sin, last_position, scale)
+                    .map_err(BackendError::InvalidTensorData)?,
+                sampler,
+                &token_history,
+            )?,
+            None => engine
+                .forward_token(&emb, &cos, &sin, last_position, scale, true)
+                .map_err(BackendError::InvalidTensorData)?
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData("no logits on final prompt token".into())
+                })?,
+        };
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
         for i in 0..max_new {
@@ -2115,16 +2510,29 @@ impl RunnableModel {
                 break;
             }
             out.push(next);
+            token_history.push(next);
             on_token(next);
+            if qwen35_repetition_loop(&out) {
+                break;
+            }
             if i + 1 < max_new {
                 let emb = self.token_embd.dequant_row(next as usize, "token_embd")?;
                 let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
-                next = engine
-                    .forward_token(&emb, &cos, &sin, pos, scale, true)
-                    .map_err(BackendError::InvalidTensorData)?
-                    .ok_or_else(|| {
-                        BackendError::InvalidTensorData("no logits on decode step".into())
-                    })?;
+                next = match &sampler {
+                    Some(sampler) => qwen35_sample_logits(
+                        engine
+                            .forward_token_logits(&emb, &cos, &sin, pos, scale)
+                            .map_err(BackendError::InvalidTensorData)?,
+                        sampler,
+                        &token_history,
+                    )?,
+                    None => engine
+                        .forward_token(&emb, &cos, &sin, pos, scale, true)
+                        .map_err(BackendError::InvalidTensorData)?
+                        .ok_or_else(|| {
+                            BackendError::InvalidTensorData("no logits on decode step".into())
+                        })?,
+                };
                 pos += 1;
             }
         }
@@ -2640,6 +3048,37 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+#[cfg(all(test, not(target_os = "macos"), feature = "cuda"))]
+mod prism_vision_cuda_tests {
+    use super::*;
+
+    /// Real-model routing probe for the Windows/Linux multimodal decoder. A
+    /// zero image embedding isolates the CUDA IMRoPE/KV path from the separately
+    /// tested projector while still exercising arbitrary (non-token) inputs.
+    /// Two generated tokens force the second token through the device ring with
+    /// distinct physical-KV and logical-RoPE positions.
+    #[test]
+    fn real_prism_row_accepts_an_image_embedding_on_cuda() {
+        let Ok(path) = std::env::var("CAMELID_PRISM_27B_GGUF") else {
+            eprintln!("SKIP: set CAMELID_PRISM_27B_GGUF");
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load Prism language row");
+        let image = super::super::vision::PrismVisionEmbedding {
+            embeddings: vec![vec![0.0; model.d_model]],
+            grid_width: 1,
+            grid_height: 1,
+        };
+        let generated = model
+            .generate_vision(&[0], &image, &[0], 2, &[])
+            .expect("generate multimodal CUDA continuation");
+        assert_eq!(generated.len(), 2);
+        assert!(generated
+            .iter()
+            .all(|&token| (token as usize) < model.vocab));
+    }
+}
+
 fn name(layer: usize, tensor: &str) -> String {
     format!("blk.{layer}.{tensor}")
 }
@@ -2688,7 +3127,31 @@ fn qwen35_metal_context_capacity() -> usize {
         .unwrap_or(4096)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "cuda"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen35VisionDecodeCursor {
+    kv_position: usize,
+    rope_position: usize,
+}
+
+/// First text-decode coordinates after one Qwen3-VL image span.
+///
+/// The KV cache advances by every merged image token, while multimodal RoPE
+/// advances only by the larger grid axis. Suffix text advances both clocks.
+#[cfg(any(target_os = "macos", feature = "cuda"))]
+fn qwen35_vision_decode_cursor(
+    prefix_len: usize,
+    grid_width: usize,
+    grid_height: usize,
+    suffix_len: usize,
+) -> Qwen35VisionDecodeCursor {
+    Qwen35VisionDecodeCursor {
+        kv_position: prefix_len + grid_width * grid_height + suffix_len,
+        rope_position: prefix_len + grid_width.max(grid_height) + suffix_len,
+    }
+}
+
+#[cfg(any(target_os = "macos", feature = "cuda"))]
 fn qwen35_generation_budget(
     prompt_slots: usize,
     requested_max_new: usize,
@@ -2701,6 +3164,50 @@ fn qwen35_generation_budget(
         )));
     }
     Ok(requested_max_new.min(resident_capacity - prompt_slots))
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen35DeviceDecodeStep {
+    previous_output_step: Option<usize>,
+    uses_host_seed: bool,
+    kv_position: usize,
+    rope_position: usize,
+    output_step: usize,
+}
+
+/// Plan one device-decode chunk after a host-produced first candidate.
+///
+/// Output step zero consumes that host candidate. Every later step consumes the
+/// preceding device output directly. `first_kv_position` and
+/// `first_rope_position` deliberately remain independent: after a vision span,
+/// the physical cache is farther ahead than Qwen3-VL's logical text clock.
+#[cfg(feature = "cuda")]
+fn qwen35_device_decode_steps(
+    produced: usize,
+    count: usize,
+    first_kv_position: usize,
+    first_rope_position: usize,
+) -> impl Iterator<Item = Qwen35DeviceDecodeStep> {
+    let end = produced
+        .checked_add(count)
+        .expect("device decode step range overflow");
+    (produced..end).map(move |output_step| Qwen35DeviceDecodeStep {
+        previous_output_step: output_step.checked_sub(1),
+        uses_host_seed: output_step == 0,
+        kv_position: first_kv_position + output_step,
+        rope_position: first_rope_position + output_step,
+        output_step,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn qwen35_device_decode_chunk_len() -> usize {
+    std::env::var("CAMELID_DEVICE_DECODE_CHUNK")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value >= 1)
+        .unwrap_or(8)
 }
 
 fn qwen35_sampling_requires_logits(config: &SamplingConfig) -> bool {
@@ -2762,7 +3269,7 @@ fn qwen35_rope_tables(pos: usize, rope_base: f32, rope_dim: usize) -> (Vec<f32>,
 /// time/height/width (`t,h,w,t,h,w,...`) subject to the section caps, exactly as
 /// llama.cpp's `GGML_ROPE_TYPE_IMROPE`; the frequency index continues across
 /// sections and therefore must not reset for height or width.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "cuda"))]
 fn qwen35_imrope_tables(
     positions: [usize; 4],
     sections: [usize; 4],
@@ -2793,10 +3300,13 @@ fn qwen35_imrope_tables(
     (cos_t, sin_t)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", feature = "cuda")))]
 mod qwen35_imrope_tests {
+    #[cfg(feature = "cuda")]
+    use super::{qwen35_device_decode_steps, Qwen35DeviceDecodeStep};
     use super::{
         qwen35_generation_budget, qwen35_imrope_tables, qwen35_repetition_loop, qwen35_rope_tables,
+        qwen35_vision_decode_cursor,
     };
 
     #[test]
@@ -2804,6 +3314,17 @@ mod qwen35_imrope_tests {
         let normal = qwen35_rope_tables(37, 10_000_000.0, 64);
         let multimodal = qwen35_imrope_tables([37, 37, 37, 37], [11, 11, 10, 0], 10_000_000.0, 64);
         assert_eq!(normal, multimodal);
+    }
+
+    #[test]
+    fn vision_decode_cursor_tracks_physical_slots_and_logical_rope() {
+        let rectangular = qwen35_vision_decode_cursor(2, 3, 2, 2);
+        assert_eq!(rectangular.kv_position, 10);
+        assert_eq!(rectangular.rope_position, 7);
+
+        let single = qwen35_vision_decode_cursor(2, 1, 1, 2);
+        assert_eq!(single.kv_position, single.rope_position);
+        assert_eq!(single.kv_position, 5);
     }
 
     #[test]
@@ -2834,6 +3355,59 @@ mod qwen35_imrope_tests {
         ]));
         assert!(!qwen35_repetition_loop(&[7, 8, 7, 9, 7, 8, 7, 10]));
         assert!(!qwen35_repetition_loop(&[1, 2, 3, 1, 2, 3]));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn multimodal_device_chunks_keep_kv_and_rope_clocks_separate() {
+        let first: Vec<_> = qwen35_device_decode_steps(0, 3, 143, 39).collect();
+        assert_eq!(
+            first,
+            vec![
+                Qwen35DeviceDecodeStep {
+                    previous_output_step: None,
+                    uses_host_seed: true,
+                    kv_position: 143,
+                    rope_position: 39,
+                    output_step: 0,
+                },
+                Qwen35DeviceDecodeStep {
+                    previous_output_step: Some(0),
+                    uses_host_seed: false,
+                    kv_position: 144,
+                    rope_position: 40,
+                    output_step: 1,
+                },
+                Qwen35DeviceDecodeStep {
+                    previous_output_step: Some(1),
+                    uses_host_seed: false,
+                    kv_position: 145,
+                    rope_position: 41,
+                    output_step: 2,
+                },
+            ]
+        );
+
+        let resumed: Vec<_> = qwen35_device_decode_steps(3, 2, 143, 39).collect();
+        assert_eq!(
+            resumed,
+            vec![
+                Qwen35DeviceDecodeStep {
+                    previous_output_step: Some(2),
+                    uses_host_seed: false,
+                    kv_position: 146,
+                    rope_position: 42,
+                    output_step: 3,
+                },
+                Qwen35DeviceDecodeStep {
+                    previous_output_step: Some(3),
+                    uses_host_seed: false,
+                    kv_position: 147,
+                    rope_position: 43,
+                    output_step: 4,
+                },
+            ]
+        );
     }
 }
 
@@ -2951,7 +3525,8 @@ impl RunnableModel {
         // Per-tensor quant: Q8_0 weights are widened for the CPU seam (set_*'s
         // repack_for_lane then compacts them to f16-scale SoA); K-quant
         // (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) bytes pass
-        // through raw (the q2k/q3k/q4k/q5k/q6k GEMV kernels expand them on the fly).
+        // through raw (the q2k/q3k/q4k/q5k/q6k and Prism Q1/Q2 GEMV kernels
+        // expand them on the fly).
         // Q5_K previously had no resident GEMV and was upcast to Q8_0 blocks at load
         // (~+40 MiB on stock Q3_K_M's four q5_K tensors); with `q5k_gemv` in-tree it
         // rides its own lane at wire size. Returns (repack-ready bytes, lane).
@@ -2963,12 +3538,96 @@ impl RunnableModel {
                 GgufTensorType::Q4K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q4K)),
                 GgufTensorType::Q5K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q5K)),
                 GgufTensorType::Q6K => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q6K)),
+                GgufTensorType::Q1_0 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q1_0)),
+                GgufTensorType::Q2_0G64 => Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2_0G64)),
+                GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+                    Ok((m.bytes.as_slice().to_vec(), ProjQuant::Q2_0G128))
+                }
                 other => Err(format!(
                     "qwen35 CUDA lane: unsupported projection quant {other:?}"
                 )),
             }
         };
-        let mut e = CudaResidentDecode::new(
+        let mat_bytes = |m: &RawMat| m.bytes.as_slice().len() as u64;
+        // Fit the graph to detected VRAM before the first upload. Full-attention
+        // layers can stream all seven projections; recurrent layers keep their
+        // mixer resident and stream only the three large FFN projections. Walking
+        // from the tail preserves a contiguous resident prefix and reuses the
+        // established pinned-host, multi-buffered offload path.
+        let layer_bytes: Vec<(u64, u64)> = rt
+            .layers
+            .iter()
+            .map(|layer| {
+                let ffn = mat_bytes(&layer.ffn_gate)
+                    + mat_bytes(&layer.ffn_up)
+                    + mat_bytes(&layer.ffn_down);
+                match &layer.kind {
+                    Qwen35Kind::Full { wq, wk, wv, wo, .. } => {
+                        let total =
+                            ffn + mat_bytes(wq) + mat_bytes(wk) + mat_bytes(wv) + mat_bytes(wo);
+                        (total, total)
+                    }
+                    Qwen35Kind::Ssm {
+                        wqkv,
+                        wqkv_gate,
+                        beta,
+                        alpha,
+                        ssm_out,
+                        ..
+                    } => (
+                        ffn + mat_bytes(wqkv)
+                            + mat_bytes(wqkv_gate)
+                            + mat_bytes(beta)
+                            + mat_bytes(alpha)
+                            + mat_bytes(ssm_out),
+                        ffn,
+                    ),
+                }
+            })
+            .collect();
+        let full_layers = rt
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.kind, Qwen35Kind::Full { .. }))
+            .count() as u64;
+        let sparse_kv_bytes =
+            full_layers * max_pos as u64 * self.n_kv_heads as u64 * self.head_dim as u64 * 2 * 2;
+        let free_vram = crate::cuda::probe_capability()
+            .map(|capability| capability.vram_free_bytes)
+            .unwrap_or(0);
+        let headroom_mb = std::env::var("CAMELID_QWEN35_CUDA_HEADROOM_MB")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(768);
+        let resident_budget = free_vram
+            .saturating_sub(sparse_kv_bytes)
+            .saturating_sub(headroom_mb * 1024 * 1024);
+        let mut resident_bytes =
+            layer_bytes.iter().map(|(total, _)| total).sum::<u64>() + mat_bytes(&self.output);
+        let mut offloaded = vec![false; rt.layers.len()];
+        if free_vram > 0 && resident_bytes > resident_budget {
+            for (index, (_, reclaimable)) in layer_bytes.iter().enumerate().rev() {
+                if resident_bytes <= resident_budget {
+                    break;
+                }
+                offloaded[index] = true;
+                resident_bytes = resident_bytes.saturating_sub(*reclaimable);
+            }
+        }
+        let offloaded_layers = offloaded.iter().filter(|value| **value).count();
+        if offloaded_layers > 0 {
+            eprintln!(
+                "[qwen35] CUDA capacity plan: {}/{} trailing layers stream from pinned host RAM; required resident weights {} MiB, budget {} MiB (free {} MiB, sparse KV {} MiB, headroom {} MiB)",
+                offloaded_layers,
+                rt.layers.len(),
+                resident_bytes / (1024 * 1024),
+                resident_budget / (1024 * 1024),
+                free_vram / (1024 * 1024),
+                sparse_kv_bytes / (1024 * 1024),
+                headroom_mb,
+            );
+        }
+        let mut e = CudaResidentDecode::new_for_artifact(
             self.n_layers,
             self.n_heads,
             self.n_kv_heads,
@@ -2980,6 +3639,7 @@ impl RunnableModel {
             self.vocab,
             self.eps,
             self.rope_neox,
+            self.resident_cuda_artifact,
         )?;
         e.set_qwen35(
             rt.d_state,
@@ -3003,7 +3663,7 @@ impl RunnableModel {
             .collect();
         e.sparsify_kv(&keep_full)?;
         crate::cuda::release_async_pool();
-        for layer in &rt.layers {
+        for (layer_index, layer) in rt.layers.iter().enumerate() {
             match &layer.kind {
                 Qwen35Kind::Full {
                     wq,
@@ -3032,7 +3692,7 @@ impl RunnableModel {
                         &layer.post_attn_norm,
                         Some(q_norm.as_slice()),
                         Some(k_norm.as_slice()),
-                        true,
+                        !offloaded[layer_index],
                         [qq, qk, qv, qo, qg, qu, qd],
                     )?;
                     e.push_ssm_placeholders()?;
@@ -3073,6 +3733,7 @@ impl RunnableModel {
                         ssm_norm,
                         [qqkv, qgate, qbeta, qalpha, qout],
                         [qg, qu, qd],
+                        !offloaded[layer_index],
                         rt.conv_dim,
                         rt.d_conv,
                         rt.num_v_heads,
@@ -3080,6 +3741,9 @@ impl RunnableModel {
                     )?;
                 }
             }
+        }
+        if offloaded_layers > 0 {
+            e.enable_offload_scratch()?;
         }
         let (bout, qout) = prep(&self.output)?;
         e.set_output(&self.output_norm, &bout, qout)?;
@@ -3101,6 +3765,17 @@ impl RunnableModel {
             GgufTensorType::Q6K => Some((
                 crate::cuda_resident::pad_q6k_blocks(self.token_embd.bytes.as_slice()),
                 ProjQuant::Q6K,
+            )),
+            GgufTensorType::Q1_0 => {
+                Some((self.token_embd.bytes.as_slice().to_vec(), ProjQuant::Q1_0))
+            }
+            GgufTensorType::Q2_0G64 => Some((
+                self.token_embd.bytes.as_slice().to_vec(),
+                ProjQuant::Q2_0G64,
+            )),
+            GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => Some((
+                self.token_embd.bytes.as_slice().to_vec(),
+                ProjQuant::Q2_0G128,
             )),
             _ => None,
         };
@@ -3741,6 +4416,69 @@ mod gpu_ssm_layer_tests {
     /// prompt token-by-token through forward_pass (SSM + full-attn branches), and assert
     /// the GPU next-token argmax equals the CPU runnable lane's (greedy-token parity).
     #[test]
+    #[ignore = "needs CAMELID_PRISM_27B_GGUF (Q1_0) + a CUDA device"]
+    fn qwen35_prism_q1_batched_prefill_matches_serial_logits_bitwise() {
+        let Ok(path) = std::env::var("CAMELID_PRISM_27B_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load Prism qwen35");
+        let prompt: Vec<u32> = vec![
+            3710, 369, 279, 6511, 314, 9338, 30, 220, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        ];
+        let (&last, prior) = prompt.split_last().unwrap();
+        let half = model.rope_dim / 2;
+        let mut embeddings = Vec::with_capacity(prior.len() * model.d_model);
+        let mut cos_all = Vec::with_capacity(prior.len() * half);
+        let mut sin_all = Vec::with_capacity(prior.len() * half);
+        for (position, &token) in prior.iter().enumerate() {
+            embeddings.extend_from_slice(
+                &model
+                    .token_embd
+                    .dequant_row(token as usize, "token_embd")
+                    .expect("embedding"),
+            );
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            cos_all.extend_from_slice(&cos);
+            sin_all.extend_from_slice(&sin);
+        }
+        let last_embedding = model
+            .token_embd
+            .dequant_row(last as usize, "token_embd")
+            .expect("last embedding");
+        let (last_cos, last_sin) = qwen35_rope_tables(prior.len(), model.rope_base, model.rope_dim);
+        let scale = 1.0f32 / (model.head_dim as f32).sqrt();
+        let mut engine = model
+            .build_qwen35_resident(prompt.len() + 8)
+            .expect("build Prism resident engine");
+        assert!(engine.prefers_batched_prefill());
+
+        engine.reset_qwen35_state().unwrap();
+        engine
+            .prefill(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .expect("serial prefill");
+        let serial = engine
+            .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+            .expect("serial logits");
+
+        engine.reset_qwen35_state().unwrap();
+        engine
+            .prefill_batched(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .expect("batched prefill");
+        let batched = engine
+            .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
+            .expect("batched logits");
+
+        let first_diff = serial
+            .iter()
+            .zip(&batched)
+            .position(|(left, right)| left.to_bits() != right.to_bits());
+        assert_eq!(
+            first_diff, None,
+            "hybrid Q1 batched prefill changed final logits"
+        );
+    }
+
+    #[test]
     #[ignore = "needs CAMELID_ORNITH_GGUF (Q8) + a CUDA device"]
     fn qwen35_gpu_single_token_matches_cpu() {
         let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
@@ -3802,11 +4540,11 @@ mod gpu_ssm_layer_tests {
             .generate_qwen35_cpu(&prompt, n, &[], None, &mut |_| {})
             .expect("cpu gen");
         let gpu = model
-            .generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
+            .generate_qwen35_cuda(&prompt, n, &[], None, &mut |_| {})
             .expect("gpu gen");
         // run-twice reuses the cached engine -> validates reset_qwen35_state.
         let gpu2 = model
-            .generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
+            .generate_qwen35_cuda(&prompt, n, &[], None, &mut |_| {})
             .expect("gpu gen 2");
         eprintln!("cpu ={cpu:?}");
         eprintln!("gpu ={gpu:?}");
@@ -3820,7 +4558,7 @@ mod gpu_ssm_layer_tests {
         if let Ok(gguf) = read_metadata(&path) {
             if let Ok(tok) = crate::tokenizer::Tokenizer::from_gguf(&gguf) {
                 let ids16 = model
-                    .generate_qwen35_cuda(&prompt, 16, &[], &mut |_| {})
+                    .generate_qwen35_cuda(&prompt, 16, &[], None, &mut |_| {})
                     .expect("gpu 16-tok");
                 let text = tok.decode(&ids16, true).unwrap_or_default();
                 eprintln!("qwen35 GPU 16-tok decode: {text}");
@@ -3848,7 +4586,7 @@ mod gpu_ssm_layer_tests {
         let secs = |gpu: bool, n: usize| -> f64 {
             let t = std::time::Instant::now();
             let r = if gpu {
-                model.generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
+                model.generate_qwen35_cuda(&prompt, n, &[], None, &mut |_| {})
             } else {
                 model.generate_qwen35_cpu(&prompt, n, &[], None, &mut |_| {})
             };
@@ -3856,7 +4594,7 @@ mod gpu_ssm_layer_tests {
             t.elapsed().as_secs_f64()
         };
         // GPU: warm (lazy-build + 5.24 GB upload), then two timed runs.
-        let _ = model.generate_qwen35_cuda(&prompt, 4, &[], &mut |_| {});
+        let _ = model.generate_qwen35_cuda(&prompt, 4, &[], None, &mut |_| {});
         let g_lo = secs(true, n_lo);
         let g_hi = secs(true, n_hi);
         let gpu_tokps = (n_hi - n_lo) as f64 / (g_hi - g_lo);

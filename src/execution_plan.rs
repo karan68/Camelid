@@ -461,24 +461,33 @@ pub fn plan_for_model_with_platform_and_env(
     });
 
     // The static Q8 support table below is intentionally platform-blind, but the
-    // Bonsai promotion is not: it is certified only on the packed Apple-Silicon
-    // Metal lane. Mirror the routing predicate here so the execution plan cannot
-    // say supported when Safe mode, a CPU fallback, Windows, or a renamed
-    // neighboring quant is what will actually run.
-    let prism_supported_exact_row = prism_bonsai_expected_quant(&row).is_some_and(|expected| {
+    // Bonsai promotion is lane-specific. Mirror both certified routing predicates
+    // here so Safe mode, CPU fallback, or a renamed neighboring quant cannot inherit
+    // an exact-row claim.
+    let prism_exact_row = prism_bonsai_expected_quant(&row).is_some_and(|expected| {
         expected == quant_type.as_str()
             || (expected == "Q2_0_G128" && matches!(quant_type.as_str(), "Q2_0" | "Q2_0_G128"))
     }) && has_prism_low_bit_tensors
         && prism_low_bit_tensor_mix_supported
-        && is_prism_low_bit_metal_arch(gguf)
+        && is_prism_low_bit_metal_arch(gguf);
+    let prism_supported_macos = prism_exact_row
         && platform.operating_system == "macos"
         && platform.architecture == "aarch64"
         && platform.metal_available
         && !matches!(profile, ExecutionProfile::Safe)
         && planner_env.flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
         && !planner_env.flag_disabled("CAMELID_MAC_Q8_METAL_PLAN");
-    let support_level = if prism_supported_exact_row {
+    let prism_supported_windows = prism_exact_row
+        && platform.operating_system == "windows"
+        && platform.architecture == "x86_64"
+        && platform.cuda_resident_active
+        && !matches!(profile, ExecutionProfile::Safe)
+        && (gguf.architecture() != Some("qwen35")
+            || !planner_env.flag_disabled("CAMELID_QWEN35_CUDA"));
+    let support_level = if prism_supported_macos {
         "supported_exact_row_smoke_macos_metal".to_string()
+    } else if prism_supported_windows {
+        "supported_exact_row_smoke_windows_cuda".to_string()
     } else {
         support_level(&row, &quant_type)
     };
@@ -518,6 +527,36 @@ pub fn plan_for_model_with_platform_and_env(
             )),
         }
         gemma4_plan(admitted.is_ok())
+    } else if has_prism_low_bit_tensors
+        && prism_low_bit_tensor_mix_supported
+        && is_prism_low_bit_metal_arch(gguf)
+        && platform.operating_system == "windows"
+        && platform.architecture == "x86_64"
+        && platform.cuda_resident_active
+        && !matches!(profile, ExecutionProfile::Safe)
+        && (gguf.architecture() != Some("qwen35")
+            || !planner_env.flag_disabled("CAMELID_QWEN35_CUDA"))
+    {
+        if gguf.architecture() == Some("qwen35") {
+            env_updates.insert("CAMELID_QWEN35_CUDA", Some("on"));
+        }
+        reasons.push(
+            "Prism packed low-bit Windows CUDA lane selected; Q1_0/Q2_0 wire blocks remain \
+             packed and execute in the Qwen/Qwen3.5 resident CUDA graph. Q1_0 Qwen3.5 prompts \
+             use up to 128-token tensor-core prefill with Bonsai-specific D128 recurrent \
+             kernels; greedy text and image decode keep token lookup and RoPE selection \
+             on-device. CAMELID_PRISM_CUDA_STRICT=1 retains the exact arithmetic lane. \
+             Oversized rows stream a capacity-planned suffix from pinned host RAM"
+                .into(),
+        );
+        (
+            "cuda_resident_prism_low_bit_runtime",
+            "cuda_resident_prism_packed_wire",
+            "prism_low_bit_cuda_resident_prefill",
+            "prism_q1_tensor_core_cuda_prefill",
+            "prism_low_bit_cuda_resident_decode",
+            "scalar_prism_block_decode_fallback",
+        )
     } else if has_prism_low_bit_tensors
         && prism_low_bit_tensor_mix_supported
         && is_prism_low_bit_metal_arch(gguf)
@@ -1513,12 +1552,12 @@ fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
         .unwrap_or(true)
 }
 
-/// Architectures implemented by the packed Prism Q1_0/Q2_0 Metal runtime.
+/// Architectures implemented by the packed Prism Q1_0/Q2_0 GPU runtimes.
 ///
 /// This is deliberately separate from [`is_gpu_runnable_arch`]: that predicate
 /// describes the generic dense CUDA/Metal engine and correctly excludes
 /// `qwen35`, while the dedicated Qwen3.5 runnable graph is exactly what drives
-/// Bonsai on Apple Silicon. Sharing the generic predicate made `/v1/health`
+/// Bonsai on Apple Silicon Metal and Windows CUDA. Sharing the generic predicate made `/v1/health`
 /// disclose `cpu_reference` even while the resident Qwen3.5 Metal graph was
 /// active.
 fn is_prism_low_bit_metal_arch(gguf: &GgufFile) -> bool {
@@ -2265,6 +2304,7 @@ mod tests {
             "CAMELID_METAL_KQUANT",
             "CAMELID_METAL_F32Y",
             "CAMELID_METAL_WIRE",
+            "CAMELID_QWEN35_CUDA",
             "CAMELID_X86_Q8_REPACK",
             "CAMELID_X86_Q8_KERNEL",
             "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
@@ -3131,7 +3171,68 @@ mod tests {
     }
 
     #[test]
-    fn exact_bonsai_rows_report_supported_only_on_the_certified_metal_lane() {
+    fn prism_windows_cuda_lane_is_disclosed_without_macos_certification() {
+        let _guard = env_lock();
+        clear_profile_env();
+        for architecture in ["qwen3", "qwen35"] {
+            for (tensor_type, expected) in [
+                (GgufTensorType::Q1_0, "Q1_0"),
+                (GgufTensorType::Q2_0G64, "Q2_0_G64"),
+                (GgufTensorType::Q2_0G128, "Q2_0_G128"),
+                (GgufTensorType::Pq2_0, "PQ2_0"),
+            ] {
+                let mut gguf = quant_fixture("Ternary Bonsai 4B", None, &[tensor_type]);
+                gguf.metadata.insert(
+                    "general.architecture".into(),
+                    GgufMetadataValue::String(architecture.into()),
+                );
+                let outcome = plan_for_model_with_platform(
+                    &PathBuf::from("C:/models/renamed.gguf"),
+                    &gguf,
+                    Some(8),
+                    cuda_platform("windows", "x86_64", &["avx2"]),
+                );
+                assert_eq!(outcome.plan.quant_type, expected);
+                assert_eq!(
+                    outcome.plan.selected_backend,
+                    "cuda_resident_prism_low_bit_runtime"
+                );
+                assert_eq!(
+                    outcome.plan.decode_path,
+                    "prism_low_bit_cuda_resident_decode"
+                );
+                assert_eq!(outcome.plan.support_level, "unknown_or_unvalidated");
+                if architecture == "qwen35" {
+                    assert_eq!(
+                        outcome.env_updates.get("CAMELID_QWEN35_CUDA"),
+                        Some(&Some("on"))
+                    );
+                } else {
+                    assert!(!outcome.env_updates.contains_key("CAMELID_QWEN35_CUDA"));
+                }
+            }
+        }
+        env::set_var("CAMELID_QWEN35_CUDA", "0");
+        let mut qwen35 = quant_fixture("Ternary Bonsai 27B", Some(40), &[GgufTensorType::Q1_0]);
+        qwen35.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen35".into()),
+        );
+        let disabled = plan_for_model_with_platform(
+            &PathBuf::from("C:/models/Bonsai-27B-Q1_0.gguf"),
+            &qwen35,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_ne!(
+            disabled.plan.selected_backend,
+            "cuda_resident_prism_low_bit_runtime"
+        );
+        clear_profile_env();
+    }
+
+    #[test]
+    fn exact_bonsai_rows_report_supported_on_certified_metal_and_windows_cuda_lanes() {
         let _guard = env_lock();
         clear_profile_env();
         env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
@@ -3163,6 +3264,21 @@ mod tests {
             assert_eq!(
                 outcome.plan.selected_backend, "metal_resident_prism_low_bit_runtime",
                 "{filename} backend",
+            );
+
+            let windows = plan_for_model_with_platform(
+                &PathBuf::from(format!("C:/models/{filename}")),
+                &gguf,
+                Some(8),
+                cuda_platform("windows", "x86_64", &["avx2"]),
+            );
+            assert_eq!(
+                windows.plan.support_level, "supported_exact_row_smoke_windows_cuda",
+                "{filename} Windows support level",
+            );
+            assert_eq!(
+                windows.plan.selected_backend, "cuda_resident_prism_low_bit_runtime",
+                "{filename} Windows backend",
             );
         }
 

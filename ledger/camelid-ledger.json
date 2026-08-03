@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "c7dcf7a",
+    "source_head": "d2372332",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -15,7 +15,7 @@
     "hf_catalog_install": true,
     "execution_plan": null,
     "support_contract": {
-      "current_gate": "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal after the Mac mini 2 text and vision matrix; the claim is exact-file and platform-scoped, with Windows, broader qwen35 or quant support, bounded context, and production throughput still unclaimed.",
+      "current_gate": "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed.",
       "support_policy": "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
       "unsupported_policy": "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior."
     },
@@ -58,17 +58,17 @@
       {
         "id": "Q1_0",
         "status": "supported_named_exact_rows_only",
-        "notes": "Bonsai 4B, 8B, and 27B Q1_0 are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No Q1_0-wide, Windows, bounded-context, or production-throughput claim is implied."
+        "notes": "Bonsai 4B, 8B, and 27B Q1_0 are supported exact-row smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA, anchored to the hashes in the platform-specific Prism Bonsai evidence manifests. No Q1_0-wide, other-platform, bounded-context, or production-throughput claim is implied."
       },
       {
         "id": "Q2_0",
         "status": "supported_named_exact_rows_only",
-        "notes": "Ternary Bonsai 4B, 8B, and 27B Prism Q2_0-G128 artifacts are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. Upstream Q2_0-G64 remains structurally distinct and unclaimed."
+        "notes": "Ternary Bonsai 4B, 8B, and 27B Prism Q2_0-G128 artifacts are supported exact-row smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA, anchored to the hashes in the platform-specific Prism Bonsai evidence manifests. Upstream Q2_0-G64 remains structurally distinct and unclaimed."
       },
       {
         "id": "PQ2_0",
         "status": "supported_named_exact_rows_only",
-        "notes": "Ternary Bonsai 4B PQ2_0 is supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hash in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No PQ2_0-wide, Windows, bounded-context, or production-throughput claim is implied."
+        "notes": "Ternary Bonsai 4B PQ2_0 is supported exact-row smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA, anchored to the hash in the platform-specific Prism Bonsai evidence manifests. No PQ2_0-wide, other-platform, bounded-context, or production-throughput claim is implied."
       },
       {
         "id": "IQ4_XS",
@@ -120,9 +120,9 @@
         "notes": "exact dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking DISABLED) have row-specific smoke support: qwen2 BPE pre-tokenizer + hardcoded ChatML renderer, per-head QK-norm + NEOX (split-half) RoPE, and token-AND-text-identical greedy parity vs llama.cpp at 1/5/50 tokens on macOS/Ubuntu and on Windows x86_64 CPU (both the cpu_reference scalar path and the x86_q8 AVX2 runtime-repack path, bit-identical). 1.7B additionally runs the GPU-resident decode+prefill path and a 15,373-token single-shot prefill lane on macOS, with opt-in thinking-mode leading-trace parity. Exact rows only; other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the validated envelope, and broad Qwen-family support are not implied."
       },
       {
-        "id": "prism_bonsai_qwen35_exact_4b_8b_27b_metal",
+        "id": "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
         "status": "supported_exact_row_smoke_lanes",
-        "notes": "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal. The exact 27B Q1_0 row additionally has browser and API single-image smoke with the checked Q8_0 projector. Exact rows and platform only; Windows, neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied."
+        "notes": "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal and Windows x86_64 CUDA. Both exact 27B rows have API/WebUI single-image smoke with the checked Q8_0 projector; constrained Windows GPUs use capacity-planned pinned-host layer streaming. Exact rows and these two GPU platforms only; neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied."
       }
     ],
     "planned_model_families": [
@@ -166,7 +166,7 @@
       {
         "id": "openai_chat_completions",
         "status": "supported_current_gate",
-        "notes": "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows. The exact Prism/Qwen3.5 row additionally accepts one OpenAI image_url content part containing a local PNG/JPEG data URL when its sibling mmproj is resident on macOS Metal; /v1/health advertises vision_ready."
+        "notes": "POST /v1/chat/completions supports non-streaming and SSE streaming for loaded supported dense GGUF models, including stateless function-tool round trips on tool-capable rows. The exact 27B Prism/Qwen3.5 rows additionally accept one OpenAI image_url content part containing a local PNG/JPEG data URL when their sibling mmproj is resident on macOS Metal or Windows CUDA; /v1/health advertises vision_ready."
       },
       {
         "id": "openai_responses",
@@ -1181,28 +1181,28 @@
     {
       "identity": {
         "id": "bonsai_4b_q1_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q1_0",
         "gguf_filename": "Bonsai-4B-Q1_0.gguf",
         "sha256": "4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168"
       },
       "contract": {
         "id": "bonsai_4b_q1_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q1_0",
         "status": "supported_exact_row_smoke",
         "tool_capable": false,
-        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "support_scope": "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
         "full_support_status": "blocked_pending_portability_and_bounded_context",
-        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+        "full_support_blockers": "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
         "metadata_parses": "validated_qwen35_hybrid_metadata",
         "tokenizer_works": "validated_qwen35_bpe_chatml",
         "tensors_load": "validated_all_tensors_packed_q1_0_wire_resident",
-        "generation_runs": "validated_chat_completions_on_macos_metal",
-        "parity_audited": "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "generation_runs": "validated_chat_completions_on_macos_metal_and_windows_cuda",
+        "parity_audited": "metal_scalar_projection_gate_plus_windows_cuda_vendor_token_and_text_parity",
         "performance_measured": "recorded_smoke_only_not_a_portable_sla",
         "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
-        "frontend_readiness_gate": "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "frontend_readiness_gate": "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
         "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml",
         "chat_template_shape_pack": "not_promoted",
@@ -1222,43 +1222,46 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_bucket": "windows_cuda_vendor_raw_decode_parity",
         "latest_checked_result": "pass",
-        "latest_checked_output": "deterministic_eight_token_probe",
-        "evidence": "Bonsai-4B-Q1_0.gguf sha256 4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+        "latest_checked_output": "vendor_token_and_text_parity_at_1_5_50_tokens",
+        "evidence": "Bonsai-4B-Q1_0.gguf sha256 4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168 passed the Mac mini 2 packed-Metal receipt and Windows x86_64 packed-CUDA raw greedy token/text parity against PrismML-Eng/Bonsai-demo llama.cpp 9fcaed7. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "next_step": "add bounded-context and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
         {
           "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        },
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json"
         }
       ]
     },
     {
       "identity": {
         "id": "ternary_bonsai_4b_q2_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q2_0/Q2_0_G128",
         "gguf_filename": "Ternary-Bonsai-4B-Q2_0.gguf",
         "sha256": "4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b"
       },
       "contract": {
         "id": "ternary_bonsai_4b_q2_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q2_0/Q2_0_G128",
         "status": "supported_exact_row_smoke",
         "tool_capable": false,
-        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "support_scope": "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
         "full_support_status": "blocked_pending_portability_and_bounded_context",
-        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+        "full_support_blockers": "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
         "metadata_parses": "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
         "tokenizer_works": "validated_qwen35_bpe_chatml",
         "tensors_load": "validated_all_tensors_packed_q2_0_wire_resident",
-        "generation_runs": "validated_chat_completions_on_macos_metal",
-        "parity_audited": "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "generation_runs": "validated_chat_completions_on_macos_metal_and_windows_cuda",
+        "parity_audited": "metal_scalar_projection_gate_plus_windows_cuda_vendor_short_decode_parity",
         "performance_measured": "recorded_smoke_only_not_a_portable_sla",
         "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
-        "frontend_readiness_gate": "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
         "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml",
         "chat_template_shape_pack": "not_promoted",
@@ -1278,43 +1281,46 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_bucket": "windows_cuda_vendor_raw_decode_parity",
         "latest_checked_result": "pass",
-        "latest_checked_output": "deterministic_eight_token_probe",
-        "evidence": "Ternary-Bonsai-4B-Q2_0.gguf sha256 4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+        "latest_checked_output": "eleven_of_twelve_vendor_parity_legs_all_1_and_5_token_legs_exact",
+        "evidence": "Ternary-Bonsai-4B-Q2_0.gguf sha256 4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b passed the Mac mini 2 packed-Metal receipt and Windows packed-CUDA serving against PrismML-Eng/Bonsai-demo 9fcaed7: all 1/5-token raw legs and the deterministic chat probe match; one of four 50-token raw legs flips late at token 46. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "next_step": "add bounded-context and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
         {
           "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        },
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json"
         }
       ]
     },
     {
       "identity": {
         "id": "ternary_bonsai_4b_pq2_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "PQ2_0",
         "gguf_filename": "Ternary-Bonsai-4B-PQ2_0.gguf",
         "sha256": "829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb"
       },
       "contract": {
         "id": "ternary_bonsai_4b_pq2_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "PQ2_0",
         "status": "supported_exact_row_smoke",
         "tool_capable": false,
-        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "support_scope": "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
         "full_support_status": "blocked_pending_portability_and_bounded_context",
-        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
+        "full_support_blockers": "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
         "metadata_parses": "validated_qwen35_hybrid_metadata_and_prism_pq2_type_142",
         "tokenizer_works": "validated_qwen35_bpe_chatml",
         "tensors_load": "validated_all_tensors_packed_pq2_0_wire_resident",
-        "generation_runs": "validated_chat_completions_on_macos_metal",
-        "parity_audited": "pq2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "generation_runs": "validated_chat_completions_on_macos_metal_and_windows_cuda",
+        "parity_audited": "pq2_wire_identity_plus_deterministic_windows_cuda_chat_probe",
         "performance_measured": "recorded_smoke_only_not_a_portable_sla",
         "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
-        "frontend_readiness_gate": "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
         "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml",
         "chat_template_shape_pack": "not_promoted",
@@ -1334,43 +1340,46 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_bucket": "windows_cuda_deterministic_chat_smoke",
         "latest_checked_result": "pass",
         "latest_checked_output": "deterministic_eight_token_probe",
-        "evidence": "Ternary-Bonsai-4B-PQ2_0.gguf sha256 829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+        "evidence": "Ternary-Bonsai-4B-PQ2_0.gguf sha256 829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb passed the Mac mini 2 packed-Metal receipt and the Windows packed-CUDA deterministic eight-token chat smoke; PQ2 type 142 is wire-identical to the checked group-128 Q2 kernel lane. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "next_step": "add bounded-context and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
         {
           "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        },
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json"
         }
       ]
     },
     {
       "identity": {
         "id": "bonsai_8b_q1_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q1_0",
         "gguf_filename": "Bonsai-8B-Q1_0.gguf",
         "sha256": "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54"
       },
       "contract": {
         "id": "bonsai_8b_q1_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q1_0",
         "status": "supported_exact_row_smoke",
         "tool_capable": false,
-        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "support_scope": "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
         "full_support_status": "blocked_pending_portability_and_bounded_context",
-        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+        "full_support_blockers": "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
         "metadata_parses": "validated_qwen35_hybrid_metadata",
         "tokenizer_works": "validated_qwen35_bpe_chatml",
         "tensors_load": "validated_all_tensors_packed_q1_0_wire_resident",
-        "generation_runs": "validated_chat_completions_on_macos_metal",
-        "parity_audited": "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "generation_runs": "validated_chat_completions_on_macos_metal_and_windows_cuda",
+        "parity_audited": "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
         "performance_measured": "recorded_smoke_only_not_a_portable_sla",
         "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
-        "frontend_readiness_gate": "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "frontend_readiness_gate": "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
         "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml",
         "chat_template_shape_pack": "not_promoted",
@@ -1390,43 +1399,46 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_bucket": "windows_cuda_deterministic_chat_smoke",
         "latest_checked_result": "pass",
         "latest_checked_output": "deterministic_eight_token_probe",
-        "evidence": "Bonsai-8B-Q1_0.gguf sha256 284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+        "evidence": "Bonsai-8B-Q1_0.gguf sha256 284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54 passed the Mac mini 2 packed-Metal receipt and the Windows packed-CUDA deterministic eight-token chat smoke. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "next_step": "add bounded-context and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
         {
           "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        },
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json"
         }
       ]
     },
     {
       "identity": {
         "id": "ternary_bonsai_8b_q2_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q2_0/Q2_0_G128",
         "gguf_filename": "Ternary-Bonsai-8B-Q2_0.gguf",
         "sha256": "3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b"
       },
       "contract": {
         "id": "ternary_bonsai_8b_q2_0",
-        "family": "qwen35_bonsai_metal",
+        "family": "qwen35_bonsai_gpu",
         "quantization": "Q2_0/Q2_0_G128",
         "status": "supported_exact_row_smoke",
         "tool_capable": false,
-        "support_scope": "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+        "support_scope": "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
         "full_support_status": "blocked_pending_portability_and_bounded_context",
-        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+        "full_support_blockers": "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
         "metadata_parses": "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
         "tokenizer_works": "validated_qwen35_bpe_chatml",
         "tensors_load": "validated_all_tensors_packed_q2_0_wire_resident",
-        "generation_runs": "validated_chat_completions_on_macos_metal",
-        "parity_audited": "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+        "generation_runs": "validated_chat_completions_on_macos_metal_and_windows_cuda",
+        "parity_audited": "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
         "performance_measured": "recorded_smoke_only_not_a_portable_sla",
         "frontend_load_path_verified": "curated_catalog_entry_plus_browser_chat_smoke",
-        "frontend_readiness_gate": "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
         "tested_context": "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml",
         "chat_template_shape_pack": "not_promoted",
@@ -1446,43 +1458,46 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "mac_mini_2_chat_completions_smoke",
+        "latest_checked_bucket": "windows_cuda_deterministic_chat_smoke",
         "latest_checked_result": "pass",
         "latest_checked_output": "deterministic_eight_token_probe",
-        "evidence": "Ternary-Bonsai-8B-Q2_0.gguf sha256 3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-        "next_step": "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+        "evidence": "Ternary-Bonsai-8B-Q2_0.gguf sha256 3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b passed the Mac mini 2 packed-Metal receipt and the Windows packed-CUDA deterministic eight-token chat smoke. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "next_step": "add bounded-context and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
         {
           "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        },
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json"
         }
       ]
     },
     {
       "identity": {
         "id": "bonsai_27b_q1_0",
-        "family": "qwen35_bonsai_metal_vision",
+        "family": "qwen35_bonsai_gpu_vision",
         "quantization": "Q1_0",
         "gguf_filename": "Bonsai-27B-Q1_0.gguf",
         "sha256": "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0"
       },
       "contract": {
         "id": "bonsai_27b_q1_0",
-        "family": "qwen35_bonsai_metal_vision",
+        "family": "qwen35_bonsai_gpu_vision",
         "quantization": "Q1_0",
         "status": "supported_exact_row_smoke",
         "tool_capable": false,
-        "support_scope": "exact_row_macos_apple_silicon_metal_text_and_single_image_chat_smoke_only",
+        "support_scope": "exact_row_macos_metal_or_windows_cuda_text_and_single_image_chat_smoke_only",
         "full_support_status": "blocked_pending_portability_bounded_context_and_multimodal_expansion",
-        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+        "full_support_blockers": "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
         "metadata_parses": "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
         "tokenizer_works": "validated_qwen35_bpe_chatml_and_single_image_token_injection",
         "tensors_load": "validated_packed_q1_0_wire_resident_model_plus_q8_0_vision_projector",
-        "generation_runs": "validated_text_nonstreaming_sse_and_single_local_png_chat_completions_on_macos_metal",
-        "parity_audited": "q1_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_deterministic_vision_probe_passes",
+        "generation_runs": "validated_text_and_single_local_png_chat_completions_on_macos_metal_and_windows_cuda",
+        "parity_audited": "metal_projection_projector_gates_plus_windows_vendor_text_token_parity_and_bounded_vision_smoke",
         "performance_measured": "optimized_small_image_8_91_end_to_end_output_tokens_per_second_and_full_resolution_4_9_recorded_not_a_portable_sla",
         "frontend_load_path_verified": "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
-        "frontend_readiness_gate": "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
+        "frontend_readiness_gate": "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
         "tested_context": "short_text_and_single_image_chat_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml_with_qwen3_vl_image_token",
         "chat_template_shape_pack": "not_promoted",
@@ -1502,43 +1517,46 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "mac_mini_2_text_vision_and_browser_acceptance",
+        "latest_checked_bucket": "windows_cuda_vendor_text_and_bounded_vision_smoke",
         "latest_checked_result": "pass",
         "latest_checked_output": "coherent_full_resolution_image_description_and_128_token_text_completion",
-        "evidence": "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the projector hash-pinned separately in the receipt passed text, nonstreaming and SSE image Chat Completions, browser image upload, projector CPU to Metal parity, and coherent full-resolution vision on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
-        "next_step": "run the Windows kernel, projector, API, and browser matrix, then add bounded-context, multi-image policy, and normalized throughput packs before widening this exact-row scope"
+        "evidence": "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the hash-pinned Q8_0 projector passed the Mac mini 2 Metal receipt and Windows CUDA validation: four 64-token text chats match PrismML-Eng/Bonsai-demo 9fcaed7 token-for-token; image prompt-token counts align at the same 128-token cap and both engines produce coherent descriptions. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "next_step": "add bounded-context, multi-image policy, and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
         {
           "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        },
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json"
         }
       ]
     },
     {
       "identity": {
         "id": "ternary_bonsai_27b_q2_0",
-        "family": "qwen35_bonsai_metal_vision",
+        "family": "qwen35_bonsai_gpu_vision",
         "quantization": "Q2_0/Q2_0_G128",
         "gguf_filename": "Ternary-Bonsai-27B-Q2_0.gguf",
         "sha256": "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757"
       },
       "contract": {
         "id": "ternary_bonsai_27b_q2_0",
-        "family": "qwen35_bonsai_metal_vision",
+        "family": "qwen35_bonsai_gpu_vision",
         "quantization": "Q2_0/Q2_0_G128",
         "status": "supported_exact_row_smoke",
         "tool_capable": false,
-        "support_scope": "exact_row_macos_apple_silicon_metal_text_and_single_image_cli_smoke_only",
+        "support_scope": "exact_row_macos_metal_or_windows_cuda_text_and_single_image_chat_smoke_only",
         "full_support_status": "blocked_pending_portability_bounded_context_and_multimodal_expansion",
-        "full_support_blockers": "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, browser image Chat Completions on this exact quant, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+        "full_support_blockers": "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
         "metadata_parses": "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
         "tokenizer_works": "validated_qwen35_bpe_chatml_and_single_image_token_injection",
         "tensors_load": "validated_packed_q2_0_wire_resident_model_plus_q8_0_vision_projector",
-        "generation_runs": "validated_text_chat_completions_and_single_local_png_cli_vision_on_macos_metal",
-        "parity_audited": "q2_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_cli_vision_probe_passes",
+        "generation_runs": "validated_text_and_single_local_png_chat_completions_on_macos_metal_and_windows_cuda",
+        "parity_audited": "metal_projection_projector_gates_plus_windows_capacity_offload_text_and_image_smoke",
         "performance_measured": "recorded_smoke_only_not_a_portable_sla",
-        "frontend_load_path_verified": "curated_model_catalog_entry_and_text_chat_smoke_validated",
-        "frontend_readiness_gate": "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match; image support remains scoped to the checked CLI probe and separately installed Q8_0 mmproj",
+        "frontend_load_path_verified": "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
         "tested_context": "short_text_and_single_image_cli_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml_with_qwen3_vl_image_token",
         "chat_template_shape_pack": "not_promoted",
@@ -1558,15 +1576,18 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "mac_mini_2_text_and_cli_vision_smoke",
+        "latest_checked_bucket": "windows_cuda_capacity_offload_text_and_image_smoke",
         "latest_checked_result": "pass",
         "latest_checked_output": "coherent_text_and_checked_single_image_cli_output",
-        "evidence": "Ternary-Bonsai-27B-Q2_0.gguf sha256 868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757 plus the projector hash-pinned separately in the receipt passed text Chat Completions, single-image CLI vision, and projector CPU to Metal parity on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
-        "next_step": "run the Windows kernel, projector, API, and browser matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope"
+        "evidence": "Ternary-Bonsai-27B-Q2_0.gguf sha256 868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757 plus the hash-pinned projector passed the Mac mini 2 Metal receipt and Windows CUDA validation on a 6 GiB RTX 3060 Laptop GPU: the capacity plan streamed 36/64 trailing layers, cold CUDA build completed in 13.1 seconds, the deterministic eight-token text prefix matched the checked 27B vendor output, and a real PNG completed through the image Chat Completions path with vision_ready=true. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "next_step": "add bounded-context, direct Q2 vendor vision comparison, and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
         {
           "path": "qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json"
+        },
+        {
+          "path": "qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json"
         }
       ]
     },

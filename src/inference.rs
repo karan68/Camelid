@@ -694,10 +694,9 @@ impl LlamaLoadedWeights {
                     return store.load_iq4_xs_wire_linear(name);
                 }
                 // Prism Q1/Q2 linears stay in their native packed wire format on
-                // macOS. The Metal resident lane consumes these bytes directly;
-                // there is no whole-model Q8/F32 expansion. Keep the pre-existing
-                // lossless Q1->Q8 bridge on other platforms until their native
-                // backend lands; Windows is intentionally the follow-up machine.
+                // macOS Metal and Windows CUDA. Both resident lanes consume these
+                // bytes directly; there is no whole-model Q8/F32 expansion. Keep
+                // the pre-existing lossless Q1->Q8 bridge on other platforms.
                 if matches!(
                     desc.tensor_type,
                     GgufTensorType::Q1_0
@@ -706,7 +705,10 @@ impl LlamaLoadedWeights {
                         | GgufTensorType::Pq2_0
                 ) && desc.dimensions.len() == 2
                 {
-                    if cfg!(target_os = "macos") {
+                    if cfg!(any(
+                        target_os = "macos",
+                        all(target_os = "windows", feature = "cuda")
+                    )) {
                         return store.load_prism_wire_linear(name);
                     }
                     if desc.tensor_type == GgufTensorType::Q1_0 {
@@ -13067,9 +13069,9 @@ fn build_resident_cuda_engine(
     gemma3: Option<&crate::model::Gemma3Metadata>,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     use crate::cuda_resident::ProjQuant;
-    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks, or the
-    // raw K-quant super-block wire bytes (144 B for Q4_K, 210 B for Q6_K). These are
-    // the bytes `set_layer_located`/`set_output` repack per lane.
+    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks,
+    // raw K-quant super-blocks, or native Prism Q1/Q2 packed blocks. These are the
+    // bytes `set_layer_located`/`set_output` repack per lane.
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
         if let Some(b) = t.q8_0_blocks.as_deref() {
             return Some(q8_0_blocks_as_bytes(b));
@@ -13104,6 +13106,19 @@ fn build_resident_cuda_engine(
                 return Some(w.as_slice());
             }
         }
+        if matches!(
+            t.source_type,
+            Some(
+                GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            )
+        ) {
+            if let Some(w) = t.low_bit_wire() {
+                return Some(w);
+            }
+        }
         None
     }
     // The resident GEMV lane a projection dispatches on (drives the upload repack and
@@ -13116,6 +13131,13 @@ fn build_resident_cuda_engine(
             Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
             Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
             Some(GgufTensorType::IQ4XS) if t.iq4_xs_wire_bytes.is_some() => ProjQuant::IQ4XS,
+            Some(GgufTensorType::Q1_0) if t.low_bit_wire().is_some() => ProjQuant::Q1_0,
+            Some(GgufTensorType::Q2_0G64) if t.low_bit_wire().is_some() => ProjQuant::Q2_0G64,
+            Some(GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0)
+                if t.low_bit_wire().is_some() =>
+            {
+                ProjQuant::Q2_0G128
+            }
             _ => ProjQuant::Q8_0,
         }
     }
