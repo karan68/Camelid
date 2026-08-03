@@ -1392,6 +1392,10 @@ enum Command {
     BenchOwnerSweep {
         /// GGUF model path.
         model: PathBuf,
+        /// Which owner to sweep: `q8` or `kquant` (for a Q4_K/Q6_K model).
+        /// Inner kernels this CPU cannot run are skipped rather than measured.
+        #[arg(long, default_value = "q8")]
+        lane: String,
         /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
@@ -2893,6 +2897,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::BenchOwnerSweep {
             model,
+            lane,
             prompt_file,
             prompt,
             max_tokens,
@@ -2902,6 +2907,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             run_bench_owner_sweep(
                 model,
+                lane,
                 prompt_file,
                 prompt,
                 max_tokens,
@@ -4634,6 +4640,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
 #[allow(clippy::too_many_arguments)]
 fn run_bench_owner_sweep(
     model: PathBuf,
+    lane: String,
     prompt_file: Option<PathBuf>,
     prompt: Option<String>,
     max_tokens: usize,
@@ -4641,6 +4648,16 @@ fn run_bench_owner_sweep(
     warmup_rounds: usize,
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Lane {
+        Q8,
+        KQuant,
+    }
+    let lane = match lane.trim().to_ascii_lowercase().as_str() {
+        "q8" => Lane::Q8,
+        "kquant" | "q4_k" | "k" => Lane::KQuant,
+        other => anyhow::bail!("--lane must be `q8` or `kquant`, got `{other}`"),
+    };
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
     anyhow::ensure!(rounds >= 1, "--rounds must be at least 1");
     // The sweep mutates owner env keys between configs in-process; without
@@ -4675,16 +4692,35 @@ fn run_bench_owner_sweep(
     let sampler = LlamaSampler::Greedy;
 
     // Owner keys cleared before each config so "off" is the true default path.
-    let owner_keys = [
-        "CAMELID_X86_Q8_MATMUL_OWNER",
-        "CAMELID_X86_Q8_MATMUL_OWNER_AVX2",
-        "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
-        "CAMELID_X86_Q8_MATMUL_OWNER_4X8",
-    ];
+    let owner_keys: &[&str] = match lane {
+        Lane::Q8 => &[
+            "CAMELID_X86_Q8_MATMUL_OWNER",
+            "CAMELID_X86_Q8_MATMUL_OWNER_AVX2",
+            "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
+            "CAMELID_X86_Q8_MATMUL_OWNER_4X8",
+        ],
+        Lane::KQuant => &[
+            "CAMELID_X86_KQUANT_MATMUL_OWNER",
+            "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+            "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8",
+        ],
+    };
     // (label, owner_expected_to_fire, env). "off" is EXPLICIT since D15 made
     // the owner default-on for win-x86_64 — an empty env would measure the
     // default (owner on), not the baseline.
     type SweepConfig<'a> = (&'a str, bool, &'a [(&'a str, &'a str)]);
+    #[cfg(target_arch = "x86_64")]
+    let avx512_vnni = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx512_vnni = false;
+    #[cfg(target_arch = "x86_64")]
+    let avx_vnni = std::arch::is_x86_feature_detected!("avxvnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx_vnni = false;
+
+    // Lane A (Q8).
     let vnni4x4: SweepConfig = (
         "owner_vnni4x4",
         true,
@@ -4715,18 +4751,7 @@ fn run_bench_owner_sweep(
             ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
         ],
     );
-    #[cfg(target_arch = "x86_64")]
-    let avx512_vnni = std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512vnni");
-    #[cfg(not(target_arch = "x86_64"))]
-    let avx512_vnni = false;
-    #[cfg(target_arch = "x86_64")]
-    let avx_vnni = std::arch::is_x86_feature_detected!("avxvnni");
-    #[cfg(not(target_arch = "x86_64"))]
-    let avx_vnni = false;
-
-    let mut configs: Vec<SweepConfig> = vec![
+    let mut q8_configs: Vec<SweepConfig> = vec![
         ("off", false, &[("CAMELID_X86_Q8_MATMUL_OWNER", "off")]),
         (
             "owner_avx2",
@@ -4738,12 +4763,40 @@ fn run_bench_owner_sweep(
         ),
     ];
     if avx512_vnni {
-        configs.push(vnni4x4);
-        configs.push(vnni4x8);
+        q8_configs.push(vnni4x4);
+        q8_configs.push(vnni4x8);
     } else if avx_vnni {
-        configs.push(avxvnni256);
+        q8_configs.push(avxvnni256);
     }
-    let configs = &configs[..];
+
+    // Lane B. The 512-bit inner and the 8-row repack need AVX-512; the 256-bit
+    // inner needs only `vpdpbusd`. Both answer the same env flag, so which one
+    // runs is a property of the host — hence the label is picked from the
+    // host's capabilities, and kernels this CPU cannot reach are not measured.
+    const KQ_OWNER: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER";
+    const KQ_VNNI: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI";
+    const KQ_REPACK8: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8";
+    let kq_off: SweepConfig = ("off", false, &[(KQ_OWNER, "0")]);
+    let kq_avx2: SweepConfig = ("owner_avx2", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "0")]);
+    let kq_vnni512: SweepConfig = ("owner_vnni512", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
+    let kq_avxvnni: SweepConfig = ("owner_avxvnni256", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
+    let kq_repack8: SweepConfig = (
+        "owner_vnni512_repack8",
+        true,
+        &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_REPACK8, "1")],
+    );
+    let mut kquant_configs: Vec<SweepConfig> = vec![kq_off, kq_avx2];
+    if avx512_vnni {
+        kquant_configs.push(kq_vnni512);
+        kquant_configs.push(kq_repack8);
+    } else if avx_vnni {
+        kquant_configs.push(kq_avxvnni);
+    }
+    let configs: Vec<SweepConfig> = match lane {
+        Lane::Q8 => q8_configs,
+        Lane::KQuant => kquant_configs,
+    };
+    let configs = configs.as_slice();
     let apply = |envs: &[(&str, &str)]| {
         for k in owner_keys {
             std::env::remove_var(k);
@@ -4757,13 +4810,22 @@ fn run_bench_owner_sweep(
     let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
     let total_rounds = warmup_rounds + rounds;
     eprintln!(
-        "[bench-owner-sweep] {prompt_tokens} prompt tokens, {} configs, {warmup_rounds} warmup + {rounds} measured rounds interleaved",
+        "[bench-owner-sweep] lane={} {prompt_tokens} prompt tokens, {} configs, {warmup_rounds} warmup + {rounds} measured rounds interleaved",
+        match lane {
+            Lane::Q8 => "q8",
+            Lane::KQuant => "kquant",
+        },
         configs.len()
     );
-    if !avx512_vnni && avx_vnni {
-        eprintln!(
-            "[bench-owner-sweep] no avx512f/bw/vnni: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
-        );
+    // Both lanes are capability-aware now, so this applies to either one.
+    if !avx512_vnni {
+        if avx_vnni {
+            eprintln!(
+                "[bench-owner-sweep] no avx512f/bw/vnni: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
+            );
+        } else {
+            eprintln!("[bench-owner-sweep] no vpdpbusd at all: only the AVX2 inner is measured");
+        }
     }
     for round in 0..total_rounds {
         let measured = round >= warmup_rounds;
@@ -4784,7 +4846,10 @@ fn run_bench_owner_sweep(
             // planner disabled the repack) would measure a fake null. Applies
             // to warmup rounds too — fail fast.
             let telemetry_snapshot = camelid::inference::snapshot_q8_schedule_telemetry();
-            let owner_taken = telemetry_snapshot.matmul_owner_prefill_taken;
+            let owner_taken = match lane {
+                Lane::Q8 => telemetry_snapshot.matmul_owner_prefill_taken,
+                Lane::KQuant => telemetry_snapshot.kquant_owner_prefill_taken,
+            };
             anyhow::ensure!(
                 *owner_expected == (owner_taken > 0),
                 "engaged-check failed for config '{label}': owner_expected={owner_expected} \
@@ -4817,6 +4882,8 @@ fn run_bench_owner_sweep(
                 "decode_tok_s": r3(decode_tok_s),
                 "owner_prefill_taken": owner_taken,
                 "q8_avxvnni256_taken": telemetry_snapshot.matmul_owner_avxvnni_taken,
+                "kquant_vnni512_taken": telemetry_snapshot.kquant_owner_vnni_taken,
+                "kquant_avxvnni256_taken": telemetry_snapshot.kquant_owner_avxvnni_taken,
             });
             println!("{}", serde_json::to_string(&rec)?);
         }
