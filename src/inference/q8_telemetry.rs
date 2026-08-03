@@ -46,6 +46,8 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub activation_quantize_pack_us: u64,
     pub q8_gemm_compute_us: u64,
     pub matmul_owner_prefill_taken: u64,
+    /// Owner prefill matmuls that dispatched the 256-bit AVX-VNNI inner (no AVX-512 on the host).
+    pub matmul_owner_avxvnni_taken: u64,
     pub kquant_owner_prefill_taken: u64,
     pub kquant_owner_vnni_taken: u64,
     pub kquant_owner_repack8_taken: u64,
@@ -145,6 +147,7 @@ pub(super) static Q8_SCHED_SCRATCH_PEAK_CAPACITY_BYTES: AtomicU64 = AtomicU64::n
 pub(super) static Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_Q8_GEMM_COMPUTE_US: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN: AtomicU64 = AtomicU64::new(0);
+pub(super) static Q8_SCHED_MATMUL_OWNER_AVXVNNI_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN: AtomicU64 = AtomicU64::new(0);
@@ -222,6 +225,7 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US.store(0, Ordering::Relaxed);
     Q8_SCHED_Q8_GEMM_COMPUTE_US.store(0, Ordering::Relaxed);
     Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_MATMUL_OWNER_AVXVNNI_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN.store(0, Ordering::Relaxed);
@@ -332,6 +336,7 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
         activation_quantize_pack_us: Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US.load(Ordering::Relaxed),
         q8_gemm_compute_us: Q8_SCHED_Q8_GEMM_COMPUTE_US.load(Ordering::Relaxed),
         matmul_owner_prefill_taken: Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN.load(Ordering::Relaxed),
+        matmul_owner_avxvnni_taken: Q8_SCHED_MATMUL_OWNER_AVXVNNI_TAKEN.load(Ordering::Relaxed),
         kquant_owner_prefill_taken: Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.load(Ordering::Relaxed),
         kquant_owner_vnni_taken: Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.load(Ordering::Relaxed),
         kquant_owner_repack8_taken: Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN.load(Ordering::Relaxed),

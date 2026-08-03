@@ -4626,7 +4626,48 @@ fn run_bench_owner_sweep(
     // the owner default-on for win-x86_64 — an empty env would measure the
     // default (owner on), not the baseline.
     type SweepConfig<'a> = (&'a str, bool, &'a [(&'a str, &'a str)]);
-    let configs: &[SweepConfig] = &[
+    let vnni4x4: SweepConfig = (
+        "owner_vnni4x4",
+        true,
+        &[
+            ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
+        ],
+    );
+    let vnni4x8: SweepConfig = (
+        "owner_vnni4x8",
+        true,
+        &[
+            ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "1"),
+        ],
+    );
+    // Same env as vnni4x4, but on a host without AVX-512 that env selects the 256-bit inner. The
+    // label has to say which kernel actually ran: calling it "vnni4x4" here would be a fake null,
+    // since the 512-bit arms silently degrade to the AVX2 inner on these parts.
+    let avxvnni256: SweepConfig = (
+        "owner_avxvnni256",
+        true,
+        &[
+            ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+            ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
+        ],
+    );
+    #[cfg(target_arch = "x86_64")]
+    let avx512_vnni = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx512_vnni = false;
+    #[cfg(target_arch = "x86_64")]
+    let avx_vnni = std::arch::is_x86_feature_detected!("avxvnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx_vnni = false;
+
+    let mut configs: Vec<SweepConfig> = vec![
         ("off", false, &[("CAMELID_X86_Q8_MATMUL_OWNER", "off")]),
         (
             "owner_avx2",
@@ -4636,25 +4677,14 @@ fn run_bench_owner_sweep(
                 ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "0"),
             ],
         ),
-        (
-            "owner_vnni4x4",
-            true,
-            &[
-                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
-            ],
-        ),
-        (
-            "owner_vnni4x8",
-            true,
-            &[
-                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
-                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "1"),
-            ],
-        ),
     ];
+    if avx512_vnni {
+        configs.push(vnni4x4);
+        configs.push(vnni4x8);
+    } else if avx_vnni {
+        configs.push(avxvnni256);
+    }
+    let configs = &configs[..];
     let apply = |envs: &[(&str, &str)]| {
         for k in owner_keys {
             std::env::remove_var(k);
@@ -4671,6 +4701,11 @@ fn run_bench_owner_sweep(
         "[bench-owner-sweep] {prompt_tokens} prompt tokens, {} configs, {warmup_rounds} warmup + {rounds} measured rounds interleaved",
         configs.len()
     );
+    if !avx512_vnni && avx_vnni {
+        eprintln!(
+            "[bench-owner-sweep] no avx512f/bw/vnni: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
+        );
+    }
     for round in 0..total_rounds {
         let measured = round >= warmup_rounds;
         for (label, owner_expected, envs) in configs {
@@ -4689,8 +4724,8 @@ fn run_bench_owner_sweep(
             // owner arm (e.g. env mutation swallowed by a cached plan, or the
             // planner disabled the repack) would measure a fake null. Applies
             // to warmup rounds too — fail fast.
-            let owner_taken =
-                camelid::inference::snapshot_q8_schedule_telemetry().matmul_owner_prefill_taken;
+            let telemetry_snapshot = camelid::inference::snapshot_q8_schedule_telemetry();
+            let owner_taken = telemetry_snapshot.matmul_owner_prefill_taken;
             anyhow::ensure!(
                 *owner_expected == (owner_taken > 0),
                 "engaged-check failed for config '{label}': owner_expected={owner_expected} \
@@ -4722,6 +4757,7 @@ fn run_bench_owner_sweep(
                 "prefill_tok_s": r3(prefill_tok_s),
                 "decode_tok_s": r3(decode_tok_s),
                 "owner_prefill_taken": owner_taken,
+                "q8_avxvnni256_taken": telemetry_snapshot.matmul_owner_avxvnni_taken,
             });
             println!("{}", serde_json::to_string(&rec)?);
         }
