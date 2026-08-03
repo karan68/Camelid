@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "d2372332",
+    "source_head": "f297857f",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -1495,9 +1495,9 @@
         "tensors_load": "validated_packed_q1_0_wire_resident_model_plus_q8_0_vision_projector",
         "generation_runs": "validated_text_and_single_local_png_chat_completions_on_macos_metal_and_windows_cuda",
         "parity_audited": "metal_projection_projector_gates_plus_windows_vendor_text_token_parity_and_bounded_vision_smoke",
-        "performance_measured": "optimized_small_image_8_91_end_to_end_output_tokens_per_second_and_full_resolution_4_9_recorded_not_a_portable_sla",
+        "performance_measured": "macos_metal_small_image_8_91_and_full_resolution_4_9_output_tokens_per_second_plus_windows_rtx3060_full_image_21_38_decode_tokens_per_second_vs_16_46_without_popc_1_299x_same_text_recorded_not_a_portable_sla",
         "frontend_load_path_verified": "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
-        "frontend_readiness_gate": "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
+        "frontend_readiness_gate": "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; Models installs the checked Q8_0 mmproj as a required companion",
         "tested_context": "short_text_and_single_image_chat_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml_with_qwen3_vl_image_token",
         "chat_template_shape_pack": "not_promoted",
@@ -1520,7 +1520,7 @@
         "latest_checked_bucket": "windows_cuda_vendor_text_and_bounded_vision_smoke",
         "latest_checked_result": "pass",
         "latest_checked_output": "coherent_full_resolution_image_description_and_128_token_text_completion",
-        "evidence": "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the hash-pinned Q8_0 projector passed the Mac mini 2 Metal receipt and Windows CUDA validation: four 64-token text chats match PrismML-Eng/Bonsai-demo 9fcaed7 token-for-token; image prompt-token counts align at the same 128-token cap and both engines produce coherent descriptions. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+        "evidence": "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the hash-pinned Q8_0 projector passed the Mac mini 2 Metal receipt and Windows CUDA validation: four 64-token text chats match PrismML-Eng/Bonsai-demo 9fcaed7 token-for-token; image prompt-token counts align at the same 128-token cap and both engines produce coherent descriptions. On an RTX 3060 Laptop GPU, three repeated 24-token full-image graph runs measured 21.38 decode tok/s versus 16.46 tok/s with POPC disabled (1.299x), with identical generated text across all six runs. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
         "next_step": "add bounded-context, multi-image policy, and normalized throughput packs before widening this exact-row scope"
       },
       "receipts": [
@@ -1556,7 +1556,7 @@
         "parity_audited": "metal_projection_projector_gates_plus_windows_capacity_offload_text_and_image_smoke",
         "performance_measured": "recorded_smoke_only_not_a_portable_sla",
         "frontend_load_path_verified": "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
-        "frontend_readiness_gate": "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
+        "frontend_readiness_gate": "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; Models installs the checked Q8_0 mmproj as a required companion",
         "tested_context": "short_text_and_single_image_cli_smoke_with_runtime_capacity_capped_at_4096",
         "chat_template_renderer": "qwen35_chatml_with_qwen3_vl_image_token",
         "chat_template_shape_pack": "not_promoted",

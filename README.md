@@ -333,12 +333,16 @@ hash-pinned artifacts on macOS Apple Silicon Metal and Windows x86_64 CUDA; it i
 bounded-context, broad-qwen35, quant-wide, other-platform, or production-throughput claim.
 
 On Windows, the exact 27B Q1 artifact uses Q1T128 CUDA layouts, Bonsai-shape fused
-projections, binary tensor-core prompt prefill, and a captured decode graph by default.
+projections, binary tensor-core prompt prefill, bitplane/POPC decode kernels, and a
+captured decode graph by default. On the checked RTX 3060 Laptop GPU, a three-run
+24-token full-image benchmark measured 21.38 decode tok/s versus 16.46 tok/s with
+POPC disabled (29.9% faster), with identical generated text in all six runs. This is
+a hardware-specific receipt, not a portable throughput promise.
 The graph covers the layer stack, final norm, and LM head; embedding lookup, RoPE table
 selection, device argmax, and generated-token handoff stay device-resident immediately
 outside the capture. Diagnostic escape hatches are `CAMELID_PRISM_CUDA_NO_GRAPH=1` for
-ordinary per-kernel decode and `CAMELID_PRISM_CUDA_STRICT=1` for the slower
-exact-arithmetic lane.
+ordinary per-kernel decode, `CAMELID_PRISM_CUDA_NO_POPC=1` for the prior DP4A decode
+route, and `CAMELID_PRISM_CUDA_STRICT=1` for the slower exact-arithmetic lane.
 
 ## Ways to use Camelid
 

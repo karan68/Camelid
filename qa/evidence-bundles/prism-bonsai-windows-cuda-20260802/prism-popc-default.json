@@ -1,0 +1,57 @@
+{
+  "schema": "camelid.prism_vision_stream_benchmark/v1",
+  "created_at": "2026-08-03T23:08:13.895Z",
+  "base": "http://127.0.0.1:8181",
+  "model": "Bonsai-27B",
+  "image": "target/reference/Bonsai-demo/assets/frontier.png",
+  "prompt": "Describe this image in exactly 24 short words. Do not stop early.",
+  "max_tokens": 24,
+  "iterations": 3,
+  "runs": [
+    {
+      "iteration": 1,
+      "ttft_ms": 3014.536,
+      "total_ms": 4091.3422000000005,
+      "post_first_ms": 1076.8062000000004,
+      "post_first_tokens": 23,
+      "decode_tokens_per_second": 21.35946096892829,
+      "content_events": 24,
+      "completion_tokens": 24,
+      "prompt_tokens": 142,
+      "generated_text": "This graph plots average benchmark score against model size in gigabytes on a logarithmic scale. Data points for various models,"
+    },
+    {
+      "iteration": 2,
+      "ttft_ms": 2823.3966,
+      "total_ms": 3898.5882999999994,
+      "post_first_ms": 1075.1916999999994,
+      "post_first_tokens": 23,
+      "decode_tokens_per_second": 21.391534179439827,
+      "content_events": 24,
+      "completion_tokens": 24,
+      "prompt_tokens": 142,
+      "generated_text": "This graph plots average benchmark score against model size in gigabytes on a logarithmic scale. Data points for various models,"
+    },
+    {
+      "iteration": 3,
+      "ttft_ms": 2826.7374999999993,
+      "total_ms": 3901.9669999999987,
+      "post_first_ms": 1075.2294999999995,
+      "post_first_tokens": 23,
+      "decode_tokens_per_second": 21.39078215394947,
+      "content_events": 24,
+      "completion_tokens": 24,
+      "prompt_tokens": 142,
+      "generated_text": "This graph plots average benchmark score against model size in gigabytes on a logarithmic scale. Data points for various models,"
+    }
+  ],
+  "summary": {
+    "mean_ttft_ms": 2888.2233666666666,
+    "mean_total_ms": 3963.965833333333,
+    "mean_post_first_ms": 1075.7424666666664,
+    "mean_decode_tokens_per_second": 21.380592434105864,
+    "min_total_ms": 3898.5882999999994,
+    "max_total_ms": 4091.3422000000005,
+    "identical_generated_text": true
+  }
+}
