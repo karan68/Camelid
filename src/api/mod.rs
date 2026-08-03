@@ -193,6 +193,9 @@ pub struct AppState {
     /// paths never touch it, and a relative path that exists against the
     /// process CWD keeps its historical meaning — this only adds a fallback.
     models_dir: PathBuf,
+    /// Model digest agreed with the worker before a distributed coordinator starts.
+    /// The worker cannot switch models, so every later local load must preserve it.
+    distributed_model_sha256: Option<String>,
     /// Immutable request/token/download ceilings resolved at startup.
     server_limits: server::ServerLimits,
     /// Lock-free process metrics shared by middleware and decode jobs.
@@ -230,6 +233,7 @@ impl Default for AppState {
             configured_threads: None,
             default_enable_thinking: false,
             models_dir: resolve_models_dir(None),
+            distributed_model_sha256: None,
             server_limits: server::ServerPolicy::loopback_default().limits,
             metrics: metrics::ServerMetrics::default(),
         }
@@ -2434,6 +2438,7 @@ pub struct StartupModel {
     pub path: PathBuf,
     /// `true` when the path came from `--model`.
     pub explicit: bool,
+    distributed_model_sha256: Option<String>,
 }
 
 impl StartupModel {
@@ -2442,6 +2447,15 @@ impl StartupModel {
         Self {
             path,
             explicit: true,
+            distributed_model_sha256: None,
+        }
+    }
+
+    pub fn distributed(path: PathBuf, model_sha256: String) -> Self {
+        Self {
+            path,
+            explicit: true,
+            distributed_model_sha256: Some(model_sha256),
         }
     }
 
@@ -2450,6 +2464,7 @@ impl StartupModel {
         Self {
             path,
             explicit: false,
+            distributed_model_sha256: None,
         }
     }
 }
@@ -2472,6 +2487,9 @@ pub async fn serve(
         .with_models_dir(models_dir)
         .with_serve_addr(addr)
         .with_server_policy(&policy);
+    state.distributed_model_sha256 = initial_model
+        .as_ref()
+        .and_then(|model| model.distributed_model_sha256.clone());
     let workspace_cli_credential = if addr.ip().is_loopback() {
         match crate::workspace_auth::WorkspaceCliCredential::issue(addr) {
             Ok(credential) => Some(credential),
@@ -2562,7 +2580,7 @@ pub async fn serve(
     // otherwise take down the server on every launch, including the UI the
     // user needs to choose a different model. Reinstalling does not help —
     // the models directory outlives the app — so the failure is permanent.
-    if let Some(StartupModel { path, explicit }) = initial_model {
+    if let Some(StartupModel { path, explicit, .. }) = initial_model {
         if let Err(err) = load_model_from_path(&startup_state, path.clone(), None, true).await {
             tracing::error!(error=%err, "failed to load startup model");
             if explicit {
@@ -6437,6 +6455,25 @@ fn fit_preload_guard(
     ))
 }
 
+fn enforce_distributed_model_sha256(state: &AppState, path: &std::path::Path) -> crate::Result<()> {
+    let Some(expected) = &state.distributed_model_sha256 else {
+        return Ok(());
+    };
+    let actual = crate::receipt::sha256_file_hex_cached(path).map_err(|err| {
+        BackendError::InvalidModelMetadata(format!(
+            "could not verify the distributed model {}: {err}",
+            path.display()
+        ))
+    })?;
+    if actual != *expected {
+        return Err(BackendError::InvalidModelMetadata(
+            "serve-distributed is pinned to the model agreed with its worker; restart both nodes to use a different GGUF"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
     // Resolve relative request paths against the configured models dir BEFORE
     // the fit guard, so the guard sizes the file that will actually be loaded.
@@ -6451,6 +6488,14 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             )
         }
     };
+    if let Err(err) = enforce_distributed_model_sha256(&state, &path) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "distributed_model_pinned",
+            err.to_string(),
+            Some("path"),
+        );
+    }
     // What is resident BESIDES the model being requested. A second copy of the
     // same file is not reclaimable room (the load would be idempotent), so it is
     // excluded — otherwise a repeat load would offer to release itself.
@@ -6545,6 +6590,47 @@ async fn load_model_from_path(
     set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
     load_model_from_path_with_activation(state, path, id, set_active).await
+}
+
+#[cfg(test)]
+mod distributed_model_pin_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn distributed_coordinator_rejects_model_switches_before_replace() {
+        let temp = tempfile::tempdir().unwrap();
+        let startup = temp.path().join("startup.gguf");
+        let same_bytes = temp.path().join("same.gguf");
+        let other = temp.path().join("other.gguf");
+        std::fs::write(&startup, b"startup model").unwrap();
+        std::fs::write(&same_bytes, b"startup model").unwrap();
+        std::fs::write(&other, b"other model").unwrap();
+        let state = AppState {
+            models_dir: temp.path().to_path_buf(),
+            distributed_model_sha256: Some(
+                crate::receipt::sha256_file_hex_cached(&startup).unwrap(),
+            ),
+            ..AppState::default()
+        };
+
+        enforce_distributed_model_sha256(&state, &startup).unwrap();
+        enforce_distributed_model_sha256(&state, &same_bytes).unwrap();
+        let err = enforce_distributed_model_sha256(&state, &other)
+            .expect_err("a coordinator must not switch away from its worker's model");
+        assert!(err.to_string().contains("pinned to the model"));
+
+        let response = load_model(
+            State(state),
+            Json(LoadModelRequest {
+                path: other,
+                id: None,
+                replace: true,
+                set_active: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -9619,6 +9705,7 @@ async fn load_model_from_path_with_activation(
     // Resolution runs BEFORE the idempotent fast path so a repeated relative
     // request compares equal to the resolved path the first load stored.
     let path = resolve_request_model_path(&state.models_dir, path)?;
+    enforce_distributed_model_sha256(state, &path)?;
     // Idempotent fast path: the same id already loaded from the same file
     // returns the existing record instead of re-running the full load pipeline
     // (an 8 GB row re-reads the whole file for its receipt otherwise; repeat
@@ -10431,27 +10518,36 @@ async fn load_weights_lru(
     }
 
     let store = TensorStore::open(&model.path, &model.gguf);
-    let range = if let Some(&(layer_start, layer_end)) = crate::distributed::DISTRIBUTED_RANGE.get()
-    {
-        tracing::info!(
-            "API loader running in distributed coordinator mode; loading layers {}..{}",
-            layer_start,
-            layer_end
-        );
-        Some(layer_start..layer_end)
-    } else {
-        None
-    };
-    let weights = Arc::new(
-        LlamaLoadedWeights::load(&store, binding, range).map_err(|err| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "loaded_cpu_weights_unavailable",
-                err.to_string(),
-                Some("model"),
+    // Only the coordinator reaches the API loader; a worker runs `run_worker_loop` instead.
+    // Its ownership is role-derived, not positional -- see `distributed::PipelineRole`.
+    let loaded = match crate::distributed::DISTRIBUTED_RANGE.get() {
+        Some(&(layer_start, layer_end)) => {
+            let (load_embedding, load_output) =
+                crate::distributed::PipelineRole::Coordinator.tensor_ownership();
+            tracing::info!(
+                "API loader running in distributed coordinator mode; loading layers {}..{}",
+                layer_start,
+                layer_end
+            );
+            LlamaLoadedWeights::load_distributed(
+                &store,
+                binding,
+                layer_start,
+                layer_end,
+                load_embedding,
+                load_output,
             )
-        })?,
-    );
+        }
+        None => LlamaLoadedWeights::load(&store, binding, None),
+    };
+    let weights = Arc::new(loaded.map_err(|err| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "loaded_cpu_weights_unavailable",
+            err.to_string(),
+            Some("model"),
+        )
+    })?);
 
     state
         .cached_weights

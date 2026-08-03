@@ -4568,7 +4568,8 @@ impl LlamaInferenceSession {
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
                     if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
-                        let _worker_response = client.forward_to_worker(
+                        // Prefill only warms KV; this returns timings, so the reply is unused.
+                        client.forward_to_worker(
                             &hidden,
                             true,
                             token_ids.len(),
@@ -4815,13 +4816,13 @@ impl LlamaInferenceSession {
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
                     if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
-                        let worker_response = client.forward_to_worker(
+                        // Prefill only warms KV; this returns timings, so the reply is unused.
+                        client.forward_to_worker(
                             &hidden,
                             true,
                             token_ids.len(),
                             self.kv_cache.position,
                         )?;
-                        hidden = worker_response;
                         break;
                     } else {
                         continue;
