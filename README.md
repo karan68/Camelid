@@ -29,15 +29,15 @@ supported row is validated token-for-token against a pinned reference before it 
 ready to use.
 
 > [!TIP]
-> **New: [PrismML](https://prismml.com/) Bonsai models are Supported on Apple Silicon Metal.**
+> **New: [PrismML](https://prismml.com/) Bonsai models are Supported on Apple Silicon Metal and Windows CUDA.**
 > Seven exact, hash-pinned 4B, 8B, and 27B GGUFs covering `Q1_0`, `Q2_0`, and `PQ2_0` are
 > downloadable from the Desktop **Models** page or with `camelid pull`. With the pinned Qwen3-VL
-> projector, the 27B Q1 row also supports local PNG/JPEG input through browser chat and the API;
-> the 27B Q2 row has a checked single-image CLI smoke. These rows are **Supported**, not
-> Experimental; the claim is limited to the listed artifacts on macOS Apple Silicon Metal.
-> [See the exact rows and vision setup.](#prismml--bonsai-macos-metal-support)
-> Also make sure to download [Ternary-Bonsai-27B-mmproj-Q8_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf)
-> and drop it in your models directory for vision projector. I will have this automated in the next release.
+> projector, both 27B rows accept a local PNG/JPEG through browser chat and the API. The Models
+> page downloads and reuses the projector automatically with either 27B model; manual installs can
+> download [Ternary-Bonsai-27B-mmproj-Q8_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf)
+> into the models directory. These rows are **Supported**, not Experimental; the claim is limited
+> to the listed artifacts on macOS Apple Silicon Metal and Windows x86_64 CUDA.
+> [See the exact rows and vision setup.](#prismml--bonsai-gpu-support)
 
 ## Why Camelid
 
@@ -222,8 +222,8 @@ Not sure where to begin? Pick **Llama 3.2 3B** — the best balance of quality a
 | **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `3b_instruct_q8` |
 | Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
 | Reasoning + coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
-| PrismML compact model on Apple Silicon | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
-| PrismML browser/API vision on Apple Silicon (projector required) | Bonsai 27B Q1_0 | `bonsai_27b_q1` |
+| PrismML compact GPU model | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
+| PrismML browser/API vision (projector required) | Bonsai 27B Q1_0 | `bonsai_27b_q1` |
 
 ### Catalog models — `camelid pull`
 
@@ -293,19 +293,23 @@ Each row's exact envelope — which surfaces are certified, which contexts were 
 explicitly not claimed — lives in [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md).
 [COMPATIBILITY.md](COMPATIBILITY.md) is the complete, authoritative supported-row ledger.
 
-### PrismML / Bonsai macOS Metal support
+### PrismML / Bonsai GPU support
 
-Seven exact PrismML Bonsai GGUFs are supported exact-row smoke on Apple Silicon Metal
-without expanding their Q1_0, legacy Q2_0, or PQ2_0 linears into dense weights.
-The checked Mac mini 2 matrix covers 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2.
+Seven exact PrismML Bonsai GGUFs are supported exact-row smoke on Apple Silicon Metal and
+Windows x86_64 CUDA without expanding their Q1_0, legacy Q2_0, or PQ2_0 linears into dense
+weights. The checked matrices cover 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. On constrained
+Windows GPUs, the 27B Q2 lane capacity-plans a trailing layer suffix through pinned host RAM.
 The 27B row can pair with `Ternary-Bonsai-27B-mmproj-Q8_0.gguf` for Qwen3-VL
-image input. Exact hashes and results are recorded in
-[`qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json`](qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json).
+image input. Exact hashes and results are recorded in the
+[Metal receipt](qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json) and
+[Windows CUDA receipt](qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json).
 
 All seven language-model files are available from the Models page or with
-`camelid pull <id>`. The vision projector is a companion file rather than a
-loadable model, so download it separately from Prism ML and place it beside the
-27B GGUF:
+`camelid pull <id>`. Downloading either exact 27B row from the Models page also
+downloads the shared vision projector automatically, skips it when it is already
+installed, and does not load the model until both files are ready. For a CLI-only
+installation, download the companion from Prism ML and place it beside the 27B
+GGUF:
 
 ```bash
 hf download prism-ml/Ternary-Bonsai-27B-gguf \
@@ -325,8 +329,24 @@ sends an OpenAI-compatible `image_url` data part. The same shape works directly
 with `/v1/chat/completions`, including SSE streaming. Remote URLs, multiple
 images, audio/video, and vision combined with tools fail closed; multimodal
 input on `/v1/responses` remains unsupported. Support is limited to the seven
-hash-pinned artifacts on macOS Apple Silicon Metal; it is not yet a Windows,
-bounded-context, broad-qwen35, quant-wide, or production-throughput claim.
+hash-pinned artifacts on macOS Apple Silicon Metal and Windows x86_64 CUDA; it is not a
+bounded-context, broad-qwen35, quant-wide, other-platform, or production-throughput claim.
+
+On Windows, the exact 27B Q1 artifact uses Q1T128 CUDA layouts, Bonsai-shape fused
+projections, binary tensor-core prompt prefill, bitplane/POPC decode kernels, and a
+captured decode graph by default. On the checked RTX 3060 Laptop GPU, a three-run
+24-token full-image benchmark measured 21.38 decode tok/s versus 16.46 tok/s with
+POPC disabled (29.9% faster), with identical generated text in all six runs. This is
+a hardware-specific receipt, not a portable throughput promise. With the same model,
+projector, image, prompt, 142 prompt tokens, 24-token greedy completion, and reasoning
+disabled, the pinned Prism CUDA demo measured 18.19 decode tok/s on the same host;
+Camelid was 17.6% faster in that bounded post-first decode comparison. Prism retained
+materially lower image TTFT, so this is not an end-to-end latency claim.
+The graph covers the layer stack, final norm, and LM head; embedding lookup, RoPE table
+selection, device argmax, and generated-token handoff stay device-resident immediately
+outside the capture. Diagnostic escape hatches are `CAMELID_PRISM_CUDA_NO_GRAPH=1` for
+ordinary per-kernel decode, `CAMELID_PRISM_CUDA_NO_POPC=1` for the prior DP4A decode
+route, and `CAMELID_PRISM_CUDA_STRICT=1` for the slower exact-arithmetic lane.
 
 ## Ways to use Camelid
 
@@ -531,7 +551,7 @@ Camelid ships for three platforms today.
 
 | Platform | Distribution | Acceleration |
 |---|---|---|
-| Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | Experimental CUDA on named exact rows and recorded NVIDIA configurations; CPU fallback |
+| Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | CUDA; supported packed Prism Q1/Q2 exact rows plus other named row-scoped lanes; CPU fallback |
 | macOS Apple Silicon | Desktop DMG (prebuilt, ad-hoc signed) or source-installed desktop app, engine archive (`.tar.gz`) | Metal and CPU |
 | Linux x86_64 | Engine archive (`.tar.gz`) | NVIDIA CUDA compiled in by default; CPU fallback |
 

@@ -5,6 +5,7 @@ import {
   completeCatalogAcquisition,
 } from '../../lib/catalogActivation'
 import { findCompatibilityHint } from '../../lib/capabilities'
+import { catalogBundleInstalled } from '../../lib/catalogCompanions'
 import {
   firstRunCancelOutcome,
   firstRunFailureIsRetryable,
@@ -180,7 +181,10 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
       const target = itemRef.current
       setDownload(Array.isArray(downloads) ? downloads.find((entry) => entry.id === target?.catalog_id) || null : null)
       if (local?.models) {
-        installedRef.current = local.models.some((model) => model.filename === target?.filename)
+        installedRef.current = catalogBundleInstalled(
+          target,
+          new Set(local.models.map((model) => model.filename)),
+        )
         setArtifactInstalled(installedRef.current)
       }
       setSettlementTick((value) => value + 1)
@@ -249,6 +253,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
     if (phase !== 'downloading') return
     const settlement = catalogDownloadSettlement({
       downloading: download?.status === 'downloading',
+      failed: download?.status === 'failed',
       installed: installedRef.current,
       sawDownload: sawDownloadRef.current,
       settledAt: settledAtRef.current,

@@ -155,6 +155,10 @@ assert.match(chatWorkspaceSource, /selectedChatGate\.contractSupported \? 'suppo
    intent stands: chat must not render a max-token PICKER — the control lives
    in Settings. */
 assert.doesNotMatch(chatWorkspaceSource, /<ResponseLengthControl|Response length<|setConfiguredMaxTokens/, 'Chat UI must not expose the response-length picker — it lives in Settings')
+assert.match(chatWorkspaceSource, /runtime\?\.vision_ready/, 'the local image picker must fail closed unless the active backend reports vision_ready')
+assert.match(chatWorkspaceSource, /accept="image\/png,image\/jpeg"/, 'the image picker must accept only the PNG/JPEG formats supported by the Prism API lane')
+assert.match(chatWorkspaceSource, /prepareVisionAttachment\(file\)/, 'selected images must pass through the bounded browser preparation path')
+assert.match(chatWorkspaceSource, /MAX_VISION_UPLOAD_BYTES\s*=\s*3 \* 1024 \* 1024/, 'browser image attachments must retain their explicit upload-size ceiling')
 
 /* ---- Message rendering (moved from pre-redesign ChatWorkspace to MessageTurn/markdown) ---- */
 assert.match(messageTurnSource, /aria-busy=\{assistantStreaming \? 'true' : undefined\}/, 'streaming assistant rows should expose row-level busy state while text is incomplete')
@@ -192,6 +196,7 @@ assert.match(dashboardHookSource, /localRecordMatchesBackendId/, 'dashboard mode
 assert.match(dashboardHookSource, /const id = localRecord\?\.id \|\| item\.id/, 'backend model merges should preserve the browser row id while keeping the backend runtime id as runtime_model_name')
 assert.match(dashboardHookSource, /const conversation = await ensureConversation\(\)[\s\S]*?setSelectedConversationId\(conversation\.id\)[\s\S]*?fetch\(`\$\{normalizedApiBase\}\/v1\/chat\/completions`/, 'fresh-chat sends must select the real conversation before streaming starts so the main pane updates with sidebar previews')
 assert.match(dashboardHookSource, /applyLocalChatPolicy\(requestHistory\)/, 'code/html prompts should use the local code-first request policy after image parts are attached')
+assert.match(dashboardHookSource, /activeImageIndex[\s\S]*image_url[\s\S]*image\.data_url/, 'the chat request must encode the latest local attachment as an OpenAI image_url data part')
 assert.match(dashboardHookSource, /CODE_FIRST_SYSTEM_PROMPT/, 'frontend should keep a code-first system prompt for code/html local chat requests')
 assert.match(dashboardHookSource, /begin immediately with complete runnable code/, 'code-first prompt should suppress slow prose preambles before code and ask for complete output')
 assert.match(dashboardHookSource, /Start exactly with ```html then <!doctype html>/, 'HTML code prompts should request visible code at the beginning of the stream')
@@ -583,5 +588,6 @@ assert.match(tokensCss, /@keyframes camelidDotBounce/, 'the streaming dot bounce
    suite CI already gates; a behavioural module with no gate is a regression
    waiting to happen. The module asserts at import time and throws on failure. */
 await import('./catalog-browse-smoke.mjs')
+await import('./catalog-companion-smoke.mjs')
 
 console.log('UI regression smoke passed (re-baselined Phase 2 pre-work)')

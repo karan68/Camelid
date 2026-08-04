@@ -286,6 +286,20 @@ assert.equal(
     'experimental',
     'only an exact supported_* artifact verdict may unlock the supported lane',
   )
+  const exactContractButRejectedArtifact = {
+    ...experimental,
+    id: 'qwen3_0_6b_instruct_q8_0',
+    name: 'qwen3_0_6b_instruct_q8_0',
+  }
+  assert.equal(
+    getChatGateState(
+      capabilities,
+      exactContractButRejectedArtifact,
+      { ...runtime, active_model_id: 'qwen3_0_6b_instruct_q8_0' },
+    ).chatMode,
+    'experimental',
+    'an explicit backend identity rejection must override an otherwise exact contract-name match',
+  )
   const noVerdict = { ...asAppLoaded }
   delete noVerdict.lane_class
   assert.equal(

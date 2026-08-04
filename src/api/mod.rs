@@ -2788,6 +2788,55 @@ async fn warmup_generation_blocking(
 /// the forward has completed so the resident engine is built before the caller
 /// proceeds. Errors are swallowed by the caller â€” this only shaves the cold start.
 fn warmup_request(addr: SocketAddr, model_id: &str, auth_header: Option<&str>) {
+    let text_body = serde_json::json!({
+        "model": model_id,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": false,
+    })
+    .to_string();
+    warmup_http_post(addr, auth_header, &text_body);
+
+    // The ordinary one-token warm-up does not touch the multimodal projector or
+    // the wide Q1 prompt kernels. When a Bonsai-27B projector is present that
+    // leaves NVRTC/driver JIT and its VRAM-aware matrix cache on the user's first
+    // image. Run one generated 224x224 PNG through the real API before announcing
+    // readiness. If no projector is installed the typed API rejection is harmless.
+    let id = model_id.to_ascii_lowercase();
+    if id.contains("bonsai") && id.contains("27b") {
+        use image::ImageEncoder as _;
+        let pixels = vec![0u8; 224 * 224 * 3];
+        let mut png = Vec::new();
+        let encoded = image::codecs::png::PngEncoder::new(&mut png).write_image(
+            &pixels,
+            224,
+            224,
+            image::ExtendedColorType::Rgb8,
+        );
+        if encoded.is_ok() {
+            let url = format!("data:image/png;base64,{}", BASE64_STANDARD.encode(&png));
+            let vision_body = serde_json::json!({
+                "model": model_id,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Describe the image briefly." },
+                        { "type": "image_url", "image_url": { "url": url } }
+                    ]
+                }],
+                "max_tokens": 2,
+                "temperature": 0,
+                "stream": false,
+                "camelid_enable_thinking": false,
+            })
+            .to_string();
+            warmup_http_post(addr, auth_header, &vision_body);
+        }
+    }
+}
+
+fn warmup_http_post(addr: SocketAddr, auth_header: Option<&str>, body: &str) {
     use std::io::{Read, Write};
     // Give the just-spawned listener a moment to start accepting; retry briefly.
     let mut stream = None;
@@ -2805,14 +2854,6 @@ fn warmup_request(addr: SocketAddr, model_id: &str, auth_header: Option<&str>) {
     };
     // Don't let a stuck forward hang startup forever.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(180)));
-    let body = serde_json::json!({
-        "model": model_id,
-        "messages": [{ "role": "user", "content": "hi" }],
-        "max_tokens": 1,
-        "temperature": 0,
-        "stream": false,
-    })
-    .to_string();
     let auth_header = auth_header.unwrap_or("");
     let request = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4243,7 +4284,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal after the Mac mini 2 text and vision matrix; the claim is exact-file and platform-scoped, with Windows, broader qwen35 or quant support, bounded context, and production throughput still unclaimed.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -4286,17 +4327,17 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q1_0",
                 status: "supported_named_exact_rows_only",
-                notes: "Bonsai 4B, 8B, and 27B Q1_0 are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No Q1_0-wide, Windows, bounded-context, or production-throughput claim is implied.",
+                notes: "Bonsai 4B, 8B, and 27B Q1_0 are supported exact-row smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA, anchored to the hashes in the platform-specific Prism Bonsai evidence manifests. No Q1_0-wide, other-platform, bounded-context, or production-throughput claim is implied.",
             },
             SupportItem {
                 id: "Q2_0",
                 status: "supported_named_exact_rows_only",
-                notes: "Ternary Bonsai 4B, 8B, and 27B Prism Q2_0-G128 artifacts are supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hashes in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. Upstream Q2_0-G64 remains structurally distinct and unclaimed.",
+                notes: "Ternary Bonsai 4B, 8B, and 27B Prism Q2_0-G128 artifacts are supported exact-row smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA, anchored to the hashes in the platform-specific Prism Bonsai evidence manifests. Upstream Q2_0-G64 remains structurally distinct and unclaimed.",
             },
             SupportItem {
                 id: "PQ2_0",
                 status: "supported_named_exact_rows_only",
-                notes: "Ternary Bonsai 4B PQ2_0 is supported exact-row smoke on macOS Apple Silicon Metal only, anchored to the hash in qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. No PQ2_0-wide, Windows, bounded-context, or production-throughput claim is implied.",
+                notes: "Ternary Bonsai 4B PQ2_0 is supported exact-row smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA, anchored to the hash in the platform-specific Prism Bonsai evidence manifests. No PQ2_0-wide, other-platform, bounded-context, or production-throughput claim is implied.",
             },
             SupportItem {
                 id: "IQ4_XS",
@@ -4348,9 +4389,9 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "exact dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking DISABLED) have row-specific smoke support: qwen2 BPE pre-tokenizer + hardcoded ChatML renderer, per-head QK-norm + NEOX (split-half) RoPE, and token-AND-text-identical greedy parity vs llama.cpp at 1/5/50 tokens on macOS/Ubuntu and on Windows x86_64 CPU (both the cpu_reference scalar path and the x86_q8 AVX2 runtime-repack path, bit-identical). 1.7B additionally runs the GPU-resident decode+prefill path and a 15,373-token single-shot prefill lane on macOS, with opt-in thinking-mode leading-trace parity. Exact rows only; other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the validated envelope, and broad Qwen-family support are not implied.",
             },
             SupportItem {
-                id: "prism_bonsai_qwen35_exact_4b_8b_27b_metal",
+                id: "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal. The exact 27B Q1_0 row additionally has browser and API single-image smoke with the checked Q8_0 projector. Exact rows and platform only; Windows, neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied.",
+                notes: "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal and Windows x86_64 CUDA. Both exact 27B rows have API/WebUI single-image smoke with the checked Q8_0 projector; constrained Windows GPUs use capacity-planned pinned-host layer streaming. Exact rows and these two GPU platforms only; neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied.",
             },
         ],
         planned_model_families: vec![
@@ -5192,27 +5233,27 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 evidence: "Ternary-Bonsai-4B-TQ2_0.gguf (sha256 b85dcbaa6f57a9c71252371c97f4c68602c2c5fc61a9e1ce74d963d6fee5047c, general.architecture=qwen3, 36 layers, TQ2_0 2.06bpw ternary linears + Q6_K tied embed/lm_head, yarn rope factor 4) runs end-to-end on a single i7-11800H CPU (CUDA hidden), streaming the TQ2_0 wire blocks and the Q6_K head so the 4B model fits in 3.09GB RSS instead of ~16GB f32. Greedy parity vs llama.cpp acd79d6 (llama-server -ngl 0, /completion temp 0 top_k 1): 3/4 probe prompts token-identical for 24 tokens (capital-of-France, once-upon-a-time, quick-brown-fox), 1 diverges at a near-tie (2+2= continuation, camelid '2' vs llama '4' after both emit the correct '= 4,'). Decode 11.34 tok/s = 0.53x llama.cpp (21.25), the general forward gap. Receipt: qa/ternary/tq2_0-bonsai-parity-receipt.json. Camelid supports exact-row CPU completion smoke for this row only; no bounded-context, performance, serve/WebUI, GPU, or full support is implied",
                 next_step: "formal bounded-context + serve/WebUI parity closure, a perf/RSS gate, and a curated current-head refresh before any wider ternary claim; an AVX2 Q6_K head and last-position-only prefill would lift throughput further",
             },
-            // Prism ML Bonsai rows: support is exact-artifact and macOS Metal
-            // scoped. Every id below is also a curated catalog id, so the Models
-            // page derives Supported from this contract rather than hand-written UI
-            // copy. The single receipt hash-pins all seven files and the projector.
+            // Prism ML Bonsai rows: support is exact-artifact and scoped to the
+            // packed macOS Metal and Windows CUDA lanes. Every id below is also a
+            // curated catalog id, so the Models page derives Supported from this
+            // contract. The receipts hash-pin all seven files and the projector.
             ModelCompatibilityTarget {
                 id: "bonsai_4b_q1_0",
-                family: "qwen35_bonsai_metal",
+                family: "qwen35_bonsai_gpu",
                 quantization: "Q1_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
-                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
                 metadata_parses: "validated_qwen35_hybrid_metadata",
                 tokenizer_works: "validated_qwen35_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
-                generation_runs: "validated_chat_completions_on_macos_metal",
-                parity_audited: "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
+                parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_vendor_token_and_text_parity",
                 performance_measured: "recorded_smoke_only_not_a_portable_sla",
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
-                frontend_readiness_gate: "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                frontend_readiness_gate: "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
                 chat_template_renderer: "qwen35_chatml",
                 chat_template_shape_pack: "not_promoted",
@@ -5232,29 +5273,29 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_bucket: "windows_cuda_vendor_raw_decode_parity",
                 latest_checked_result: "pass",
-                latest_checked_output: "deterministic_eight_token_probe",
-                evidence: "Bonsai-4B-Q1_0.gguf sha256 4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+                latest_checked_output: "vendor_token_and_text_parity_at_1_5_50_tokens",
+                evidence: "Bonsai-4B-Q1_0.gguf sha256 4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168 passed the Mac mini 2 packed-Metal receipt and Windows x86_64 packed-CUDA raw greedy token/text parity against PrismML-Eng/Bonsai-demo llama.cpp 9fcaed7. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+                next_step: "add bounded-context and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_q2_0",
-                family: "qwen35_bonsai_metal",
+                family: "qwen35_bonsai_gpu",
                 quantization: "Q2_0/Q2_0_G128",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
-                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
                 metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
                 tokenizer_works: "validated_qwen35_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
-                generation_runs: "validated_chat_completions_on_macos_metal",
-                parity_audited: "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
+                parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_vendor_short_decode_parity",
                 performance_measured: "recorded_smoke_only_not_a_portable_sla",
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
-                frontend_readiness_gate: "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
                 chat_template_renderer: "qwen35_chatml",
                 chat_template_shape_pack: "not_promoted",
@@ -5274,29 +5315,29 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_bucket: "windows_cuda_vendor_raw_decode_parity",
                 latest_checked_result: "pass",
-                latest_checked_output: "deterministic_eight_token_probe",
-                evidence: "Ternary-Bonsai-4B-Q2_0.gguf sha256 4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+                latest_checked_output: "eleven_of_twelve_vendor_parity_legs_all_1_and_5_token_legs_exact",
+                evidence: "Ternary-Bonsai-4B-Q2_0.gguf sha256 4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b passed the Mac mini 2 packed-Metal receipt and Windows packed-CUDA serving against PrismML-Eng/Bonsai-demo 9fcaed7: all 1/5-token raw legs and the deterministic chat probe match; one of four 50-token raw legs flips late at token 46. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+                next_step: "add bounded-context and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_pq2_0",
-                family: "qwen35_bonsai_metal",
+                family: "qwen35_bonsai_gpu",
                 quantization: "PQ2_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
-                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
                 metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_pq2_type_142",
                 tokenizer_works: "validated_qwen35_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_pq2_0_wire_resident",
-                generation_runs: "validated_chat_completions_on_macos_metal",
-                parity_audited: "pq2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
+                parity_audited: "pq2_wire_identity_plus_deterministic_windows_cuda_chat_probe",
                 performance_measured: "recorded_smoke_only_not_a_portable_sla",
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
-                frontend_readiness_gate: "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
                 chat_template_renderer: "qwen35_chatml",
                 chat_template_shape_pack: "not_promoted",
@@ -5316,29 +5357,29 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_bucket: "windows_cuda_deterministic_chat_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "deterministic_eight_token_probe",
-                evidence: "Ternary-Bonsai-4B-PQ2_0.gguf sha256 829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+                evidence: "Ternary-Bonsai-4B-PQ2_0.gguf sha256 829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb passed the Mac mini 2 packed-Metal receipt and the Windows packed-CUDA deterministic eight-token chat smoke; PQ2 type 142 is wire-identical to the checked group-128 Q2 kernel lane. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+                next_step: "add bounded-context and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "bonsai_8b_q1_0",
-                family: "qwen35_bonsai_metal",
+                family: "qwen35_bonsai_gpu",
                 quantization: "Q1_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
-                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
                 metadata_parses: "validated_qwen35_hybrid_metadata",
                 tokenizer_works: "validated_qwen35_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
-                generation_runs: "validated_chat_completions_on_macos_metal",
-                parity_audited: "q1_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
+                parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
                 performance_measured: "recorded_smoke_only_not_a_portable_sla",
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
-                frontend_readiness_gate: "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                frontend_readiness_gate: "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
                 chat_template_renderer: "qwen35_chatml",
                 chat_template_shape_pack: "not_promoted",
@@ -5358,29 +5399,29 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_bucket: "windows_cuda_deterministic_chat_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "deterministic_eight_token_probe",
-                evidence: "Bonsai-8B-Q1_0.gguf sha256 284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54 passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+                evidence: "Bonsai-8B-Q1_0.gguf sha256 284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54 passed the Mac mini 2 packed-Metal receipt and the Windows packed-CUDA deterministic eight-token chat smoke. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+                next_step: "add bounded-context and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_8b_q2_0",
-                family: "qwen35_bonsai_metal",
+                family: "qwen35_bonsai_gpu",
                 quantization: "Q2_0/Q2_0_G128",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
-                support_scope: "exact_row_macos_apple_silicon_metal_chat_smoke_only",
+                support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
                 metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
                 tokenizer_works: "validated_qwen35_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
-                generation_runs: "validated_chat_completions_on_macos_metal",
-                parity_audited: "q2_0_metal_projection_matches_scalar_decode_and_deterministic_chat_probe_passes",
+                generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
+                parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
                 performance_measured: "recorded_smoke_only_not_a_portable_sla",
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
-                frontend_readiness_gate: "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
                 chat_template_renderer: "qwen35_chatml",
                 chat_template_shape_pack: "not_promoted",
@@ -5400,29 +5441,29 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "mac_mini_2_chat_completions_smoke",
+                latest_checked_bucket: "windows_cuda_deterministic_chat_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "deterministic_eight_token_probe",
-                evidence: "Ternary-Bonsai-8B-Q2_0.gguf sha256 3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b passed exact-row Chat Completions on Mac mini 2 M4 through the packed Metal qwen35 graph; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only this exact artifact on macOS Apple Silicon Metal.",
-                next_step: "run the Windows kernel and serve matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+                evidence: "Ternary-Bonsai-8B-Q2_0.gguf sha256 3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b passed the Mac mini 2 packed-Metal receipt and the Windows packed-CUDA deterministic eight-token chat smoke. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+                next_step: "add bounded-context and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "bonsai_27b_q1_0",
-                family: "qwen35_bonsai_metal_vision",
+                family: "qwen35_bonsai_gpu_vision",
                 quantization: "Q1_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
-                support_scope: "exact_row_macos_apple_silicon_metal_text_and_single_image_chat_smoke_only",
+                support_scope: "exact_row_macos_metal_or_windows_cuda_text_and_single_image_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_bounded_context_and_multimodal_expansion",
-                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
                 metadata_parses: "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
                 tokenizer_works: "validated_qwen35_bpe_chatml_and_single_image_token_injection",
                 tensors_load: "validated_packed_q1_0_wire_resident_model_plus_q8_0_vision_projector",
-                generation_runs: "validated_text_nonstreaming_sse_and_single_local_png_chat_completions_on_macos_metal",
-                parity_audited: "q1_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_deterministic_vision_probe_passes",
-                performance_measured: "optimized_small_image_8_91_end_to_end_output_tokens_per_second_and_full_resolution_4_9_recorded_not_a_portable_sla",
+                generation_runs: "validated_text_and_single_local_png_chat_completions_on_macos_metal_and_windows_cuda",
+                parity_audited: "metal_projection_projector_gates_plus_windows_vendor_text_token_parity_and_bounded_vision_smoke",
+                performance_measured: "macos_metal_small_image_8_91_and_full_resolution_4_9_output_tokens_per_second_plus_windows_rtx3060_full_image_21_38_decode_tokens_per_second_vs_16_46_without_popc_1_299x_same_text_recorded_not_a_portable_sla",
                 frontend_load_path_verified: "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
-                frontend_readiness_gate: "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; the Q8_0 mmproj must be installed separately",
+                frontend_readiness_gate: "green only for Bonsai-27B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; Models installs the checked Q8_0 mmproj as a required companion",
                 tested_context: "short_text_and_single_image_chat_smoke_with_runtime_capacity_capped_at_4096",
                 chat_template_renderer: "qwen35_chatml_with_qwen3_vl_image_token",
                 chat_template_shape_pack: "not_promoted",
@@ -5442,29 +5483,29 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "mac_mini_2_text_vision_and_browser_acceptance",
+                latest_checked_bucket: "windows_cuda_vendor_text_and_bounded_vision_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "coherent_full_resolution_image_description_and_128_token_text_completion",
-                evidence: "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the projector hash-pinned separately in the receipt passed text, nonstreaming and SSE image Chat Completions, browser image upload, projector CPU to Metal parity, and coherent full-resolution vision on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
-                next_step: "run the Windows kernel, projector, API, and browser matrix, then add bounded-context, multi-image policy, and normalized throughput packs before widening this exact-row scope",
+                evidence: "Bonsai-27B-Q1_0.gguf sha256 17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0 plus the hash-pinned Q8_0 projector passed the Mac mini 2 Metal receipt and Windows CUDA validation: four 64-token text chats match PrismML-Eng/Bonsai-demo 9fcaed7 token-for-token; image prompt-token counts align at the same 128-token cap and both engines produce coherent descriptions. On an RTX 3060 Laptop GPU, three repeated 24-token full-image graph runs measured 21.38 decode tok/s versus 16.46 tok/s with POPC disabled (1.299x), with identical generated text across all six runs. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+                next_step: "add bounded-context, multi-image policy, and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_27b_q2_0",
-                family: "qwen35_bonsai_metal_vision",
+                family: "qwen35_bonsai_gpu_vision",
                 quantization: "Q2_0/Q2_0_G128",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
-                support_scope: "exact_row_macos_apple_silicon_metal_text_and_single_image_cli_smoke_only",
+                support_scope: "exact_row_macos_metal_or_windows_cuda_text_and_single_image_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_bounded_context_and_multimodal_expansion",
-                full_support_blockers: "Windows and non-Apple portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, browser image Chat Completions on this exact quant, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, multiple or remote images, audio, video, Responses multimodal input, and production throughput remain unproven",
                 metadata_parses: "validated_qwen35_hybrid_metadata_plus_qwen3_vl_projector_metadata",
                 tokenizer_works: "validated_qwen35_bpe_chatml_and_single_image_token_injection",
                 tensors_load: "validated_packed_q2_0_wire_resident_model_plus_q8_0_vision_projector",
-                generation_runs: "validated_text_chat_completions_and_single_local_png_cli_vision_on_macos_metal",
-                parity_audited: "q2_0_metal_projection_matches_scalar_decode_projector_metal_matches_cpu_and_cli_vision_probe_passes",
+                generation_runs: "validated_text_and_single_local_png_chat_completions_on_macos_metal_and_windows_cuda",
+                parity_audited: "metal_projection_projector_gates_plus_windows_capacity_offload_text_and_image_smoke",
                 performance_measured: "recorded_smoke_only_not_a_portable_sla",
-                frontend_load_path_verified: "curated_model_catalog_entry_and_text_chat_smoke_validated",
-                frontend_readiness_gate: "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal when loaded_now, generation_ready, and active_model_id all match; image support remains scoped to the checked CLI probe and separately installed Q8_0 mmproj",
+                frontend_load_path_verified: "curated_model_catalog_entry_browser_chat_and_gated_image_control_validated",
+                frontend_readiness_gate: "green only for Ternary-Bonsai-27B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, active_model_id, and for images vision_ready all match; Models installs the checked Q8_0 mmproj as a required companion",
                 tested_context: "short_text_and_single_image_cli_smoke_with_runtime_capacity_capped_at_4096",
                 chat_template_renderer: "qwen35_chatml_with_qwen3_vl_image_token",
                 chat_template_shape_pack: "not_promoted",
@@ -5484,11 +5525,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "mac_mini_2_text_and_cli_vision_smoke",
+                latest_checked_bucket: "windows_cuda_capacity_offload_text_and_image_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "coherent_text_and_checked_single_image_cli_output",
-                evidence: "Ternary-Bonsai-27B-Q2_0.gguf sha256 868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757 plus the projector hash-pinned separately in the receipt passed text Chat Completions, single-image CLI vision, and projector CPU to Metal parity on Mac mini 2 M4; receipt qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json. This supports only the exact language artifact and checked projector on macOS Apple Silicon Metal.",
-                next_step: "run the Windows kernel, projector, API, and browser matrix, then add bounded-context and normalized throughput packs before widening this exact-row scope",
+                evidence: "Ternary-Bonsai-27B-Q2_0.gguf sha256 868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757 plus the hash-pinned projector passed the Mac mini 2 Metal receipt and Windows CUDA validation on a 6 GiB RTX 3060 Laptop GPU: the capacity plan streamed 36/64 trailing layers, cold CUDA build completed in 13.1 seconds, the deterministic eight-token text prefix matched the checked 27B vendor output, and a real PNG completed through the image Chat Completions path with vision_ready=true. Receipts: qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json and qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json.",
+                next_step: "add bounded-context, direct Q2 vendor vision comparison, and normalized throughput packs before widening this exact-row scope",
             },
             ModelCompatibilityTarget {
                 id: "llama3_2_1b_instruct_iq4_xs",
@@ -6832,7 +6873,7 @@ async fn inspect_model(
     };
     let (lane_class, blocker) = match config_result {
         Ok(_) => (
-            classify_model_lane(architecture.as_deref(), &filename),
+            classify_model_lane_with_verified_sha256(architecture.as_deref(), &filename, None),
             None,
         ),
         Err(err) => (
@@ -8144,13 +8185,22 @@ pub struct RunnableServeRuntime {
 }
 
 impl RunnableServeRuntime {
-    fn load(path: &std::path::Path) -> std::result::Result<Self, BackendError> {
+    fn load(path: &std::path::Path, model_sha256: &str) -> std::result::Result<Self, BackendError> {
         let path_str = path.to_string_lossy().to_string();
         let gguf = crate::gguf::read_metadata(&path_str)?;
         let architecture = gguf.architecture().unwrap_or_default().to_string();
         let tokenizer = std::sync::Arc::new(Tokenizer::from_gguf(&gguf)?);
         let model = crate::runnable::RunnableModel::load(&path_str)?;
-        let vision = if architecture == "qwen35" {
+        // Vision is an exact-row capability, not a qwen35-wide capability. In
+        // particular, a 4B/8B Bonsai file must remain text-loadable when it
+        // happens to share a directory with the 27B projector.
+        let exact_prism_artifact = path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .is_some_and(|filename| {
+                prism_supported_artifact_identity_matches(filename, model_sha256)
+            });
+        let vision = if exact_prism_artifact {
             prism_mmproj_path(path)
                 .map(crate::runnable::PrismVisionProjector::load)
                 .transpose()?
@@ -8164,6 +8214,10 @@ impl RunnableServeRuntime {
                     projector.projection_dim()
                 )));
             }
+            // `vision_ready` is a runtime capability claim, not just a parsed
+            // file claim. Force backend construction now so Windows CUDA/NVRTC
+            // failures reject the load instead of surfacing on the first image.
+            projector.ensure_backend_ready()?;
         }
         Ok(Self {
             model,
@@ -8174,7 +8228,9 @@ impl RunnableServeRuntime {
     }
 
     fn vision_ready(&self) -> bool {
-        self.vision.is_some()
+        self.vision
+            .as_ref()
+            .is_some_and(crate::runnable::PrismVisionProjector::backend_ready)
     }
 
     /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
@@ -8186,13 +8242,9 @@ impl RunnableServeRuntime {
         sampling: &SamplingConfig,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self.model.generate_stopping_streaming_with_sampling(
-            prompt_ids,
-            max_new,
-            &stop,
-            sampling,
-            &mut |_| {},
-        )?;
+        let ids = self
+            .model
+            .generate_stopping_with_sampling(prompt_ids, max_new, &stop, sampling)?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
@@ -8277,12 +8329,82 @@ impl RunnableServeRuntime {
     }
 }
 
+/// The checked vision companion for an exact curated model row. Looking this
+/// up through the catalog binding keeps discovery in lockstep with Models-page
+/// acquisition: qwen35-family membership alone never grants image support.
+fn prism_vision_companion_for_model(
+    model_path: &std::path::Path,
+) -> Option<CatalogCompanionArtifact> {
+    let filename = model_path.file_name()?.to_str()?;
+    let catalog_id = curated_catalog()
+        .into_iter()
+        .find(|item| item.filename == filename)?
+        .catalog_id;
+    catalog_companion_artifacts(catalog_id)
+        .into_iter()
+        .find(|artifact| artifact.role == "vision_projector")
+}
+
+/// Exact identity gate for a capability-bearing artifact. Size is checked
+/// before hashing so truncated files fail cheaply; the existing GGUF hash
+/// cache keeps subsequent Models scans and model loads from re-reading a valid
+/// 600 MiB projector.
+fn file_matches_expected_identity(
+    path: &std::path::Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> bool {
+    let has_expected_size = std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size);
+    has_expected_size
+        && receipt::sha256_file_hex_cached(path)
+            .is_ok_and(|actual| actual.eq_ignore_ascii_case(expected_sha256))
+}
+
+fn companion_file_matches_expected_identity(
+    path: &std::path::Path,
+    artifact: &CatalogCompanionArtifact,
+) -> bool {
+    catalog_companion_expected_sha256(artifact).is_some_and(|expected_sha256| {
+        file_matches_expected_identity(path, artifact.size_bytes, expected_sha256)
+    })
+}
+
 /// Resolve a projector explicitly (`CAMELID_MMPROJ`) or from a sibling
-/// `*mmproj*.gguf` file. Sorting makes discovery deterministic when a model
-/// directory contains more than one candidate.
+/// `*mmproj*.gguf` file, but only for a curated row bound to that capability.
+/// The canonical filename wins when a directory contains multiple valid-sized
+/// candidates; deterministic lexical order breaks any remaining tie.
 fn prism_mmproj_path(model_path: &std::path::Path) -> Option<PathBuf> {
-    if let Some(explicit) = env::var_os("CAMELID_MMPROJ").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(explicit));
+    let explicit = env::var_os("CAMELID_MMPROJ")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    prism_mmproj_path_with_override(model_path, explicit.as_deref())
+}
+
+fn prism_mmproj_path_with_override(
+    model_path: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let companion = prism_vision_companion_for_model(model_path)?;
+    let expected_sha256 = catalog_companion_expected_sha256(&companion)?;
+    prism_mmproj_path_with_override_and_identity(
+        model_path,
+        explicit,
+        companion.size_bytes,
+        expected_sha256,
+    )
+}
+
+fn prism_mmproj_path_with_override_and_identity(
+    model_path: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Option<PathBuf> {
+    let companion = prism_vision_companion_for_model(model_path)?;
+    if let Some(explicit) = explicit {
+        return file_matches_expected_identity(explicit, expected_size, expected_sha256)
+            .then(|| explicit.to_path_buf());
     }
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(model_path.parent()?)
         .ok()?
@@ -8297,8 +8419,126 @@ fn prism_mmproj_path(model_path: &std::path::Path) -> Option<PathBuf> {
                 })
         })
         .collect();
-    candidates.sort();
-    candidates.into_iter().next()
+    candidates.sort_by(|left, right| {
+        let is_exact = |path: &std::path::Path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case(companion.filename)
+            })
+        };
+        is_exact(right)
+            .cmp(&is_exact(left))
+            .then_with(|| left.cmp(right))
+    });
+    candidates
+        .into_iter()
+        .find(|path| file_matches_expected_identity(path, expected_size, expected_sha256))
+}
+
+#[cfg(test)]
+mod prism_mmproj_discovery_tests {
+    use super::{
+        prism_mmproj_path_with_override, prism_mmproj_path_with_override_and_identity,
+        BONSAI_27B_VISION_PROJECTOR,
+    };
+
+    fn sparse_file(path: &std::path::Path, len: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(len).unwrap();
+    }
+
+    #[test]
+    fn bonsai_4b_and_8b_ignore_a_sibling_27b_projector() {
+        let temp = tempfile::tempdir().unwrap();
+        sparse_file(
+            &temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename),
+            BONSAI_27B_VISION_PROJECTOR.size_bytes,
+        );
+
+        for filename in ["Bonsai-4B-Q1_0.gguf", "Ternary-Bonsai-8B-Q2_0.gguf"] {
+            let model = temp.path().join(filename);
+            std::fs::write(&model, b"model stub").unwrap();
+            assert_eq!(
+                prism_mmproj_path_with_override(&model, None),
+                None,
+                "{filename} must not inherit 27B image support from its directory"
+            );
+        }
+    }
+
+    #[test]
+    fn both_exact_27b_rows_prefer_the_canonical_projector_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let lexical_first = temp.path().join("aaa-mmproj-custom.gguf");
+        std::fs::write(&lexical_first, b"synthetic checked projector").unwrap();
+        let canonical = temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename);
+        std::fs::write(&canonical, b"synthetic checked projector").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&canonical).unwrap();
+        let expected_size = std::fs::metadata(&canonical).unwrap().len();
+
+        for filename in ["Bonsai-27B-Q1_0.gguf", "Ternary-Bonsai-27B-Q2_0.gguf"] {
+            let model = temp.path().join(filename);
+            std::fs::write(&model, b"model stub").unwrap();
+            assert_eq!(
+                prism_mmproj_path_with_override_and_identity(
+                    &model,
+                    None,
+                    expected_size,
+                    &expected_sha256,
+                ),
+                Some(canonical.clone()),
+                "{filename} must prefer the checked companion name"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_size_projector_is_not_discovered_even_when_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("Bonsai-27B-Q1_0.gguf");
+        std::fs::write(&model, b"model stub").unwrap();
+        let projector = temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename);
+        std::fs::write(&projector, b"truncated projector").unwrap();
+
+        assert_eq!(prism_mmproj_path_with_override(&model, None), None);
+        assert_eq!(
+            prism_mmproj_path_with_override(&model, Some(&projector)),
+            None
+        );
+    }
+
+    #[test]
+    fn same_size_wrong_hash_projector_is_not_discovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("Bonsai-27B-Q1_0.gguf");
+        std::fs::write(&model, b"model stub").unwrap();
+        let projector = temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename);
+        std::fs::write(&projector, b"malicious").unwrap();
+        let expected = temp.path().join("expected.bin");
+        std::fs::write(&expected, b"different").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&expected).unwrap();
+
+        assert_eq!(
+            prism_mmproj_path_with_override_and_identity(
+                &model,
+                None,
+                std::fs::metadata(&projector).unwrap().len(),
+                &expected_sha256,
+            ),
+            None,
+            "a same-size projector with different bytes must fail closed"
+        );
+        assert_eq!(
+            prism_mmproj_path_with_override_and_identity(
+                &model,
+                Some(&projector),
+                std::fs::metadata(&projector).unwrap().len(),
+                &expected_sha256,
+            ),
+            None,
+            "CAMELID_MMPROJ must not bypass the checked digest"
+        );
+    }
 }
 
 /// Render a gemma3 chat prompt byte-faithful to the GGUF `tokenizer.chat_template`
@@ -8619,13 +8859,18 @@ async fn load_runnable_serve_runtime(
     state: &AppState,
     id: &str,
     model_path: &std::path::Path,
+    model_sha256: &str,
 ) -> std::result::Result<(), BackendError> {
     let load_path = model_path.to_path_buf();
-    let runtime = tokio::task::spawn_blocking(move || RunnableServeRuntime::load(&load_path))
-        .await
-        .map_err(|e| {
-            BackendError::InvalidModelMetadata(format!("runnable serve load task panicked: {e}"))
-        })??;
+    let load_sha256 = model_sha256.to_string();
+    let runtime =
+        tokio::task::spawn_blocking(move || RunnableServeRuntime::load(&load_path, &load_sha256))
+            .await
+            .map_err(|e| {
+                BackendError::InvalidModelMetadata(format!(
+                    "runnable serve load task panicked: {e}"
+                ))
+            })??;
     let arch = runtime.architecture.clone();
     state
         .runnable_runtimes
@@ -9899,7 +10144,7 @@ async fn load_model_from_path_with_activation(
     // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
     // load a runnable-lane runtime (qwen35/Ornith, gemma3) so /v1/chat can route to it.
     if runnable_serve_enabled() && is_runnable_serve_file(&loaded.gguf) {
-        load_runnable_serve_runtime(state, &id, &loaded.path).await?;
+        load_runnable_serve_runtime(state, &id, &loaded.path, &loaded.lane.gguf_sha256).await?;
     }
 
     // DiffusionGemma serve path (additive, on by default; opt-out CAMELID_DG_SERVE=0):
@@ -19950,7 +20195,7 @@ mod tests {
             classify_model_lane(Some("qwen3"), "Ternary-Bonsai-4B-TQ2_0.gguf"),
             ModelLaneClass::Supported,
         );
-        // The seven Mac mini 2-certified Prism artifacts are catalog-backed
+        // The seven Metal/CUDA-certified Prism artifacts are catalog-backed
         // exact rows. A real qwen35 header plus any one of these exact filenames
         // must land in Supported; neighboring files stay experimental below.
         for filename in [
@@ -19994,6 +20239,44 @@ mod tests {
         assert_eq!(
             classify_model_lane(None, "headerless.gguf"),
             ModelLaneClass::Unsupported,
+        );
+    }
+
+    #[test]
+    fn loaded_prism_support_requires_each_exact_recorded_sha256() {
+        for (filename, expected_sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
+            assert!(prism_supported_artifact_identity_matches(
+                filename,
+                expected_sha256
+            ));
+            assert!(!prism_supported_artifact_identity_matches(
+                filename,
+                &"00".repeat(32)
+            ));
+            assert_eq!(
+                classify_loaded_model_identity(Some("qwen35"), filename, expected_sha256),
+                ModelLaneClass::Supported,
+                "{filename} with its evidence digest must remain supported"
+            );
+            assert_eq!(
+                classify_loaded_model_identity(Some("qwen35"), filename, &"00".repeat(32)),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} with replaced bytes must not inherit support by name"
+            );
+            assert_eq!(
+                classify_model_lane_with_verified_sha256(Some("qwen35"), filename, None),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} must remain unverified until the load path supplies its digest"
+            );
+        }
+        assert_eq!(
+            classify_loaded_model_identity(
+                Some("llama"),
+                "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+                &"00".repeat(32),
+            ),
+            ModelLaneClass::Supported,
+            "this hardening is scoped to the seven Prism identities"
         );
     }
 
@@ -20235,9 +20518,9 @@ mod tests {
                 // greedy token-identical vs llama.cpp acd79d6 + 1 near-tie. Decode
                 // ~0.53x llama (general forward gap). See qa/ternary/ receipt.
                 "ternary_bonsai_4b_tq2_0",
-                // Prism ML Bonsai exact-artifact macOS Metal rows. These are
+                // Prism ML Bonsai exact-artifact macOS Metal / Windows CUDA rows.
                 // intentionally row-scoped: the seven catalog ids below are the
-                // seven hash-pinned files in the Mac mini 2 receipt.
+                // seven hash-pinned files in the paired platform receipts.
                 "bonsai_4b_q1_0",
                 "ternary_bonsai_4b_q2_0",
                 "ternary_bonsai_4b_pq2_0",
@@ -20325,7 +20608,7 @@ mod tests {
                 "llama_spm_decoder",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
                 "nomic_bert_encoder_exact_v1_5_q8_0",
-                "prism_bonsai_qwen35_exact_4b_8b_27b_metal",
+                "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
                 "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
             ])
         );
@@ -23898,6 +24181,61 @@ pub struct CatalogItem {
     pub task_tags: &'static [&'static str],
 }
 
+/// A non-model artifact required to expose an optional capability of a curated
+/// catalog row. The Models page renders this metadata, while the install endpoint
+/// consumes the same table server-side so clients cannot invent companion URLs.
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogCompanionArtifact {
+    /// Stable capability role. Currently `vision_projector`; kept explicit so a
+    /// future tokenizer/adapter companion does not need an API shape change.
+    pub role: &'static str,
+    pub repo_id: &'static str,
+    pub filename: &'static str,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CatalogCompanionBinding {
+    catalog_ids: &'static [&'static str],
+    artifact: CatalogCompanionArtifact,
+}
+
+const BONSAI_27B_VISION_PROJECTOR: CatalogCompanionArtifact = CatalogCompanionArtifact {
+    role: "vision_projector",
+    repo_id: "prism-ml/Ternary-Bonsai-27B-gguf",
+    filename: "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
+    size_bytes: 629_246_880,
+};
+const BONSAI_27B_VISION_PROJECTOR_SHA256: &str =
+    "eb561d41a7bbeb0fcf04883c8af11078ef6cae0a66862a0b68443cfca495269d";
+
+/// Data-only bindings between curated rows and required companion artifacts.
+/// Both exact 27B packs use the same checked projector, so downloading either row
+/// from Models produces a complete text+vision installation.
+const CATALOG_COMPANION_BINDINGS: &[CatalogCompanionBinding] = &[CatalogCompanionBinding {
+    catalog_ids: &["bonsai_27b_q1_0", "ternary_bonsai_27b_q2_0"],
+    artifact: BONSAI_27B_VISION_PROJECTOR,
+}];
+
+fn catalog_companion_artifact_by_filename(filename: &str) -> Option<CatalogCompanionArtifact> {
+    CATALOG_COMPANION_BINDINGS
+        .iter()
+        .map(|binding| binding.artifact)
+        .find(|artifact| artifact.filename.eq_ignore_ascii_case(filename))
+}
+
+fn catalog_companion_expected_sha256(artifact: &CatalogCompanionArtifact) -> Option<&'static str> {
+    (*artifact == BONSAI_27B_VISION_PROJECTOR).then_some(BONSAI_27B_VISION_PROJECTOR_SHA256)
+}
+
+fn catalog_companion_artifacts(catalog_id: &str) -> Vec<CatalogCompanionArtifact> {
+    CATALOG_COMPANION_BINDINGS
+        .iter()
+        .filter(|binding| binding.catalog_ids.contains(&catalog_id))
+        .map(|binding| binding.artifact)
+        .collect()
+}
+
 /// A catalog item plus its predicted runnable lane, so the Models tab can show which
 /// lane each entry would land in without downloading it. `oracle_qualified` means the
 /// `(architecture, quant)` combo is anchored â†’ it would be Compatible after download
@@ -23967,6 +24305,9 @@ pub struct CatalogItemView {
     /// Advisory in every case: the authoritative architecture is read from GGUF
     /// metadata at load time and is the only thing that gates a load.
     pub arch_support: &'static str,
+    /// Additional GGUFs installed as one acquisition with this model. Empty for
+    /// ordinary curated rows and all untrusted live-Hugging-Face results.
+    pub companion_artifacts: Vec<CatalogCompanionArtifact>,
 }
 
 /// The `general.architecture` a GGUF guessed as `token` will actually declare.
@@ -24080,6 +24421,7 @@ impl CatalogItemView {
             // Deliberately no claim: see `arch_support`. The curated `architecture`
             // label uses a different vocabulary from the loader's allowlist.
             arch_support: "unknown",
+            companion_artifacts: catalog_companion_artifacts(item.catalog_id),
         }
     }
 
@@ -24120,6 +24462,7 @@ impl CatalogItemView {
             fit,
             task_tags: Vec::new(),
             fit_confidence,
+            companion_artifacts: Vec::new(),
         }
     }
 }
@@ -24531,7 +24874,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             license: "mit",
             task_tags: &["general", "tools"],
         },
-        // Prism ML publishes the exact Mac mini 2-certified Bonsai bytes. Keep
+        // Prism ML publishes the exact Metal/CUDA-certified Bonsai bytes. Keep
         // these ids identical to their /api/capabilities exact-row ids: that
         // join is what makes the Models page say Supported rather than merely
         // decorating an unverified download. Sizes are the HF LFS byte counts,
@@ -25886,6 +26229,19 @@ async fn local_models(
     let expose_delete_tokens =
         state.allow_local_model_delete && local_management_request_allowed(&_headers);
     let dir = state.models_dir.clone();
+    // A Prism filename is only a candidate until the normal model-load path has
+    // computed its full-file digest. Reuse that already-paid identity here; do
+    // not turn every Models-page poll into a multi-gigabyte hash pass.
+    let loaded_sha256_by_path = {
+        let loaded = state.loaded_models.read().await;
+        loaded
+            .values()
+            .filter_map(|model| {
+                let path = std::fs::canonicalize(&model.path).ok()?;
+                Some((path, model.lane.gguf_sha256.clone()))
+            })
+            .collect::<HashMap<_, _>>()
+    };
     let mut models = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let mut paths: Vec<PathBuf> = entries
@@ -25913,6 +26269,21 @@ async fn local_models(
                     continue;
                 }
             };
+            // Companion GGUFs participate in the frontend's bundle-installed
+            // decision by filename. Do not publish a corrupt/truncated known
+            // companion as a local artifact, or the Models page would suppress
+            // the repair download even though vision cannot become ready.
+            if let Some(companion) = catalog_companion_artifact_by_filename(&filename) {
+                if !companion_file_matches_expected_identity(&path, &companion) {
+                    tracing::warn!(
+                        %filename,
+                        expected_size_bytes = companion.size_bytes,
+                        actual_size_bytes = metadata.len(),
+                        "skipping local companion with unexpected identity"
+                    );
+                    continue;
+                }
+            }
             #[cfg(any(windows, unix))]
             let identity = match local_model_file_identity(
                 &dir,
@@ -26017,7 +26388,16 @@ async fn local_models(
                 }
             };
 
-            let lane_class = classify_model_lane(meta.architecture.as_deref(), &filename);
+            let canonical_path = std::fs::canonicalize(&path).ok();
+            let verified_sha256 = canonical_path
+                .as_ref()
+                .and_then(|path| loaded_sha256_by_path.get(path))
+                .map(String::as_str);
+            let lane_class = classify_model_lane_with_verified_sha256(
+                meta.architecture.as_deref(),
+                &filename,
+                verified_sha256,
+            );
             models.push(LocalModelEntry {
                 runnable_receipt_present: runnable_smoke_receipt_path(&filename).exists(),
                 filename,
@@ -26232,6 +26612,52 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
     // branch carries an exact size, while this one matches on filename alone.
 ];
 
+/// Exact Prism model identities proven by the paired Metal/CUDA evidence
+/// bundles. Unlike the cheap local-library listing, a loaded model already has
+/// a full-file digest in `LaneIdentity`; use it so a neighboring or replaced
+/// file cannot inherit a supported-row claim from the certified filename.
+const PRISM_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
+    (
+        "Bonsai-4B-Q1_0.gguf",
+        "4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168",
+    ),
+    (
+        "Ternary-Bonsai-4B-Q2_0.gguf",
+        "4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b",
+    ),
+    (
+        "Ternary-Bonsai-4B-PQ2_0.gguf",
+        "829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb",
+    ),
+    (
+        "Bonsai-8B-Q1_0.gguf",
+        "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+    ),
+    (
+        "Ternary-Bonsai-8B-Q2_0.gguf",
+        "3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b",
+    ),
+    (
+        "Bonsai-27B-Q1_0.gguf",
+        "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0",
+    ),
+    (
+        "Ternary-Bonsai-27B-Q2_0.gguf",
+        "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757",
+    ),
+];
+
+fn prism_supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
+    PRISM_SUPPORTED_ARTIFACT_SHA256
+        .iter()
+        .find_map(|(artifact, sha256)| (*artifact == filename).then_some(*sha256))
+}
+
+fn prism_supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
+    prism_supported_artifact_expected_sha256(filename)
+        .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
+}
+
 /// True when `filename` is the exact GGUF artifact of a curated row whose
 /// `catalog_id` is a `supported_*` compatibility row, or an allowlisted
 /// non-catalog artifact of a `supported_*` row. The ledger is exact-artifact
@@ -26264,6 +26690,42 @@ fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneC
     }
 }
 
+/// Prism's public support boundary is hash-pinned. Filename/header-only views
+/// (local library and inspect) therefore remain experimental until the ordinary
+/// load path has computed the exact digest; other established rows retain their
+/// existing filename-gated classification.
+fn classify_model_lane_with_verified_sha256(
+    architecture: Option<&str>,
+    filename: &str,
+    verified_sha256: Option<&str>,
+) -> ModelLaneClass {
+    let class = classify_model_lane(architecture, filename);
+    if class != ModelLaneClass::Supported
+        || prism_supported_artifact_expected_sha256(filename).is_none()
+    {
+        return class;
+    }
+    verified_sha256.map_or(ModelLaneClass::ExperimentalImplemented, |sha256| {
+        classify_loaded_model_identity(architecture, filename, sha256)
+    })
+}
+
+fn classify_loaded_model_identity(
+    architecture: Option<&str>,
+    filename: &str,
+    gguf_sha256: &str,
+) -> ModelLaneClass {
+    let class = classify_model_lane(architecture, filename);
+    if class == ModelLaneClass::Supported
+        && prism_supported_artifact_expected_sha256(filename).is_some()
+        && !prism_supported_artifact_identity_matches(filename, gguf_sha256)
+    {
+        ModelLaneClass::ExperimentalImplemented
+    } else {
+        class
+    }
+}
+
 /// Classify a loaded model from its real GGUF metadata + exact artifact path.
 fn classify_loaded_model(model: &LoadedModel) -> ModelLaneClass {
     let filename = model
@@ -26271,7 +26733,7 @@ fn classify_loaded_model(model: &LoadedModel) -> ModelLaneClass {
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or_default();
-    classify_model_lane(model.gguf.architecture(), filename)
+    classify_loaded_model_identity(model.gguf.architecture(), filename, &model.lane.gguf_sha256)
 }
 
 /// Stable, frontend-switchable `error.code` for a typed backend failure. The
@@ -26483,6 +26945,12 @@ pub struct ActiveDownload {
     pub id: String,
     pub repo_id: String,
     pub filename: String,
+    /// Role of the file currently crossing the wire (`model` or
+    /// `vision_projector`). The id remains the parent catalog row throughout.
+    pub current_artifact_role: String,
+    /// One-based position within the files that actually needed downloading.
+    pub artifact_index: usize,
+    pub artifact_count: usize,
     pub continuation_mode: String,
     pub total_bytes: u64,
     pub bytes_downloaded: u64,
@@ -26491,6 +26959,12 @@ pub struct ActiveDownload {
     pub child_pid: Option<u32>,
     #[serde(skip)]
     pub finished_at: Option<std::time::Instant>,
+    #[serde(skip)]
+    pub completed_bytes: u64,
+    /// Every destination reserved by this acquisition, including files later in
+    /// the sequence. This closes the race where two rows share one projector.
+    #[serde(skip)]
+    pub reserved_filenames: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -26521,26 +26995,166 @@ fn download_destination_key(filename: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CatalogDownloadArtifact {
+    role: &'static str,
+    repo_id: String,
+    filename: String,
+    size_bytes: u64,
+}
+
+impl CatalogDownloadArtifact {
+    /// Catalog model byte counts predate bundle downloads and are advisory in
+    /// a few rows. Companion identities are capability gates, so their
+    /// published byte counts are exact and must match before installation.
+    fn expected_exact_size(&self) -> Option<u64> {
+        (self.role != "model").then_some(self.size_bytes)
+    }
+
+    fn expected_sha256(&self) -> Option<&'static str> {
+        (self.role != "model")
+            .then(|| catalog_companion_artifact_by_filename(&self.filename))
+            .flatten()
+            .and_then(|companion| catalog_companion_expected_sha256(&companion))
+    }
+}
+
+fn catalog_download_artifacts(
+    req: &InstallCatalogRequest,
+) -> Result<Vec<CatalogDownloadArtifact>, &'static str> {
+    let curated = curated_catalog()
+        .into_iter()
+        .find(|item| item.catalog_id == req.catalog_id);
+    if let Some(item) = curated.as_ref() {
+        if item.repo_id != req.repo_id
+            || item.filename != req.filename
+            || item.size_bytes != req.size_bytes
+        {
+            return Err(
+                "catalog id, repository, filename, and size must identify the same curated row",
+            );
+        }
+    }
+
+    let mut artifacts = vec![CatalogDownloadArtifact {
+        role: "model",
+        repo_id: req.repo_id.clone(),
+        filename: req.filename.clone(),
+        size_bytes: req.size_bytes,
+    }];
+    if let Some(item) = curated {
+        artifacts.extend(
+            catalog_companion_artifacts(item.catalog_id)
+                .into_iter()
+                .map(|companion| CatalogDownloadArtifact {
+                    role: companion.role,
+                    repo_id: companion.repo_id.to_string(),
+                    filename: companion.filename.to_string(),
+                    size_bytes: companion.size_bytes,
+                }),
+        );
+    }
+    Ok(artifacts)
+}
+
+fn artifact_is_installed(models_dir: &std::path::Path, artifact: &CatalogDownloadArtifact) -> bool {
+    artifact_is_installed_with_expected_sha256(models_dir, artifact, artifact.expected_sha256())
+}
+
+fn artifact_is_installed_with_expected_sha256(
+    models_dir: &std::path::Path,
+    artifact: &CatalogDownloadArtifact,
+    expected_sha256: Option<&str>,
+) -> bool {
+    let path = models_dir.join(&artifact.filename);
+    if let Some(expected_sha256) = expected_sha256 {
+        return file_matches_expected_identity(&path, artifact.size_bytes, expected_sha256);
+    }
+    std::fs::metadata(path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && artifact
+                .expected_exact_size()
+                .map_or_else(|| metadata.len() > 0, |expected| metadata.len() == expected)
+    })
+}
+
+fn spawn_catalog_artifact_download(
+    artifact: &CatalogDownloadArtifact,
+    models_dir: &std::path::Path,
+    max_download_bytes: u64,
+) -> std::io::Result<(std::process::Child, String, String)> {
+    let dest_path = models_dir.join(&artifact.filename).display().to_string();
+    let part_path = format!("{dest_path}.part");
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        artifact.repo_id, artifact.filename
+    );
+    let max_download_bytes = max_download_bytes.to_string();
+    let child = std::process::Command::new("curl")
+        // Resilience flags for multi-GB pulls over flaky/throttled CDNs. `-C -`
+        // resumes the current artifact's `.part` file on each retry.
+        .args([
+            "-f",
+            "-L",
+            "-C",
+            "-",
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "30",
+            "--retry",
+            "10",
+            "--retry-delay",
+            "2",
+            "--retry-all-errors",
+            "--max-filesize",
+            &max_download_bytes,
+            "-o",
+            &part_path,
+            &url,
+        ])
+        .spawn()?;
+    Ok((child, part_path, dest_path))
+}
+
 async fn install_catalog_model(
     State(state): State<AppState>,
     Json(req): Json<InstallCatalogRequest>,
 ) -> Response {
     let _reader = state.model_file_lifecycle.read().await;
-    if !validate_local_model_filename(&req.filename) {
+    let artifacts = match catalog_download_artifacts(&req) {
+        Ok(artifacts) => artifacts,
+        Err(message) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_catalog_identity",
+                message.to_string(),
+                Some("catalog_id"),
+            )
+        }
+    };
+    if artifacts
+        .iter()
+        .any(|artifact| !validate_local_model_filename(&artifact.filename))
+    {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_filename",
-            "catalog filename must be one bare .gguf name".to_string(),
+            "catalog filenames must be bare .gguf names".to_string(),
             Some("filename"),
         );
     }
-    if req.size_bytes == 0 || req.size_bytes > state.server_limits.max_download_bytes {
+    if let Some(artifact) = artifacts.iter().find(|artifact| {
+        artifact.size_bytes == 0 || artifact.size_bytes > state.server_limits.max_download_bytes
+    }) {
         return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "download_size_limit_exceeded",
             format!(
-                "declared model size {} bytes is outside the server download ceiling of {} bytes",
-                req.size_bytes, state.server_limits.max_download_bytes
+                "declared artifact size {} bytes for {} is outside the server download ceiling of {} bytes",
+                artifact.size_bytes, artifact.filename, state.server_limits.max_download_bytes
             ),
             Some("size_bytes"),
         );
@@ -26564,14 +27178,6 @@ async fn install_catalog_model(
         map.remove(&req.catalog_id);
     }
     if let Some(existing) = map.get(&req.catalog_id) {
-        if existing.repo_id != req.repo_id || existing.filename != req.filename {
-            return api_error(
-                StatusCode::CONFLICT,
-                "download_identity_conflict",
-                "this catalog id is already downloading a different artifact".to_string(),
-                Some("catalog_id"),
-            );
-        }
         if existing.continuation_mode != continuation_mode {
             return api_error(
                 StatusCode::CONFLICT,
@@ -26588,15 +27194,36 @@ async fn install_catalog_model(
             Some("catalog_id"),
         );
     }
-    let destination_key = download_destination_key(&req.filename);
+    std::fs::create_dir_all(&state.models_dir).ok();
+    let missing_artifacts = artifacts
+        .into_iter()
+        .filter(|artifact| !artifact_is_installed(&state.models_dir, artifact))
+        .collect::<Vec<_>>();
+    if missing_artifacts.is_empty() {
+        return (
+            StatusCode::OK,
+            "Model and companion artifacts already installed",
+        )
+            .into_response();
+    }
+    let reserved_filenames = missing_artifacts
+        .iter()
+        .map(|artifact| artifact.filename.clone())
+        .collect::<Vec<_>>();
+    let requested_destination_keys = reserved_filenames
+        .iter()
+        .map(|filename| download_destination_key(filename))
+        .collect::<Vec<_>>();
     if map.values().any(|download| {
         download.status == "downloading"
-            && download_destination_key(&download.filename) == destination_key
+            && download.reserved_filenames.iter().any(|filename| {
+                requested_destination_keys.contains(&download_destination_key(filename))
+            })
     }) {
         return api_error(
             StatusCode::CONFLICT,
             "download_destination_busy",
-            "another download is already writing this model filename".to_string(),
+            "another download is already writing one of this model's artifacts".to_string(),
             Some("filename"),
         );
     }
@@ -26604,97 +27231,124 @@ async fn install_catalog_model(
     // Download into the configured models dir — the same directory the
     // local-models scan reads — so an installed model is visible to the scan
     // whatever CWD the server process inherited.
-    std::fs::create_dir_all(&state.models_dir).ok();
-    let dest_path = state.models_dir.join(&req.filename).display().to_string();
+    let total_bytes = match missing_artifacts.iter().try_fold(0_u64, |total, artifact| {
+        total.checked_add(artifact.size_bytes)
+    }) {
+        Some(total) => total,
+        None => {
+            return api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "download_size_overflow",
+                "combined artifact size is too large".to_string(),
+                Some("size_bytes"),
+            )
+        }
+    };
+    let first = missing_artifacts[0].clone();
     // Download into a `.part` file and only promote it to the final path once curl
     // exits successfully. The loadable GGUF therefore never exists until the
     // download is genuinely complete, so a half-downloaded model cannot be loaded.
-    let part_path = format!("{dest_path}.part");
-    let url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        req.repo_id, req.filename
-    );
     let max_download_bytes_limit = state.server_limits.max_download_bytes;
-    let max_download_bytes = max_download_bytes_limit.to_string();
 
-    // `-f` makes curl FAIL on an HTTP error (404/403/â€¦) instead of writing the
-    // error page to the output file and exiting 0 â€” which previously looked like an
-    // instant successful download.
-    match std::process::Command::new("curl")
-        // Resilience flags for large multi-GB pulls over flaky/throttled CDNs:
-        //   --speed-limit/--speed-time: abort (exit 28) if throughput stays below
-        //     1 KiB/s for 30s. Without this, a silently stalled-but-still-Established
-        //     TCP connection makes curl wait on a dead stream forever, so the download
-        //     freezes mid-file and never recovers (the bug this fixes).
-        //   --retry/--retry-delay/--retry-all-errors: reconnect on transient errors
-        //     AND on that speed-abort (--retry-all-errors covers exit 28); `-C -`
-        //     resumes from the existing `.part` offset on each retry, so no bytes are
-        //     re-downloaded.
-        //   --connect-timeout caps a dead connect attempt.
-        .args([
-            "-f",
-            "-L",
-            "-C",
-            "-",
-            "--connect-timeout",
-            "30",
-            "--speed-limit",
-            "1024",
-            "--speed-time",
-            "30",
-            "--retry",
-            "10",
-            "--retry-delay",
-            "2",
-            "--retry-all-errors",
-            "--max-filesize",
-            &max_download_bytes,
-            "-o",
-            &part_path,
-            &url,
-        ])
-        .spawn()
-    {
-        Ok(child) => {
+    match spawn_catalog_artifact_download(&first, &state.models_dir, max_download_bytes_limit) {
+        Ok((child, first_part_path, first_dest_path)) => {
             let pid = child.id();
             let download = ActiveDownload {
                 id: req.catalog_id.clone(),
-                repo_id: req.repo_id.clone(),
-                filename: req.filename.clone(),
+                repo_id: first.repo_id.clone(),
+                filename: first.filename.clone(),
+                current_artifact_role: first.role.to_string(),
+                artifact_index: 1,
+                artifact_count: missing_artifacts.len(),
                 continuation_mode,
-                total_bytes: req.size_bytes,
+                total_bytes,
                 bytes_downloaded: 0,
                 status: "downloading",
                 child_pid: Some(pid),
                 finished_at: None,
+                completed_bytes: 0,
+                reserved_filenames,
             };
             map.insert(req.catalog_id.clone(), download);
 
             let catalog_id_clone = req.catalog_id.clone();
-            let part_path_clone = part_path.clone();
-            let dest_path_clone = dest_path.clone();
             let lifecycle = state.model_file_lifecycle.clone();
+            let models_dir = state.models_dir.clone();
             tokio::spawn(async move {
-                let mut child = child;
-                let succeeded = matches!(child.wait(), Ok(status) if status.success());
-                // Completion is the curl exit code AND a successful promote of the
-                // .part file to the final path, never a size heuristic. The map lock
-                // is held across the promote decision so a cancel cannot race the
-                // rename: cancel removes the entry, and an untracked (canceled)
-                // download must never promote, whatever curl's exit code says.
-                let _reader = lifecycle.read().await;
-                let mut map = active_downloads_map().lock().unwrap();
-                let still_tracked = map.contains_key(&catalog_id_clone);
-                let status = finalize_download_artifact(
-                    succeeded,
-                    still_tracked,
-                    &part_path_clone,
-                    &dest_path_clone,
-                    max_download_bytes_limit,
-                );
-                if let Some(dl) = map.get_mut(&catalog_id_clone) {
-                    dl.status = status;
-                    dl.finished_at = Some(std::time::Instant::now());
+                let mut first_child = Some((child, first_part_path, first_dest_path));
+                for (index, artifact) in missing_artifacts.iter().enumerate() {
+                    let (mut child, part_path, dest_path) = if index == 0 {
+                        first_child.take().expect("first catalog download child")
+                    } else {
+                        let spawned = match spawn_catalog_artifact_download(
+                            artifact,
+                            &models_dir,
+                            max_download_bytes_limit,
+                        ) {
+                            Ok(spawned) => spawned,
+                            Err(_) => {
+                                let mut map = active_downloads_map().lock().unwrap();
+                                if let Some(dl) = map.get_mut(&catalog_id_clone) {
+                                    dl.repo_id = artifact.repo_id.clone();
+                                    dl.filename = artifact.filename.clone();
+                                    dl.current_artifact_role = artifact.role.to_string();
+                                    dl.artifact_index = index + 1;
+                                    dl.status = "failed";
+                                    dl.finished_at = Some(std::time::Instant::now());
+                                }
+                                return;
+                            }
+                        };
+                        let mut map = active_downloads_map().lock().unwrap();
+                        let Some(dl) = map.get_mut(&catalog_id_clone) else {
+                            let mut orphan = spawned.0;
+                            orphan.kill().ok();
+                            orphan.wait().ok();
+                            std::fs::remove_file(&spawned.1).ok();
+                            return;
+                        };
+                        dl.repo_id = artifact.repo_id.clone();
+                        dl.filename = artifact.filename.clone();
+                        dl.current_artifact_role = artifact.role.to_string();
+                        dl.artifact_index = index + 1;
+                        dl.child_pid = Some(spawned.0.id());
+                        spawned
+                    };
+
+                    let succeeded = matches!(child.wait(), Ok(status) if status.success());
+                    // Completion is the curl exit code plus atomic `.part` promotion.
+                    // A cancel removes the map entry before this decision, so an
+                    // untracked child can never make a partial GGUF loadable.
+                    let _reader = lifecycle.read().await;
+                    let mut map = active_downloads_map().lock().unwrap();
+                    let still_tracked = map.contains_key(&catalog_id_clone);
+                    let status = finalize_download_artifact(
+                        succeeded,
+                        still_tracked,
+                        &part_path,
+                        &dest_path,
+                        max_download_bytes_limit,
+                        artifact.expected_exact_size(),
+                        artifact.expected_sha256(),
+                    );
+                    let Some(dl) = map.get_mut(&catalog_id_clone) else {
+                        return;
+                    };
+                    if status != "completed" {
+                        dl.status = "failed";
+                        dl.finished_at = Some(std::time::Instant::now());
+                        return;
+                    }
+                    dl.completed_bytes = dl
+                        .completed_bytes
+                        .saturating_add(artifact.size_bytes)
+                        .min(dl.total_bytes);
+                    dl.bytes_downloaded = dl.completed_bytes;
+                    if index + 1 == missing_artifacts.len() {
+                        dl.status = "completed";
+                        dl.bytes_downloaded = dl.total_bytes;
+                        dl.finished_at = Some(std::time::Instant::now());
+                    }
                 }
             });
 
@@ -26728,7 +27382,10 @@ async fn get_catalog_downloads(State(state): State<AppState>) -> Json<Vec<Active
         // flip a download to "completed" before it actually finished.
         let part_path = format!("{}.part", state.models_dir.join(&dl.filename).display());
         if let Ok(metadata) = std::fs::metadata(&part_path) {
-            dl.bytes_downloaded = metadata.len();
+            dl.bytes_downloaded = dl
+                .completed_bytes
+                .saturating_add(metadata.len())
+                .min(dl.total_bytes);
         }
     }
 
@@ -26752,15 +27409,34 @@ fn finalize_download_artifact(
     part_path: &str,
     dest_path: &str,
     max_download_bytes: u64,
+    expected_exact_size: Option<u64>,
+    expected_sha256: Option<&str>,
 ) -> &'static str {
     // Curl's --max-filesize is the first line of defense, but the origin may
     // omit or lie about Content-Length and curl behavior varies by version.
     // Recheck the artifact itself before making it loadable so the configured
     // ceiling remains authoritative even in those cases.
-    let within_limit = std::fs::metadata(part_path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_download_bytes);
-    let promoted =
-        succeeded && still_tracked && within_limit && std::fs::rename(part_path, dest_path).is_ok();
+    let within_limit = std::fs::metadata(part_path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.len() <= max_download_bytes
+            && expected_exact_size.is_none_or(|expected| metadata.len() == expected)
+    });
+    let digest_matches = succeeded
+        && still_tracked
+        && within_limit
+        && expected_sha256.is_none_or(|expected| {
+            // A just-finished network artifact is a trust boundary, not a
+            // performance-sensitive model-load repeat. Hash it from disk so a
+            // stale cache entry can never promote bytes fetched from a mutable
+            // `resolve/main` URL.
+            receipt::sha256_file_hex(std::path::Path::new(part_path))
+                .is_ok_and(|actual| actual.eq_ignore_ascii_case(expected))
+        });
+    let promoted = succeeded
+        && still_tracked
+        && within_limit
+        && digest_matches
+        && promote_download_part(part_path, dest_path, expected_exact_size, expected_sha256);
     if !promoted {
         std::fs::remove_file(part_path).ok();
     }
@@ -26768,6 +27444,53 @@ fn finalize_download_artifact(
         "completed"
     } else {
         "failed"
+    }
+}
+
+/// Promote a fully validated part. Unix rename replaces an existing corrupt
+/// destination directly; Windows rename does not. For an exact-size companion
+/// repair, park only the known-invalid old destination, install the validated
+/// part, then remove the parked file. A failed promotion restores the old file
+/// when possible and otherwise leaves the uniquely named backup recoverable.
+fn promote_download_part(
+    part_path: &str,
+    dest_path: &str,
+    expected_exact_size: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> bool {
+    if std::fs::rename(part_path, dest_path).is_ok() {
+        return true;
+    }
+    let Some(expected) = expected_exact_size else {
+        return false;
+    };
+    let destination_is_invalid = std::fs::metadata(dest_path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && expected_sha256.map_or_else(
+                || metadata.len() != expected,
+                |sha256| {
+                    !file_matches_expected_identity(
+                        std::path::Path::new(dest_path),
+                        expected,
+                        sha256,
+                    )
+                },
+            )
+    });
+    if !destination_is_invalid {
+        return false;
+    }
+
+    let backup_path = format!("{dest_path}.invalid-{}", uuid::Uuid::new_v4());
+    if std::fs::rename(dest_path, &backup_path).is_err() {
+        return false;
+    }
+    if std::fs::rename(part_path, dest_path).is_ok() {
+        std::fs::remove_file(backup_path).ok();
+        true
+    } else {
+        std::fs::rename(&backup_path, dest_path).ok();
+        false
     }
 }
 
@@ -27041,12 +27764,17 @@ mod local_model_delete_tests {
                 id: download_id.clone(),
                 repo_id: "test/repo".to_string(),
                 filename: "other.gguf".to_string(),
+                current_artifact_role: "model".to_string(),
+                artifact_index: 1,
+                artifact_count: 1,
                 continuation_mode: "download".to_string(),
                 total_bytes: 1,
                 bytes_downloaded: 0,
                 status: "downloading",
                 child_pid: None,
                 finished_at: None,
+                completed_bytes: 0,
+                reserved_filenames: vec!["other.gguf".to_string()],
             },
         );
         let token = scanned_token(app.clone(), "guarded.gguf").await;
@@ -27330,7 +28058,10 @@ mod non_windows_model_delete_tests {
 
 #[cfg(test)]
 mod catalog_fit_tests {
-    use super::{curated_catalog, CatalogItem, CatalogItemView};
+    use super::{
+        catalog_companion_artifacts, curated_catalog, CatalogItem, CatalogItemView,
+        BONSAI_27B_VISION_PROJECTOR,
+    };
     use crate::capability::{HardwareProfile, SimdCaps};
     use crate::fit::FitVerdict;
 
@@ -27370,6 +28101,33 @@ mod catalog_fit_tests {
         assert_eq!(view.task_tags, vec!["general".to_string()]);
         // ~1.1 GB model on a 64 GB CPU host → comfortably CPU-only.
         assert_eq!(view.fit, FitVerdict::CpuOnlyOk);
+    }
+
+    #[test]
+    fn both_bonsai_27b_rows_publish_the_same_checked_vision_projector() {
+        let hw = host(true, 6 * GIB, 32 * GIB, 24 * GIB);
+        for id in ["bonsai_27b_q1_0", "ternary_bonsai_27b_q2_0"] {
+            let item = row(id);
+            let view = CatalogItemView::from_curated(&item, &hw);
+            assert_eq!(
+                view.companion_artifacts,
+                vec![BONSAI_27B_VISION_PROJECTOR],
+                "{id} must install the checked projector"
+            );
+        }
+        assert_eq!(
+            catalog_companion_artifacts("bonsai_4b_q1_0"),
+            Vec::new(),
+            "non-vision rows must preserve single-file acquisition"
+        );
+        assert_eq!(
+            format!(
+                "https://huggingface.co/{}/resolve/main/{}",
+                BONSAI_27B_VISION_PROJECTOR.repo_id,
+                BONSAI_27B_VISION_PROJECTOR.filename
+            ),
+            "https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf"
+        );
     }
 
     #[test]
@@ -27960,6 +28718,188 @@ mod catalog_fit_endpoint_tests {
 }
 
 #[cfg(test)]
+mod catalog_companion_download_tests {
+    use super::{
+        artifact_is_installed, artifact_is_installed_with_expected_sha256,
+        catalog_download_artifacts, local_models, AppState, InstallCatalogRequest,
+        BONSAI_27B_VISION_PROJECTOR,
+    };
+    use axum::{extract::State, http::HeaderMap, Json};
+
+    fn request(
+        catalog_id: &str,
+        repo_id: &str,
+        filename: &str,
+        size_bytes: u64,
+    ) -> InstallCatalogRequest {
+        InstallCatalogRequest {
+            catalog_id: catalog_id.to_string(),
+            repo_id: repo_id.to_string(),
+            filename: filename.to_string(),
+            size_bytes,
+            continuation_mode: Some("start".to_string()),
+        }
+    }
+
+    #[test]
+    fn exact_bonsai_install_plan_is_model_then_projector() {
+        let artifacts = catalog_download_artifacts(&request(
+            "bonsai_27b_q1_0",
+            "prism-ml/Bonsai-27B-gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            3_803_452_480,
+        ))
+        .unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].role, "model");
+        assert_eq!(artifacts[0].filename, "Bonsai-27B-Q1_0.gguf");
+        assert_eq!(artifacts[1].role, "vision_projector");
+        assert_eq!(artifacts[1].repo_id, BONSAI_27B_VISION_PROJECTOR.repo_id);
+        assert_eq!(artifacts[1].filename, BONSAI_27B_VISION_PROJECTOR.filename);
+        assert_eq!(artifacts[1].size_bytes, 629_246_880);
+    }
+
+    #[test]
+    fn curated_identity_cannot_be_repointed_while_live_hf_rows_stay_single_file() {
+        assert!(catalog_download_artifacts(&request(
+            "bonsai_27b_q1_0",
+            "attacker/repo",
+            "Bonsai-27B-Q1_0.gguf",
+            3_803_452_480,
+        ))
+        .is_err());
+        let live = catalog_download_artifacts(&request(
+            "hf::someone/repo::other.gguf",
+            "someone/repo",
+            "other.gguf",
+            42,
+        ))
+        .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].role, "model");
+    }
+
+    #[test]
+    fn installed_projector_is_deduplicated_and_missing_projector_is_repairable() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = catalog_download_artifacts(&request(
+            "ternary_bonsai_27b_q2_0",
+            "prism-ml/Ternary-Bonsai-27B-gguf",
+            "Ternary-Bonsai-27B-Q2_0.gguf",
+            7_165_121_600,
+        ))
+        .unwrap();
+        let model = &artifacts[0];
+        let mut projector = artifacts[1].clone();
+
+        let projector_path = temp.path().join(&projector.filename);
+        std::fs::write(&projector_path, b"synthetic checked projector").unwrap();
+        projector.size_bytes = std::fs::metadata(&projector_path).unwrap().len();
+        let projector_sha256 = crate::receipt::sha256_file_hex(&projector_path).unwrap();
+        assert!(!artifact_is_installed(temp.path(), model));
+        assert!(artifact_is_installed_with_expected_sha256(
+            temp.path(),
+            &projector,
+            Some(&projector_sha256),
+        ));
+        let missing = [
+            (model.role, artifact_is_installed(temp.path(), model)),
+            (
+                projector.role,
+                artifact_is_installed_with_expected_sha256(
+                    temp.path(),
+                    &projector,
+                    Some(&projector_sha256),
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(role, installed)| (!installed).then_some(role))
+        .collect::<Vec<_>>();
+        assert_eq!(missing, vec!["model"]);
+
+        std::fs::remove_file(&projector_path).unwrap();
+        std::fs::write(temp.path().join(&model.filename), b"model").unwrap();
+        let missing = [
+            (model.role, artifact_is_installed(temp.path(), model)),
+            (
+                projector.role,
+                artifact_is_installed_with_expected_sha256(
+                    temp.path(),
+                    &projector,
+                    Some(&projector_sha256),
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(role, installed)| (!installed).then_some(role))
+        .collect::<Vec<_>>();
+        assert_eq!(missing, vec!["vision_projector"]);
+    }
+
+    #[test]
+    fn wrong_size_projector_is_never_classified_as_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = catalog_download_artifacts(&request(
+            "bonsai_27b_q1_0",
+            "prism-ml/Bonsai-27B-gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            3_803_452_480,
+        ))
+        .unwrap();
+        let projector = &artifacts[1];
+        let path = temp.path().join(&projector.filename);
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(projector.size_bytes - 1).unwrap();
+
+        assert!(!artifact_is_installed(temp.path(), projector));
+    }
+
+    #[test]
+    fn same_size_wrong_hash_projector_is_never_classified_as_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut artifact = catalog_download_artifacts(&request(
+            "bonsai_27b_q1_0",
+            "prism-ml/Bonsai-27B-gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            3_803_452_480,
+        ))
+        .unwrap()
+        .remove(1);
+        let path = temp.path().join(&artifact.filename);
+        std::fs::write(&path, b"wrong bytes").unwrap();
+        artifact.size_bytes = std::fs::metadata(&path).unwrap().len();
+        let expected_path = temp.path().join("expected.bin");
+        std::fs::write(&expected_path, b"right byte!").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&expected_path).unwrap();
+
+        assert!(!artifact_is_installed_with_expected_sha256(
+            temp.path(),
+            &artifact,
+            Some(&expected_sha256),
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_scan_does_not_publish_a_wrong_size_projector_as_bundle_support() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename),
+            b"corrupt projector",
+        )
+        .unwrap();
+        let state = AppState::default().with_models_dir(Some(temp.path().to_path_buf()));
+
+        let Json(local) = local_models(State(state), HeaderMap::new()).await;
+
+        assert!(
+            local.models.is_empty(),
+            "a filename alone must not make the Models page report the bundle installed"
+        );
+    }
+}
+
+#[cfg(test)]
 mod download_cancel_tests {
     use super::{
         active_downloads_map, download_destination_key, finalize_download_artifact,
@@ -28008,7 +28948,7 @@ mod download_cancel_tests {
     fn successful_tracked_download_promotes_part_to_dest() {
         let (part, dest) = temp_paths("promote");
         std::fs::write(&part, b"payload").unwrap();
-        let status = finalize_download_artifact(true, true, &part, &dest, u64::MAX);
+        let status = finalize_download_artifact(true, true, &part, &dest, u64::MAX, None, None);
         assert_eq!(status, "completed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -28024,7 +28964,7 @@ mod download_cancel_tests {
         std::fs::write(&part, b"payload").unwrap();
         // still_tracked=false models a cancel that removed the map entry while
         // curl went on to finish successfully (the Windows kill-less failure mode).
-        let status = finalize_download_artifact(true, false, &part, &dest, u64::MAX);
+        let status = finalize_download_artifact(true, false, &part, &dest, u64::MAX, None, None);
         assert_eq!(status, "failed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -28040,7 +28980,7 @@ mod download_cancel_tests {
     fn failed_download_removes_partial() {
         let (part, dest) = temp_paths("fail");
         std::fs::write(&part, b"half").unwrap();
-        let status = finalize_download_artifact(false, true, &part, &dest, u64::MAX);
+        let status = finalize_download_artifact(false, true, &part, &dest, u64::MAX, None, None);
         assert_eq!(status, "failed");
         assert!(!std::path::Path::new(&part).exists());
         assert!(!std::path::Path::new(&dest).exists());
@@ -28059,6 +28999,8 @@ mod download_cancel_tests {
             part.to_str().unwrap(),
             dest.to_str().unwrap(),
             4,
+            None,
+            None,
         );
 
         assert_eq!(status, "failed");
@@ -28067,6 +29009,76 @@ mod download_cancel_tests {
             !dest.exists(),
             "oversized partial must never become loadable"
         );
+    }
+
+    #[test]
+    fn wrong_size_companion_download_is_never_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("projector.gguf.part");
+        let dest = dir.path().join("projector.gguf");
+        std::fs::write(&part, b"truncated").unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            u64::MAX,
+            Some(10),
+            None,
+        );
+
+        assert_eq!(status, "failed");
+        assert!(!part.exists());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn same_size_wrong_hash_companion_download_is_never_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("projector.gguf.part");
+        let dest = dir.path().join("projector.gguf");
+        let expected = dir.path().join("expected.gguf");
+        std::fs::write(&part, b"wrong").unwrap();
+        std::fs::write(&expected, b"right").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&expected).unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            u64::MAX,
+            Some(5),
+            Some(&expected_sha256),
+        );
+
+        assert_eq!(status, "failed");
+        assert!(!part.exists());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn validated_companion_replaces_an_existing_same_size_wrong_hash_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("projector.gguf.part");
+        let dest = dir.path().join("projector.gguf");
+        std::fs::write(&part, b"correct").unwrap();
+        std::fs::write(&dest, b"wrong!!").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&part).unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            u64::MAX,
+            Some(7),
+            Some(&expected_sha256),
+        );
+
+        assert_eq!(status, "completed");
+        assert_eq!(std::fs::read(dest).unwrap(), b"correct");
     }
 
     #[test]
@@ -28091,12 +29103,17 @@ mod download_cancel_tests {
             id: id.clone(),
             repo_id: "test/repo".to_string(),
             filename: "terminal.gguf".to_string(),
+            current_artifact_role: "model".to_string(),
+            artifact_index: 1,
+            artifact_count: 1,
             continuation_mode: "start".to_string(),
             total_bytes: 10,
             bytes_downloaded: 10,
             status: "downloading",
             child_pid: None,
             finished_at: Some(std::time::Instant::now()),
+            completed_bytes: 10,
+            reserved_filenames: vec!["terminal.gguf".to_string()],
         };
         terminal.status = "completed";
         active_downloads_map()
@@ -28142,12 +29159,17 @@ mod download_cancel_tests {
                 id: id.clone(),
                 repo_id: "test/repo".to_string(),
                 filename: "active.gguf".to_string(),
+                current_artifact_role: "model".to_string(),
+                artifact_index: 1,
+                artifact_count: 1,
                 continuation_mode: "download".to_string(),
                 total_bytes: 10,
                 bytes_downloaded: 1,
                 status: "downloading",
                 child_pid: None,
                 finished_at: None,
+                completed_bytes: 0,
+                reserved_filenames: vec!["active.gguf".to_string()],
             },
         );
         let app = router_with_state(AppState::default());

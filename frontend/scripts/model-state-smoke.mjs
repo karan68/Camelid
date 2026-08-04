@@ -269,11 +269,11 @@ const prismCatalogRows = [
 const prismCapabilityFixture = {
   model_compatibility: prismCatalogRows.map(([id, filename, quantization]) => ({
     id,
-    family: 'qwen35_bonsai_metal',
+    family: 'qwen35_bonsai_gpu',
     quantization,
     status: 'supported_exact_row_smoke',
-    frontend_readiness_gate: `green only for ${filename} on the checked Metal lane`,
-    evidence: 'Mac mini 2 exact-artifact receipt',
+    frontend_readiness_gate: `green only for ${filename} on a checked Metal or Windows CUDA lane`,
+    evidence: 'paired Metal and Windows CUDA exact-artifact receipts',
   })),
 }
 for (const [id, filename, quant] of prismCatalogRows) {

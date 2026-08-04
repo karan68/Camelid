@@ -1359,7 +1359,7 @@ enum Command {
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
     },
-    /// Hidden: end-to-end Prism Qwen3-VL image encode plus Qwen3.5 Metal decode.
+    /// Hidden: end-to-end Prism Qwen3-VL image encode plus Qwen3.5 Metal/CUDA decode.
     #[command(hide = true)]
     BenchGenerateVision {
         /// Qwen3.5 Bonsai GGUF model path.
@@ -5194,7 +5194,7 @@ fn run_bench_generate_vision(
     let generation_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
     let output_text = tokenizer.decode(&generated, true)?;
     let record = serde_json::json!({
-        "runtime": "camelid-prism-metal",
+        "runtime": "camelid-prism-gpu",
         "model": model,
         "mmproj": mmproj,
         "image": image,
