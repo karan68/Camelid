@@ -6873,7 +6873,7 @@ async fn inspect_model(
     };
     let (lane_class, blocker) = match config_result {
         Ok(_) => (
-            classify_model_lane(architecture.as_deref(), &filename),
+            classify_model_lane_with_verified_sha256(architecture.as_deref(), &filename, None),
             None,
         ),
         Err(err) => (
@@ -8185,13 +8185,22 @@ pub struct RunnableServeRuntime {
 }
 
 impl RunnableServeRuntime {
-    fn load(path: &std::path::Path) -> std::result::Result<Self, BackendError> {
+    fn load(path: &std::path::Path, model_sha256: &str) -> std::result::Result<Self, BackendError> {
         let path_str = path.to_string_lossy().to_string();
         let gguf = crate::gguf::read_metadata(&path_str)?;
         let architecture = gguf.architecture().unwrap_or_default().to_string();
         let tokenizer = std::sync::Arc::new(Tokenizer::from_gguf(&gguf)?);
         let model = crate::runnable::RunnableModel::load(&path_str)?;
-        let vision = if architecture == "qwen35" {
+        // Vision is an exact-row capability, not a qwen35-wide capability. In
+        // particular, a 4B/8B Bonsai file must remain text-loadable when it
+        // happens to share a directory with the 27B projector.
+        let exact_prism_artifact = path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .is_some_and(|filename| {
+                prism_supported_artifact_identity_matches(filename, model_sha256)
+            });
+        let vision = if exact_prism_artifact {
             prism_mmproj_path(path)
                 .map(crate::runnable::PrismVisionProjector::load)
                 .transpose()?
@@ -8205,6 +8214,10 @@ impl RunnableServeRuntime {
                     projector.projection_dim()
                 )));
             }
+            // `vision_ready` is a runtime capability claim, not just a parsed
+            // file claim. Force backend construction now so Windows CUDA/NVRTC
+            // failures reject the load instead of surfacing on the first image.
+            projector.ensure_backend_ready()?;
         }
         Ok(Self {
             model,
@@ -8215,7 +8228,9 @@ impl RunnableServeRuntime {
     }
 
     fn vision_ready(&self) -> bool {
-        self.vision.is_some()
+        self.vision
+            .as_ref()
+            .is_some_and(|projector| projector.ensure_backend_ready().is_ok())
     }
 
     /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
@@ -8227,13 +8242,9 @@ impl RunnableServeRuntime {
         sampling: &SamplingConfig,
     ) -> std::result::Result<(String, Vec<u32>), BackendError> {
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
-        let ids = self.model.generate_stopping_streaming_with_sampling(
-            prompt_ids,
-            max_new,
-            &stop,
-            sampling,
-            &mut |_| {},
-        )?;
+        let ids = self
+            .model
+            .generate_stopping_with_sampling(prompt_ids, max_new, &stop, sampling)?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
@@ -8318,12 +8329,82 @@ impl RunnableServeRuntime {
     }
 }
 
+/// The checked vision companion for an exact curated model row. Looking this
+/// up through the catalog binding keeps discovery in lockstep with Models-page
+/// acquisition: qwen35-family membership alone never grants image support.
+fn prism_vision_companion_for_model(
+    model_path: &std::path::Path,
+) -> Option<CatalogCompanionArtifact> {
+    let filename = model_path.file_name()?.to_str()?;
+    let catalog_id = curated_catalog()
+        .into_iter()
+        .find(|item| item.filename == filename)?
+        .catalog_id;
+    catalog_companion_artifacts(catalog_id)
+        .into_iter()
+        .find(|artifact| artifact.role == "vision_projector")
+}
+
+/// Exact identity gate for a capability-bearing artifact. Size is checked
+/// before hashing so truncated files fail cheaply; the existing GGUF hash
+/// cache keeps subsequent Models scans and model loads from re-reading a valid
+/// 600 MiB projector.
+fn file_matches_expected_identity(
+    path: &std::path::Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> bool {
+    let has_expected_size = std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size);
+    has_expected_size
+        && receipt::sha256_file_hex_cached(path)
+            .is_ok_and(|actual| actual.eq_ignore_ascii_case(expected_sha256))
+}
+
+fn companion_file_matches_expected_identity(
+    path: &std::path::Path,
+    artifact: &CatalogCompanionArtifact,
+) -> bool {
+    catalog_companion_expected_sha256(artifact).is_some_and(|expected_sha256| {
+        file_matches_expected_identity(path, artifact.size_bytes, expected_sha256)
+    })
+}
+
 /// Resolve a projector explicitly (`CAMELID_MMPROJ`) or from a sibling
-/// `*mmproj*.gguf` file. Sorting makes discovery deterministic when a model
-/// directory contains more than one candidate.
+/// `*mmproj*.gguf` file, but only for a curated row bound to that capability.
+/// The canonical filename wins when a directory contains multiple valid-sized
+/// candidates; deterministic lexical order breaks any remaining tie.
 fn prism_mmproj_path(model_path: &std::path::Path) -> Option<PathBuf> {
-    if let Some(explicit) = env::var_os("CAMELID_MMPROJ").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(explicit));
+    let explicit = env::var_os("CAMELID_MMPROJ")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    prism_mmproj_path_with_override(model_path, explicit.as_deref())
+}
+
+fn prism_mmproj_path_with_override(
+    model_path: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let companion = prism_vision_companion_for_model(model_path)?;
+    let expected_sha256 = catalog_companion_expected_sha256(&companion)?;
+    prism_mmproj_path_with_override_and_identity(
+        model_path,
+        explicit,
+        companion.size_bytes,
+        expected_sha256,
+    )
+}
+
+fn prism_mmproj_path_with_override_and_identity(
+    model_path: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Option<PathBuf> {
+    let companion = prism_vision_companion_for_model(model_path)?;
+    if let Some(explicit) = explicit {
+        return file_matches_expected_identity(explicit, expected_size, expected_sha256)
+            .then(|| explicit.to_path_buf());
     }
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(model_path.parent()?)
         .ok()?
@@ -8338,8 +8419,126 @@ fn prism_mmproj_path(model_path: &std::path::Path) -> Option<PathBuf> {
                 })
         })
         .collect();
-    candidates.sort();
-    candidates.into_iter().next()
+    candidates.sort_by(|left, right| {
+        let is_exact = |path: &std::path::Path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .eq_ignore_ascii_case(companion.filename)
+            })
+        };
+        is_exact(right)
+            .cmp(&is_exact(left))
+            .then_with(|| left.cmp(right))
+    });
+    candidates
+        .into_iter()
+        .find(|path| file_matches_expected_identity(path, expected_size, expected_sha256))
+}
+
+#[cfg(test)]
+mod prism_mmproj_discovery_tests {
+    use super::{
+        prism_mmproj_path_with_override, prism_mmproj_path_with_override_and_identity,
+        BONSAI_27B_VISION_PROJECTOR,
+    };
+
+    fn sparse_file(path: &std::path::Path, len: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(len).unwrap();
+    }
+
+    #[test]
+    fn bonsai_4b_and_8b_ignore_a_sibling_27b_projector() {
+        let temp = tempfile::tempdir().unwrap();
+        sparse_file(
+            &temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename),
+            BONSAI_27B_VISION_PROJECTOR.size_bytes,
+        );
+
+        for filename in ["Bonsai-4B-Q1_0.gguf", "Ternary-Bonsai-8B-Q2_0.gguf"] {
+            let model = temp.path().join(filename);
+            std::fs::write(&model, b"model stub").unwrap();
+            assert_eq!(
+                prism_mmproj_path_with_override(&model, None),
+                None,
+                "{filename} must not inherit 27B image support from its directory"
+            );
+        }
+    }
+
+    #[test]
+    fn both_exact_27b_rows_prefer_the_canonical_projector_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let lexical_first = temp.path().join("aaa-mmproj-custom.gguf");
+        std::fs::write(&lexical_first, b"synthetic checked projector").unwrap();
+        let canonical = temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename);
+        std::fs::write(&canonical, b"synthetic checked projector").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&canonical).unwrap();
+        let expected_size = std::fs::metadata(&canonical).unwrap().len();
+
+        for filename in ["Bonsai-27B-Q1_0.gguf", "Ternary-Bonsai-27B-Q2_0.gguf"] {
+            let model = temp.path().join(filename);
+            std::fs::write(&model, b"model stub").unwrap();
+            assert_eq!(
+                prism_mmproj_path_with_override_and_identity(
+                    &model,
+                    None,
+                    expected_size,
+                    &expected_sha256,
+                ),
+                Some(canonical.clone()),
+                "{filename} must prefer the checked companion name"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_size_projector_is_not_discovered_even_when_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("Bonsai-27B-Q1_0.gguf");
+        std::fs::write(&model, b"model stub").unwrap();
+        let projector = temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename);
+        std::fs::write(&projector, b"truncated projector").unwrap();
+
+        assert_eq!(prism_mmproj_path_with_override(&model, None), None);
+        assert_eq!(
+            prism_mmproj_path_with_override(&model, Some(&projector)),
+            None
+        );
+    }
+
+    #[test]
+    fn same_size_wrong_hash_projector_is_not_discovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("Bonsai-27B-Q1_0.gguf");
+        std::fs::write(&model, b"model stub").unwrap();
+        let projector = temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename);
+        std::fs::write(&projector, b"malicious").unwrap();
+        let expected = temp.path().join("expected.bin");
+        std::fs::write(&expected, b"different").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&expected).unwrap();
+
+        assert_eq!(
+            prism_mmproj_path_with_override_and_identity(
+                &model,
+                None,
+                std::fs::metadata(&projector).unwrap().len(),
+                &expected_sha256,
+            ),
+            None,
+            "a same-size projector with different bytes must fail closed"
+        );
+        assert_eq!(
+            prism_mmproj_path_with_override_and_identity(
+                &model,
+                Some(&projector),
+                std::fs::metadata(&projector).unwrap().len(),
+                &expected_sha256,
+            ),
+            None,
+            "CAMELID_MMPROJ must not bypass the checked digest"
+        );
+    }
 }
 
 /// Render a gemma3 chat prompt byte-faithful to the GGUF `tokenizer.chat_template`
@@ -8660,13 +8859,18 @@ async fn load_runnable_serve_runtime(
     state: &AppState,
     id: &str,
     model_path: &std::path::Path,
+    model_sha256: &str,
 ) -> std::result::Result<(), BackendError> {
     let load_path = model_path.to_path_buf();
-    let runtime = tokio::task::spawn_blocking(move || RunnableServeRuntime::load(&load_path))
-        .await
-        .map_err(|e| {
-            BackendError::InvalidModelMetadata(format!("runnable serve load task panicked: {e}"))
-        })??;
+    let load_sha256 = model_sha256.to_string();
+    let runtime =
+        tokio::task::spawn_blocking(move || RunnableServeRuntime::load(&load_path, &load_sha256))
+            .await
+            .map_err(|e| {
+                BackendError::InvalidModelMetadata(format!(
+                    "runnable serve load task panicked: {e}"
+                ))
+            })??;
     let arch = runtime.architecture.clone();
     state
         .runnable_runtimes
@@ -9940,7 +10144,7 @@ async fn load_model_from_path_with_activation(
     // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
     // load a runnable-lane runtime (qwen35/Ornith, gemma3) so /v1/chat can route to it.
     if runnable_serve_enabled() && is_runnable_serve_file(&loaded.gguf) {
-        load_runnable_serve_runtime(state, &id, &loaded.path).await?;
+        load_runnable_serve_runtime(state, &id, &loaded.path, &loaded.lane.gguf_sha256).await?;
     }
 
     // DiffusionGemma serve path (additive, on by default; opt-out CAMELID_DG_SERVE=0):
@@ -20039,6 +20243,44 @@ mod tests {
     }
 
     #[test]
+    fn loaded_prism_support_requires_each_exact_recorded_sha256() {
+        for (filename, expected_sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
+            assert!(prism_supported_artifact_identity_matches(
+                filename,
+                expected_sha256
+            ));
+            assert!(!prism_supported_artifact_identity_matches(
+                filename,
+                &"00".repeat(32)
+            ));
+            assert_eq!(
+                classify_loaded_model_identity(Some("qwen35"), filename, expected_sha256),
+                ModelLaneClass::Supported,
+                "{filename} with its evidence digest must remain supported"
+            );
+            assert_eq!(
+                classify_loaded_model_identity(Some("qwen35"), filename, &"00".repeat(32)),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} with replaced bytes must not inherit support by name"
+            );
+            assert_eq!(
+                classify_model_lane_with_verified_sha256(Some("qwen35"), filename, None),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} must remain unverified until the load path supplies its digest"
+            );
+        }
+        assert_eq!(
+            classify_loaded_model_identity(
+                Some("llama"),
+                "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+                &"00".repeat(32),
+            ),
+            ModelLaneClass::Supported,
+            "this hardening is scoped to the seven Prism identities"
+        );
+    }
+
+    #[test]
     fn backend_error_code_is_stable_and_switchable() {
         use crate::BackendError;
         assert_eq!(
@@ -23964,6 +24206,8 @@ const BONSAI_27B_VISION_PROJECTOR: CatalogCompanionArtifact = CatalogCompanionAr
     filename: "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
     size_bytes: 629_246_880,
 };
+const BONSAI_27B_VISION_PROJECTOR_SHA256: &str =
+    "eb561d41a7bbeb0fcf04883c8af11078ef6cae0a66862a0b68443cfca495269d";
 
 /// Data-only bindings between curated rows and required companion artifacts.
 /// Both exact 27B packs use the same checked projector, so downloading either row
@@ -23972,6 +24216,17 @@ const CATALOG_COMPANION_BINDINGS: &[CatalogCompanionBinding] = &[CatalogCompanio
     catalog_ids: &["bonsai_27b_q1_0", "ternary_bonsai_27b_q2_0"],
     artifact: BONSAI_27B_VISION_PROJECTOR,
 }];
+
+fn catalog_companion_artifact_by_filename(filename: &str) -> Option<CatalogCompanionArtifact> {
+    CATALOG_COMPANION_BINDINGS
+        .iter()
+        .map(|binding| binding.artifact)
+        .find(|artifact| artifact.filename.eq_ignore_ascii_case(filename))
+}
+
+fn catalog_companion_expected_sha256(artifact: &CatalogCompanionArtifact) -> Option<&'static str> {
+    (*artifact == BONSAI_27B_VISION_PROJECTOR).then_some(BONSAI_27B_VISION_PROJECTOR_SHA256)
+}
 
 fn catalog_companion_artifacts(catalog_id: &str) -> Vec<CatalogCompanionArtifact> {
     CATALOG_COMPANION_BINDINGS
@@ -25974,6 +26229,19 @@ async fn local_models(
     let expose_delete_tokens =
         state.allow_local_model_delete && local_management_request_allowed(&_headers);
     let dir = state.models_dir.clone();
+    // A Prism filename is only a candidate until the normal model-load path has
+    // computed its full-file digest. Reuse that already-paid identity here; do
+    // not turn every Models-page poll into a multi-gigabyte hash pass.
+    let loaded_sha256_by_path = {
+        let loaded = state.loaded_models.read().await;
+        loaded
+            .values()
+            .filter_map(|model| {
+                let path = std::fs::canonicalize(&model.path).ok()?;
+                Some((path, model.lane.gguf_sha256.clone()))
+            })
+            .collect::<HashMap<_, _>>()
+    };
     let mut models = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let mut paths: Vec<PathBuf> = entries
@@ -26001,6 +26269,21 @@ async fn local_models(
                     continue;
                 }
             };
+            // Companion GGUFs participate in the frontend's bundle-installed
+            // decision by filename. Do not publish a corrupt/truncated known
+            // companion as a local artifact, or the Models page would suppress
+            // the repair download even though vision cannot become ready.
+            if let Some(companion) = catalog_companion_artifact_by_filename(&filename) {
+                if !companion_file_matches_expected_identity(&path, &companion) {
+                    tracing::warn!(
+                        %filename,
+                        expected_size_bytes = companion.size_bytes,
+                        actual_size_bytes = metadata.len(),
+                        "skipping local companion with unexpected identity"
+                    );
+                    continue;
+                }
+            }
             #[cfg(any(windows, unix))]
             let identity = match local_model_file_identity(
                 &dir,
@@ -26105,7 +26388,16 @@ async fn local_models(
                 }
             };
 
-            let lane_class = classify_model_lane(meta.architecture.as_deref(), &filename);
+            let canonical_path = std::fs::canonicalize(&path).ok();
+            let verified_sha256 = canonical_path
+                .as_ref()
+                .and_then(|path| loaded_sha256_by_path.get(path))
+                .map(String::as_str);
+            let lane_class = classify_model_lane_with_verified_sha256(
+                meta.architecture.as_deref(),
+                &filename,
+                verified_sha256,
+            );
             models.push(LocalModelEntry {
                 runnable_receipt_present: runnable_smoke_receipt_path(&filename).exists(),
                 filename,
@@ -26320,6 +26612,52 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
     // branch carries an exact size, while this one matches on filename alone.
 ];
 
+/// Exact Prism model identities proven by the paired Metal/CUDA evidence
+/// bundles. Unlike the cheap local-library listing, a loaded model already has
+/// a full-file digest in `LaneIdentity`; use it so a neighboring or replaced
+/// file cannot inherit a supported-row claim from the certified filename.
+const PRISM_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
+    (
+        "Bonsai-4B-Q1_0.gguf",
+        "4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168",
+    ),
+    (
+        "Ternary-Bonsai-4B-Q2_0.gguf",
+        "4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b",
+    ),
+    (
+        "Ternary-Bonsai-4B-PQ2_0.gguf",
+        "829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb",
+    ),
+    (
+        "Bonsai-8B-Q1_0.gguf",
+        "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+    ),
+    (
+        "Ternary-Bonsai-8B-Q2_0.gguf",
+        "3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b",
+    ),
+    (
+        "Bonsai-27B-Q1_0.gguf",
+        "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0",
+    ),
+    (
+        "Ternary-Bonsai-27B-Q2_0.gguf",
+        "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757",
+    ),
+];
+
+fn prism_supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
+    PRISM_SUPPORTED_ARTIFACT_SHA256
+        .iter()
+        .find_map(|(artifact, sha256)| (*artifact == filename).then_some(*sha256))
+}
+
+fn prism_supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
+    prism_supported_artifact_expected_sha256(filename)
+        .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
+}
+
 /// True when `filename` is the exact GGUF artifact of a curated row whose
 /// `catalog_id` is a `supported_*` compatibility row, or an allowlisted
 /// non-catalog artifact of a `supported_*` row. The ledger is exact-artifact
@@ -26352,6 +26690,42 @@ fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneC
     }
 }
 
+/// Prism's public support boundary is hash-pinned. Filename/header-only views
+/// (local library and inspect) therefore remain experimental until the ordinary
+/// load path has computed the exact digest; other established rows retain their
+/// existing filename-gated classification.
+fn classify_model_lane_with_verified_sha256(
+    architecture: Option<&str>,
+    filename: &str,
+    verified_sha256: Option<&str>,
+) -> ModelLaneClass {
+    let class = classify_model_lane(architecture, filename);
+    if class != ModelLaneClass::Supported
+        || prism_supported_artifact_expected_sha256(filename).is_none()
+    {
+        return class;
+    }
+    verified_sha256.map_or(ModelLaneClass::ExperimentalImplemented, |sha256| {
+        classify_loaded_model_identity(architecture, filename, sha256)
+    })
+}
+
+fn classify_loaded_model_identity(
+    architecture: Option<&str>,
+    filename: &str,
+    gguf_sha256: &str,
+) -> ModelLaneClass {
+    let class = classify_model_lane(architecture, filename);
+    if class == ModelLaneClass::Supported
+        && prism_supported_artifact_expected_sha256(filename).is_some()
+        && !prism_supported_artifact_identity_matches(filename, gguf_sha256)
+    {
+        ModelLaneClass::ExperimentalImplemented
+    } else {
+        class
+    }
+}
+
 /// Classify a loaded model from its real GGUF metadata + exact artifact path.
 fn classify_loaded_model(model: &LoadedModel) -> ModelLaneClass {
     let filename = model
@@ -26359,7 +26733,7 @@ fn classify_loaded_model(model: &LoadedModel) -> ModelLaneClass {
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or_default();
-    classify_model_lane(model.gguf.architecture(), filename)
+    classify_loaded_model_identity(model.gguf.architecture(), filename, &model.lane.gguf_sha256)
 }
 
 /// Stable, frontend-switchable `error.code` for a typed backend failure. The
@@ -26629,6 +27003,22 @@ struct CatalogDownloadArtifact {
     size_bytes: u64,
 }
 
+impl CatalogDownloadArtifact {
+    /// Catalog model byte counts predate bundle downloads and are advisory in
+    /// a few rows. Companion identities are capability gates, so their
+    /// published byte counts are exact and must match before installation.
+    fn expected_exact_size(&self) -> Option<u64> {
+        (self.role != "model").then_some(self.size_bytes)
+    }
+
+    fn expected_sha256(&self) -> Option<&'static str> {
+        (self.role != "model")
+            .then(|| catalog_companion_artifact_by_filename(&self.filename))
+            .flatten()
+            .and_then(|companion| catalog_companion_expected_sha256(&companion))
+    }
+}
+
 fn catalog_download_artifacts(
     req: &InstallCatalogRequest,
 ) -> Result<Vec<CatalogDownloadArtifact>, &'static str> {
@@ -26668,8 +27058,24 @@ fn catalog_download_artifacts(
 }
 
 fn artifact_is_installed(models_dir: &std::path::Path, artifact: &CatalogDownloadArtifact) -> bool {
-    std::fs::metadata(models_dir.join(&artifact.filename))
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    artifact_is_installed_with_expected_sha256(models_dir, artifact, artifact.expected_sha256())
+}
+
+fn artifact_is_installed_with_expected_sha256(
+    models_dir: &std::path::Path,
+    artifact: &CatalogDownloadArtifact,
+    expected_sha256: Option<&str>,
+) -> bool {
+    let path = models_dir.join(&artifact.filename);
+    if let Some(expected_sha256) = expected_sha256 {
+        return file_matches_expected_identity(&path, artifact.size_bytes, expected_sha256);
+    }
+    std::fs::metadata(path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && artifact
+                .expected_exact_size()
+                .map_or_else(|| metadata.len() > 0, |expected| metadata.len() == expected)
+    })
 }
 
 fn spawn_catalog_artifact_download(
@@ -26922,6 +27328,8 @@ async fn install_catalog_model(
                         &part_path,
                         &dest_path,
                         max_download_bytes_limit,
+                        artifact.expected_exact_size(),
+                        artifact.expected_sha256(),
                     );
                     let Some(dl) = map.get_mut(&catalog_id_clone) else {
                         return;
@@ -27001,15 +27409,34 @@ fn finalize_download_artifact(
     part_path: &str,
     dest_path: &str,
     max_download_bytes: u64,
+    expected_exact_size: Option<u64>,
+    expected_sha256: Option<&str>,
 ) -> &'static str {
     // Curl's --max-filesize is the first line of defense, but the origin may
     // omit or lie about Content-Length and curl behavior varies by version.
     // Recheck the artifact itself before making it loadable so the configured
     // ceiling remains authoritative even in those cases.
-    let within_limit = std::fs::metadata(part_path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_download_bytes);
-    let promoted =
-        succeeded && still_tracked && within_limit && std::fs::rename(part_path, dest_path).is_ok();
+    let within_limit = std::fs::metadata(part_path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.len() <= max_download_bytes
+            && expected_exact_size.is_none_or(|expected| metadata.len() == expected)
+    });
+    let digest_matches = succeeded
+        && still_tracked
+        && within_limit
+        && expected_sha256.is_none_or(|expected| {
+            // A just-finished network artifact is a trust boundary, not a
+            // performance-sensitive model-load repeat. Hash it from disk so a
+            // stale cache entry can never promote bytes fetched from a mutable
+            // `resolve/main` URL.
+            receipt::sha256_file_hex(std::path::Path::new(part_path))
+                .is_ok_and(|actual| actual.eq_ignore_ascii_case(expected))
+        });
+    let promoted = succeeded
+        && still_tracked
+        && within_limit
+        && digest_matches
+        && promote_download_part(part_path, dest_path, expected_exact_size, expected_sha256);
     if !promoted {
         std::fs::remove_file(part_path).ok();
     }
@@ -27017,6 +27444,53 @@ fn finalize_download_artifact(
         "completed"
     } else {
         "failed"
+    }
+}
+
+/// Promote a fully validated part. Unix rename replaces an existing corrupt
+/// destination directly; Windows rename does not. For an exact-size companion
+/// repair, park only the known-invalid old destination, install the validated
+/// part, then remove the parked file. A failed promotion restores the old file
+/// when possible and otherwise leaves the uniquely named backup recoverable.
+fn promote_download_part(
+    part_path: &str,
+    dest_path: &str,
+    expected_exact_size: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> bool {
+    if std::fs::rename(part_path, dest_path).is_ok() {
+        return true;
+    }
+    let Some(expected) = expected_exact_size else {
+        return false;
+    };
+    let destination_is_invalid = std::fs::metadata(dest_path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && expected_sha256.map_or_else(
+                || metadata.len() != expected,
+                |sha256| {
+                    !file_matches_expected_identity(
+                        std::path::Path::new(dest_path),
+                        expected,
+                        sha256,
+                    )
+                },
+            )
+    });
+    if !destination_is_invalid {
+        return false;
+    }
+
+    let backup_path = format!("{dest_path}.invalid-{}", uuid::Uuid::new_v4());
+    if std::fs::rename(dest_path, &backup_path).is_err() {
+        return false;
+    }
+    if std::fs::rename(part_path, dest_path).is_ok() {
+        std::fs::remove_file(backup_path).ok();
+        true
+    } else {
+        std::fs::rename(&backup_path, dest_path).ok();
+        false
     }
 }
 
@@ -28246,9 +28720,11 @@ mod catalog_fit_endpoint_tests {
 #[cfg(test)]
 mod catalog_companion_download_tests {
     use super::{
-        artifact_is_installed, catalog_download_artifacts, InstallCatalogRequest,
+        artifact_is_installed, artifact_is_installed_with_expected_sha256,
+        catalog_download_artifacts, local_models, AppState, InstallCatalogRequest,
         BONSAI_27B_VISION_PROJECTOR,
     };
+    use axum::{extract::State, http::HeaderMap, Json};
 
     fn request(
         catalog_id: &str,
@@ -28314,26 +28790,112 @@ mod catalog_companion_download_tests {
         ))
         .unwrap();
         let model = &artifacts[0];
-        let projector = &artifacts[1];
+        let mut projector = artifacts[1].clone();
 
-        std::fs::write(temp.path().join(&projector.filename), b"projector").unwrap();
+        let projector_path = temp.path().join(&projector.filename);
+        std::fs::write(&projector_path, b"synthetic checked projector").unwrap();
+        projector.size_bytes = std::fs::metadata(&projector_path).unwrap().len();
+        let projector_sha256 = crate::receipt::sha256_file_hex(&projector_path).unwrap();
         assert!(!artifact_is_installed(temp.path(), model));
-        assert!(artifact_is_installed(temp.path(), projector));
-        let missing = artifacts
-            .iter()
-            .filter(|artifact| !artifact_is_installed(temp.path(), artifact))
-            .map(|artifact| artifact.role)
-            .collect::<Vec<_>>();
+        assert!(artifact_is_installed_with_expected_sha256(
+            temp.path(),
+            &projector,
+            Some(&projector_sha256),
+        ));
+        let missing = [
+            (model.role, artifact_is_installed(temp.path(), model)),
+            (
+                projector.role,
+                artifact_is_installed_with_expected_sha256(
+                    temp.path(),
+                    &projector,
+                    Some(&projector_sha256),
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(role, installed)| (!installed).then_some(role))
+        .collect::<Vec<_>>();
         assert_eq!(missing, vec!["model"]);
 
-        std::fs::remove_file(temp.path().join(&projector.filename)).unwrap();
+        std::fs::remove_file(&projector_path).unwrap();
         std::fs::write(temp.path().join(&model.filename), b"model").unwrap();
-        let missing = artifacts
-            .iter()
-            .filter(|artifact| !artifact_is_installed(temp.path(), artifact))
-            .map(|artifact| artifact.role)
-            .collect::<Vec<_>>();
+        let missing = [
+            (model.role, artifact_is_installed(temp.path(), model)),
+            (
+                projector.role,
+                artifact_is_installed_with_expected_sha256(
+                    temp.path(),
+                    &projector,
+                    Some(&projector_sha256),
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(role, installed)| (!installed).then_some(role))
+        .collect::<Vec<_>>();
         assert_eq!(missing, vec!["vision_projector"]);
+    }
+
+    #[test]
+    fn wrong_size_projector_is_never_classified_as_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = catalog_download_artifacts(&request(
+            "bonsai_27b_q1_0",
+            "prism-ml/Bonsai-27B-gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            3_803_452_480,
+        ))
+        .unwrap();
+        let projector = &artifacts[1];
+        let path = temp.path().join(&projector.filename);
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(projector.size_bytes - 1).unwrap();
+
+        assert!(!artifact_is_installed(temp.path(), projector));
+    }
+
+    #[test]
+    fn same_size_wrong_hash_projector_is_never_classified_as_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut artifact = catalog_download_artifacts(&request(
+            "bonsai_27b_q1_0",
+            "prism-ml/Bonsai-27B-gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            3_803_452_480,
+        ))
+        .unwrap()
+        .remove(1);
+        let path = temp.path().join(&artifact.filename);
+        std::fs::write(&path, b"wrong bytes").unwrap();
+        artifact.size_bytes = std::fs::metadata(&path).unwrap().len();
+        let expected_path = temp.path().join("expected.bin");
+        std::fs::write(&expected_path, b"right byte!").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&expected_path).unwrap();
+
+        assert!(!artifact_is_installed_with_expected_sha256(
+            temp.path(),
+            &artifact,
+            Some(&expected_sha256),
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_scan_does_not_publish_a_wrong_size_projector_as_bundle_support() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(BONSAI_27B_VISION_PROJECTOR.filename),
+            b"corrupt projector",
+        )
+        .unwrap();
+        let state = AppState::default().with_models_dir(Some(temp.path().to_path_buf()));
+
+        let Json(local) = local_models(State(state), HeaderMap::new()).await;
+
+        assert!(
+            local.models.is_empty(),
+            "a filename alone must not make the Models page report the bundle installed"
+        );
     }
 }
 
@@ -28386,7 +28948,7 @@ mod download_cancel_tests {
     fn successful_tracked_download_promotes_part_to_dest() {
         let (part, dest) = temp_paths("promote");
         std::fs::write(&part, b"payload").unwrap();
-        let status = finalize_download_artifact(true, true, &part, &dest, u64::MAX);
+        let status = finalize_download_artifact(true, true, &part, &dest, u64::MAX, None, None);
         assert_eq!(status, "completed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -28402,7 +28964,7 @@ mod download_cancel_tests {
         std::fs::write(&part, b"payload").unwrap();
         // still_tracked=false models a cancel that removed the map entry while
         // curl went on to finish successfully (the Windows kill-less failure mode).
-        let status = finalize_download_artifact(true, false, &part, &dest, u64::MAX);
+        let status = finalize_download_artifact(true, false, &part, &dest, u64::MAX, None, None);
         assert_eq!(status, "failed");
         assert!(
             !std::path::Path::new(&part).exists(),
@@ -28418,7 +28980,7 @@ mod download_cancel_tests {
     fn failed_download_removes_partial() {
         let (part, dest) = temp_paths("fail");
         std::fs::write(&part, b"half").unwrap();
-        let status = finalize_download_artifact(false, true, &part, &dest, u64::MAX);
+        let status = finalize_download_artifact(false, true, &part, &dest, u64::MAX, None, None);
         assert_eq!(status, "failed");
         assert!(!std::path::Path::new(&part).exists());
         assert!(!std::path::Path::new(&dest).exists());
@@ -28437,6 +28999,8 @@ mod download_cancel_tests {
             part.to_str().unwrap(),
             dest.to_str().unwrap(),
             4,
+            None,
+            None,
         );
 
         assert_eq!(status, "failed");
@@ -28445,6 +29009,76 @@ mod download_cancel_tests {
             !dest.exists(),
             "oversized partial must never become loadable"
         );
+    }
+
+    #[test]
+    fn wrong_size_companion_download_is_never_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("projector.gguf.part");
+        let dest = dir.path().join("projector.gguf");
+        std::fs::write(&part, b"truncated").unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            u64::MAX,
+            Some(10),
+            None,
+        );
+
+        assert_eq!(status, "failed");
+        assert!(!part.exists());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn same_size_wrong_hash_companion_download_is_never_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("projector.gguf.part");
+        let dest = dir.path().join("projector.gguf");
+        let expected = dir.path().join("expected.gguf");
+        std::fs::write(&part, b"wrong").unwrap();
+        std::fs::write(&expected, b"right").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&expected).unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            u64::MAX,
+            Some(5),
+            Some(&expected_sha256),
+        );
+
+        assert_eq!(status, "failed");
+        assert!(!part.exists());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn validated_companion_replaces_an_existing_same_size_wrong_hash_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("projector.gguf.part");
+        let dest = dir.path().join("projector.gguf");
+        std::fs::write(&part, b"correct").unwrap();
+        std::fs::write(&dest, b"wrong!!").unwrap();
+        let expected_sha256 = crate::receipt::sha256_file_hex(&part).unwrap();
+
+        let status = finalize_download_artifact(
+            true,
+            true,
+            part.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            u64::MAX,
+            Some(7),
+            Some(&expected_sha256),
+        );
+
+        assert_eq!(status, "completed");
+        assert_eq!(std::fs::read(dest).unwrap(), b"correct");
     }
 
     #[test]

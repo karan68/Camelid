@@ -1701,7 +1701,7 @@ impl RunnableModel {
     /// (lazy-built, reused, recurrent state reset per call), and falls back to the CPU
     /// runnable lane on any CUDA error. The CPU lane is the certified oracle and default.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
-        self.generate_qwen35_streaming(prompt, max_new, stop, None, &mut |_| {})
+        self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {})
     }
 
     /// Like [`generate_qwen35`](Self::generate_qwen35) but invokes `on_token` for
@@ -1713,8 +1713,12 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
+        stream_tokens_observable: bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
+        #[cfg(not(feature = "cuda"))]
+        let _ = stream_tokens_observable;
+
         #[cfg(target_os = "macos")]
         if !std::env::var("CAMELID_QWEN35_METAL")
             .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
@@ -1740,12 +1744,16 @@ impl RunnableModel {
                 Err(_) => cfg!(windows) && self.output.is_prism_low_bit(),
             };
             if cuda_enabled {
-                match self.generate_qwen35_cuda(prompt, max_new, stop, sampling, on_token) {
-                    Ok(v) => return Ok(v),
-                    Err(e) => {
-                        eprintln!("[qwen35] CUDA lane failed ({e}); falling back to CPU");
-                    }
-                }
+                return qwen35_cuda_with_cpu_fallback(
+                    on_token,
+                    stream_tokens_observable,
+                    |tracked_on_token| {
+                        self.generate_qwen35_cuda(prompt, max_new, stop, sampling, tracked_on_token)
+                    },
+                    |fallback_on_token| {
+                        self.generate_qwen35_cpu(prompt, max_new, stop, sampling, fallback_on_token)
+                    },
+                );
             }
         }
         self.generate_qwen35_cpu(prompt, max_new, stop, sampling, on_token)
@@ -2551,7 +2559,41 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
     ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
+        }
+        if self.qwen35.is_some() {
+            return self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {});
+        }
         self.generate_stopping_streaming(prompt, max_new, stop, &mut |_| {})
+    }
+
+    /// Non-streaming counterpart to
+    /// [`generate_stopping_streaming_with_sampling`](Self::generate_stopping_streaming_with_sampling).
+    /// Its callback is intentionally unobservable, so a late CUDA failure may
+    /// safely restart on CPU without duplicating output to a client.
+    pub fn generate_stopping_with_sampling(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: &SamplingConfig,
+    ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
+        }
+        if self.qwen35.is_some() {
+            let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
+            return self.generate_qwen35_streaming(
+                prompt,
+                max_new,
+                stop,
+                sampling,
+                false,
+                &mut |_| {},
+            );
+        }
+        self.generate_stopping(prompt, max_new, stop)
     }
 
     /// [`generate_stopping`](Self::generate_stopping) with a per-token callback
@@ -2569,7 +2611,7 @@ impl RunnableModel {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
         if self.qwen35.is_some() {
-            return self.generate_qwen35_streaming(prompt, max_new, stop, None, on_token);
+            return self.generate_qwen35_streaming(prompt, max_new, stop, None, true, on_token);
         }
         // Dense/generic path (MUSTER M-A1): the same incremental loop as `generate`
         // (byte-identical forward sequence when no stop token fires) plus stop-token
@@ -2610,7 +2652,14 @@ impl RunnableModel {
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         if self.qwen35.is_some() && qwen35_sampling_requires_logits(sampling) {
-            return self.generate_qwen35_streaming(prompt, max_new, stop, Some(sampling), on_token);
+            return self.generate_qwen35_streaming(
+                prompt,
+                max_new,
+                stop,
+                Some(sampling),
+                true,
+                on_token,
+            );
         }
         self.generate_stopping_streaming(prompt, max_new, stop, on_token)
     }
@@ -3208,6 +3257,120 @@ fn qwen35_device_decode_chunk_len() -> usize {
         .and_then(|value| value.parse().ok())
         .filter(|&value| value >= 1)
         .unwrap_or(8)
+}
+
+/// Run the CUDA text lane with a CPU fallback that cannot replay tokens already
+/// delivered to a streaming client. Non-streaming callers pass `false` because
+/// their callback is deliberately unobservable, preserving the existing
+/// CUDA-to-CPU recovery behavior for [`RunnableModel::generate_qwen35`].
+#[cfg(feature = "cuda")]
+fn qwen35_cuda_with_cpu_fallback<T>(
+    on_token: &mut dyn FnMut(u32),
+    stream_tokens_observable: bool,
+    cuda: impl FnOnce(&mut dyn FnMut(u32)) -> Result<T>,
+    cpu: impl FnOnce(&mut dyn FnMut(u32)) -> Result<T>,
+) -> Result<T> {
+    let mut emitted = false;
+    let cuda_result = {
+        let mut tracked_on_token = |token| {
+            emitted = true;
+            on_token(token);
+        };
+        cuda(&mut tracked_on_token)
+    };
+
+    match cuda_result {
+        Ok(value) => Ok(value),
+        Err(error) if stream_tokens_observable && emitted => {
+            eprintln!(
+                "[qwen35] CUDA lane failed after streaming output ({error}); refusing CPU replay"
+            );
+            Err(error)
+        }
+        Err(error) => {
+            eprintln!("[qwen35] CUDA lane failed ({error}); falling back to CPU");
+            cpu(on_token)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod qwen35_cuda_fallback_tests {
+    use std::cell::Cell;
+
+    use super::{qwen35_cuda_with_cpu_fallback, BackendError, Result};
+
+    fn cuda_failure(message: &str) -> BackendError {
+        BackendError::InvalidTensorData(message.into())
+    }
+
+    #[test]
+    fn cuda_error_after_a_streamed_token_is_not_replayed_by_cpu() {
+        let fallback_called = Cell::new(false);
+        let mut delivered = Vec::new();
+
+        let result: Result<Vec<u32>> = qwen35_cuda_with_cpu_fallback(
+            &mut |token| delivered.push(token),
+            true,
+            |on_token| {
+                on_token(7);
+                Err(cuda_failure("late CUDA failure"))
+            },
+            |on_token| {
+                fallback_called.set(true);
+                on_token(7);
+                Ok(vec![7])
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(delivered, vec![7]);
+        assert!(!fallback_called.get());
+    }
+
+    #[test]
+    fn cuda_error_before_streaming_still_uses_cpu_fallback() {
+        let fallback_called = Cell::new(false);
+        let mut delivered = Vec::new();
+
+        let result = qwen35_cuda_with_cpu_fallback(
+            &mut |token| delivered.push(token),
+            true,
+            |_| Err(cuda_failure("early CUDA failure")),
+            |on_token| {
+                fallback_called.set(true);
+                on_token(11);
+                Ok(vec![11])
+            },
+        )
+        .expect("pre-stream CUDA failure should fall back");
+
+        assert_eq!(result, vec![11]);
+        assert_eq!(delivered, vec![11]);
+        assert!(fallback_called.get());
+    }
+
+    #[test]
+    fn non_streaming_generation_preserves_cuda_to_cpu_recovery() {
+        let fallback_called = Cell::new(false);
+
+        let result = qwen35_cuda_with_cpu_fallback(
+            &mut |_| {},
+            false,
+            |on_token| {
+                on_token(7);
+                Err(cuda_failure("late CUDA failure"))
+            },
+            |_| {
+                fallback_called.set(true);
+                Ok(vec![11])
+            },
+        )
+        .expect("non-streaming generation should still fall back");
+
+        assert_eq!(result, vec![11]);
+        assert!(fallback_called.get());
+    }
 }
 
 fn qwen35_sampling_requires_logits(config: &SamplingConfig) -> bool {

@@ -29,8 +29,13 @@ export function getChatGateState(capabilities, model, runtime) {
   const runtimeGenerationReady = Boolean(runtime?.generation_ready && modelRuntimeIdMatches(model, runtime))
   const runtimeReady = Boolean(isRunnableInCurrentRuntime(model, runtime) && runtimeLoaded && runtimeGenerationReady)
   const hint = findCompatibilityHint(capabilities, model)
-  const contractSupported = backendMarksSupportedRow(model)
-    || isCompatibilitySupportedForModel(capabilities, model)
+  // Once /api/models/local supplies a lane verdict, it owns artifact identity.
+  // Falling back to name matching after an explicit experimental verdict would
+  // let a same-named, wrong-hash Prism file inherit the supported contract.
+  const hasBackendLaneVerdict = Boolean(model?.lane_class)
+  const contractSupported = hasBackendLaneVerdict
+    ? backendMarksSupportedRow(model)
+    : isCompatibilitySupportedForModel(capabilities, model)
   const chatUnlocked = Boolean(runtimeReady && contractSupported)
   // Experimental lane: the model loaded and is generation-ready (so its architecture
   // is implemented — generation_ready is false for unimplemented archs) but it is NOT

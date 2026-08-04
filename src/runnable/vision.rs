@@ -179,6 +179,56 @@ enum PrismVisionCudaLane {
     Pending,
     Ready(super::vision_cuda::CudaVisionEncoder),
     Disabled,
+    Failed(String),
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_windows_cuda_lane_selected_with(
+    projection: usize,
+    cuda_available: bool,
+    qwen35_cuda: Option<&str>,
+) -> bool {
+    cfg!(target_os = "windows")
+        && projection == 5_120
+        && cuda_available
+        && qwen35_cuda
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(true)
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_windows_cuda_lane_selected(projection: usize) -> bool {
+    let qwen35_cuda = std::env::var("CAMELID_QWEN35_CUDA").ok();
+    prism_27b_windows_cuda_lane_selected_with(
+        projection,
+        crate::cuda::is_available(),
+        qwen35_cuda.as_deref(),
+    )
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_cuda_failure_message(stage: &str, cause: &str, ordinal: usize) -> String {
+    format!(
+        "Prism 27B image support requires the Windows CUDA projector, but CUDA {stage} failed on device {ordinal}: {cause}. CPU fallback is disabled for this supported GPU lane. Verify CAMELID_CUDA_DEVICE selects the intended NVIDIA GPU, update the NVIDIA driver and CUDA toolkit/NVRTC, free enough VRAM, then reload the model or restart Camelid"
+    )
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_cuda_failure_diagnostic(
+    projection: usize,
+    stage: &str,
+    cause: &str,
+) -> Option<String> {
+    if !prism_27b_windows_cuda_lane_selected(projection) {
+        return None;
+    }
+    let ordinal = crate::cuda::selected_device_ordinal();
+    Some(prism_27b_cuda_failure_message(stage, cause, ordinal))
 }
 
 impl PrismVisionProjector {
@@ -204,6 +254,20 @@ impl PrismVisionProjector {
 
     pub fn projection_dim(&self) -> usize {
         self.model.projection
+    }
+
+    /// Initialize the execution backend without encoding an image. This lets a
+    /// serving layer distinguish a loaded projector file from a projector that
+    /// can actually execute. CPU-only builds remain ready by construction.
+    pub fn ensure_backend_ready(&self) -> Result<()> {
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        {
+            let mut lane = self.cuda.lock().map_err(|_| {
+                BackendError::InvalidTensorData("Prism vision CUDA mutex poisoned".into())
+            })?;
+            self.initialize_cuda_lane(&mut lane)?;
+        }
+        Ok(())
     }
 
     pub fn encode_image(
@@ -278,18 +342,7 @@ impl PrismVisionProjector {
                 let mut lane = self.cuda.lock().map_err(|_| {
                     BackendError::InvalidTensorData("Prism vision CUDA mutex poisoned".into())
                 })?;
-                if matches!(*lane, PrismVisionCudaLane::Pending) {
-                    *lane = match super::vision_cuda::CudaVisionEncoder::new() {
-                        Ok(encoder) => {
-                            eprintln!("[qwen3vl] streaming CUDA projector active (bounded VRAM)");
-                            PrismVisionCudaLane::Ready(encoder)
-                        }
-                        Err(error) => {
-                            eprintln!("[qwen3vl] CUDA projector unavailable ({error}); using CPU");
-                            PrismVisionCudaLane::Disabled
-                        }
-                    };
-                }
+                self.initialize_cuda_lane(&mut lane)?;
                 if let PrismVisionCudaLane::Ready(encoder) = &mut *lane {
                     match encoder.encode(&self.model, &input) {
                         Ok(embeddings) => {
@@ -308,6 +361,14 @@ impl PrismVisionProjector {
                             });
                         }
                         Err(error) => {
+                            if let Some(diagnostic) = prism_27b_cuda_failure_diagnostic(
+                                self.model.projection,
+                                "execution",
+                                &error,
+                            ) {
+                                *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
+                                return Err(BackendError::UnsupportedGguf(diagnostic));
+                            }
                             eprintln!(
                                 "[qwen3vl] CUDA projector failed ({error}); using CPU fallback"
                             );
@@ -318,6 +379,44 @@ impl PrismVisionProjector {
             }
             self.model.encode_cpu(input)
         }
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    fn initialize_cuda_lane(&self, lane: &mut PrismVisionCudaLane) -> Result<()> {
+        if matches!(*lane, PrismVisionCudaLane::Pending) {
+            if cfg!(target_os = "windows")
+                && self.model.projection == 5_120
+                && !prism_27b_windows_cuda_lane_selected(self.model.projection)
+            {
+                eprintln!(
+                    "[qwen3vl] Windows CUDA projector not selected or unavailable; using CPU"
+                );
+                *lane = PrismVisionCudaLane::Disabled;
+                return Ok(());
+            }
+            *lane = match super::vision_cuda::CudaVisionEncoder::new() {
+                Ok(encoder) => {
+                    eprintln!("[qwen3vl] streaming CUDA projector active (bounded VRAM)");
+                    PrismVisionCudaLane::Ready(encoder)
+                }
+                Err(error) => {
+                    if let Some(diagnostic) = prism_27b_cuda_failure_diagnostic(
+                        self.model.projection,
+                        "initialization",
+                        &error,
+                    ) {
+                        *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
+                        return Err(BackendError::UnsupportedGguf(diagnostic));
+                    }
+                    eprintln!("[qwen3vl] CUDA projector unavailable ({error}); using CPU");
+                    PrismVisionCudaLane::Disabled
+                }
+            };
+        }
+        if let PrismVisionCudaLane::Failed(diagnostic) = lane {
+            return Err(BackendError::UnsupportedGguf(diagnostic.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -1059,6 +1158,37 @@ mod tests {
         assert_eq!(width % 32, 0);
         assert_eq!(height % 32, 0);
         assert!(width * height <= 1024 * 1024);
+    }
+
+    #[cfg(all(target_os = "windows", feature = "cuda"))]
+    #[test]
+    fn prism_27b_windows_cuda_failures_are_actionable_and_fail_closed() {
+        assert!(prism_27b_windows_cuda_lane_selected_with(5_120, true, None));
+        assert!(prism_27b_windows_cuda_lane_selected_with(
+            5_120,
+            true,
+            Some("on")
+        ));
+        assert!(!prism_27b_windows_cuda_lane_selected_with(
+            5_120, false, None
+        ));
+        assert!(!prism_27b_windows_cuda_lane_selected_with(
+            5_120,
+            true,
+            Some("0")
+        ));
+        assert!(!prism_27b_windows_cuda_lane_selected_with(
+            4_096, true, None
+        ));
+
+        let diagnostic = prism_27b_cuda_failure_message("execution", "CUDA_ERROR_OUT_OF_MEMORY", 0);
+        assert!(diagnostic.contains("Prism 27B image support"));
+        assert!(diagnostic.contains("CUDA execution failed"));
+        assert!(diagnostic.contains("CUDA_ERROR_OUT_OF_MEMORY"));
+        assert!(diagnostic.contains("CPU fallback is disabled"));
+        assert!(diagnostic.contains("CAMELID_CUDA_DEVICE"));
+        assert!(diagnostic.contains("free enough VRAM"));
+        assert!(diagnostic.contains("reload the model or restart Camelid"));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! The digest is unchanged — this caches it, it does not narrow it. A hit is
 //! only accepted when the file still presents the exact same identity the
 //! digest was recorded against: length, mtime to nanosecond precision, and the
-//! (device, inode) pair on unix. Any ordinary rewrite — re-download,
+//! filesystem file ID on Unix and Windows. Any ordinary rewrite — re-download,
 //! re-quantize, `cp` over the top, editing in place — moves at least one of
 //! those and misses the cache.
 //!
@@ -21,8 +21,8 @@
 //! (`receipt::verify`, and `crate::verify::run` when selecting a profile), so
 //! a receipt produced from a stale entry names a digest the file no longer
 //! has and *fails* verification. A stale cache can cost a false alarm; it
-//! cannot manufacture a false pass. Only the producing load path reads this
-//! cache — no verification path does.
+//! cannot manufacture a false pass. Network downloads are also promoted only
+//! after an uncached digest check; the cache is for repeat local-file reads.
 //!
 //! Set `CAMELID_GGUF_HASH_CACHE=0` to always re-hash.
 
@@ -111,25 +111,67 @@ fn identity_key(path: &Path) -> Option<String> {
         meta.len(),
         modified.as_secs(),
         modified.subsec_nanos(),
-        volume_identity(&meta)
+        volume_identity(&canonical, &meta)?
     ))
 }
 
-/// The (device, inode) pair, which pins the file across a rename or a
-/// same-path replacement that happens to preserve length and mtime.
-///
-/// Unix only. Elsewhere the key is path + length + mtime, which is weaker but
-/// still misses on every ordinary rewrite; the digest is never *wrong*, and
-/// the verifier re-hashes regardless.
+/// The filesystem identity pins the file across a rename or a same-path
+/// replacement that happens to preserve length and mtime. If the platform
+/// cannot provide it, return `None` and force an honest re-hash.
 #[cfg(unix)]
-fn volume_identity(meta: &std::fs::Metadata) -> String {
+fn volume_identity(_path: &Path, meta: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    format!("|{}|{}", meta.dev(), meta.ino())
+    Some(format!("|{}|{}", meta.dev(), meta.ino()))
 }
 
-#[cfg(not(unix))]
-fn volume_identity(_meta: &std::fs::Metadata) -> String {
-    String::new()
+#[cfg(windows)]
+fn volume_identity(path: &Path, _meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let ok = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) } != 0;
+    unsafe { CloseHandle(handle) };
+    if !ok {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some(format!(
+        "|{}|{}|{}|{}",
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow, info.nNumberOfLinks
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_identity(_path: &Path, _meta: &std::fs::Metadata) -> Option<String> {
+    None
 }
 
 fn now_unix() -> u64 {
