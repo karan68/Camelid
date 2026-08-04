@@ -167,7 +167,7 @@ The Windows default remains the parity-checked CPU/storage lane. Set
 `CAMELID_GEMMA4_GHOST_CUDA=1` to opt into the experimental CUDA route; it is not a support or
 token-parity claim. `CAMELID_GEMMA4_GHOST_CUDA_CACHE=0` disables persistent expert residency.
 `CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS` caps resident routed experts, while
-`CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB` preserves VRAM for transient uploads and driver overhead.
+`CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB` preserves VRAM for routed scratch and driver/WDDM overhead.
 Camelid also clamps the requested capacity to current free VRAM and falls back to CPU/storage if a
 single routed expert cannot fit after the reserve. The runtime GPU switch can force an already
 loaded lane back to CPU generation and truthful CPU health without a model reload. Starting with
@@ -183,6 +183,23 @@ In normal buffered CUDA mode, Camelid maps the immutable `.cghost` payload read-
 validated routed-expert ranges directly into fixed GPU cache arenas. This avoids allocating and
 copying an intermediate expert record on every cache miss. `--ghost-strict-cache` deliberately
 disables that mapping and retains the bounded positioned/unbuffered reader path.
+
+The Windows CUDA hot path batches routed hits while a dedicated copy stream fills miss slots.
+An eight-slot page-locked host ring pipelines one complete top-8 route without pinning the 12 GiB
+expert payload. Q4_0 nibble bias is removed with packed byte subtraction and the exact integer dot
+uses DP4A; the existing ordered f32 block fold is unchanged. Routed GeGLU and Q8_0 quantization are
+fused, and one router-order kernel replaces eight weighted-accumulate launches. These optimizations
+are on by default for the experimental CUDA lane. Set
+`CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS=0` for the serial diagnostic path or
+`CAMELID_GEMMA4_CUDA_PINNED_EXPERTS=0` to bypass the page-locked transfer ring.
+
+On the tracked RTX 3060 Laptop 6 GiB, the mapped 26B Q4_0 row with an 803-expert VRAM cache and the
+160 MiB reserve sustained 12.29 decode tokens/second over the second half of a 256-token greedy run;
+the fastest eight-token window was 14.73 tokens/second. The complete generated token sequence was
+unchanged, and the standalone Q4_0 CUDA oracle remained bit-identical on 96/96 rows. A 64 MiB
+reserve admitted 830 experts and raised the hit rate, but slowed sustained decode to 10.13
+tokens/second under WDDM memory pressure, so the 160 MiB reserve remains the recommended setting.
+These are exact-machine measurements, not a general throughput claim.
 
 The 1 GiB default can retain a little more than one token's 240-expert routed working set on the
 tracked Q4_0 row. `--expert-cache-mib 0` retains no routed expert after the current use and gives

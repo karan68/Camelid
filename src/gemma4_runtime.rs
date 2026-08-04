@@ -6522,6 +6522,15 @@ struct SserExpertDev {
     last_used: u64,
 }
 
+/// One page-locked host staging slot for a routed expert's two weight tensors.
+/// A top-k-sized ring lets CPU mmap copies run ahead of the CUDA copy engine
+/// without pinning the multi-gigabyte `.cghost` mapping itself.
+#[cfg(feature = "cuda")]
+struct SserTransferSlot {
+    gate_up: cudarc::driver::PinnedHostSlice<u8>,
+    down: cudarc::driver::PinnedHostSlice<u8>,
+}
+
 /// SSER (self-specializing expert residency) VRAM cache: a per-(layer,expert) LRU
 /// of Q4_0 expert weight slices. A single user's session fires a skewed, stable
 /// subset of the experts; keeping the hot ones resident lets their two GEMVs run on
@@ -6577,6 +6586,7 @@ struct SserCache {
     gate_up_stride: usize,
     down_stride: usize,
     free_slots: Vec<usize>,
+    transfer_slots: Vec<SserTransferSlot>,
     // Diagnostics (per-generate; reset by the harness before each run).
     hits: u64,
     misses: u64,
@@ -6589,6 +6599,7 @@ impl SserCache {
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         gate_up_stride: usize,
         down_stride: usize,
+        transfer_slot_count: usize,
     ) -> Result<Self> {
         let capacity = capacity.max(1);
         // SAFETY: a slot is initialized by HtoD before it is inserted into
@@ -6596,6 +6607,14 @@ impl SserCache {
         let gate_up_arena = unsafe { stream.alloc::<u8>(capacity * gate_up_stride) }.map_err(cu)?;
         // SAFETY: see above.
         let down_arena = unsafe { stream.alloc::<u8>(capacity * down_stride) }.map_err(cu)?;
+        let mut transfer_slots = Vec::with_capacity(transfer_slot_count);
+        for _ in 0..transfer_slot_count {
+            transfer_slots.push(SserTransferSlot {
+                gate_up: unsafe { stream.context().alloc_pinned::<u8>(gate_up_stride) }
+                    .map_err(cu)?,
+                down: unsafe { stream.context().alloc_pinned::<u8>(down_stride) }.map_err(cu)?,
+            });
+        }
         Ok(Self {
             entries: std::collections::HashMap::new(),
             capacity,
@@ -6605,6 +6624,7 @@ impl SserCache {
             gate_up_stride,
             down_stride,
             free_slots: (0..capacity).rev().collect(),
+            transfer_slots,
             hits: 0,
             misses: 0,
         })
@@ -6638,6 +6658,30 @@ impl SserCache {
             .expect("the selected SSER victim remains resident")
             .slot
     }
+
+    /// Reserve a slot without evicting any expert selected by the current
+    /// route. Batched execution resolves all slots before launching, so routed
+    /// hits must remain pinned until their GEMVs have consumed them.
+    fn slot_for_miss_excluding(
+        &mut self,
+        protected: &std::collections::HashSet<(u16, u16)>,
+    ) -> Option<usize> {
+        if let Some(slot) = self.free_slots.pop() {
+            return Some(slot);
+        }
+        let victim = self
+            .entries
+            .iter()
+            .filter(|(key, _)| !protected.contains(key))
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(&key, _)| key)?;
+        Some(
+            self.entries
+                .remove(&victim)
+                .expect("the selected SSER victim remains resident")
+                .slot,
+        )
+    }
 }
 
 /// CUDA gemma4 decode engine (Windows/NVIDIA). Wraps a CPU-loaded [`Gemma4Runtime`]
@@ -6657,6 +6701,9 @@ pub struct Gemma4CudaResident {
     /// stream (`kernels.stream`) cannot be put into capture mode, so all per-token
     /// work runs here to allow recording the layer stack into a CUDA graph.
     cap_stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    /// Dedicated expert-weight upload stream. Routed hits execute on
+    /// `cap_stream` while missing arena slots are populated by the copy engine.
+    expert_copy_stream: std::sync::Arc<cudarc::driver::CudaStream>,
     plan: Vec<crate::model::Gemma4LayerPlan>,
     norms: Vec<Gemma4LayerNormsDev>,
     lweights: Vec<Gemma4LayerWeightsDev>,
@@ -6794,6 +6841,7 @@ impl Gemma4CudaResident {
         unsafe { kernels.ctx.disable_event_tracking() };
         // Capture-capable stream for the decode graph (the default stream is not).
         let cap_stream = kernels.ctx.new_stream().map_err(cu)?;
+        let expert_copy_stream = kernels.ctx.new_stream().map_err(cu)?;
         let s = kernels.stream.clone();
         let block_count = cpu.config.block_count as usize;
         let heads = cpu.config.attention_head_count as usize;
@@ -7058,12 +7106,12 @@ impl Gemma4CudaResident {
             // Budget: keep the cache under ~80% of the free VRAM after the resident set
             // (leaving headroom for the per-token scratch + the KV cache growth).
             let (free, _total) = cudarc::driver::result::mem_get_info().unwrap_or((0, 0));
-            // Cache budget = free VRAM at load MINUS a fixed reserve for the transient
-            // per-miss weight uploads (a few pooled ~6 MiB `clone_htod` buffers) and
-            // driver slack. The KV caches and per-token scratch are already allocated
-            // ABOVE (so `free` excludes them) — the only dynamic post-cache consumer is
-            // those small transient buffers, whose need is ~constant, not proportional
-            // to free VRAM. A fixed reserve therefore lets the cache claim far more of
+            // Cache budget = free VRAM at load MINUS a fixed reserve for routed-batch
+            // scratch and driver/WDDM slack. Expert weights upload directly into fixed
+            // arenas; the top-k transfer ring is page-locked HOST memory. The KV caches
+            // and common scratch are already allocated above, so `free` excludes them.
+            // The remaining dynamic need is small and not proportional to free VRAM.
+            // A fixed reserve therefore lets the cache claim far more of
             // the card than the old flat 0.80 factor did: on the 6 GB box this lifts
             // the cap ~690 -> ~820 experts, cutting the miss count and measuring
             // +~50% steady decode (miss-bound, capacity-limited). Reserve tunable via
@@ -7117,6 +7165,7 @@ impl Gemma4CudaResident {
                 &cap_stream,
                 gate_up_stride,
                 down_stride,
+                moe.n_expert_used,
             )?)
         } else {
             None
@@ -7169,6 +7218,7 @@ impl Gemma4CudaResident {
             plan,
             kernels,
             cap_stream,
+            expert_copy_stream,
             gpu_head,
             gpu_ple_ctx,
             cpu,
@@ -7246,10 +7296,355 @@ impl Gemma4CudaResident {
         }
     }
 
+    /// Execute one top-k route as at most two CUDA batches: already-resident
+    /// experts first, then misses after their copy-stream event. Both batches
+    /// write into router-positioned scratch, and one final kernel performs the
+    /// same left-to-right weighted sum as the serial launch path.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn moe_layer_ffn_cached_routed(
+        &self,
+        l: usize,
+        moe: &MoeWeights,
+        sser: &std::cell::RefCell<SserCache>,
+        idx: &[usize],
+        probs: &[f32],
+        wsum: f32,
+        mut ghost_records: Option<&mut std::collections::HashMap<usize, GhostCudaExpertRecord>>,
+        d_in_s: &cudarc::driver::CudaSlice<f32>,
+        d_in_q: &cudarc::driver::CudaSlice<i8>,
+        d_gate_up: &mut cudarc::driver::CudaSlice<f32>,
+        d_geglu_q: &mut cudarc::driver::CudaSlice<i8>,
+        d_geglu_s: &mut cudarc::driver::CudaSlice<f32>,
+        d_y_all: &mut cudarc::driver::CudaSlice<f32>,
+        d_moe_acc: &mut cudarc::driver::CudaSlice<f32>,
+    ) -> Result<()> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let s = self.cap_stream.clone();
+        let k = &self.kernels;
+        let hidden = self.hidden;
+        let route_count = idx.len();
+        let nff = moe.n_ff_exp;
+        let two_nff = 2 * nff;
+        let gu_blocks = hidden / 32;
+        let down_blocks = nff / 32;
+        let gu_row_bytes = gu_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        let down_row_bytes = down_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        let expected_gu = two_nff * gu_row_bytes;
+        let expected_down = hidden * down_row_bytes;
+        let gate_up_bytes = moe.gate_up_exps.bytes();
+        let down_bytes = moe.down_exps.bytes();
+
+        let protected = idx
+            .iter()
+            .map(|&expert| (l as u16, expert as u16))
+            .collect::<std::collections::HashSet<_>>();
+        let mut hit_slots = Vec::<i32>::with_capacity(route_count);
+        let mut hit_routes = Vec::<i32>::with_capacity(route_count);
+        let mut miss_slots = Vec::<i32>::with_capacity(route_count);
+        let mut miss_routes = Vec::<i32>::with_capacity(route_count);
+        let mut route_scales = Vec::<f32>::with_capacity(route_count);
+        let pinned_transfers = std::env::var("CAMELID_GEMMA4_CUDA_PINNED_EXPERTS")
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+            })
+            .unwrap_or(true);
+
+        // Resolve the complete route before any GEMV. `protected` prevents a miss
+        // from recycling a slot that another selected resident expert still needs.
+        for (route, &expert) in idx.iter().enumerate() {
+            route_scales.push(moe.down_exps_scale[expert] * (probs[expert] / wsum));
+            let key = (l as u16, expert as u16);
+            if sser.borrow_mut().touch(key) {
+                let slot = sser
+                    .borrow()
+                    .entries
+                    .get(&key)
+                    .expect("touched routed expert remains resident")
+                    .slot;
+                sser.borrow_mut().hits += 1;
+                hit_slots.push(slot as i32);
+                hit_routes.push(route as i32);
+                continue;
+            }
+
+            let (gu_host, down_host) = if let Some(records) = ghost_records.as_deref_mut() {
+                let record = records.get(&expert).ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(format!(
+                        "Ghost-MoE CUDA lost routed expert layer={l} expert={expert}"
+                    ))
+                })?;
+                let (gu_dtype, gu_bytes) = record.gate_up()?;
+                let (down_dtype, down_bytes) = record.down()?;
+                if gu_dtype != GgufTensorType::Q4_0 || down_dtype != GgufTensorType::Q4_0 {
+                    return Err(BackendError::UnsupportedGguf(format!(
+                        "Ghost-MoE CUDA requires Q4_0 expert records; layer={l} expert={expert} gate_up={gu_dtype:?} down={down_dtype:?}"
+                    )));
+                }
+                (gu_bytes, down_bytes)
+            } else {
+                let gu_off = expert * expected_gu;
+                let down_off = expert * expected_down;
+                (
+                    &gate_up_bytes[gu_off..gu_off + expected_gu],
+                    &down_bytes[down_off..down_off + expected_down],
+                )
+            };
+            if gu_host.len() != expected_gu || down_host.len() != expected_down {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 CUDA expert record length mismatch at layer={l} expert={expert}: gate_up={} expected={expected_gu}, down={} expected={expected_down}",
+                    gu_host.len(),
+                    down_host.len()
+                )));
+            }
+
+            let mut cache = sser.borrow_mut();
+            let slot = cache.slot_for_miss_excluding(&protected).ok_or_else(|| {
+                BackendError::InvalidModelMetadata(format!(
+                    "Gemma 4 CUDA expert cache capacity {} cannot pin a top-{route_count} route",
+                    cache.capacity
+                ))
+            })?;
+            let gu_start = slot * cache.gate_up_stride;
+            let down_start = slot * cache.down_stride;
+            if pinned_transfers {
+                let transfer_index = miss_slots.len();
+                let SserCache {
+                    gate_up_arena,
+                    down_arena,
+                    transfer_slots,
+                    ..
+                } = &mut *cache;
+                let transfer_slot_count = transfer_slots.len();
+                let transfer = transfer_slots.get_mut(transfer_index).ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(format!(
+                        "Gemma 4 CUDA transfer ring has {} slots for a top-{route_count} route",
+                        transfer_slot_count
+                    ))
+                })?;
+                transfer
+                    .gate_up
+                    .as_mut_slice()
+                    .map_err(cu)?
+                    .copy_from_slice(gu_host);
+                transfer
+                    .down
+                    .as_mut_slice()
+                    .map_err(cu)?
+                    .copy_from_slice(down_host);
+                self.expert_copy_stream
+                    .memcpy_htod(
+                        &transfer.gate_up,
+                        &mut gate_up_arena.slice_mut(gu_start..gu_start + expected_gu),
+                    )
+                    .map_err(cu)?;
+                self.expert_copy_stream
+                    .memcpy_htod(
+                        &transfer.down,
+                        &mut down_arena.slice_mut(down_start..down_start + expected_down),
+                    )
+                    .map_err(cu)?;
+            } else {
+                self.expert_copy_stream
+                    .memcpy_htod(
+                        gu_host,
+                        &mut cache
+                            .gate_up_arena
+                            .slice_mut(gu_start..gu_start + expected_gu),
+                    )
+                    .map_err(cu)?;
+                self.expert_copy_stream
+                    .memcpy_htod(
+                        down_host,
+                        &mut cache
+                            .down_arena
+                            .slice_mut(down_start..down_start + expected_down),
+                    )
+                    .map_err(cu)?;
+            }
+            cache.misses += 1;
+            cache.clock += 1;
+            let stamp = cache.clock;
+            cache.entries.insert(
+                key,
+                SserExpertDev {
+                    slot,
+                    last_used: stamp,
+                },
+            );
+            miss_slots.push(slot as i32);
+            miss_routes.push(route as i32);
+        }
+
+        let copy_done = if miss_slots.is_empty() {
+            None
+        } else {
+            Some(self.expert_copy_stream.record_event(None).map_err(cu)?)
+        };
+
+        let run_group = |slots: &[i32],
+                         routes: &[i32],
+                         d_gate_up: &mut cudarc::driver::CudaSlice<f32>,
+                         d_geglu_q: &mut cudarc::driver::CudaSlice<i8>,
+                         d_geglu_s: &mut cudarc::driver::CudaSlice<f32>,
+                         d_y_all: &mut cudarc::driver::CudaSlice<f32>|
+         -> Result<()> {
+            if slots.is_empty() {
+                return Ok(());
+            }
+            let d_slots = s.clone_htod(slots).map_err(cu)?;
+            let d_routes = s.clone_htod(routes).map_err(cu)?;
+            let experts_i = slots.len() as i32;
+            let block = 256u32;
+            let warps = block / 32;
+
+            let launch_q4 = |weights: &cudarc::driver::CudaSlice<u8>,
+                             stride: usize,
+                             in_s: &cudarc::driver::CudaSlice<f32>,
+                             in_q: &cudarc::driver::CudaSlice<i8>,
+                             rows: usize,
+                             blocks: usize,
+                             out: &mut cudarc::driver::CudaSlice<f32>,
+                             batched_input: i32|
+             -> Result<()> {
+                let cfg = LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(warps), slots.len() as u32, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: blocks as u32 * 32
+                        + blocks as u32 * 4
+                        + warps * blocks as u32 * 4,
+                };
+                let stride_u64 = stride as u64;
+                let rows_i = rows as i32;
+                let blocks_i = blocks as i32;
+                let mut builder = s.launch_builder(&k.q4_0_gemv_routed);
+                builder
+                    .arg(in_s)
+                    .arg(in_q)
+                    .arg(weights)
+                    .arg(&d_slots)
+                    .arg(&d_routes)
+                    .arg(&stride_u64)
+                    .arg(&rows_i)
+                    .arg(&blocks_i)
+                    .arg(out)
+                    .arg(&experts_i)
+                    .arg(&batched_input);
+                unsafe { builder.launch(cfg) }.map_err(cu)?;
+                Ok(())
+            };
+
+            {
+                let cache = sser.borrow();
+                launch_q4(
+                    &cache.gate_up_arena,
+                    cache.gate_up_stride,
+                    d_in_s,
+                    d_in_q,
+                    two_nff,
+                    gu_blocks,
+                    d_gate_up,
+                    0,
+                )?;
+            }
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: ((down_blocks as u32).div_ceil(block), slots.len() as u32, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let nff_i = nff as i32;
+                let blocks_i = down_blocks as i32;
+                let mut builder = s.launch_builder(&k.geglu_quantize_routed);
+                builder
+                    .arg(d_gate_up)
+                    .arg(&d_routes)
+                    .arg(&mut *d_geglu_q)
+                    .arg(&mut *d_geglu_s)
+                    .arg(&nff_i)
+                    .arg(&blocks_i)
+                    .arg(&experts_i);
+                unsafe { builder.launch(cfg) }.map_err(cu)?;
+            }
+            {
+                let cache = sser.borrow();
+                launch_q4(
+                    &cache.down_arena,
+                    cache.down_stride,
+                    d_geglu_s,
+                    d_geglu_q,
+                    hidden,
+                    down_blocks,
+                    d_y_all,
+                    1,
+                )?;
+            }
+            Ok(())
+        };
+
+        let hit_started = std::time::Instant::now();
+        run_group(
+            &hit_slots,
+            &hit_routes,
+            d_gate_up,
+            d_geglu_q,
+            d_geglu_s,
+            d_y_all,
+        )?;
+        if std::env::var_os("CAMELID_SSER_PROFILE").is_some() {
+            SSER_PROF_HIT_NS.fetch_add(
+                hit_started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        if let Some(event) = copy_done.as_ref() {
+            s.wait(event).map_err(cu)?;
+        }
+        let miss_started = std::time::Instant::now();
+        run_group(
+            &miss_slots,
+            &miss_routes,
+            d_gate_up,
+            d_geglu_q,
+            d_geglu_s,
+            d_y_all,
+        )?;
+        if std::env::var_os("CAMELID_SSER_PROFILE").is_some() {
+            SSER_PROF_MISS_NS.fetch_add(
+                miss_started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        let d_route_scales = s.clone_htod(&route_scales).map_err(cu)?;
+        let cfg = LaunchConfig {
+            grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hidden_i = hidden as i32;
+        let experts_i = route_count as i32;
+        let mut builder = s.launch_builder(&k.moe_weighted_sum_routed);
+        builder
+            .arg(d_y_all)
+            .arg(&d_route_scales)
+            .arg(d_moe_acc)
+            .arg(&hidden_i)
+            .arg(&experts_i);
+        unsafe { builder.launch(cfg) }.map_err(cu)?;
+        Ok(())
+    }
+
     /// SSER (M2/M3/M4) sparse-expert branch of the MoE FFN. Runs the router on the
     /// CPU (tiny), then every selected expert's two GEMVs on the GPU — cached in VRAM
     /// (hit) or uploaded+promoted (miss) — accumulating each expert's weighted
-    /// down-GEMV into an on-device buffer (`scaled_axpy`). Returns that device
+    /// down-GEMV into router-positioned scratch. Hits run as one CUDA batch while
+    /// a second stream stages misses; one ordered kernel returns the device
     /// accumulator (the sparse expert sum, BEFORE `post_norm_2`); the caller composes
     /// it on-device with the GPU dense branch (M4). `attn_out` is the post-attention
     /// residual (already copied device->host by the caller for the router).
@@ -7358,11 +7753,13 @@ impl Gemma4CudaResident {
         }
         let d_in_s = s.clone_htod(&in_scales).map_err(cu)?;
         let d_in_q = s.clone_htod(&in_quants).map_err(cu)?;
-        let mut d_gate_up = s.alloc_zeros::<f32>(two_nff).map_err(cu)?;
-        let mut d_geglu = s.alloc_zeros::<f32>(nff).map_err(cu)?;
-        let mut d_geglu_q = s.alloc_zeros::<i8>(nff).map_err(cu)?;
-        let mut d_geglu_s = s.alloc_zeros::<f32>(down_blocks).map_err(cu)?;
-        let mut d_y = s.alloc_zeros::<f32>(hidden).map_err(cu)?;
+        let route_count = idx.len();
+        // The routed kernels write each expert into its original top-k position.
+        // Hits execute together while the copy stream populates missing arena slots.
+        let mut d_gate_up = unsafe { s.alloc::<f32>(route_count * two_nff) }.map_err(cu)?;
+        let mut d_geglu_q = unsafe { s.alloc::<i8>(route_count * nff) }.map_err(cu)?;
+        let mut d_geglu_s = unsafe { s.alloc::<f32>(route_count * down_blocks) }.map_err(cu)?;
+        let mut d_y_all = unsafe { s.alloc::<f32>(route_count * hidden) }.map_err(cu)?;
         // M3/M4 on-device MoE accumulator: every selected expert (hit OR uploaded-miss)
         // folds its weighted down-GEMV output straight into this device buffer (one
         // scaled_axpy launch each). In M4 the buffer is RETURNED to the caller and
@@ -7372,65 +7769,81 @@ impl Gemma4CudaResident {
         let gate_up_bytes = moe.gate_up_exps.bytes();
         let down_bytes = moe.down_exps.bytes();
 
-        for &e in &idx {
-            let w = probs[e] / wsum;
-            let scale = moe.down_exps_scale[e] * w;
-            let key = (l as u16, e as u16);
+        let routed_batch = std::env::var("CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS")
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+            })
+            .unwrap_or(true);
+        if !routed_batch {
+            // Allocate fallback-only scratch lazily so the routed hot path pays
+            // neither the device allocations nor their event-tracking teardown.
+            let mut d_geglu = unsafe { s.alloc::<f32>(nff) }.map_err(cu)?;
+            let mut d_y = unsafe { s.alloc::<f32>(hidden) }.map_err(cu)?;
+            for &e in &idx {
+                let w = probs[e] / wsum;
+                let scale = moe.down_exps_scale[e] * w;
+                let key = (l as u16, e as u16);
 
-            let cached = sser.borrow_mut().touch(key);
-            let te = std::time::Instant::now();
-            // On a MISS, upload the expert's two Q4_0 slices and insert them into the
-            // VRAM cache (promotion) BEFORE running — then the GPU pipeline below reads
-            // the freshly-resident slices exactly as it does for a hit. This moves the
-            // expensive part of a miss (the ~1.8 ms CPU expert matvec, which profiling
-            // showed was ~72% of all MoE time) onto the GPU: a miss now costs only the
-            // ~6 MiB weight htod + the same tiny GEMV launches a hit already pays.
-            if !cached {
-                sser.borrow_mut().misses += 1;
-                let expected_gu = two_nff * gu_row_bytes;
-                let expected_down = hidden * down_row_bytes;
-                // Expert kernels and uploads share `cap_stream`, so overwriting an
-                // LRU arena slot is ordered after its preceding GEMVs without a host
-                // sync. The arenas were allocated while event tracking was disabled.
-                let upload = |gu_host: &[u8], down_host: &[u8]| -> Result<usize> {
-                    let mut cache = sser.borrow_mut();
-                    if gu_host.len() != cache.gate_up_stride || down_host.len() != cache.down_stride
-                    {
-                        return Err(BackendError::InvalidModelMetadata(format!(
+                let cached = sser.borrow_mut().touch(key);
+                let te = std::time::Instant::now();
+                // On a MISS, upload the expert's two Q4_0 slices and insert them into the
+                // VRAM cache (promotion) BEFORE running — then the GPU pipeline below reads
+                // the freshly-resident slices exactly as it does for a hit. This moves the
+                // expensive part of a miss (the ~1.8 ms CPU expert matvec, which profiling
+                // showed was ~72% of all MoE time) onto the GPU: a miss now costs only the
+                // ~6 MiB weight htod + the same tiny GEMV launches a hit already pays.
+                if !cached {
+                    sser.borrow_mut().misses += 1;
+                    let expected_gu = two_nff * gu_row_bytes;
+                    let expected_down = hidden * down_row_bytes;
+                    // Expert kernels and uploads share `cap_stream`, so overwriting an
+                    // LRU arena slot is ordered after its preceding GEMVs without a host
+                    // sync. The arenas were allocated while event tracking was disabled.
+                    let upload = |gu_host: &[u8], down_host: &[u8]| -> Result<usize> {
+                        let mut cache = sser.borrow_mut();
+                        if gu_host.len() != cache.gate_up_stride
+                            || down_host.len() != cache.down_stride
+                        {
+                            return Err(BackendError::InvalidModelMetadata(format!(
                             "Gemma 4 CUDA expert arena geometry changed at layer={l} expert={e}: gate_up={} expected={}, down={} expected={}",
                             gu_host.len(),
                             cache.gate_up_stride,
                             down_host.len(),
                             cache.down_stride,
                         )));
-                    }
-                    let slot = cache.slot_for_miss();
-                    let gu_start = slot * cache.gate_up_stride;
-                    let down_start = slot * cache.down_stride;
-                    s.memcpy_htod(
-                        gu_host,
-                        &mut cache
-                            .gate_up_arena
-                            .slice_mut(gu_start..gu_start + gu_host.len()),
-                    )
-                    .map_err(cu)?;
-                    s.memcpy_htod(
-                        down_host,
-                        &mut cache
-                            .down_arena
-                            .slice_mut(down_start..down_start + down_host.len()),
-                    )
-                    .map_err(cu)?;
-                    Ok(slot)
-                };
-                let slot = if let Some(records) = ghost_records.as_mut() {
-                    // A route that was resident when `missing` was captured can
-                    // be evicted by an earlier miss in this same ordered top-k.
-                    // Recover only that exact race from `.cghost`; processing
-                    // order and weighted accumulation remain router-identical.
-                    if let std::collections::hash_map::Entry::Vacant(slot) = records.entry(e) {
-                        let ghost = moe.ghost.as_ref().expect("Ghost records require Ghost MoE");
-                        let record = ghost
+                        }
+                        let slot = cache.slot_for_miss();
+                        let gu_start = slot * cache.gate_up_stride;
+                        let down_start = slot * cache.down_stride;
+                        s.memcpy_htod(
+                            gu_host,
+                            &mut cache
+                                .gate_up_arena
+                                .slice_mut(gu_start..gu_start + gu_host.len()),
+                        )
+                        .map_err(cu)?;
+                        s.memcpy_htod(
+                            down_host,
+                            &mut cache
+                                .down_arena
+                                .slice_mut(down_start..down_start + down_host.len()),
+                        )
+                        .map_err(cu)?;
+                        Ok(slot)
+                    };
+                    let slot = if let Some(records) = ghost_records.as_mut() {
+                        // A route that was resident when `missing` was captured can
+                        // be evicted by an earlier miss in this same ordered top-k.
+                        // Recover only that exact race from `.cghost`; processing
+                        // order and weighted accumulation remain router-identical.
+                        if let std::collections::hash_map::Entry::Vacant(slot) = records.entry(e) {
+                            let ghost =
+                                moe.ghost.as_ref().expect("Ghost records require Ghost MoE");
+                            let record = ghost
                             .cache
                             .get_many_cuda(ghost.layer_idx, &[e])?
                             .into_iter()
@@ -7440,137 +7853,155 @@ impl Gemma4CudaResident {
                                     "Ghost-MoE CUDA could not recover evicted routed expert layer={l} expert={e}"
                                 ))
                             })?;
-                        slot.insert(record);
-                    }
-                    let record = records.get(&e).ok_or_else(|| {
-                        BackendError::InvalidModelMetadata(format!(
-                            "Ghost-MoE CUDA lost routed expert layer={l} expert={e}"
-                        ))
-                    })?;
-                    let (gu_dtype, gu_bytes) = record.gate_up()?;
-                    let (down_dtype, down_bytes) = record.down()?;
-                    if gu_dtype != GgufTensorType::Q4_0 || down_dtype != GgufTensorType::Q4_0 {
-                        return Err(BackendError::UnsupportedGguf(format!(
+                            slot.insert(record);
+                        }
+                        let record = records.get(&e).ok_or_else(|| {
+                            BackendError::InvalidModelMetadata(format!(
+                                "Ghost-MoE CUDA lost routed expert layer={l} expert={e}"
+                            ))
+                        })?;
+                        let (gu_dtype, gu_bytes) = record.gate_up()?;
+                        let (down_dtype, down_bytes) = record.down()?;
+                        if gu_dtype != GgufTensorType::Q4_0 || down_dtype != GgufTensorType::Q4_0 {
+                            return Err(BackendError::UnsupportedGguf(format!(
                             "Ghost-MoE CUDA requires Q4_0 expert records; layer={l} expert={e} gate_up={:?} down={:?}",
                             gu_dtype, down_dtype
                         )));
-                    }
-                    if gu_bytes.len() != expected_gu || down_bytes.len() != expected_down {
-                        return Err(BackendError::InvalidModelMetadata(format!(
+                        }
+                        if gu_bytes.len() != expected_gu || down_bytes.len() != expected_down {
+                            return Err(BackendError::InvalidModelMetadata(format!(
                             "Ghost-MoE CUDA expert record length mismatch at layer={l} expert={e}: gate_up={} expected={expected_gu}, down={} expected={expected_down}",
                             gu_bytes.len(),
                             down_bytes.len()
                         )));
-                    }
-                    upload(gu_bytes, down_bytes)?
+                        }
+                        upload(gu_bytes, down_bytes)?
+                    } else {
+                        let gu_off = e * expected_gu;
+                        let down_off = e * expected_down;
+                        upload(
+                            &gate_up_bytes[gu_off..gu_off + expected_gu],
+                            &down_bytes[down_off..down_off + expected_down],
+                        )?
+                    };
+                    let mut c = sser.borrow_mut();
+                    c.clock += 1;
+                    let stamp = c.clock;
+                    c.entries.insert(
+                        key,
+                        SserExpertDev {
+                            slot,
+                            last_used: stamp,
+                        },
+                    );
                 } else {
-                    let gu_off = e * expected_gu;
-                    let down_off = e * expected_down;
-                    upload(
-                        &gate_up_bytes[gu_off..gu_off + expected_gu],
-                        &down_bytes[down_off..down_off + expected_down],
-                    )?
-                };
-                let mut c = sser.borrow_mut();
-                c.clock += 1;
-                let stamp = c.clock;
-                c.entries.insert(
-                    key,
-                    SserExpertDev {
-                        slot,
-                        last_used: stamp,
-                    },
-                );
-            } else {
-                sser.borrow_mut().hits += 1;
-            }
+                    sser.borrow_mut().hits += 1;
+                }
 
-            // --- GPU pipeline (hit OR promoted-miss): fused gate‖up GEMV -> GeGLU ->
-            // quantize -> down GEMV -> weighted on-device accumulate. Every expert now
-            // takes the identical bit-exact GPU path, so the token stream no longer
-            // depends on cache warmth (removes host/device path-divergence). Hold the
-            // shared cache borrow for the whole launch sequence so the resident weight
-            // views stay valid; `touch`/`insert` above made `key` the newest entry, so
-            // it cannot be evicted while this borrow is live. ---
-            {
-                let c = sser.borrow();
-                let ent = c.entries.get(&key).expect("hit or just-promoted miss");
-                let gu_start = ent.slot * c.gate_up_stride;
-                let down_start = ent.slot * c.down_stride;
-                let gu_dev = c.gate_up_arena.slice(gu_start..gu_start + c.gate_up_stride);
-                let down_dev = c.down_arena.slice(down_start..down_start + c.down_stride);
-                // gate‖up: two_nff rows, gu_blocks blocks/row.
-                crate::cuda_resident::launch_q4_0_gemv(
-                    &s,
-                    &k.q4_0_gemv,
-                    &d_in_s,
-                    &d_in_q,
-                    &gu_dev,
-                    two_nff,
-                    gu_blocks,
-                    &mut d_gate_up,
-                    0,
-                )
-                .map_err(cu)?;
-                // GeGLU: gelu_tanh(gate[o]) * up[o] where gate = out[0..nff], up = out[nff..2nff].
+                // --- GPU pipeline (hit OR promoted-miss): fused gate‖up GEMV -> GeGLU ->
+                // quantize -> down GEMV -> weighted on-device accumulate. Every expert now
+                // takes the identical bit-exact GPU path, so the token stream no longer
+                // depends on cache warmth (removes host/device path-divergence). Hold the
+                // shared cache borrow for the whole launch sequence so the resident weight
+                // views stay valid; `touch`/`insert` above made `key` the newest entry, so
+                // it cannot be evicted while this borrow is live. ---
                 {
-                    let gate_v = d_gate_up.slice(0..nff);
-                    let up_v = d_gate_up.slice(nff..two_nff);
+                    let c = sser.borrow();
+                    let ent = c.entries.get(&key).expect("hit or just-promoted miss");
+                    let gu_start = ent.slot * c.gate_up_stride;
+                    let down_start = ent.slot * c.down_stride;
+                    let gu_dev = c.gate_up_arena.slice(gu_start..gu_start + c.gate_up_stride);
+                    let down_dev = c.down_arena.slice(down_start..down_start + c.down_stride);
+                    // gate‖up: two_nff rows, gu_blocks blocks/row.
+                    crate::cuda_resident::launch_q4_0_gemv(
+                        &s,
+                        &k.q4_0_gemv,
+                        &d_in_s,
+                        &d_in_q,
+                        &gu_dev,
+                        two_nff,
+                        gu_blocks,
+                        &mut d_gate_up,
+                        0,
+                    )
+                    .map_err(cu)?;
+                    // GeGLU: gelu_tanh(gate[o]) * up[o] where gate = out[0..nff], up = out[nff..2nff].
+                    {
+                        let gate_v = d_gate_up.slice(0..nff);
+                        let up_v = d_gate_up.slice(nff..two_nff);
+                        let cfg = LaunchConfig {
+                            grid_dim: ((nff as u32).div_ceil(256), 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let n_i = nff as i32;
+                        let mut b = s.launch_builder(&k.geglu_mul);
+                        b.arg(&gate_v).arg(&up_v).arg(&mut d_geglu).arg(&n_i);
+                        unsafe { b.launch(cfg) }.map_err(cu)?;
+                    }
+                    crate::cuda_resident::launch_quantize(
+                        &s,
+                        &k.quantize,
+                        &d_geglu,
+                        &mut d_geglu_q,
+                        &mut d_geglu_s,
+                        down_blocks,
+                    )
+                    .map_err(cu)?;
+                    // down: hidden rows, down_blocks blocks/row.
+                    crate::cuda_resident::launch_q4_0_gemv(
+                        &s,
+                        &k.q4_0_gemv,
+                        &d_geglu_s,
+                        &d_geglu_q,
+                        &down_dev,
+                        hidden,
+                        down_blocks,
+                        &mut d_y,
+                        0,
+                    )
+                    .map_err(cu)?;
+                }
+                // On-device weighted accumulate: d_moe_acc[i] += d_y[i] * scale (deferred to
+                // one dtoh after the loop). scaled_axpy(acc, y, scale, n): acc += y*scale.
+                {
                     let cfg = LaunchConfig {
-                        grid_dim: ((nff as u32).div_ceil(256), 1, 1),
+                        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let n_i = nff as i32;
-                    let mut b = s.launch_builder(&k.geglu_mul);
-                    b.arg(&gate_v).arg(&up_v).arg(&mut d_geglu).arg(&n_i);
+                    let n_i = hidden as i32;
+                    let mut b = s.launch_builder(&k.scaled_axpy);
+                    b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
                     unsafe { b.launch(cfg) }.map_err(cu)?;
                 }
-                crate::cuda_resident::launch_quantize(
-                    &s,
-                    &k.quantize,
-                    &d_geglu,
-                    &mut d_geglu_q,
-                    &mut d_geglu_s,
-                    down_blocks,
-                )
-                .map_err(cu)?;
-                // down: hidden rows, down_blocks blocks/row.
-                crate::cuda_resident::launch_q4_0_gemv(
-                    &s,
-                    &k.q4_0_gemv,
-                    &d_geglu_s,
-                    &d_geglu_q,
-                    &down_dev,
-                    hidden,
-                    down_blocks,
-                    &mut d_y,
-                    0,
-                )
-                .map_err(cu)?;
-            }
-            // On-device weighted accumulate: d_moe_acc[i] += d_y[i] * scale (deferred to
-            // one dtoh after the loop). scaled_axpy(acc, y, scale, n): acc += y*scale.
-            {
-                let cfg = LaunchConfig {
-                    grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let n_i = hidden as i32;
-                let mut b = s.launch_builder(&k.scaled_axpy);
-                b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
-                unsafe { b.launch(cfg) }.map_err(cu)?;
-            }
-            if prof {
-                let ns = te.elapsed().as_nanos() as u64;
-                use std::sync::atomic::Ordering::Relaxed;
-                if cached {
-                    SSER_PROF_HIT_NS.fetch_add(ns, Relaxed);
-                } else {
-                    SSER_PROF_MISS_NS.fetch_add(ns, Relaxed);
+                if prof {
+                    let ns = te.elapsed().as_nanos() as u64;
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if cached {
+                        SSER_PROF_HIT_NS.fetch_add(ns, Relaxed);
+                    } else {
+                        SSER_PROF_MISS_NS.fetch_add(ns, Relaxed);
+                    }
                 }
             }
+        } else {
+            self.moe_layer_ffn_cached_routed(
+                l,
+                moe,
+                sser,
+                &idx,
+                &probs,
+                wsum,
+                ghost_records.as_mut(),
+                &d_in_s,
+                &d_in_q,
+                &mut d_gate_up,
+                &mut d_geglu_q,
+                &mut d_geglu_s,
+                &mut d_y_all,
+                &mut d_moe_acc,
+            )?;
         }
         // Every selected expert (hit OR uploaded-miss) accumulated into `d_moe_acc` in
         // strict idx order, so the layer's expert sum is one left-to-right f32

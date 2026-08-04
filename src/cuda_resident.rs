@@ -1947,6 +1947,31 @@ extern "C" __global__ void prism_q1_q8_b128_bmma_gemm_batched(
 #endif
 }
 
+// Decode one Q4_0 block into packed signed bytes and contract with Q8_0 via
+// DP4A. `__vsub4` performs four independent byte subtractions, so subtracting
+// 0x08 from each nibble is exactly the scalar `(q & 15) - 8` operation without
+// cross-byte borrow. Integer addition order cannot affect the exact i32 result.
+__device__ __forceinline__ int q4_0_dot32_dp4a(
+    const unsigned char* __restrict__ qs,
+    const signed char* __restrict__ y
+) {
+    int sum = 0;
+    #pragma unroll
+    for (int j = 0; j < 16; j += 4) {
+        unsigned int packed = (unsigned int)qs[j]
+            | ((unsigned int)qs[j + 1] << 8)
+            | ((unsigned int)qs[j + 2] << 16)
+            | ((unsigned int)qs[j + 3] << 24);
+        int lo = (int)__vsub4(packed & 0x0f0f0f0fu, 0x08080808u);
+        int hi = (int)__vsub4((packed >> 4) & 0x0f0f0f0fu, 0x08080808u);
+        int ylo = *((const int*)(y + j));
+        int yhi = *((const int*)(y + 16 + j));
+        sum = __dp4a(lo, ylo, sum);
+        sum = __dp4a(hi, yhi, sum);
+    }
+    return sum;
+}
+
 // ---- Q4_0 GEMV: one warp per output row, raw 18-byte wire, Q8_0 activation ----
 // Bit-identical reproduction of the validated CPU oracle `q4_0_wire_row_dot_scalar`
 // (the gemma4 QAT linear lane). Per 18-byte block: scale = f16(blk[0..2]); for
@@ -1955,8 +1980,8 @@ extern "C" __global__ void prism_q1_q8_b128_bmma_gemm_batched(
 // terms IN ORDER — the exact same ordered-f32 contract as q8_gemv, so the result is
 // bit-identical to the CPU. Weights are read RAW (nibbles packed) to keep the 4-bit
 // footprint; the activation is Q8_0 (input_scales[bpr] + input_quants[bpr*32] i8),
-// staged once in shared like q8_gemv. The -8 bias precludes a clean __dp4a, so the
-// per-block integer dot is the scalar nibble unpack the oracle uses (parity-first).
+// staged once in shared like q8_gemv. Packed byte-wise subtract removes the -8
+// nibble bias exactly, allowing the integer dot to use DP4A without changing math.
 extern "C" __global__ void q4_0_gemv(
     const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
@@ -1985,15 +2010,7 @@ extern "C" __global__ void q4_0_gemv(
             const unsigned char* blk = weight_bytes + (long)(row_block0 + b) * WIRE;
             float w_scale = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
             const signed char* y = s_iq + (long)b * 32;
-            int isum = 0;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                unsigned char byte = blk[2 + j];
-                int lo = (int)(byte & 0xF) - 8;
-                int hi = (int)(byte >> 4) - 8;
-                isum += lo * (int)y[j];
-                isum += hi * (int)y[j + 16];
-            }
+            int isum = q4_0_dot32_dp4a(blk + 2, y);
             myterms[b] = (float)isum * w_scale * s_is[b];
         }
     }
@@ -3756,6 +3773,120 @@ extern "C" __global__ void scaled_axpy(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) acc[i] += y[i] * scale;
+}
+
+// ---- Routed batched Q4_0 GEMV -------------------------------------------
+// Gemma 4 selects several experts that share one input activation. Launching
+// q4_0_gemv once per expert makes batch-1 decode submission-bound on WDDM. This
+// 2-D variant keeps the exact warp-per-row arithmetic above, but grid.y selects
+// an expert arena slot and writes the result into its original router position.
+// `batched_input=0` shares one activation (gate/up); `1` selects the activation
+// at route*blocks_per_row (down). The ordered per-row sum is unchanged.
+extern "C" __global__ void q4_0_gemv_routed(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ route_ids,
+    unsigned long long weight_stride, int rows, int blocks_per_row,
+    float* __restrict__ output, int expert_count, int batched_input
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int route = route_ids[expert];
+    int slot = slot_ids[expert];
+    const float* expert_scales = input_scales
+        + (batched_input ? (long)route * blocks_per_row : 0);
+    const signed char* expert_quants = input_quants
+        + (batched_input ? (long)route * blocks_per_row * 32 : 0);
+    const unsigned char* expert_weights = weight_arena + (long)slot * weight_stride;
+
+    extern __shared__ unsigned char smem40r[];
+    signed char* s_iq = (signed char*)smem40r;
+    float* s_is = (float*)(smem40r + (long)blocks_per_row * 32);
+    float* terms = (float*)(smem40r + (long)blocks_per_row * 36);
+    int tid = threadIdx.x;
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)expert_quants)[i];
+    for (int i = tid; i < blocks_per_row; i += blockDim.x)
+        s_is[i] = expert_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = expert_weights + (row_block0 + b) * 18;
+            float w_scale = f16_bits_to_f32(
+                (unsigned short)(blk[0] | (blk[1] << 8)));
+            const signed char* y = s_iq + (long)b * 32;
+            int isum = q4_0_dot32_dp4a(blk + 2, y);
+            myterms[b] = (float)isum * w_scale * s_is[b];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[(long)route * rows + row] = acc;
+    }
+}
+
+// Fuse each routed expert's GeGLU with its Q8_0 quantization. One thread owns a
+// 32-value Q8 block, retaining its GeGLU values locally across the max and quant
+// passes so neither a second tanh nor a global f32 intermediate is needed.
+extern "C" __global__ void geglu_quantize_routed(
+    const float* __restrict__ gate_up,
+    const int* __restrict__ route_ids,
+    signed char* __restrict__ quants,
+    float* __restrict__ scales,
+    int nff, int blocks_per_expert, int expert_count
+) {
+    int expert = blockIdx.y;
+    int block = blockIdx.x * blockDim.x + threadIdx.x;
+    if (expert >= expert_count || block >= blocks_per_expert) return;
+    int route = route_ids[expert];
+    const float* gate = gate_up + (long)route * (2 * nff) + (long)block * 32;
+    const float* up = gate_up + (long)route * (2 * nff) + nff + (long)block * 32;
+    float values[32];
+    float max_abs = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        float x = gate[j];
+        float inner = 0.79788456f * (x + 0.044715f * x * x * x);
+        float v = (0.5f * x * (1.0f + tanhf(inner))) * up[j];
+        values[j] = v;
+        float a = fabsf(v);
+        if (a > max_abs) max_abs = a;
+    }
+    float unrounded = max_abs / 127.0f;
+    scales[(long)route * blocks_per_expert + block] = f16_round(unrounded);
+    float inv = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+    signed char* qb = quants + ((long)route * blocks_per_expert + block) * 32;
+    for (int j = 0; j < 32; j++) {
+        float q = rintf(values[j] * inv);
+        if (q > 127.0f) q = 127.0f;
+        if (q < -128.0f) q = -128.0f;
+        qb[j] = (signed char)q;
+    }
+}
+
+// Strict router-order weighted sum. One thread owns one hidden coordinate and
+// accumulates expert 0..top_k exactly as the former scaled_axpy launch sequence.
+extern "C" __global__ void moe_weighted_sum_routed(
+    const float* __restrict__ expert_y,
+    const float* __restrict__ route_scales,
+    float* __restrict__ output, int hidden, int expert_count
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) return;
+    float acc = 0.0f;
+    for (int expert = 0; expert < expert_count; expert++)
+        acc += expert_y[(long)expert * hidden + i] * route_scales[expert];
+    output[i] = acc;
 }
 
 // ---- Greedy argmax (strict >, first index wins ties) ----------------------
@@ -5557,6 +5688,9 @@ pub struct CudaResidentKernels {
     pub(crate) scale_f32: CudaFunction,
     pub(crate) residual_add: CudaFunction,
     pub(crate) scaled_axpy: CudaFunction,
+    pub(crate) q4_0_gemv_routed: CudaFunction,
+    pub(crate) geglu_quantize_routed: CudaFunction,
+    pub(crate) moe_weighted_sum_routed: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
     pub(crate) gemm_batched: CudaFunction,
@@ -5756,6 +5890,9 @@ impl CudaResidentKernels {
             scale_f32: f("scale_f32")?,
             residual_add: f("residual_add")?,
             scaled_axpy: f("scaled_axpy")?,
+            q4_0_gemv_routed: f("q4_0_gemv_routed")?,
+            geglu_quantize_routed: f("geglu_quantize_routed")?,
+            moe_weighted_sum_routed: f("moe_weighted_sum_routed")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
             gemm_batched: f("q8_gemm_batched")?,
