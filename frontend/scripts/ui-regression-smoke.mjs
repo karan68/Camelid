@@ -33,6 +33,10 @@ assert.deepEqual(executionRuntimeFields({ execution_plan: healthExecutionPlan, b
   gemma4_ghost_common_metal_active: null,
   gemma4_ghost_experts_metal_active: null,
   gemma4_ghost_head_metal_active: null,
+  gemma4_ghost_backend: null,
+  gemma4_ghost_common_gpu_active: null,
+  gemma4_ghost_experts_gpu_active: null,
+  gemma4_ghost_head_gpu_active: null,
 }, 'dashboard normalization should preserve health execution plan identity and serving backend')
 assert.deepEqual(executionRuntimeFields(null), {
   execution_plan: null,
@@ -41,6 +45,10 @@ assert.deepEqual(executionRuntimeFields(null), {
   gemma4_ghost_common_metal_active: null,
   gemma4_ghost_experts_metal_active: null,
   gemma4_ghost_head_metal_active: null,
+  gemma4_ghost_backend: null,
+  gemma4_ghost_common_gpu_active: null,
+  gemma4_ghost_experts_gpu_active: null,
+  gemma4_ghost_head_gpu_active: null,
 }, 'missing health should fail closed to no plan and no backend')
 
 assert.deepEqual(describeExecutionPlan({ status: 'offline' }), {

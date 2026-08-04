@@ -1795,29 +1795,77 @@ impl GhostFile {
 #[cfg(windows)]
 struct UncachedReader {
     file: File,
-    /// Over-allocated so a `SECTOR`-aligned sub-slice of the largest (rounded-up) group span
-    /// always fits; sized once at open and never grown (growing would move the base pointer).
+    /// Logical sector size reported by the volume containing `.cghost`.
+    sector: usize,
+    /// Over-allocated so a sector-aligned sub-slice of the largest (rounded-up)
+    /// group span always fits; sized once at open and never grown (growing would
+    /// move the base pointer).
     scratch: Vec<u8>,
     file_len: u64,
 }
 
 #[cfg(windows)]
 impl UncachedReader {
-    /// 4 KiB covers both 512e and 4Kn NVMe logical sectors; a 4 KiB-aligned offset/length is
-    /// also 512-aligned, so this is a safe universal alignment for `FILE_FLAG_NO_BUFFERING`.
-    const SECTOR: usize = 4096;
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+
+    fn volume_sector_size(path: &Path) -> std::io::Result<usize> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
+
+        let absolute = std::fs::canonicalize(path)?;
+        let wide = absolute
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut volume = vec![0u16; 32_768];
+        // SAFETY: both UTF-16 buffers are live and NUL-terminated/capacity-sized
+        // as required. The path names an existing file on the queried volume.
+        if unsafe { GetVolumePathNameW(wide.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut sectors_per_cluster = 0u32;
+        let mut bytes_per_sector = 0u32;
+        let mut free_clusters = 0u32;
+        let mut total_clusters = 0u32;
+        // SAFETY: volume contains the NUL-terminated root returned above and all
+        // output pointers refer to initialized writable u32 storage.
+        if unsafe {
+            GetDiskFreeSpaceW(
+                volume.as_ptr(),
+                &mut sectors_per_cluster,
+                &mut bytes_per_sector,
+                &mut free_clusters,
+                &mut total_clusters,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sector = bytes_per_sector as usize;
+        if sector == 0 || !sector.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("volume reported invalid sector size {sector}"),
+            ));
+        }
+        Ok(sector)
+    }
 
     fn open(path: &Path, max_layer_span: u64) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt;
+        let sector = Self::volume_sector_size(path)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(Self::FILE_FLAG_NO_BUFFERING)
             .open(path)?;
         let file_len = file.metadata()?.len();
-        let cap = (max_layer_span as usize).next_multiple_of(Self::SECTOR) + Self::SECTOR;
+        let cap = (max_layer_span as usize).next_multiple_of(sector) + sector;
         Ok(Self {
             file,
+            sector,
             scratch: vec![0u8; cap],
             file_len,
         })
@@ -1830,11 +1878,11 @@ impl UncachedReader {
     fn read_into(&mut self, start: u64, len: u64, out: &mut [u8]) -> std::io::Result<bool> {
         use std::os::windows::fs::FileExt;
         let len = len as usize;
-        let aligned_len = len.next_multiple_of(Self::SECTOR);
+        let aligned_len = len.next_multiple_of(self.sector);
         // Locate a sector-aligned window inside the over-allocated scratch.
         let base = self.scratch.as_ptr() as usize;
-        let pad = (Self::SECTOR - (base % Self::SECTOR)) % Self::SECTOR;
-        if !start.is_multiple_of(Self::SECTOR as u64)
+        let pad = (self.sector - (base % self.sector)) % self.sector;
+        if !start.is_multiple_of(self.sector as u64)
             || start + aligned_len as u64 > self.file_len
             || pad + aligned_len > self.scratch.len()
         {

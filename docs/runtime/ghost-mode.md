@@ -144,6 +144,41 @@ the scalar ordered kernel.
 duplicate memory pressure on a 16 GiB unified-memory machine, but should be benchmarked on the
 target system because it gives up OS cache reuse.
 
+### Windows CUDA serve lane
+
+On Windows, the same sparse-shadow and `.cghost` pair can serve through the Gemma 4 CUDA runtime.
+The common core and KV cache remain resident on the GPU. Selected Q4_0 routed experts are read from
+`.cghost` on a cache miss and promoted into a bounded VRAM expert cache; the Q6_K tied head uses the
+existing CUDA head kernel. The router still determines the same expert order before any records are
+loaded. This lane is experimental until a Windows parity and memory receipt is committed.
+
+```powershell
+$env:CAMELID_GEMMA4_GHOST_CUDA = '1'
+$env:CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS = '1000'
+$env:CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB = '160'
+
+.\camelid.exe serve --gpu on `
+  --model models\gemma-4-26B_q4_0-it.gguf `
+  --cghost models\gemma-4-26B_q4_0-it.cghost `
+  --expert-cache-mib 1024
+```
+
+The Windows default remains the parity-checked CPU/storage lane. Set
+`CAMELID_GEMMA4_GHOST_CUDA=1` to opt into the experimental CUDA route; it is not a support or
+token-parity claim. `CAMELID_GEMMA4_GHOST_CUDA_CACHE=0` disables persistent expert residency.
+`CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS` caps resident routed experts, while
+`CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB` preserves VRAM for transient uploads and driver overhead.
+Camelid also clamps the requested capacity to current free VRAM and falls back to CPU/storage if a
+single routed expert cannot fit after the reserve. The runtime GPU switch can force an already
+loaded lane back to CPU generation and truthful CPU health without a model reload. Starting with
+`--gpu off` or `--deterministic` prevents CUDA admission in the first place.
+
+The hot-shadow repacker marks its Windows destination sparse and deallocates routed-expert ranges
+with NTFS zero-data control calls. The runtime queries the destination volume's sector size for
+unbuffered reads instead of assuming 4 KiB sectors. Keep both artifacts on local NTFS storage;
+copying a sparse shadow through a tool or filesystem that expands holes can restore its full logical
+disk usage without changing model correctness.
+
 The 1 GiB default can retain a little more than one token's 240-expert routed working set on the
 tracked Q4_0 row. `--expert-cache-mib 0` retains no routed expert after the current use and gives
 the smallest application-owned footprint; smaller budgets may cyclically evict every expert

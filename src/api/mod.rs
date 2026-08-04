@@ -526,6 +526,15 @@ pub enum Gemma4ServeLane {
     Cuda,
 }
 
+/// Effective accelerator serving the single-node Ghost-MoE lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gemma4GhostBackend {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
 /// Effective accelerator shape for the active single-node Ghost-MoE runtime.
 /// Component booleans alongside this enum carry the exact common/expert/head
 /// breakdown; the string gives clients a stable high-level presentation lane.
@@ -534,6 +543,8 @@ pub enum Gemma4ServeLane {
 pub enum Gemma4GhostExecutionMode {
     FullCommonMetal,
     HybridMetal,
+    FullCommonCuda,
+    HybridCuda,
     CpuStorage,
 }
 
@@ -586,6 +597,13 @@ pub struct HealthResponse {
     pub gemma4_ghost_experts_metal_active: Option<bool>,
     /// True when the no-copy Q6_K tied vocabulary head is live on Metal.
     pub gemma4_ghost_head_metal_active: Option<bool>,
+    /// Backend-neutral Ghost execution truth. New clients should prefer these
+    /// fields; the Metal-specific booleans remain for compatibility with the
+    /// first experimental WebUI contract.
+    pub gemma4_ghost_backend: Option<Gemma4GhostBackend>,
+    pub gemma4_ghost_common_gpu_active: Option<bool>,
+    pub gemma4_ghost_experts_gpu_active: Option<bool>,
+    pub gemma4_ghost_head_gpu_active: Option<bool>,
     /// Engine-queue backpressure gauge: generation jobs accepted and not yet
     /// finished (queued + running). Bounded by CAMELID_QUEUE_DEPTH; beyond the
     /// bound requests get a typed 503 (`engine_queue_full`).
@@ -3005,6 +3023,10 @@ fn active_gemma4_serve_lane(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gemma4GhostExecutionHealth {
     mode: Gemma4GhostExecutionMode,
+    backend: Gemma4GhostBackend,
+    common_gpu_active: bool,
+    experts_gpu_active: bool,
+    head_gpu_active: bool,
     common_metal_active: bool,
     experts_metal_active: bool,
     head_metal_active: bool,
@@ -3013,29 +3035,61 @@ struct Gemma4GhostExecutionHealth {
 fn gemma4_ghost_execution_health(
     lane: Option<Gemma4ServeLane>,
     runtime_present: bool,
-    constructed: crate::gemma4_runtime::Gemma4GhostMetalComponents,
+    metal: crate::gemma4_runtime::Gemma4GhostMetalComponents,
+    cuda: crate::gemma4_runtime::Gemma4GhostCudaComponents,
     gpu_enabled: bool,
     deterministic: bool,
 ) -> Option<Gemma4GhostExecutionHealth> {
     if lane != Some(Gemma4ServeLane::GhostMoe) || !runtime_present {
         return None;
     }
-    let metal_allowed = gpu_enabled && !deterministic;
-    let common_metal_active = constructed.common && metal_allowed;
-    let experts_metal_active = constructed.experts && metal_allowed;
-    let head_metal_active = constructed.head && metal_allowed;
-    let mode = if common_metal_active {
-        Gemma4GhostExecutionMode::FullCommonMetal
-    } else if experts_metal_active || head_metal_active {
-        Gemma4GhostExecutionMode::HybridMetal
+    let gpu_allowed = gpu_enabled && !deterministic;
+    let cuda_active = gpu_allowed && (cuda.common || cuda.experts || cuda.head);
+    let metal_active = gpu_allowed && (metal.common || metal.experts || metal.head);
+    let (backend, common_gpu_active, experts_gpu_active, head_gpu_active, mode) = if cuda_active {
+        let mode = if cuda.common {
+            Gemma4GhostExecutionMode::FullCommonCuda
+        } else {
+            Gemma4GhostExecutionMode::HybridCuda
+        };
+        (
+            Gemma4GhostBackend::Cuda,
+            cuda.common,
+            cuda.experts,
+            cuda.head,
+            mode,
+        )
+    } else if metal_active {
+        let mode = if metal.common {
+            Gemma4GhostExecutionMode::FullCommonMetal
+        } else {
+            Gemma4GhostExecutionMode::HybridMetal
+        };
+        (
+            Gemma4GhostBackend::Metal,
+            metal.common,
+            metal.experts,
+            metal.head,
+            mode,
+        )
     } else {
-        Gemma4GhostExecutionMode::CpuStorage
+        (
+            Gemma4GhostBackend::Cpu,
+            false,
+            false,
+            false,
+            Gemma4GhostExecutionMode::CpuStorage,
+        )
     };
     Some(Gemma4GhostExecutionHealth {
         mode,
-        common_metal_active,
-        experts_metal_active,
-        head_metal_active,
+        backend,
+        common_gpu_active,
+        experts_gpu_active,
+        head_gpu_active,
+        common_metal_active: metal_active && metal.common,
+        experts_metal_active: metal_active && metal.experts,
+        head_metal_active: metal_active && metal.head,
     })
 }
 
@@ -3089,17 +3143,23 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         None
     };
     // Ask the active runtime, rather than the generic execution plan, which
-    // exact Ghost Metal components still exist. Then apply both live dispatch
+    // exact Ghost accelerator components still exist. These snapshots never
+    // take the stateful CUDA generation lock. Then apply both live dispatch
     // gates so POST /api/runtime/gpu and deterministic mode are reflected on
     // the very next health poll without a model reload.
     let metal_constructed = gemma4_runtime
         .as_deref()
         .map(Gemma4ServeRuntime::ghost_metal_components_constructed)
         .unwrap_or_default();
+    let cuda_constructed = gemma4_runtime
+        .as_deref()
+        .map(Gemma4ServeRuntime::ghost_cuda_components_constructed)
+        .unwrap_or_default();
     let ghost_execution = gemma4_ghost_execution_health(
         gemma4_serve_lane,
         gemma4_runtime.is_some(),
         metal_constructed,
+        cuda_constructed,
         crate::cuda::gpu_accel_enabled(),
         crate::inference::deterministic_mode_enabled(),
     );
@@ -3124,6 +3184,10 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         gemma4_ghost_experts_metal_active: ghost_execution
             .map(|health| health.experts_metal_active),
         gemma4_ghost_head_metal_active: ghost_execution.map(|health| health.head_metal_active),
+        gemma4_ghost_backend: ghost_execution.map(|health| health.backend),
+        gemma4_ghost_common_gpu_active: ghost_execution.map(|health| health.common_gpu_active),
+        gemma4_ghost_experts_gpu_active: ghost_execution.map(|health| health.experts_gpu_active),
+        gemma4_ghost_head_gpu_active: ghost_execution.map(|health| health.head_gpu_active),
         engine_queue_depth: state.engine.depth(),
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
@@ -3161,6 +3225,10 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         gemma4_ghost_execution_mode: None,
         gemma4_ghost_experts_metal_active: None,
         gemma4_ghost_head_metal_active: None,
+        gemma4_ghost_backend: None,
+        gemma4_ghost_common_gpu_active: None,
+        gemma4_ghost_experts_gpu_active: None,
+        gemma4_ghost_head_gpu_active: None,
         engine_queue_depth: state.engine.depth(),
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
@@ -3280,9 +3348,18 @@ mod gemma4_serve_lane_health_tests {
                 "full_common_metal",
             ),
             (Gemma4GhostExecutionMode::HybridMetal, "hybrid_metal"),
+            (Gemma4GhostExecutionMode::FullCommonCuda, "full_common_cuda"),
+            (Gemma4GhostExecutionMode::HybridCuda, "hybrid_cuda"),
             (Gemma4GhostExecutionMode::CpuStorage, "cpu_storage"),
         ] {
             assert_eq!(serde_json::to_value(mode).unwrap(), expected);
+        }
+        for (backend, expected) in [
+            (Gemma4GhostBackend::Cpu, "cpu"),
+            (Gemma4GhostBackend::Metal, "metal"),
+            (Gemma4GhostBackend::Cuda, "cuda"),
+        ] {
+            assert_eq!(serde_json::to_value(backend).unwrap(), expected);
         }
     }
 
@@ -3304,6 +3381,11 @@ mod gemma4_serve_lane_health_tests {
         );
         assert_eq!(
             value["gemma4_ghost_head_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["gemma4_ghost_backend"], serde_json::Value::Null);
+        assert_eq!(
+            value["gemma4_ghost_experts_gpu_active"],
             serde_json::Value::Null
         );
         assert_eq!(value["gemma4_available"], false);
@@ -3336,18 +3418,21 @@ mod gemma4_serve_lane_health_tests {
 
     #[test]
     fn ghost_execution_health_reports_full_hybrid_and_cpu_components() {
-        use crate::gemma4_runtime::Gemma4GhostMetalComponents as Components;
+        use crate::gemma4_runtime::{
+            Gemma4GhostCudaComponents as Cuda, Gemma4GhostMetalComponents as Metal,
+        };
         use Gemma4ServeLane::{Distributed, GhostMoe};
 
         assert_eq!(
             gemma4_ghost_execution_health(
                 Some(Distributed),
                 true,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
@@ -3357,20 +3442,32 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 false,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
             None
         );
         assert_eq!(
-            gemma4_ghost_execution_health(Some(GhostMoe), true, Components::default(), true, false,),
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Metal::default(),
+                Cuda::default(),
+                true,
+                false,
+            ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::CpuStorage,
+                backend: Gemma4GhostBackend::Cpu,
+                common_gpu_active: false,
+                experts_gpu_active: false,
+                head_gpu_active: false,
                 common_metal_active: false,
                 experts_metal_active: false,
                 head_metal_active: false,
@@ -3380,16 +3477,21 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal {
                     common: false,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::HybridMetal,
+                backend: Gemma4GhostBackend::Metal,
+                common_gpu_active: false,
+                experts_gpu_active: true,
+                head_gpu_active: true,
                 common_metal_active: false,
                 experts_metal_active: true,
                 head_metal_active: true,
@@ -3399,16 +3501,21 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 false,
                 false,
             ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::CpuStorage,
+                backend: Gemma4GhostBackend::Cpu,
+                common_gpu_active: false,
+                experts_gpu_active: false,
+                head_gpu_active: false,
                 common_metal_active: false,
                 experts_metal_active: false,
                 head_metal_active: false,
@@ -3418,16 +3525,21 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: false,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::FullCommonMetal,
+                backend: Gemma4GhostBackend::Metal,
+                common_gpu_active: true,
+                experts_gpu_active: true,
+                head_gpu_active: false,
                 common_metal_active: true,
                 experts_metal_active: true,
                 head_metal_active: false,
@@ -3437,7 +3549,49 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal::default(),
+                Cuda {
+                    common: false,
+                    experts: true,
+                    head: true,
+                },
+                true,
+                false,
+            ),
+            Some(Gemma4GhostExecutionHealth {
+                mode: Gemma4GhostExecutionMode::HybridCuda,
+                backend: Gemma4GhostBackend::Cuda,
+                common_gpu_active: false,
+                experts_gpu_active: true,
+                head_gpu_active: true,
+                common_metal_active: false,
+                experts_metal_active: false,
+                head_metal_active: false,
+            })
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Metal::default(),
+                Cuda {
+                    common: true,
+                    experts: true,
+                    head: true,
+                },
+                true,
+                false,
+            )
+            .unwrap()
+            .mode,
+            Gemma4GhostExecutionMode::FullCommonCuda,
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Metal::default(),
+                Cuda {
                     common: false,
                     experts: false,
                     head: true,
@@ -3448,7 +3602,7 @@ mod gemma4_serve_lane_health_tests {
             .unwrap()
             .mode,
             Gemma4GhostExecutionMode::CpuStorage,
-            "deterministic mode disables every Metal component",
+            "deterministic mode disables every accelerator component",
         );
     }
 
@@ -3459,11 +3613,17 @@ mod gemma4_serve_lane_health_tests {
         response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::HybridMetal);
         response.gemma4_ghost_experts_metal_active = Some(true);
         response.gemma4_ghost_head_metal_active = Some(false);
+        response.gemma4_ghost_backend = Some(Gemma4GhostBackend::Metal);
+        response.gemma4_ghost_common_gpu_active = Some(false);
+        response.gemma4_ghost_experts_gpu_active = Some(true);
+        response.gemma4_ghost_head_gpu_active = Some(false);
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["gemma4_ghost_common_metal_active"], false);
         assert_eq!(value["gemma4_ghost_execution_mode"], "hybrid_metal");
         assert_eq!(value["gemma4_ghost_experts_metal_active"], true);
         assert_eq!(value["gemma4_ghost_head_metal_active"], false);
+        assert_eq!(value["gemma4_ghost_backend"], "metal");
+        assert_eq!(value["gemma4_ghost_experts_gpu_active"], true);
 
         response.gemma4_ghost_common_metal_active = Some(true);
         response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::FullCommonMetal);
@@ -7422,6 +7582,22 @@ fn gemma4_cuda_enabled() -> bool {
     crate::execution_plan::gemma4_cuda_lane_selectable()
 }
 
+/// Ghost-MoE CUDA remains an explicit experimental opt-in until the exact 26B
+/// row has a committed Windows parity receipt. The ordinary host-wide CUDA
+/// policy still has to admit the device after this narrow gate is enabled.
+#[cfg(feature = "cuda")]
+fn gemma4_ghost_cuda_enabled() -> bool {
+    let enabled = std::env::var("CAMELID_GEMMA4_GHOST_CUDA")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes" | "enabled"
+            )
+        });
+    enabled && gemma4_cuda_enabled()
+}
+
 /// Per-file VRAM fit check for the gemma4 CUDA-resident lane.
 ///
 /// Policy says the lane is wanted; this says whether THIS file can have it. The
@@ -8307,7 +8483,11 @@ pub enum Gemma4ServeRuntime {
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
     /// CUDA decode engine (stateful GPU runtime -> Mutex; one request at a time).
     #[cfg(feature = "cuda")]
-    Cuda(std::sync::Mutex<crate::gemma4_runtime::Gemma4CudaResident>),
+    Cuda {
+        runtime: std::sync::Mutex<crate::gemma4_runtime::Gemma4CudaResident>,
+        /// Immutable construction-time truth for lock-free health snapshots.
+        ghost_components: crate::gemma4_runtime::Gemma4GhostCudaComponents,
+    },
 }
 
 impl Gemma4ServeRuntime {
@@ -8321,7 +8501,21 @@ impl Gemma4ServeRuntime {
             Self::Local(runtime) => runtime.ghost_metal_components(),
             Self::Distributed(_) => Default::default(),
             #[cfg(feature = "cuda")]
-            Self::Cuda(_) => Default::default(),
+            Self::Cuda { .. } => Default::default(),
+        }
+    }
+
+    /// CUDA components owned by the live runtime, captured separately from the
+    /// stateful decoder so a health poll cannot block behind a generation.
+    fn ghost_cuda_components_constructed(
+        &self,
+    ) -> crate::gemma4_runtime::Gemma4GhostCudaComponents {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda {
+                ghost_components, ..
+            } => *ghost_components,
+            _ => Default::default(),
         }
     }
 
@@ -8334,7 +8528,7 @@ impl Gemma4ServeRuntime {
             Self::Local(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
             Self::Distributed(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
             #[cfg(feature = "cuda")]
-            Self::Cuda(runtime) => runtime
+            Self::Cuda { runtime, .. } => runtime
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .tokenizer()
@@ -8353,7 +8547,7 @@ impl Gemma4ServeRuntime {
             Self::Local(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             Self::Distributed(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             #[cfg(feature = "cuda")]
-            Self::Cuda(m) => m
+            Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_cancellable(prompt, max_new, should_cancel),
@@ -8375,7 +8569,7 @@ impl Gemma4ServeRuntime {
                 r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
             }
             #[cfg(feature = "cuda")]
-            Self::Cuda(m) => m
+            Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel),
@@ -11051,6 +11245,44 @@ async fn load_gemma4_serve_runtime(
     let load_path = model_path.to_path_buf();
     let runtime = tokio::task::spawn_blocking(move || match (ghost_moe, distributed) {
         (Some((cghost, cache_mib, strict_cache)), None) => {
+            #[cfg(feature = "cuda")]
+            if gemma4_ghost_cuda_enabled() {
+                match gemma4_cuda_fit_check(&load_path) {
+                    Ok(()) => match crate::gemma4_runtime::Gemma4CudaResident::load_ghost_moe(
+                        &load_path,
+                        &cghost,
+                        cache_mib,
+                        strict_cache,
+                        4096,
+                    ) {
+                        Ok(runtime) => {
+                            let ghost_components = runtime.ghost_cuda_components();
+                            return Ok(Gemma4ServeRuntime::Cuda {
+                                runtime: std::sync::Mutex::new(runtime),
+                                ghost_components,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "gemma4 Ghost-MoE CUDA load failed; using CPU/storage"
+                            );
+                            eprintln!(
+                                "[gemma4-ghost] CUDA load failed: {error}; using CPU/storage"
+                            );
+                        }
+                    },
+                    Err(shortfall) => {
+                        tracing::warn!(
+                            shortfall = %shortfall,
+                            "gemma4 Ghost-MoE CUDA lane declined; using CPU/storage"
+                        );
+                        eprintln!(
+                            "[gemma4-ghost] CUDA lane declined: {shortfall}; using CPU/storage"
+                        );
+                    }
+                }
+            }
             crate::gemma4_runtime::Gemma4Runtime::load_ghost_moe(
                 &load_path,
                 &cghost,
@@ -11082,7 +11314,10 @@ async fn load_gemma4_serve_runtime(
                             // multi-turn headroom; overflow past it is guarded in the runtime.
                             match crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 4096) {
                                 Ok(r) => {
-                                    return Ok(Gemma4ServeRuntime::Cuda(std::sync::Mutex::new(r)))
+                                    return Ok(Gemma4ServeRuntime::Cuda {
+                                        runtime: std::sync::Mutex::new(r),
+                                        ghost_components: Default::default(),
+                                    });
                                 }
                                 // FALL BACK, do not propagate. The admission check
                                 // above is a projection, and a projection that is
@@ -11131,7 +11366,7 @@ async fn load_gemma4_serve_runtime(
             Gemma4ServeRuntime::Local(_) => Gemma4ServeLane::Local,
             Gemma4ServeRuntime::Distributed(_) => Gemma4ServeLane::Distributed,
             #[cfg(feature = "cuda")]
-            Gemma4ServeRuntime::Cuda(_) => Gemma4ServeLane::Cuda,
+            Gemma4ServeRuntime::Cuda { .. } => Gemma4ServeLane::Cuda,
         }
     };
     state

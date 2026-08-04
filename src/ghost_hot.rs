@@ -273,16 +273,70 @@ fn copy_span(
 }
 
 #[cfg(unix)]
-fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+fn allocated_bytes(metadata: &std::fs::Metadata, _path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.blocks().saturating_mul(512)
 }
 
-#[cfg(not(unix))]
-fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
-    // Portable Rust does not expose allocation size on Windows. The logical
-    // length is a conservative report; the byte/hole semantics remain exact.
+#[cfg(windows)]
+fn allocated_bytes(metadata: &std::fs::Metadata, path: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_SUCCESS};
+    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut high = 0u32;
+    // SAFETY: `wide` is a live, NUL-terminated UTF-16 path and `high` points to
+    // writable storage. GetCompressedFileSize reports allocated bytes for sparse
+    // files on NTFS/ReFS. Fall back conservatively when the filesystem declines.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low == INVALID_FILE_SIZE && unsafe { GetLastError() } != ERROR_SUCCESS {
+        metadata.len()
+    } else {
+        (u64::from(high) << 32) | u64::from(low)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn allocated_bytes(metadata: &std::fs::Metadata, _path: &Path) -> u64 {
     metadata.len()
+}
+
+#[cfg(windows)]
+fn prepare_sparse_destination(destination: &File, destination_path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let mut returned = 0u32;
+    // SAFETY: destination owns a live writable file handle. A null input buffer
+    // with FSCTL_SET_SPARSE marks the file sparse; no output buffer is required.
+    let ok = unsafe {
+        DeviceIoControl(
+            destination.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io_err(destination_path, std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn prepare_sparse_destination(_destination: &File, _destination_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// APFS eagerly accounts zero-extended ranges as allocated blocks. Explicitly
@@ -361,15 +415,60 @@ fn punch_expert_holes(
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows sparse ranges are deallocated with FSCTL_SET_ZERO_DATA. The file is
+/// marked sparse before its logical length is extended, so this operation keeps
+/// only the copied common core and the bounded identity islands allocated.
+#[cfg(windows)]
+fn punch_expert_holes(
+    destination: &File,
+    spans: &[Range<u64>],
+    destination_path: &Path,
+) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    for span in spans {
+        if span.start >= span.end {
+            continue;
+        }
+        let info = FILE_ZERO_DATA_INFORMATION {
+            FileOffset: i64::try_from(span.start)
+                .map_err(|_| invalid("Ghost hot-shadow hole start exceeds Windows i64 offsets"))?,
+            BeyondFinalZero: i64::try_from(span.end)
+                .map_err(|_| invalid("Ghost hot-shadow hole end exceeds Windows i64 offsets"))?,
+        };
+        let mut returned = 0u32;
+        // SAFETY: destination owns a live writable sparse-file handle and info
+        // describes an in-file half-open byte range. The control code consumes
+        // exactly one FILE_ZERO_DATA_INFORMATION and returns no output payload.
+        let ok = unsafe {
+            DeviceIoControl(
+                destination.as_raw_handle(),
+                FSCTL_SET_ZERO_DATA,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io_err(destination_path, std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn punch_expert_holes(
     _destination: &File,
     _spans: &[Range<u64>],
     _destination_path: &Path,
 ) -> Result<()> {
-    // Other targets retain the correct zero-hole byte semantics. Their
-    // platform APIs are not exposed by this crate, so allocation reporting is
-    // conservative until an explicit punch implementation is added.
+    // Other targets retain the correct zero-hole byte semantics. Their platform
+    // APIs are not exposed by this crate, so allocation reporting is conservative.
     Ok(())
 }
 
@@ -414,6 +513,7 @@ pub fn write_moe_hot_shadow(
         .write(true)
         .open(destination_path)
         .map_err(|err| io_err(destination_path, err))?;
+    prepare_sparse_destination(&destination, destination_path)?;
     destination
         .set_len(source_len)
         .map_err(|err| io_err(destination_path, err))?;
@@ -470,7 +570,7 @@ pub fn write_moe_hot_shadow(
 
     Ok(GhostHotShadowReport {
         logical_bytes: source_len,
-        allocated_bytes: allocated_bytes(&metadata),
+        allocated_bytes: allocated_bytes(&metadata, destination_path),
         copied_bytes,
         sparse_expert_bytes,
         expert_extents: expert_spans.len(),
@@ -674,6 +774,19 @@ mod tests {
             report.allocated_bytes,
             report.logical_bytes
         );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+
+            let attributes = std::fs::metadata(&shadow_path).unwrap().file_attributes();
+            assert_ne!(
+                attributes & FILE_ATTRIBUTE_SPARSE_FILE,
+                0,
+                "Windows hot shadow must be explicitly marked sparse"
+            );
+            assert!(report.allocated_bytes <= report.logical_bytes);
+        }
     }
 
     #[test]

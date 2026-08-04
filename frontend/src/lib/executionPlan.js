@@ -27,19 +27,25 @@ const SPECIALIZED_BACKENDS = new Set([
 const GHOST_EXECUTION_MODES = new Set([
   'full_common_metal',
   'hybrid_metal',
+  'full_common_cuda',
+  'hybrid_cuda',
   'cpu_storage',
 ])
+
+const GHOST_BACKENDS = new Set(['cpu', 'metal', 'cuda'])
 
 function optionalBoolean(value) {
   return typeof value === 'boolean' ? value : null
 }
 
-function ghostComponentSummary({ common, experts, head }) {
-  return `Common core: ${common ? 'Metal' : 'CPU'}. Persistent Q4_0 expert slots: ${experts ? 'Metal' : 'CPU/storage'}. Q6_K tied head: ${head ? 'Metal' : 'CPU'}. Routed expert records page from the local SSD.`
+function ghostComponentSummary({ accelerator, common, experts, head }) {
+  const gpu = accelerator === 'cuda' ? 'CUDA' : 'Metal'
+  return `Common core: ${common ? gpu : 'CPU'}. Persistent Q4_0 expert slots: ${experts ? gpu : 'CPU/storage'}. Q6_K tied head: ${head ? gpu : 'CPU'}. Routed expert records page from the local SSD.`
 }
 
 export function executionRuntimeFields(health) {
   const executionMode = String(health?.gemma4_ghost_execution_mode || '')
+  const ghostBackend = String(health?.gemma4_ghost_backend || '')
   return {
     execution_plan: health?.execution_plan || null,
     backend: health?.backend || 'none',
@@ -47,6 +53,10 @@ export function executionRuntimeFields(health) {
     gemma4_ghost_common_metal_active: optionalBoolean(health?.gemma4_ghost_common_metal_active),
     gemma4_ghost_experts_metal_active: optionalBoolean(health?.gemma4_ghost_experts_metal_active),
     gemma4_ghost_head_metal_active: optionalBoolean(health?.gemma4_ghost_head_metal_active),
+    gemma4_ghost_backend: GHOST_BACKENDS.has(ghostBackend) ? ghostBackend : null,
+    gemma4_ghost_common_gpu_active: optionalBoolean(health?.gemma4_ghost_common_gpu_active),
+    gemma4_ghost_experts_gpu_active: optionalBoolean(health?.gemma4_ghost_experts_gpu_active),
+    gemma4_ghost_head_gpu_active: optionalBoolean(health?.gemma4_ghost_head_gpu_active),
   }
 }
 
@@ -79,29 +89,52 @@ export function describeExecutionPlan(runtime) {
   }
 
   if (runtime?.backend === 'gemma4-runtime' && runtime?.gemma4_serve_lane === 'ghost_moe') {
-    const common = runtime?.gemma4_ghost_common_metal_active === true
-    const experts = runtime?.gemma4_ghost_experts_metal_active === true
-    const head = runtime?.gemma4_ghost_head_metal_active === true
-    const componentMode = common ? 'full_common_metal' : (experts || head) ? 'hybrid_metal' : 'cpu_storage'
+    const reportedBackend = GHOST_BACKENDS.has(runtime?.gemma4_ghost_backend)
+      ? runtime.gemma4_ghost_backend
+      : null
+    // Prefer the backend-neutral contract. Older engines expose only the
+    // Metal-specific fields, which remain a supported compatibility fallback.
+    const accelerator = reportedBackend === 'cuda'
+      ? 'cuda'
+      : reportedBackend === 'metal'
+        ? 'metal'
+        : reportedBackend === 'cpu'
+          ? null
+          : 'metal'
+    const neutral = reportedBackend !== null
+    const common = neutral
+      ? runtime?.gemma4_ghost_common_gpu_active === true
+      : runtime?.gemma4_ghost_common_metal_active === true
+    const experts = neutral
+      ? runtime?.gemma4_ghost_experts_gpu_active === true
+      : runtime?.gemma4_ghost_experts_metal_active === true
+    const head = neutral
+      ? runtime?.gemma4_ghost_head_gpu_active === true
+      : runtime?.gemma4_ghost_head_metal_active === true
+    const componentMode = accelerator && common
+      ? `full_common_${accelerator}`
+      : accelerator && (experts || head)
+        ? `hybrid_${accelerator}`
+        : 'cpu_storage'
     // The explicit mode is accepted only when its component booleans agree.
     // This prevents a malformed/stale string from manufacturing a GPU claim.
     const reportedMode = GHOST_EXECUTION_MODES.has(runtime?.gemma4_ghost_execution_mode)
       ? runtime.gemma4_ghost_execution_mode
       : null
     const mode = reportedMode === componentMode ? reportedMode : componentMode
-    const summary = ghostComponentSummary({ common, experts, head })
-    if (mode === 'full_common_metal') {
+    const summary = ghostComponentSummary({ accelerator, common, experts, head })
+    if (mode === 'full_common_metal' || mode === 'hybrid_metal') {
       return {
         state: 'metal',
-        device: 'Full-common Metal + local SSD',
+        device: `${mode === 'full_common_metal' ? 'Full-common' : 'Hybrid'} Metal + local SSD`,
         backend: 'Ghost-MoE',
         summary,
       }
     }
-    if (mode === 'hybrid_metal') {
+    if (mode === 'full_common_cuda' || mode === 'hybrid_cuda') {
       return {
-        state: 'metal',
-        device: 'Hybrid Metal + local SSD',
+        state: 'cuda',
+        device: `${mode === 'full_common_cuda' ? 'Full-common' : 'Hybrid'} CUDA + local SSD`,
         backend: 'Ghost-MoE',
         summary,
       }

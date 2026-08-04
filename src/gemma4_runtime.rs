@@ -1111,6 +1111,7 @@ impl GhostMoeExpertCache {
     /// frequency, recency, or observable hit/miss counters. The persistent
     /// Metal lane uses this only as a slot-fill source: routing remains owned by
     /// the normal caller, and a miss falls through to direct positioned I/O.
+    #[cfg(any(target_os = "macos", test))]
     fn peek_resident(&self, layer: usize, expert: usize) -> Option<Arc<GhostMoeExpert>> {
         self.state
             .lock()
@@ -1304,6 +1305,7 @@ fn ghost_metal_slots_per_layer_from_env() -> usize {
     slots
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GhostMetalSlotEntry {
     expert: usize,
@@ -1323,6 +1325,7 @@ struct GhostMetalSlotEntry {
 /// experts cannot evict one of its own earlier selections while filling later
 /// misses. Eviction chooses the least frequently used unpinned slot and uses
 /// oldest access as its stable tie-break.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct GhostMetalSlotDirectory {
     entries: Vec<Option<GhostMetalSlotEntry>>,
@@ -1330,6 +1333,7 @@ struct GhostMetalSlotDirectory {
     accesses: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GhostMetalSlotLoad {
     slot: usize,
@@ -1338,6 +1342,7 @@ struct GhostMetalSlotLoad {
     last_used: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, PartialEq, Eq)]
 struct GhostMetalSlotPlan {
     /// Slot IDs in the router's original top-k order.
@@ -1352,6 +1357,7 @@ struct GhostMetalSlotPlan {
     evictions: usize,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl GhostMetalSlotDirectory {
     fn new(slot_count: usize) -> Self {
         Self {
@@ -2249,11 +2255,13 @@ fn packed_band_matvec(packed: &crate::tensor::Q4_0PackedRows8, xq: &[Q8_0Block])
 /// loads. Deterministic mode remains authoritative even if the runtime switch is
 /// subsequently turned back on.
 #[inline]
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_acceleration_allowed(deterministic: bool, runtime_gpu_enabled: bool) -> bool {
     !deterministic && runtime_gpu_enabled
 }
 
 #[inline]
+#[cfg(target_os = "macos")]
 fn ghost_metal_acceleration_enabled() -> bool {
     ghost_metal_acceleration_allowed(
         crate::inference::deterministic_mode_enabled(),
@@ -2701,6 +2709,16 @@ pub struct Gemma4Runtime {
 /// the model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gemma4GhostMetalComponents {
+    pub common: bool,
+    pub experts: bool,
+    pub head: bool,
+}
+
+/// CUDA components constructed for a single-node Ghost-MoE runtime. Kept as a
+/// small copyable snapshot so API health never needs to lock the stateful CUDA
+/// decoder while a generation owns it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Gemma4GhostCudaComponents {
     pub common: bool,
     pub experts: bool,
     pub head: bool,
@@ -6655,6 +6673,26 @@ impl Gemma4CudaResident {
     /// bounds the resident KV cache.
     pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
         let cpu = Gemma4Runtime::load(path)?;
+        Self::from_cpu_runtime(cpu, max_positions)
+    }
+
+    /// Load the common Gemma 4 core from the sparse GGUF shadow and routed
+    /// experts from `.cghost`, then execute through the existing CUDA common
+    /// core and bounded SSER expert cache. A cache miss uploads exactly one
+    /// validated expert record; routed expert holes in the shadow are never read.
+    pub fn load_ghost_moe(
+        path: &Path,
+        cghost: &Path,
+        cache_mib: usize,
+        evict_page_cache: bool,
+        max_positions: usize,
+    ) -> Result<Self> {
+        let cpu = Gemma4Runtime::load_ghost_moe(path, cghost, cache_mib, evict_page_cache)?;
+        Self::from_cpu_runtime(cpu, max_positions)
+    }
+
+    fn from_cpu_runtime(cpu: Gemma4Runtime, max_positions: usize) -> Result<Self> {
+        let ghost_moe = cpu.ghost_moe_cache.is_some();
         // BASALT Amendment 3 review fix: refuse NVFP4 layer projections with a
         // typed error BEFORE the `GemmaLayerQuant::from_wire` catch-all (`upw`
         // below) can panic. The CPU wire lane serves NVFP4 in this release;
@@ -6908,16 +6946,39 @@ impl Gemma4CudaResident {
 
         let alloc_f = |n: usize| s.alloc_zeros::<f32>(n.max(1));
         let alloc_i = |n: usize| s.alloc_zeros::<i8>(n.max(1));
-        // SSER (M2): enable the per-(layer,expert) VRAM cache only when the model has
-        // MoE layers AND the flag is set. Capacity defaults to ~1000 experts (the
+        // SSER (M2): enable the per-(layer,expert) VRAM cache when requested for a
+        // normal GGUF, and by default for Ghost-MoE. Capacity defaults to ~1000 experts (the
         // measured hot set); each cached expert is ~2*n_ff_exp*(hidden/32)*18 +
         // hidden*(n_ff_exp/32)*18 bytes of Q4_0 wire (~3.3 MB on the 26B), so ~1000
         // experts ≈ ~3.3 GB — under the ~3.6 GB free after the resident set. Tunable
         // via CAMELID_SSER_CACHE_EXPERTS.
         let first_moe = cpu.layers.iter().find_map(|lw| lw.moe.as_ref());
-        let sser = if let (Some(moe), true) =
-            (first_moe, std::env::var_os("CAMELID_SSER_CACHE").is_some())
-        {
+        let ghost_cuda_cache_enabled = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_CACHE")
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+            })
+            .unwrap_or(true);
+        let sser_requested = std::env::var_os("CAMELID_SSER_CACHE").is_some()
+            || (ghost_moe && ghost_cuda_cache_enabled);
+        let q4_experts = cpu
+            .layers
+            .iter()
+            .filter_map(|layer| layer.moe.as_ref())
+            .all(|moe| {
+                moe.gate_up_exps.format == WireFormat::Q4_0
+                    && moe.down_exps.format == WireFormat::Q4_0
+            });
+        if ghost_moe && sser_requested && !q4_experts {
+            return Err(BackendError::UnsupportedGguf(
+                "Ghost-MoE CUDA expert residency currently requires Q4_0 gate_up and down records"
+                    .into(),
+            ));
+        }
+        let sser = if let (Some(moe), true) = (first_moe, sser_requested) {
             // Per-expert VRAM cost: the two Q4_0 slices this expert's GEMVs read.
             // gate_up = 2*n_ff_exp rows of hidden values; down = hidden rows of
             // n_ff_exp values; Q4_0 packs 32 values per 18-byte block.
@@ -6938,18 +6999,27 @@ impl Gemma4CudaResident {
             // +~50% steady decode (miss-bound, capacity-limited). Reserve tunable via
             // CAMELID_SSER_CACHE_RESERVE_MIB; a hard 0.98 cap on the free fraction is a
             // final belt-and-suspenders against a pathologically small `free`.
-            let reserve_mib = std::env::var("CAMELID_SSER_CACHE_RESERVE_MIB")
+            let reserve_mib = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB")
                 .ok()
+                .or_else(|| std::env::var("CAMELID_SSER_CACHE_RESERVE_MIB").ok())
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(160);
             let reserve = reserve_mib * 1024 * 1024;
             let hard_cap = (free as f64 * 0.98) as usize;
             let budget = free.saturating_sub(reserve).min(hard_cap);
             let fit_cap = budget.checked_div(per_expert_bytes).unwrap_or(0);
-            let req_cap = std::env::var("CAMELID_SSER_CACHE_EXPERTS")
+            let req_cap = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS")
                 .ok()
+                .or_else(|| std::env::var("CAMELID_SSER_CACHE_EXPERTS").ok())
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1000);
+            if ghost_moe && fit_cap == 0 {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "gemma4 Ghost-MoE CUDA has only {} MiB free after common weights/KV/head; no routed expert fits while preserving the {} MiB reserve",
+                    free / (1024 * 1024),
+                    reserve_mib
+                )));
+            }
             // Honor the smaller of the requested capacity and what free VRAM allows.
             let cap = req_cap.min(fit_cap).max(1);
             eprintln!(
@@ -7064,6 +7134,18 @@ impl Gemma4CudaResident {
         })
     }
 
+    /// Load-time Ghost CUDA ownership snapshot for lock-free API health.
+    pub fn ghost_cuda_components(&self) -> Gemma4GhostCudaComponents {
+        if self.cpu.ghost_moe_cache.is_none() {
+            return Gemma4GhostCudaComponents::default();
+        }
+        Gemma4GhostCudaComponents {
+            common: true,
+            experts: self.sser.is_some(),
+            head: self.gpu_head.is_some(),
+        }
+    }
+
     /// Reset the SSER hit/miss counters (keeps resident weights). Lets the harness
     /// separate warm-up misses from steady-state hit-rate. No-op when disabled.
     pub fn sser_reset_counters(&self) {
@@ -7136,6 +7218,27 @@ impl Gemma4CudaResident {
         }
         let mut wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
         wsum = wsum.max(6.103_515e-5);
+        // Ghost-MoE shadows intentionally contain zero holes for routed experts.
+        // Resolve only SSER misses from the paired `.cghost`, batching positioned
+        // reads in physical expert order before restoring router order.
+        let mut ghost_records = if let Some(ghost) = moe.ghost.as_ref() {
+            let missing = {
+                let cache = sser.borrow();
+                idx.iter()
+                    .copied()
+                    .filter(|&expert| !cache.entries.contains_key(&(l as u16, expert as u16)))
+                    .collect::<Vec<_>>()
+            };
+            let loaded = ghost.cache.get_many(ghost.layer_idx, &missing)?;
+            Some(
+                missing
+                    .into_iter()
+                    .zip(loaded)
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+        } else {
+            None
+        };
         if prof {
             SSER_PROF_ROUTER_NS.fetch_add(
                 tp1.elapsed().as_nanos() as u64,
@@ -7194,12 +7297,63 @@ impl Gemma4CudaResident {
             // ~6 MiB weight htod + the same tiny GEMV launches a hit already pays.
             if !cached {
                 sser.borrow_mut().misses += 1;
-                let gu_off = e * two_nff * gu_row_bytes;
-                let down_off = e * hidden * down_row_bytes;
-                let gu_slice = &gate_up_bytes[gu_off..gu_off + two_nff * gu_row_bytes];
-                let down_slice = &down_bytes[down_off..down_off + hidden * down_row_bytes];
-                let gu_dev = s.clone_htod(gu_slice).map_err(cu)?;
-                let down_dev = s.clone_htod(down_slice).map_err(cu)?;
+                let expected_gu = two_nff * gu_row_bytes;
+                let expected_down = hidden * down_row_bytes;
+                let (gu_dev, down_dev) = if let Some(records) = ghost_records.as_mut() {
+                    // A route that was resident when `missing` was captured can
+                    // be evicted by an earlier miss in this same ordered top-k.
+                    // Recover only that exact race from `.cghost`; processing
+                    // order and weighted accumulation remain router-identical.
+                    if let std::collections::hash_map::Entry::Vacant(slot) = records.entry(e) {
+                        let ghost = moe.ghost.as_ref().expect("Ghost records require Ghost MoE");
+                        let record = ghost
+                            .cache
+                            .get_many(ghost.layer_idx, &[e])?
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                BackendError::InvalidModelMetadata(format!(
+                                    "Ghost-MoE CUDA could not recover evicted routed expert layer={l} expert={e}"
+                                ))
+                            })?;
+                        slot.insert(record);
+                    }
+                    let record = records.get(&e).ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(format!(
+                            "Ghost-MoE CUDA lost routed expert layer={l} expert={e}"
+                        ))
+                    })?;
+                    if record.gate_up.dtype != GgufTensorType::Q4_0
+                        || record.down.dtype != GgufTensorType::Q4_0
+                    {
+                        return Err(BackendError::UnsupportedGguf(format!(
+                            "Ghost-MoE CUDA requires Q4_0 expert records; layer={l} expert={e} gate_up={:?} down={:?}",
+                            record.gate_up.dtype, record.down.dtype
+                        )));
+                    }
+                    let (gu_backing, gu_range) = record.tensor_backing(&record.gate_up);
+                    let (down_backing, down_range) = record.tensor_backing(&record.down);
+                    if gu_range.len() != expected_gu || down_range.len() != expected_down {
+                        return Err(BackendError::InvalidModelMetadata(format!(
+                            "Ghost-MoE CUDA expert record length mismatch at layer={l} expert={e}: gate_up={} expected={expected_gu}, down={} expected={expected_down}",
+                            gu_range.len(),
+                            down_range.len()
+                        )));
+                    }
+                    (
+                        s.clone_htod(&gu_backing[gu_range]).map_err(cu)?,
+                        s.clone_htod(&down_backing[down_range]).map_err(cu)?,
+                    )
+                } else {
+                    let gu_off = e * expected_gu;
+                    let down_off = e * expected_down;
+                    (
+                        s.clone_htod(&gate_up_bytes[gu_off..gu_off + expected_gu])
+                            .map_err(cu)?,
+                        s.clone_htod(&down_bytes[down_off..down_off + expected_down])
+                            .map_err(cu)?,
+                    )
+                };
                 let mut c = sser.borrow_mut();
                 c.evict_if_full();
                 c.clock += 1;
@@ -8433,6 +8587,19 @@ impl Gemma4CudaResident {
         mut on_delta: F,
         mut should_cancel: C,
     ) -> Result<Gemma4GenerationOutcome> {
+        // The shared runtime GPU switch remains live after model load. When it
+        // is disabled (or deterministic mode is active), use the already-loaded
+        // CPU/Ghost runtime and discard CUDA prefix state so health and execution
+        // agree without requiring a model reload.
+        if !crate::cuda::gpu_accel_enabled() || crate::inference::deterministic_mode_enabled() {
+            self.cached_tokens.clear();
+            return self.cpu.generate_greedy_streaming_cancellable(
+                prompt,
+                max_new,
+                on_delta,
+                should_cancel,
+            );
+        }
         if should_cancel() {
             self.cached_tokens.clear();
             return Ok(Gemma4GenerationOutcome::Cancelled {

@@ -35,6 +35,24 @@ assert.deepEqual(
 assert.deepEqual(
   describeExecutionPlan({
     ...baseGhostRuntime,
+    gemma4_ghost_backend: 'cuda',
+    gemma4_ghost_execution_mode: 'hybrid_cuda',
+    gemma4_ghost_common_gpu_active: false,
+    gemma4_ghost_experts_gpu_active: true,
+    gemma4_ghost_head_gpu_active: true,
+  }),
+  {
+    state: 'cuda',
+    device: 'Hybrid CUDA + local SSD',
+    backend: 'Ghost-MoE',
+    summary: 'Common core: CPU. Persistent Q4_0 expert slots: CUDA. Q6_K tied head: CUDA. Routed expert records page from the local SSD.',
+  },
+  'a Windows Ghost runtime should report its live CUDA expert and head components',
+)
+
+assert.deepEqual(
+  describeExecutionPlan({
+    ...baseGhostRuntime,
     gemma4_ghost_execution_mode: 'hybrid_metal',
     gemma4_ghost_common_metal_active: false,
     gemma4_ghost_experts_metal_active: true,
@@ -68,6 +86,10 @@ assert.deepEqual(
     gemma4_ghost_common_metal_active: false,
     gemma4_ghost_experts_metal_active: true,
     gemma4_ghost_head_metal_active: false,
+    gemma4_ghost_backend: 'metal',
+    gemma4_ghost_common_gpu_active: false,
+    gemma4_ghost_experts_gpu_active: true,
+    gemma4_ghost_head_gpu_active: false,
   }),
   {
     execution_plan: null,
@@ -76,6 +98,10 @@ assert.deepEqual(
     gemma4_ghost_common_metal_active: false,
     gemma4_ghost_experts_metal_active: true,
     gemma4_ghost_head_metal_active: false,
+    gemma4_ghost_backend: 'metal',
+    gemma4_ghost_common_gpu_active: false,
+    gemma4_ghost_experts_gpu_active: true,
+    gemma4_ghost_head_gpu_active: false,
   },
   'dashboard projection must preserve the exact hybrid component report',
 )
@@ -92,6 +118,11 @@ assert.equal(
   'unknown execution modes must fail closed',
 )
 assert.equal(
+  executionRuntimeFields({ gemma4_ghost_backend: 'directml' }).gemma4_ghost_backend,
+  null,
+  'unknown Ghost backends must fail closed',
+)
+assert.equal(
   describeExecutionPlan({
     ...baseGhostRuntime,
     gemma4_ghost_execution_mode: 'hybrid_metal',
@@ -101,6 +132,18 @@ assert.equal(
   }).state,
   'cpu',
   'a mode string without matching live component booleans must not manufacture a Metal claim',
+)
+assert.equal(
+  describeExecutionPlan({
+    ...baseGhostRuntime,
+    gemma4_ghost_backend: 'cuda',
+    gemma4_ghost_execution_mode: 'full_common_cuda',
+    gemma4_ghost_common_gpu_active: 'true',
+    gemma4_ghost_experts_gpu_active: false,
+    gemma4_ghost_head_gpu_active: false,
+  }).state,
+  'cpu',
+  'malformed neutral component fields must not manufacture a CUDA claim',
 )
 
 const dashboardSource = readFileSync(

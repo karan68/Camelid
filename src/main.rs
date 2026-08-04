@@ -6555,6 +6555,8 @@ fn apply_deterministic_mode() {
         "CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST",
         "CAMELID_GEMMA4_GHOST_METAL_COMMON",
         "CAMELID_GEMMA4_GHOST_METAL",
+        "CAMELID_GEMMA4_GHOST_CUDA",
+        "CAMELID_GEMMA4_GHOST_CUDA_CACHE",
     ] {
         std::env::set_var(key, "0");
     }
