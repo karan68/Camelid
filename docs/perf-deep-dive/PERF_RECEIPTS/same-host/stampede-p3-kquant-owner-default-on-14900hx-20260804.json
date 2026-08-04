@@ -27,6 +27,13 @@
     "engagement_check": "the sweep hard-fails a config whose owner never dispatched; owner_prefill_taken is recorded per row"
   },
 
+  "what_the_flag_actually_gates": {
+    "call_sites": "exactly three, all found by grepping kquant_prefill_owner_enabled: q4_k_block_dot_core_with_repack, matmul_rhs_transposed_q4_k_block_dot, and q6_k_block_dot_core (all src/inference.rs). Every one is additionally guarded by n_rows >= 4, which is why decode is untouched.",
+    "in_scope": "Q4_K and Q6_K tensors only.",
+    "NOT_in_scope": "Q5_K, Q3_K, Q2_K and IQ4_XS do NOT route through this gate -- they have no owner at all, so the promotion cannot change them. A Q5_K_M model is still partially affected, because such mixes carry Q6_K tensors.",
+    "why_this_is_called_out": "An earlier draft of this receipt claimed those quants shared the gate and were unswept. That was wrong, and the grep above is the correction."
+  },
+
   "results": {
     "note": "owner_avxvnni256 is what a promoted default actually selects on this host. owner_avx2 is what it selects on an AVX2-only host, and is reported so the promotion is not justified purely by hardware this receipt's author happens to own.",
     "llama1b_q4km": {
@@ -44,7 +51,14 @@
       "p606_8_rounds":  { "off": 28.169, "owner_avx2": 44.289, "owner_avxvnni256": 49.691, "ratio_vs_off": 1.7634, "ci95": [1.7404, 1.7891], "won": "8/8" },
       "p2421_5_rounds": { "off": 23.921, "owner_avx2": 34.357, "owner_avxvnni256": 37.493, "ratio_vs_off": 1.5700, "ci95": [1.5465, 1.5821], "won": "5/5" }
     },
-    "totals": { "cells": 9, "cells_significant": 9, "paired_rounds": 66, "rounds_won": 66, "ratio_range": [1.5619, 1.8768] },
+    "pure_q6k_the_other_gated_path": {
+      "model": "<home>/models/Llama-3.2-1B-Instruct-Q6_K.gguf, 974.5 MB, sha256 0f4c510daf16e0d1b3bc94931fd9296c28936bebdda2593687d4eb70c5b70628",
+      "why": "The Q4_K_M sweeps exercise q6_k_block_dot_core only as the per-layer Q6_K tensor (1 matmul in 7). A model that is Q6_K throughout is the case those sweeps do not cover, and it is the second path this promotion switches on.",
+      "p606_8_rounds": { "off": 72.693, "owner_avx2": 108.307, "owner_avxvnni256": 108.387, "ratio_vs_off": 1.4937, "ci95": [1.4835, 1.5004], "won": "8/8", "engaged": 336 },
+      "internal_consistency": "owner_avx2 and owner_avxvnni256 are within 0.1% of each other here, which is exactly right: Q6_K has no VNNI inner at any width, so the 256-bit kernel from #593 cannot and does not move this model. That the two arms agree is evidence the measurement is real.",
+      "supersedes": "stampede-p3-q6k-owner-{off,on}-tinyllama-q6k-20260708.json, which show the owner SLOWER on a pure Q6_K model (23.76 vs 24.21 tok/s). Those were taken before the Q6_K wrapper was fixed to delegate (it carried an inline duplicate of the core and never dispatched the owner), and on a local requant that routes to the EXPERIMENTAL lane rather than native kernels. They do not describe the shipping path."
+    },
+    "totals": { "cells": 10, "cells_significant": 10, "paired_rounds": 74, "rounds_won": 74, "ratio_range": [1.4937, 1.8768] },
     "avx2_only_hosts": "owner_avx2 vs off spans 1.4102 to 1.6115 across the same nine cells, all significant, so the promotion is a win on plain-AVX2 hosts too and does not depend on AVX-VNNI.",
     "units": "prefill_tok_s, median over measured rounds"
   },
@@ -87,10 +101,10 @@
 
   "open_questions": [
     "One host. The promotion is scoped to win-x86_64 but measured on a single hybrid Raptor Lake part; an AVX2-only or AMD x86 host would strengthen or narrow the scope.",
-    "Q4_K_M only. Q5_K_M, Q3_K_M, Q2_K and IQ4_XS route through the same owner gate but were not swept -- several of them have no SIMD kernel at all, so the owner's benefit there is unmeasured.",
+    "Pure Q6_K was measured at one model and one prompt length (606 tokens), not the full three-length sweep the Q4_K_M models got.",
     "The Q8 owner's 1B regression remains open and is NOT addressed here; the two owners are separate flags with separate defaults.",
     "The gate in STAMPEDE_CONDUCTOR is expressed as an absolute tok/s against a llama.cpp pin on an i7-11800H. This receipt argues the promotion on measured ratio-vs-shipped-default plus zero regression instead, because the pinned reference was not re-run on this host."
   ],
 
-  "verdict": "Promote for win-x86_64. 9 of 9 cells significant, 66 of 66 paired rounds, 1.56x to 1.88x over the shipped default across three models and three prompt lengths, byte-identical output, no measurable memory cost, and a verified kill switch. The small-model regression that sank the equivalent Q8 claim was specifically tested for and does not occur."
+  "verdict": "Promote for win-x86_64. 10 of 10 cells significant, 74 of 74 paired rounds, 1.49x to 1.88x over the shipped default across four models and three prompt lengths, byte-identical output, no measurable memory cost, and a verified kill switch. Both gated paths are covered: Q4_K via three Q4_K_M models, and Q6_K via a native Q6_K model that supersedes the older pre-fix receipts. The small-model regression that sank the equivalent Q8 claim was specifically tested for and does not occur."
 }
