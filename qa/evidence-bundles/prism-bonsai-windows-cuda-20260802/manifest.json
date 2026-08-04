@@ -73,10 +73,13 @@
     "q1_27b_cuda_performance": "bonsai-27b-q1-cuda-performance.json; default POPC decode averaged 21.3805924341 tok/s versus 16.4639010553 tok/s disabled, reported as 29.864% at four-decimal rate display precision (29.863465% from the full-precision means) over 23 post-first tokens per run",
     "q1_27b_cuda_performance_receipts": [
       "prism-popc-default.json",
-      "prism-popc-disabled.json"
+      "prism-popc-disabled.json",
+      "prism-vendor-reasoning-off.json"
     ],
     "q1_27b_cuda_performance_correctness": "identical generated text across all three default and all three POPC-disabled image runs",
     "q1_27b_cuda_performance_timing_boundary": "image TTFT includes projection, prefill, and first-token production and is reported separately; it was 1.547% slower in this A/B, while end-to-end latency was 6.537% lower",
+    "q1_27b_vendor_decode_comparison": "same-host pinned Prism demo with reasoning off and matching 142 prompt tokens averaged 18.1872652785 tok/s; Camelid averaged 21.3805924341 tok/s, a bounded 17.558% post-first decode-throughput advantage",
+    "q1_27b_vendor_comparison_boundary": "same model, projector, image, prompt, greedy sampling, prompt-token count, and completion length; generated wording differs and Prism image TTFT was materially lower, so no output-parity or overall-latency advantage is claimed",
     "q1_27b_text_vision": "bonsai-27b-chat-vision-parity.json and bonsai-27b-frontier-cap128-parity.json",
     "vision_disclosure": "text is token-exact; image prompt-token counts align at the 128-token cap, while generated visual wording is coherent but not token-exact",
     "q2_27b_capacity": "36/64 trailing layers streamed from pinned host RAM on the 6144 MiB reference GPU",
@@ -93,6 +96,7 @@
     "bonsai-4b-q1-parity.json",
     "prism-popc-default.json",
     "prism-popc-disabled.json",
+    "prism-vendor-reasoning-off.json",
     "ternary-4b-q2-oracle.json",
     "ternary-4b-q2-parity.json",
     "windows-exact-row-smoke.json"
@@ -103,6 +107,7 @@
     "non-Windows-CUDA portability beyond the separate macOS Metal receipt",
     "multiple or remote images, audio, video, vision plus tools, or Responses API multimodal input",
     "cross-hardware, multi-user, production-service, or broader-model throughput",
-    "bit-exact equivalence of every internal optimized kernel or intermediate logit to a legacy serial or BMMA implementation"
+    "bit-exact equivalence of every internal optimized kernel or intermediate logit to a legacy serial or BMMA implementation",
+    "a cross-engine image-TTFT, end-to-end-latency, output-parity, cross-hardware, or production-service advantage over the Prism reference"
   ]
 }

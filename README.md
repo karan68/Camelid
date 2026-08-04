@@ -337,7 +337,11 @@ projections, binary tensor-core prompt prefill, bitplane/POPC decode kernels, an
 captured decode graph by default. On the checked RTX 3060 Laptop GPU, a three-run
 24-token full-image benchmark measured 21.38 decode tok/s versus 16.46 tok/s with
 POPC disabled (29.9% faster), with identical generated text in all six runs. This is
-a hardware-specific receipt, not a portable throughput promise.
+a hardware-specific receipt, not a portable throughput promise. With the same model,
+projector, image, prompt, 142 prompt tokens, 24-token greedy completion, and reasoning
+disabled, the pinned Prism CUDA demo measured 18.19 decode tok/s on the same host;
+Camelid was 17.6% faster in that bounded post-first decode comparison. Prism retained
+materially lower image TTFT, so this is not an end-to-end latency claim.
 The graph covers the layer stack, final norm, and LM head; embedding lookup, RoPE table
 selection, device argmax, and generated-token handoff stay device-resident immediately
 outside the capture. Diagnostic escape hatches are `CAMELID_PRISM_CUDA_NO_GRAPH=1` for
