@@ -12,6 +12,7 @@ import {
   fitIsRecheckable,
   fitIsSettled,
   fitLabel,
+  ghostMoeFits,
   groupHfFilesByRepo,
   isRefusingFit,
   partitionByArchSupport,
@@ -197,10 +198,48 @@ function FitAdvisory({ item, onCheckFit, checking }) {
   )
 }
 
+function GhostMoeOption({ item, selected, prepared, disabled, onChange }) {
+  const ghost = item?.ghost_moe
+  if (!ghost?.available) return null
+  const fits = ghostMoeFits(item)
+  return (
+    <div className={`catalog-ghost-option${fits ? ' catalog-ghost-option--ready' : ''}`}>
+      <label className="catalog-ghost-toggle">
+        <input
+          type="checkbox"
+          checked={prepared || selected}
+          disabled={prepared || disabled || !fits}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span>
+          <strong>{prepared ? 'Ghost MoE enabled' : 'Use Ghost MoE'}</strong>
+          {ghost.recommended && !prepared ? <em>Recommended for this GPU</em> : null}
+        </span>
+      </label>
+      <p>
+        Keeps the common core and hot experts on CUDA, then pages routed experts from disk.
+        The prepared install uses about {prettySize(ghost.installed_bytes)}; preparation temporarily
+        needs up to {prettySize(ghost.peak_disk_bytes)} total.
+      </p>
+      {!ghost.host_eligible ? (
+        <p className="catalog-ghost-warning">This supported lane requires Windows and a compatible CUDA GPU.</p>
+      ) : ghost.fit === 'insufficient_free_memory' ? (
+        <p className="catalog-ghost-warning">
+          This GPU has enough total VRAM. Camelid will release its current model before starting Ghost MoE;
+          other GPU applications may also need to be closed.
+        </p>
+      ) : !fits ? (
+        <p className="catalog-ghost-warning">The Ghost common resident set does not fit the currently available GPU memory.</p>
+      ) : null}
+    </div>
+  )
+}
+
 function CatalogRow({
   item,
   capabilities,
   installed,
+  ghostMoePrepared = false,
   missingArtifacts = [],
   activeDownload,
   apiBase,
@@ -229,6 +268,10 @@ function CatalogRow({
   const [message, setMessage] = useState('')
   const [isError, setIsError] = useState(false)
   const [failedStage, setFailedStage] = useState('')
+  // Ghost-MoE changes the on-disk representation, so keep it an explicit user
+  // opt-in. `recommended` decorates the option but must never tick it on behalf
+  // of the user; prepared installs remain checked and locked by design.
+  const [ghostMoeSelected, setGhostMoeSelected] = useState(() => Boolean(ghostMoePrepared))
   const [settlementTick, setSettlementTick] = useState(0)
   const sawDownloadRef = useRef(false)
   const startedAtRef = useRef(0)
@@ -241,13 +284,17 @@ function CatalogRow({
   // ANY load-refusing verdict must stop the auto-start chain, not just `wont_fit`:
   // the load-time guard refuses both, so chaining into it would end in a 422.
   const refusedByFit = isRefusingFit(item.fit)
-  const downloadAndStart = lane === 'supported' && !refusedByFit
+  const ghostMoeUsable = ghostMoeFits(item)
+  const useGhostMoe = ghostMoePrepared || (ghostMoeSelected && ghostMoeUsable)
+  const effectiveFitRefusal = refusedByFit && !useGhostMoe
+  const downloadAndStart = lane === 'supported' && !effectiveFitRefusal
   const smokeAfterDownload = item.group !== 'experimental'
-    && !refusedByFit
+    && !effectiveFitRefusal
     && !downloadAndStart
     && item.oracle_qualified
   const acquisitionMode = downloadAndStart ? 'start' : smokeAfterDownload ? 'smoke' : 'download'
-  const downloading = activeDownload?.status === 'downloading'
+  const downloading = activeDownload?.status === 'downloading' || activeDownload?.status === 'preparing'
+  const preparingGhost = activeDownload?.status === 'preparing'
   const downloadFailed = activeDownload?.status === 'failed'
   const rejoinableDownload = downloading || activeDownload?.status === 'completed'
   const operationBusy = phase === 'checking' || phase === 'loading'
@@ -402,6 +449,7 @@ function CatalogRow({
           filename: item.filename,
           size_bytes: item.size_bytes,
           continuation_mode: acquisitionMode,
+          ghost_moe: useGhostMoe,
         }),
       })
       if (!res.ok) {
@@ -451,6 +499,13 @@ function CatalogRow({
       )}
       <FitAdvisory item={item} onCheckFit={onCheckFit} checking={checkingFit} />
       {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
+      <GhostMoeOption
+        item={item}
+        selected={ghostMoeSelected}
+        prepared={ghostMoePrepared}
+        disabled={!['idle', 'confirm'].includes(phase)}
+        onChange={setGhostMoeSelected}
+      />
 
       {showProgress ? (
         <div className="catalog-start" role="status" aria-live="polite">
@@ -478,6 +533,8 @@ function CatalogRow({
               ? 'Download complete — checking the model…'
               : phase === 'loading'
                 ? 'Check passed — loading the model for Chat…'
+                : preparingGhost
+                  ? 'Preparing Ghost MoE — repacking routed experts and reclaiming the full download…'
                 : downloading
                   ? activeDownload?.current_artifact_role === 'vision_projector'
                     ? 'Downloading the vision projector — live progress is shown above.'
@@ -497,8 +554,10 @@ function CatalogRow({
         </div>
       ) : phase === 'done' ? (
         <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p>
-      ) : installed ? (
-        <p className="catalog-row-faint">Already on disk — shown in its section above.</p>
+      ) : installed && (!useGhostMoe || ghostMoePrepared) ? (
+        <p className="catalog-row-faint">
+          Already on disk{ghostMoePrepared ? ' with Ghost MoE enabled' : ''} — shown in its section above.
+        </p>
       ) : phase === 'idle' ? (
         <>
           {onlyCompanionsMissing ? (
@@ -525,6 +584,8 @@ function CatalogRow({
                 ? downloadAndStart
                   ? 'Download vision projector and start…'
                   : 'Download vision projector…'
+                : installed && useGhostMoe
+                  ? 'Enable Ghost MoE and start…'
                 : downloadAndStart
                   ? 'Download and start…'
                   : 'Download…'}
@@ -556,14 +617,27 @@ function CatalogRow({
             </p>
           ) : (
             <p>
-              Download <strong>{item.filename}</strong> from <code>{item.repo_id}</code> (
-              {prettySize(item.size_bytes)})? This pulls from HuggingFace into your local models folder.
-              {downloadAndStart ? ' Camelid will check it, load it, and open Chat after the download.' : ''}
+              {installed ? (
+                <>
+                  Prepare the existing <strong>{item.filename}</strong> for Ghost MoE? Camelid will reuse the local
+                  GGUF without downloading it again.
+                </>
+              ) : (
+                <>
+                  Download <strong>{item.filename}</strong> from <code>{item.repo_id}</code> (
+                  {prettySize(item.size_bytes)})? This pulls from HuggingFace into your local models folder.
+                </>
+              )}
+              {useGhostMoe
+                ? ' Camelid will repack routed experts for Ghost MoE, reclaim the temporary full GGUF, check the prepared model, and open Chat.'
+                : downloadAndStart
+                  ? ' Camelid will check it, load it, and open Chat after the download.'
+                  : ''}
             </p>
           )}
           <div className="catalog-confirm-actions">
             <button type="button" className="catalog-row-action" onClick={confirmDownload}>
-              Confirm download
+              {installed ? 'Confirm preparation' : 'Confirm download'}
             </button>
             <button
               type="button"
@@ -686,6 +760,7 @@ export function CatalogLaneBrowse({
   apiBase = '',
   capabilities,
   localFilenames = new Set(),
+  ghostMoePreparedFilenames = new Set(),
   downloads = [],
   installAvailable = true,
   installBlockedReason = '',
@@ -826,6 +901,7 @@ export function CatalogLaneBrowse({
                 // Whether the question is settled. Without it an unresolvable model
                 // keeps offering a check that can never change anything.
                 fit_checked: body.checked,
+                ghost_moe: body.ghost_moe ?? row.ghost_moe,
               }
             : row,
         ),
@@ -849,6 +925,7 @@ export function CatalogLaneBrowse({
       item={item}
       capabilities={capabilities}
       installed={catalogBundleInstalled(item, localFilenames)}
+      ghostMoePrepared={ghostMoePreparedFilenames.has(item.filename)}
       missingArtifacts={missingCatalogArtifacts(item, localFilenames)}
       activeDownload={downloads.find((download) => download.id === item.catalog_id)}
       apiBase={base}
@@ -875,7 +952,7 @@ export function CatalogLaneBrowse({
     />
   ), [
     base, canceledCatalogIds, capabilities, checkFit, downloads, installAvailable,
-    installBlockedReason, isCheckingFit, localFilenames, onAcquired, onDownloadAcknowledged,
+    ghostMoePreparedFilenames, installBlockedReason, isCheckingFit, localFilenames, onAcquired, onDownloadAcknowledged,
     onDownloadRetry, onInstallStarted, onModelStarted, onOperationBusy, onStartModel,
     pendingCatalogId, reserveAcquisition, settleAcquisition,
   ])

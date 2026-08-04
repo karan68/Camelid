@@ -24,6 +24,7 @@ pub mod gemma4_runtime;
 pub mod gguf;
 pub mod ghost;
 pub mod ghost_hot;
+pub mod ghost_install;
 pub mod grammar;
 pub mod hf_browse;
 pub mod inference;

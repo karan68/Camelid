@@ -9,6 +9,10 @@ assert.match(
   modelDeleteBlockedReason({ downloads: [{ status: 'downloading' }] }),
   /downloads/,
 )
+assert.match(
+  modelDeleteBlockedReason({ downloads: [{ status: 'preparing' }] }),
+  /downloads/,
+)
 assert.equal(modelDeleteBlockedReason({ downloads: [{ status: 'failed' }] }), '')
 assert.deepEqual(
   localModelDeleteRequest({ filename: 'model.gguf', delete_token: 'opaque-token' }),

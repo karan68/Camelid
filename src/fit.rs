@@ -277,6 +277,34 @@ pub fn assess(hw: &HardwareProfile, m: &FitInputs) -> FitVerdict {
     assess_with_headroom(hw, m, crate::cuda_vram::min_headroom_mib())
 }
 
+/// Assess a lane that specifically requires its declared footprint to stay on
+/// the GPU. Unlike [`assess`], host-RAM offload is not a positive result. This is
+/// used by catalog-managed Ghost-MoE: routed experts page independently, but the
+/// common core and bounded KV/scratch must fit VRAM before the supported CUDA
+/// lane can be offered.
+pub fn assess_gpu_resident(hw: &HardwareProfile, m: &FitInputs) -> FitVerdict {
+    if !has_usable_gpu(hw) {
+        return FitVerdict::Unknown;
+    }
+    let footprint = m.footprint_bytes();
+    let headroom = crate::cuda_vram::min_headroom_mib();
+    if crate::cuda_vram::evaluate(hw.cuda_vram_free_bytes, footprint, headroom).is_ok() {
+        return match usable_host_ram_bytes(hw) {
+            Some(ram) if footprint > ram => {
+                negative_verdict(footprint, idle_host_ram_bytes(hw).unwrap_or(0))
+            }
+            _ => FitVerdict::FitsResident,
+        };
+    }
+    let fits_idle_vram =
+        crate::cuda_vram::evaluate(hw.cuda_vram_total_bytes, footprint, headroom).is_ok();
+    if fits_idle_vram && idle_host_ram_bytes(hw).is_some_and(|ram| footprint <= ram) {
+        FitVerdict::InsufficientFreeMemory
+    } else {
+        FitVerdict::WontFit
+    }
+}
+
 /// Advisory allowance, as a percent of weight bytes, for everything resident
 /// beyond the weights at a modest default context: the KV cache, activations, and
 /// scratch. This is a deliberately coarse, deliberately *conservative* (slightly

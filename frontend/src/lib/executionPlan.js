@@ -54,6 +54,7 @@ export function executionRuntimeFields(health) {
     gemma4_ghost_experts_metal_active: optionalBoolean(health?.gemma4_ghost_experts_metal_active),
     gemma4_ghost_head_metal_active: optionalBoolean(health?.gemma4_ghost_head_metal_active),
     gemma4_ghost_backend: GHOST_BACKENDS.has(ghostBackend) ? ghostBackend : null,
+    gemma4_ghost_catalog_managed: optionalBoolean(health?.gemma4_ghost_catalog_managed),
     gemma4_ghost_common_gpu_active: optionalBoolean(health?.gemma4_ghost_common_gpu_active),
     gemma4_ghost_experts_gpu_active: optionalBoolean(health?.gemma4_ghost_experts_gpu_active),
     gemma4_ghost_head_gpu_active: optionalBoolean(health?.gemma4_ghost_head_gpu_active),

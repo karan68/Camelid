@@ -7,7 +7,7 @@ export function modelDeleteBlockedReason({
   if (activeFilename) return 'Unload the current model before deleting files.'
   if (loading) return 'Wait for the current model load to finish.'
   if (smoking) return 'Wait for the current model check to finish.'
-  if (downloads.some((download) => download.status === 'downloading')) {
+  if (downloads.some((download) => download.status === 'downloading' || download.status === 'preparing')) {
     return 'Cancel or finish active model downloads before deleting files.'
   }
   return ''
