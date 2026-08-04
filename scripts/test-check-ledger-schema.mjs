@@ -64,4 +64,14 @@ assert.ok(
 const enums = extractCodeEnum('status: "supported_exact_row_smoke", x, status: "planned"', 'status')
 assert.deepEqual([...enums].sort(), ['planned', 'supported_exact_row_smoke'], 'extractCodeEnum must find all literal values')
 
+for (const supportScope of [
+  'exact_row_macos_metal_or_windows_cuda_chat_smoke_only',
+  'exact_row_macos_metal_or_windows_cuda_text_and_single_image_chat_smoke_only',
+]) {
+  assert.ok(
+    schema.definitions.supportScopeVocabulary.enum.includes(supportScope),
+    `support-scope vocabulary must retain the cross-platform Bonsai value ${supportScope}`,
+  )
+}
+
 console.log('test-check-ledger-schema: all checks passed')
