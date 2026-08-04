@@ -100,10 +100,16 @@ export function getChatGateState(capabilities, model, runtime) {
   // for that row; an explicit distributed report preserves its supported gate.
   const runtimeLaneEligible = runtimeLane !== 'ghost_moe'
     && (!distributedOnlyRow || runtimeLane === 'distributed')
-  const contractSupported = Boolean(runtimeLaneEligible && (
-    backendMarksSupportedRow(model)
-    || isCompatibilitySupportedForModel(capabilities, model)
-  ))
+  // Once /api/models/local supplies a lane verdict, it owns artifact identity.
+  // Falling back to name matching after an explicit experimental verdict would
+  // let a same-named, wrong-hash file inherit the supported contract. Runtime
+  // lane scope is an additional gate: a supported distributed row still does
+  // not make the experimental single-node Ghost lane supported.
+  const hasBackendLaneVerdict = Boolean(model?.lane_class)
+  const artifactSupported = hasBackendLaneVerdict
+    ? backendMarksSupportedRow(model)
+    : isCompatibilitySupportedForModel(capabilities, model)
+  const contractSupported = Boolean(runtimeLaneEligible && artifactSupported)
   const hint = runtimeLaneEligible
     ? contractHint
     : runtimeLaneHint(contractHint, distributedOnlyRow, runtimeLane)

@@ -40,7 +40,10 @@ function backendMarksSupported(entry) {
 
 export function laneOf(entry, capabilities) {
   if (backendMarksSupported(entry)) return 'supported'
-  if (isCompatibilitySupportedForModel(capabilities, matchModel(entry))) return 'supported'
+  // An explicit backend verdict is authoritative. In particular, a hash-pinned
+  // Prism filename remains experimental until the server has verified its loaded
+  // digest; the looser frontend name/quant matcher must not promote it back.
+  if (!entry?.lane_class && isCompatibilitySupportedForModel(capabilities, matchModel(entry))) return 'supported'
   if (entry.runnable_receipt_present) return 'compatible'
   if (entry.admitted && entry.oracle_qualified) return 'eligible'
   return 'not_anchored'

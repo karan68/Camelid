@@ -983,7 +983,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           return content && content !== '(empty response)'
         })
         .filter((message) => !message.content.startsWith('Conversation created.'))
-      // The current Metal lane accepts one image. Retain every attachment in
+      // The current Prism vision lanes accept one image. Retain every attachment in
       // the local transcript, but send only the most recent one so follow-ups
       // keep image context and attaching a replacement does not form an
       // unsupported multi-image request.

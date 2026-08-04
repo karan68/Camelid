@@ -1,0 +1,113 @@
+{
+  "schema": "camelid.prism_bonsai_windows_cuda_receipt/v2",
+  "created_at": "2026-08-03",
+  "source_commit": "f297857f",
+  "source_commit_note": "Implementation source commit measured by the final Windows CUDA A/B; this evidence bundle was assembled afterward.",
+  "support_scope": "seven exact hash-pinned PrismML Bonsai 4B/8B/27B Q1_0, Q2_0_G128, and PQ2_0 files on Windows x86_64 CUDA",
+  "platform": {
+    "os": "Microsoft Windows 11 Home Insider Preview 10.0.26220.0",
+    "architecture": "x86_64",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "ram_gib": 15.7,
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "gpu_memory_mib": 6144,
+    "compute_capability": "8.6",
+    "driver": "576.83"
+  },
+  "vendor_reference": {
+    "repository": "PrismML-Eng/Bonsai-demo",
+    "commit": "f904ea2ae3bb48e664de3ef36f55b553211b0c3c",
+    "llama_cpp_release": "prism-b9596-9fcaed7",
+    "llama_cpp_version": "1 (9fcaed7)",
+    "windows_cuda_archive_sha256": "6d109e2930c0eaf2f729c3a6fc58dd7809ce2ba7047bfb294547cc389af6de5d",
+    "windows_cudart_archive_sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+  },
+  "artifacts": [
+    {
+      "file": "Bonsai-4B-Q1_0.gguf",
+      "sha256": "4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168",
+      "result": "vendor raw greedy token-and-text parity at 1, 5, and 50 tokens"
+    },
+    {
+      "file": "Ternary-Bonsai-4B-Q2_0.gguf",
+      "sha256": "4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b",
+      "result": "all 1/5-token vendor raw legs exact; 3/4 50-token legs exact, one late near-tie divergence at generated token 46; deterministic chat probe exact"
+    },
+    {
+      "file": "Ternary-Bonsai-4B-PQ2_0.gguf",
+      "sha256": "829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb",
+      "result": "packed type-142 CUDA load and deterministic eight-token chat smoke"
+    },
+    {
+      "file": "Bonsai-8B-Q1_0.gguf",
+      "sha256": "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+      "result": "packed CUDA load and deterministic eight-token chat smoke"
+    },
+    {
+      "file": "Ternary-Bonsai-8B-Q2_0.gguf",
+      "sha256": "3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b",
+      "result": "packed CUDA load and deterministic eight-token chat smoke"
+    },
+    {
+      "file": "Bonsai-27B-Q1_0.gguf",
+      "sha256": "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0",
+      "result": "four 64-token text chats exact against the vendor CUDA server; real PNG Chat Completions smoke"
+    },
+    {
+      "file": "Ternary-Bonsai-27B-Q2_0.gguf",
+      "sha256": "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757",
+      "result": "6 GiB capacity path streams 36/64 trailing layers; 13.1-second cold CUDA build, deterministic eight-token text smoke, vision_ready and real PNG Chat Completions smoke"
+    },
+    {
+      "file": "Ternary-Bonsai-27B-mmproj-Q8_0.gguf",
+      "sha256": "eb561d41a7bbeb0fcf04883c8af11078ef6cae0a66862a0b68443cfca495269d",
+      "result": "CPU and bounded-VRAM CUDA projector paths; single local PNG/JPEG OpenAI-compatible API flow"
+    }
+  ],
+  "validation": {
+    "packed_cuda_kernel_oracle": "Q1_0, Q2_0_G64, and Q2_0_G128 packed GEMV matches the f32 wire oracle on a real CUDA device",
+    "q1_raw_parity": "bonsai-4b-q1-parity.json",
+    "q2_raw_parity": "ternary-4b-q2-parity.json",
+    "q2_raw_parity_disclosure": "all short legs exact; report all_pass=false because one 50-token leg diverges late at token 46",
+    "exact_row_smoke": "windows-exact-row-smoke.json",
+    "q1_27b_cuda_performance": "bonsai-27b-q1-cuda-performance.json; default POPC decode averaged 21.3805924341 tok/s versus 16.4639010553 tok/s disabled, reported as 29.864% at four-decimal rate display precision (29.863465% from the full-precision means) over 23 post-first tokens per run",
+    "q1_27b_cuda_performance_receipts": [
+      "prism-popc-default.json",
+      "prism-popc-disabled.json",
+      "prism-vendor-reasoning-off.json"
+    ],
+    "q1_27b_cuda_performance_correctness": "identical generated text across all three default and all three POPC-disabled image runs",
+    "q1_27b_cuda_performance_timing_boundary": "image TTFT includes projection, prefill, and first-token production and is reported separately; it was 1.547% slower in this A/B, while end-to-end latency was 6.537% lower",
+    "q1_27b_vendor_decode_comparison": "same-host pinned Prism demo with reasoning off and matching 142 prompt tokens averaged 18.1872652785 tok/s; Camelid averaged 21.3805924341 tok/s, a bounded 17.558% post-first decode-throughput advantage",
+    "q1_27b_vendor_comparison_boundary": "same model, projector, image, prompt, greedy sampling, prompt-token count, and completion length; generated wording differs and Prism image TTFT was materially lower, so no output-parity or overall-latency advantage is claimed",
+    "q1_27b_text_vision": "bonsai-27b-chat-vision-parity.json and bonsai-27b-frontier-cap128-parity.json",
+    "vision_disclosure": "text is token-exact; image prompt-token counts align at the 128-token cap, while generated visual wording is coherent but not token-exact",
+    "q2_27b_capacity": "36/64 trailing layers streamed from pinned host RAM on the 6144 MiB reference GPU",
+    "insert_image_file": "validated through the OpenAI-compatible image_url data part with vision_ready=true; the frontend contract exposes one local PNG/JPEG attachment when the projector is ready"
+  },
+  "evidence_files": [
+    "bonsai-27b-chat-vision-oracle.json",
+    "bonsai-27b-chat-vision-parity.json",
+    "bonsai-27b-frontier-cap128-oracle.json",
+    "bonsai-27b-frontier-cap128-parity.json",
+    "bonsai-27b-q1-cuda-performance.json",
+    "bonsai-27b-q1-oracle.json",
+    "bonsai-4b-q1-oracle.json",
+    "bonsai-4b-q1-parity.json",
+    "prism-popc-default.json",
+    "prism-popc-disabled.json",
+    "prism-vendor-reasoning-off.json",
+    "ternary-4b-q2-oracle.json",
+    "ternary-4b-q2-parity.json",
+    "windows-exact-row-smoke.json"
+  ],
+  "not_claimed": [
+    "neighboring or renamed model artifacts",
+    "all Qwen3/Qwen3.5 models or all Q1/Q2 quantized files",
+    "non-Windows-CUDA portability beyond the separate macOS Metal receipt",
+    "multiple or remote images, audio, video, vision plus tools, or Responses API multimodal input",
+    "cross-hardware, multi-user, production-service, or broader-model throughput",
+    "bit-exact equivalence of every internal optimized kernel or intermediate logit to a legacy serial or BMMA implementation",
+    "a cross-engine image-TTFT, end-to-end-latency, output-parity, cross-hardware, or production-service advantage over the Prism reference"
+  ]
+}

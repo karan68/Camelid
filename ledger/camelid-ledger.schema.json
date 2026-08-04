@@ -73,6 +73,8 @@
         "exact_row_macos_apple_silicon_metal_chat_smoke_only",
         "exact_row_macos_apple_silicon_metal_text_and_single_image_chat_smoke_only",
         "exact_row_macos_apple_silicon_metal_text_and_single_image_cli_smoke_only",
+        "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
+        "exact_row_macos_metal_or_windows_cuda_text_and_single_image_chat_smoke_only",
         "exact_row_metal_gpu_resident_windowed_chat_smoke_only",
         "exact_row_single_node_cpu_smoke_only",
         "exact_row_smoke_only",

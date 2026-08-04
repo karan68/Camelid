@@ -2,18 +2,23 @@
 //!
 //! The published 27B rows pair the Qwen3.5 language model with a separate
 //! `qwen3vl_merger` GGUF. Large matrices remain page-backed so Metal can wrap
-//! them with `newBufferWithBytesNoCopy`; only biases, norms and the learned
-//! position table are decoded to f32 on the host.
+//! them with `newBufferWithBytesNoCopy` or CUDA can stream them one matrix at a
+//! time; only biases, norms and the learned position table are decoded to f32
+//! on the host.
 
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(target_os = "macos", feature = "cuda"))]
 use std::sync::Mutex;
 
 use image::{imageops::FilterType, RgbImage};
+#[cfg(not(target_os = "macos"))]
+use rayon::prelude::*;
 
 use crate::error::{BackendError, Result};
 use crate::gguf::{self, GgufFile, GgufTensorDescriptor, GgufTensorType};
@@ -47,6 +52,58 @@ impl VisionMat {
             format,
             pages: &self.pages,
         })
+    }
+
+    /// Apply this GGUF matrix to token-major f32 activations. The projector's
+    /// dense F32/F16 and Q8_0 rows are decoded one matrix at a time, keeping the
+    /// full 630 MiB projector page-backed while Rayon spreads the contractions
+    /// across host cores. This is the portable fallback when neither the Metal
+    /// graph nor the streaming CUDA graph can execute.
+    #[cfg(not(target_os = "macos"))]
+    fn linear(&self, input: &[f32], tokens: usize, label: &str) -> Result<Vec<f32>> {
+        if input.len() != tokens * self.input {
+            return Err(BackendError::InvalidTensorData(format!(
+                "{label}: input has {} values, expected {}x{}",
+                input.len(),
+                tokens,
+                self.input
+            )));
+        }
+        let elements = self.input.checked_mul(self.output).ok_or_else(|| {
+            BackendError::InvalidTensorData(format!("{label}: matrix geometry overflow"))
+        })?;
+        let weights = dequant::dequantize(self.tensor_type, self.pages.bytes(), elements, label)?;
+        if weights.len() != elements {
+            return Err(BackendError::InvalidTensorData(format!(
+                "{label}: decoded {} weights, expected {elements}",
+                weights.len()
+            )));
+        }
+        // Row-major scheduling reuses one decoded weight row across every image
+        // token before moving on. Image activations fit in cache while the full
+        // projector does not, so this avoids streaming each matrix from RAM once
+        // per token. Each individual dot retains the same element order.
+        let row_major = (0..self.output)
+            .into_par_iter()
+            .flat_map_iter(|row| {
+                let weight = &weights[row * self.input..(row + 1) * self.input];
+                (0..tokens).map(move |token| {
+                    let activation = &input[token * self.input..(token + 1) * self.input];
+                    activation
+                        .iter()
+                        .zip(weight.iter())
+                        .map(|(&x, &w)| x * w)
+                        .sum::<f32>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut output = vec![0.0f32; tokens * self.output];
+        for row in 0..self.output {
+            for token in 0..tokens {
+                output[token * self.output + row] = row_major[row * tokens + token];
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -90,6 +147,7 @@ pub(crate) struct PrismVisionModel {
     pub merger_2_bias: Vec<f32>,
 }
 
+#[derive(Clone)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct PrismVisionInput {
     /// Tile-major patches `[patch_count, 3 * patch_size * patch_size]`.
@@ -109,13 +167,102 @@ pub struct PrismVisionEmbedding {
     pub grid_height: usize,
 }
 
-/// Loaded Prism Qwen3-VL projector with its native Metal graph retained across
-/// requests. The backing GGUF pages stay owned by `model` while the Metal
-/// buffers refer to them through NoCopy allocations.
+/// Loaded Prism Qwen3-VL projector. macOS retains its native Metal graph;
+/// CUDA hosts stream page-backed matrices through a bounded-VRAM graph, with a
+/// portable CPU implementation as the final fallback.
 pub struct PrismVisionProjector {
     model: PrismVisionModel,
     #[cfg(target_os = "macos")]
     encoder: Mutex<crate::metal::PrismVisionMetalEncoder>,
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    cuda: PrismVisionCudaRuntime,
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+// The encoder is a single long-lived execution object behind a mutex. Keeping
+// it inline avoids an extra heap indirection on every image request; the small
+// control variants never move through a hot collection.
+#[allow(clippy::large_enum_variant)]
+enum PrismVisionCudaLane {
+    Pending,
+    Ready(super::vision_cuda::CudaVisionEncoder),
+    Disabled,
+    Failed(String),
+}
+
+/// CUDA execution is serialized, but liveness must remain observable while a
+/// long image projection owns the lane mutex.
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+struct PrismVisionCudaRuntime {
+    lane: Mutex<PrismVisionCudaLane>,
+    ready: AtomicBool,
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+impl PrismVisionCudaRuntime {
+    fn new() -> Self {
+        Self {
+            lane: Mutex::new(PrismVisionCudaLane::Pending),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_windows_cuda_lane_selected_with(
+    projection: usize,
+    cuda_available: bool,
+    qwen35_cuda: Option<&str>,
+) -> bool {
+    cfg!(target_os = "windows")
+        && projection == 5_120
+        && cuda_available
+        && qwen35_cuda
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(true)
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_windows_cuda_lane_selected(projection: usize) -> bool {
+    let qwen35_cuda = std::env::var("CAMELID_QWEN35_CUDA").ok();
+    prism_27b_windows_cuda_lane_selected_with(
+        projection,
+        crate::cuda::is_available(),
+        qwen35_cuda.as_deref(),
+    )
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_cuda_failure_message(stage: &str, cause: &str, ordinal: usize) -> String {
+    format!(
+        "Prism 27B image support requires the Windows CUDA projector, but CUDA {stage} failed on device {ordinal}: {cause}. CPU fallback is disabled for this supported GPU lane. Verify CAMELID_CUDA_DEVICE selects the intended NVIDIA GPU, update the NVIDIA driver and CUDA toolkit/NVRTC, free enough VRAM, then reload the model or restart Camelid"
+    )
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn prism_27b_cuda_failure_diagnostic(
+    projection: usize,
+    stage: &str,
+    cause: &str,
+) -> Option<String> {
+    if !prism_27b_windows_cuda_lane_selected(projection) {
+        return None;
+    }
+    let ordinal = crate::cuda::selected_device_ordinal();
+    Some(prism_27b_cuda_failure_message(stage, cause, ordinal))
 }
 
 impl PrismVisionProjector {
@@ -131,15 +278,43 @@ impl PrismVisionProjector {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = model;
-            Err(BackendError::UnsupportedGguf(
-                "Prism Qwen3-VL projector execution currently requires macOS Metal".into(),
-            ))
+            Ok(Self {
+                model,
+                #[cfg(feature = "cuda")]
+                cuda: PrismVisionCudaRuntime::new(),
+            })
         }
     }
 
     pub fn projection_dim(&self) -> usize {
         self.model.projection
+    }
+
+    /// Initialize the execution backend without encoding an image. This lets a
+    /// serving layer distinguish a loaded projector file from a projector that
+    /// can actually execute. CPU-only builds remain ready by construction.
+    pub fn ensure_backend_ready(&self) -> Result<()> {
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        {
+            let mut lane = self.cuda.lane.lock().map_err(|_| {
+                self.cuda.mark_ready(false);
+                BackendError::InvalidTensorData("Prism vision CUDA mutex poisoned".into())
+            })?;
+            self.initialize_cuda_lane(&mut lane)?;
+        }
+        Ok(())
+    }
+
+    /// Non-blocking readiness query for health/liveness endpoints. Image
+    /// projection owns `cuda` for the duration of GPU execution; consulting
+    /// that mutex here would let an ordinary image request stall health polls.
+    pub fn backend_ready(&self) -> bool {
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        {
+            self.cuda.is_ready()
+        }
+        #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
+        true
     }
 
     pub fn encode_image(
@@ -209,11 +384,92 @@ impl PrismVisionProjector {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = input;
-            Err(BackendError::UnsupportedGguf(
-                "Prism Qwen3-VL projector execution currently requires macOS Metal".into(),
-            ))
+            #[cfg(feature = "cuda")]
+            {
+                let mut lane = self.cuda.lane.lock().map_err(|_| {
+                    self.cuda.mark_ready(false);
+                    BackendError::InvalidTensorData("Prism vision CUDA mutex poisoned".into())
+                })?;
+                self.initialize_cuda_lane(&mut lane)?;
+                if let PrismVisionCudaLane::Ready(encoder) = &mut *lane {
+                    match encoder.encode(&self.model, &input) {
+                        Ok(embeddings) => {
+                            let grid_width = input.patch_width / self.model.merge;
+                            let grid_height = input.patch_height / self.model.merge;
+                            if embeddings.len() != grid_width * grid_height {
+                                return Err(BackendError::InvalidTensorData(
+                                    "Prism vision CUDA encoder returned the wrong image-token count"
+                                        .into(),
+                                ));
+                            }
+                            return Ok(PrismVisionEmbedding {
+                                embeddings,
+                                grid_width,
+                                grid_height,
+                            });
+                        }
+                        Err(error) => {
+                            if let Some(diagnostic) = prism_27b_cuda_failure_diagnostic(
+                                self.model.projection,
+                                "execution",
+                                &error,
+                            ) {
+                                self.cuda.mark_ready(false);
+                                *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
+                                return Err(BackendError::UnsupportedGguf(diagnostic));
+                            }
+                            eprintln!(
+                                "[qwen3vl] CUDA projector failed ({error}); using CPU fallback"
+                            );
+                            *lane = PrismVisionCudaLane::Disabled;
+                        }
+                    }
+                }
+            }
+            self.model.encode_cpu(input)
         }
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    fn initialize_cuda_lane(&self, lane: &mut PrismVisionCudaLane) -> Result<()> {
+        if matches!(*lane, PrismVisionCudaLane::Pending) {
+            if cfg!(target_os = "windows")
+                && self.model.projection == 5_120
+                && !prism_27b_windows_cuda_lane_selected(self.model.projection)
+            {
+                eprintln!(
+                    "[qwen3vl] Windows CUDA projector not selected or unavailable; using CPU"
+                );
+                *lane = PrismVisionCudaLane::Disabled;
+                self.cuda.mark_ready(true);
+                return Ok(());
+            }
+            *lane = match super::vision_cuda::CudaVisionEncoder::new() {
+                Ok(encoder) => {
+                    eprintln!("[qwen3vl] streaming CUDA projector active (bounded VRAM)");
+                    PrismVisionCudaLane::Ready(encoder)
+                }
+                Err(error) => {
+                    if let Some(diagnostic) = prism_27b_cuda_failure_diagnostic(
+                        self.model.projection,
+                        "initialization",
+                        &error,
+                    ) {
+                        self.cuda.mark_ready(false);
+                        *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
+                        return Err(BackendError::UnsupportedGguf(diagnostic));
+                    }
+                    eprintln!("[qwen3vl] CUDA projector unavailable ({error}); using CPU");
+                    PrismVisionCudaLane::Disabled
+                }
+            };
+        }
+        if let PrismVisionCudaLane::Failed(diagnostic) = lane {
+            self.cuda.mark_ready(false);
+            return Err(BackendError::UnsupportedGguf(diagnostic.clone()));
+        }
+        self.cuda.mark_ready(true);
+        Ok(())
     }
 }
 
@@ -462,6 +718,146 @@ impl PrismVisionModel {
         })
     }
 
+    /// Portable reference implementation of the Qwen3-VL projector graph used
+    /// by the Prism 27B image row. Its operation order mirrors the Metal graph:
+    /// dual patch projection, 27 bidirectional transformer blocks, post norm,
+    /// spatial merge and the two-layer language projection.
+    #[cfg(not(target_os = "macos"))]
+    fn encode_cpu(&self, input: PrismVisionInput) -> Result<PrismVisionEmbedding> {
+        let tokens = input
+            .patch_width
+            .checked_mul(input.patch_height)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData("vision patch geometry overflow".into())
+            })?;
+        if tokens == 0
+            || tokens > 4096
+            || input.patches.len() != tokens * self.patch_0.input
+            || input.position.len() != tokens * self.hidden
+            || !input.patch_width.is_multiple_of(self.merge)
+            || !input.patch_height.is_multiple_of(self.merge)
+        {
+            return Err(BackendError::InvalidTensorData(
+                "Qwen3-VL CPU projector refused the preprocessed image geometry".into(),
+            ));
+        }
+        let head_dim = self.hidden / self.heads;
+        if !head_dim.is_multiple_of(2) {
+            return Err(BackendError::InvalidModelMetadata(
+                "Qwen3-VL vision head width must be even".into(),
+            ));
+        }
+
+        let patch_first = self
+            .patch_0
+            .linear(&input.patches, tokens, "vision patch 0")?;
+        let patch_second = self
+            .patch_1
+            .linear(&input.patches, tokens, "vision patch 1")?;
+        let mut hidden = patch_first;
+        hidden
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| {
+                *value += patch_second[index]
+                    + self.patch_bias[index % self.hidden]
+                    + input.position[index];
+            });
+
+        let (cosine, sine) =
+            vision_rope_tables(input.patch_width, input.patch_height, self.merge, head_dim);
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let normalized = vision_layer_norm(
+                &hidden,
+                tokens,
+                self.hidden,
+                &layer.ln1_weight,
+                &layer.ln1_bias,
+                self.eps,
+            );
+            let mut qkv = layer.qkv.linear(
+                &normalized,
+                tokens,
+                &format!("vision layer {layer_index} qkv"),
+            )?;
+            add_bias(&mut qkv, &layer.qkv_bias);
+            apply_vision_rope(
+                &mut qkv,
+                &cosine,
+                &sine,
+                tokens,
+                self.hidden,
+                self.heads,
+                head_dim,
+            );
+            let attention = vision_attention(&qkv, tokens, self.hidden, self.heads, head_dim);
+            let projected = layer.attn_output.linear(
+                &attention,
+                tokens,
+                &format!("vision layer {layer_index} attention output"),
+            )?;
+            let mut after_attention = hidden;
+            add_bias_residual(&mut after_attention, &projected, &layer.attn_output_bias);
+
+            let normalized = vision_layer_norm(
+                &after_attention,
+                tokens,
+                self.hidden,
+                &layer.ln2_weight,
+                &layer.ln2_bias,
+                self.eps,
+            );
+            let mut ffn = layer.ffn_up.linear(
+                &normalized,
+                tokens,
+                &format!("vision layer {layer_index} ffn up"),
+            )?;
+            add_bias_gelu(&mut ffn, &layer.ffn_up_bias);
+            let projected = layer.ffn_down.linear(
+                &ffn,
+                tokens,
+                &format!("vision layer {layer_index} ffn down"),
+            )?;
+            hidden = after_attention;
+            add_bias_residual(&mut hidden, &projected, &layer.ffn_down_bias);
+        }
+
+        let normalized = vision_layer_norm(
+            &hidden,
+            tokens,
+            self.hidden,
+            &self.post_weight,
+            &self.post_bias,
+            self.eps,
+        );
+        let output_tokens = tokens / (self.merge * self.merge);
+        let merged = self.hidden * self.merge * self.merge;
+        // Preprocessing is tile-major, so each consecutive group of four patch
+        // rows is already one flattened 2x2 merger row.
+        debug_assert_eq!(normalized.len(), output_tokens * merged);
+        let mut merger_hidden =
+            self.merger_0
+                .linear(&normalized, output_tokens, "vision merger 0")?;
+        add_bias_gelu(&mut merger_hidden, &self.merger_0_bias);
+        let mut projected =
+            self.merger_2
+                .linear(&merger_hidden, output_tokens, "vision merger 2")?;
+        add_bias(&mut projected, &self.merger_2_bias);
+        if projected.iter().any(|value| !value.is_finite()) {
+            return Err(BackendError::InvalidTensorData(
+                "Qwen3-VL CPU projector produced non-finite embeddings".into(),
+            ));
+        }
+        Ok(PrismVisionEmbedding {
+            embeddings: projected
+                .chunks_exact(self.projection)
+                .map(<[f32]>::to_vec)
+                .collect(),
+            grid_width: input.patch_width / self.merge,
+            grid_height: input.patch_height / self.merge,
+        })
+    }
+
     /// Resolve the page-backed projector into a resident Metal encoder. The
     /// returned object holds all small bias/norm buffers and reuses the GGUF
     /// pages for every large matrix without copying them into a second host
@@ -515,6 +911,177 @@ impl PrismVisionModel {
             )
         })
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vision_layer_norm(
+    input: &[f32],
+    tokens: usize,
+    width: usize,
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    debug_assert_eq!(input.len(), tokens * width);
+    let mut output = vec![0.0f32; input.len()];
+    output
+        .par_chunks_mut(width)
+        .zip(input.par_chunks(width))
+        .for_each(|(out, row)| {
+            let mean = row.iter().sum::<f32>() / width as f32;
+            let variance = row
+                .iter()
+                .map(|&value| {
+                    let centered = value - mean;
+                    centered * centered
+                })
+                .sum::<f32>()
+                / width as f32;
+            let inverse = 1.0 / (variance + eps).sqrt();
+            for index in 0..width {
+                out[index] = (row[index] - mean) * inverse * weight[index] + bias[index];
+            }
+        });
+    output
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_bias(values: &mut [f32], bias: &[f32]) {
+    values
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, value)| *value += bias[index % bias.len()]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_bias_residual(residual: &mut [f32], projected: &[f32], bias: &[f32]) {
+    residual
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, value)| *value += projected[index] + bias[index % bias.len()]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_bias_gelu(values: &mut [f32], bias: &[f32]) {
+    values
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, value)| {
+            let x = *value + bias[index % bias.len()];
+            let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
+            *value = 0.5 * x * (1.0 + inner.clamp(-15.0, 15.0).tanh());
+        });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vision_rope_tables(
+    patch_width: usize,
+    patch_height: usize,
+    merge: usize,
+    head_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let section = half / 2;
+    let mut cosine = Vec::with_capacity(patch_width * patch_height * half);
+    let mut sine = Vec::with_capacity(cosine.capacity());
+    for tile_y in (0..patch_height).step_by(merge) {
+        for tile_x in (0..patch_width).step_by(merge) {
+            for dy in 0..merge {
+                for dx in 0..merge {
+                    for pair in 0..half {
+                        let (position, dimension) = if pair < section {
+                            ((tile_y + dy) as f32, pair)
+                        } else {
+                            ((tile_x + dx) as f32, pair - section)
+                        };
+                        let angle =
+                            position * 10_000.0f32.powf(-2.0 * dimension as f32 / half as f32);
+                        cosine.push(angle.cos());
+                        sine.push(angle.sin());
+                    }
+                }
+            }
+        }
+    }
+    (cosine, sine)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_vision_rope(
+    qkv: &mut [f32],
+    cosine: &[f32],
+    sine: &[f32],
+    tokens: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+) {
+    let half = head_dim / 2;
+    qkv.par_chunks_mut(3 * hidden)
+        .enumerate()
+        .for_each(|(token, row)| {
+            debug_assert!(token < tokens);
+            for qk in 0..2 {
+                for head in 0..heads {
+                    let base = qk * hidden + head * head_dim;
+                    for pair in 0..half {
+                        let x0 = row[base + pair];
+                        let x1 = row[base + pair + half];
+                        let c = cosine[token * half + pair];
+                        let s = sine[token * half + pair];
+                        row[base + pair] = x0 * c - x1 * s;
+                        row[base + pair + half] = x0 * s + x1 * c;
+                    }
+                }
+            }
+        });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vision_attention(
+    qkv: &[f32],
+    tokens: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut output = vec![0.0f32; tokens * hidden];
+    output
+        .par_chunks_mut(hidden)
+        .enumerate()
+        .for_each(|(query_token, out)| {
+            for head in 0..heads {
+                let qbase = query_token * 3 * hidden + head * head_dim;
+                let mut scores = Vec::with_capacity(tokens);
+                let mut maximum = f32::NEG_INFINITY;
+                for key_token in 0..tokens {
+                    let kbase = key_token * 3 * hidden + hidden + head * head_dim;
+                    let mut score = 0.0f32;
+                    for dimension in 0..head_dim {
+                        score += qkv[qbase + dimension] * qkv[kbase + dimension];
+                    }
+                    score *= scale;
+                    maximum = maximum.max(score);
+                    scores.push(score);
+                }
+                let mut sum = 0.0f32;
+                for score in &mut scores {
+                    *score = (*score - maximum).exp();
+                    sum += *score;
+                }
+                let inverse = 1.0 / sum;
+                for dimension in 0..head_dim {
+                    let mut value = 0.0f32;
+                    for (key_token, &score) in scores.iter().enumerate() {
+                        let vbase = key_token * 3 * hidden + 2 * hidden + head * head_dim;
+                        value += score * inverse * qkv[vbase + dimension];
+                    }
+                    out[head * head_dim + dimension] = value;
+                }
+            }
+        });
+    output
 }
 
 fn find<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a GgufTensorDescriptor> {
@@ -654,6 +1221,60 @@ mod tests {
         assert!(width * height <= 1024 * 1024);
     }
 
+    #[cfg(all(target_os = "windows", feature = "cuda"))]
+    #[test]
+    fn cuda_readiness_does_not_wait_for_the_projection_lane_mutex() {
+        let runtime = std::sync::Arc::new(PrismVisionCudaRuntime::new());
+        runtime.mark_ready(true);
+        let projection_in_flight = runtime.lane.lock().expect("lane lock");
+        let (send, receive) = std::sync::mpsc::channel();
+        let health_runtime = std::sync::Arc::clone(&runtime);
+        let health = std::thread::spawn(move || send.send(health_runtime.is_ready()));
+
+        let result = receive.recv_timeout(std::time::Duration::from_millis(500));
+        drop(projection_in_flight);
+        health
+            .join()
+            .expect("health thread")
+            .expect("health result");
+        assert_eq!(
+            result,
+            Ok(true),
+            "health readiness must remain lock-free during image projection"
+        );
+    }
+
+    #[cfg(all(target_os = "windows", feature = "cuda"))]
+    #[test]
+    fn prism_27b_windows_cuda_failures_are_actionable_and_fail_closed() {
+        assert!(prism_27b_windows_cuda_lane_selected_with(5_120, true, None));
+        assert!(prism_27b_windows_cuda_lane_selected_with(
+            5_120,
+            true,
+            Some("on")
+        ));
+        assert!(!prism_27b_windows_cuda_lane_selected_with(
+            5_120, false, None
+        ));
+        assert!(!prism_27b_windows_cuda_lane_selected_with(
+            5_120,
+            true,
+            Some("0")
+        ));
+        assert!(!prism_27b_windows_cuda_lane_selected_with(
+            4_096, true, None
+        ));
+
+        let diagnostic = prism_27b_cuda_failure_message("execution", "CUDA_ERROR_OUT_OF_MEMORY", 0);
+        assert!(diagnostic.contains("Prism 27B image support"));
+        assert!(diagnostic.contains("CUDA execution failed"));
+        assert!(diagnostic.contains("CUDA_ERROR_OUT_OF_MEMORY"));
+        assert!(diagnostic.contains("CPU fallback is disabled"));
+        assert!(diagnostic.contains("CAMELID_CUDA_DEVICE"));
+        assert!(diagnostic.contains("free enough VRAM"));
+        assert!(diagnostic.contains("reload the model or restart Camelid"));
+    }
+
     #[test]
     fn real_prism_mmproj_loads_as_page_backed_qwen3vl() {
         let Ok(path) = std::env::var("CAMELID_PRISM_MMPROJ") else {
@@ -667,6 +1288,196 @@ mod tests {
         assert_eq!(model.patch_0.pages.byte_len(), 16 * 16 * 3 * 1152 * 4);
         assert_eq!(model.layers[0].qkv.tensor_type, GgufTensorType::Q8_0);
         assert_eq!(model.layers[0].ffn_down.tensor_type, GgufTensorType::F16);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn real_prism_mmproj_encodes_a_tiny_image_on_cpu() {
+        let Ok(model_path) = std::env::var("CAMELID_PRISM_MMPROJ") else {
+            eprintln!("SKIP: set CAMELID_PRISM_MMPROJ");
+            return;
+        };
+        let model = PrismVisionModel::load(model_path).expect("load Prism projector");
+        let image = RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 7) as u8, ((x + y) * 3) as u8])
+        });
+        let input = model
+            .preprocess_rgb(image, 1, 1)
+            .expect("preprocess tiny image");
+        let output = model.encode_cpu(input).expect("encode tiny image on CPU");
+        assert_eq!(output.grid_width, 1);
+        assert_eq!(output.grid_height, 1);
+        assert_eq!(output.embeddings.len(), 1);
+        assert_eq!(output.embeddings[0].len(), model.projection);
+        assert!(output.embeddings[0].iter().all(|value| value.is_finite()));
+        let l2 = output.embeddings[0]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        eprintln!("Qwen3-VL tiny image CPU embedding: l2={l2:.6}");
+        assert!(l2 > 1.0);
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    #[test]
+    fn real_prism_mmproj_cuda_matches_cpu_for_a_tiny_image() {
+        let Ok(model_path) = std::env::var("CAMELID_PRISM_MMPROJ") else {
+            eprintln!("SKIP: set CAMELID_PRISM_MMPROJ");
+            return;
+        };
+        let model = PrismVisionModel::load(model_path).expect("load Prism projector");
+        let image = RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 7) as u8, ((x + y) * 3) as u8])
+        });
+        let input = model
+            .preprocess_rgb(image, 1, 1)
+            .expect("preprocess tiny image");
+        let cpu = model
+            .encode_cpu(input.clone())
+            .expect("encode CPU reference");
+        let mut encoder =
+            super::super::vision_cuda::CudaVisionEncoder::new().expect("initialize CUDA projector");
+        let started = std::time::Instant::now();
+        let cuda = encoder.encode(&model, &input).expect("encode on CUDA");
+        let elapsed = started.elapsed().as_secs_f64();
+        assert_eq!(cuda.len(), 1);
+        assert_eq!(cuda[0].len(), model.projection);
+        let (mut dot, mut cpu_l2, mut cuda_l2) = (0.0f64, 0.0f64, 0.0f64);
+        let mut max_abs = 0.0f32;
+        for (&expected, &actual) in cpu.embeddings[0].iter().zip(cuda[0].iter()) {
+            dot += expected as f64 * actual as f64;
+            cpu_l2 += expected as f64 * expected as f64;
+            cuda_l2 += actual as f64 * actual as f64;
+            max_abs = max_abs.max((expected - actual).abs());
+        }
+        let cosine = dot / (cpu_l2.sqrt() * cuda_l2.sqrt());
+        eprintln!(
+            "Qwen3-VL CUDA projector: elapsed={elapsed:.3}s cosine={cosine:.9} max_abs={max_abs:.6}"
+        );
+        assert!(cosine > 0.999, "CUDA projector cosine similarity {cosine}");
+        assert!(max_abs < 0.1, "CUDA projector max abs error {max_abs}");
+    }
+
+    /// Full-resolution projector timing harness. Unlike the end-to-end hidden
+    /// CLI benchmark this does not load the 27B language graph, so it isolates
+    /// the image encoder and can run beside language-kernel development.
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    #[test]
+    fn real_prism_mmproj_cuda_encodes_configured_image() {
+        let (Ok(model_path), Ok(image_path)) = (
+            std::env::var("CAMELID_PRISM_MMPROJ"),
+            std::env::var("CAMELID_PRISM_IMAGE"),
+        ) else {
+            eprintln!("SKIP: set CAMELID_PRISM_MMPROJ and CAMELID_PRISM_IMAGE");
+            return;
+        };
+        let model = PrismVisionModel::load(model_path).expect("load Prism projector");
+        let input = model
+            .preprocess(image_path, 1, 128)
+            .expect("preprocess configured image");
+        let grid_width = input.patch_width / model.merge;
+        let grid_height = input.patch_height / model.merge;
+        let mut encoder =
+            super::super::vision_cuda::CudaVisionEncoder::new().expect("initialize CUDA projector");
+        let started = std::time::Instant::now();
+        let cuda = encoder.encode(&model, &input).expect("encode on CUDA");
+        let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "Qwen3-VL CUDA full image: grid={grid_width}x{grid_height} tokens={} elapsed={elapsed:.6}s",
+            cuda.len()
+        );
+        assert_eq!(cuda.len(), grid_width * grid_height);
+        assert!(cuda
+            .iter()
+            .all(|row| row.len() == model.projection && row.iter().all(|value| value.is_finite())));
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    #[test]
+    fn real_prism_mmproj_cuda_tensor_cores_match_scalar_for_configured_image() {
+        let (Ok(model_path), Ok(image_path)) = (
+            std::env::var("CAMELID_PRISM_MMPROJ"),
+            std::env::var("CAMELID_PRISM_IMAGE"),
+        ) else {
+            eprintln!("SKIP: set CAMELID_PRISM_MMPROJ and CAMELID_PRISM_IMAGE");
+            return;
+        };
+        let model = PrismVisionModel::load(model_path).expect("load Prism projector");
+        let input = model
+            .preprocess(image_path, 1, 128)
+            .expect("preprocess configured image");
+
+        let mut scalar = super::super::vision_cuda::CudaVisionEncoder::new()
+            .expect("initialize scalar CUDA projector");
+        scalar.disable_tensor_cores_for_test();
+        let scalar_started = std::time::Instant::now();
+        let expected = scalar
+            .encode(&model, &input)
+            .expect("encode with scalar CUDA kernels");
+        let scalar_seconds = scalar_started.elapsed().as_secs_f64();
+        drop(scalar);
+
+        let mut tensor = super::super::vision_cuda::CudaVisionEncoder::new()
+            .expect("initialize tensor-core CUDA projector");
+        let tensor_started = std::time::Instant::now();
+        let actual = tensor
+            .encode(&model, &input)
+            .expect("encode with tensor-core CUDA kernels");
+        let tensor_seconds = tensor_started.elapsed().as_secs_f64();
+        assert_eq!(actual.len(), expected.len());
+        let (mut dot, mut expected_l2, mut actual_l2, mut error_l2) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut max_abs = 0.0f32;
+        let mut max_reference_abs = 0.0f32;
+        for (&reference, &candidate) in expected.iter().flatten().zip(actual.iter().flatten()) {
+            dot += reference as f64 * candidate as f64;
+            expected_l2 += reference as f64 * reference as f64;
+            actual_l2 += candidate as f64 * candidate as f64;
+            error_l2 += (reference - candidate) as f64 * (reference - candidate) as f64;
+            max_abs = max_abs.max((reference - candidate).abs());
+            max_reference_abs = max_reference_abs.max(reference.abs());
+        }
+        let cosine = dot / (expected_l2.sqrt() * actual_l2.sqrt());
+        let relative_l2 = (error_l2 / expected_l2).sqrt();
+        eprintln!(
+            "Qwen3-VL CUDA tensor-core parity: scalar={scalar_seconds:.6}s tensor={tensor_seconds:.6}s cosine={cosine:.9} relative_l2={relative_l2:.6} max_abs={max_abs:.6} max_reference_abs={max_reference_abs:.6}"
+        );
+        assert!(cosine > 0.999, "tensor-core projector cosine {cosine}");
+        assert!(
+            relative_l2 < 0.04,
+            "tensor-core projector relative L2 {relative_l2}"
+        );
+    }
+
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    #[test]
+    fn real_prism_27b_generates_from_a_real_cuda_projector_embedding() {
+        let (Ok(model_path), Ok(projector_path)) = (
+            std::env::var("CAMELID_PRISM_27B_GGUF"),
+            std::env::var("CAMELID_PRISM_MMPROJ"),
+        ) else {
+            eprintln!("SKIP: set CAMELID_PRISM_27B_GGUF and CAMELID_PRISM_MMPROJ");
+            return;
+        };
+        let projector = PrismVisionProjector::load(projector_path).expect("load Prism projector");
+        let image = RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 7) as u8, ((x + y) * 3) as u8])
+        });
+        let input = projector
+            .model
+            .preprocess_rgb(image, 1, 1)
+            .expect("preprocess tiny image");
+        let embedding = projector
+            .encode_preprocessed(input)
+            .expect("encode tiny image on CUDA");
+        let model =
+            crate::runnable::RunnableModel::load(&model_path).expect("load Prism 27B language row");
+        let generated = model
+            .generate_vision(&[0], &embedding, &[0], 1, &[])
+            .expect("generate from real CUDA projector embedding");
+        assert_eq!(generated.len(), 1);
+        assert!((generated[0] as usize) < model.vocab);
     }
 
     #[cfg(target_os = "macos")]

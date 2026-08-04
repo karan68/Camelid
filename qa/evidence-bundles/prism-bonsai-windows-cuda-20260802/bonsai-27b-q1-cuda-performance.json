@@ -1,0 +1,70 @@
+{
+  "schema": "camelid.prism_bonsai_windows_cuda_performance/v2",
+  "created_at": "2026-08-03",
+  "source_commit": "f297857f",
+  "scope": "Bonsai-27B-Q1_0.gguf plus Ternary-Bonsai-27B-mmproj-Q8_0.gguf on the receipt hardware",
+  "request": {
+    "image": "target/reference/Bonsai-demo/assets/frontier.png",
+    "image_path_portable": true,
+    "prompt": "Describe this image in exactly 24 short words. Do not stop early.",
+    "max_tokens": 24,
+    "stream": true,
+    "prompt_tokens": 142,
+    "completion_tokens": 24,
+    "post_first_tokens_per_run": 23,
+    "iterations_per_configuration": 3
+  },
+  "control": {
+    "receipt": "prism-popc-disabled.json",
+    "configuration": "CAMELID_PRISM_CUDA_NO_POPC=1",
+    "mean_image_ttft_ms": 2844.2297,
+    "mean_total_ms": 4241.225733333334,
+    "mean_post_first_ms": 1396.9960333333338,
+    "mean_decode_tokens_per_second": 16.463901055331572
+  },
+  "optimized": {
+    "receipt": "prism-popc-default.json",
+    "configuration": "default artifact-gated POPC Q1 decode route",
+    "mean_image_ttft_ms": 2888.2233666666666,
+    "mean_total_ms": 3963.965833333333,
+    "mean_post_first_ms": 1075.7424666666664,
+    "mean_decode_tokens_per_second": 21.380592434105864
+  },
+  "vendor_reference": {
+    "receipt": "prism-vendor-reasoning-off.json",
+    "configuration": "PrismML-Eng/Bonsai-demo pinned llama.cpp 9fcaed7, Windows CUDA, reasoning off",
+    "prompt_tokens": 142,
+    "completion_tokens": 24,
+    "post_first_tokens_per_run": 23,
+    "mean_image_ttft_ms": 488.45649999999983,
+    "mean_total_ms": 1753.0813333333329,
+    "mean_post_first_ms": 1264.6248333333333,
+    "mean_decode_tokens_per_second": 18.187265278468875
+  },
+  "comparison": {
+    "decode_throughput_speedup_percent_from_full_precision_means": 29.8634653005407,
+    "decode_throughput_speedup_percent_from_four_decimal_display_rates": 29.8635195792006,
+    "reported_decode_throughput_speedup_percent": 29.864,
+    "post_first_time_reduction_percent": 22.9960256866394,
+    "end_to_end_time_reduction_percent": 6.53725874152168,
+    "image_ttft_change_percent": 1.5467691187764,
+    "image_ttft_direction": "slower",
+    "camelid_vs_vendor_decode_throughput_speedup_percent": 17.558039137513614,
+    "camelid_vs_vendor_post_first_time_reduction_percent": 14.935841973686816
+  },
+  "correctness": {
+    "identical_generated_text_within_default_runs": true,
+    "identical_generated_text_within_disabled_runs": true,
+    "identical_generated_text_across_all_six_runs": true,
+    "generated_text": "This graph plots average benchmark score against model size in gigabytes on a logarithmic scale. Data points for various models,",
+    "claim_boundary": "Observed output identity for the six Camelid POPC-on/off requests; no claim that every internal kernel or intermediate logit is bit-exact to a legacy serial or BMMA implementation. The vendor run used the same request shape and prompt-token count but produced different coherent wording, so no cross-engine output-parity claim is made."
+  },
+  "measurement_notes": [
+    "Decode tokens per second is 23 post-first tokens divided by the measured post-first interval; the first generated token is excluded.",
+    "Image TTFT includes image projection, prompt prefill, and production of the first generated token, so it is reported separately from decode throughput.",
+    "Measurements are same-host three-run engineering benchmarks for each configuration, not a cross-machine or production-service claim.",
+    "Both Camelid configurations retained the exact prompt, repository-relative image, completion length, and generated text.",
+    "The pinned vendor comparison retained the same artifact, projector, image, prompt, 142 prompt tokens, 24 completion tokens, greedy sampling, and reasoning-off mode on the same host.",
+    "Camelid's 17.558% advantage over the vendor reference is a bounded post-first decode-throughput observation only; vendor image TTFT was materially lower and no overall-latency advantage is claimed."
+  ]
+}

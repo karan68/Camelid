@@ -4,7 +4,19 @@
 //! GPU-less CI); run with `cargo test --features cuda -- --ignored`.
 
 use super::{CudaResidentDecode, CudaResidentKernels, ProjQuant};
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+
+fn fill_q1_wire(wire: &mut [u8], seed: u8) {
+    for (block_index, block) in wire.chunks_exact_mut(18).enumerate() {
+        let scale = 0.0025 + (block_index % 29) as f32 * 0.000_19;
+        block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+        for (byte_index, value) in block[2..].iter_mut().enumerate() {
+            *value = seed
+                .wrapping_add((block_index as u8).wrapping_mul(37))
+                .wrapping_add((byte_index as u8).wrapping_mul(19));
+        }
+    }
+}
 
 // Pure predicate (no GPU): the device-decode embed-gather allowlist must stay in
 // lockstep with the `embed_gather_*` dispatch in `forward_token_device`. Families
@@ -14,6 +26,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 fn device_embed_gather_allowlist_matches_the_gather_dispatch() {
     for q in [
         ProjQuant::Q8_0,
+        ProjQuant::Q1_0,
+        ProjQuant::Q2_0G64,
+        ProjQuant::Q2_0G128,
         ProjQuant::Q4K,
         ProjQuant::Q6K,
         ProjQuant::Q3K,
@@ -27,6 +42,2395 @@ fn device_embed_gather_allowlist_matches_the_gather_dispatch() {
         assert!(
             !q.has_device_embed_gather(),
             "{q:?} has no embed_gather_* kernel and must fall back to the host-fed loop"
+        );
+    }
+}
+
+#[test]
+fn q1t128_roundtrip_is_same_size_and_tail_exact() {
+    for &(rows, cols) in &[
+        (1usize, 128usize),
+        (8, 256),
+        (127, 384),
+        (128, 256),
+        (129, 256),
+        (255, 512),
+        (257, 128),
+    ] {
+        let blocks = cols / 128;
+        let mut wire = vec![0u8; rows * blocks * 18];
+        for (index, byte) in wire.iter_mut().enumerate() {
+            *byte = index
+                .wrapping_mul(73)
+                .wrapping_add(index / 17)
+                .wrapping_add(29) as u8;
+        }
+        let tiled = super::repack_q1_t128(&wire, rows, cols).unwrap();
+        assert_eq!(tiled.len(), wire.len(), "Q1T128 changed VRAM size");
+        let roundtrip = super::unpack_q1_t128(&tiled, rows, cols).unwrap();
+        assert_eq!(
+            roundtrip, wire,
+            "Q1T128 tail roundtrip failed at {rows}x{cols}"
+        );
+
+        // Pin the group shape directly: first K block in each row tile is all
+        // signs followed by all scales, including a short final tile.
+        let mut group = 0usize;
+        for row0 in (0..rows).step_by(128) {
+            let nr = (rows - row0).min(128);
+            for block in 0..blocks {
+                for rr in 0..nr {
+                    let raw = ((row0 + rr) * blocks + block) * 18;
+                    assert_eq!(
+                        &tiled[group + rr * 16..group + (rr + 1) * 16],
+                        &wire[raw + 2..raw + 18]
+                    );
+                    assert_eq!(
+                        &tiled[group + nr * 16 + rr * 2..group + nr * 16 + (rr + 1) * 2],
+                        &wire[raw..raw + 2]
+                    );
+                }
+                group += nr * 18;
+            }
+        }
+        assert_eq!(group, tiled.len());
+    }
+    assert!(super::repack_q1_t128(&[0; 18], 1, 64).is_err());
+    assert!(super::repack_q1_t128(&[0; 17], 1, 128).is_err());
+}
+
+#[test]
+#[ignore = "requires a CUDA device; validates every Q1T128 reader"]
+fn prism_q1t128_readers_match_raw_wire_with_row_and_token_tails() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    let (rows, cols, k_tokens) = (131usize, 256usize, 19usize);
+    let mut rng = Lcg(0x51_31_74_12_80);
+    let mut wire = vec![0u8; rows * (cols / 128) * 18];
+    for block in wire.chunks_exact_mut(18) {
+        let scale = 0.002 + rng.next_f32().abs() * 0.035;
+        block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+        for byte in &mut block[2..] {
+            *byte = rng.next_u8();
+        }
+    }
+    let tiled = super::repack_q1_t128(&wire, rows, cols).unwrap();
+    let activation = (0..k_tokens * cols)
+        .map(|_| rng.next_f32() * 1.75)
+        .collect::<Vec<_>>();
+    let d_wire = kernels.stream.clone_htod(&wire).unwrap();
+    let d_tiled = kernels.stream.clone_htod(&tiled).unwrap();
+    let d_activation = kernels.stream.clone_htod(&activation).unwrap();
+
+    // Strict f32 decode and K<=2 prompt paths must remain bitwise identical:
+    // Q1T128 changes addresses only, never the parity-locked reduction order.
+    let mut d_strict_raw = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    let mut d_strict_tiled = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_prism_low_bit_f32_gemv(
+        &kernels.stream,
+        &kernels.prism_low_bit_f32_gemv,
+        &d_activation,
+        &d_wire.slice(0..wire.len()),
+        rows,
+        cols,
+        1,
+        128,
+        false,
+        &mut d_strict_raw,
+        0,
+    )
+    .unwrap();
+    super::launch_prism_low_bit_f32_gemv(
+        &kernels.stream,
+        &kernels.prism_low_bit_f32_gemv,
+        &d_activation,
+        &d_tiled.slice(0..tiled.len()),
+        rows,
+        cols,
+        1,
+        128,
+        true,
+        &mut d_strict_tiled,
+        0,
+    )
+    .unwrap();
+    let mut d_prompt_raw = kernels.stream.alloc_zeros::<f32>(2 * rows).unwrap();
+    let mut d_prompt_tiled = kernels.stream.alloc_zeros::<f32>(2 * rows).unwrap();
+    super::launch_prism_q1_f32_gemm_batched(
+        &kernels.stream,
+        &kernels.prism_q1_f32_gemm_batched,
+        &d_activation,
+        &d_wire.slice(0..wire.len()),
+        rows,
+        cols,
+        2,
+        false,
+        &mut d_prompt_raw,
+    )
+    .unwrap();
+    super::launch_prism_q1_f32_gemm_batched(
+        &kernels.stream,
+        &kernels.prism_q1_f32_gemm_batched,
+        &d_activation,
+        &d_tiled.slice(0..tiled.len()),
+        rows,
+        cols,
+        2,
+        true,
+        &mut d_prompt_tiled,
+    )
+    .unwrap();
+
+    let mut d_quants = kernels.stream.alloc_zeros::<i8>(k_tokens * cols).unwrap();
+    let mut d_scales = kernels
+        .stream
+        .alloc_zeros::<f32>(k_tokens * cols / 32)
+        .unwrap();
+    super::launch_quantize(
+        &kernels.stream,
+        &kernels.quantize,
+        &d_activation,
+        &mut d_quants,
+        &mut d_scales,
+        k_tokens * cols / 32,
+    )
+    .unwrap();
+
+    // Decode uses a deliberately different four-lane subgroup mapping to make
+    // the tiled sign slab coalesced. It may reassociate block sums by a few ULP,
+    // while the batched readers below retain bitwise output parity.
+    let mut d_fast_raw = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    let mut d_fast_tiled = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_prism_q1_q8_gemv(
+        &kernels.stream,
+        &kernels.prism_q1_q8_gemv,
+        &d_quants,
+        &d_scales,
+        &d_wire.slice(0..wire.len()),
+        rows,
+        cols,
+        &mut d_fast_raw,
+        0,
+    )
+    .unwrap();
+    super::launch_prism_q1_q8_gemv(
+        &kernels.stream,
+        &kernels.prism_q1t128_q8_gemv,
+        &d_quants,
+        &d_scales,
+        &d_tiled.slice(0..tiled.len()),
+        rows,
+        cols,
+        &mut d_fast_tiled,
+        0,
+    )
+    .unwrap();
+
+    let mut d_dp4a_raw = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+    let mut d_dp4a_tiled = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+    super::launch_prism_q1_q8_gemm_batched(
+        &kernels.stream,
+        &kernels.prism_q1_q8_gemm_batched,
+        &d_quants,
+        &d_scales,
+        &d_wire.slice(0..wire.len()),
+        rows,
+        cols,
+        k_tokens,
+        false,
+        &mut d_dp4a_raw,
+        0,
+    )
+    .unwrap();
+    super::launch_prism_q1_q8_gemm_batched(
+        &kernels.stream,
+        &kernels.prism_q1_q8_gemm_batched,
+        &d_quants,
+        &d_scales,
+        &d_tiled.slice(0..tiled.len()),
+        rows,
+        cols,
+        k_tokens,
+        true,
+        &mut d_dp4a_tiled,
+        0,
+    )
+    .unwrap();
+
+    let mut tensor_core_outputs = None;
+    if let Some(imma) = kernels.prism_q1_q8_wmma_gemm_batched.as_ref() {
+        let mut raw = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        let mut tiled_out = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_prism_q1_q8_wmma_gemm_batched(
+            &kernels.stream,
+            imma,
+            &d_quants,
+            &d_scales,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            k_tokens,
+            false,
+            &mut raw,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q1_q8_wmma_gemm_batched(
+            &kernels.stream,
+            imma,
+            &d_quants,
+            &d_scales,
+            &d_tiled.slice(0..tiled.len()),
+            rows,
+            cols,
+            k_tokens,
+            true,
+            &mut tiled_out,
+            0,
+        )
+        .unwrap();
+        tensor_core_outputs = Some((raw, tiled_out));
+    }
+
+    let mut bmma_outputs = None;
+    if let (Some(pack), Some(bmma)) = (
+        kernels.prism_q8_b128_bitpack.as_ref(),
+        kernels.prism_q1_q8_b128_bmma_gemm_batched.as_ref(),
+    ) {
+        let mut bits = kernels
+            .stream
+            .alloc_zeros::<u32>(k_tokens * cols / 4)
+            .unwrap();
+        let mut scales = kernels
+            .stream
+            .alloc_zeros::<f32>(k_tokens * cols / 128)
+            .unwrap();
+        super::launch_prism_q8_b128_bitpack(
+            &kernels.stream,
+            pack,
+            &d_activation,
+            &mut bits,
+            &mut scales,
+            cols,
+            k_tokens,
+        )
+        .unwrap();
+        let mut raw = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        let mut tiled_out = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_prism_q1_q8_b128_bmma_gemm_batched(
+            &kernels.stream,
+            bmma,
+            &bits,
+            &scales,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            k_tokens,
+            false,
+            &mut raw,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q1_q8_b128_bmma_gemm_batched(
+            &kernels.stream,
+            bmma,
+            &bits,
+            &scales,
+            &d_tiled.slice(0..tiled.len()),
+            rows,
+            cols,
+            k_tokens,
+            true,
+            &mut tiled_out,
+            0,
+        )
+        .unwrap();
+        bmma_outputs = Some((raw, tiled_out));
+    }
+
+    let mut strict_raw = vec![0.0f32; rows];
+    let mut strict_tiled = vec![0.0f32; rows];
+    let mut prompt_raw = vec![0.0f32; 2 * rows];
+    let mut prompt_tiled = vec![0.0f32; 2 * rows];
+    let mut fast_raw = vec![0.0f32; rows];
+    let mut fast_tiled = vec![0.0f32; rows];
+    let mut dp4a_raw = vec![0.0f32; k_tokens * rows];
+    let mut dp4a_tiled = vec![0.0f32; k_tokens * rows];
+    kernels
+        .stream
+        .memcpy_dtoh(&d_strict_raw, &mut strict_raw)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_strict_tiled, &mut strict_tiled)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_prompt_raw, &mut prompt_raw)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_prompt_tiled, &mut prompt_tiled)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_fast_raw, &mut fast_raw)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_fast_tiled, &mut fast_tiled)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_dp4a_raw, &mut dp4a_raw)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_dp4a_tiled, &mut dp4a_tiled)
+        .unwrap();
+    kernels.ctx.synchronize().unwrap();
+
+    assert_same_bits("strict Q1 decode", &strict_raw, &strict_tiled);
+    assert_same_bits("strict Q1 prompt", &prompt_raw, &prompt_tiled);
+    assert_same_bits("Q1 DP4A prompt", &dp4a_raw, &dp4a_tiled);
+    let (cosine, relative_l2, max_abs) = vector_error(&fast_tiled, &fast_raw);
+    assert!(
+        cosine > 0.999_999 && relative_l2 < 3e-6,
+        "Q1T128 subgroup decode diverged: cosine={cosine:.9} relative_l2={relative_l2:.9} max_abs={max_abs:.9}"
+    );
+
+    if let Some((raw, tiled_out)) = tensor_core_outputs {
+        let mut raw_host = vec![0.0f32; k_tokens * rows];
+        let mut tiled_host = vec![0.0f32; k_tokens * rows];
+        kernels.stream.memcpy_dtoh(&raw, &mut raw_host).unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&tiled_out, &mut tiled_host)
+            .unwrap();
+        kernels.ctx.synchronize().unwrap();
+        assert_same_bits("Q1 IMMA prompt", &raw_host, &tiled_host);
+    }
+    if let Some((raw, tiled_out)) = bmma_outputs {
+        let mut raw_host = vec![0.0f32; k_tokens * rows];
+        let mut tiled_host = vec![0.0f32; k_tokens * rows];
+        kernels.stream.memcpy_dtoh(&raw, &mut raw_host).unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&tiled_out, &mut tiled_host)
+            .unwrap();
+        kernels.ctx.synchronize().unwrap();
+        assert_same_bits("Q1 BMMA prompt", &raw_host, &tiled_host);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device; exact Bonsai-27B fused-projection parity"]
+fn prism_q1t128_fused_bonsai27b_projections_match_separate_launches_bitwise() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    const COLS: usize = 5_120;
+    let mut rng = Lcg(0x000f_027b_05a1);
+    let activation = (0..COLS).map(|_| rng.next_f32() * 1.75).collect::<Vec<_>>();
+    let d_activation = kernels.stream.clone_htod(&activation).unwrap();
+    let mut d_quants = kernels.stream.alloc_zeros::<i8>(COLS).unwrap();
+    let mut d_scales = kernels.stream.alloc_zeros::<f32>(COLS / 32).unwrap();
+    super::launch_quantize(
+        &kernels.stream,
+        &kernels.quantize,
+        &d_activation,
+        &mut d_quants,
+        &mut d_scales,
+        COLS / 32,
+    )
+    .unwrap();
+    let mut d_bitplanes = kernels.stream.alloc_zeros::<u32>((COLS / 32) * 8).unwrap();
+    let mut d_qsums = kernels.stream.alloc_zeros::<i32>(COLS / 32).unwrap();
+
+    // Full attention: qgate + K + V.
+    {
+        const QGATE: usize = 12_288;
+        const KV: usize = 1_024;
+        let qgate = q1t_fixture(QGATE, COLS, &mut rng);
+        let k = q1t_fixture(KV, COLS, &mut rng);
+        let v = q1t_fixture(KV, COLS, &mut rng);
+        let d_qgate = kernels.stream.clone_htod(&qgate).unwrap();
+        let d_k = kernels.stream.clone_htod(&k).unwrap();
+        let d_v = kernels.stream.clone_htod(&v).unwrap();
+        let mut separate_qgate = kernels.stream.alloc_zeros::<f32>(QGATE).unwrap();
+        let mut separate_k = kernels.stream.alloc_zeros::<f32>(KV).unwrap();
+        let mut separate_v = kernels.stream.alloc_zeros::<f32>(KV).unwrap();
+        let mut fused_qgate = kernels.stream.alloc_zeros::<f32>(QGATE).unwrap();
+        let mut fused_k = kernels.stream.alloc_zeros::<f32>(KV).unwrap();
+        let mut fused_v = kernels.stream.alloc_zeros::<f32>(KV).unwrap();
+        let mut popc_qgate = kernels.stream.alloc_zeros::<f32>(QGATE).unwrap();
+        let mut popc_k = kernels.stream.alloc_zeros::<f32>(KV).unwrap();
+        let mut popc_v = kernels.stream.alloc_zeros::<f32>(KV).unwrap();
+        super::launch_prism_q1_q8_gemv(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_qgate.slice(0..qgate.len()),
+            QGATE,
+            COLS,
+            &mut separate_qgate,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q1_q8_gemv(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_k.slice(0..k.len()),
+            KV,
+            COLS,
+            &mut separate_k,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q1_q8_gemv(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_v.slice(0..v.len()),
+            KV,
+            COLS,
+            &mut separate_v,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q1t128_fused_full_bonsai27b(
+            &kernels.stream,
+            &kernels.prism_q1t128_fused_full_bonsai27b,
+            &d_quants,
+            &d_scales,
+            &d_qgate.slice(0..qgate.len()),
+            &d_k.slice(0..k.len()),
+            &d_v.slice(0..v.len()),
+            &mut fused_qgate,
+            &mut fused_k,
+            &mut fused_v,
+        )
+        .unwrap();
+        super::launch_prism_q8_32_bitplanes_qsum(
+            &kernels.stream,
+            &kernels.prism_q8_32_bitplanes_qsum,
+            &d_quants,
+            &mut d_bitplanes,
+            &mut d_qsums,
+            COLS / 32,
+        )
+        .unwrap();
+        super::launch_prism_q1t128_q8_popc_fused_full_bonsai27b(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_popc_fused_full_bonsai27b,
+            &d_bitplanes,
+            &d_qsums,
+            &d_scales,
+            &d_qgate.slice(0..qgate.len()),
+            &d_k.slice(0..k.len()),
+            &d_v.slice(0..v.len()),
+            &mut popc_qgate,
+            &mut popc_k,
+            &mut popc_v,
+        )
+        .unwrap();
+        let mut separate_qgate_host = vec![0.0f32; QGATE];
+        let mut separate_k_host = vec![0.0f32; KV];
+        let mut separate_v_host = vec![0.0f32; KV];
+        let mut fused_qgate_host = vec![0.0f32; QGATE];
+        let mut fused_k_host = vec![0.0f32; KV];
+        let mut fused_v_host = vec![0.0f32; KV];
+        let mut popc_qgate_host = vec![0.0f32; QGATE];
+        let mut popc_k_host = vec![0.0f32; KV];
+        let mut popc_v_host = vec![0.0f32; KV];
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_qgate, &mut separate_qgate_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_k, &mut separate_k_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_v, &mut separate_v_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_qgate, &mut fused_qgate_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_k, &mut fused_k_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_v, &mut fused_v_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&popc_qgate, &mut popc_qgate_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&popc_k, &mut popc_k_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&popc_v, &mut popc_v_host)
+            .unwrap();
+        kernels.ctx.synchronize().unwrap();
+        assert_same_bits("fused qgate", &fused_qgate_host, &separate_qgate_host);
+        assert_same_bits("fused K", &fused_k_host, &separate_k_host);
+        assert_same_bits("fused V", &fused_v_host, &separate_v_host);
+        assert_same_bits("POPC fused qgate", &popc_qgate_host, &fused_qgate_host);
+        assert_same_bits("POPC fused K", &popc_k_host, &fused_k_host);
+        assert_same_bits("POPC fused V", &popc_v_host, &fused_v_host);
+
+        let mut popc_ms = Vec::new();
+        let mut dp4a_ms = Vec::new();
+        for _ in 0..11 {
+            let started = std::time::Instant::now();
+            super::launch_prism_q8_32_bitplanes_qsum(
+                &kernels.stream,
+                &kernels.prism_q8_32_bitplanes_qsum,
+                &d_quants,
+                &mut d_bitplanes,
+                &mut d_qsums,
+                COLS / 32,
+            )
+            .unwrap();
+            super::launch_prism_q1t128_q8_popc_fused_full_bonsai27b(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_popc_fused_full_bonsai27b,
+                &d_bitplanes,
+                &d_qsums,
+                &d_scales,
+                &d_qgate.slice(0..qgate.len()),
+                &d_k.slice(0..k.len()),
+                &d_v.slice(0..v.len()),
+                &mut popc_qgate,
+                &mut popc_k,
+                &mut popc_v,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+            popc_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+            let started = std::time::Instant::now();
+            super::launch_prism_q1t128_fused_full_bonsai27b(
+                &kernels.stream,
+                &kernels.prism_q1t128_fused_full_bonsai27b,
+                &d_quants,
+                &d_scales,
+                &d_qgate.slice(0..qgate.len()),
+                &d_k.slice(0..k.len()),
+                &d_v.slice(0..v.len()),
+                &mut fused_qgate,
+                &mut fused_k,
+                &mut fused_v,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+            dp4a_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        let popc_ms = mean(&popc_ms);
+        let dp4a_ms = mean(&dp4a_ms);
+        eprintln!(
+            "Q1T full fused qgate/K/V: POPC+pack={popc_ms:.4}ms DP4A={dp4a_ms:.4}ms speedup={:.3}x",
+            dp4a_ms / popc_ms,
+        );
+    }
+
+    // SSM input: wqkv + z + the short beta/alpha row tile.
+    {
+        const WQKV: usize = 10_240;
+        const Z: usize = 6_144;
+        const TAIL: usize = 48;
+        let wqkv = q1t_fixture(WQKV, COLS, &mut rng);
+        let z = q1t_fixture(Z, COLS, &mut rng);
+        let beta = q1t_fixture(TAIL, COLS, &mut rng);
+        let alpha = q1t_fixture(TAIL, COLS, &mut rng);
+        let d_wqkv = kernels.stream.clone_htod(&wqkv).unwrap();
+        let d_z = kernels.stream.clone_htod(&z).unwrap();
+        let d_beta = kernels.stream.clone_htod(&beta).unwrap();
+        let d_alpha = kernels.stream.clone_htod(&alpha).unwrap();
+        let mut separate_wqkv = kernels.stream.alloc_zeros::<f32>(WQKV).unwrap();
+        let mut separate_z = kernels.stream.alloc_zeros::<f32>(Z).unwrap();
+        let mut separate_beta = kernels.stream.alloc_zeros::<f32>(TAIL).unwrap();
+        let mut separate_alpha = kernels.stream.alloc_zeros::<f32>(TAIL).unwrap();
+        let mut fused_wqkv = kernels.stream.alloc_zeros::<f32>(WQKV).unwrap();
+        let mut fused_z = kernels.stream.alloc_zeros::<f32>(Z).unwrap();
+        let mut fused_beta = kernels.stream.alloc_zeros::<f32>(TAIL).unwrap();
+        let mut fused_alpha = kernels.stream.alloc_zeros::<f32>(TAIL).unwrap();
+        let mut popc_wqkv = kernels.stream.alloc_zeros::<f32>(WQKV).unwrap();
+        let mut popc_z = kernels.stream.alloc_zeros::<f32>(Z).unwrap();
+        let mut popc_beta = kernels.stream.alloc_zeros::<f32>(TAIL).unwrap();
+        let mut popc_alpha = kernels.stream.alloc_zeros::<f32>(TAIL).unwrap();
+        for (weight, rows, out) in [
+            (&d_wqkv, WQKV, &mut separate_wqkv),
+            (&d_z, Z, &mut separate_z),
+            (&d_beta, TAIL, &mut separate_beta),
+            (&d_alpha, TAIL, &mut separate_alpha),
+        ] {
+            super::launch_prism_q1_q8_gemv(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_gemv,
+                &d_quants,
+                &d_scales,
+                &weight.slice(0..weight.len()),
+                rows,
+                COLS,
+                out,
+                0,
+            )
+            .unwrap();
+        }
+        super::launch_prism_q1t128_fused_ssm_bonsai27b(
+            &kernels.stream,
+            &kernels.prism_q1t128_fused_ssm_bonsai27b,
+            &d_quants,
+            &d_scales,
+            &d_wqkv.slice(0..wqkv.len()),
+            &d_z.slice(0..z.len()),
+            &d_beta.slice(0..beta.len()),
+            &d_alpha.slice(0..alpha.len()),
+            &mut fused_wqkv,
+            &mut fused_z,
+            &mut fused_beta,
+            &mut fused_alpha,
+        )
+        .unwrap();
+        super::launch_prism_q8_32_bitplanes_qsum(
+            &kernels.stream,
+            &kernels.prism_q8_32_bitplanes_qsum,
+            &d_quants,
+            &mut d_bitplanes,
+            &mut d_qsums,
+            COLS / 32,
+        )
+        .unwrap();
+        super::launch_prism_q1t128_q8_popc_fused_ssm_bonsai27b(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_popc_fused_ssm_bonsai27b,
+            &d_bitplanes,
+            &d_qsums,
+            &d_scales,
+            &d_wqkv.slice(0..wqkv.len()),
+            &d_z.slice(0..z.len()),
+            &d_beta.slice(0..beta.len()),
+            &d_alpha.slice(0..alpha.len()),
+            &mut popc_wqkv,
+            &mut popc_z,
+            &mut popc_beta,
+            &mut popc_alpha,
+        )
+        .unwrap();
+        let mut separate_wqkv_host = vec![0.0f32; WQKV];
+        let mut separate_z_host = vec![0.0f32; Z];
+        let mut separate_beta_host = vec![0.0f32; TAIL];
+        let mut separate_alpha_host = vec![0.0f32; TAIL];
+        let mut fused_wqkv_host = vec![0.0f32; WQKV];
+        let mut fused_z_host = vec![0.0f32; Z];
+        let mut fused_beta_host = vec![0.0f32; TAIL];
+        let mut fused_alpha_host = vec![0.0f32; TAIL];
+        let mut popc_wqkv_host = vec![0.0f32; WQKV];
+        let mut popc_z_host = vec![0.0f32; Z];
+        let mut popc_beta_host = vec![0.0f32; TAIL];
+        let mut popc_alpha_host = vec![0.0f32; TAIL];
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_wqkv, &mut separate_wqkv_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_z, &mut separate_z_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_beta, &mut separate_beta_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_alpha, &mut separate_alpha_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_wqkv, &mut fused_wqkv_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_z, &mut fused_z_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_beta, &mut fused_beta_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_alpha, &mut fused_alpha_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&popc_wqkv, &mut popc_wqkv_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&popc_z, &mut popc_z_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&popc_beta, &mut popc_beta_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&popc_alpha, &mut popc_alpha_host)
+            .unwrap();
+        kernels.ctx.synchronize().unwrap();
+        assert_same_bits("fused wqkv", &fused_wqkv_host, &separate_wqkv_host);
+        assert_same_bits("fused z", &fused_z_host, &separate_z_host);
+        assert_same_bits("fused beta", &fused_beta_host, &separate_beta_host);
+        assert_same_bits("fused alpha", &fused_alpha_host, &separate_alpha_host);
+        assert_same_bits("POPC fused wqkv", &popc_wqkv_host, &fused_wqkv_host);
+        assert_same_bits("POPC fused z", &popc_z_host, &fused_z_host);
+        assert_same_bits("POPC fused beta", &popc_beta_host, &fused_beta_host);
+        assert_same_bits("POPC fused alpha", &popc_alpha_host, &fused_alpha_host);
+
+        let mut popc_ms = Vec::new();
+        let mut dp4a_ms = Vec::new();
+        for _ in 0..11 {
+            let started = std::time::Instant::now();
+            super::launch_prism_q8_32_bitplanes_qsum(
+                &kernels.stream,
+                &kernels.prism_q8_32_bitplanes_qsum,
+                &d_quants,
+                &mut d_bitplanes,
+                &mut d_qsums,
+                COLS / 32,
+            )
+            .unwrap();
+            super::launch_prism_q1t128_q8_popc_fused_ssm_bonsai27b(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_popc_fused_ssm_bonsai27b,
+                &d_bitplanes,
+                &d_qsums,
+                &d_scales,
+                &d_wqkv.slice(0..wqkv.len()),
+                &d_z.slice(0..z.len()),
+                &d_beta.slice(0..beta.len()),
+                &d_alpha.slice(0..alpha.len()),
+                &mut popc_wqkv,
+                &mut popc_z,
+                &mut popc_beta,
+                &mut popc_alpha,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+            popc_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+            let started = std::time::Instant::now();
+            super::launch_prism_q1t128_fused_ssm_bonsai27b(
+                &kernels.stream,
+                &kernels.prism_q1t128_fused_ssm_bonsai27b,
+                &d_quants,
+                &d_scales,
+                &d_wqkv.slice(0..wqkv.len()),
+                &d_z.slice(0..z.len()),
+                &d_beta.slice(0..beta.len()),
+                &d_alpha.slice(0..alpha.len()),
+                &mut fused_wqkv,
+                &mut fused_z,
+                &mut fused_beta,
+                &mut fused_alpha,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+            dp4a_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        let popc_ms = mean(&popc_ms);
+        let dp4a_ms = mean(&dp4a_ms);
+        eprintln!(
+            "Q1T SSM fused wqkv/z/beta/alpha: POPC+pack={popc_ms:.4}ms DP4A={dp4a_ms:.4}ms speedup={:.3}x",
+            dp4a_ms / popc_ms,
+        );
+    }
+
+    // FFN gate + up.
+    {
+        const FFN: usize = 17_408;
+        let gate = q1t_fixture(FFN, COLS, &mut rng);
+        let up = q1t_fixture(FFN, COLS, &mut rng);
+        let d_gate = kernels.stream.clone_htod(&gate).unwrap();
+        let d_up = kernels.stream.clone_htod(&up).unwrap();
+        let mut separate_gate = kernels.stream.alloc_zeros::<f32>(FFN).unwrap();
+        let mut separate_up = kernels.stream.alloc_zeros::<f32>(FFN).unwrap();
+        let mut fused_gate = kernels.stream.alloc_zeros::<f32>(FFN).unwrap();
+        let mut fused_up = kernels.stream.alloc_zeros::<f32>(FFN).unwrap();
+        super::launch_prism_q1_q8_gemv(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_gate.slice(0..gate.len()),
+            FFN,
+            COLS,
+            &mut separate_gate,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q1_q8_gemv(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_up.slice(0..up.len()),
+            FFN,
+            COLS,
+            &mut separate_up,
+            0,
+        )
+        .unwrap();
+        super::launch_prism_q1t128_fused_ffn_bonsai27b(
+            &kernels.stream,
+            &kernels.prism_q1t128_fused_ffn_bonsai27b,
+            &d_quants,
+            &d_scales,
+            &d_gate.slice(0..gate.len()),
+            &d_up.slice(0..up.len()),
+            &mut fused_gate,
+            &mut fused_up,
+        )
+        .unwrap();
+        let mut separate_gate_host = vec![0.0f32; FFN];
+        let mut separate_up_host = vec![0.0f32; FFN];
+        let mut fused_gate_host = vec![0.0f32; FFN];
+        let mut fused_up_host = vec![0.0f32; FFN];
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_gate, &mut separate_gate_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&separate_up, &mut separate_up_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_gate, &mut fused_gate_host)
+            .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&fused_up, &mut fused_up_host)
+            .unwrap();
+        kernels.ctx.synchronize().unwrap();
+        assert_same_bits("fused FFN gate", &fused_gate_host, &separate_gate_host);
+        assert_same_bits("fused FFN up", &fused_up_host, &separate_up_host);
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn prism_low_bit_f32_gemv_matches_packed_wire_oracle() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    let rows = 79usize; // crosses several 8-warp thread blocks
+    let kdim = 256usize;
+    let mut rng = Lcg(0x51_52_53_54);
+    let activation = (0..kdim).map(|_| rng.next_f32()).collect::<Vec<_>>();
+
+    for (lane, bits, block_elements) in [
+        (ProjQuant::Q1_0, 1usize, 128usize),
+        (ProjQuant::Q2_0G64, 2usize, 64usize),
+        (ProjQuant::Q2_0G128, 2usize, 128usize),
+    ] {
+        let block_bytes = 2 + block_elements * bits / 8;
+        let weight_blocks_per_row = kdim / block_elements;
+        let mut wire = vec![0u8; rows * weight_blocks_per_row * block_bytes];
+        for block in wire.chunks_exact_mut(block_bytes) {
+            let scale = rng.next_f32().abs() * 0.04 + 0.001;
+            block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+            for byte in &mut block[2..] {
+                *byte = rng.next_u8();
+            }
+        }
+
+        let mut expected = vec![0.0f32; rows];
+        for (row, slot) in expected.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for wb in 0..weight_blocks_per_row {
+                let offset = (row * weight_blocks_per_row + wb) * block_bytes;
+                let block = &wire[offset..offset + block_bytes];
+                let scale =
+                    crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                for index in 0..block_elements {
+                    let weight = if bits == 1 {
+                        if (block[2 + index / 8] >> (index % 8)) & 1 == 1 {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    } else {
+                        f32::from((block[2 + index / 4] >> ((index % 4) * 2)) & 3) - 1.0
+                    };
+                    acc += activation[wb * block_elements + index] * weight * scale;
+                }
+            }
+            *slot = acc;
+        }
+
+        let d_input = kernels.stream.clone_htod(&activation).unwrap();
+        let d_wire = kernels.stream.clone_htod(&wire).unwrap();
+        let mut d_out = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_prism_low_bit_f32_gemv(
+            &kernels.stream,
+            &kernels.prism_low_bit_f32_gemv,
+            &d_input,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            kdim,
+            bits,
+            block_elements,
+            false,
+            &mut d_out,
+            0,
+        )
+        .unwrap();
+        let mut got = vec![0.0f32; rows];
+        kernels.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+        kernels.ctx.synchronize().unwrap();
+        assert!(
+            close(&got, &expected, 2e-5),
+            "{lane:?} packed f32 GEMV diverged from the wire oracle"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn prism_q1_f32_gemm_batched_matches_decode_gemv_bitwise() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    let (rows, kdim, k_tokens) = (79usize, 256usize, 2usize);
+    let blocks_per_row = kdim / 128;
+    let mut rng = Lcg(0x71_31_ba_7c);
+    let activation = (0..k_tokens * kdim)
+        .map(|_| rng.next_f32())
+        .collect::<Vec<_>>();
+    let mut wire = vec![0u8; rows * blocks_per_row * 18];
+    for block in wire.chunks_exact_mut(18) {
+        let scale = rng.next_f32().abs() * 0.04 + 0.001;
+        block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+        for byte in &mut block[2..] {
+            *byte = rng.next_u8();
+        }
+    }
+
+    let d_wire = kernels.stream.clone_htod(&wire).unwrap();
+    let mut expected = vec![0.0f32; k_tokens * rows];
+    for token in 0..k_tokens {
+        let row = &activation[token * kdim..(token + 1) * kdim];
+        let d_input = kernels.stream.clone_htod(row).unwrap();
+        let mut d_out = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_prism_low_bit_f32_gemv(
+            &kernels.stream,
+            &kernels.prism_low_bit_f32_gemv,
+            &d_input,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            kdim,
+            1,
+            128,
+            false,
+            &mut d_out,
+            0,
+        )
+        .unwrap();
+        kernels
+            .stream
+            .memcpy_dtoh(&d_out, &mut expected[token * rows..(token + 1) * rows])
+            .unwrap();
+    }
+
+    let d_input = kernels.stream.clone_htod(&activation).unwrap();
+    let mut d_out = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+    super::launch_prism_q1_f32_gemm_batched(
+        &kernels.stream,
+        &kernels.prism_q1_f32_gemm_batched,
+        &d_input,
+        &d_wire.slice(0..wire.len()),
+        rows,
+        kdim,
+        k_tokens,
+        false,
+        &mut d_out,
+    )
+    .unwrap();
+    let mut got = vec![0.0f32; k_tokens * rows];
+    kernels.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    kernels.ctx.synchronize().unwrap();
+    assert!(
+        got.iter()
+            .zip(&expected)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+        "Q1 batched prompt GEMM changed the parity-locked decode reduction"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device; performance diagnostic"]
+fn prism_q1_f32_gemm_batched_real_shape_speed_probe() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    let (rows, cols, k_tokens) = (17_408usize, 5_120usize, 2usize);
+    let mut wire = vec![0u8; rows * (cols / 128) * 18];
+    for (block_index, block) in wire.chunks_exact_mut(18).enumerate() {
+        // f16 1.0 scale plus a deterministic, nontrivial Q1 sign pattern.
+        block[0] = 0x00;
+        block[1] = 0x3c;
+        for (byte_index, value) in block[2..].iter_mut().enumerate() {
+            *value = (block_index as u8)
+                .wrapping_mul(17)
+                .wrapping_add((byte_index as u8).wrapping_mul(29));
+        }
+    }
+    let activation = vec![0.25f32; k_tokens * cols];
+    let d_wire = kernels.stream.clone_htod(&wire).unwrap();
+    let d_batch = kernels.stream.clone_htod(&activation).unwrap();
+    let single = vec![0.25f32; cols];
+    let d_single = kernels.stream.clone_htod(&single).unwrap();
+    let mut d_serial_out = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    let mut d_batch_out = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+
+    let mut serial_tile = || {
+        for _ in 0..k_tokens {
+            super::launch_prism_low_bit_f32_gemv(
+                &kernels.stream,
+                &kernels.prism_low_bit_f32_gemv,
+                &d_single,
+                &d_wire.slice(0..wire.len()),
+                rows,
+                cols,
+                1,
+                128,
+                false,
+                &mut d_serial_out,
+                0,
+            )
+            .unwrap();
+        }
+        kernels.ctx.synchronize().unwrap();
+    };
+    let mut batched_tile = || {
+        super::launch_prism_q1_f32_gemm_batched(
+            &kernels.stream,
+            &kernels.prism_q1_f32_gemm_batched,
+            &d_batch,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            k_tokens,
+            false,
+            &mut d_batch_out,
+        )
+        .unwrap();
+        kernels.ctx.synchronize().unwrap();
+    };
+    serial_tile();
+    batched_tile();
+
+    let mut serial_ms = Vec::new();
+    let mut batched_ms = Vec::new();
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        serial_tile();
+        serial_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        let started = std::time::Instant::now();
+        batched_tile();
+        batched_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    eprintln!(
+        "Q1 real-shape 2-token tile: serial={:.3}ms batched={:.3}ms speedup={:.3}x",
+        mean(&serial_ms),
+        mean(&batched_ms),
+        mean(&serial_ms) / mean(&batched_ms),
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device; performance diagnostic"]
+// These closures mutably capture device outputs. Explicitly consuming them
+// before DtoH copies is the intended borrow boundary in this diagnostic.
+#[allow(clippy::drop_non_drop)]
+fn prism_q1_q8_gemm_batched_real_shape_speed_probe() {
+    let kernels = CudaResidentKernels::new().expect("CUDA resident kernels for Q1 speed probe");
+    let (rows, cols, k_tokens) = (17_408usize, 5_120usize, 8usize);
+    let wire = vec![0u8; rows * (cols / 128) * 18];
+    let tiled_wire = super::repack_q1_t128(&wire, rows, cols).unwrap();
+    let activation = (0..k_tokens * cols)
+        .map(|index| ((index % 251) as f32 - 125.0) / 127.0)
+        .collect::<Vec<_>>();
+    let d_wire = kernels.stream.clone_htod(&wire).unwrap();
+    let d_tiled_wire = kernels.stream.clone_htod(&tiled_wire).unwrap();
+    let d_activation = kernels.stream.clone_htod(&activation).unwrap();
+    let mut d_quants = kernels.stream.alloc_zeros::<i8>(k_tokens * cols).unwrap();
+    let mut d_scales = kernels
+        .stream
+        .alloc_zeros::<f32>(k_tokens * cols / 32)
+        .unwrap();
+    super::launch_quantize(
+        &kernels.stream,
+        &kernels.quantize,
+        &d_activation,
+        &mut d_quants,
+        &mut d_scales,
+        k_tokens * cols / 32,
+    )
+    .unwrap();
+    let mut d_decode_exact = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    let mut d_decode_fast = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    let mut d_decode_tiled = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+    let mut decode_exact = || {
+        super::launch_prism_low_bit_f32_gemv(
+            &kernels.stream,
+            &kernels.prism_low_bit_f32_gemv,
+            &d_activation,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            1,
+            128,
+            false,
+            &mut d_decode_exact,
+            0,
+        )
+        .unwrap();
+        kernels.ctx.synchronize().unwrap();
+    };
+    let mut decode_fast = || {
+        super::launch_prism_q1_q8_gemv(
+            &kernels.stream,
+            &kernels.prism_q1_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            &mut d_decode_fast,
+            0,
+        )
+        .unwrap();
+        kernels.ctx.synchronize().unwrap();
+    };
+    let mut decode_tiled = || {
+        super::launch_prism_q1_q8_gemv(
+            &kernels.stream,
+            &kernels.prism_q1t128_q8_gemv,
+            &d_quants,
+            &d_scales,
+            &d_tiled_wire.slice(0..tiled_wire.len()),
+            rows,
+            cols,
+            &mut d_decode_tiled,
+            0,
+        )
+        .unwrap();
+        kernels.ctx.synchronize().unwrap();
+    };
+    decode_exact();
+    decode_fast();
+    decode_tiled();
+    let mut decode_exact_ms = Vec::new();
+    let mut decode_fast_ms = Vec::new();
+    let mut decode_tiled_ms = Vec::new();
+    for _ in 0..15 {
+        let started = std::time::Instant::now();
+        decode_exact();
+        decode_exact_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        let started = std::time::Instant::now();
+        decode_fast();
+        decode_fast_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        let started = std::time::Instant::now();
+        decode_tiled();
+        decode_tiled_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    drop(decode_exact);
+    drop(decode_fast);
+    drop(decode_tiled);
+    let mut decode_exact_out = vec![0.0f32; rows];
+    let mut decode_fast_out = vec![0.0f32; rows];
+    let mut decode_tiled_out = vec![0.0f32; rows];
+    kernels
+        .stream
+        .memcpy_dtoh(&d_decode_exact, &mut decode_exact_out)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_decode_fast, &mut decode_fast_out)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_decode_tiled, &mut decode_tiled_out)
+        .unwrap();
+    let decode_max_abs = decode_exact_out
+        .iter()
+        .zip(&decode_fast_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let (_, tiled_relative_l2, tiled_max_abs) = vector_error(&decode_tiled_out, &decode_fast_out);
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    eprintln!(
+        "Q1 real-shape decode: exact-f32={:.3}ms raw-q8={:.3}ms q1t128-q8={:.3}ms exact/tiled={:.3}x raw/tiled={:.3}x exact-vs-raw-max={:.6} tiled-vs-raw-rel-l2={:.3e} tiled-vs-raw-max={:.6}",
+        mean(&decode_exact_ms),
+        mean(&decode_fast_ms),
+        mean(&decode_tiled_ms),
+        mean(&decode_exact_ms) / mean(&decode_tiled_ms),
+        mean(&decode_fast_ms) / mean(&decode_tiled_ms),
+        decode_max_abs,
+        tiled_relative_l2,
+        tiled_max_abs,
+    );
+    let mut d_exact_out = kernels.stream.alloc_zeros::<f32>(2 * rows).unwrap();
+    let mut d_fast_out = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+    let mut d_wmma_out = kernels.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+
+    let mut exact_tiles = || {
+        for _ in 0..(k_tokens / 2) {
+            super::launch_prism_q1_f32_gemm_batched(
+                &kernels.stream,
+                &kernels.prism_q1_f32_gemm_batched,
+                &d_activation,
+                &d_wire.slice(0..wire.len()),
+                rows,
+                cols,
+                2,
+                false,
+                &mut d_exact_out,
+            )
+            .unwrap();
+        }
+        kernels.ctx.synchronize().unwrap();
+    };
+    let mut fast_tile = || {
+        super::launch_prism_q1_q8_gemm_batched(
+            &kernels.stream,
+            &kernels.prism_q1_q8_gemm_batched,
+            &d_quants,
+            &d_scales,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            k_tokens,
+            false,
+            &mut d_fast_out,
+            0,
+        )
+        .unwrap();
+        kernels.ctx.synchronize().unwrap();
+    };
+    let wmma = kernels
+        .prism_q1_q8_wmma_gemm_batched
+        .as_ref()
+        .expect("SM 7.5+ tensor-core kernel");
+    let mut wmma_tile = || {
+        super::launch_prism_q1_q8_wmma_gemm_batched(
+            &kernels.stream,
+            wmma,
+            &d_quants,
+            &d_scales,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            k_tokens,
+            false,
+            &mut d_wmma_out,
+            0,
+        )
+        .unwrap();
+        kernels.ctx.synchronize().unwrap();
+    };
+    exact_tiles();
+    fast_tile();
+    wmma_tile();
+
+    let mut exact_ms = Vec::new();
+    let mut fast_ms = Vec::new();
+    let mut wmma_ms = Vec::new();
+    for _ in 0..7 {
+        let started = std::time::Instant::now();
+        exact_tiles();
+        exact_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        let started = std::time::Instant::now();
+        fast_tile();
+        fast_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        let started = std::time::Instant::now();
+        wmma_tile();
+        wmma_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    drop(fast_tile);
+    drop(wmma_tile);
+    let mut fast_out = vec![0.0f32; k_tokens * rows];
+    let mut wmma_out = vec![0.0f32; k_tokens * rows];
+    kernels
+        .stream
+        .memcpy_dtoh(&d_fast_out, &mut fast_out)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_wmma_out, &mut wmma_out)
+        .unwrap();
+    let max_abs = fast_out
+        .iter()
+        .zip(&wmma_out)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    eprintln!(
+        "Q1 real-shape 8-token tile: exact-k2={:.3}ms q8-dp4a={:.3}ms q8-wmma={:.3}ms exact/wmma={:.3}x dp4a/wmma={:.3}x max_abs={:.6}",
+        mean(&exact_ms),
+        mean(&fast_ms),
+        mean(&wmma_ms),
+        mean(&exact_ms) / mean(&wmma_ms),
+        mean(&fast_ms) / mean(&wmma_ms),
+        max_abs,
+    );
+
+    // The tensor-core CTA is designed for a full prompt tile. At K=128 all
+    // eight warps reuse the same decoded Q1 tile; compare it with the 64 exact
+    // K2 launches Camelid currently needs for the same amount of prompt work.
+    let big_k = 128usize;
+    let big_activation = (0..big_k * cols)
+        .map(|index| ((index % 251) as f32 - 125.0) / 127.0)
+        .collect::<Vec<_>>();
+    let d_big_activation = kernels.stream.clone_htod(&big_activation).unwrap();
+    let mut d_big_quants = kernels.stream.alloc_zeros::<i8>(big_k * cols).unwrap();
+    let mut d_big_scales = kernels
+        .stream
+        .alloc_zeros::<f32>(big_k * cols / 32)
+        .unwrap();
+    super::launch_quantize(
+        &kernels.stream,
+        &kernels.quantize,
+        &d_big_activation,
+        &mut d_big_quants,
+        &mut d_big_scales,
+        big_k * cols / 32,
+    )
+    .unwrap();
+    let mut d_big_exact = kernels.stream.alloc_zeros::<f32>(2 * rows).unwrap();
+    let mut d_big_wmma = kernels.stream.alloc_zeros::<f32>(big_k * rows).unwrap();
+    let mut exact_128 = || {
+        for _ in 0..(big_k / 2) {
+            super::launch_prism_q1_f32_gemm_batched(
+                &kernels.stream,
+                &kernels.prism_q1_f32_gemm_batched,
+                &d_big_activation,
+                &d_wire.slice(0..wire.len()),
+                rows,
+                cols,
+                2,
+                false,
+                &mut d_big_exact,
+            )
+            .unwrap();
+        }
+        kernels.ctx.synchronize().unwrap();
+    };
+    let mut wmma_128 = || {
+        super::launch_prism_q1_q8_wmma_gemm_batched(
+            &kernels.stream,
+            wmma,
+            &d_big_quants,
+            &d_big_scales,
+            &d_wire.slice(0..wire.len()),
+            rows,
+            cols,
+            big_k,
+            false,
+            &mut d_big_wmma,
+            0,
+        )
+        .unwrap();
+        kernels.ctx.synchronize().unwrap();
+    };
+    exact_128();
+    wmma_128();
+    let mut exact_128_ms = Vec::new();
+    let mut wmma_128_ms = Vec::new();
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        exact_128();
+        exact_128_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        let started = std::time::Instant::now();
+        wmma_128();
+        wmma_128_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!(
+        "Q1 real-shape 128-token tile: exact-k2x64={:.3}ms q8-wmma={:.3}ms speedup={:.3}x",
+        mean(&exact_128_ms),
+        mean(&wmma_128_ms),
+        mean(&exact_128_ms) / mean(&wmma_128_ms),
+    );
+}
+
+// CPU oracle for the experimental BMMA activation format. The payload is one
+// byte per activation arranged as [K/128][plane][token][u32 word], while the
+// returned q values remain token-major solely for the scalar dot reference.
+fn quantize_q8_b128_cpu(
+    input: &[f32],
+    cols: usize,
+    k_tokens: usize,
+) -> (Vec<u32>, Vec<f32>, Vec<i8>) {
+    assert_eq!(cols % 128, 0);
+    assert_eq!(input.len(), cols * k_tokens);
+    let blocks = cols / 128;
+    let mut bitplanes = vec![0u32; k_tokens * cols / 4];
+    let mut scales = vec![0.0f32; blocks * k_tokens];
+    let mut quants = vec![0i8; input.len()];
+    for block in 0..blocks {
+        for token in 0..k_tokens {
+            let base = token * cols + block * 128;
+            let values = &input[base..base + 128];
+            let max_abs = values.iter().fold(0.0f32, |m, value| m.max(value.abs()));
+            let unrounded = max_abs / 127.0;
+            scales[block * k_tokens + token] = f16rt(unrounded);
+            let inv = if unrounded == 0.0 {
+                0.0
+            } else {
+                1.0 / unrounded
+            };
+            for (index, &value) in values.iter().enumerate() {
+                let q = (value * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+                quants[base + index] = q;
+                let uq = q as u8;
+                let word = index / 32;
+                let bit = index % 32;
+                for plane in 0..8 {
+                    if ((uq >> plane) & 1) != 0 {
+                        let dst = (((block * 8 + plane) * k_tokens + token) * 4) + word;
+                        bitplanes[dst] |= 1u32 << bit;
+                    }
+                }
+            }
+        }
+    }
+    (bitplanes, scales, quants)
+}
+
+fn q1_q8_b128_cpu(
+    wire: &[u8],
+    quants: &[i8],
+    scales: &[f32],
+    rows: usize,
+    cols: usize,
+    k_tokens: usize,
+) -> Vec<f32> {
+    let blocks = cols / 128;
+    let mut output = vec![0.0f32; rows * k_tokens];
+    for token in 0..k_tokens {
+        for row in 0..rows {
+            let mut acc = 0.0f32;
+            for block in 0..blocks {
+                let wb = &wire[(row * blocks + block) * 18..(row * blocks + block + 1) * 18];
+                let dw = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+                let mut dot = 0i32;
+                for index in 0..128 {
+                    let sign = if ((wb[2 + index / 8] >> (index % 8)) & 1) != 0 {
+                        1
+                    } else {
+                        -1
+                    };
+                    dot += sign * i32::from(quants[token * cols + block * 128 + index]);
+                }
+                let term = (dot as f32 * dw) * scales[block * k_tokens + token];
+                acc += term;
+            }
+            output[token * rows + row] = acc;
+        }
+    }
+    output
+}
+
+fn vector_error(actual: &[f32], reference: &[f32]) -> (f64, f64, f32) {
+    let mut dot = 0.0f64;
+    let mut aa = 0.0f64;
+    let mut rr = 0.0f64;
+    let mut dd = 0.0f64;
+    let mut max_abs = 0.0f32;
+    for (&a, &r) in actual.iter().zip(reference) {
+        dot += f64::from(a) * f64::from(r);
+        aa += f64::from(a) * f64::from(a);
+        rr += f64::from(r) * f64::from(r);
+        let delta = a - r;
+        dd += f64::from(delta) * f64::from(delta);
+        max_abs = max_abs.max(delta.abs());
+    }
+    let cosine = dot / (aa.sqrt() * rr.sqrt()).max(f64::MIN_POSITIVE);
+    let relative_l2 = (dd / rr.max(f64::MIN_POSITIVE)).sqrt();
+    (cosine, relative_l2, max_abs)
+}
+
+#[test]
+fn prism_bmma_dispatch_policy_is_strict_and_shape_safe() {
+    let allow = |fast, enabled, available, cols, tokens, threshold| {
+        super::prism_bmma_dispatch_policy(fast, enabled, available, cols, tokens, threshold)
+    };
+    assert!(allow(true, true, true, 5_120, 32, 32));
+    assert!(allow(true, true, true, 5_120, 128, 32));
+    assert!(!allow(false, true, true, 5_120, 128, 32)); // strict mode
+    assert!(!allow(true, false, true, 5_120, 128, 32)); // force-disable
+    assert!(!allow(true, true, false, 5_120, 128, 32)); // pre-SM80
+    assert!(!allow(true, true, true, 5_121, 128, 32)); // incomplete Q1 block
+    assert!(!allow(true, true, true, 5_120, 31, 32));
+    assert!(!allow(true, true, true, 5_120, 129, 32));
+
+    assert_eq!(super::parse_prism_bmma_min_tokens(None), 32);
+    assert_eq!(super::parse_prism_bmma_min_tokens(Some("14")), 14);
+    assert_eq!(super::parse_prism_bmma_min_tokens(Some("0")), 1);
+    assert_eq!(super::parse_prism_bmma_min_tokens(Some("999")), 128);
+    assert_eq!(super::parse_prism_bmma_min_tokens(Some("invalid")), 32);
+}
+
+#[test]
+fn prism_q1_model_policy_defaults_only_for_exact_windows_bonsai27b() {
+    let policy = |fast, windows, artifact, exact, q1_on, q1_off, fused_on, fused_off| {
+        super::prism_q1_model_policy(
+            fast, windows, artifact, exact, q1_on, q1_off, fused_on, fused_off,
+        )
+    };
+    let prism = super::ResidentCudaArtifact::PrismBonsai27bQ1;
+    let generic = super::ResidentCudaArtifact::Generic;
+
+    let production = policy(true, true, prism, true, false, false, false, false);
+    assert!(production.q1_tiled);
+    assert!(production.fused_projections);
+
+    assert_eq!(
+        policy(true, false, prism, true, false, false, false, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: false,
+            fused_projections: false,
+        }
+    );
+    assert_eq!(
+        policy(true, true, generic, true, false, false, false, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: false,
+            fused_projections: false,
+        }
+    );
+    assert_eq!(
+        policy(true, true, prism, false, false, false, false, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: false,
+            fused_projections: false,
+        }
+    );
+    assert_eq!(
+        policy(false, true, prism, true, false, false, false, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: false,
+            fused_projections: false,
+        }
+    );
+
+    assert!(super::is_bonsai27b_geometry(
+        64, 5_120, 17_408, 6_144, 1_024
+    ));
+    assert!(!super::is_bonsai27b_geometry(
+        63, 5_120, 17_408, 6_144, 1_024
+    ));
+    assert!(!super::is_bonsai27b_geometry(
+        64, 5_120, 17_409, 6_144, 1_024
+    ));
+}
+
+#[test]
+fn prism_q1_model_policy_keeps_opt_ins_and_negative_escapes_ordered() {
+    let policy = |fast, windows, artifact, exact, q1_on, q1_off, fused_on, fused_off| {
+        super::prism_q1_model_policy(
+            fast, windows, artifact, exact, q1_on, q1_off, fused_on, fused_off,
+        )
+    };
+    let prism = super::ResidentCudaArtifact::PrismBonsai27bQ1;
+    let generic = super::ResidentCudaArtifact::Generic;
+
+    // Q1T128 remains available to other shapes and to the strict f32 reader as
+    // an explicit bring-up lane. Fusion still requires exact artifact identity.
+    assert_eq!(
+        policy(false, false, generic, false, true, false, true, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: true,
+            fused_projections: false,
+        }
+    );
+    assert_eq!(
+        policy(true, false, generic, true, true, false, true, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: true,
+            fused_projections: false,
+        }
+    );
+    assert_eq!(
+        policy(true, false, prism, true, true, false, true, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: true,
+            fused_projections: true,
+        }
+    );
+
+    // A negative layout escape disables both layout and its consumers even if
+    // every positive/default source is also present. Fusion has its own escape.
+    assert_eq!(
+        policy(true, true, prism, true, true, true, true, false),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: false,
+            fused_projections: false,
+        }
+    );
+    assert_eq!(
+        policy(true, true, prism, true, false, false, true, true),
+        super::PrismQ1ModelPolicy {
+            q1_tiled: true,
+            fused_projections: false,
+        }
+    );
+}
+
+#[test]
+fn prism_cuda_fast_policy_is_per_construction_not_process_cached() {
+    assert!(super::prism_cuda_fast_policy(None));
+    assert!(super::prism_cuda_fast_policy(Some("0")));
+    assert!(!super::prism_cuda_fast_policy(Some("1")));
+    assert!(!super::prism_cuda_fast_policy(Some("true")));
+    assert!(!super::prism_cuda_fast_policy(Some("on")));
+    assert!(!super::prism_cuda_fast_policy(Some("yes")));
+
+    // Sequential evaluations intentionally disagree. Engine construction reads
+    // this pure policy once, so model reloads cannot inherit a OnceLock decision.
+    assert_ne!(
+        super::prism_cuda_fast_policy(None),
+        super::prism_cuda_fast_policy(Some("1"))
+    );
+}
+
+#[test]
+fn prism_cuda_popc_policy_is_exact_artifact_sm86_and_escape_safe() {
+    let prism = super::ResidentCudaArtifact::PrismBonsai27bQ1;
+    let generic = super::ResidentCudaArtifact::Generic;
+    let allow = |fast, windows, artifact, exact, tiled, sm86, off| {
+        super::prism_cuda_popc_policy(fast, windows, artifact, exact, tiled, sm86, off)
+    };
+    assert!(allow(true, true, prism, true, true, true, false));
+    assert!(!allow(false, true, prism, true, true, true, false));
+    assert!(!allow(true, false, prism, true, true, true, false));
+    assert!(!allow(true, true, generic, true, true, true, false));
+    assert!(!allow(true, true, prism, false, true, true, false));
+    assert!(!allow(true, true, prism, true, false, true, false));
+    assert!(!allow(true, true, prism, true, true, false, false));
+    assert!(!allow(true, true, prism, true, true, true, true));
+}
+
+#[test]
+fn resident_cuda_artifact_identity_is_sha_pinned() {
+    assert_eq!(
+        super::resident_cuda_artifact_from_sha256(
+            "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0"
+        ),
+        super::ResidentCudaArtifact::PrismBonsai27bQ1
+    );
+    assert_eq!(
+        super::resident_cuda_artifact_from_sha256(
+            "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757"
+        ),
+        super::ResidentCudaArtifact::Generic
+    );
+    assert_eq!(
+        super::resident_cuda_artifact_from_sha256("not-a-promoted-artifact"),
+        super::ResidentCudaArtifact::Generic
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA; exact fused POPC versus production fused DP4A"]
+fn prism_q1t_q8_popc_fused_ffn_matches_and_times_production() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    const COLS: usize = 5_120;
+    const CHUNKS: usize = COLS / 32;
+    const ROWS: usize = 17_408;
+    let edge = [-128i8, -127, -64, -1, 0, 1, 63, 126, 127];
+    let quants = (0..COLS)
+        .map(|index| edge[(index * 11 + index / 32) % edge.len()])
+        .collect::<Vec<_>>();
+    let scales = (0..CHUNKS)
+        .map(|index| 0.000_75 + (index % 31) as f32 * 0.000_11)
+        .collect::<Vec<_>>();
+    let mut expected_bits = vec![0u32; CHUNKS * 8];
+    let mut expected_qsums = vec![0i32; CHUNKS];
+    for (chunk, values) in quants.chunks_exact(32).enumerate() {
+        expected_qsums[chunk] = values.iter().map(|&q| i32::from(q)).sum();
+        for (lane, &q) in values.iter().enumerate() {
+            for plane in 0..8 {
+                expected_bits[chunk * 8 + plane] |= u32::from(((q as u8) >> plane) & 1) << lane;
+            }
+        }
+    }
+    let d_quants = kernels.stream.clone_htod(&quants).unwrap();
+    let d_scales = kernels.stream.clone_htod(&scales).unwrap();
+    let mut d_bits = kernels
+        .stream
+        .alloc_zeros::<u32>(expected_bits.len())
+        .unwrap();
+    let mut d_qsums = kernels.stream.alloc_zeros::<i32>(CHUNKS).unwrap();
+    super::launch_prism_q8_32_bitplanes_qsum(
+        &kernels.stream,
+        &kernels.prism_q8_32_bitplanes_qsum,
+        &d_quants,
+        &mut d_bits,
+        &mut d_qsums,
+        CHUNKS,
+    )
+    .unwrap();
+    let mut got_bits = vec![0u32; expected_bits.len()];
+    let mut got_qsums = vec![0i32; CHUNKS];
+    kernels.stream.memcpy_dtoh(&d_bits, &mut got_bits).unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_qsums, &mut got_qsums)
+        .unwrap();
+    kernels.ctx.synchronize().unwrap();
+    assert_eq!(got_bits, expected_bits);
+    assert_eq!(got_qsums, expected_qsums);
+
+    // Tail/residual parity for the reusable M16 primitive.
+    for &rows in &[48usize, 131] {
+        let blocks = COLS / 128;
+        let mut wire = vec![0u8; rows * blocks * 18];
+        fill_q1_wire(&mut wire, 0x73);
+        let tiled = super::repack_q1_t128(&wire, rows, COLS).unwrap();
+        let d_weight = kernels.stream.clone_htod(&tiled).unwrap();
+        for residual in [0i32, 1] {
+            let initial = (0..rows)
+                .map(|index| (index % 37) as f32 * 0.001_25 - 0.02)
+                .collect::<Vec<_>>();
+            let mut d_dp4a = kernels.stream.clone_htod(&initial).unwrap();
+            let mut d_popc = kernels.stream.clone_htod(&initial).unwrap();
+            super::launch_prism_q1_q8_gemv(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_gemv,
+                &d_quants,
+                &d_scales,
+                &d_weight.slice(0..d_weight.len()),
+                rows,
+                COLS,
+                &mut d_dp4a,
+                residual,
+            )
+            .unwrap();
+            super::launch_prism_q1t128_q8_popc_gemv_m16(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_popc_gemv_m16,
+                &d_bits,
+                &d_qsums,
+                &d_scales,
+                &d_weight.slice(0..d_weight.len()),
+                rows,
+                COLS,
+                &mut d_popc,
+                residual,
+            )
+            .unwrap();
+            let mut dp4a = vec![0.0f32; rows];
+            let mut popc = vec![0.0f32; rows];
+            kernels.stream.memcpy_dtoh(&d_dp4a, &mut dp4a).unwrap();
+            kernels.stream.memcpy_dtoh(&d_popc, &mut popc).unwrap();
+            kernels.ctx.synchronize().unwrap();
+            assert_same_bits(
+                &format!("Q1T POPC M16 rows={rows} residual={residual}"),
+                &popc,
+                &dp4a,
+            );
+        }
+    }
+
+    let blocks = COLS / 128;
+    let mut gate_wire = vec![0u8; ROWS * blocks * 18];
+    let mut up_wire = vec![0u8; ROWS * blocks * 18];
+    fill_q1_wire(&mut gate_wire, 0x25);
+    fill_q1_wire(&mut up_wire, 0xb7);
+    let gate_tiled = super::repack_q1_t128(&gate_wire, ROWS, COLS).unwrap();
+    let up_tiled = super::repack_q1_t128(&up_wire, ROWS, COLS).unwrap();
+    let d_gate_weight = kernels.stream.clone_htod(&gate_tiled).unwrap();
+    let d_up_weight = kernels.stream.clone_htod(&up_tiled).unwrap();
+    let mut d_gate_dp4a = kernels.stream.alloc_zeros::<f32>(ROWS).unwrap();
+    let mut d_up_dp4a = kernels.stream.alloc_zeros::<f32>(ROWS).unwrap();
+    let mut d_gate_popc = kernels.stream.alloc_zeros::<f32>(ROWS).unwrap();
+    let mut d_up_popc = kernels.stream.alloc_zeros::<f32>(ROWS).unwrap();
+
+    macro_rules! pack {
+        () => {{
+            super::launch_prism_q8_32_bitplanes_qsum(
+                &kernels.stream,
+                &kernels.prism_q8_32_bitplanes_qsum,
+                &d_quants,
+                &mut d_bits,
+                &mut d_qsums,
+                CHUNKS,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    macro_rules! popc_fused {
+        () => {{
+            super::launch_prism_q1t128_q8_popc_fused_ffn_bonsai27b(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_popc_fused_ffn_bonsai27b,
+                &d_bits,
+                &d_qsums,
+                &d_scales,
+                &d_gate_weight.slice(0..d_gate_weight.len()),
+                &d_up_weight.slice(0..d_up_weight.len()),
+                &mut d_gate_popc,
+                &mut d_up_popc,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    macro_rules! dp4a_fused {
+        () => {{
+            super::launch_prism_q1t128_fused_ffn_bonsai27b(
+                &kernels.stream,
+                &kernels.prism_q1t128_fused_ffn_bonsai27b,
+                &d_quants,
+                &d_scales,
+                &d_gate_weight.slice(0..d_gate_weight.len()),
+                &d_up_weight.slice(0..d_up_weight.len()),
+                &mut d_gate_dp4a,
+                &mut d_up_dp4a,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    pack!();
+    popc_fused!();
+    dp4a_fused!();
+    let mut pack_ms = Vec::new();
+    let mut popc_ms = Vec::new();
+    let mut dp4a_ms = Vec::new();
+    for _ in 0..11 {
+        let started = std::time::Instant::now();
+        pack!();
+        pack_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let started = std::time::Instant::now();
+        popc_fused!();
+        popc_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let started = std::time::Instant::now();
+        dp4a_fused!();
+        dp4a_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    let pack_ms = mean(&pack_ms);
+    let popc_ms = mean(&popc_ms);
+    let dp4a_ms = mean(&dp4a_ms);
+    eprintln!(
+        "Q1T fused gate/up 17408x5120: POPC pack={pack_ms:.4}ms kernel={popc_ms:.4}ms total={:.4}ms DP4A-fused={dp4a_ms:.4}ms speedup={:.3}x",
+        pack_ms + popc_ms,
+        dp4a_ms / (pack_ms + popc_ms),
+    );
+    let mut gate_dp4a = vec![0.0f32; ROWS];
+    let mut up_dp4a = vec![0.0f32; ROWS];
+    let mut gate_popc = vec![0.0f32; ROWS];
+    let mut up_popc = vec![0.0f32; ROWS];
+    kernels
+        .stream
+        .memcpy_dtoh(&d_gate_dp4a, &mut gate_dp4a)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_up_dp4a, &mut up_dp4a)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_gate_popc, &mut gate_popc)
+        .unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_up_popc, &mut up_popc)
+        .unwrap();
+    kernels.ctx.synchronize().unwrap();
+    assert_same_bits("Q1T fused POPC gate", &gate_popc, &gate_dp4a);
+    assert_same_bits("Q1T fused POPC up", &up_popc, &up_dp4a);
+}
+
+#[test]
+#[ignore = "requires CUDA; exact single-projection POPC production shape timings"]
+fn prism_q1t_q8_popc_single_projection_real_shapes_match_and_gate() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    for &(label, rows, cols, seed) in &[
+        ("O/SSM-out", 5_120usize, 6_144usize, 0x31u8),
+        ("FFN-down", 5_120, 17_408, 0x57),
+        ("lm-head", 151_936, 5_120, 0x9b),
+    ] {
+        let chunks = cols / 32;
+        let edge = [-128i8, -127, -64, -1, 0, 1, 63, 126, 127];
+        let quants = (0..cols)
+            .map(|index| edge[(index * 13 + index / 32) % edge.len()])
+            .collect::<Vec<_>>();
+        let scales = (0..chunks)
+            .map(|index| 0.000_6 + (index % 29) as f32 * 0.000_13)
+            .collect::<Vec<_>>();
+        let d_quants = kernels.stream.clone_htod(&quants).unwrap();
+        let d_scales = kernels.stream.clone_htod(&scales).unwrap();
+        let mut d_bitplanes = kernels.stream.alloc_zeros::<u32>(chunks * 8).unwrap();
+        let mut d_qsums = kernels.stream.alloc_zeros::<i32>(chunks).unwrap();
+
+        let mut wire = vec![0u8; rows * (cols / 128) * 18];
+        fill_q1_wire(&mut wire, seed);
+        let tiled = super::repack_q1_t128(&wire, rows, cols).unwrap();
+        drop(wire);
+        let d_weight = kernels.stream.clone_htod(&tiled).unwrap();
+        drop(tiled);
+        let mut d_dp4a = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+        let mut d_popc = kernels.stream.alloc_zeros::<f32>(rows).unwrap();
+
+        let launch_pack_popc = |d_bitplanes: &mut CudaSlice<u32>,
+                                d_qsums: &mut CudaSlice<i32>,
+                                d_popc: &mut CudaSlice<f32>| {
+            super::launch_prism_q8_32_bitplanes_qsum(
+                &kernels.stream,
+                &kernels.prism_q8_32_bitplanes_qsum,
+                &d_quants,
+                d_bitplanes,
+                d_qsums,
+                chunks,
+            )
+            .unwrap();
+            super::launch_prism_q1t128_q8_popc_gemv_m16(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_popc_gemv_m16,
+                d_bitplanes,
+                d_qsums,
+                &d_scales,
+                &d_weight.slice(0..d_weight.len()),
+                rows,
+                cols,
+                d_popc,
+                0,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        };
+        let launch_dp4a = |d_dp4a: &mut CudaSlice<f32>| {
+            super::launch_prism_q1_q8_gemv(
+                &kernels.stream,
+                &kernels.prism_q1t128_q8_gemv,
+                &d_quants,
+                &d_scales,
+                &d_weight.slice(0..d_weight.len()),
+                rows,
+                cols,
+                d_dp4a,
+                0,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        };
+
+        launch_pack_popc(&mut d_bitplanes, &mut d_qsums, &mut d_popc);
+        launch_dp4a(&mut d_dp4a);
+        let mut popc = vec![0.0f32; rows];
+        let mut dp4a = vec![0.0f32; rows];
+        kernels.stream.memcpy_dtoh(&d_popc, &mut popc).unwrap();
+        kernels.stream.memcpy_dtoh(&d_dp4a, &mut dp4a).unwrap();
+        kernels.ctx.synchronize().unwrap();
+        assert_same_bits(&format!("Q1T POPC {label}"), &popc, &dp4a);
+
+        let mut popc_ms = Vec::new();
+        let mut dp4a_ms = Vec::new();
+        for _ in 0..11 {
+            let started = std::time::Instant::now();
+            launch_pack_popc(&mut d_bitplanes, &mut d_qsums, &mut d_popc);
+            popc_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            let started = std::time::Instant::now();
+            launch_dp4a(&mut d_dp4a);
+            dp4a_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        let popc_ms = mean(&popc_ms);
+        let dp4a_ms = mean(&dp4a_ms);
+        eprintln!(
+            "Q1T {label} {rows}x{cols}: POPC+pack={popc_ms:.4}ms DP4A={dp4a_ms:.4}ms speedup={:.3}x",
+            dp4a_ms / popc_ms,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an SM80+ CUDA device; BMMA parity/performance diagnostic"]
+fn prism_q1_q8_b128_bmma_parity_and_real_shape_speed_probe() {
+    let Some(kernels) = kernels() else {
+        return;
+    };
+    let Some(pack) = kernels.prism_q8_b128_bitpack.as_ref() else {
+        eprintln!("Q8/128 BMMA probe skipped: device is below SM80");
+        return;
+    };
+    let Some(bmma) = kernels.prism_q1_q8_b128_bmma_gemm_batched.as_ref() else {
+        eprintln!("Q8/128 BMMA probe skipped: BMMA kernel unavailable");
+        return;
+    };
+
+    // First validate every seam: non-multiple row/token tails, two K=128
+    // blocks, exact packed bits/scales, fragment mapping, and XOR reconstruction.
+    let (rows, cols, k_tokens) = (131usize, 256usize, 19usize);
+    let blocks = cols / 128;
+    let mut rng = Lcg(0xb1_80_12_80);
+    let activation = (0..cols * k_tokens)
+        .map(|_| rng.next_f32() * 1.75)
+        .collect::<Vec<_>>();
+    let mut wire = vec![0u8; rows * blocks * 18];
+    for block in wire.chunks_exact_mut(18) {
+        let scale = 0.0025 + rng.next_f32().abs() * 0.03;
+        block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+        for byte in &mut block[2..] {
+            *byte = rng.next_u8();
+        }
+    }
+    let (expected_bits, expected_scales, expected_quants) =
+        quantize_q8_b128_cpu(&activation, cols, k_tokens);
+    let expected = q1_q8_b128_cpu(
+        &wire,
+        &expected_quants,
+        &expected_scales,
+        rows,
+        cols,
+        k_tokens,
+    );
+
+    let d_activation = kernels.stream.clone_htod(&activation).unwrap();
+    let d_wire = kernels.stream.clone_htod(&wire).unwrap();
+    let mut d_bits = kernels
+        .stream
+        .alloc_zeros::<u32>(expected_bits.len())
+        .unwrap();
+    let mut d_scales = kernels
+        .stream
+        .alloc_zeros::<f32>(expected_scales.len())
+        .unwrap();
+    super::launch_prism_q8_b128_bitpack(
+        &kernels.stream,
+        pack,
+        &d_activation,
+        &mut d_bits,
+        &mut d_scales,
+        cols,
+        k_tokens,
+    )
+    .unwrap();
+    let mut d_out = kernels.stream.alloc_zeros::<f32>(rows * k_tokens).unwrap();
+    super::launch_prism_q1_q8_b128_bmma_gemm_batched(
+        &kernels.stream,
+        bmma,
+        &d_bits,
+        &d_scales,
+        &d_wire.slice(0..wire.len()),
+        rows,
+        cols,
+        k_tokens,
+        false,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got_bits = vec![0u32; expected_bits.len()];
+    let mut got_scales = vec![0.0f32; expected_scales.len()];
+    let mut got = vec![0.0f32; expected.len()];
+    kernels.stream.memcpy_dtoh(&d_bits, &mut got_bits).unwrap();
+    kernels
+        .stream
+        .memcpy_dtoh(&d_scales, &mut got_scales)
+        .unwrap();
+    kernels.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    kernels.ctx.synchronize().unwrap();
+    assert_eq!(
+        got_bits, expected_bits,
+        "Q8/128 bit-slice pack changed bits"
+    );
+    assert!(
+        got_scales
+            .iter()
+            .zip(&expected_scales)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "Q8/128 bit-slice pack changed f16-rounded scales"
+    );
+    let (cpu_cosine, cpu_relative_l2, cpu_max_abs) = vector_error(&got, &expected);
+    assert!(
+        cpu_cosine > 0.999_999 && cpu_relative_l2 < 2e-6,
+        "BMMA XOR reconstruction diverged: cosine={cpu_cosine:.9} relative_l2={cpu_relative_l2:.9} max_abs={cpu_max_abs:.9}"
+    );
+
+    // The production attention/down projections use the in-kernel residual
+    // epilogue. Exercise it independently so enabling BMMA cannot silently
+    // overwrite the hidden-state residual.
+    let residual = (0..expected.len())
+        .map(|index| (index % 37) as f32 * 0.002 - 0.03)
+        .collect::<Vec<_>>();
+    let mut d_residual = kernels.stream.clone_htod(&residual).unwrap();
+    super::launch_prism_q1_q8_b128_bmma_gemm_batched(
+        &kernels.stream,
+        bmma,
+        &d_bits,
+        &d_scales,
+        &d_wire.slice(0..wire.len()),
+        rows,
+        cols,
+        k_tokens,
+        false,
+        &mut d_residual,
+        1,
+    )
+    .unwrap();
+    let mut got_residual = vec![0.0f32; expected.len()];
+    kernels
+        .stream
+        .memcpy_dtoh(&d_residual, &mut got_residual)
+        .unwrap();
+    kernels.ctx.synchronize().unwrap();
+    let expected_residual = expected
+        .iter()
+        .zip(&residual)
+        .map(|(value, residual)| value + residual)
+        .collect::<Vec<_>>();
+    let (residual_cosine, residual_relative_l2, _) =
+        vector_error(&got_residual, &expected_residual);
+    assert!(
+        residual_cosine > 0.999_999 && residual_relative_l2 < 2e-6,
+        "BMMA residual epilogue diverged: cosine={residual_cosine:.9} relative_l2={residual_relative_l2:.9}"
+    );
+
+    // Real Bonsai FFN-up shape. Sweep the image/prompt tail sizes that matter in
+    // production and compare against both existing Q8/32 implementations. This
+    // is the dispatch-crossover probe, not a toy square GEMM benchmark.
+    let (rows, cols, capacity) = (17_408usize, 5_120usize, 128usize);
+    let blocks = cols / 128;
+    let mut wire = vec![0u8; rows * blocks * 18];
+    for (block_index, block) in wire.chunks_exact_mut(18).enumerate() {
+        let scale = 0.003 + (block_index % 29) as f32 * 0.0002;
+        block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+        for (byte_index, value) in block[2..].iter_mut().enumerate() {
+            *value = (block_index as u8)
+                .wrapping_mul(37)
+                .wrapping_add((byte_index as u8).wrapping_mul(19));
+        }
+    }
+    let mut rng = Lcg(0x80_12_80_b1);
+    let activation = (0..cols * capacity)
+        .map(|_| rng.next_f32() * 2.0)
+        .collect::<Vec<_>>();
+    let d_wire = kernels.stream.clone_htod(&wire).unwrap();
+    let d_activation = kernels.stream.clone_htod(&activation).unwrap();
+
+    let mut d_b128_bits = kernels
+        .stream
+        .alloc_zeros::<u32>(capacity * cols / 4)
+        .unwrap();
+    let mut d_b128_scales = kernels
+        .stream
+        .alloc_zeros::<f32>(capacity * blocks)
+        .unwrap();
+    let mut d_b128_out = kernels.stream.alloc_zeros::<f32>(capacity * rows).unwrap();
+    let mut d_q8_quants = kernels.stream.alloc_zeros::<i8>(capacity * cols).unwrap();
+    let mut d_q8_scales = kernels
+        .stream
+        .alloc_zeros::<f32>(capacity * cols / 32)
+        .unwrap();
+    let mut d_imma_out = kernels.stream.alloc_zeros::<f32>(capacity * rows).unwrap();
+    let mut d_dp4a_out = kernels.stream.alloc_zeros::<f32>(capacity * rows).unwrap();
+    let imma = kernels
+        .prism_q1_q8_wmma_gemm_batched
+        .as_ref()
+        .expect("SM80 device should expose the Q8/32 IMMA comparison kernel");
+
+    macro_rules! pack_b128 {
+        ($k_tokens:expr) => {{
+            super::launch_prism_q8_b128_bitpack(
+                &kernels.stream,
+                pack,
+                &d_activation,
+                &mut d_b128_bits,
+                &mut d_b128_scales,
+                cols,
+                $k_tokens,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    macro_rules! run_bmma {
+        ($k_tokens:expr) => {{
+            super::launch_prism_q1_q8_b128_bmma_gemm_batched(
+                &kernels.stream,
+                bmma,
+                &d_b128_bits,
+                &d_b128_scales,
+                &d_wire.slice(0..wire.len()),
+                rows,
+                cols,
+                $k_tokens,
+                false,
+                &mut d_b128_out,
+                0,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    macro_rules! pack_q8 {
+        ($k_tokens:expr) => {{
+            super::launch_quantize(
+                &kernels.stream,
+                &kernels.quantize,
+                &d_activation,
+                &mut d_q8_quants,
+                &mut d_q8_scales,
+                $k_tokens * cols / 32,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    macro_rules! run_imma {
+        ($k_tokens:expr) => {{
+            super::launch_prism_q1_q8_wmma_gemm_batched(
+                &kernels.stream,
+                imma,
+                &d_q8_quants,
+                &d_q8_scales,
+                &d_wire.slice(0..wire.len()),
+                rows,
+                cols,
+                $k_tokens,
+                false,
+                &mut d_imma_out,
+                0,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    macro_rules! run_dp4a {
+        ($k_tokens:expr) => {{
+            super::launch_prism_q1_q8_gemm_batched(
+                &kernels.stream,
+                &kernels.prism_q1_q8_gemm_batched,
+                &d_q8_quants,
+                &d_q8_scales,
+                &d_wire.slice(0..wire.len()),
+                rows,
+                cols,
+                $k_tokens,
+                false,
+                &mut d_dp4a_out,
+                0,
+            )
+            .unwrap();
+            kernels.ctx.synchronize().unwrap();
+        }};
+    }
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    for &k_tokens in &[8usize, 14, 16, 32, 64, 128] {
+        pack_b128!(k_tokens);
+        run_bmma!(k_tokens);
+        pack_q8!(k_tokens);
+        run_dp4a!(k_tokens);
+        run_imma!(k_tokens);
+
+        let mut b128_pack_ms = Vec::new();
+        let mut bmma_ms = Vec::new();
+        let mut q8_pack_ms = Vec::new();
+        let mut dp4a_ms = Vec::new();
+        let mut imma_ms = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            pack_b128!(k_tokens);
+            b128_pack_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
+            run_bmma!(k_tokens);
+            bmma_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
+            pack_q8!(k_tokens);
+            q8_pack_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
+            run_dp4a!(k_tokens);
+            dp4a_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
+            run_imma!(k_tokens);
+            imma_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        let mut b128_out = vec![0.0f32; capacity * rows];
+        let mut q8_out = vec![0.0f32; capacity * rows];
+        kernels
+            .stream
+            .memcpy_dtoh(&d_b128_out, &mut b128_out)
+            .unwrap();
+        // DP4A and IMMA implement the same Q8/32 math; use DP4A as the quality
+        // reference while timing both independently.
+        kernels
+            .stream
+            .memcpy_dtoh(&d_dp4a_out, &mut q8_out)
+            .unwrap();
+        kernels.ctx.synchronize().unwrap();
+        let live = k_tokens * rows;
+        let (cosine, relative_l2, max_abs) = vector_error(&b128_out[..live], &q8_out[..live]);
+        let b128_total = mean(&b128_pack_ms) + mean(&bmma_ms);
+        let q8_pack = mean(&q8_pack_ms);
+        let dp4a_total = q8_pack + mean(&dp4a_ms);
+        let imma_total = q8_pack + mean(&imma_ms);
+        let baseline_total = dp4a_total.min(imma_total);
+        let baseline = if dp4a_total <= imma_total {
+            "DP4A"
+        } else {
+            "IMMA"
+        };
+        eprintln!(
+            "Q1 17408x5120 N{k_tokens}: q8/128-pack={:.3}ms BMMA={:.3}ms total={:.3}ms; q8/32-pack={:.3}ms DP4A={:.3}ms total={:.3}ms IMMA={:.3}ms total={:.3}ms; best={baseline} BMMA-speedup={:.3}x cosine={:.8} rel_l2={:.6} max_abs={:.6}",
+            mean(&b128_pack_ms),
+            mean(&bmma_ms),
+            b128_total,
+            q8_pack,
+            mean(&dp4a_ms),
+            dp4a_total,
+            mean(&imma_ms),
+            imma_total,
+            baseline_total / b128_total,
+            cosine,
+            relative_l2,
+            max_abs,
+        );
+        assert!(
+            cosine > 0.99,
+            "Q8/128 quality scout cosine is too low at N={k_tokens}: {cosine}"
+        );
+        assert!(
+            relative_l2 < 0.15,
+            "Q8/128 quality scout relative L2 is too high at N={k_tokens}: {relative_l2}"
         );
     }
 }
@@ -575,6 +2979,18 @@ impl Lcg {
     }
 }
 
+fn q1t_fixture(rows: usize, cols: usize, rng: &mut Lcg) -> Vec<u8> {
+    let mut wire = vec![0u8; rows * (cols / 128) * 18];
+    for block in wire.chunks_exact_mut(18) {
+        let scale = 0.001 + rng.next_f32().abs() * 0.04;
+        block[..2].copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
+        for byte in &mut block[2..] {
+            *byte = rng.next_u8();
+        }
+    }
+    super::repack_q1_t128(&wire, rows, cols).unwrap()
+}
+
 fn kernels() -> Option<CudaResidentKernels> {
     CudaResidentKernels::new().ok()
 }
@@ -584,6 +3000,22 @@ fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
         let d = (x - y).abs() / y.abs().max(1.0);
         d < tol
     })
+}
+
+fn assert_same_bits(label: &str, actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "{label} length changed");
+    if let Some((index, (actual, expected))) = actual
+        .iter()
+        .zip(expected)
+        .enumerate()
+        .find(|(_, (actual, expected))| actual.to_bits() != expected.to_bits())
+    {
+        panic!(
+            "{label} changed at {index}: actual={actual:?} ({:#010x}) expected={expected:?} ({:#010x})",
+            actual.to_bits(),
+            expected.to_bits()
+        );
+    }
 }
 
 #[test]
@@ -3504,9 +5936,9 @@ fn ssm_delta_rule_matches_cpu() {
     let vc: Vec<f32> = (0..nv * ds).map(|_| rng.next_f32()).collect();
     let z: Vec<f32> = (0..nv * ds).map(|_| rng.next_f32()).collect();
     let beta: Vec<f32> = (0..nv).map(|_| rng.next_f32() * 0.5 + 0.5).collect(); // (0,1)
-    let glog: Vec<f32> = (0..nv)
-        .map(|_| -(rng.next_f32() * 0.5 + 0.5) * 0.1)
-        .collect(); // <= 0
+    let decay: Vec<f32> = (0..nv)
+        .map(|_| (-(rng.next_f32() * 0.5 + 0.5) * 0.1).exp())
+        .collect(); // (0,1]
     let norm: Vec<f32> = (0..ds).map(|_| rng.next_f32() * 0.5 + 1.0).collect();
     let silu = |v: f32| v / (1.0 + (-v).exp());
     // CPU reference (matches qwen35_ssm_compute recurrence + gated RMSNorm).
@@ -3515,7 +5947,7 @@ fn ssm_delta_rule_matches_cpu() {
     let qscale = 1.0f32 / (ds as f32).sqrt();
     for h in 0..nv {
         let hk = h % nk;
-        let g = glog[h].exp();
+        let g = decay[h];
         let bh = beta[h];
         let st = &mut exp_state[h * ds * ds..(h + 1) * ds * ds];
         for s in st.iter_mut() {
@@ -3557,7 +5989,7 @@ fn ssm_delta_rule_matches_cpu() {
     let dv = k.stream.clone_htod(&vc).unwrap();
     let dz = k.stream.clone_htod(&z).unwrap();
     let dbeta = k.stream.clone_htod(&beta).unwrap();
-    let dglog = k.stream.clone_htod(&glog).unwrap();
+    let ddecay = k.stream.clone_htod(&decay).unwrap();
     let dnorm = k.stream.clone_htod(&norm).unwrap();
     let mut dout = k.stream.alloc_zeros::<f32>(nv * ds).unwrap();
     let cfg = LaunchConfig {
@@ -3574,7 +6006,7 @@ fn ssm_delta_rule_matches_cpu() {
         .arg(&dv)
         .arg(&dz)
         .arg(&dbeta)
-        .arg(&dglog)
+        .arg(&ddecay)
         .arg(&dnorm)
         .arg(&mut dout)
         .arg(&dsi)
@@ -3593,6 +6025,299 @@ fn ssm_delta_rule_matches_cpu() {
     assert!(
         close(&got_state, &exp_state, 3e-3),
         "ssm_delta_rule carried state diverged"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn qwen35_ssm_register_sharded_d128_matches_cpu_and_does_not_spill() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (ds, nk, nv, k_tokens) = (128usize, 2usize, 4usize, 8usize);
+    let key_dim = nk * ds;
+    let value_dim = nv * ds;
+    let conv_dim = 2 * key_dim + value_dim;
+    let eps = 1e-6f32;
+    let mut rng = Lcg(0xB0_55_A1_27);
+    let mut conv: Vec<f32> = (0..k_tokens * conv_dim)
+        .map(|_| rng.next_f32() * 0.2)
+        .collect();
+    // The recurrence consumes already-normalized q/k vectors.
+    for token in 0..k_tokens {
+        for head in 0..nk {
+            for offset in [0usize, key_dim] {
+                let base = token * conv_dim + offset + head * ds;
+                let row = &mut conv[base..base + ds];
+                let ss: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+                let scale = 1.0f32 / (ss as f32).sqrt().max(eps);
+                for v in row {
+                    *v *= scale;
+                }
+            }
+        }
+    }
+    let z: Vec<f32> = (0..k_tokens * value_dim).map(|_| rng.next_f32()).collect();
+    let beta: Vec<f32> = (0..k_tokens * nv)
+        .map(|_| 0.45 + rng.next_f32() * 0.1)
+        .collect();
+    let decay: Vec<f32> = (0..k_tokens * nv)
+        .map(|_| 0.985 + rng.next_f32() * 0.005)
+        .collect();
+    let norm: Vec<f32> = (0..ds).map(|_| 1.0 + rng.next_f32() * 0.1).collect();
+    let state0: Vec<f32> = (0..nv * ds * ds).map(|_| rng.next_f32() * 0.01).collect();
+
+    // CPU row-major oracle.
+    let mut expected_state = state0.clone();
+    let mut expected_mix = vec![0.0f32; k_tokens * value_dim];
+    let qscale = 1.0f32 / (ds as f32).sqrt();
+    for token in 0..k_tokens {
+        let token_conv = &conv[token * conv_dim..(token + 1) * conv_dim];
+        for h in 0..nv {
+            let hk = h % nk;
+            let qv = &token_conv[hk * ds..(hk + 1) * ds];
+            let kv = &token_conv[key_dim + hk * ds..key_dim + (hk + 1) * ds];
+            let vv = &token_conv[2 * key_dim + h * ds..2 * key_dim + (h + 1) * ds];
+            let st = &mut expected_state[h * ds * ds..(h + 1) * ds * ds];
+            let g = decay[token * nv + h];
+            let bh = beta[token * nv + h];
+            let mut sk = [0.0f32; 128];
+            for i in 0..ds {
+                for j in 0..ds {
+                    st[i * ds + j] *= g;
+                    sk[j] += st[i * ds + j] * kv[i];
+                }
+            }
+            let mut delta = [0.0f32; 128];
+            for j in 0..ds {
+                delta[j] = (vv[j] - sk[j]) * bh;
+            }
+            let mut raw = [0.0f32; 128];
+            for i in 0..ds {
+                for j in 0..ds {
+                    st[i * ds + j] += kv[i] * delta[j];
+                    raw[j] += st[i * ds + j] * (qv[i] * qscale);
+                }
+            }
+            let ss: f32 = raw.iter().map(|v| v * v).sum();
+            let scale = 1.0 / (ss / ds as f32 + eps).sqrt();
+            for j in 0..ds {
+                let zj = z[token * value_dim + h * ds + j];
+                let silu = zj / (1.0 + (-zj).exp());
+                expected_mix[token * value_dim + h * ds + j] = raw[j] * scale * norm[j] * silu;
+            }
+        }
+    }
+
+    // Fast state persists as [head][column][row].
+    let mut state_t = vec![0.0f32; state0.len()];
+    for h in 0..nv {
+        for row in 0..ds {
+            for col in 0..ds {
+                state_t[(h * ds + col) * ds + row] = state0[(h * ds + row) * ds + col];
+            }
+        }
+    }
+    let mut dstate = k.stream.clone_htod(&state_t).unwrap();
+    let dconv = k.stream.clone_htod(&conv).unwrap();
+    let dz = k.stream.clone_htod(&z).unwrap();
+    let dbeta = k.stream.clone_htod(&beta).unwrap();
+    let ddecay = k.stream.clone_htod(&decay).unwrap();
+    let dnorm = k.stream.clone_htod(&norm).unwrap();
+    let mut draw = k.stream.alloc_zeros::<f32>(k_tokens * value_dim).unwrap();
+    let mut dquants = k.stream.alloc_zeros::<i8>(k_tokens * value_dim).unwrap();
+    let mut dscales = k
+        .stream
+        .alloc_zeros::<f32>(k_tokens * value_dim / 32)
+        .unwrap();
+    super::launch_qwen35_ssm_delta_rule_d128_batched(
+        &k.stream,
+        &k.qwen35_ssm_delta_rule_d128_batched,
+        &mut dstate,
+        &dconv,
+        &dbeta,
+        &ddecay,
+        &mut draw,
+        nk,
+        nv,
+        key_dim,
+        value_dim,
+        conv_dim,
+        k_tokens,
+    )
+    .unwrap();
+    super::launch_qwen35_ssm_rmsnorm_gate_q8_d128_batched(
+        &k.stream,
+        &k.qwen35_ssm_rmsnorm_gate_q8_d128_batched,
+        &draw,
+        &dz,
+        &dnorm,
+        &mut dquants,
+        &mut dscales,
+        nv,
+        value_dim,
+        k_tokens,
+        eps,
+    )
+    .unwrap();
+    let mut got_state_t = vec![0.0f32; state_t.len()];
+    let mut got_quants = vec![0i8; k_tokens * value_dim];
+    let mut got_scales = vec![0.0f32; k_tokens * value_dim / 32];
+    k.stream.memcpy_dtoh(&dstate, &mut got_state_t).unwrap();
+    k.stream.memcpy_dtoh(&dquants, &mut got_quants).unwrap();
+    k.stream.memcpy_dtoh(&dscales, &mut got_scales).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let mut got_state = vec![0.0f32; state0.len()];
+    for h in 0..nv {
+        for row in 0..ds {
+            for col in 0..ds {
+                got_state[(h * ds + row) * ds + col] = got_state_t[(h * ds + col) * ds + row];
+            }
+        }
+    }
+    let mut got_mix = vec![0.0f32; k_tokens * value_dim];
+    for (block, &scale) in got_scales.iter().enumerate() {
+        for lane in 0..32 {
+            got_mix[block * 32 + lane] = f32::from(got_quants[block * 32 + lane]) * scale;
+        }
+    }
+    let state_max_abs = got_state
+        .iter()
+        .zip(&expected_state)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let dot: f64 = got_mix
+        .iter()
+        .zip(&expected_mix)
+        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+        .sum();
+    let an: f64 = got_mix.iter().map(|v| f64::from(*v).powi(2)).sum();
+    let bn: f64 = expected_mix.iter().map(|v| f64::from(*v).powi(2)).sum();
+    let cosine = dot / (an.sqrt() * bn.sqrt()).max(f64::MIN_POSITIVE);
+    let regs = k.qwen35_ssm_delta_rule_d128_batched.num_regs().unwrap();
+    let local = k
+        .qwen35_ssm_delta_rule_d128_batched
+        .local_size_bytes()
+        .unwrap();
+    eprintln!(
+        "Bonsai D128 register SSM: regs/thread={regs} local_bytes={local} state_max_abs={state_max_abs:.6} output_cosine={cosine:.9}"
+    );
+    assert!(
+        local <= 16,
+        "register SSM spilled {local} local bytes/thread"
+    );
+    assert!(
+        state_max_abs < 2e-4,
+        "register SSM state drift {state_max_abs}"
+    );
+    assert!(cosine > 0.9998, "register SSM output cosine {cosine}");
+}
+
+#[test]
+#[ignore = "requires a CUDA device; performance diagnostic"]
+fn qwen35_ssm_register_sharded_real_27b_speed_probe() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (ds, nk, nv, k_tokens) = (128usize, 4usize, 48usize, 128usize);
+    let key_dim = nk * ds;
+    let value_dim = nv * ds;
+    let conv_dim = 2 * key_dim + value_dim;
+    let eps = 1e-6f32;
+    let conv = vec![0.0f32; k_tokens * conv_dim];
+    let z = vec![0.0f32; k_tokens * value_dim];
+    let beta = vec![0.5f32; k_tokens * nv];
+    let decay = vec![0.99f32; k_tokens * nv];
+    let norm = vec![1.0f32; ds];
+    let dconv = k.stream.clone_htod(&conv).unwrap();
+    let dz = k.stream.clone_htod(&z).unwrap();
+    let dbeta = k.stream.clone_htod(&beta).unwrap();
+    let ddecay = k.stream.clone_htod(&decay).unwrap();
+    let dnorm = k.stream.clone_htod(&norm).unwrap();
+    let mut generic_state = k.stream.alloc_zeros::<f32>(nv * ds * ds).unwrap();
+    let mut fast_state = k.stream.alloc_zeros::<f32>(nv * ds * ds).unwrap();
+    let mut generic_out = k.stream.alloc_zeros::<f32>(k_tokens * value_dim).unwrap();
+    let mut raw = k.stream.alloc_zeros::<f32>(k_tokens * value_dim).unwrap();
+    let mut quants = k.stream.alloc_zeros::<i8>(k_tokens * value_dim).unwrap();
+    let mut scales = k
+        .stream
+        .alloc_zeros::<f32>(k_tokens * value_dim / 32)
+        .unwrap();
+    let mut generic = || {
+        super::launch_ssm_delta_rule_batched(
+            &k.stream,
+            &k.ssm_delta_rule_batched,
+            &mut generic_state,
+            &dconv,
+            &dz,
+            &dbeta,
+            &ddecay,
+            &dnorm,
+            &mut generic_out,
+            ds,
+            nk,
+            nv,
+            key_dim,
+            value_dim,
+            conv_dim,
+            k_tokens,
+            eps,
+        )
+        .unwrap();
+        k.ctx.synchronize().unwrap();
+    };
+    let mut fast = || {
+        super::launch_qwen35_ssm_delta_rule_d128_batched(
+            &k.stream,
+            &k.qwen35_ssm_delta_rule_d128_batched,
+            &mut fast_state,
+            &dconv,
+            &dbeta,
+            &ddecay,
+            &mut raw,
+            nk,
+            nv,
+            key_dim,
+            value_dim,
+            conv_dim,
+            k_tokens,
+        )
+        .unwrap();
+        super::launch_qwen35_ssm_rmsnorm_gate_q8_d128_batched(
+            &k.stream,
+            &k.qwen35_ssm_rmsnorm_gate_q8_d128_batched,
+            &raw,
+            &dz,
+            &dnorm,
+            &mut quants,
+            &mut scales,
+            nv,
+            value_dim,
+            k_tokens,
+            eps,
+        )
+        .unwrap();
+        k.ctx.synchronize().unwrap();
+    };
+    generic();
+    fast();
+    let mut generic_ms = Vec::new();
+    let mut fast_ms = Vec::new();
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        generic();
+        generic_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        let start = std::time::Instant::now();
+        fast();
+        fast_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    eprintln!(
+        "Bonsai-27B SSM K128: generic={:.3}ms register+Q8={:.3}ms speedup={:.3}x",
+        mean(&generic_ms),
+        mean(&fast_ms),
+        mean(&generic_ms) / mean(&fast_ms),
     );
 }
 
@@ -3643,15 +6368,15 @@ fn ssm_gates_matches_cpu() {
     let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
     let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
     let exp_beta: Vec<f32> = beta_raw.iter().map(|&v| sigmoid(v)).collect();
-    let exp_glog: Vec<f32> = (0..nv)
-        .map(|h| softplus(alpha_raw[h] + dt_bias[h]) * a[h])
+    let exp_decay: Vec<f32> = (0..nv)
+        .map(|h| (softplus(alpha_raw[h] + dt_bias[h]) * a[h]).exp())
         .collect();
     let dbr = k.stream.clone_htod(&beta_raw).unwrap();
     let dar = k.stream.clone_htod(&alpha_raw).unwrap();
     let ddt = k.stream.clone_htod(&dt_bias).unwrap();
     let da = k.stream.clone_htod(&a).unwrap();
     let mut dbeta = k.stream.alloc_zeros::<f32>(nv).unwrap();
-    let mut dglog = k.stream.alloc_zeros::<f32>(nv).unwrap();
+    let mut ddecay = k.stream.alloc_zeros::<f32>(nv).unwrap();
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (nv as u32, 1, 1),
@@ -3664,16 +6389,19 @@ fn ssm_gates_matches_cpu() {
         .arg(&ddt)
         .arg(&da)
         .arg(&mut dbeta)
-        .arg(&mut dglog)
+        .arg(&mut ddecay)
         .arg(&nvi);
     unsafe { b.launch(cfg).unwrap() };
     let mut got_beta = vec![0f32; nv];
-    let mut got_glog = vec![0f32; nv];
+    let mut got_decay = vec![0f32; nv];
     k.stream.memcpy_dtoh(&dbeta, &mut got_beta).unwrap();
-    k.stream.memcpy_dtoh(&dglog, &mut got_glog).unwrap();
+    k.stream.memcpy_dtoh(&ddecay, &mut got_decay).unwrap();
     k.ctx.synchronize().unwrap();
     assert!(close(&got_beta, &exp_beta, 2e-3), "ssm_gates beta diverged");
-    assert!(close(&got_glog, &exp_glog, 2e-3), "ssm_gates glog diverged");
+    assert!(
+        close(&got_decay, &exp_decay, 2e-3),
+        "ssm_gates decay diverged"
+    );
 }
 
 #[test]
@@ -3756,10 +6484,10 @@ fn ssm_layer_chain_matches_cpu() {
 
     // ---- CPU reference (qwen35_ssm_compute core, post-projection) ----
     let mut beta = vec![0f32; nv];
-    let mut glog = vec![0f32; nv];
+    let mut decay = vec![0f32; nv];
     for h in 0..nv {
         beta[h] = sigmoid(beta_raw[h]);
-        glog[h] = softplus(alpha_raw[h] + dt_bias[h]) * a_vec[h];
+        decay[h] = (softplus(alpha_raw[h] + dt_bias[h]) * a_vec[h]).exp();
     }
     let mut exp_cs = conv_state0.clone();
     let mut conv_out = vec![0f32; conv_dim];
@@ -3797,7 +6525,7 @@ fn ssm_layer_chain_matches_cpu() {
         let kh = &k_conv[hk * ds..(hk + 1) * ds];
         let vh = &v_conv[h * ds..(h + 1) * ds];
         let st = &mut exp_state[h * ds * ds..(h + 1) * ds * ds];
-        let g = glog[h].exp();
+        let g = decay[h];
         for s in st.iter_mut() {
             *s *= g;
         }
@@ -3844,7 +6572,7 @@ fn ssm_layer_chain_matches_cpu() {
     let mut dcs = k.stream.clone_htod(&conv_state0).unwrap();
     let mut dstate = k.stream.clone_htod(&state0).unwrap();
     let mut dbeta = k.stream.alloc_zeros::<f32>(nv).unwrap();
-    let mut dglog = k.stream.alloc_zeros::<f32>(nv).unwrap();
+    let mut ddecay = k.stream.alloc_zeros::<f32>(nv).unwrap();
     let mut dconv_out = k.stream.alloc_zeros::<f32>(conv_dim).unwrap();
     let mut dfinal = k.stream.alloc_zeros::<f32>(value_dim).unwrap();
     let nvi = nv as i32;
@@ -3863,7 +6591,7 @@ fn ssm_layer_chain_matches_cpu() {
             .arg(&ddt)
             .arg(&da)
             .arg(&mut dbeta)
-            .arg(&mut dglog)
+            .arg(&mut ddecay)
             .arg(&nvi);
         unsafe { b.launch(cfg).unwrap() };
     }
@@ -3914,7 +6642,7 @@ fn ssm_layer_chain_matches_cpu() {
             .arg(&vv)
             .arg(&dz)
             .arg(&dbeta)
-            .arg(&dglog)
+            .arg(&ddecay)
             .arg(&dnorm)
             .arg(&mut dfinal)
             .arg(&dsi)
