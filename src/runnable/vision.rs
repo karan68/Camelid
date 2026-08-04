@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use image::{imageops::FilterType, RgbImage};
+#[cfg(not(target_os = "macos"))]
 use rayon::prelude::*;
 
 use crate::error::{BackendError, Result};
@@ -58,6 +59,7 @@ impl VisionMat {
     /// full 630 MiB projector page-backed while Rayon spreads the contractions
     /// across host cores. This is the portable fallback when neither the Metal
     /// graph nor the streaming CUDA graph can execute.
+    #[cfg(not(target_os = "macos"))]
     fn linear(&self, input: &[f32], tokens: usize, label: &str) -> Result<Vec<f32>> {
         if input.len() != tokens * self.input {
             return Err(BackendError::InvalidTensorData(format!(
@@ -177,6 +179,10 @@ pub struct PrismVisionProjector {
 }
 
 #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+// The encoder is a single long-lived execution object behind a mutex. Keeping
+// it inline avoids an extra heap indirection on every image request; the small
+// control variants never move through a hot collection.
+#[allow(clippy::large_enum_variant)]
 enum PrismVisionCudaLane {
     Pending,
     Ready(super::vision_cuda::CudaVisionEncoder),
@@ -305,7 +311,7 @@ impl PrismVisionProjector {
     pub fn backend_ready(&self) -> bool {
         #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
         {
-            return self.cuda.is_ready();
+            self.cuda.is_ready()
         }
         #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
         true
@@ -716,6 +722,7 @@ impl PrismVisionModel {
     /// by the Prism 27B image row. Its operation order mirrors the Metal graph:
     /// dual patch projection, 27 bidirectional transformer blocks, post norm,
     /// spatial merge and the two-layer language projection.
+    #[cfg(not(target_os = "macos"))]
     fn encode_cpu(&self, input: PrismVisionInput) -> Result<PrismVisionEmbedding> {
         let tokens = input
             .patch_width
@@ -906,6 +913,7 @@ impl PrismVisionModel {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn vision_layer_norm(
     input: &[f32],
     tokens: usize,
@@ -937,6 +945,7 @@ fn vision_layer_norm(
     output
 }
 
+#[cfg(not(target_os = "macos"))]
 fn add_bias(values: &mut [f32], bias: &[f32]) {
     values
         .par_iter_mut()
@@ -944,6 +953,7 @@ fn add_bias(values: &mut [f32], bias: &[f32]) {
         .for_each(|(index, value)| *value += bias[index % bias.len()]);
 }
 
+#[cfg(not(target_os = "macos"))]
 fn add_bias_residual(residual: &mut [f32], projected: &[f32], bias: &[f32]) {
     residual
         .par_iter_mut()
@@ -951,6 +961,7 @@ fn add_bias_residual(residual: &mut [f32], projected: &[f32], bias: &[f32]) {
         .for_each(|(index, value)| *value += projected[index] + bias[index % bias.len()]);
 }
 
+#[cfg(not(target_os = "macos"))]
 fn add_bias_gelu(values: &mut [f32], bias: &[f32]) {
     values
         .par_iter_mut()
@@ -962,6 +973,7 @@ fn add_bias_gelu(values: &mut [f32], bias: &[f32]) {
         });
 }
 
+#[cfg(not(target_os = "macos"))]
 fn vision_rope_tables(
     patch_width: usize,
     patch_height: usize,
@@ -994,6 +1006,7 @@ fn vision_rope_tables(
     (cosine, sine)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn apply_vision_rope(
     qkv: &mut [f32],
     cosine: &[f32],
@@ -1024,6 +1037,7 @@ fn apply_vision_rope(
         });
 }
 
+#[cfg(not(target_os = "macos"))]
 fn vision_attention(
     qkv: &[f32],
     tokens: usize,

@@ -107,6 +107,7 @@ impl Mat {
 }
 
 impl RawMat {
+    #[cfg(not(target_os = "macos"))]
     fn is_prism_low_bit(&self) -> bool {
         matches!(
             self.tt,

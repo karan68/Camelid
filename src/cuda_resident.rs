@@ -5656,7 +5656,7 @@ impl CudaResidentKernels {
         };
         let cuda_include = ["CUDA_PATH", "CUDA_HOME"]
             .into_iter()
-            .filter_map(|name| std::env::var_os(name))
+            .filter_map(std::env::var_os)
             .map(std::path::PathBuf::from)
             .map(|root| root.join("include"))
             .chain([std::path::PathBuf::from("/usr/local/cuda/include")])
@@ -7434,8 +7434,8 @@ fn quantize_batched_for_lanes(
     k_tokens: usize,
     lanes: &[ProjQuant],
 ) -> Result<bool, cudarc::driver::DriverError> {
-    let bmma_ready = lanes.iter().any(|q| *q == ProjQuant::Q1_0)
-        && prism_bmma_shape_enabled(kern, cols, k_tokens);
+    let bmma_ready =
+        lanes.contains(&ProjQuant::Q1_0) && prism_bmma_shape_enabled(kern, cols, k_tokens);
     if bmma_ready {
         launch_prism_q8_b128_bitpack(
             s,
@@ -9769,7 +9769,7 @@ fn prism_bmma_dispatch_policy(
     fast_q1
         && bmma_enabled
         && functions_available
-        && cols % 128 == 0
+        && cols.is_multiple_of(128)
         && (min_tokens..=MAX_PRISM_PREFILL_K).contains(&k_tokens)
 }
 

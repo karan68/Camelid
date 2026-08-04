@@ -431,7 +431,7 @@ fn prism_q1t128_fused_bonsai27b_projections_match_separate_launches_bitwise() {
         return;
     };
     const COLS: usize = 5_120;
-    let mut rng = Lcg(0xf0_27_b0_5a_1);
+    let mut rng = Lcg(0x000f_027b_05a1);
     let activation = (0..COLS).map(|_| rng.next_f32() * 1.75).collect::<Vec<_>>();
     let d_activation = kernels.stream.clone_htod(&activation).unwrap();
     let mut d_quants = kernels.stream.alloc_zeros::<i8>(COLS).unwrap();
@@ -1168,6 +1168,9 @@ fn prism_q1_f32_gemm_batched_real_shape_speed_probe() {
 
 #[test]
 #[ignore = "requires a CUDA device; performance diagnostic"]
+// These closures mutably capture device outputs. Explicitly consuming them
+// before DtoH copies is the intended borrow boundary in this diagnostic.
+#[allow(clippy::drop_non_drop)]
 fn prism_q1_q8_gemm_batched_real_shape_speed_probe() {
     let kernels = CudaResidentKernels::new().expect("CUDA resident kernels for Q1 speed probe");
     let (rows, cols, k_tokens) = (17_408usize, 5_120usize, 8usize);
