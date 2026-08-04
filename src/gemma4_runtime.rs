@@ -11,7 +11,7 @@
 //! sharing: layers >= `first_kv_shared` reuse the last same-type layer's cache.
 
 use crate::gguf::{read_metadata, GgufFile, GgufTensorType};
-use crate::ghost::{GhostFile, GhostMoeExpert, GhostMoeTensorView};
+use crate::ghost::{GhostFile, GhostMoeExpert, GhostMoeMappedExpert, GhostMoeTensorView};
 use crate::inference::gemma4::{gelu_tanh, soft_cap_in_place};
 use crate::inference::{
     nvfp4_wire_block_dequant, nvfp4_wire_row_dot, q4_0_wire_block_dequant, q4_0_wire_row_dot,
@@ -1246,6 +1246,26 @@ impl GhostMoeExpertCache {
                 })
             })
             .collect()
+    }
+
+    /// CUDA normal-cache mode uploads immutable expert ranges directly from
+    /// the `.cghost` mapping. Strict cache mode has no mapping and deliberately
+    /// falls back to the allocating positioned-reader cache.
+    #[cfg(feature = "cuda")]
+    fn get_many_cuda(&self, layer: usize, experts: &[usize]) -> Result<Vec<GhostCudaExpertRecord>> {
+        let mut mapped = Vec::with_capacity(experts.len());
+        for &expert in experts {
+            let Some(record) = self.file.mapped_moe_expert(layer, expert)? else {
+                return self.get_many(layer, experts).map(|records| {
+                    records
+                        .into_iter()
+                        .map(GhostCudaExpertRecord::Owned)
+                        .collect()
+                });
+            };
+            mapped.push(GhostCudaExpertRecord::Mapped(record));
+        }
+        Ok(mapped)
     }
 
     fn stats(&self) -> GhostMoeCacheStats {
@@ -6494,14 +6514,11 @@ struct Gemma4PleCtxDev {
     embed_scale: f32,
 }
 
-/// One cached MoE expert's two Q4_0 weight slices, resident on the GPU. `gate_up`
-/// is the fused gate‖up rows (`2*n_ff_exp × hidden`) and `down` is the down rows
-/// (`hidden × n_ff_exp`) — the exact byte ranges `moe_layer_ffn`'s CPU path reads
-/// from the mmap for this expert. `last_used` is the LRU recency stamp.
+/// One cached MoE expert's slot in the fixed gate/up and down Q4_0 GPU arenas.
+/// `last_used` is the LRU recency stamp.
 #[cfg(feature = "cuda")]
 struct SserExpertDev {
-    gate_up: cudarc::driver::CudaSlice<u8>,
-    down: cudarc::driver::CudaSlice<u8>,
+    slot: usize,
     last_used: u64,
 }
 
@@ -6526,10 +6543,40 @@ static SSER_PROF_HIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static SSER_PROF_MISS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(feature = "cuda")]
+enum GhostCudaExpertRecord {
+    Owned(Arc<GhostMoeExpert>),
+    Mapped(GhostMoeMappedExpert),
+}
+
+#[cfg(feature = "cuda")]
+impl GhostCudaExpertRecord {
+    fn gate_up(&self) -> Result<(GgufTensorType, &[u8])> {
+        match self {
+            Self::Owned(expert) => Ok((expert.gate_up.dtype, expert.tensor_bytes(&expert.gate_up))),
+            Self::Mapped(expert) => {
+                Ok((expert.gate_up.dtype, expert.tensor_bytes(&expert.gate_up)?))
+            }
+        }
+    }
+
+    fn down(&self) -> Result<(GgufTensorType, &[u8])> {
+        match self {
+            Self::Owned(expert) => Ok((expert.down.dtype, expert.tensor_bytes(&expert.down))),
+            Self::Mapped(expert) => Ok((expert.down.dtype, expert.tensor_bytes(&expert.down)?)),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 struct SserCache {
     entries: std::collections::HashMap<(u16, u16), SserExpertDev>,
     capacity: usize,
     clock: u64,
+    gate_up_arena: cudarc::driver::CudaSlice<u8>,
+    down_arena: cudarc::driver::CudaSlice<u8>,
+    gate_up_stride: usize,
+    down_stride: usize,
+    free_slots: Vec<usize>,
     // Diagnostics (per-generate; reset by the harness before each run).
     hits: u64,
     misses: u64,
@@ -6537,14 +6584,30 @@ struct SserCache {
 
 #[cfg(feature = "cuda")]
 impl SserCache {
-    fn new(capacity: usize) -> Self {
-        Self {
+    fn new(
+        capacity: usize,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        gate_up_stride: usize,
+        down_stride: usize,
+    ) -> Result<Self> {
+        let capacity = capacity.max(1);
+        // SAFETY: a slot is initialized by HtoD before it is inserted into
+        // `entries`, and only entries can be exposed to a GEMV.
+        let gate_up_arena = unsafe { stream.alloc::<u8>(capacity * gate_up_stride) }.map_err(cu)?;
+        // SAFETY: see above.
+        let down_arena = unsafe { stream.alloc::<u8>(capacity * down_stride) }.map_err(cu)?;
+        Ok(Self {
             entries: std::collections::HashMap::new(),
-            capacity: capacity.max(1),
+            capacity,
             clock: 0,
+            gate_up_arena,
+            down_arena,
+            gate_up_stride,
+            down_stride,
+            free_slots: (0..capacity).rev().collect(),
             hits: 0,
             misses: 0,
-        }
+        })
     }
 
     /// Mark `key` most-recently-used and return true if resident.
@@ -6559,14 +6622,21 @@ impl SserCache {
         }
     }
 
-    /// Evict the least-recently-used entry if at capacity (called before an insert).
-    fn evict_if_full(&mut self) {
-        if self.entries.len() < self.capacity {
-            return;
+    /// Return a free slot or remove and recycle the least-recently-used slot.
+    fn slot_for_miss(&mut self) -> usize {
+        if let Some(slot) = self.free_slots.pop() {
+            return slot;
         }
-        if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, e)| e.last_used) {
-            self.entries.remove(&victim);
-        }
+        let victim = self
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(&key, _)| key)
+            .expect("a full SSER cache has an LRU victim");
+        self.entries
+            .remove(&victim)
+            .expect("the selected SSER victim remains resident")
+            .slot
     }
 }
 
@@ -7027,7 +7097,27 @@ impl Gemma4CudaResident {
                 per_expert_bytes / (1024 * 1024),
                 free / (1024 * 1024),
             );
-            Some(SserCache::new(cap))
+            let gate_up_stride = two_nff * (hidden / 32) * WB;
+            let down_stride = hidden * (moe.n_ff_exp / 32) * WB;
+            let uniform_geometry = cpu
+                .layers
+                .iter()
+                .filter_map(|layer| layer.moe.as_ref())
+                .all(|layer_moe| {
+                    2 * layer_moe.n_ff_exp * (hidden / 32) * WB == gate_up_stride
+                        && hidden * (layer_moe.n_ff_exp / 32) * WB == down_stride
+                });
+            if !uniform_geometry {
+                return Err(BackendError::UnsupportedGguf(
+                    "Gemma 4 CUDA expert residency requires uniform MoE expert geometry".into(),
+                ));
+            }
+            Some(SserCache::new(
+                cap,
+                &cap_stream,
+                gate_up_stride,
+                down_stride,
+            )?)
         } else {
             None
         };
@@ -7229,7 +7319,7 @@ impl Gemma4CudaResident {
                     .filter(|&expert| !cache.entries.contains_key(&(l as u16, expert as u16)))
                     .collect::<Vec<_>>()
             };
-            let loaded = ghost.cache.get_many(ghost.layer_idx, &missing)?;
+            let loaded = ghost.cache.get_many_cuda(ghost.layer_idx, &missing)?;
             Some(
                 missing
                     .into_iter()
@@ -7299,7 +7389,41 @@ impl Gemma4CudaResident {
                 sser.borrow_mut().misses += 1;
                 let expected_gu = two_nff * gu_row_bytes;
                 let expected_down = hidden * down_row_bytes;
-                let (gu_dev, down_dev) = if let Some(records) = ghost_records.as_mut() {
+                // Expert kernels and uploads share `cap_stream`, so overwriting an
+                // LRU arena slot is ordered after its preceding GEMVs without a host
+                // sync. The arenas were allocated while event tracking was disabled.
+                let upload = |gu_host: &[u8], down_host: &[u8]| -> Result<usize> {
+                    let mut cache = sser.borrow_mut();
+                    if gu_host.len() != cache.gate_up_stride || down_host.len() != cache.down_stride
+                    {
+                        return Err(BackendError::InvalidModelMetadata(format!(
+                            "Gemma 4 CUDA expert arena geometry changed at layer={l} expert={e}: gate_up={} expected={}, down={} expected={}",
+                            gu_host.len(),
+                            cache.gate_up_stride,
+                            down_host.len(),
+                            cache.down_stride,
+                        )));
+                    }
+                    let slot = cache.slot_for_miss();
+                    let gu_start = slot * cache.gate_up_stride;
+                    let down_start = slot * cache.down_stride;
+                    s.memcpy_htod(
+                        gu_host,
+                        &mut cache
+                            .gate_up_arena
+                            .slice_mut(gu_start..gu_start + gu_host.len()),
+                    )
+                    .map_err(cu)?;
+                    s.memcpy_htod(
+                        down_host,
+                        &mut cache
+                            .down_arena
+                            .slice_mut(down_start..down_start + down_host.len()),
+                    )
+                    .map_err(cu)?;
+                    Ok(slot)
+                };
+                let slot = if let Some(records) = ghost_records.as_mut() {
                     // A route that was resident when `missing` was captured can
                     // be evicted by an earlier miss in this same ordered top-k.
                     // Recover only that exact race from `.cghost`; processing
@@ -7308,7 +7432,7 @@ impl Gemma4CudaResident {
                         let ghost = moe.ghost.as_ref().expect("Ghost records require Ghost MoE");
                         let record = ghost
                             .cache
-                            .get_many(ghost.layer_idx, &[e])?
+                            .get_many_cuda(ghost.layer_idx, &[e])?
                             .into_iter()
                             .next()
                             .ok_or_else(|| {
@@ -7323,46 +7447,37 @@ impl Gemma4CudaResident {
                             "Ghost-MoE CUDA lost routed expert layer={l} expert={e}"
                         ))
                     })?;
-                    if record.gate_up.dtype != GgufTensorType::Q4_0
-                        || record.down.dtype != GgufTensorType::Q4_0
-                    {
+                    let (gu_dtype, gu_bytes) = record.gate_up()?;
+                    let (down_dtype, down_bytes) = record.down()?;
+                    if gu_dtype != GgufTensorType::Q4_0 || down_dtype != GgufTensorType::Q4_0 {
                         return Err(BackendError::UnsupportedGguf(format!(
                             "Ghost-MoE CUDA requires Q4_0 expert records; layer={l} expert={e} gate_up={:?} down={:?}",
-                            record.gate_up.dtype, record.down.dtype
+                            gu_dtype, down_dtype
                         )));
                     }
-                    let (gu_backing, gu_range) = record.tensor_backing(&record.gate_up);
-                    let (down_backing, down_range) = record.tensor_backing(&record.down);
-                    if gu_range.len() != expected_gu || down_range.len() != expected_down {
+                    if gu_bytes.len() != expected_gu || down_bytes.len() != expected_down {
                         return Err(BackendError::InvalidModelMetadata(format!(
                             "Ghost-MoE CUDA expert record length mismatch at layer={l} expert={e}: gate_up={} expected={expected_gu}, down={} expected={expected_down}",
-                            gu_range.len(),
-                            down_range.len()
+                            gu_bytes.len(),
+                            down_bytes.len()
                         )));
                     }
-                    (
-                        s.clone_htod(&gu_backing[gu_range]).map_err(cu)?,
-                        s.clone_htod(&down_backing[down_range]).map_err(cu)?,
-                    )
+                    upload(gu_bytes, down_bytes)?
                 } else {
                     let gu_off = e * expected_gu;
                     let down_off = e * expected_down;
-                    (
-                        s.clone_htod(&gate_up_bytes[gu_off..gu_off + expected_gu])
-                            .map_err(cu)?,
-                        s.clone_htod(&down_bytes[down_off..down_off + expected_down])
-                            .map_err(cu)?,
-                    )
+                    upload(
+                        &gate_up_bytes[gu_off..gu_off + expected_gu],
+                        &down_bytes[down_off..down_off + expected_down],
+                    )?
                 };
                 let mut c = sser.borrow_mut();
-                c.evict_if_full();
                 c.clock += 1;
                 let stamp = c.clock;
                 c.entries.insert(
                     key,
                     SserExpertDev {
-                        gate_up: gu_dev,
-                        down: down_dev,
+                        slot,
                         last_used: stamp,
                     },
                 );
@@ -7380,8 +7495,10 @@ impl Gemma4CudaResident {
             {
                 let c = sser.borrow();
                 let ent = c.entries.get(&key).expect("hit or just-promoted miss");
-                let gu_dev = ent.gate_up.slice(0..ent.gate_up.len());
-                let down_dev = ent.down.slice(0..ent.down.len());
+                let gu_start = ent.slot * c.gate_up_stride;
+                let down_start = ent.slot * c.down_stride;
+                let gu_dev = c.gate_up_arena.slice(gu_start..gu_start + c.gate_up_stride);
+                let down_dev = c.down_arena.slice(down_start..down_start + c.down_stride);
                 // gate‖up: two_nff rows, gu_blocks blocks/row.
                 crate::cuda_resident::launch_q4_0_gemv(
                     &s,

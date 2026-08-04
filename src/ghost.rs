@@ -33,6 +33,7 @@ use crate::model::{
     Gemma4Binding, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig, LlamaTensorBinding,
 };
 use crate::tensor::{cpu_tensor_from_gguf_bytes, CpuTensor, TensorStore};
+use crate::wire_mmap::GgufWireMmap;
 
 pub const CGHOST_MAGIC: &[u8; 8] = b"CGHOST1\0";
 pub const CGHOST_ALIGN: u64 = 16 * 1024;
@@ -908,6 +909,27 @@ impl GhostMoeExpert {
     ) -> (Arc<[u8]>, std::ops::Range<usize>) {
         (Arc::clone(&self.bytes), view.offset..view.offset + view.len)
     }
+
+    pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> &[u8] {
+        &self.bytes[view.offset..view.offset + view.len]
+    }
+}
+
+/// A routed expert borrowed directly from the read-only `.cghost` mapping.
+/// The mapping owns the file view; tensor slices allocate and copy nothing.
+#[derive(Debug, Clone)]
+pub(crate) struct GhostMoeMappedExpert {
+    mmap: Arc<GgufWireMmap>,
+    record_start: u64,
+    pub gate_up: GhostMoeTensorView,
+    pub down: GhostMoeTensorView,
+}
+
+impl GhostMoeMappedExpert {
+    pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> Result<&[u8]> {
+        self.mmap
+            .bytes(self.record_start + view.offset as u64, view.len)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1011,6 +1033,10 @@ fn parse_moe_group_id(id: &str) -> Option<(usize, usize)> {
 pub struct GhostFile {
     pub index: CghostIndex,
     file: File,
+    /// Normal buffered mode maps the immutable payload so CUDA can upload a
+    /// validated expert record without an intermediate Vec/read copy. Strict
+    /// cache mode clears this mapping and retains positioned I/O semantics.
+    mmap: Option<Arc<GgufWireMmap>>,
     /// Flat row-major `[layer][expert]` lookup for v2 MoE files. Dense/legacy files keep the
     /// original string lookup path and pay no extra allocation.
     moe_access: Option<GhostMoeAccessIndex>,
@@ -1046,6 +1072,7 @@ impl GhostFile {
     pub fn open_with_options(path: &Path, evict_page_cache: bool) -> Result<Self> {
         let mut this = Self::open(path)?;
         if evict_page_cache {
+            this.mmap = None;
             crate::tensor::disable_file_cache_best_effort(&this.file);
             #[cfg(windows)]
             match UncachedReader::open(path, this.max_layer_span()) {
@@ -1092,6 +1119,7 @@ impl GhostFile {
         Ok(Self {
             index,
             file,
+            mmap: Some(GgufWireMmap::map(path)?),
             moe_access,
             moe_payload_verified,
             #[cfg(windows)]
@@ -1373,6 +1401,38 @@ impl GhostFile {
             }
         }
         Ok(())
+    }
+
+    /// Borrow one routed expert directly from the read-only file mapping. The
+    /// same payload-identity check as the positioned reader runs before bytes
+    /// are exposed. Strict-cache mode returns `None` because it disables mmap.
+    pub(crate) fn mapped_moe_expert(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+    ) -> Result<Option<GhostMoeMappedExpert>> {
+        let Some(mmap) = self.mmap.as_ref() else {
+            return Ok(None);
+        };
+        let (group, start, len) = self.checked_moe_expert_span(layer_idx, expert_idx)?;
+        let (_, access) = self.moe_group_access(layer_idx, expert_idx)?;
+        let payload = mmap.bytes(start, len)?;
+        self.validate_moe_expert_payload_identity(group, access, start, payload)?;
+        let view = |role: &str| -> Result<GhostMoeTensorView> {
+            let tensor = self.moe_group_tensor(group, access, role)?;
+            Ok(GhostMoeTensorView {
+                dtype: tensor.dtype,
+                dims: tensor.dims.clone(),
+                offset: (tensor.offset - start) as usize,
+                len: tensor.len as usize,
+            })
+        };
+        Ok(Some(GhostMoeMappedExpert {
+            mmap: Arc::clone(mmap),
+            record_start: start,
+            gate_up: view("gate_up_exps")?,
+            down: view("down_exps")?,
+        }))
     }
 
     /// Read one routed expert with one sequential positioned read. The file's
@@ -2281,6 +2341,10 @@ mod tests {
         assert!(Arc::ptr_eq(&gate_bytes, &down_bytes));
         assert_eq!(&gate_bytes[gate_range], &[1, 11]);
         assert_eq!(&down_bytes[down_range], &[21, 31]);
+
+        let mapped = ghost.mapped_moe_expert(0, 1).unwrap().unwrap();
+        assert_eq!(mapped.tensor_bytes(&mapped.gate_up).unwrap(), &[1, 11]);
+        assert_eq!(mapped.tensor_bytes(&mapped.down).unwrap(), &[21, 31]);
     }
 
     #[test]

@@ -179,6 +179,11 @@ unbuffered reads instead of assuming 4 KiB sectors. Keep both artifacts on local
 copying a sparse shadow through a tool or filesystem that expands holes can restore its full logical
 disk usage without changing model correctness.
 
+In normal buffered CUDA mode, Camelid maps the immutable `.cghost` payload read-only and uploads
+validated routed-expert ranges directly into fixed GPU cache arenas. This avoids allocating and
+copying an intermediate expert record on every cache miss. `--ghost-strict-cache` deliberately
+disables that mapping and retains the bounded positioned/unbuffered reader path.
+
 The 1 GiB default can retain a little more than one token's 240-expert routed working set on the
 tracked Q4_0 row. `--expert-cache-mib 0` retains no routed expert after the current use and gives
 the smallest application-owned footprint; smaller budgets may cyclically evict every expert
