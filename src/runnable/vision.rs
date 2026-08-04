@@ -11,6 +11,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(target_os = "macos", feature = "cuda"))]
 use std::sync::Mutex;
 
@@ -171,7 +173,7 @@ pub struct PrismVisionProjector {
     #[cfg(target_os = "macos")]
     encoder: Mutex<crate::metal::PrismVisionMetalEncoder>,
     #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
-    cuda: Mutex<PrismVisionCudaLane>,
+    cuda: PrismVisionCudaRuntime,
 }
 
 #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
@@ -180,6 +182,32 @@ enum PrismVisionCudaLane {
     Ready(super::vision_cuda::CudaVisionEncoder),
     Disabled,
     Failed(String),
+}
+
+/// CUDA execution is serialized, but liveness must remain observable while a
+/// long image projection owns the lane mutex.
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+struct PrismVisionCudaRuntime {
+    lane: Mutex<PrismVisionCudaLane>,
+    ready: AtomicBool,
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+impl PrismVisionCudaRuntime {
+    fn new() -> Self {
+        Self {
+            lane: Mutex::new(PrismVisionCudaLane::Pending),
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
@@ -247,7 +275,7 @@ impl PrismVisionProjector {
             Ok(Self {
                 model,
                 #[cfg(feature = "cuda")]
-                cuda: Mutex::new(PrismVisionCudaLane::Pending),
+                cuda: PrismVisionCudaRuntime::new(),
             })
         }
     }
@@ -262,12 +290,25 @@ impl PrismVisionProjector {
     pub fn ensure_backend_ready(&self) -> Result<()> {
         #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
         {
-            let mut lane = self.cuda.lock().map_err(|_| {
+            let mut lane = self.cuda.lane.lock().map_err(|_| {
+                self.cuda.mark_ready(false);
                 BackendError::InvalidTensorData("Prism vision CUDA mutex poisoned".into())
             })?;
             self.initialize_cuda_lane(&mut lane)?;
         }
         Ok(())
+    }
+
+    /// Non-blocking readiness query for health/liveness endpoints. Image
+    /// projection owns `cuda` for the duration of GPU execution; consulting
+    /// that mutex here would let an ordinary image request stall health polls.
+    pub fn backend_ready(&self) -> bool {
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        {
+            return self.cuda.is_ready();
+        }
+        #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
+        true
     }
 
     pub fn encode_image(
@@ -339,7 +380,8 @@ impl PrismVisionProjector {
         {
             #[cfg(feature = "cuda")]
             {
-                let mut lane = self.cuda.lock().map_err(|_| {
+                let mut lane = self.cuda.lane.lock().map_err(|_| {
+                    self.cuda.mark_ready(false);
                     BackendError::InvalidTensorData("Prism vision CUDA mutex poisoned".into())
                 })?;
                 self.initialize_cuda_lane(&mut lane)?;
@@ -366,6 +408,7 @@ impl PrismVisionProjector {
                                 "execution",
                                 &error,
                             ) {
+                                self.cuda.mark_ready(false);
                                 *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
                                 return Err(BackendError::UnsupportedGguf(diagnostic));
                             }
@@ -392,6 +435,7 @@ impl PrismVisionProjector {
                     "[qwen3vl] Windows CUDA projector not selected or unavailable; using CPU"
                 );
                 *lane = PrismVisionCudaLane::Disabled;
+                self.cuda.mark_ready(true);
                 return Ok(());
             }
             *lane = match super::vision_cuda::CudaVisionEncoder::new() {
@@ -405,6 +449,7 @@ impl PrismVisionProjector {
                         "initialization",
                         &error,
                     ) {
+                        self.cuda.mark_ready(false);
                         *lane = PrismVisionCudaLane::Failed(diagnostic.clone());
                         return Err(BackendError::UnsupportedGguf(diagnostic));
                     }
@@ -414,8 +459,10 @@ impl PrismVisionProjector {
             };
         }
         if let PrismVisionCudaLane::Failed(diagnostic) = lane {
+            self.cuda.mark_ready(false);
             return Err(BackendError::UnsupportedGguf(diagnostic.clone()));
         }
+        self.cuda.mark_ready(true);
         Ok(())
     }
 }
@@ -1158,6 +1205,29 @@ mod tests {
         assert_eq!(width % 32, 0);
         assert_eq!(height % 32, 0);
         assert!(width * height <= 1024 * 1024);
+    }
+
+    #[cfg(all(target_os = "windows", feature = "cuda"))]
+    #[test]
+    fn cuda_readiness_does_not_wait_for_the_projection_lane_mutex() {
+        let runtime = std::sync::Arc::new(PrismVisionCudaRuntime::new());
+        runtime.mark_ready(true);
+        let projection_in_flight = runtime.lane.lock().expect("lane lock");
+        let (send, receive) = std::sync::mpsc::channel();
+        let health_runtime = std::sync::Arc::clone(&runtime);
+        let health = std::thread::spawn(move || send.send(health_runtime.is_ready()));
+
+        let result = receive.recv_timeout(std::time::Duration::from_millis(500));
+        drop(projection_in_flight);
+        health
+            .join()
+            .expect("health thread")
+            .expect("health result");
+        assert_eq!(
+            result,
+            Ok(true),
+            "health readiness must remain lock-free during image projection"
+        );
     }
 
     #[cfg(all(target_os = "windows", feature = "cuda"))]

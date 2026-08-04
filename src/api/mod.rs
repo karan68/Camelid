@@ -8230,7 +8230,7 @@ impl RunnableServeRuntime {
     fn vision_ready(&self) -> bool {
         self.vision
             .as_ref()
-            .is_some_and(|projector| projector.ensure_backend_ready().is_ok())
+            .is_some_and(crate::runnable::PrismVisionProjector::backend_ready)
     }
 
     /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
