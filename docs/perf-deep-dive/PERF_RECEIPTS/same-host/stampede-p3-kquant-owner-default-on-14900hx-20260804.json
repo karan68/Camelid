@@ -1,0 +1,96 @@
+{
+  "what": "Promoting the K-quant prefill owner from opt-in to default-on for win-x86_64. The owner is not new code -- it has been in the tree since 2026-07-08, is bit-identical by construction, and was parked in the STAMPEDE Phase 3 PIVOT band when it measured +50%. The lane has improved four times since that decision (Q6_K sibling, AVX-512 VNNI inner, 8-row repack, and the 256-bit AVX-VNNI inner merged as #593) and the flag was never revisited.",
+  "lever": "RuntimeConfig::kquant_prefill_owner now resolves through env_flag_default_on for win-x86_64 and stays env_flag_default_off everywhere else. Kill switch: CAMELID_X86_KQUANT_MATMUL_OWNER=0|false|off|no|disabled.",
+  "camelid_head": "77b054dd2 + this branch",
+
+  "why_now": "The Phase 3 gate is written down in STAMPEDE_CONDUCTOR: prefill >= 28 tok/s -> GO, promote the owner to default; 24-28 -> PIVOT, keep it opt-in. Lane B (Q4_K) landed in the PIVOT band at v2 and stayed opt-in. Nothing re-checked the gate after the lane got faster four more times. This receipt re-checks it.",
+
+  "host": {
+    "cpu": "win i9-14900HX 8P+16E (24 physical / 32 logical), Raptor Lake",
+    "isa": "avx2=true avxvnni=true; avx512f=false -- so the owner's selected inner here is the 256-bit AVX-VNNI one from #593",
+    "gpu": "RTX 4060 Laptop present but hidden with CUDA_VISIBLE_DEVICES=-1 for every measurement",
+    "power": "AC for every reported number (BatteryStatus=2 recorded per run). An earlier screening pass on battery is excluded from this receipt."
+  },
+
+  "models": [
+    { "path": "<home>/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf", "size_mb": 770.3, "sha256": "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83" },
+    { "path": "<home>/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf", "size_mb": 1925.8 },
+    { "path": "<home>/models/Qwen3-4B-Q4_K_M.gguf", "size_mb": 2381.6, "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5" }
+  ],
+
+  "method": {
+    "harness": "camelid bench-owner-sweep --lane kquant --max-tokens 1 (prefill only)",
+    "arms": ["off", "owner_avx2", "owner_avxvnni256"],
+    "baseline": "off -- the question is owner vs the SHIPPED DEFAULT, not owner vs a different inner",
+    "pairing": "all arms run once per round inside one process, interleaved, 2 warmup rounds discarded",
+    "statistic": "median of per-round ratios, 95% percentile bootstrap CI (2000 resamples)",
+    "engagement_check": "the sweep hard-fails a config whose owner never dispatched; owner_prefill_taken is recorded per row"
+  },
+
+  "results": {
+    "note": "owner_avxvnni256 is what a promoted default actually selects on this host. owner_avx2 is what it selects on an AVX2-only host, and is reported so the promotion is not justified purely by hardware this receipt's author happens to own.",
+    "llama1b_q4km": {
+      "p124_8_rounds":  { "off": 129.212, "owner_avx2": 208.588, "owner_avxvnni256": 242.921, "ratio_vs_off": 1.8768, "ci95": [1.8706, 1.8881], "won": "8/8" },
+      "p606_8_rounds":  { "off": 108.965, "owner_avx2": 167.443, "owner_avxvnni256": 190.610, "ratio_vs_off": 1.7488, "ci95": [1.7327, 1.7590], "won": "8/8" },
+      "p2421_6_rounds": { "off": 88.544,  "owner_avx2": 124.821, "owner_avxvnni256": 137.751, "ratio_vs_off": 1.5619, "ci95": [1.5510, 1.5713], "won": "6/6" }
+    },
+    "llama3b_q4km": {
+      "p124_8_rounds":  { "off": 38.449, "owner_avx2": 61.578, "owner_avxvnni256": 70.387, "ratio_vs_off": 1.8288, "ci95": [1.8166, 1.8933], "won": "8/8" },
+      "p606_8_rounds":  { "off": 32.982, "owner_avx2": 51.779, "owner_avxvnni256": 59.553, "ratio_vs_off": 1.7990, "ci95": [1.7778, 1.8370], "won": "8/8" },
+      "p2421_5_rounds": { "off": 32.557, "owner_avx2": 47.739, "owner_avxvnni256": 52.598, "ratio_vs_off": 1.6169, "ci95": [1.6074, 1.6213], "won": "5/5" }
+    },
+    "qwen3_4b_q4km": {
+      "p124_8_rounds":  { "off": 31.584, "owner_avx2": 50.228, "owner_avxvnni256": 56.913, "ratio_vs_off": 1.8176, "ci95": [1.7983, 1.8278], "won": "8/8" },
+      "p606_8_rounds":  { "off": 28.169, "owner_avx2": 44.289, "owner_avxvnni256": 49.691, "ratio_vs_off": 1.7634, "ci95": [1.7404, 1.7891], "won": "8/8" },
+      "p2421_5_rounds": { "off": 23.921, "owner_avx2": 34.357, "owner_avxvnni256": 37.493, "ratio_vs_off": 1.5700, "ci95": [1.5465, 1.5821], "won": "5/5" }
+    },
+    "totals": { "cells": 9, "cells_significant": 9, "paired_rounds": 66, "rounds_won": 66, "ratio_range": [1.5619, 1.8768] },
+    "avx2_only_hosts": "owner_avx2 vs off spans 1.4102 to 1.6115 across the same nine cells, all significant, so the promotion is a win on plain-AVX2 hosts too and does not depend on AVX-VNNI.",
+    "units": "prefill_tok_s, median over measured rounds"
+  },
+
+  "the_regression_that_did_not_happen": {
+    "why_it_was_the_deciding_test": "The Q8 owner -- the same shape of lever, promoted the same way -- turns out to REGRESS on a 1B model (0.9730 vs off at 2421 tokens, 0/8 rounds; see stampede-p3-q8-owner-avxvnni256-14900hx-20260803.json). The K-quant owner had only ever been measured on 3B/4B, so the small-model case was the specific risk to this promotion.",
+    "result": "Llama-3.2-1B Q4_K_M was pulled specifically to test it and shows the LARGEST wins of any model measured (1.8768 / 1.7488 / 1.5619). The failure mode does not reproduce on this lane.",
+    "contaminated_cell_rerun": "qwen4b at 2421 tokens first returned an off arm spanning 10.18-24.12 tok/s and an owner_avxvnni256 CI of [0.6876, 1.9466] (not significant). It was re-run rather than reported: the clean re-run has off 23.58-24.11 and owner 37.29-37.56, giving 1.5700 [1.5465, 1.5821], 5/5. The contaminated cell is discarded, not averaged in."
+  },
+
+  "cost": {
+    "peak_rss_mb": {
+      "llama1b_q4km": { "off": 985.7, "on": 987.9, "delta_pct": 0.22 },
+      "llama3b_q4km": { "off": 2314.2, "on": 2310.5, "delta_pct": -0.16 },
+      "qwen3_4b_q4km": { "off": 2814.0, "on": 2816.6, "delta_pct": 0.09 }
+    },
+    "reading": "Under 0.25% in both directions, i.e. inside run-to-run noise. The owner reuses a thread-local packed-input scratch; it is not the opt-in 8-row repack, which is a separate flag and stays off.",
+    "decode": "untouched -- the owner is prefill-only and declines batches below 4 rows."
+  },
+
+  "parity": {
+    "e2e_hash_equality": "byte-identical generated text with the owner off vs on, per model: llama1b e07ef0c0bea3e982, llama3b 788682831fb9ada1, qwen3-4b f5f70dae91dd9706",
+    "promotion_proof_on_the_shipped_binary": {
+      "note": "Three arms on the built binary: no env var (the promoted default), the kill switch, and explicit opt-in. One SHA per model across all three.",
+      "llama3b_q4km": { "default_prefill_ms": 7511.2, "killswitch_off_prefill_ms": 13423.5, "explicit_on_prefill_ms": 7629.2, "sha": "0776215f49fa7325", "default_vs_off": 1.787 },
+      "qwen3_4b_q4km": { "default_prefill_ms": 10524.8, "killswitch_off_prefill_ms": 20188.1, "explicit_on_prefill_ms": 10931.7, "sha": "f7bcca771fbefcdc", "default_vs_off": 1.918 }
+    },
+    "why_it_is_exact": "The owner was built bit-identical by construction and has carried twin tests against the per-cell block-dot path since it landed; this change adds no arithmetic, it selects an existing path."
+  },
+
+  "blast_radius": {
+    "scope": "win-x86_64 only, matching the platform measured here and mirroring how the Q8 owner's default-on scope was set. Every other target keeps env_flag_default_off, so nothing changes for them.",
+    "kill_switch": "CAMELID_X86_KQUANT_MATMUL_OWNER=0|false|off|no|disabled restores the previous path exactly -- verified on the shipped binary, and the timings return to the pre-promotion values.",
+    "typo_safety": "any OTHER value leaves the owner on, so a mistyped kill switch cannot silently disable a measured default. Same convention as CAMELID_WIN_HYBRID_POLICY.",
+    "non_x86_or_non_windows": "unchanged, still opt-in.",
+    "repack8": "unchanged and still opt-in; it is a separate flag with a memory cost."
+  },
+
+  "test_suite_state": "cargo test --lib: 1463 passed / 2 failed. Both failures (api::engine::tests::slot_occupancy_tracks_cooperative_and_exclusive_work, api::tests::cooperative_stream_job_seeds_from_the_prompt_prefix_cache) were re-proved pre-existing at 77b054dd2 by stashing this branch's src changes and rerunning on the clean tree. Neither is in the inference path.",
+
+  "open_questions": [
+    "One host. The promotion is scoped to win-x86_64 but measured on a single hybrid Raptor Lake part; an AVX2-only or AMD x86 host would strengthen or narrow the scope.",
+    "Q4_K_M only. Q5_K_M, Q3_K_M, Q2_K and IQ4_XS route through the same owner gate but were not swept -- several of them have no SIMD kernel at all, so the owner's benefit there is unmeasured.",
+    "The Q8 owner's 1B regression remains open and is NOT addressed here; the two owners are separate flags with separate defaults.",
+    "The gate in STAMPEDE_CONDUCTOR is expressed as an absolute tok/s against a llama.cpp pin on an i7-11800H. This receipt argues the promotion on measured ratio-vs-shipped-default plus zero regression instead, because the pinned reference was not re-run on this host."
+  ],
+
+  "verdict": "Promote for win-x86_64. 9 of 9 cells significant, 66 of 66 paired rounds, 1.56x to 1.88x over the shipped default across three models and three prompt lengths, byte-identical output, no measurable memory cost, and a verified kill switch. The small-model regression that sank the equivalent Q8 claim was specifically tested for and does not occur."
+}
