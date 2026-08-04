@@ -28,6 +28,18 @@ Camelid deliberately supports a curated set of exact model-and-quantization comb
 supported row is validated token-for-token against a pinned reference before it is presented as
 ready to use.
 
+## What is Camelid?
+
+Camelid is an open-source, Rust-native local AI inference engine for running supported GGUF large
+language models (LLMs) and vision-language models (VLMs) on Windows, macOS, and Linux. Use it as a
+desktop app, a browser-based local AI chat interface, a terminal application, or a self-hosted
+OpenAI-compatible API for your own tools and applications.
+
+Model inference runs on your hardware, with CPU execution, Apple Silicon Metal acceleration, and
+NVIDIA CUDA acceleration available within the documented support boundaries. Camelid is designed
+for private local AI chat, offline inference after model download, GGUF model testing, and local LLM
+application development without a Python, Node.js, or Docker runtime.
+
 > [!TIP]
 > **New: [PrismML](https://prismml.com/) Bonsai models are Supported on Apple Silicon Metal and Windows CUDA.**
 > Seven exact, hash-pinned 4B, 8B, and 27B GGUFs covering `Q1_0`, `Q2_0`, and `PQ2_0` are
