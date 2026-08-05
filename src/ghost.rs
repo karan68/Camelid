@@ -920,6 +920,9 @@ impl GhostMoeExpert {
 
 /// A routed expert borrowed directly from the read-only `.cghost` mapping.
 /// The mapping owns the file view; tensor slices allocate and copy nothing.
+/// Consumed by the cuda expert-residency lane (and its unit tests); gated so
+/// a default-features build — macOS CI's clippy shape — carries no dead code.
+#[cfg(any(feature = "cuda", test))]
 #[derive(Debug, Clone)]
 pub(crate) struct GhostMoeMappedExpert {
     mmap: Arc<GgufWireMmap>,
@@ -928,7 +931,7 @@ pub(crate) struct GhostMoeMappedExpert {
     pub down: GhostMoeTensorView,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 impl GhostMoeMappedExpert {
     pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> Result<&[u8]> {
         self.mmap
@@ -1423,7 +1426,7 @@ impl GhostFile {
     /// Borrow one routed expert directly from the read-only file mapping. The
     /// same payload-identity check as the positioned reader runs before bytes
     /// are exposed. Strict-cache mode returns `None` because it disables mmap.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn mapped_moe_expert(
         &self,
         layer_idx: usize,
