@@ -1,0 +1,128 @@
+{
+  "reference": "llama.cpp b9632 (acd79d603) /apply-template + /tokenize(add_special=true)",
+  "gguf": "LFM2.5-2.6B-Q8_0.gguf",
+  "gguf_sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+  "note": "applied_prompt INCLUDES the template bos_token; Camelid emits BOS via tokenizer add_special, not as renderer text, so the Rust gate compares TOKEN IDS.",
+  "cases": [
+    {
+      "name": "single_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        }
+      ],
+      "applied_prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>",
+      "prompt_ids": [
+        124894,
+        124899,
+        5922,
+        207,
+        2992,
+        355,
+        278,
+        5205,
+        302,
+        3980,
+        39,
+        124900,
+        207,
+        124899,
+        63514,
+        207,
+        124901
+      ]
+    },
+    {
+      "name": "system_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant."
+        },
+        {
+          "role": "user",
+          "content": "Name a primary color."
+        }
+      ],
+      "applied_prompt": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a primary color.<|im_end|>\n<|im_start|>assistant\n<think>",
+      "prompt_ids": [
+        124894,
+        124899,
+        23630,
+        207,
+        3582,
+        437,
+        267,
+        11037,
+        16200,
+        22,
+        124900,
+        207,
+        124899,
+        5922,
+        207,
+        2617,
+        267,
+        4909,
+        3599,
+        22,
+        124900,
+        207,
+        124899,
+        63514,
+        207,
+        124901
+      ]
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Say hello."
+        },
+        {
+          "role": "assistant",
+          "content": "Hello!"
+        },
+        {
+          "role": "user",
+          "content": "Say it again."
+        }
+      ],
+      "applied_prompt": "<|im_start|>user\nSay hello.<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nSay it again.<|im_end|>\n<|im_start|>assistant\n<think>",
+      "prompt_ids": [
+        124894,
+        124899,
+        5922,
+        207,
+        94866,
+        63532,
+        22,
+        124900,
+        207,
+        124899,
+        63514,
+        207,
+        35808,
+        9,
+        124900,
+        207,
+        124899,
+        5922,
+        207,
+        94866,
+        435,
+        1529,
+        22,
+        124900,
+        207,
+        124899,
+        63514,
+        207,
+        124901
+      ]
+    }
+  ]
+}

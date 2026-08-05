@@ -1,0 +1,55 @@
+{
+  "smoke": "lfm2-runnable-serve",
+  "lane": "runnable",
+  "architecture": "lfm2",
+  "quant": "Q8_0",
+  "gguf_filename": "LFM2.5-2.6B-Q8_0.gguf",
+  "gguf_sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+  "host": "windows x86_64",
+  "surface": "POST /v1/chat/completions (runnable serve bridge, on by default)",
+  "note": "Hand-run smoke, NOT a parity receipt: it demonstrates the end-to-end serve path works for lfm2 and that the documented refusals fire. It compares nothing against a reference engine, so it promotes nothing. The reference-anchored gates are qa/runnable/lfm2-parity.json plus the tokenizer and chat-template tests.",
+  "cases": [
+    {
+      "name": "single_turn_reasoning_split",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer in one short sentence."
+        }
+      ],
+      "content": "The capital of France is Paris.",
+      "reasoning_content_present": true,
+      "finish_reason": "stop",
+      "prompt_tokens": 23,
+      "completion_tokens": 69,
+      "observed": "the model's own <think> block was separated into reasoning_content rather than leaking into content; token 124902 (</think>) appears in the generated id stream, which is the phase switch the streaming bridge keys on"
+    },
+    {
+      "name": "multi_turn_assistant_history",
+      "messages": [
+        { "role": "user", "content": "Say hello." },
+        { "role": "assistant", "content": "Hello!" },
+        { "role": "user", "content": "Now name one primary color, one word only." }
+      ],
+      "content": "Red",
+      "finish_reason": "stop",
+      "prompt_tokens": 35,
+      "observed": "prior assistant turn replayed through render_lfm2_chatml_prompt without corrupting the prompt"
+    },
+    {
+      "name": "tools_fail_closed",
+      "request": "tools: [get_weather]",
+      "http_status": 422,
+      "error_code": "unsupported_tools",
+      "observed": "refused with the typed LFM2 tool rejection rather than borrowing the qwen35 <function=...> envelope"
+    }
+  ],
+  "not_claimed": [
+    "parity against a reference engine on this surface",
+    "sampling (this lane decodes greedy; temperature/top_p are accepted and ignored)",
+    "long context or a bounded context pack",
+    "streaming SSE (only the non-streaming surface was exercised)",
+    "tool calling (fails closed by design)",
+    "throughput"
+  ]
+}

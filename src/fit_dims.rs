@@ -479,8 +479,23 @@ pub fn dims_from_gguf_file(path: &Path) -> Option<ModelDims> {
 pub(crate) fn dims_from_gguf(gguf: &crate::gguf::GgufFile) -> Option<ModelDims> {
     let config = crate::model::LlamaModelConfig::from_gguf(gguf).ok()?;
     let dims = crate::model::DenseLlamaDims::from_config(&config).ok()?;
+    // KV bytes scale with the number of layers that actually hold K/V. That is
+    // `block_count` for a dense decoder, but NOT for lfm2: its short-conv
+    // layers carry no attention at all (22 of 30 on the LFM2.5-2.6B row), so
+    // counting every block would overstate the KV cache by ~3.75x and could
+    // refuse a context that comfortably fits. The conv layers' own rolling
+    // state is O(l_cache * embedding) per layer — constant in context length —
+    // so it does not belong in a per-token KV figure.
+    let kv_layers = match config.lfm2.as_ref() {
+        Some(meta) => meta
+            .layer_is_conv
+            .iter()
+            .filter(|is_conv| !**is_conv)
+            .count() as u64,
+        None => dims.block_count as u64,
+    };
     let dims = ModelDims {
-        layers: dims.block_count as u64,
+        layers: kv_layers,
         kv_heads: dims.attention_head_count_kv as u64,
         head_dim: dims.head_dim as u64,
     };

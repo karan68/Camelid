@@ -132,6 +132,7 @@ impl HfLlamaConfigSummary {
             gemma3: None,
             gemma4: None,
             qwen35: None,
+            lfm2: None,
             mla: None,
         }
     }
