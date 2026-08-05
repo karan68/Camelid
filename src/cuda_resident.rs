@@ -3499,7 +3499,11 @@ extern "C" __global__ void rope_rotate(
 }
 
 // ---- KV scatter: write current position's K (or V) with f16 round-trip -----
-// cache layout [kv_head][position][head_dim].
+// cache layout [kv_head][slot][head_dim], slot = position % max_pos: `max_pos` is the
+// cache's per-head position CAPACITY and positions wrap onto it as a ring. Full-context
+// callers never wrap (position < capacity, so slot == position); the gemma4 lane sizes
+// sliding-layer caches at window+1 slots and relies on the wrap — the matching ring
+// read is in attention_decode_sw.
 extern "C" __global__ void kv_scatter(
     const float* __restrict__ src, unsigned short* __restrict__ cache,
     const int* __restrict__ position_ptr, int n_kv_heads, int head_dim, int max_pos
@@ -3512,7 +3516,7 @@ extern "C" __global__ void kv_scatter(
     // KV stored as f16 bits (half the VRAM). The value is f16-rounded either way, so this is
     // bit-identical to storing f16_round(src) in f32 — the attention kernels read it back via
     // f16_bits_to_f32 and feed the same f32 into the dot product.
-    cache[((long)kv_head * max_pos + position) * head_dim + d] =
+    cache[((long)kv_head * max_pos + (position % max_pos)) * head_dim + d] =
         f32_to_f16_bits(src[(long)kv_head * head_dim + d]);
 }
 
@@ -3623,6 +3627,14 @@ extern "C" __global__ void attention_decode(
 // attention_decode exactly (so the non-sliding gemma4 layers / any caller can
 // share this kernel). Same online softmax + FP-reassociated weighted-V
 // (token-parity, not bit-identical) shape as attention_decode.
+//
+// K/V slots ring on `max_pos` (slot = p % max_pos, matching kv_scatter's write):
+// a sliding-layer cache holds only window+1 positions, so every p in
+// [start, position_count) still maps to a distinct live slot. Full-capacity
+// callers (gemma3's sliding layers, and every window <= 0 caller — full-causal
+// needs all positions) never wrap. scores[] stays indexed by ABSOLUTE p, so the
+// caller's shared-memory sizing must span the context, not the ring (see
+// launch_attention_sw's shared_positions vs max_pos split).
 extern "C" __global__ void attention_decode_sw(
     const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
     const unsigned short* __restrict__ cache_v, float* __restrict__ out,
@@ -3650,7 +3662,7 @@ extern "C" __global__ void attention_decode_sw(
 
     int kd8 = ((head_dim & 7) == 0) ? head_dim : 0;  // uint4 K-read when row is 16B-aligned
     for (int p = start + tid; p < position_count; p += blockDim.x) {
-        const unsigned short* kp = kbase + (long)p * head_dim;
+        const unsigned short* kp = kbase + (long)(p % max_pos) * head_dim;
         float dot = 0.0f;
         int d = 0;
         for (; d < kd8; d += 8) {
@@ -3689,7 +3701,7 @@ extern "C" __global__ void attention_decode_sw(
     int p_hi = start + (int)((long)(gid + 1) * active / G);
     float acc = 0.0f;
     for (int p = p_lo; p < p_hi; p++)
-        acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+        acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)(p % max_pos) * head_dim + did]);
     vpart[(long)did * G + gid] = acc;
     __syncthreads();
     if (gid == 0) {

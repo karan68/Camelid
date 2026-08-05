@@ -209,9 +209,13 @@ fills the tier at load with a uniform per-layer stripe of records (mostly sequen
 On the tracked 16 GiB machine this measured neutral-to-negative — the prefill read evicts the OS
 page cache's copy of the same payload, giving back what the extra tier hits gain — so it is off
 by default; it is expected to pay off only when the tier can hold the entire routed payload.
-`CAMELID_GEMMA4_GHOST_CUDA_CONTEXT` bounds the KV window (default 4096): the 26B row's KV costs
-~220 MiB per 1024 positions, and every ~3.2 MiB returned admits one more resident routed expert,
-so short-session deployments can trade context for hit rate.
+`CAMELID_GEMMA4_GHOST_CUDA_CONTEXT` bounds the KV window (default 4096). Sliding-layer KV caches
+are rings of window+1 positions (a sliding layer can never attend further back than its 1024-token
+window, so older slots are reclaimed in place), which means only the 5 global layers scale with
+context: the 26B row's KV costs ~20 MiB per 1024 positions on top of a ~200 MiB sliding-ring
+floor, where it used to cost ~220 MiB per 1024 positions across all 30 layers. Every ~3.2 MiB
+returned admits one more resident routed expert, so short-session deployments can still trade
+context for hit rate — but full 4096-position context no longer forfeits the bulk of the cache.
 
 Throughput on the tracked RTX 3060 Laptop 6 GiB (i7-11800H, 16 GiB RAM) is dominated by how much
 of the 12.0 GiB routed payload is resident somewhere, which makes it strongly dependent on free

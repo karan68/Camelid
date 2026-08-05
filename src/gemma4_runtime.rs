@@ -7317,6 +7317,19 @@ pub struct Gemma4CudaResident {
     moe_scratch: Option<std::cell::RefCell<MoeScratchDev>>,
 }
 
+/// Per-layer KV cache capacity (positions) for the CUDA-resident lane. A sliding
+/// layer's `attention_decode_sw` read starts at `position_count - window`, so no key
+/// older than `window` positions back is ever read: its cache is a ring of
+/// `window + 1` slots (`kv_scatter` and the attention reads wrap with `% capacity`),
+/// while global layers keep the full `max_positions`. On the 26B ghost row this
+/// returns ~600 MiB of VRAM at the default 4096-position context (25 sliding layers
+/// × K+V × kv_dim 2048 × (4096−1025) positions × 2 B) — headroom the SSER expert
+/// cache's VRAM-fit sizing converts directly into more resident routed experts.
+#[cfg(feature = "cuda")]
+fn gemma4_kv_capacity(window: Option<usize>, max_positions: usize) -> usize {
+    window.map_or(max_positions, |w| (w + 1).min(max_positions))
+}
+
 #[cfg(feature = "cuda")]
 impl Gemma4CudaResident {
     /// Load the model (CPU runtime, weights mmap'd), bring up the CUDA kernels,
@@ -7356,14 +7369,15 @@ impl Gemma4CudaResident {
         // returns. The tier fills through the same buffered positioned reader, so
         // a fill that the page cache can serve stays at memcpy speed.
         let strict_reads = evict_page_cache;
-        // KV context is a direct trade against routed-expert residency, and on the
-        // 26B row it is not the small term the dense-lane comment assumed: all 30
-        // layers own KV and allocate `kv_dim * max_positions` u16 for both K and V,
-        // which is 880 MiB at 4096 positions — 36.7% of everything Camelid puts on
-        // a 6 GiB card. Every 3.19 MiB returned here buys one more resident expert,
-        // so a caller who knows the session is short can convert context into hit
-        // rate. Default is the caller's value, so nothing changes unless asked.
-        // (The Metal ghost lane already exposes the equivalent knob.)
+        // KV context is a direct trade against routed-expert residency, but since
+        // the sliding-layer caches became window+1-slot rings (gemma4_kv_capacity)
+        // only the 5 global layers still scale with `max_positions`: the 26B row's
+        // KV is ~280 MiB at 4096 positions where it used to be 880 MiB. Every
+        // 3.19 MiB returned here buys one more resident expert, so the knob still
+        // converts context into hit rate — it just has ~4x less lever arm than
+        // when all 30 layers paid full context. Default is the caller's value, so
+        // nothing changes unless asked. (The Metal ghost lane exposes the
+        // equivalent knob.)
         let max_positions = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_CONTEXT")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -7619,12 +7633,14 @@ impl Gemma4CudaResident {
             );
         }
 
-        // Per-owning-layer f16 KV caches sized to that layer's kv geometry.
+        // Per-owning-layer f16 KV caches sized to that layer's kv geometry and
+        // position capacity: sliding layers ring on window+1 slots, only global
+        // layers pay for the full context (see gemma4_kv_capacity).
         let mut cache_k = Vec::with_capacity(block_count);
         let mut cache_v = Vec::with_capacity(block_count);
         for p in &plan {
             if p.owns_kv {
-                let n = p.kv_dim * max_positions;
+                let n = p.kv_dim * gemma4_kv_capacity(p.window, max_positions);
                 cache_k.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
                 cache_v.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
             } else {
@@ -9115,7 +9131,9 @@ impl Gemma4CudaResident {
                             .arg(&pr);
                         unsafe { b.launch(cfg) }.map_err(cu)?;
                     }
-                    // Scatter K/V into this layer's cache at `position`.
+                    // Scatter K/V into this layer's cache at `position` (ring slot
+                    // `position % capacity`; sliding layers keep only window+1 slots).
+                    let kv_cap = gemma4_kv_capacity(p.window, self.max_positions);
                     let ck = self.cache_k[li].as_mut().expect("owning layer has K cache");
                     crate::cuda_resident::launch_kv_scatter(
                         &s,
@@ -9125,7 +9143,7 @@ impl Gemma4CudaResident {
                         &self.d_position,
                         kv_heads,
                         hd,
-                        self.max_positions,
+                        kv_cap,
                     )
                     .map_err(cu)?;
                     let cv = self.cache_v[li].as_mut().expect("owning layer has V cache");
@@ -9137,7 +9155,7 @@ impl Gemma4CudaResident {
                         &self.d_position,
                         kv_heads,
                         hd,
-                        self.max_positions,
+                        kv_cap,
                     )
                     .map_err(cu)?;
                 }
@@ -9145,6 +9163,11 @@ impl Gemma4CudaResident {
                 // Attention against the source layer's cache (sliding window or full causal).
                 let src = p.kv_source_layer;
                 let window = p.window.map(|w| w as i32).unwrap_or(0);
+                // The source cache's position capacity (== this layer's: KV sharing is
+                // same-type, enforced by the layer_plan test). Sliding caches ring on
+                // window+1 slots; shared memory still spans the full context because
+                // the kernel's scores[] is indexed by absolute position.
+                let src_cap = gemma4_kv_capacity(self.plan[src].window, self.max_positions);
                 {
                     let ck = self.cache_k[src].as_ref().expect("KV source has K cache");
                     let cv = self.cache_v[src].as_ref().expect("KV source has V cache");
@@ -9153,12 +9176,8 @@ impl Gemma4CudaResident {
                         block_dim: (hd as u32, 1, 1),
                         shared_mem_bytes: ((2 * hd + self.max_positions) as u32) * 4,
                     };
-                    let (nh, nkv, hdi, mp) = (
-                        heads as i32,
-                        kv_heads as i32,
-                        hd as i32,
-                        self.max_positions as i32,
-                    );
+                    let (nh, nkv, hdi, mp) =
+                        (heads as i32, kv_heads as i32, hd as i32, src_cap as i32);
                     let scale = 1.0f32; // gemma folds the scale; attention uses no 1/sqrt(d).
                     let mut b = s.launch_builder(&k.attention_sw);
                     b.arg(&self.d_q)
@@ -9763,6 +9782,19 @@ impl Gemma4CudaResident {
                 && prompt_tokens[p] == self.cached_tokens[p]
             {
                 p += 1;
+            }
+            // Sliding-layer caches are rings of window+1 positions: writing position x
+            // reclaims position x-(window+1)'s slot, so of the previous request only
+            // the last window+1 positions still exist. Resuming at `start = p.min(n-1)`
+            // reads sliding keys [start+1-window, start]; the oldest survivor is
+            // cached_len-(window+1), so reuse is sound iff start + 2 >= cached_len
+            // (pure extension, or regenerating the final token). A deeper rewind
+            // (edited history / shortened prompt) re-prefills from zero — same output,
+            // just no TTFT shortcut. While the cached sequence is still within
+            // window+1 positions nothing has been overwritten and any p is fine.
+            let win = self.cpu.g.sliding_window as usize;
+            if self.cached_tokens.len() > win + 1 && p.min(n - 1) + 2 < self.cached_tokens.len() {
+                p = 0;
             }
         }
         // Always run at least the final prompt token to produce its logits.
