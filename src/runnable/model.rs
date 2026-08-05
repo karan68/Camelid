@@ -1081,8 +1081,11 @@ impl RunnableModel {
         if let Some(rt) = &self.lfm2 {
             let mut cache = self.new_cache();
             let mut logits = Vec::new();
+            // This entry point returns the LAST position's logits, so only that
+            // position needs the tied 128k-row head.
+            let last = tokens.len().saturating_sub(1);
             for (pos, &tok) in tokens.iter().enumerate() {
-                logits = self.forward_step_lfm2(rt, tok, pos, &mut cache)?;
+                logits = self.forward_step_lfm2(rt, tok, pos, &mut cache, pos == last)?;
             }
             return Ok(logits);
         }
@@ -1170,8 +1173,12 @@ impl RunnableModel {
         }
         let mut cache = self.new_cache();
         let mut last = Vec::new();
+        // Only the LAST prompt position's logits are consumed; the rest exist to
+        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
+        // those positions removes 9.7% of the bytes each prefill step reads.
+        let last_prompt = prompt.len().saturating_sub(1);
         for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step(tok, pos, &mut cache)?;
+            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
         }
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
@@ -1301,12 +1308,17 @@ impl RunnableModel {
     /// h    = prev + h
     /// h    = h + SwiGLU_FFN(RMSNorm(h, ffn_norm))
     /// ```
+    /// `need_logits = false` advances the cache and the conv ring but skips the
+    /// 128,000-row tied LM head. Every prompt-prefill position except the last
+    /// discards its logits, and that projection is 9.7% of the bytes a step
+    /// touches — the same economy `decode_token_qwen35` already takes.
     fn forward_step_lfm2(
         &self,
         rt: &Lfm2Runtime,
         token: u32,
         pos: usize,
         cache: &mut KvCache,
+        need_logits: bool,
     ) -> Result<Vec<f32>> {
         let dm = self.d_model;
         let hd = self.head_dim;
@@ -1472,6 +1484,9 @@ impl RunnableModel {
         // `token_embd` (LFM2.5 ships no `output.weight`). The 128k-row vocab
         // projection dominates a decode step, so take the row-parallel form
         // (same int8-activation caveat as the per-layer projections above).
+        if !need_logits {
+            return Ok(Vec::new());
+        }
         let normed = self.apply_norm(&hidden, &self.output_norm);
         self.output.par_matvec(&normed, "output")
     }
@@ -1479,8 +1494,23 @@ impl RunnableModel {
     /// Incremental forward of a single token at absolute `pos`, appending its K/V to
     /// `cache` and attending over all cached positions. Returns next-token logits.
     fn forward_step(&self, token: u32, pos: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        self.forward_step_maybe_logits(token, pos, cache, true)
+    }
+
+    /// [`forward_step`] with the LM head made optional. Only the lfm2 path honors
+    /// the flag today; every other architecture ignores it and always projects,
+    /// so behaviour there is unchanged.
+    ///
+    /// [`forward_step`]: RunnableModel::forward_step
+    fn forward_step_maybe_logits(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut KvCache,
+        need_logits: bool,
+    ) -> Result<Vec<f32>> {
         if let Some(rt) = &self.lfm2 {
-            return self.forward_step_lfm2(rt, token, pos, cache);
+            return self.forward_step_lfm2(rt, token, pos, cache, need_logits);
         }
         let hd = self.head_dim;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -3064,8 +3094,12 @@ impl RunnableModel {
         // NOT appended — matching the qwen35 lane and llama.cpp's served output.
         let mut cache = self.new_cache();
         let mut last = Vec::new();
+        // Only the LAST prompt position's logits are consumed; the rest exist to
+        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
+        // those positions removes 9.7% of the bytes each prefill step reads.
+        let last_prompt = prompt.len().saturating_sub(1);
         for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step(tok, pos, &mut cache)?;
+            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
         }
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
