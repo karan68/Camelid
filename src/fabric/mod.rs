@@ -72,6 +72,23 @@ impl Fabric {
         probe_fabric(&self.specs, self.timeout)
     }
 
+    /// Observe every node once and choose one for a request.
+    ///
+    /// The chosen node's snapshot comes back with the decision so a caller can
+    /// read what that node is already serving before it builds a request body.
+    pub fn place(
+        &self,
+        request: &RouteRequest<'_>,
+    ) -> Result<(RouteDecision, NodeSnapshot), RouteError> {
+        let snapshots = self.observe();
+        let decision = route(&snapshots, request)?;
+        let chosen = snapshots
+            .into_iter()
+            .find(|snapshot| snapshot.label() == decision.label)
+            .expect("placement returns a label it was given");
+        Ok((decision, chosen))
+    }
+
     /// Observe, place, and send — the whole path a caller actually wants.
     ///
     /// Returns the placement alongside the answer so a caller can record which
@@ -86,15 +103,8 @@ impl Fabric {
         // Refuse an unsupported request before spending any probes on it.
         forward::reject_streaming(body)?;
 
-        let snapshots = self.observe();
-        let decision = route(&snapshots, request)?;
-        let spec = snapshots
-            .iter()
-            .find(|snapshot| snapshot.label() == decision.label)
-            .map(|snapshot| snapshot.spec.clone())
-            .ok_or(DispatchError::Route(RouteError::NoNodesConfigured))?;
-
-        let answer = forward::forward(&spec, path, body, forward_timeout)?;
+        let (decision, chosen) = self.place(request)?;
+        let answer = forward::forward(&chosen.spec, path, body, forward_timeout)?;
         Ok((decision, answer))
     }
 }

@@ -11,8 +11,12 @@
 //! health probe nor a request forward should depend on.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
+
+/// Never spend the whole budget dialling; a forward budget is minutes long and
+/// a node that has not accepted in five seconds is not about to.
+const CONNECT_ATTEMPT_CAP: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HttpError {
@@ -57,17 +61,14 @@ fn find_header_end(raw: &[u8]) -> Option<HeaderSplit> {
 }
 
 fn parse_status_line(line: &str) -> Result<u16, HttpError> {
-    let mut parts = line.split(' ');
-    let version = parts
-        .next()
-        .ok_or_else(|| HttpError::Malformed("no status line".to_string()))?;
-    if !version.starts_with("HTTP/") {
+    if !line.starts_with("HTTP/") {
         return Err(HttpError::Malformed(format!(
             "status line does not start with HTTP/: {line}"
         )));
     }
-    let code = parts
-        .next()
+    let code = line
+        .split(' ')
+        .nth(1)
         .ok_or_else(|| HttpError::Malformed("status line has no code".to_string()))?;
     code.parse::<u16>()
         .map_err(|_| HttpError::Malformed(format!("status code `{code}` is not a number")))
@@ -155,6 +156,35 @@ pub(crate) fn parse_response(raw: &[u8], max_body: usize) -> Result<HttpResponse
     Ok(HttpResponse { status, body })
 }
 
+/// Connect to the first address that accepts.
+///
+/// A fabric member is usually named rather than numbered, and one name commonly
+/// resolves to several addresses — typically an AAAA ahead of an A. Trying only
+/// the first would report a healthy node as offline whenever its leading address
+/// is unroutable, so every address gets a turn until the deadline runs out.
+fn connect_any(addrs: &[SocketAddr], deadline: Instant) -> Result<TcpStream, HttpError> {
+    let mut last: Option<String> = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Share what is left between the addresses still untried, so one that
+        // black-holes instead of refusing cannot starve the ones behind it.
+        let untried = (addrs.len() - index) as u32;
+        let attempt = (remaining / untried)
+            .min(CONNECT_ATTEMPT_CAP)
+            .max(Duration::from_millis(1));
+        match TcpStream::connect_timeout(addr, attempt) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = Some(format!("{addr}: {error}")),
+        }
+    }
+    Err(HttpError::Connect(last.unwrap_or_else(|| {
+        "no address accepted a connection within the timeout".to_string()
+    })))
+}
+
 /// Perform one request/response round trip against a node.
 ///
 /// `timeout` bounds the whole exchange, not each socket operation, so a peer
@@ -171,18 +201,17 @@ pub(crate) fn request(
     let deadline = Instant::now() + timeout;
     let authority = format!("{host}:{port}");
 
-    let addr = authority
+    let addrs: Vec<SocketAddr> = authority
         .to_socket_addrs()
         .map_err(|error| HttpError::Resolve(error.to_string()))?
-        .next()
-        .ok_or_else(|| HttpError::Resolve("host resolved to no addresses".to_string()))?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(HttpError::Resolve(
+            "host resolved to no addresses".to_string(),
+        ));
+    }
 
-    // Connecting must not consume the whole budget; leave time to actually talk.
-    let connect_timeout = timeout
-        .min(Duration::from_secs(5))
-        .max(Duration::from_millis(1));
-    let mut stream = TcpStream::connect_timeout(&addr, connect_timeout)
-        .map_err(|error| HttpError::Connect(error.to_string()))?;
+    let mut stream = connect_any(&addrs, deadline)?;
     // Short socket reads keep the loop responsive to the overall deadline; one
     // long read timeout would overshoot it on a stalled peer.
     stream
@@ -240,8 +269,29 @@ pub(crate) fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     const LIMIT: usize = 1024 * 1024;
+
+    #[test]
+    fn a_dead_leading_address_does_not_hide_a_live_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let live = listener.local_addr().expect("has an address");
+        // Port 1 is closed; it stands in for an unroutable AAAA ahead of the A.
+        let dead = SocketAddr::from(([127, 0, 0, 1], 1));
+
+        let stream = connect_any(&[dead, live], Instant::now() + Duration::from_secs(2))
+            .expect("the second address accepts");
+        assert_eq!(stream.peer_addr().expect("connected"), live);
+    }
+
+    #[test]
+    fn every_address_failing_reports_the_last_failure() {
+        let dead = SocketAddr::from(([127, 0, 0, 1], 1));
+        let error = connect_any(&[dead, dead], Instant::now() + Duration::from_secs(1))
+            .expect_err("nothing is listening");
+        assert!(matches!(error, HttpError::Connect(_)), "{error:?}");
+    }
 
     #[test]
     fn a_content_length_body_is_read_exactly() {

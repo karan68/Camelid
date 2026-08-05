@@ -814,6 +814,15 @@ fn resolved_gpu_switch(gpu: GpuMode, deterministic: bool) -> Option<bool> {
     }
 }
 
+/// Parse the `--mode` flag shared by `fabric route` and `fabric run`.
+fn route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
+    match raw {
+        "throughput" => Ok(camelid::fabric::RouteMode::Throughput),
+        "affinity" => Ok(camelid::fabric::RouteMode::Affinity),
+        other => anyhow::bail!("unknown mode `{other}`; expected `throughput` or `affinity`"),
+    }
+}
+
 /// Actions over a fabric of independent Camelid nodes.
 ///
 /// A fabric places whole requests on nodes that each own a complete model and
@@ -2383,13 +2392,7 @@ async fn main() -> anyhow::Result<()> {
                 timeout_ms,
                 json,
             } => {
-                let mode = match mode.as_str() {
-                    "throughput" => camelid::fabric::RouteMode::Throughput,
-                    "affinity" => camelid::fabric::RouteMode::Affinity,
-                    other => {
-                        anyhow::bail!("unknown mode `{other}`; expected `throughput` or `affinity`")
-                    }
-                };
+                let mode = route_mode(&mode)?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
@@ -2434,29 +2437,18 @@ async fn main() -> anyhow::Result<()> {
                 forward_timeout_s,
                 json,
             } => {
-                let mode = match mode.as_str() {
-                    "throughput" => camelid::fabric::RouteMode::Throughput,
-                    "affinity" => camelid::fabric::RouteMode::Affinity,
-                    other => {
-                        anyhow::bail!("unknown mode `{other}`; expected `throughput` or `affinity`")
-                    }
-                };
+                let mode = route_mode(&mode)?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
                     .with_timeout(std::time::Duration::from_millis(timeout_ms));
 
-                let snapshots = fabric.observe();
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
                     .with_sticky(sticky.as_deref());
-                let decision = camelid::fabric::route(&snapshots, &request)
+                let (decision, chosen) = fabric
+                    .place(&request)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
-
-                let chosen = snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.label() == decision.label)
-                    .ok_or_else(|| anyhow::anyhow!("placement named an unknown node"))?;
 
                 // The request must name a model. Prefer the operator's choice,
                 // otherwise use whatever the chosen node has loaded.
