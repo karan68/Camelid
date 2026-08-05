@@ -382,6 +382,9 @@ impl LlamaModelConfig {
         let gemma4 = Gemma4Metadata::from_gguf(gguf, architecture);
         let qwen35 = Qwen35Metadata::from_gguf(gguf, architecture);
         let lfm2 = Lfm2Metadata::from_gguf(gguf, architecture);
+        if let Some(meta) = lfm2.as_ref() {
+            lfm2_reject_unrunnable_shapes(gguf, architecture, meta)?;
+        }
 
         let attention_head_count = required_u32(
             gguf,
@@ -1340,6 +1343,56 @@ impl Lfm2Metadata {
     pub fn max_kv_heads(&self) -> u32 {
         self.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
     }
+}
+
+/// Fail closed on the two LFM2 shapes the runnable lane's forward cannot execute.
+///
+/// Both are absent from LFM2.5-2.6B, so this changes nothing for the shipped row —
+/// it stops a future/variant LFM2 file from decoding fluent-looking but wrong
+/// output under an architecture Camelid claims to implement (the failure mode the
+/// smollm3 NoPE audit was opened for).
+///
+/// 1. **Sliding-window attention.** llama.cpp `src/models/lfm2.cpp:23-28`
+///    (`load_arch_hparams`) reads `<arch>.attention.sliding_window` and, when it is
+///    present and non-zero, marks EVERY non-recurrent layer SWA:
+///    `hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; ... is_swa_impl[il] =
+///    !is_recr_impl[il];`. The runnable lane's attention is full-causal with no
+///    window mask, so it would silently attend outside the model's trained span.
+/// 2. **A heterogeneous attention schedule.** K/V are sized from one global head
+///    count ([`Lfm2Metadata::max_kv_heads`]), so attention layers with DIFFERENT
+///    non-zero KV head counts would be executed with the wrong cache stride.
+fn lfm2_reject_unrunnable_shapes(
+    gguf: &GgufFile,
+    architecture: &str,
+    meta: &Lfm2Metadata,
+) -> Result<()> {
+    let swa_key = architecture_key(architecture, "attention.sliding_window");
+    if let Some(window) = gguf.metadata_u32(&swa_key) {
+        if window > 0 {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "lfm2: {swa_key} = {window} makes every attention layer sliding-window \
+                 (llama.cpp src/models/lfm2.cpp load_arch_hparams), and the runnable lane's \
+                 attention is full-causal with no window mask; refusing rather than decoding \
+                 with the wrong attention span"
+            )));
+        }
+    }
+
+    let widths: std::collections::BTreeSet<u32> = meta
+        .kv_heads_per_layer
+        .iter()
+        .copied()
+        .filter(|&n| n > 0)
+        .collect();
+    if widths.len() > 1 {
+        return Err(BackendError::UnsupportedGguf(format!(
+            "lfm2: {} carries a heterogeneous attention schedule (distinct non-zero KV head \
+             counts {widths:?}); the runnable lane sizes K/V from one global count and would \
+             mis-stride the cache",
+            architecture_key(architecture, "attention.head_count_kv")
+        )));
+    }
+    Ok(())
 }
 
 /// NEOX split-half RoPE pairing per architecture: qwen2/qwen3/qwen3moe/qwen35,
@@ -2755,6 +2808,79 @@ mod tests {
             0, 0, 8, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 8, 0, 0, 8, 0,
             0,
         ]
+    }
+
+    /// The runnable lane's attention is full-causal. llama.cpp turns a non-zero
+    /// `attention.sliding_window` into SWA on EVERY attention layer, so such a file
+    /// must be refused rather than decoded with the wrong attention span.
+    #[test]
+    fn lfm2_sliding_window_row_is_refused() {
+        let base = |extra: Vec<(&'static str, GgufMetadataValue)>| {
+            let mut kv: Vec<(&'static str, GgufMetadataValue)> = vec![
+                (
+                    "general.architecture",
+                    GgufMetadataValue::String("lfm2".into()),
+                ),
+                ("lfm2.block_count", GgufMetadataValue::U32(30)),
+                ("lfm2.attention.head_count", GgufMetadataValue::U32(32)),
+                ("lfm2.context_length", GgufMetadataValue::U32(4096)),
+                ("lfm2.embedding_length", GgufMetadataValue::U32(2048)),
+                ("lfm2.feed_forward_length", GgufMetadataValue::U32(10752)),
+                (
+                    "lfm2.attention.head_count_kv",
+                    GgufMetadataValue::Array(
+                        lfm2_2_6b_kv_heads()
+                            .into_iter()
+                            .map(GgufMetadataValue::I32)
+                            .collect(),
+                    ),
+                ),
+                ("lfm2.shortconv.l_cache", GgufMetadataValue::U32(3)),
+            ];
+            kv.extend(extra);
+            meta_only_gguf(kv)
+        };
+
+        // The real row carries no sliding_window key and must still parse.
+        assert!(super::LlamaModelConfig::from_gguf(&base(vec![])).is_ok());
+
+        // A windowed row is refused, and the message names the blocker.
+        let err = super::LlamaModelConfig::from_gguf(&base(vec![(
+            "lfm2.attention.sliding_window",
+            GgufMetadataValue::U32(512),
+        )]))
+        .expect_err("a windowed lfm2 row must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sliding_window") && msg.contains("full-causal"),
+            "refusal must name the window blocker, got: {msg}"
+        );
+
+        // A heterogeneous attention schedule is refused too: K/V are sized from
+        // one global head count and would otherwise be mis-strided.
+        let mut mixed = lfm2_2_6b_kv_heads();
+        mixed[5] = 4; // an attention layer with a different width
+        let err = super::LlamaModelConfig::from_gguf(&meta_only_gguf(vec![
+            (
+                "general.architecture",
+                GgufMetadataValue::String("lfm2".into()),
+            ),
+            ("lfm2.block_count", GgufMetadataValue::U32(30)),
+            ("lfm2.attention.head_count", GgufMetadataValue::U32(32)),
+            ("lfm2.context_length", GgufMetadataValue::U32(4096)),
+            ("lfm2.embedding_length", GgufMetadataValue::U32(2048)),
+            ("lfm2.feed_forward_length", GgufMetadataValue::U32(10752)),
+            (
+                "lfm2.attention.head_count_kv",
+                GgufMetadataValue::Array(mixed.into_iter().map(GgufMetadataValue::I32).collect()),
+            ),
+            ("lfm2.shortconv.l_cache", GgufMetadataValue::U32(3)),
+        ]))
+        .expect_err("a heterogeneous lfm2 schedule must be refused");
+        assert!(
+            err.to_string().contains("heterogeneous"),
+            "refusal must name the schedule blocker, got: {err}"
+        );
     }
 
     #[test]
