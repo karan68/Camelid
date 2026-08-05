@@ -126,6 +126,7 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
             | "mistral"
             | "qwen2"
             | "qwen3"
+            | "qwen3moe"
             | "qwen35"
             | "smollm3"
             | "gemma3"
@@ -304,8 +305,8 @@ impl LlamaModelConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let architecture = match gguf.architecture() {
             Some(
-                architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "qwen35" | "smollm3"
-                | "gemma3" | "gemma4" | "phi3" | "lfm2"),
+                architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35"
+                | "smollm3" | "gemma3" | "gemma4" | "phi3" | "lfm2"),
             ) => architecture,
             // Gemma 4 MTP/assistant drafter heads ship as a distinct architecture.
             // The tensor map parses (q-only attention layers, per-layer
@@ -512,6 +513,10 @@ pub struct MixtralMoeMetadata {
     pub expert_weights_scale: f32,
     pub expert_weights_norm: bool,
     pub expert_gating_func: u32,
+    /// Per-expert FFN width when it differs from the dense `feed_forward_length`
+    /// (fine-grained MoE like qwen3moe: `{arch}.expert_feed_forward_length`).
+    /// `None` keeps the Mixtral convention of expert width == dense FFN width.
+    pub expert_feed_forward_length: Option<u32>,
 }
 
 impl MixtralMoeMetadata {
@@ -539,6 +544,10 @@ impl MixtralMoeMetadata {
         let expert_gating_func = gguf
             .metadata_u32(&architecture_key(architecture, "expert_gating_func"))
             .unwrap_or(0);
+        let expert_feed_forward_length = gguf.metadata_u32(&architecture_key(
+            architecture,
+            "expert_feed_forward_length",
+        ));
 
         Some(Self {
             family_label,
@@ -547,6 +556,7 @@ impl MixtralMoeMetadata {
             expert_weights_scale,
             expert_weights_norm,
             expert_gating_func,
+            expert_feed_forward_length,
         })
     }
 }
@@ -1240,7 +1250,10 @@ impl Qwen35Metadata {
 /// for phi3). Everything else keeps adjacent even/odd (LLaMA-style permuted
 /// conversions). Pure so the gate is unit-testable.
 fn arch_uses_neox_rope_pairing(architecture: &str) -> bool {
-    matches!(architecture, "qwen2" | "qwen3" | "qwen35" | "phi3")
+    matches!(
+        architecture,
+        "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "phi3"
+    )
 }
 
 /// NoPE layer step per architecture.
@@ -1453,7 +1466,7 @@ impl LlamaTensorBinding {
         // resident-capable hosts, while the CPU dense forward stays fail-closed
         // for windowed archs (hazard H4).
         let architecture = gguf.architecture().unwrap_or_default();
-        let expects_qk_norm = matches!(architecture, "qwen3" | "command-r" | "gemma3");
+        let expects_qk_norm = matches!(architecture, "qwen3" | "qwen3moe" | "command-r" | "gemma3");
         let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
         // gemma3's 4-norm "sandwich" structure: an extra RMSNorm on the attention
         // output and on the FFN output, each applied BEFORE its residual add
@@ -1869,23 +1882,27 @@ impl LlamaTensorBinding {
                         moe.expert_count as usize,
                         &format!("layer {idx} ffn router"),
                     )?;
+                    let expert_ff = moe
+                        .expert_feed_forward_length
+                        .map(|v| v as usize)
+                        .unwrap_or(dims.feed_forward_length);
                     validate_moe_expert_tensor_shape(
                         gate_experts,
                         dims.embedding_length,
-                        dims.feed_forward_length,
+                        expert_ff,
                         moe.expert_count as usize,
                         &format!("layer {idx} ffn gate experts"),
                     )?;
                     validate_moe_expert_tensor_shape(
                         up_experts,
                         dims.embedding_length,
-                        dims.feed_forward_length,
+                        expert_ff,
                         moe.expert_count as usize,
                         &format!("layer {idx} ffn up experts"),
                     )?;
                     validate_moe_expert_tensor_shape(
                         down_experts,
-                        dims.feed_forward_length,
+                        expert_ff,
                         dims.embedding_length,
                         moe.expert_count as usize,
                         &format!("layer {idx} ffn down experts"),
@@ -2615,6 +2632,7 @@ mod tests {
         // else — including the other unpermuted-but-unproven archs — must stay
         // on adjacent even/odd until its own row proves the flip.
         assert!(super::arch_uses_neox_rope_pairing("qwen3"));
+        assert!(super::arch_uses_neox_rope_pairing("qwen3moe"));
         assert!(super::arch_uses_neox_rope_pairing("qwen35"));
         assert!(super::arch_uses_neox_rope_pairing("phi3"));
         assert!(super::arch_uses_neox_rope_pairing("qwen2"));
@@ -2638,7 +2656,8 @@ mod tests {
         // mistral3.cpp:137,143. gemma3/gemma4/qwen35 carry per-layer rope BASES
         // or schedules — not skips — and those live in their own metadata.
         for arch in [
-            "llama", "mistral", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4", "phi3", "lfm2",
+            "llama", "mistral", "qwen2", "qwen3", "qwen3moe", "qwen35", "gemma3", "gemma4", "phi3",
+            "lfm2",
         ] {
             assert!(
                 super::arch_no_rope_layer_step(arch).is_none(),
@@ -2662,7 +2681,8 @@ mod tests {
             );
         }
         for arch in [
-            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "lfm2", "",
+            "llama", "mistral", "qwen2", "qwen3", "qwen3moe", "smollm3", "gemma3", "gemma4",
+            "phi3", "lfm2", "",
         ] {
             assert!(
                 !super::is_runnable_only_arch(arch),
@@ -2795,10 +2815,11 @@ mod tests {
 
     #[test]
     fn implemented_architecture_set_is_exactly_the_from_gguf_accept_arm() {
-        // These nine must stay byte-for-byte in sync with the match arm in
+        // This list must stay byte-for-byte in sync with the match arm in
         // LlamaModelConfig::from_gguf. If you change one, change both.
         for arch in [
-            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "lfm2",
+            "llama", "mistral", "qwen2", "qwen3", "qwen3moe", "smollm3", "gemma3", "gemma4",
+            "phi3", "lfm2",
         ] {
             assert!(
                 super::is_implemented_architecture(arch),

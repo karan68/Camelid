@@ -1166,6 +1166,98 @@ impl PartialEq for Q8_0FileBacking {
 
 impl Eq for Q8_0FileBacking {}
 
+/// File-backed raw Q4_0 wire storage for a rank-3 streamed MoE expert pack.
+///
+/// Unlike [`Q8_0FileBacking`], the shared handle keeps OS file caching
+/// ENABLED (no `F_NOCACHE`/readahead-off): a fine-grained MoE's routed expert
+/// set cannot be RAM-resident on the hosts this lane targets, and the page
+/// cache retaining recently routed experts between tokens is the streamed
+/// lane's entire performance model.
+#[derive(Debug, Clone)]
+pub struct Q4_0FileBacking {
+    pub path: PathBuf,
+    pub absolute_offset: u64,
+    pub num_blocks: usize,
+    /// 18 for Q4_0, 20 for Q4_1 — the streamed lane serves both nibble
+    /// formats; the tensor's `source_type` picks the dequantizer.
+    pub wire_bytes_per_block: usize,
+    file_handle: Arc<OnceLock<Arc<File>>>,
+}
+
+impl Q4_0FileBacking {
+    pub const WIRE_BYTES_PER_BLOCK: usize = 18;
+
+    pub fn new(
+        path: PathBuf,
+        absolute_offset: u64,
+        num_blocks: usize,
+        wire_bytes_per_block: usize,
+    ) -> Self {
+        Self {
+            path,
+            absolute_offset,
+            num_blocks,
+            wire_bytes_per_block,
+            file_handle: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn file(&self) -> Result<Arc<File>> {
+        if let Some(file) = self.file_handle.get() {
+            return Ok(file.clone());
+        }
+        let file = File::open(&self.path).map_err(|source| BackendError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        let file = Arc::new(file);
+        if self.file_handle.set(file.clone()).is_err() {
+            return Ok(self
+                .file_handle
+                .get()
+                .expect("q4_0 file handle must exist after OnceLock set race")
+                .clone());
+        }
+        Ok(file)
+    }
+
+    /// Read `block_count` contiguous 18-byte Q4_0 wire blocks starting
+    /// `block_offset` blocks into the backing.
+    pub fn read_wire_blocks(&self, block_offset: usize, block_count: usize) -> Result<Vec<u8>> {
+        let end_block = block_offset.checked_add(block_count).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("q4_0 file-backed block range overflow".to_string())
+        })?;
+        if end_block > self.num_blocks {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "q4_0 file-backed read blocks {block_offset}..{end_block} exceed backing of {} blocks",
+                self.num_blocks
+            )));
+        }
+        let mut out = vec![0u8; block_count * self.wire_bytes_per_block];
+        let file = self.file()?;
+        let offset = self
+            .absolute_offset
+            .saturating_add((block_offset * self.wire_bytes_per_block) as u64);
+        crate::platform_fs::read_exact_at(&file, &mut out, offset).map_err(|source| {
+            BackendError::Io {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        Ok(out)
+    }
+}
+
+impl PartialEq for Q4_0FileBacking {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.absolute_offset == other.absolute_offset
+            && self.num_blocks == other.num_blocks
+    }
+}
+
+impl Eq for Q4_0FileBacking {}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CpuTensor {
     pub name: String,
@@ -1186,6 +1278,11 @@ pub struct CpuTensor {
     /// `source_type` identifies the K-quant or Prism Q1/Q2 block format.
     pub kquant_wire_pages: Option<std::sync::Arc<crate::wire_mmap::WirePages>>,
     pub q8_0_split_file_backing: Option<Vec<Q8_0FileBacking>>,
+    /// Buffered file backing for a rank-3 Q4_0 MoE expert pack. Per-expert
+    /// wire slices are read and dequantized transiently at matvec time; see
+    /// [`Q4_0FileBacking`] for why this backing deliberately keeps the OS
+    /// page cache enabled.
+    pub q4_0_file_backing: Option<Q4_0FileBacking>,
     /// Q4_K_M super-block wire bytes (144 bytes/super-block, row-major), retained
     /// when the tensor's `source_type` is `Q4K` so the GPU-resident decode path can
     /// repack them into the `q4k_gemv` SoA layout. Populated by the Q4_K load path;
@@ -1426,6 +1523,7 @@ impl Q8_0TensorBlocks {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -1511,6 +1609,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -1604,6 +1703,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -1651,6 +1751,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -1696,6 +1797,44 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
+            q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
+            q5_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
+            data: Vec::new(),
+        }
+    }
+
+    /// Descriptor-only rank-3 Q4_0/Q4_1 MoE expert pack: no weight bytes are
+    /// materialized at load; per-expert wire slices stream (buffered) from the
+    /// backing at matvec time and are dequantized transiently.
+    pub fn q4_0_file_backed_experts(
+        name: impl Into<String>,
+        shape: TensorShape,
+        backing: Q4_0FileBacking,
+        source_type: GgufTensorType,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(source_type),
+            q8_0_blocks: None,
+            q8_0_shared_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            kquant_wire_pages: None,
+            q8_0_split_file_backing: None,
+            q4_0_file_backing: Some(backing),
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -1728,6 +1867,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -1760,6 +1900,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: Some(backings),
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -4091,6 +4232,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes,
@@ -4160,6 +4302,7 @@ impl TensorStore {
                 wire_bytes,
             )?),
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -4197,6 +4340,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -4257,6 +4401,7 @@ impl TensorStore {
                 wire_bytes,
             )?),
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -4294,6 +4439,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes: None,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -4421,6 +4567,41 @@ impl TensorStore {
 
     pub fn load_q8_0_file_backed_tensor(&self, name: &str) -> Result<CpuTensor> {
         self.load_q8_0_file_backed_tensor_as(name, name)
+    }
+
+    /// Load a rank-3 Q4_0/Q4_1 MoE expert pack as a descriptor-only streamed
+    /// tensor. Refuses other sources rather than falling back to f32
+    /// materialization: a fine-grained MoE pack materialized f32 is tens of
+    /// GiB and must never happen silently.
+    pub fn load_q4_0_file_backed_expert_tensor(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        let wire_bytes_per_block = match desc.tensor_type {
+            GgufTensorType::Q4_0 => Q4_0_BLOCK_BYTES,
+            GgufTensorType::Q4_1 => Q4_1_BLOCK_BYTES,
+            other => {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "tensor {name} is {other:?}, not Q4_0/Q4_1; the streamed expert loader refuses fallback"
+                )));
+            }
+        };
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        let expected_elements = shape.element_count()?;
+        if expected_elements % 32 != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "tensor {name} nibble-block element count {expected_elements} is not block aligned"
+            )));
+        }
+        Ok(CpuTensor::q4_0_file_backed_experts(
+            name,
+            shape,
+            Q4_0FileBacking::new(
+                self.path.clone(),
+                desc.absolute_offset,
+                expected_elements / 32,
+                wire_bytes_per_block,
+            ),
+            desc.tensor_type,
+        ))
     }
 
     pub fn load_q8_0_file_backed_tensor_as(
@@ -4596,6 +4777,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             kquant_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_0_file_backing: None,
             q4_k_wire_bytes,
             q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
@@ -6012,7 +6194,11 @@ pub(crate) fn q1_0_to_q8_0_blocks(
     Ok(out)
 }
 
-fn decode_q4_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_q4_1_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
     let blocks = decode_q4_1_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
