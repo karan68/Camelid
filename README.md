@@ -311,28 +311,33 @@ OpenAI-compatible API:
 ```bash
 CAMELID_GEMMA4_GHOST_METAL_SLOTS=1 \
 CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST=1 \
-CAMELID_GEMMA4_GHOST_METAL_COMMON=0 \
-CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER=24 \
+CAMELID_GEMMA4_GHOST_METAL_TURBO=1 \
+CAMELID_GEMMA4_GHOST_METAL_COMMON=1 \
+CAMELID_GEMMA4_GHOST_METAL_CONTEXT=1024 \
+CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER=80 \
+CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT=1 \
 CAMELID_GEMMA4_GHOST_READ_THREADS=4 \
 cargo run --release --bin camelid -- serve --gpu on \
   --model models/gemma-4-26B_q4_0-it.gguf \
   --cghost models/gemma-4-26B_q4_0-it.cghost \
-  --expert-cache-mib 1024
+  --expert-cache-mib 64
 ```
 
-The 24-slot setting retains 2.25 GiB of routed experts across the 30 layer-local slabs. The 1 GiB
-host cache retains prompt-fetched experts that can refill later slot misses without another SSD
-read. Eight slots is the correctness floor and 32 is the current maximum; larger values reduce
-storage reads but increase unified-memory pressure. The server skips an irrelevant resident-engine
+The 80-slot setting retains 7.5 GiB of routed experts across the 30 layer-local slabs — on a
+16 GiB machine the slot slabs are deliberately the largest resident. Eight slots is the
+correctness floor and 128 is the maximum (full per-layer residency); on the tested 16 GiB M4,
+80 was the sweet spot and 96 regressed into swap. The server skips an irrelevant resident-engine
 warm-up and reports `gemma4_serve_lane: "ghost_moe"` in `/v1/health` when the lane is ready. The
 original/sparse GGUF and matching `.cghost` must both stay on fast local storage.
 
-This hybrid uses CPU common-core math with persistent Metal Q4_0 expert slots and the exact Metal
-Q6_K head. Set `CAMELID_GEMMA4_GHOST_METAL_COMMON=1` and
-`CAMELID_GEMMA4_GHOST_METAL_CONTEXT=4096` to opt into the complete common-core Metal path. On the
-tested 16 GiB M4, the hybrid was faster because it avoided enough per-layer launch and
-unified-memory pressure to outweigh the extra CPU work. The final acceptance runs completed the
-fixed 32-token response in 8.42–9.04 seconds while full-common Metal took 10.85–11.08 seconds.
+This profile keeps the common core, the routed Q4_0 experts, and the Q6_K head on Metal, with
+opt-in turbo kernels (reassociated summation, four rows per SIMD group) and a resident tied-head
+copy. With expanded slot residency, full-common Metal now measures faster than the earlier
+24-slot hybrid recommendation: end-to-end throughput on the acceptance prompt improved from
+3.54–3.80 tok/s to 12.7 tok/s over 256 visible tokens, with steady-state decode at 17–20 tok/s
+once expert residency converges (97.5% slot hit rate). A persistent server keeps slots warm across
+requests, so follow-up requests decode at the steady-state rate from the first token. The hybrid
+CPU-common profile (`CAMELID_GEMMA4_GHOST_METAL_COMMON=0`) remains available.
 
 This remains an experimental exact-row lane, with a CPU fallback if Metal admission fails. Dense
 ghost's stage-split and speculative flags are refused because expert IDs do not exist until each

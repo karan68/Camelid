@@ -1276,7 +1276,7 @@ const GHOST_METAL_EXPERT_SLOTS_MIN: usize = 8;
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_EXPERT_SLOTS_DEFAULT: usize = 16;
 #[cfg(any(target_os = "macos", test))]
-const GHOST_METAL_EXPERT_SLOTS_MAX: usize = 32;
+const GHOST_METAL_EXPERT_SLOTS_MAX: usize = 128;
 
 #[cfg(any(target_os = "macos", test))]
 fn parse_ghost_metal_slots_per_layer(value: Option<&str>) -> usize {
@@ -9904,7 +9904,8 @@ mod ghost_moe_wire_tests {
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("8")), 8);
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("24")), 24);
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("32")), 32);
-        assert_eq!(parse_ghost_metal_slots_per_layer(Some("4096")), 32);
+        assert_eq!(parse_ghost_metal_slots_per_layer(Some("96")), 96);
+        assert_eq!(parse_ghost_metal_slots_per_layer(Some("4096")), 128);
     }
 
     #[cfg(target_os = "macos")]
