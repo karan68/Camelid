@@ -22486,6 +22486,11 @@ mod tests {
     #[test]
     fn cooperative_stream_job_seeds_from_the_prompt_prefix_cache() {
         let _env_guard = crate::test_support::env_lock();
+        // The GPU-resident CUDA lane truthfully BYPASSES the prompt-prefix cache
+        // (reseeding GPU KV from cached host history is not bit-identical to a
+        // fresh GPU prefill), so on a CUDA box this test must pin the CPU lane
+        // it asserts; CI runners have no GPU and are unaffected.
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
         std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
         std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
@@ -22530,6 +22535,7 @@ mod tests {
             vec![cached_next_token],
             "decode resumes from the cached token, not from the whole prompt"
         );
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
     #[test]
