@@ -17,15 +17,21 @@
 //! # Shape
 //!
 //! * [`node`] — identity and observed state.
-//! * [`probe`] — the only socket work.
+//! * [`probe`] — turning `/v1/health` into a routing fact.
 //! * [`policy`] — pure placement decisions; the correctness of the fabric.
+//! * [`forward`] — sending a placed request to the node that will serve it.
 
+pub mod forward;
+pub(crate) mod http;
 pub mod node;
 pub mod policy;
 pub mod probe;
 
 use std::time::Duration;
 
+use serde_json::Value;
+
+pub use forward::{ForwardError, Forwarded, DEFAULT_FORWARD_TIMEOUT};
 pub use node::{
     parse_fabric, parse_node_spec, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
     NodeStatus, DEFAULT_NODE_PORT,
@@ -64,6 +70,64 @@ impl Fabric {
     /// Observe every node once.
     pub fn observe(&self) -> Vec<NodeSnapshot> {
         probe_fabric(&self.specs, self.timeout)
+    }
+
+    /// Observe, place, and send — the whole path a caller actually wants.
+    ///
+    /// Returns the placement alongside the answer so a caller can record which
+    /// node served the request and whether affinity held.
+    pub fn dispatch(
+        &self,
+        path: &str,
+        body: &Value,
+        request: &RouteRequest<'_>,
+        forward_timeout: Duration,
+    ) -> Result<(RouteDecision, Forwarded), DispatchError> {
+        // Refuse an unsupported request before spending any probes on it.
+        forward::reject_streaming(body)?;
+
+        let snapshots = self.observe();
+        let decision = route(&snapshots, request)?;
+        let spec = snapshots
+            .iter()
+            .find(|snapshot| snapshot.label() == decision.label)
+            .map(|snapshot| snapshot.spec.clone())
+            .ok_or(DispatchError::Route(RouteError::NoNodesConfigured))?;
+
+        let answer = forward::forward(&spec, path, body, forward_timeout)?;
+        Ok((decision, answer))
+    }
+}
+
+/// Why a dispatch did not produce an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchError {
+    /// No node could take the request.
+    Route(RouteError),
+    /// A node was chosen, but the request did not complete against it.
+    Forward(ForwardError),
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Route(error) => write!(f, "{error}"),
+            Self::Forward(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+impl From<RouteError> for DispatchError {
+    fn from(error: RouteError) -> Self {
+        Self::Route(error)
+    }
+}
+
+impl From<ForwardError> for DispatchError {
+    fn from(error: ForwardError) -> Self {
+        Self::Forward(error)
     }
 }
 
@@ -252,5 +316,70 @@ mod tests {
         let fabric = Fabric::new(Vec::new());
         assert!(fabric.is_empty());
         assert!(fabric.observe().is_empty());
+    }
+
+    #[test]
+    fn dispatch_refuses_a_streaming_request_before_probing_anything() {
+        // The node here is unreachable on purpose: if dispatch probed first, this
+        // would surface as a routing failure instead of the streaming refusal.
+        let fabric = Fabric::new(vec![NodeSpec {
+            label: "dead".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        }]);
+        let body = serde_json::json!({ "model": "m", "stream": true });
+        let error = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &body,
+                &RouteRequest::new(RouteMode::Throughput),
+                Duration::from_millis(200),
+            )
+            .expect_err("streaming is unsupported");
+        assert!(
+            matches!(error, DispatchError::Forward(ForwardError::Unsupported(_))),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_on_an_empty_fabric_fails_at_placement_not_transport() {
+        let fabric = Fabric::new(Vec::new());
+        let error = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &serde_json::json!({ "model": "m" }),
+                &RouteRequest::new(RouteMode::Throughput),
+                Duration::from_millis(200),
+            )
+            .expect_err("no nodes");
+        assert_eq!(error, DispatchError::Route(RouteError::NoNodesConfigured));
+    }
+
+    #[test]
+    fn dispatch_reports_a_dead_node_as_a_placement_failure() {
+        // Every node being unreachable is a routing outcome, not a forward error:
+        // there was never a node to send to.
+        let fabric = Fabric::new(vec![NodeSpec {
+            label: "dead".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        }])
+        .with_timeout(Duration::from_millis(300));
+        let error = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &serde_json::json!({ "model": "m" }),
+                &RouteRequest::new(RouteMode::Throughput),
+                Duration::from_millis(300),
+            )
+            .expect_err("node is dead");
+        assert!(
+            matches!(
+                error,
+                DispatchError::Route(RouteError::AllNodesUnavailable { .. })
+            ),
+            "got {error:?}"
+        );
     }
 }

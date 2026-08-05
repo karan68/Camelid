@@ -856,6 +856,35 @@ enum FabricAction {
         #[arg(long)]
         json: bool,
     },
+    /// Send one chat request through the fabric and print the answer.
+    ///
+    /// Placement, then forward: the request crosses the network once, not once
+    /// per token.
+    Run {
+        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        nodes: Vec<String>,
+        /// The user message to send.
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value = "throughput")]
+        mode: String,
+        /// Require a node serving this exact model id. When omitted, the fabric
+        /// picks a node and uses whatever that node has loaded.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        sticky: Option<String>,
+        #[arg(long, default_value_t = 64)]
+        max_tokens: u32,
+        /// Per-node health probe budget.
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+        /// Budget for the generation itself, which can legitimately take minutes.
+        #[arg(long, default_value_t = 300)]
+        forward_timeout_s: u64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2392,6 +2421,102 @@ async fn main() -> anyhow::Result<()> {
                              this request re-prefills on a cold node"
                         );
                     }
+                }
+            }
+            FabricAction::Run {
+                nodes,
+                prompt,
+                mode,
+                model,
+                sticky,
+                max_tokens,
+                timeout_ms,
+                forward_timeout_s,
+                json,
+            } => {
+                let mode = match mode.as_str() {
+                    "throughput" => camelid::fabric::RouteMode::Throughput,
+                    "affinity" => camelid::fabric::RouteMode::Affinity,
+                    other => {
+                        anyhow::bail!("unknown mode `{other}`; expected `throughput` or `affinity`")
+                    }
+                };
+                let specs = camelid::fabric::parse_fabric(&nodes)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let fabric = camelid::fabric::Fabric::new(specs)
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+
+                let snapshots = fabric.observe();
+                let request = camelid::fabric::RouteRequest::new(mode)
+                    .with_model(model.as_deref())
+                    .with_sticky(sticky.as_deref());
+                let decision = camelid::fabric::route(&snapshots, &request)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+                let chosen = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.label() == decision.label)
+                    .ok_or_else(|| anyhow::anyhow!("placement named an unknown node"))?;
+
+                // The request must name a model. Prefer the operator's choice,
+                // otherwise use whatever the chosen node has loaded.
+                let model_id = match model {
+                    Some(model) => model,
+                    None => chosen
+                        .active_model_id()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "node `{}` reports no active model; pass --model",
+                                decision.label
+                            )
+                        })?
+                        .to_string(),
+                };
+
+                let body = camelid::fabric::forward::chat_request(&model_id, &prompt, max_tokens);
+                let answer = camelid::fabric::forward::forward(
+                    &chosen.spec,
+                    "/v1/chat/completions",
+                    &body,
+                    std::time::Duration::from_secs(forward_timeout_s),
+                )
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "node": answer.label,
+                            "reason": format!("{:?}", decision.reason),
+                            "affinity_lost": decision.affinity_lost,
+                            "model": model_id,
+                            "status": answer.status,
+                            "elapsed_ms": answer.elapsed.as_millis() as u64,
+                            "body": answer.body,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[{} · {:?} · {} · {} ms]",
+                        answer.label,
+                        decision.reason,
+                        model_id,
+                        answer.elapsed.as_millis()
+                    );
+                    match camelid::fabric::forward::completion_text(&answer.body) {
+                        Some(text) => println!("{text}"),
+                        None => println!("(no completion text; HTTP {})", answer.status),
+                    }
+                }
+
+                if !answer.is_success() {
+                    let detail = camelid::fabric::forward::error_message(&answer.body)
+                        .unwrap_or("no message");
+                    anyhow::bail!(
+                        "node `{}` answered HTTP {}: {detail}",
+                        answer.label,
+                        answer.status
+                    );
                 }
             }
         },
