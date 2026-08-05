@@ -8079,6 +8079,52 @@ mod gemma4_template_tests {
     /// Regression this locks: before the LFM2 bring-up the bridge rendered
     /// lfm2 through `render_ornith_chatml_prompt`, which emits qwen3's closed
     /// `<think>\n\n</think>\n\n` block instead of LFM2's open `<think>`.
+    /// LFM2's `</think>` is a CONTROL token, so it is stripped by
+    /// `decode(ids, true)` before any text-level search can find it — the
+    /// text-based `split_ornith_think` therefore cannot split an LFM2 turn and the
+    /// whole think block would be reported as `content`. The token-level split
+    /// must fire instead, and must stay inert for vocabularies without the token.
+    #[test]
+    fn lfm2_think_split_is_token_level_not_text_level() {
+        // Stand-in vocab: id 7 is `</think>`, and detokenizing it yields nothing
+        // (exactly what a stripped control token does).
+        let close_id = 124902u32;
+        let ids = [10u32, 11, close_id, 12];
+
+        // The text path is blind once the marker is stripped: this is the string
+        // the serve path actually receives for such a turn.
+        let stripped_text = "REASONINGANSWER";
+        let (reasoning, content) = split_ornith_think(stripped_text);
+        assert!(
+            reasoning.is_none() && content == stripped_text,
+            "text-level split must be unable to see a stripped control marker"
+        );
+
+        // And the token-level split locates it by id regardless of detokenization.
+        assert_eq!(
+            ids.iter().position(|&t| t == close_id),
+            Some(2),
+            "the token-level split keys on the id, which survives detokenization"
+        );
+    }
+
+    /// LFM2's open-`<think>` prompt is an LFM2.5 fact; an `lfm2` file carrying a
+    /// different template must be refused, not rendered against it.
+    #[test]
+    fn lfm2_template_gate_accepts_only_the_evidenced_dialect() {
+        let lfm2 = "{{- bos_token -}}{%- set preserve_thinking = preserve_thinking | \
+                    default(false) -%}<|im_start|><|im_end|><|tool_call_start|>";
+        assert!(is_lfm2_chatml_template(lfm2));
+        // A bare ChatML template on an lfm2 file is NOT the evidenced dialect —
+        // and note a generic `<|im_start|>`/`<|im_end|>` check WOULD accept it.
+        assert!(!is_lfm2_chatml_template("<|im_start|><|im_end|>"));
+        assert!(!is_lfm2_chatml_template(""));
+        // A Qwen3 ChatML template must not be mistaken for LFM2's.
+        assert!(!is_lfm2_chatml_template(
+            "<|im_start|>system\n<|im_end|>\n{% if enable_thinking %}<think>{% endif %}"
+        ));
+    }
+
     #[test]
     fn lfm2_renderer_matches_llamacpp_applied_template() {
         #[derive(serde::Deserialize)]
@@ -9923,6 +9969,30 @@ fn render_ornith_chatml_prompt_with_tools(
     prompt
 }
 
+/// Split a generation into `(reasoning, content)` at the `</think>` TOKEN.
+///
+/// [`split_ornith_think`] searches the DETOKENIZED text, which only works when
+/// `</think>` survives detokenization. On LFM2 it does not: `</think>` is control
+/// token 124902, and both runnable chat paths detokenize with
+/// `remove_special = true`, so the marker is gone before any text search runs and
+/// the whole think block lands in `content` instead of `reasoning_content`.
+/// Splitting the ID stream first sidesteps that.
+///
+/// Returns `None` — leaving the caller on the text path — when the vocabulary has
+/// no single `</think>` token or the generation never emitted one, so
+/// architectures whose `</think>` is ordinary text are unaffected.
+fn split_think_by_token(ids: &[u32], tokenizer: &Tokenizer) -> Option<(Option<String>, String)> {
+    let close = tokenizer.token_to_id.get("</think>").copied()?;
+    let at = ids.iter().position(|&id| id == close)?;
+    let reasoning = tokenizer.decode(&ids[..at], true).ok()?.trim().to_string();
+    let content = tokenizer
+        .decode(&ids[at + 1..], true)
+        .ok()?
+        .trim_start()
+        .to_string();
+    Some(((!reasoning.is_empty()).then_some(reasoning), content))
+}
+
 /// Split an Ornith generation into `(reasoning, content)` on the first `</think>`.
 /// The generation prompt prefills `<think>` (or an empty think block), so the model's
 /// output is `REASONING</think>\n\nCONTENT` (thinking on) or just `CONTENT` (off). The
@@ -10368,6 +10438,15 @@ async fn runnable_chat_nonstreaming(
         if !tools.is_empty() {
             return lfm2_runnable_lane_tools_rejection();
         }
+        // Keyed on the FILE's template, not the arch string alone: the
+        // open-`<think>` generation prompt below is an LFM2.5 fact, evidenced by
+        // that row's template fixture. Another `lfm2` GGUF — an LFM2 v1 row, or a
+        // requant whose template was substituted — would be handed a `<think>` it
+        // may never have been trained on. Refuse instead, same contract as
+        // `reject_windowed_arch_with_unrecognized_template`.
+        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
+            return rejection;
+        }
         render_lfm2_chatml_prompt(&messages)
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
@@ -10428,7 +10507,11 @@ async fn runnable_chat_nonstreaming(
         }
     };
 
-    let (reasoning, content) = split_ornith_think(&text);
+    // Prefer the token-level split: on lfm2 `</think>` is a control token that
+    // detokenization strips, so the text search below can never find it and the
+    // whole think block would land in `content`.
+    let (reasoning, content) =
+        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text));
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
@@ -10436,11 +10519,18 @@ async fn runnable_chat_nonstreaming(
     // lifts envelopes with no tools in the request, but a `tool_choice:"none"`
     // response must never carry tool_calls (OpenAI semantics), even if the
     // model mimics envelope syntax from its conversation history.
-    let tool_calls = if tool_choice_allows_calls(req.tool_choice.as_ref()) {
-        parse_ornith_tool_calls_json(&content)
-    } else {
-        Vec::new()
-    };
+    // Also arch-gated: the envelope being lifted is Ornith's `<function=…>` XML,
+    // and lfm2 refuses tools outright (its own dialect is
+    // `<|tool_call_start|>[fn(a='v')]<|tool_call_end|>`, which no certified parser
+    // covers). Without this a request that was REFUSED a tools array could still
+    // come back with `finish_reason: "tool_calls"` if the model echoed Ornith
+    // syntax from its history.
+    let tool_calls =
+        if runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref()) {
+            parse_ornith_tool_calls_json(&content)
+        } else {
+            Vec::new()
+        };
     let finish_reason = if tool_calls.is_empty() {
         "stop"
     } else {
@@ -10509,6 +10599,15 @@ async fn runnable_chat_streaming(
         if !tools.is_empty() {
             return lfm2_runnable_lane_tools_rejection();
         }
+        // Keyed on the FILE's template, not the arch string alone: the
+        // open-`<think>` generation prompt below is an LFM2.5 fact, evidenced by
+        // that row's template fixture. Another `lfm2` GGUF — an LFM2 v1 row, or a
+        // requant whose template was substituted — would be handed a `<think>` it
+        // may never have been trained on. Refuse instead, same contract as
+        // `reject_windowed_arch_with_unrecognized_template`.
+        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
+            return rejection;
+        }
         render_lfm2_chatml_prompt(&messages)
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
@@ -10532,8 +10631,11 @@ async fn runnable_chat_streaming(
     // `tool_choice:"none"` the content has already streamed as plain deltas
     // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
     // duplicate the streamed text as a structured tool_calls delta.
-    let lift_tool_calls = tool_choice_allows_calls(req.tool_choice.as_ref());
+    // Arch-gated for the same reason as the non-streaming path above.
+    let lift_tool_calls =
+        runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
+    let opens_think_unconditionally = runtime.architecture == "lfm2";
     let created = unix_secs();
 
     enum StreamItem {
@@ -10600,7 +10702,14 @@ async fn runnable_chat_streaming(
         // Per-phase incremental decode state. `emitted` counts bytes of the phase's
         // decoded string already sent; `seen_visible` gates the leading-whitespace
         // trim (mirroring split_ornith_think's trim of the reasoning/content edges).
-        let mut in_think = enable_thinking && think_close.is_some();
+        // lfm2 thinks UNCONDITIONALLY: `render_lfm2_chatml_prompt` always ends the
+        // prompt with an OPEN `<think>`, unlike Ornith/Qwen3 where the block is
+        // opt-in. Without this the streamed turn opens in the CONTENT phase and
+        // emits the whole think block as `content` deltas, while the same turn
+        // non-streamed reports it as `reasoning_content` — the two lanes
+        // disagreeing about one request.
+        let mut in_think =
+            (enable_thinking || opens_think_unconditionally) && think_close.is_some();
         let mut phase_ids: Vec<u32> = Vec::new();
         let mut emitted = 0usize;
         let mut seen_visible = false;
@@ -19096,6 +19205,52 @@ fn gemma_runnable_lane_tools_rejection() -> Response {
 /// into structured `tool_calls`. Rendering the qwen35 `<function=…>` format
 /// instead would put a foreign convention in front of these weights, so the
 /// lane fails closed until an LFM2 tool row is actually certified.
+/// The LFM2.5 ChatML dialect [`render_lfm2_chatml_prompt`] is fixture-locked to.
+/// Keyed on markers no other admitted ChatML template carries — LFM2's tool-call
+/// delimiters and its `preserve_thinking` switch — because a check on
+/// `<|im_start|>`/`<|im_end|>` alone would match every ChatML family.
+fn is_lfm2_chatml_template(template: &str) -> bool {
+    template.contains("<|im_start|>")
+        && template.contains("<|im_end|>")
+        && template.contains("<|tool_call_start|>")
+        && template.contains("preserve_thinking")
+}
+
+/// Refuse an `lfm2` model whose embedded chat template is not the LFM2.5 dialect.
+///
+/// [`render_lfm2_chatml_prompt`] hard-codes an OPEN `<think>` generation prompt and
+/// the `keep_thinking` stripping rule. Both are LFM2.5 facts, evidenced only by
+/// that row's template fixture. Another `lfm2` GGUF would be rendered against them
+/// silently, under an architecture Camelid claims to implement — so name the
+/// missing markers and fail closed, mirroring
+/// [`reject_windowed_arch_with_unrecognized_template`].
+fn reject_lfm2_with_unrecognized_template(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+) -> Option<Response> {
+    if runtime
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_lfm2_chatml_template)
+    {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'lfm2', whose only evidenced chat \
+             rendering is the LFM2.5 ChatML dialect (markers <|im_start|>, <|im_end|>, \
+             <|tool_call_start|>, and a preserve_thinking switch), but its embedded \
+             tokenizer.chat_template does not carry those markers. The renderer would \
+             otherwise append LFM2.5's open <think> generation prompt, which this model may \
+             never have been trained on, so chat fails closed."
+        ),
+        Some("messages"),
+    ))
+}
+
 fn lfm2_runnable_lane_tools_rejection() -> Response {
     api_error(
         StatusCode::UNPROCESSABLE_ENTITY,
