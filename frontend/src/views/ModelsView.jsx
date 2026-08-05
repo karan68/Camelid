@@ -74,6 +74,10 @@ export default function ModelsView({
     () => spine.local?.models.find((m) => m.filename === spine.activeFilename) || null,
     [spine.local, spine.activeFilename],
   )
+  const ghostMoePreparedFilenames = useMemo(
+    () => new Set((spine.local?.models || []).filter((model) => model.ghost_moe_prepared).map((model) => model.filename)),
+    [spine.local],
+  )
   const experimentalRows = laneBuckets
     ? [...laneBuckets.compatible, ...laneBuckets.eligible, ...laneBuckets.not_anchored]
     : []
@@ -457,6 +461,7 @@ export default function ModelsView({
         apiBase={catalogApiBase || apiBase}
         capabilities={capabilities}
         localFilenames={spine.localFilenames}
+        ghostMoePreparedFilenames={ghostMoePreparedFilenames}
         downloads={spine.downloads}
         installAvailable={runtimeOnline && catalogInstallAvailable}
         installBlockedReason={
@@ -531,7 +536,7 @@ export default function ModelsView({
         open={Boolean(pendingDeleteEntry)}
         title="Delete model from disk?"
         detail={pendingDeleteEntry
-          ? `${pendingDeleteEntry.filename} (${prettySize(pendingDeleteEntry.size_bytes)}; ${pendingDeleteEntry.size_bytes.toLocaleString()} bytes) will be permanently removed. This cannot be undone.`
+          ? `${pendingDeleteEntry.filename} (${prettySize(pendingDeleteEntry.size_bytes)}; ${pendingDeleteEntry.size_bytes.toLocaleString()} bytes)${pendingDeleteEntry.ghost_moe_prepared ? ' and its Ghost MoE expert pack' : ''} will be permanently removed. This cannot be undone.`
           : ''}
         confirmLabel="Delete from disk"
         busy={Boolean(deletingFilename)}

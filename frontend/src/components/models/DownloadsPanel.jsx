@@ -12,7 +12,7 @@ function pct(dl) {
 }
 
 export function DownloadsPanel({ downloads = [], onCancel, cancelingIds = new Set() }) {
-  const active = downloads.filter((d) => d.status === 'downloading')
+  const active = downloads.filter((d) => d.status === 'downloading' || d.status === 'preparing')
   if (!active.length) return null
 
   return (
@@ -25,34 +25,44 @@ export function DownloadsPanel({ downloads = [], onCancel, cancelingIds = new Se
       </header>
       <div className="lane-section-body">
         {active.map((dl) => (
-          <article key={dl.id} className="lane-row downloads-row" aria-label={`Downloading ${dl.filename}`}>
+          <article
+            key={dl.id}
+            className="lane-row downloads-row"
+            aria-label={`${dl.status === 'preparing' ? 'Preparing Ghost MoE for' : 'Downloading'} ${dl.filename}`}
+          >
             <div className="lane-row-head">
               <div className="lane-row-id">
                 <span className="lane-row-name">{dl.filename}</span>
                 <span className="lane-row-meta">
-                  {dl.current_artifact_role === 'vision_projector' ? 'Vision projector' : 'Model'}
-                  {dl.artifact_count > 1 ? ` ${dl.artifact_index} of ${dl.artifact_count}` : ''} ·{' '}
-                  {formatBytes(dl.bytes_downloaded)} / {dl.total_bytes ? formatBytes(dl.total_bytes) : 'size unknown'}
-                  {dl.total_bytes ? ` · ${pct(dl)}%` : ''}
+                  {dl.status === 'preparing' ? (
+                    <>Preparing Ghost MoE · repacking experts and reclaiming the full GGUF</>
+                  ) : (
+                    <>
+                      {dl.current_artifact_role === 'vision_projector' ? 'Vision projector' : 'Model'}
+                      {dl.artifact_count > 1 ? ` ${dl.artifact_index} of ${dl.artifact_count}` : ''} ·{' '}
+                      {formatBytes(dl.bytes_downloaded)} / {dl.total_bytes ? formatBytes(dl.total_bytes) : 'size unknown'}
+                      {dl.total_bytes ? ` · ${pct(dl)}%` : ''}
+                    </>
+                  )}
                 </span>
               </div>
               <button
                 type="button"
                 className="lane-row-action downloads-cancel"
                 onClick={() => onCancel(dl.id)}
-                disabled={cancelingIds.has(dl.id)}
+                disabled={cancelingIds.has(dl.id) || dl.status === 'preparing'}
               >
-                {cancelingIds.has(dl.id) ? 'Canceling…' : 'Cancel'}
+                {dl.status === 'preparing' ? 'Finalizing…' : cancelingIds.has(dl.id) ? 'Canceling…' : 'Cancel'}
               </button>
             </div>
             <div
               className="downloads-progress"
               role="progressbar"
-              aria-valuenow={pct(dl)}
+              aria-valuenow={dl.status === 'preparing' ? 100 : pct(dl)}
               aria-valuemin={0}
               aria-valuemax={100}
             >
-              <span style={{ width: `${pct(dl)}%` }} />
+              <span style={{ width: `${dl.status === 'preparing' ? 100 : pct(dl)}%` }} />
             </div>
           </article>
         ))}

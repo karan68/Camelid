@@ -8,7 +8,7 @@ const gemma426bRow = {
   family: 'gemma4_a4b_moe_decoder',
   quantization: 'Q4_0',
   status: 'supported_exact_row_smoke',
-  support_scope: 'exact_row_distributed_serve_smoke_only',
+  support_scope: 'exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only',
   evidence: 'distributed serve receipt',
 }
 
@@ -60,6 +60,33 @@ for (const gemma4_serve_lane of ['ghost_moe', 'local', 'cuda', undefined, 'futur
   assert.match(gate.copy, /experimental/i)
 }
 
+const catalogCudaGhostRuntime = {
+  ...baseRuntime,
+  gemma4_serve_lane: 'ghost_moe',
+  gemma4_ghost_catalog_managed: true,
+  gemma4_ghost_backend: 'cuda',
+  gemma4_ghost_common_gpu_active: true,
+  gemma4_ghost_experts_gpu_active: true,
+  gemma4_ghost_head_gpu_active: true,
+}
+const catalogCudaGhost = getChatGateState(capabilities, model26b, catalogCudaGhostRuntime)
+assert.equal(catalogCudaGhost.contractSupported, true, 'the validated catalog Windows CUDA Ghost lane is supported')
+assert.equal(catalogCudaGhost.chatUnlocked, true)
+assert.equal(catalogCudaGhost.experimentalUnlocked, false)
+assert.equal(catalogCudaGhost.chatMode, 'supported')
+
+for (const patch of [
+  { gemma4_ghost_catalog_managed: false },
+  { gemma4_ghost_backend: 'metal' },
+  { gemma4_ghost_common_gpu_active: false },
+  { gemma4_ghost_experts_gpu_active: false },
+  { gemma4_ghost_head_gpu_active: false },
+]) {
+  const gate = getChatGateState(capabilities, model26b, { ...catalogCudaGhostRuntime, ...patch })
+  assert.equal(gate.contractSupported, false, `partial/ad-hoc Ghost health must fail closed: ${JSON.stringify(patch)}`)
+  assert.equal(gate.chatMode, 'experimental')
+}
+
 const distributed = getChatGateState(
   capabilities,
   model26b,
@@ -101,6 +128,16 @@ assert.match(
   dashboardSource,
   /gemma4_serve_lane:\s*optionalString\(health\?\.gemma4_serve_lane\)/,
   'health lane must survive the dashboard projection used by every chat gate',
+)
+
+const executionPlanSource = readFileSync(
+  new URL('../src/lib/executionPlan.js', import.meta.url),
+  'utf8',
+)
+assert.match(
+  executionPlanSource,
+  /gemma4_ghost_catalog_managed:\s*optionalBoolean\(health\?\.gemma4_ghost_catalog_managed\)/,
+  'catalog-managed Ghost truth must survive the health projection used by chat gating',
 )
 
 console.log('ghost-moe chat gate smoke: ok')

@@ -161,6 +161,94 @@ copy and ~600 MB of anonymous memory.
 duplicate memory pressure on a 16 GiB unified-memory machine, but should be benchmarked on the
 target system because it gives up OS cache reuse.
 
+### Windows CUDA serve lane
+
+On Windows, the same sparse-shadow and `.cghost` pair can serve through the Gemma 4 CUDA runtime.
+The common core and KV cache remain resident on the GPU. Selected Q4_0 routed experts are read from
+`.cghost` on a cache miss and promoted into a bounded VRAM expert cache; the Q6_K tied head uses the
+existing CUDA head kernel. The router still determines the same expert order before any records are
+loaded. This lane is experimental until a Windows parity and memory receipt is committed.
+
+```powershell
+$env:CAMELID_GEMMA4_GHOST_CUDA = '1'
+$env:CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS = '1000'
+$env:CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB = '160'
+
+.\camelid.exe serve --gpu on `
+  --model models\gemma-4-26B_q4_0-it.gguf `
+  --cghost models\gemma-4-26B_q4_0-it.cghost `
+  --expert-cache-mib 1024
+```
+
+The Windows default remains the parity-checked CPU/storage lane. Set
+`CAMELID_GEMMA4_GHOST_CUDA=1` to opt into the experimental CUDA route; it is not a support or
+token-parity claim. `CAMELID_GEMMA4_GHOST_CUDA_CACHE=0` disables persistent expert residency.
+`CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS` caps resident routed experts, while
+`CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB` preserves VRAM for routed scratch and driver/WDDM overhead.
+Camelid also clamps the requested capacity to current free VRAM and falls back to CPU/storage if a
+single routed expert cannot fit after the reserve. The runtime GPU switch can force an already
+loaded lane back to CPU generation and truthful CPU health without a model reload. Starting with
+`--gpu off` or `--deterministic` prevents CUDA admission in the first place.
+
+The hot-shadow repacker marks its Windows destination sparse and deallocates routed-expert ranges
+with NTFS zero-data control calls. The runtime queries the destination volume's sector size for
+unbuffered reads instead of assuming 4 KiB sectors. Keep both artifacts on local NTFS storage;
+copying a sparse shadow through a tool or filesystem that expands holes can restore its full logical
+disk usage without changing model correctness.
+
+In normal buffered CUDA mode, Camelid maps the immutable `.cghost` payload read-only and uploads
+validated routed-expert ranges directly into fixed GPU cache arenas. This avoids allocating and
+copying an intermediate expert record on every cache miss. `--ghost-strict-cache` deliberately
+disables that mapping and retains the bounded positioned/unbuffered reader path.
+
+The Windows CUDA hot path batches routed hits while a dedicated copy stream fills miss slots.
+An eight-slot page-locked host ring pipelines one complete top-8 route without pinning the 12 GiB
+expert payload. Q4_0 nibble bias is removed with packed byte subtraction and the exact integer dot
+uses DP4A; the existing ordered f32 block fold is unchanged. Routed GeGLU and Q8_0 quantization are
+fused, and one router-order kernel replaces eight weighted-accumulate launches. These optimizations
+are on by default for the experimental CUDA lane. Set
+`CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS=0` for the serial diagnostic path or
+`CAMELID_GEMMA4_CUDA_PINNED_EXPERTS=0` to bypass the page-locked transfer ring.
+
+Between the VRAM cache and storage sits a page-locked **host expert tier**: a cacheable pinned
+arena of whole `.cghost` records, auto-sized from available host RAM minus a reserve
+(`CAMELID_GEMMA4_GHOST_HOST_TIER_MIB` overrides it explicitly, `0` disables;
+`CAMELID_GEMMA4_GHOST_HOST_TIER_RESERVE_MIB` adjusts the default 3 GiB reserve). Auto-sizing
+refuses to build a tier smaller than a quarter of the routed payload: the tier only sees the
+VRAM cache's miss tail, and a small arena measured 0% hits on that stream while pinning RAM
+away from the OS page cache that was otherwise absorbing the reads — strictly worse than no
+tier. The explicit override still forces any size for measurement. A VRAM miss that
+the tier holds costs one async DMA straight from pinned memory — the CPU never touches the bytes —
+instead of a storage read. This matters because the tracked machine's NVMe delivers a flat
+1.3–1.9 GB/s regardless of read queue depth, so no amount of read parallelism can serve the
+~800 MB/token routed working set from disk. `CAMELID_GEMMA4_GHOST_TIER_PREFILL=1` optionally
+fills the tier at load with a uniform per-layer stripe of records (mostly sequential reads).
+On the tracked 16 GiB machine this measured neutral-to-negative — the prefill read evicts the OS
+page cache's copy of the same payload, giving back what the extra tier hits gain — so it is off
+by default; it is expected to pay off only when the tier can hold the entire routed payload.
+`CAMELID_GEMMA4_GHOST_CUDA_CONTEXT` bounds the KV window (default 4096). Sliding-layer KV caches
+are rings of window+1 positions (a sliding layer can never attend further back than its 1024-token
+window, so older slots are reclaimed in place), which means only the 5 global layers scale with
+context: the 26B row's KV costs ~20 MiB per 1024 positions on top of a ~200 MiB sliding-ring
+floor, where it used to cost ~220 MiB per 1024 positions across all 30 layers. Every ~3.2 MiB
+returned admits one more resident routed expert, so short-session deployments can still trade
+context for hit rate — but full 4096-position context no longer forfeits the bulk of the cache.
+
+Throughput on the tracked RTX 3060 Laptop 6 GiB (i7-11800H, 16 GiB RAM) is dominated by how much
+of the 12.0 GiB routed payload is resident somewhere, which makes it strongly dependent on free
+host RAM at load. With ~8–9.5 GiB of host RAM free, a 7.1 GiB pinned tier, the 160 MiB reserve,
+and the KV window at 1024 (1013-expert VRAM cache), a 128-token greedy run sustained 11.99 decode
+tokens/second over its second half; a 256-token run sustained 10.06 (longer sessions route to more
+distinct experts, so the storage tail grows). The same binary with the tier disabled sustained
+8.50 under the same conditions, and only ~4.3 when background applications held most of the
+machine's RAM. The greedy token stream was byte-identical with the tier on and off (96/96), and
+the standalone Q4_0 CUDA oracle remained bit-identical on 96/96 rows. With routing artificially
+concentrated so the VRAM cache hit 95.9% — expert transfers essentially removed — the lane
+measured 19.5–20.6 tokens/second, which bounds what any residency improvement alone can reach on
+this machine. A 64 MiB reserve slowed sustained decode under WDDM memory pressure, so the 160 MiB
+reserve remains the recommended setting. These are exact-machine measurements, not a general
+throughput claim.
+
 The 1 GiB default can retain a little more than one token's 240-expert routed working set on the
 tracked Q4_0 row. `--expert-cache-mib 0` retains no routed expert after the current use and gives
 the smallest application-owned footprint; smaller budgets may cyclically evict every expert

@@ -12,6 +12,7 @@ import {
   fitIsRecheckable,
   fitIsSettled,
   fitLabel,
+  ghostMoeFits,
   groupHfFilesByRepo,
   isPositiveFit,
   isRefusingFit,
@@ -250,6 +251,31 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
   const { runnable, blocked } = partitionCuratedByFit(curated)
   assert.deepEqual(runnable.map((i) => i.catalog_id), ['a', 'd'], 'unprobed hosts keep their catalog')
   assert.deepEqual(blocked.map((i) => i.catalog_id), ['b', 'c'])
+
+  const ghostAlternative = {
+    catalog_id: 'ghost',
+    fit: 'wont_fit',
+    ghost_moe: { available: true, host_eligible: true, fit: 'fits_resident' },
+  }
+  assert.equal(ghostMoeFits(ghostAlternative), true)
+  assert.equal(
+    ghostMoeFits({
+      ...ghostAlternative,
+      ghost_moe: { ...ghostAlternative.ghost_moe, fit: 'insufficient_free_memory' },
+    }),
+    true,
+    'a Ghost common set that fits after the current model is released remains selectable',
+  )
+  assert.deepEqual(
+    partitionCuratedByFit([...curated, ghostAlternative]).runnable.map((i) => i.catalog_id),
+    ['a', 'd', 'ghost'],
+    'a verified Ghost resident set keeps an otherwise-too-large curated model visible as runnable',
+  )
+  assert.equal(
+    ghostMoeFits({ ...ghostAlternative, ghost_moe: { ...ghostAlternative.ghost_moe, host_eligible: false } }),
+    false,
+    'the alternate lane never bypasses its hardware check',
+  )
 }
 
 console.log('catalog browse smoke: ok')

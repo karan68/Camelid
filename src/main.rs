@@ -1254,6 +1254,12 @@ enum Command {
     #[cfg(feature = "cuda")]
     Gemma4CudaGenerate {
         path: PathBuf,
+        /// Optional sparse routed-expert payload paired with a Ghost-MoE shadow GGUF.
+        #[arg(long)]
+        cghost: Option<PathBuf>,
+        /// Host expert-cache budget (mapped CUDA reads bypass this on the normal path).
+        #[arg(long, default_value_t = 64)]
+        expert_cache_mib: usize,
         #[arg(long, default_value = "The capital of France is")]
         prompt: String,
         #[arg(long, default_value_t = 24)]
@@ -2673,12 +2679,23 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "cuda")]
         Command::Gemma4CudaGenerate {
             path,
+            cghost,
+            expert_cache_mib,
             prompt,
             max_tokens,
         } => {
             eprintln!("[gemma4-cuda] loading resident {}...", path.display());
             let t0 = std::time::Instant::now();
-            let mut runtime = camelid::gemma4_runtime::Gemma4CudaResident::load(&path, 4096)?;
+            let mut runtime = match cghost.as_deref() {
+                Some(cghost) => camelid::gemma4_runtime::Gemma4CudaResident::load_ghost_moe(
+                    &path,
+                    cghost,
+                    expert_cache_mib,
+                    false,
+                    4096,
+                )?,
+                None => camelid::gemma4_runtime::Gemma4CudaResident::load(&path, 4096)?,
+            };
             eprintln!(
                 "[gemma4-cuda] resident loaded in {:.1}s; generating {max_tokens} tokens...",
                 t0.elapsed().as_secs_f32()
@@ -6555,6 +6572,8 @@ fn apply_deterministic_mode() {
         "CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST",
         "CAMELID_GEMMA4_GHOST_METAL_COMMON",
         "CAMELID_GEMMA4_GHOST_METAL",
+        "CAMELID_GEMMA4_GHOST_CUDA",
+        "CAMELID_GEMMA4_GHOST_CUDA_CACHE",
     ] {
         std::env::set_var(key, "0");
     }

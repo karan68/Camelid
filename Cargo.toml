@@ -93,6 +93,9 @@ windows-sys = { version = "0.59", features = [
     # (GATE 0 struck W7: OSC 52 writes are honoured on supported hosts).
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    # Sparse Ghost hot shadows and unbuffered-storage geometry.
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
 ] }
 # Windows: CUDA is part of the DEFAULT build (the primary dev host is a CUDA box).
 # cudarc is non-optional here and `build.rs` turns on the `cuda` cfg, so a bare

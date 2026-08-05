@@ -174,6 +174,15 @@ fn detect_simd() -> SimdCaps {
     }
 }
 
+/// Crate-visible `(total, available)` physical RAM. Same best-effort probe the
+/// capability report uses; `(0, 0)` means "unknown" and callers must not size a
+/// buffer from it. The Ghost-MoE CUDA host expert tier reads this to bound the
+/// arena it is allowed to claim.
+#[cfg(feature = "cuda")]
+pub(crate) fn host_ram_total_available_bytes() -> (u64, u64) {
+    host_ram_bytes()
+}
+
 /// (total, available) physical RAM in bytes. Per-OS, best-effort; returns (0, 0)
 /// on platforms without a probe so callers treat it as "unknown".
 #[cfg(windows)]

@@ -165,12 +165,12 @@ export const SUPPORTED_MODELS = [
   },
   {
     catalog_id: 'gemma4_26b_a4b_it_q4_0',
-    name: 'Gemma 4 26B-A4B-It QAT (distributed, MoE)',
+    name: 'Gemma 4 26B-A4B-It QAT (Ghost MoE)',
     repo_id: 'google/gemma-4-26B-A4B-it-qat-q4_0-gguf',
     filename: 'gemma-4-26B_q4_0-it.gguf',
     size_bytes: 14439361440,
     quant: 'Q4_0',
-    blurb: 'A large mixture-of-experts Gemma — strongest reasoning and quality.',
+    blurb: 'A large mixture-of-experts Gemma, supported on Windows CUDA with the storage-backed Ghost MoE option.',
   },
   {
     /* The one Ornith artifact that is HF-pristine; its supported Q4_K_M/Q3_K_M

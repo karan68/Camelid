@@ -5019,6 +5019,116 @@ fn q2k_gemv_matches_oracle() {
     );
 }
 
+// Bit-parity receipt for the ROUTED Q2_K expert GEMV against the dense kernel it
+// was ported from. Builds a multi-slot arena of synthetic Q2_K expert slabs, runs
+// q2k_gemv_routed once over a shuffled route (slot_ids out of order, route_ids a
+// permutation), and asserts every expert's output block is BIT-IDENTICAL to a
+// dense q2k_gemv launch over that expert's slab. This scopes the certificate to
+// what the routed port added — arena addressing, slot/route indirection, output
+// placement — on top of the dense kernel's own oracle receipt above.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q2k_gemv_routed_matches_dense() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 64usize;
+    let n_sb = 11usize; // the 26B gate_up geometry: hidden 2816 = 11*256
+    let kdim = n_sb * 256;
+    let slots = 6usize;
+    let route_count = 4usize;
+    let mut rng = Lcg(0x2b_2b_2c);
+
+    const WIRE: usize = 84;
+    let stride = rows * n_sb * WIRE;
+    let mut arena = vec![0u8; slots * stride];
+    for slot in 0..slots {
+        let wire = synth_q2k_wire(rows, n_sb, &mut rng);
+        arena[slot * stride..(slot + 1) * stride].copy_from_slice(&wire);
+    }
+
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let q8k = crate::inference::quantize_q8_k_blocks(&act);
+    let in_scales: Vec<f32> = q8k.iter().map(|b| b.d).collect();
+    let mut in_quants = vec![0i8; kdim];
+    for (b, blk) in q8k.iter().enumerate() {
+        in_quants[b * 256..(b + 1) * 256].copy_from_slice(&blk.qs);
+    }
+
+    // Deliberately non-identity mappings: routed expert e reads arena slot
+    // slot_ids[e] and writes output block route_ids[e].
+    let slot_ids: Vec<i32> = vec![4, 1, 5, 2];
+    let route_ids: Vec<i32> = vec![2, 0, 3, 1];
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_arena = k.stream.clone_htod(&arena).unwrap();
+    let d_slots = k.stream.clone_htod(&slot_ids).unwrap();
+    let d_routes = k.stream.clone_htod(&route_ids).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(route_count * rows).unwrap();
+
+    {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        let block = 256u32;
+        let warps = block / 32;
+        let cfg = LaunchConfig {
+            grid_dim: ((rows as u32).div_ceil(warps), route_count as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: n_sb as u32 * 256 + n_sb as u32 * 4 + warps * n_sb as u32 * 2 * 4,
+        };
+        let stride_u64 = stride as u64;
+        let rows_i = rows as i32;
+        let n_sb_i = n_sb as i32;
+        let experts_i = route_count as i32;
+        let mut b = k.stream.launch_builder(&k.q2k_gemv_routed);
+        b.arg(&d_is)
+            .arg(&d_iq)
+            .arg(&d_arena)
+            .arg(&d_slots)
+            .arg(&d_routes)
+            .arg(&stride_u64)
+            .arg(&rows_i)
+            .arg(&n_sb_i)
+            .arg(&mut d_out)
+            .arg(&experts_i);
+        unsafe { b.launch(cfg) }.unwrap();
+    }
+    let mut routed = vec![0f32; route_count * rows];
+    k.stream.memcpy_dtoh(&d_out, &mut routed).unwrap();
+
+    // Dense reference: one q2k_gemv per selected slot over the same arena bytes.
+    let mut mismatches = 0usize;
+    for e in 0..route_count {
+        let slot = slot_ids[e] as usize;
+        let route = route_ids[e] as usize;
+        let mut d_dense = k.stream.alloc_zeros::<f32>(rows).unwrap();
+        super::launch_q2k_gemv(
+            &k.stream,
+            &k.q2k_gemv,
+            &d_is,
+            &d_iq,
+            &d_arena.slice(slot * stride..(slot + 1) * stride),
+            rows,
+            n_sb,
+            &mut d_dense,
+            0,
+        )
+        .unwrap();
+        let mut dense = vec![0f32; rows];
+        k.stream.memcpy_dtoh(&d_dense, &mut dense).unwrap();
+        k.ctx.synchronize().unwrap();
+        for r in 0..rows {
+            if routed[route * rows + r].to_bits() != dense[r].to_bits() {
+                mismatches += 1;
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "q2k_gemv_routed must be bit-identical to per-slot dense q2k_gemv"
+    );
+}
+
 // Synthetic Q3_K weight wire bytes: rows*n_sb super-blocks of 110 bytes each
 // (hmask[32] + qs[64] + scales[12] + d f16). Small positive f16 super-scale keeps
 // the dequant products in a sane f32 range; hmask/qs/scales fully random.

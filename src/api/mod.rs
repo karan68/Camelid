@@ -118,6 +118,10 @@ pub struct AppState {
     /// from the generic execution plan because Ghost-MoE, local, distributed,
     /// and CUDA runtimes all share the `gemma4-runtime` API backend.
     gemma4_serve_lanes: Arc<RwLock<HashMap<String, Gemma4ServeLane>>>,
+    /// Model ids whose Ghost runtime came from the durable Models-page opt-in.
+    /// Environment-driven Ghost runs deliberately remain outside the supported
+    /// Windows CUDA contract even when their component health matches.
+    gemma4_catalog_managed_ghosts: Arc<RwLock<HashMap<String, bool>>>,
     /// Runnable-lane serve runtimes (qwen35/Ornith, gemma3), keyed by model id.
     /// Populated when a runnable-served arch is loaded (lane on by default;
     /// opt out with `CAMELID_RUNNABLE_SERVE=0`). Additive, parallel to the
@@ -212,6 +216,7 @@ impl Default for AppState {
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
             gemma4_serve_lanes: Arc::new(RwLock::new(HashMap::new())),
+            gemma4_catalog_managed_ghosts: Arc::new(RwLock::new(HashMap::new())),
             runnable_runtimes: Arc::new(RwLock::new(HashMap::new())),
             dg_runtimes: Arc::new(RwLock::new(HashMap::new())),
             embedding_runtimes: Arc::new(RwLock::new(HashMap::new())),
@@ -526,6 +531,15 @@ pub enum Gemma4ServeLane {
     Cuda,
 }
 
+/// Effective accelerator serving the single-node Ghost-MoE lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gemma4GhostBackend {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
 /// Effective accelerator shape for the active single-node Ghost-MoE runtime.
 /// Component booleans alongside this enum carry the exact common/expert/head
 /// breakdown; the string gives clients a stable high-level presentation lane.
@@ -534,6 +548,8 @@ pub enum Gemma4ServeLane {
 pub enum Gemma4GhostExecutionMode {
     FullCommonMetal,
     HybridMetal,
+    FullCommonCuda,
+    HybridCuda,
     CpuStorage,
 }
 
@@ -566,9 +582,9 @@ pub struct HealthResponse {
     /// True when the gemma4 serve path is enabled (on by default; opt-out
     /// CAMELID_GEMMA4_SERVE=0) and a gemma4 runtime is loaded for the active model.
     pub gemma4_available: bool,
-    /// Concrete Gemma 4 serving lane for the active model. This is the support
-    /// boundary the UI uses to keep single-node Ghost-MoE experimental instead
-    /// of inheriting evidence from a distributed-only compatibility row.
+    /// Concrete Gemma 4 serving lane for the active model. Together with the
+    /// Ghost marker/component health below, this keeps support scoped to the
+    /// validated distributed and catalog-managed Windows CUDA lanes.
     pub gemma4_serve_lane: Option<Gemma4ServeLane>,
     /// Effective common-core accelerator for the active single-node Ghost-MoE
     /// runtime. `Some(true)` means the exact common Metal runtime was admitted
@@ -586,6 +602,15 @@ pub struct HealthResponse {
     pub gemma4_ghost_experts_metal_active: Option<bool>,
     /// True when the no-copy Q6_K tied vocabulary head is live on Metal.
     pub gemma4_ghost_head_metal_active: Option<bool>,
+    /// Backend-neutral Ghost execution truth. New clients should prefer these
+    /// fields; the Metal-specific booleans remain for compatibility with the
+    /// first experimental WebUI contract.
+    pub gemma4_ghost_backend: Option<Gemma4GhostBackend>,
+    /// True only for a Ghost runtime activated by the durable catalog marker.
+    pub gemma4_ghost_catalog_managed: Option<bool>,
+    pub gemma4_ghost_common_gpu_active: Option<bool>,
+    pub gemma4_ghost_experts_gpu_active: Option<bool>,
+    pub gemma4_ghost_head_gpu_active: Option<bool>,
     /// Engine-queue backpressure gauge: generation jobs accepted and not yet
     /// finished (queued + running). Bounded by CAMELID_QUEUE_DEPTH; beyond the
     /// bound requests get a typed 503 (`engine_queue_full`).
@@ -2711,7 +2736,13 @@ pub async fn serve(
         eprintln!("\n  {warming_msg}");
         if tls_enabled {
             tracing::info!("skipping HTTP self-warmup because TLS is enabled");
-        } else if gemma4_ghost_moe_serve_requested() {
+        } else if startup_state
+            .gemma4_serve_lanes
+            .read()
+            .await
+            .get(&model_id)
+            .is_some_and(|lane| *lane == Gemma4ServeLane::GhostMoe)
+        {
             // A normal resident runtime benefits from paying its one-token
             // initialization cost before the UI appears. Ghost-MoE is already
             // initialized at load and a one-token chat would instead page a
@@ -3033,6 +3064,10 @@ fn active_gemma4_serve_lane(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gemma4GhostExecutionHealth {
     mode: Gemma4GhostExecutionMode,
+    backend: Gemma4GhostBackend,
+    common_gpu_active: bool,
+    experts_gpu_active: bool,
+    head_gpu_active: bool,
     common_metal_active: bool,
     experts_metal_active: bool,
     head_metal_active: bool,
@@ -3041,29 +3076,61 @@ struct Gemma4GhostExecutionHealth {
 fn gemma4_ghost_execution_health(
     lane: Option<Gemma4ServeLane>,
     runtime_present: bool,
-    constructed: crate::gemma4_runtime::Gemma4GhostMetalComponents,
+    metal: crate::gemma4_runtime::Gemma4GhostMetalComponents,
+    cuda: crate::gemma4_runtime::Gemma4GhostCudaComponents,
     gpu_enabled: bool,
     deterministic: bool,
 ) -> Option<Gemma4GhostExecutionHealth> {
     if lane != Some(Gemma4ServeLane::GhostMoe) || !runtime_present {
         return None;
     }
-    let metal_allowed = gpu_enabled && !deterministic;
-    let common_metal_active = constructed.common && metal_allowed;
-    let experts_metal_active = constructed.experts && metal_allowed;
-    let head_metal_active = constructed.head && metal_allowed;
-    let mode = if common_metal_active {
-        Gemma4GhostExecutionMode::FullCommonMetal
-    } else if experts_metal_active || head_metal_active {
-        Gemma4GhostExecutionMode::HybridMetal
+    let gpu_allowed = gpu_enabled && !deterministic;
+    let cuda_active = gpu_allowed && (cuda.common || cuda.experts || cuda.head);
+    let metal_active = gpu_allowed && (metal.common || metal.experts || metal.head);
+    let (backend, common_gpu_active, experts_gpu_active, head_gpu_active, mode) = if cuda_active {
+        let mode = if cuda.common {
+            Gemma4GhostExecutionMode::FullCommonCuda
+        } else {
+            Gemma4GhostExecutionMode::HybridCuda
+        };
+        (
+            Gemma4GhostBackend::Cuda,
+            cuda.common,
+            cuda.experts,
+            cuda.head,
+            mode,
+        )
+    } else if metal_active {
+        let mode = if metal.common {
+            Gemma4GhostExecutionMode::FullCommonMetal
+        } else {
+            Gemma4GhostExecutionMode::HybridMetal
+        };
+        (
+            Gemma4GhostBackend::Metal,
+            metal.common,
+            metal.experts,
+            metal.head,
+            mode,
+        )
     } else {
-        Gemma4GhostExecutionMode::CpuStorage
+        (
+            Gemma4GhostBackend::Cpu,
+            false,
+            false,
+            false,
+            Gemma4GhostExecutionMode::CpuStorage,
+        )
     };
     Some(Gemma4GhostExecutionHealth {
         mode,
-        common_metal_active,
-        experts_metal_active,
-        head_metal_active,
+        backend,
+        common_gpu_active,
+        experts_gpu_active,
+        head_gpu_active,
+        common_metal_active: metal_active && metal.common,
+        experts_metal_active: metal_active && metal.experts,
+        head_metal_active: metal_active && metal.head,
     })
 }
 
@@ -3116,18 +3183,35 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     } else {
         None
     };
+    let ghost_catalog_managed = if gemma4_serve_lane == Some(Gemma4ServeLane::GhostMoe) {
+        let managed = state.gemma4_catalog_managed_ghosts.read().await;
+        Some(
+            active_id_lock
+                .as_ref()
+                .and_then(|id| managed.get(id).copied())
+                .unwrap_or(false),
+        )
+    } else {
+        None
+    };
     // Ask the active runtime, rather than the generic execution plan, which
-    // exact Ghost Metal components still exist. Then apply both live dispatch
+    // exact Ghost accelerator components still exist. These snapshots never
+    // take the stateful CUDA generation lock. Then apply both live dispatch
     // gates so POST /api/runtime/gpu and deterministic mode are reflected on
     // the very next health poll without a model reload.
     let metal_constructed = gemma4_runtime
         .as_deref()
         .map(Gemma4ServeRuntime::ghost_metal_components_constructed)
         .unwrap_or_default();
+    let cuda_constructed = gemma4_runtime
+        .as_deref()
+        .map(Gemma4ServeRuntime::ghost_cuda_components_constructed)
+        .unwrap_or_default();
     let ghost_execution = gemma4_ghost_execution_health(
         gemma4_serve_lane,
         gemma4_runtime.is_some(),
         metal_constructed,
+        cuda_constructed,
         crate::cuda::gpu_accel_enabled(),
         crate::inference::deterministic_mode_enabled(),
     );
@@ -3152,6 +3236,11 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         gemma4_ghost_experts_metal_active: ghost_execution
             .map(|health| health.experts_metal_active),
         gemma4_ghost_head_metal_active: ghost_execution.map(|health| health.head_metal_active),
+        gemma4_ghost_backend: ghost_execution.map(|health| health.backend),
+        gemma4_ghost_catalog_managed: ghost_catalog_managed,
+        gemma4_ghost_common_gpu_active: ghost_execution.map(|health| health.common_gpu_active),
+        gemma4_ghost_experts_gpu_active: ghost_execution.map(|health| health.experts_gpu_active),
+        gemma4_ghost_head_gpu_active: ghost_execution.map(|health| health.head_gpu_active),
         engine_queue_depth: state.engine.depth(),
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
@@ -3260,6 +3349,11 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         gemma4_ghost_execution_mode: None,
         gemma4_ghost_experts_metal_active: None,
         gemma4_ghost_head_metal_active: None,
+        gemma4_ghost_backend: None,
+        gemma4_ghost_catalog_managed: None,
+        gemma4_ghost_common_gpu_active: None,
+        gemma4_ghost_experts_gpu_active: None,
+        gemma4_ghost_head_gpu_active: None,
         engine_queue_depth: state.engine.depth(),
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
@@ -3379,9 +3473,18 @@ mod gemma4_serve_lane_health_tests {
                 "full_common_metal",
             ),
             (Gemma4GhostExecutionMode::HybridMetal, "hybrid_metal"),
+            (Gemma4GhostExecutionMode::FullCommonCuda, "full_common_cuda"),
+            (Gemma4GhostExecutionMode::HybridCuda, "hybrid_cuda"),
             (Gemma4GhostExecutionMode::CpuStorage, "cpu_storage"),
         ] {
             assert_eq!(serde_json::to_value(mode).unwrap(), expected);
+        }
+        for (backend, expected) in [
+            (Gemma4GhostBackend::Cpu, "cpu"),
+            (Gemma4GhostBackend::Metal, "metal"),
+            (Gemma4GhostBackend::Cuda, "cuda"),
+        ] {
+            assert_eq!(serde_json::to_value(backend).unwrap(), expected);
         }
     }
 
@@ -3403,6 +3506,11 @@ mod gemma4_serve_lane_health_tests {
         );
         assert_eq!(
             value["gemma4_ghost_head_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["gemma4_ghost_backend"], serde_json::Value::Null);
+        assert_eq!(
+            value["gemma4_ghost_experts_gpu_active"],
             serde_json::Value::Null
         );
         assert_eq!(value["gemma4_available"], false);
@@ -3435,18 +3543,21 @@ mod gemma4_serve_lane_health_tests {
 
     #[test]
     fn ghost_execution_health_reports_full_hybrid_and_cpu_components() {
-        use crate::gemma4_runtime::Gemma4GhostMetalComponents as Components;
+        use crate::gemma4_runtime::{
+            Gemma4GhostCudaComponents as Cuda, Gemma4GhostMetalComponents as Metal,
+        };
         use Gemma4ServeLane::{Distributed, GhostMoe};
 
         assert_eq!(
             gemma4_ghost_execution_health(
                 Some(Distributed),
                 true,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
@@ -3456,20 +3567,32 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 false,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
             None
         );
         assert_eq!(
-            gemma4_ghost_execution_health(Some(GhostMoe), true, Components::default(), true, false,),
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Metal::default(),
+                Cuda::default(),
+                true,
+                false,
+            ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::CpuStorage,
+                backend: Gemma4GhostBackend::Cpu,
+                common_gpu_active: false,
+                experts_gpu_active: false,
+                head_gpu_active: false,
                 common_metal_active: false,
                 experts_metal_active: false,
                 head_metal_active: false,
@@ -3479,16 +3602,21 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal {
                     common: false,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::HybridMetal,
+                backend: Gemma4GhostBackend::Metal,
+                common_gpu_active: false,
+                experts_gpu_active: true,
+                head_gpu_active: true,
                 common_metal_active: false,
                 experts_metal_active: true,
                 head_metal_active: true,
@@ -3498,16 +3626,21 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: true,
                 },
+                Cuda::default(),
                 false,
                 false,
             ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::CpuStorage,
+                backend: Gemma4GhostBackend::Cpu,
+                common_gpu_active: false,
+                experts_gpu_active: false,
+                head_gpu_active: false,
                 common_metal_active: false,
                 experts_metal_active: false,
                 head_metal_active: false,
@@ -3517,16 +3650,21 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal {
                     common: true,
                     experts: true,
                     head: false,
                 },
+                Cuda::default(),
                 true,
                 false,
             ),
             Some(Gemma4GhostExecutionHealth {
                 mode: Gemma4GhostExecutionMode::FullCommonMetal,
+                backend: Gemma4GhostBackend::Metal,
+                common_gpu_active: true,
+                experts_gpu_active: true,
+                head_gpu_active: false,
                 common_metal_active: true,
                 experts_metal_active: true,
                 head_metal_active: false,
@@ -3536,7 +3674,49 @@ mod gemma4_serve_lane_health_tests {
             gemma4_ghost_execution_health(
                 Some(GhostMoe),
                 true,
-                Components {
+                Metal::default(),
+                Cuda {
+                    common: false,
+                    experts: true,
+                    head: true,
+                },
+                true,
+                false,
+            ),
+            Some(Gemma4GhostExecutionHealth {
+                mode: Gemma4GhostExecutionMode::HybridCuda,
+                backend: Gemma4GhostBackend::Cuda,
+                common_gpu_active: false,
+                experts_gpu_active: true,
+                head_gpu_active: true,
+                common_metal_active: false,
+                experts_metal_active: false,
+                head_metal_active: false,
+            })
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Metal::default(),
+                Cuda {
+                    common: true,
+                    experts: true,
+                    head: true,
+                },
+                true,
+                false,
+            )
+            .unwrap()
+            .mode,
+            Gemma4GhostExecutionMode::FullCommonCuda,
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Metal::default(),
+                Cuda {
                     common: false,
                     experts: false,
                     head: true,
@@ -3547,7 +3727,7 @@ mod gemma4_serve_lane_health_tests {
             .unwrap()
             .mode,
             Gemma4GhostExecutionMode::CpuStorage,
-            "deterministic mode disables every Metal component",
+            "deterministic mode disables every accelerator component",
         );
     }
 
@@ -3558,11 +3738,17 @@ mod gemma4_serve_lane_health_tests {
         response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::HybridMetal);
         response.gemma4_ghost_experts_metal_active = Some(true);
         response.gemma4_ghost_head_metal_active = Some(false);
+        response.gemma4_ghost_backend = Some(Gemma4GhostBackend::Metal);
+        response.gemma4_ghost_common_gpu_active = Some(false);
+        response.gemma4_ghost_experts_gpu_active = Some(true);
+        response.gemma4_ghost_head_gpu_active = Some(false);
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["gemma4_ghost_common_metal_active"], false);
         assert_eq!(value["gemma4_ghost_execution_mode"], "hybrid_metal");
         assert_eq!(value["gemma4_ghost_experts_metal_active"], true);
         assert_eq!(value["gemma4_ghost_head_metal_active"], false);
+        assert_eq!(value["gemma4_ghost_backend"], "metal");
+        assert_eq!(value["gemma4_ghost_experts_gpu_active"], true);
 
         response.gemma4_ghost_common_metal_active = Some(true);
         response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::FullCommonMetal);
@@ -4791,7 +4977,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q4_0 (QAT rows)",
                 status: "supported_named_exact_rows_only",
-                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke scoped to the two-Mac distributed serve lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
+                notes: "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either two-Mac distributed serve or the catalog-managed Windows CUDA Ghost-MoE lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization).",
             },
             SupportItem {
                 id: "TQ2_0",
@@ -5629,17 +5815,17 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 family: "gemma4_a4b_moe_decoder",
                 quantization: "Q4_0",
                 status: "supported_exact_row_smoke",
-                support_scope: "exact_row_distributed_serve_smoke_only",
+                support_scope: "exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "single-node 16GB hosts are memory-bound (13.4GB row; the supported lane is two-Mac distributed layer sharding); the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, performance/RSS gate, portability, or durable current-head refresh exists yet; full-row GPU residency is untested (QAT Q4_0/Q6_K GPU kernels not implemented)",
+                full_support_blockers: "the 13.4GB full row is not laptop-VRAM-resident and requires either two-node distributed serving or the catalog-prepared Windows CUDA Ghost-MoE lane; the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, cross-platform Ghost promotion, normalized performance/RSS gate, or durable current-head refresh exists yet",
                 metadata_parses: "validated_including_moe_expert_count_router_and_dual_ffn_norms",
                 tokenizer_works: "validated_for_gemma4_spm_with_forced_bos_workaround",
                 tensors_load: "validated_mmap_wire_backed_q4_0_experts_q6_k_head_layer_range_shards",
-                generation_runs: "distributed_two_node_api_chat_completions_and_sse_smoke",
-                parity_audited: "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node",
-                performance_measured: "two_mac_validation_decode_about_0_17_tok_s_recorded_not_a_perf_claim",
-                frontend_load_path_verified: "served_via_gemma4_runtime_flag_distributed_lane",
-                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q4_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (gemma4 serve lane on by default — opt-out CAMELID_GEMMA4_SERVE=0 — plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
+                generation_runs: "distributed_two_node_api_chat_completions_and_sse_smoke_plus_windows_cuda_ghost_moe_serve",
+                parity_audited: "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node_and_windows_cuda_ghost_dp4a_matches_cpu_oracle",
+                performance_measured: "windows_rtx_3060_laptop_256_token_ghost_decode_12_29_tok_s_sustained_14_73_tok_s_fastest_8_token_window",
+                frontend_load_path_verified: "catalog_managed_ghost_pair_auto_detected_by_models_load_plus_distributed_runtime_flag",
+                frontend_readiness_gate: "green for distributed serve, or for the exact catalog-managed Ghost pair when health reports ghost_moe with CUDA common, routed experts, and head active; CPU, Metal, and ad-hoc Ghost runs remain experimental",
                 tested_context: "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
                 chat_template_renderer: "gemma4_marker",
                 chat_template_shape_pack: "not_promoted",
@@ -5659,11 +5845,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "distributed_serve_api_smoke",
+                latest_checked_bucket: "windows_cuda_ghost_moe_256_token_decode",
                 latest_checked_result: "pass",
-                latest_checked_output: "Paris",
-                evidence: "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, dense shared-expert MLP + sparse expert branch, Q4_0 expert/dense weights + Q6_K tied head, parsed from the GGUF) runs as two-Mac distributed layer sharding (master layers 0..15 local + worker 15..30 + head on the second 16GB M4; model staged over Thunderbolt with full-file sha256 verified identical). On the committed basic_v1 pack vs the pinned plain-f32 reference (llama.cpp 5d56eff --no-repack -fa off -ctk f32 -ctv f32 -ub 1): count-primes (24 tok) and translate-de (16 tok) are full-budget token-identical, and capital-france/haiku-sea/rust-fn match a probe-verified prefix then flip at knife-edge near-ties (camelid top-2 gaps 0.138/0.203/0.419, the reference token is camelid's immediate #2 in all three). Distributed output equals single-node camelid (f32 wire). The distributed SERVE lane answers /v1/chat/completions (non-streaming and SSE) and /v1/completions end-to-end across the pair. Evidence: qa/evidence-bundles/gemma4-26b-it-q4-0-qat-distributed-parity-20260611T084039Z-head-b117d40cb7c3 and the distributed-serve smoke bundle qa/evidence-bundles/gemma4-26b-a4b-it-q4-0-distributed-serve-20260611T092520Z-head-6482254fca12. Camelid supports exact-row text-token generation + serve smoke for this row only, and only through the two-Mac distributed lane; no single-node, bounded-context, performance, portability, multimodal, or full support is implied",
-                next_step: "durable current-head refresh, bounded context buckets through the distributed lane, performance/RSS gates, and QAT GPU kernels before any wider 26B claim; single-node support is not a goal on 16GB hosts",
+                latest_checked_output: "12.29 tok/s sustained; token sequence preserved",
+                evidence: "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve. The supported single-node claim covers this row only, and only through this catalog-managed Windows CUDA Ghost lane; ad-hoc, CPU, and Metal Ghost runs remain experimental. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
+                next_step: "commit a normalized browser/API evidence bundle and bounded-context ladder for Windows Ghost-MoE, then validate the same prepared-artifact flow on additional NVIDIA memory tiers before widening the scope",
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_tq2_0",
@@ -7023,25 +7209,31 @@ fn fit_preload_guard(
     // Parse once: dimensions and the projection tensor types both live in the GGUF
     // header. The latter selects the same F16/F32 default as resident Metal.
     let parsed = crate::gguf::read_metadata(path).ok();
-    let footprint = parsed
-        .as_ref()
-        .and_then(|gguf| {
-            let dims = crate::fit_dims::dims_from_gguf(gguf)?;
-            let metal_resident = metal_resident_preload_enabled(&hw);
-            let metal_kv_dtype = crate::fit::metal_resident_kv_dtype_for_gguf(
-                gguf,
-                std::env::var("CAMELID_METAL_KV_DTYPE").ok().as_deref(),
-                std::env::var("CAMELID_METAL_KV16").ok().as_deref(),
-            );
-            Some(exact_preload_footprint(
-                size,
-                dims,
-                &hw,
-                metal_resident,
-                metal_kv_dtype,
-            ))
-        })
-        .unwrap_or_else(|| crate::fit::advisory_footprint(size));
+    let ghost_footprint = crate::ghost_install::installed_runtime_config(path)
+        .ok()
+        .flatten()
+        .map(|_| crate::ghost_install::resident_footprint());
+    let footprint = ghost_footprint.unwrap_or_else(|| {
+        parsed
+            .as_ref()
+            .and_then(|gguf| {
+                let dims = crate::fit_dims::dims_from_gguf(gguf)?;
+                let metal_resident = metal_resident_preload_enabled(&hw);
+                let metal_kv_dtype = crate::fit::metal_resident_kv_dtype_for_gguf(
+                    gguf,
+                    std::env::var("CAMELID_METAL_KV_DTYPE").ok().as_deref(),
+                    std::env::var("CAMELID_METAL_KV16").ok().as_deref(),
+                );
+                Some(exact_preload_footprint(
+                    size,
+                    dims,
+                    &hw,
+                    metal_resident,
+                    metal_kv_dtype,
+                ))
+            })
+            .unwrap_or_else(|| crate::fit::advisory_footprint(size))
+    });
     let (code, message) = fit_preload_message(&hw, &footprint, size, reclaim)?;
     Some(api_error(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -7405,10 +7597,6 @@ const GEMMA4_GHOST_CACHE_MIB_ENV: &str = "CAMELID_GEMMA4_GHOST_CACHE_MIB";
 const GEMMA4_GHOST_STRICT_CACHE_ENV: &str = "CAMELID_GEMMA4_GHOST_STRICT_CACHE";
 const DEFAULT_GEMMA4_GHOST_CACHE_MIB: usize = 1024;
 
-fn gemma4_ghost_moe_serve_requested() -> bool {
-    std::env::var_os(GEMMA4_GHOST_CGHOST_ENV).is_some()
-}
-
 fn parse_gemma4_ghost_moe_serve_config(
     cghost: Option<PathBuf>,
     cache_mib: Option<&str>,
@@ -7451,11 +7639,23 @@ fn parse_gemma4_ghost_moe_serve_config(
     Ok(Some((cghost, cache_mib, strict_cache)))
 }
 
-fn gemma4_ghost_moe_serve_config() -> std::result::Result<Option<(PathBuf, usize, bool)>, String> {
+fn gemma4_ghost_moe_serve_config(
+    model_path: &std::path::Path,
+) -> std::result::Result<Option<crate::ghost_install::GhostMoeRuntimeConfig>, String> {
     let cghost = std::env::var_os(GEMMA4_GHOST_CGHOST_ENV).map(PathBuf::from);
     let cache_mib = std::env::var(GEMMA4_GHOST_CACHE_MIB_ENV).ok();
     let strict_cache = std::env::var(GEMMA4_GHOST_STRICT_CACHE_ENV).ok();
-    parse_gemma4_ghost_moe_serve_config(cghost, cache_mib.as_deref(), strict_cache.as_deref())
+    if let Some((cghost, cache_mib, strict_cache)) =
+        parse_gemma4_ghost_moe_serve_config(cghost, cache_mib.as_deref(), strict_cache.as_deref())?
+    {
+        return Ok(Some(crate::ghost_install::GhostMoeRuntimeConfig {
+            cghost,
+            cache_mib,
+            strict_cache,
+            catalog_managed: false,
+        }));
+    }
+    crate::ghost_install::installed_runtime_config(model_path)
 }
 
 #[cfg(test)]
@@ -7519,6 +7719,22 @@ mod gemma4_ghost_moe_serve_config_tests {
 #[cfg(feature = "cuda")]
 fn gemma4_cuda_enabled() -> bool {
     crate::execution_plan::gemma4_cuda_lane_selectable()
+}
+
+/// Ghost-MoE CUDA remains an explicit experimental opt-in until the exact 26B
+/// row has a committed Windows parity receipt. The ordinary host-wide CUDA
+/// policy still has to admit the device after this narrow gate is enabled.
+#[cfg(feature = "cuda")]
+fn gemma4_ghost_cuda_enabled(catalog_managed: bool) -> bool {
+    let enabled = std::env::var("CAMELID_GEMMA4_GHOST_CUDA")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes" | "enabled"
+            )
+        });
+    (enabled || catalog_managed) && gemma4_cuda_enabled()
 }
 
 /// Per-file VRAM fit check for the gemma4 CUDA-resident lane.
@@ -8407,7 +8623,11 @@ pub enum Gemma4ServeRuntime {
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
     /// CUDA decode engine (stateful GPU runtime -> Mutex; one request at a time).
     #[cfg(feature = "cuda")]
-    Cuda(std::sync::Mutex<crate::gemma4_runtime::Gemma4CudaResident>),
+    Cuda {
+        runtime: std::sync::Mutex<crate::gemma4_runtime::Gemma4CudaResident>,
+        /// Immutable construction-time truth for lock-free health snapshots.
+        ghost_components: crate::gemma4_runtime::Gemma4GhostCudaComponents,
+    },
 }
 
 impl Gemma4ServeRuntime {
@@ -8421,7 +8641,21 @@ impl Gemma4ServeRuntime {
             Self::Local(runtime) => runtime.ghost_metal_components(),
             Self::Distributed(_) => Default::default(),
             #[cfg(feature = "cuda")]
-            Self::Cuda(_) => Default::default(),
+            Self::Cuda { .. } => Default::default(),
+        }
+    }
+
+    /// CUDA components owned by the live runtime, captured separately from the
+    /// stateful decoder so a health poll cannot block behind a generation.
+    fn ghost_cuda_components_constructed(
+        &self,
+    ) -> crate::gemma4_runtime::Gemma4GhostCudaComponents {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda {
+                ghost_components, ..
+            } => *ghost_components,
+            _ => Default::default(),
         }
     }
 
@@ -8434,7 +8668,7 @@ impl Gemma4ServeRuntime {
             Self::Local(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
             Self::Distributed(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
             #[cfg(feature = "cuda")]
-            Self::Cuda(runtime) => runtime
+            Self::Cuda { runtime, .. } => runtime
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .tokenizer()
@@ -8453,7 +8687,7 @@ impl Gemma4ServeRuntime {
             Self::Local(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             Self::Distributed(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             #[cfg(feature = "cuda")]
-            Self::Cuda(m) => m
+            Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_cancellable(prompt, max_new, should_cancel),
@@ -8475,7 +8709,7 @@ impl Gemma4ServeRuntime {
                 r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
             }
             #[cfg(feature = "cuda")]
-            Self::Cuda(m) => m
+            Self::Cuda { runtime: m, .. } => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
                 .generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel),
@@ -11124,6 +11358,7 @@ fn build_loaded_model(
 async fn clear_gemma4_serve_runtime(state: &AppState, id: &str) {
     state.gemma4_runtimes.write().await.remove(id);
     state.gemma4_serve_lanes.write().await.remove(id);
+    state.gemma4_catalog_managed_ghosts.write().await.remove(id);
 }
 
 /// Load (or reload) the gemma4 serve runtime for a model id. With
@@ -11140,7 +11375,8 @@ async fn load_gemma4_serve_runtime(
     clear_gemma4_serve_runtime(state, id).await;
     let distributed =
         gemma4_distributed_serve_config().map_err(BackendError::InvalidModelMetadata)?;
-    let ghost_moe = gemma4_ghost_moe_serve_config().map_err(BackendError::InvalidModelMetadata)?;
+    let ghost_moe =
+        gemma4_ghost_moe_serve_config(model_path).map_err(BackendError::InvalidModelMetadata)?;
     if distributed.is_some() && ghost_moe.is_some() {
         return Err(BackendError::InvalidModelMetadata(
             "Gemma 4 Ghost-MoE and distributed serve are mutually exclusive; unset either CAMELID_GEMMA4_GHOST_CGHOST or CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT"
@@ -11148,14 +11384,58 @@ async fn load_gemma4_serve_runtime(
         ));
     }
     let ghost_moe_requested = ghost_moe.is_some();
+    let catalog_managed_ghost = ghost_moe
+        .as_ref()
+        .is_some_and(|config| config.catalog_managed);
+    if catalog_managed_ghost {
+        crate::ghost_install::apply_catalog_cuda_defaults();
+    }
     let load_path = model_path.to_path_buf();
     let runtime = tokio::task::spawn_blocking(move || match (ghost_moe, distributed) {
-        (Some((cghost, cache_mib, strict_cache)), None) => {
+        (Some(ghost), None) => {
+            #[cfg(feature = "cuda")]
+            if gemma4_ghost_cuda_enabled(ghost.catalog_managed) {
+                match gemma4_cuda_fit_check(&load_path) {
+                    Ok(()) => match crate::gemma4_runtime::Gemma4CudaResident::load_ghost_moe(
+                        &load_path,
+                        &ghost.cghost,
+                        ghost.cache_mib,
+                        ghost.strict_cache,
+                        4096,
+                    ) {
+                        Ok(runtime) => {
+                            let ghost_components = runtime.ghost_cuda_components();
+                            return Ok(Gemma4ServeRuntime::Cuda {
+                                runtime: std::sync::Mutex::new(runtime),
+                                ghost_components,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "gemma4 Ghost-MoE CUDA load failed; using CPU/storage"
+                            );
+                            eprintln!(
+                                "[gemma4-ghost] CUDA load failed: {error}; using CPU/storage"
+                            );
+                        }
+                    },
+                    Err(shortfall) => {
+                        tracing::warn!(
+                            shortfall = %shortfall,
+                            "gemma4 Ghost-MoE CUDA lane declined; using CPU/storage"
+                        );
+                        eprintln!(
+                            "[gemma4-ghost] CUDA lane declined: {shortfall}; using CPU/storage"
+                        );
+                    }
+                }
+            }
             crate::gemma4_runtime::Gemma4Runtime::load_ghost_moe(
                 &load_path,
-                &cghost,
-                cache_mib,
-                strict_cache,
+                &ghost.cghost,
+                ghost.cache_mib,
+                ghost.strict_cache,
             )
             .map(Gemma4ServeRuntime::Local)
         }
@@ -11182,7 +11462,10 @@ async fn load_gemma4_serve_runtime(
                             // multi-turn headroom; overflow past it is guarded in the runtime.
                             match crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 4096) {
                                 Ok(r) => {
-                                    return Ok(Gemma4ServeRuntime::Cuda(std::sync::Mutex::new(r)))
+                                    return Ok(Gemma4ServeRuntime::Cuda {
+                                        runtime: std::sync::Mutex::new(r),
+                                        ghost_components: Default::default(),
+                                    });
                                 }
                                 // FALL BACK, do not propagate. The admission check
                                 // above is a projection, and a projection that is
@@ -11231,7 +11514,7 @@ async fn load_gemma4_serve_runtime(
             Gemma4ServeRuntime::Local(_) => Gemma4ServeLane::Local,
             Gemma4ServeRuntime::Distributed(_) => Gemma4ServeLane::Distributed,
             #[cfg(feature = "cuda")]
-            Gemma4ServeRuntime::Cuda(_) => Gemma4ServeLane::Cuda,
+            Gemma4ServeRuntime::Cuda { .. } => Gemma4ServeLane::Cuda,
         }
     };
     state
@@ -11244,6 +11527,13 @@ async fn load_gemma4_serve_runtime(
         .write()
         .await
         .insert(id.to_string(), lane);
+    if catalog_managed_ghost {
+        state
+            .gemma4_catalog_managed_ghosts
+            .write()
+            .await
+            .insert(id.to_string(), true);
+    }
     tracing::info!(model = %id, lane = ?lane, "gemma4 runtime loaded for serve path");
     Ok(())
 }
@@ -11324,6 +11614,11 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
         state.loaded_models.write().await.remove(&id);
         state.gemma4_runtimes.write().await.remove(&id);
         state.gemma4_serve_lanes.write().await.remove(&id);
+        state
+            .gemma4_catalog_managed_ghosts
+            .write()
+            .await
+            .remove(&id);
         state.runnable_runtimes.write().await.remove(&id);
         state.dg_runtimes.write().await.remove(&id);
         state.embedding_runtimes.write().await.remove(&id);
@@ -11339,6 +11634,7 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
         state.loaded_models.write().await.clear();
         state.gemma4_runtimes.write().await.clear();
         state.gemma4_serve_lanes.write().await.clear();
+        state.gemma4_catalog_managed_ghosts.write().await.clear();
         state.runnable_runtimes.write().await.clear();
         state.dg_runtimes.write().await.clear();
         state.embedding_runtimes.write().await.clear();
@@ -22331,6 +22627,11 @@ mod tests {
     #[test]
     fn cooperative_stream_job_seeds_from_the_prompt_prefix_cache() {
         let _env_guard = crate::test_support::env_lock();
+        // The GPU-resident CUDA lane truthfully BYPASSES the prompt-prefix cache
+        // (reseeding GPU KV from cached host history is not bit-identical to a
+        // fresh GPU prefill), so on a CUDA box this test must pin the CPU lane
+        // it asserts; CI runners have no GPU and are unaffected.
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
         std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
         std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
@@ -22375,6 +22676,7 @@ mod tests {
             vec![cached_next_token],
             "decode resumes from the cached token, not from the whole prompt"
         );
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
     #[test]
@@ -25282,6 +25584,11 @@ pub struct CatalogItemView {
     /// Additional GGUFs installed as one acquisition with this model. Empty for
     /// ordinary curated rows and all untrusted live-Hugging-Face results.
     pub companion_artifacts: Vec<CatalogCompanionArtifact>,
+    /// Optional model-specific low-memory acquisition/runtime lane. Kept
+    /// separate from `fit`: the ordinary verdict describes the full GGUF,
+    /// while this describes the resident common core used by Ghost-MoE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost_moe: Option<crate::ghost_install::GhostMoeCatalogSupport>,
 }
 
 /// The `general.architecture` a GGUF guessed as `token` will actually declare.
@@ -25375,6 +25682,7 @@ impl CatalogItemView {
             crate::fit_dims::global().lookup(item.repo_id, item.filename),
             hw,
         );
+        let fit = crate::fit::assess(hw, &footprint);
         CatalogItemView {
             catalog_id: item.catalog_id.to_string(),
             name: item.name.to_string(),
@@ -25389,13 +25697,14 @@ impl CatalogItemView {
             oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
             group: "curated",
             arch_detected: true,
-            fit: crate::fit::assess(hw, &footprint),
+            fit,
             task_tags: item.task_tags.iter().map(|t| t.to_string()).collect(),
             fit_confidence,
             // Deliberately no claim: see `arch_support`. The curated `architecture`
             // label uses a different vocabulary from the loader's allowlist.
             arch_support: "unknown",
             companion_artifacts: catalog_companion_artifacts(item.catalog_id),
+            ghost_moe: crate::ghost_install::catalog_support(item.catalog_id, fit, hw),
         }
     }
 
@@ -25437,6 +25746,7 @@ impl CatalogItemView {
             task_tags: Vec::new(),
             fit_confidence,
             companion_artifacts: Vec::new(),
+            ghost_moe: None,
         }
     }
 }
@@ -25704,7 +26014,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
         },
         CatalogItem {
             catalog_id: "gemma4_26b_a4b_it_q4_0",
-            name: "Gemma 4 26B-A4B-It QAT Q4_0 (two-Mac distributed, MoE)",
+            name: "Gemma 4 26B-A4B-It QAT Q4_0 (Ghost MoE)",
             repo_id: "google/gemma-4-26B-A4B-it-qat-q4_0-gguf",
             filename: "gemma-4-26B_q4_0-it.gguf",
             size_bytes: 14439361440,
@@ -25990,6 +26300,10 @@ pub struct CatalogFitResponse {
     /// verdict — so a "check this" affordance can never be retired and pressing it
     /// looks like a no-op.
     pub checked: bool,
+    /// Alternate resident-set verdict for the exact catalog-managed Ghost row,
+    /// refreshed from the same live hardware probe as the ordinary fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost_moe: Option<crate::ghost_install::GhostMoeCatalogSupport>,
 }
 
 /// One local on-disk GGUF with the facts the Models tab needs to bucket it by lane.
@@ -26026,6 +26340,9 @@ pub struct LocalModelEntry {
     pub chat_capable: bool,
     /// Trained context window (tokens) from the GGUF â€” a model capability.
     pub context_length: Option<u32>,
+    /// A validated catalog-managed marker and sibling `.cghost` are present, so
+    /// future loads automatically use the persisted Ghost-MoE choice.
+    pub ghost_moe_prepared: bool,
     /// Server-computed lane class from real header metadata (architecture) + the
     /// exact-artifact supported-row check. `experimental_implemented` means the
     /// architecture is implemented but this is NOT a supported row â€” attemptable,
@@ -27032,7 +27349,7 @@ async fn delete_local_model(
         .lock()
         .unwrap()
         .values()
-        .any(|download| download.status == "downloading")
+        .any(|download| download.status == "downloading" || download.status == "preparing")
     {
         return api_error(
             StatusCode::CONFLICT,
@@ -27083,6 +27400,7 @@ async fn delete_local_model(
     }
 
     let path = state.models_dir.join(&req.filename);
+    let ghost_model_path = path.clone();
     let filename = req.filename.clone();
     let filename_for_delete = filename.clone();
     let nonce = state.model_delete_nonce.clone();
@@ -27092,7 +27410,7 @@ async fn delete_local_model(
             .map(|bytes| (filename_for_delete, bytes))
     })
     .await;
-    let (filename, bytes_freed) = match deletion {
+    let (filename, mut bytes_freed) = match deletion {
         Ok(Ok(result)) => result,
         Ok(Err(DeleteLocalModelError::Changed)) => {
             return api_error(
@@ -27136,6 +27454,17 @@ async fn delete_local_model(
             )
         }
     };
+
+    if crate::ghost_install::is_catalog_model_path(&ghost_model_path) {
+        match crate::ghost_install::remove_prepared_sidecars(&ghost_model_path) {
+            Ok(sidecar_bytes) => bytes_freed = bytes_freed.saturating_add(sidecar_bytes),
+            Err(error) => tracing::warn!(
+                model = %filename,
+                error = %error,
+                "model GGUF was deleted but Ghost-MoE sidecar cleanup was incomplete"
+            ),
+        }
+    }
 
     local_meta_cache().lock().unwrap().remove(&filename);
     let _ = std::fs::remove_file(runnable_smoke_receipt_path(&filename));
@@ -27385,6 +27714,7 @@ async fn local_models(
                 oracle_qualified: meta.oracle_qualified,
                 chat_capable: meta.chat_capable,
                 context_length: meta.context_length,
+                ghost_moe_prepared: crate::ghost_install::is_prepared(&path),
                 lane_class,
             });
         }
@@ -27904,12 +28234,17 @@ async fn check_catalog_fit(Json(req): Json<CatalogFitRequest>) -> Response {
         // check would be worse than the silence it replaced.
         None => (crate::fit::FitVerdict::Unknown, "unknown"),
     };
+    let ghost_moe = curated_catalog()
+        .into_iter()
+        .find(|item| item.repo_id == req.repo_id && item.filename == req.filename)
+        .and_then(|item| crate::ghost_install::catalog_support(item.catalog_id, fit, &hw));
     Json(CatalogFitResponse {
         repo_id: req.repo_id,
         filename: req.filename,
         fit,
         fit_confidence,
         checked: resolution.is_settled(),
+        ghost_moe,
     })
     .into_response()
 }
@@ -27949,6 +28284,10 @@ pub struct InstallCatalogRequest {
     pub size_bytes: u64,
     #[serde(default)]
     pub continuation_mode: Option<String>,
+    /// Prepare and persist the exact row's catalog-managed Ghost-MoE pair after
+    /// the network download. Rejected for rows/hosts without that capability.
+    #[serde(default)]
+    pub ghost_moe: bool,
 }
 
 static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashMap<String, ActiveDownload>>> = OnceLock::new();
@@ -28070,6 +28409,8 @@ fn spawn_catalog_artifact_download(
         .args([
             "-f",
             "-L",
+            "--silent",
+            "--show-error",
             "-C",
             "-",
             "--connect-timeout",
@@ -28091,6 +28432,79 @@ fn spawn_catalog_artifact_download(
         ])
         .spawn()?;
     Ok((child, part_path, dest_path))
+}
+
+/// Wait for the external downloader without occupying a Tokio worker thread.
+/// Multi-gigabyte catalog pulls can run for tens of minutes; a synchronous
+/// `Child::wait` inside `tokio::spawn` eventually lets concurrent progress polls
+/// consume every async worker and makes the otherwise-live API look crashed.
+async fn wait_catalog_download(mut child: std::process::Child) -> bool {
+    tokio::task::spawn_blocking(move || matches!(child.wait(), Ok(status) if status.success()))
+        .await
+        .unwrap_or(false)
+}
+
+async fn finish_catalog_ghost_preparation(
+    catalog_id: String,
+    model_path: PathBuf,
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+) {
+    // Preparation atomically replaces the canonical GGUF with its sparse shadow.
+    // Hold the exclusive file lease so loads, scans, and deletes cannot retain or
+    // observe the old file while that swap is committed.
+    let _writer = lifecycle.write().await;
+    let result = tokio::task::spawn_blocking(move || crate::ghost_install::prepare(&model_path))
+        .await
+        .map_err(|error| format!("Ghost-MoE preparation task panicked: {error}"))
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    let mut map = active_downloads_map().lock().unwrap();
+    let Some(download) = map.get_mut(&catalog_id) else {
+        return;
+    };
+    download.child_pid = None;
+    download.finished_at = Some(std::time::Instant::now());
+    if result.is_ok() {
+        download.status = "completed";
+        download.bytes_downloaded = download.total_bytes;
+    } else {
+        if let Err(error) = result {
+            tracing::error!(catalog_id = %catalog_id, error = %error, "Ghost-MoE preparation failed");
+        }
+        download.status = "failed";
+    }
+}
+
+fn catalog_ghost_request_error(req: &InstallCatalogRequest) -> Option<(&'static str, String)> {
+    if !req.ghost_moe {
+        return None;
+    }
+    if !crate::ghost_install::is_catalog_row(&req.catalog_id) {
+        return Some((
+            "ghost_moe_not_available",
+            "this catalog row does not provide a Ghost-MoE representation".to_string(),
+        ));
+    }
+    let hw = crate::capability::HardwareProfile::detect();
+    let full_fit = crate::fit::assess(&hw, &crate::fit::advisory_footprint(req.size_bytes));
+    let support = crate::ghost_install::catalog_support(&req.catalog_id, full_fit, &hw)
+        .expect("exact Ghost catalog row");
+    if !support.host_eligible {
+        return Some((
+            "ghost_moe_hardware_unsupported",
+            "the supported Ghost-MoE lane requires a Windows CUDA GPU with compute capability 6.1 or newer"
+                .to_string(),
+        ));
+    }
+    if !crate::ghost_install::fit_allows_preparation(support.fit) {
+        return Some((
+            "ghost_moe_does_not_fit",
+            format!(
+                "the Ghost-MoE common resident set does not fit this GPU right now ({})",
+                support.fit.cli_label()
+            ),
+        ));
+    }
+    None
 }
 
 async fn install_catalog_model(
@@ -28144,10 +28558,18 @@ async fn install_catalog_model(
             )
         }
     };
+    if let Some((code, message)) = catalog_ghost_request_error(&req) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message,
+            Some("ghost_moe"),
+        );
+    }
     let mut map = active_downloads_map().lock().unwrap();
     if map
         .get(&req.catalog_id)
-        .is_some_and(|existing| existing.status != "downloading")
+        .is_some_and(|existing| existing.status != "downloading" && existing.status != "preparing")
     {
         map.remove(&req.catalog_id);
     }
@@ -28173,12 +28595,40 @@ async fn install_catalog_model(
         .into_iter()
         .filter(|artifact| !artifact_is_installed(&state.models_dir, artifact))
         .collect::<Vec<_>>();
-    if missing_artifacts.is_empty() {
+    let ghost_already_prepared =
+        req.ghost_moe && crate::ghost_install::is_prepared(&state.models_dir.join(&req.filename));
+    if missing_artifacts.is_empty() && (!req.ghost_moe || ghost_already_prepared) {
         return (
             StatusCode::OK,
             "Model and companion artifacts already installed",
         )
             .into_response();
+    }
+    if missing_artifacts.is_empty() {
+        let download = ActiveDownload {
+            id: req.catalog_id.clone(),
+            repo_id: req.repo_id.clone(),
+            filename: req.filename.clone(),
+            current_artifact_role: "ghost_moe".to_string(),
+            artifact_index: 1,
+            artifact_count: 1,
+            continuation_mode,
+            total_bytes: 0,
+            bytes_downloaded: 0,
+            status: "preparing",
+            child_pid: None,
+            finished_at: None,
+            completed_bytes: 0,
+            reserved_filenames: vec![req.filename.clone()],
+        };
+        map.insert(req.catalog_id.clone(), download);
+        let catalog_id = req.catalog_id.clone();
+        let model_path = state.models_dir.join(&req.filename);
+        let lifecycle = state.model_file_lifecycle.clone();
+        tokio::spawn(finish_catalog_ghost_preparation(
+            catalog_id, model_path, lifecycle,
+        ));
+        return (StatusCode::OK, "Ghost-MoE preparation started").into_response();
     }
     let reserved_filenames = missing_artifacts
         .iter()
@@ -28189,7 +28639,7 @@ async fn install_catalog_model(
         .map(|filename| download_destination_key(filename))
         .collect::<Vec<_>>();
     if map.values().any(|download| {
-        download.status == "downloading"
+        (download.status == "downloading" || download.status == "preparing")
             && download.reserved_filenames.iter().any(|filename| {
                 requested_destination_keys.contains(&download_destination_key(filename))
             })
@@ -28233,7 +28683,7 @@ async fn install_catalog_model(
                 filename: first.filename.clone(),
                 current_artifact_role: first.role.to_string(),
                 artifact_index: 1,
-                artifact_count: missing_artifacts.len(),
+                artifact_count: missing_artifacts.len() + usize::from(req.ghost_moe),
                 continuation_mode,
                 total_bytes,
                 bytes_downloaded: 0,
@@ -28246,12 +28696,14 @@ async fn install_catalog_model(
             map.insert(req.catalog_id.clone(), download);
 
             let catalog_id_clone = req.catalog_id.clone();
+            let ghost_moe_requested = req.ghost_moe;
+            let ghost_model_filename = req.filename.clone();
             let lifecycle = state.model_file_lifecycle.clone();
             let models_dir = state.models_dir.clone();
             tokio::spawn(async move {
                 let mut first_child = Some((child, first_part_path, first_dest_path));
                 for (index, artifact) in missing_artifacts.iter().enumerate() {
-                    let (mut child, part_path, dest_path) = if index == 0 {
+                    let (child, part_path, dest_path) = if index == 0 {
                         first_child.take().expect("first catalog download child")
                     } else {
                         let spawned = match spawn_catalog_artifact_download(
@@ -28289,7 +28741,7 @@ async fn install_catalog_model(
                         spawned
                     };
 
-                    let succeeded = matches!(child.wait(), Ok(status) if status.success());
+                    let succeeded = wait_catalog_download(child).await;
                     // Completion is the curl exit code plus atomic `.part` promotion.
                     // A cancel removes the map entry before this decision, so an
                     // untracked child can never make a partial GGUF loadable.
@@ -28318,11 +28770,31 @@ async fn install_catalog_model(
                         .saturating_add(artifact.size_bytes)
                         .min(dl.total_bytes);
                     dl.bytes_downloaded = dl.completed_bytes;
-                    if index + 1 == missing_artifacts.len() {
+                    if index + 1 == missing_artifacts.len() && !ghost_moe_requested {
                         dl.status = "completed";
                         dl.bytes_downloaded = dl.total_bytes;
                         dl.finished_at = Some(std::time::Instant::now());
                     }
+                }
+                if ghost_moe_requested {
+                    {
+                        let mut map = active_downloads_map().lock().unwrap();
+                        let Some(dl) = map.get_mut(&catalog_id_clone) else {
+                            return;
+                        };
+                        dl.current_artifact_role = "ghost_moe".to_string();
+                        dl.filename = ghost_model_filename.clone();
+                        dl.artifact_index = dl.artifact_count;
+                        dl.status = "preparing";
+                        dl.child_pid = None;
+                        dl.bytes_downloaded = dl.total_bytes;
+                    }
+                    finish_catalog_ghost_preparation(
+                        catalog_id_clone,
+                        models_dir.join(ghost_model_filename),
+                        lifecycle,
+                    )
+                    .await;
                 }
             });
 
@@ -28347,6 +28819,10 @@ async fn get_catalog_downloads(State(state): State<AppState>) -> Json<Vec<Active
             {
                 to_remove.push(id.clone());
             }
+            continue;
+        }
+
+        if dl.status == "preparing" {
             continue;
         }
 
@@ -28500,6 +28976,18 @@ pub struct CancelDownloadRequest {
 
 async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Response {
     let mut map = active_downloads_map().lock().unwrap();
+    if map
+        .get(&req.id)
+        .is_some_and(|download| download.status == "preparing")
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "ghost_moe_preparation_in_progress",
+            "Ghost-MoE preparation is finalizing local artifacts and cannot be canceled safely"
+                .to_string(),
+            Some("id"),
+        );
+    }
     if map
         .get(&req.id)
         .is_some_and(|download| download.status != "downloading")
@@ -29712,6 +30200,7 @@ mod catalog_companion_download_tests {
             filename: filename.to_string(),
             size_bytes,
             continuation_mode: Some("start".to_string()),
+            ghost_moe: false,
         }
     }
 
@@ -30199,5 +30688,39 @@ mod download_cancel_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_for_download_child_leaves_async_runtime_responsive() {
+        #[cfg(windows)]
+        let child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        #[cfg(not(windows))]
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        let waiter = tokio::spawn(super::wait_catalog_download(child));
+        tokio::task::yield_now().await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "waiting for a long download blocked the async runtime"
+        );
+
+        kill_download_process(pid);
+        let succeeded = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("download wait task should observe the killed child")
+            .expect("download wait task should not panic");
+        assert!(!succeeded, "a canceled child must not report success");
     }
 }

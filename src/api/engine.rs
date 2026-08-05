@@ -691,6 +691,11 @@ mod tests {
     #[tokio::test]
     async fn slot_occupancy_tracks_cooperative_and_exclusive_work() {
         let _env_guard = crate::test_support::env_lock();
+        // This test asserts the COOPERATIVE capacity contract. On a box with a
+        // usable CUDA device, `total_slots()` truthfully reports 1 (every stream
+        // runs exclusive on the GPU-resident lane), so pin the CPU lane the test
+        // was written for; CI runners have no GPU and are unaffected.
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
         std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
         let engine = EngineHandle::spawn();
         std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
@@ -790,6 +795,7 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
     /// The bounded channel is the backpressure device. A worker that drains it

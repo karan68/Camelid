@@ -249,7 +249,9 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     const tick = async () => {
       const list = await refreshDownloads()
       if (cancelled || list === null) return
-      const ids = new Set(list.filter((d) => d.status === 'downloading').map((d) => d.id))
+      const ids = new Set(
+        list.filter((d) => d.status === 'downloading' || d.status === 'preparing').map((d) => d.id),
+      )
       // Any download that left the active list (completed, failed, or canceled)
       // may have landed a file — re-scan disk so lanes update without a reload.
       const settled = [...prevDownloadIdsRef.current].some((id) => !ids.has(id))

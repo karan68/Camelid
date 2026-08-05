@@ -483,8 +483,8 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       vision_ready: Boolean(health?.vision_ready),
       q8_runtime: health?.q8_runtime || null,
       // Required for lane-scoped support truth. All Gemma 4 serve variants use
-      // backend="gemma4-runtime"; this stable discriminator keeps experimental
-      // Ghost-MoE from inheriting a distributed-only compatibility receipt.
+      // backend="gemma4-runtime"; this discriminator plus projected Ghost
+      // component/marker health identifies the supported Windows CUDA lane.
       gemma4_serve_lane: optionalString(health?.gemma4_serve_lane),
       ...executionRuntimeFields(health),
       status: health?.ok ? 'online' : 'offline',

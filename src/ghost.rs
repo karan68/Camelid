@@ -33,6 +33,7 @@ use crate::model::{
     Gemma4Binding, LlamaAttentionTensors, LlamaFfnTensors, LlamaModelConfig, LlamaTensorBinding,
 };
 use crate::tensor::{cpu_tensor_from_gguf_bytes, CpuTensor, TensorStore};
+use crate::wire_mmap::GgufWireMmap;
 
 pub const CGHOST_MAGIC: &[u8; 8] = b"CGHOST1\0";
 pub const CGHOST_ALIGN: u64 = 16 * 1024;
@@ -908,6 +909,34 @@ impl GhostMoeExpert {
     ) -> (Arc<[u8]>, std::ops::Range<usize>) {
         (Arc::clone(&self.bytes), view.offset..view.offset + view.len)
     }
+
+    /// Consumed by the CUDA lane's owned expert records; other targets read
+    /// through [`Self::tensor_backing`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> &[u8] {
+        &self.bytes[view.offset..view.offset + view.len]
+    }
+}
+
+/// A routed expert borrowed directly from the read-only `.cghost` mapping.
+/// The mapping owns the file view; tensor slices allocate and copy nothing.
+/// Consumed by the cuda expert-residency lane (and its unit tests); gated so
+/// a default-features build — macOS CI's clippy shape — carries no dead code.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Clone)]
+pub(crate) struct GhostMoeMappedExpert {
+    mmap: Arc<GgufWireMmap>,
+    record_start: u64,
+    pub gate_up: GhostMoeTensorView,
+    pub down: GhostMoeTensorView,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl GhostMoeMappedExpert {
+    pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> Result<&[u8]> {
+        self.mmap
+            .bytes(self.record_start + view.offset as u64, view.len)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -916,6 +945,19 @@ pub struct GhostMoeTensorView {
     pub dims: Vec<u64>,
     offset: usize,
     len: usize,
+}
+
+impl GhostMoeTensorView {
+    /// This tensor's byte range inside its own expert record.
+    ///
+    /// Callers that own the record's storage — the CUDA lane's page-locked host
+    /// tier reads whole records into fixed-stride slots with
+    /// [`GhostFile::read_moe_expert_into`] — need the sub-ranges without going
+    /// back through an allocating `GhostMoeExpert`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn record_range(&self) -> std::ops::Range<usize> {
+        self.offset..self.offset + self.len
+    }
 }
 
 /// Prevalidated coordinates for one routed-expert payload in [`CghostIndex::groups`].
@@ -1011,6 +1053,10 @@ fn parse_moe_group_id(id: &str) -> Option<(usize, usize)> {
 pub struct GhostFile {
     pub index: CghostIndex,
     file: File,
+    /// Normal buffered mode maps the immutable payload so CUDA can upload a
+    /// validated expert record without an intermediate Vec/read copy. Strict
+    /// cache mode clears this mapping and retains positioned I/O semantics.
+    mmap: Option<Arc<GgufWireMmap>>,
     /// Flat row-major `[layer][expert]` lookup for v2 MoE files. Dense/legacy files keep the
     /// original string lookup path and pay no extra allocation.
     moe_access: Option<GhostMoeAccessIndex>,
@@ -1046,6 +1092,7 @@ impl GhostFile {
     pub fn open_with_options(path: &Path, evict_page_cache: bool) -> Result<Self> {
         let mut this = Self::open(path)?;
         if evict_page_cache {
+            this.mmap = None;
             crate::tensor::disable_file_cache_best_effort(&this.file);
             #[cfg(windows)]
             match UncachedReader::open(path, this.max_layer_span()) {
@@ -1092,6 +1139,7 @@ impl GhostFile {
         Ok(Self {
             index,
             file,
+            mmap: Some(GgufWireMmap::map(path)?),
             moe_access,
             moe_payload_verified,
             #[cfg(windows)]
@@ -1373,6 +1421,39 @@ impl GhostFile {
             }
         }
         Ok(())
+    }
+
+    /// Borrow one routed expert directly from the read-only file mapping. The
+    /// same payload-identity check as the positioned reader runs before bytes
+    /// are exposed. Strict-cache mode returns `None` because it disables mmap.
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn mapped_moe_expert(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+    ) -> Result<Option<GhostMoeMappedExpert>> {
+        let Some(mmap) = self.mmap.as_ref() else {
+            return Ok(None);
+        };
+        let (group, start, len) = self.checked_moe_expert_span(layer_idx, expert_idx)?;
+        let (_, access) = self.moe_group_access(layer_idx, expert_idx)?;
+        let payload = mmap.bytes(start, len)?;
+        self.validate_moe_expert_payload_identity(group, access, start, payload)?;
+        let view = |role: &str| -> Result<GhostMoeTensorView> {
+            let tensor = self.moe_group_tensor(group, access, role)?;
+            Ok(GhostMoeTensorView {
+                dtype: tensor.dtype,
+                dims: tensor.dims.clone(),
+                offset: (tensor.offset - start) as usize,
+                len: tensor.len as usize,
+            })
+        };
+        Ok(Some(GhostMoeMappedExpert {
+            mmap: Arc::clone(mmap),
+            record_start: start,
+            gate_up: view("gate_up_exps")?,
+            down: view("down_exps")?,
+        }))
     }
 
     /// Read one routed expert with one sequential positioned read. The file's
@@ -1795,29 +1876,77 @@ impl GhostFile {
 #[cfg(windows)]
 struct UncachedReader {
     file: File,
-    /// Over-allocated so a `SECTOR`-aligned sub-slice of the largest (rounded-up) group span
-    /// always fits; sized once at open and never grown (growing would move the base pointer).
+    /// Logical sector size reported by the volume containing `.cghost`.
+    sector: usize,
+    /// Over-allocated so a sector-aligned sub-slice of the largest (rounded-up)
+    /// group span always fits; sized once at open and never grown (growing would
+    /// move the base pointer).
     scratch: Vec<u8>,
     file_len: u64,
 }
 
 #[cfg(windows)]
 impl UncachedReader {
-    /// 4 KiB covers both 512e and 4Kn NVMe logical sectors; a 4 KiB-aligned offset/length is
-    /// also 512-aligned, so this is a safe universal alignment for `FILE_FLAG_NO_BUFFERING`.
-    const SECTOR: usize = 4096;
     const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+
+    fn volume_sector_size(path: &Path) -> std::io::Result<usize> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
+
+        let absolute = std::fs::canonicalize(path)?;
+        let wide = absolute
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut volume = vec![0u16; 32_768];
+        // SAFETY: both UTF-16 buffers are live and NUL-terminated/capacity-sized
+        // as required. The path names an existing file on the queried volume.
+        if unsafe { GetVolumePathNameW(wide.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut sectors_per_cluster = 0u32;
+        let mut bytes_per_sector = 0u32;
+        let mut free_clusters = 0u32;
+        let mut total_clusters = 0u32;
+        // SAFETY: volume contains the NUL-terminated root returned above and all
+        // output pointers refer to initialized writable u32 storage.
+        if unsafe {
+            GetDiskFreeSpaceW(
+                volume.as_ptr(),
+                &mut sectors_per_cluster,
+                &mut bytes_per_sector,
+                &mut free_clusters,
+                &mut total_clusters,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sector = bytes_per_sector as usize;
+        if sector == 0 || !sector.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("volume reported invalid sector size {sector}"),
+            ));
+        }
+        Ok(sector)
+    }
 
     fn open(path: &Path, max_layer_span: u64) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt;
+        let sector = Self::volume_sector_size(path)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(Self::FILE_FLAG_NO_BUFFERING)
             .open(path)?;
         let file_len = file.metadata()?.len();
-        let cap = (max_layer_span as usize).next_multiple_of(Self::SECTOR) + Self::SECTOR;
+        let cap = (max_layer_span as usize).next_multiple_of(sector) + sector;
         Ok(Self {
             file,
+            sector,
             scratch: vec![0u8; cap],
             file_len,
         })
@@ -1830,11 +1959,11 @@ impl UncachedReader {
     fn read_into(&mut self, start: u64, len: u64, out: &mut [u8]) -> std::io::Result<bool> {
         use std::os::windows::fs::FileExt;
         let len = len as usize;
-        let aligned_len = len.next_multiple_of(Self::SECTOR);
+        let aligned_len = len.next_multiple_of(self.sector);
         // Locate a sector-aligned window inside the over-allocated scratch.
         let base = self.scratch.as_ptr() as usize;
-        let pad = (Self::SECTOR - (base % Self::SECTOR)) % Self::SECTOR;
-        if !start.is_multiple_of(Self::SECTOR as u64)
+        let pad = (self.sector - (base % self.sector)) % self.sector;
+        if !start.is_multiple_of(self.sector as u64)
             || start + aligned_len as u64 > self.file_len
             || pad + aligned_len > self.scratch.len()
         {
@@ -2233,6 +2362,10 @@ mod tests {
         assert!(Arc::ptr_eq(&gate_bytes, &down_bytes));
         assert_eq!(&gate_bytes[gate_range], &[1, 11]);
         assert_eq!(&down_bytes[down_range], &[21, 31]);
+
+        let mapped = ghost.mapped_moe_expert(0, 1).unwrap().unwrap();
+        assert_eq!(mapped.tensor_bytes(&mapped.gate_up).unwrap(), &[1, 11]);
+        assert_eq!(mapped.tensor_bytes(&mapped.down).unwrap(), &[21, 31]);
     }
 
     #[test]
@@ -2378,10 +2511,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.cghost");
         write_tiny_moe_cghost(&path);
-        let ghost = GhostFile::open(&path).unwrap();
+        let mut ghost = GhostFile::open(&path).unwrap();
         let (group, _) = ghost.moe_group_access(0, 1).unwrap();
         let start = group.tensors[0].offset;
         let len = ghost.moe_expert_byte_len(0, 1).unwrap();
+
+        // Windows refuses `set_len` on a file with a live user mapping
+        // (ERROR_USER_MAPPED_FILE), so drop the mapping before truncating. The
+        // positioned reader under test never reads through the mapping, so the
+        // path being exercised is unchanged; POSIX hosts allowed the truncate
+        // either way, which is why this only ever failed on Windows.
+        ghost.mmap = None;
 
         // Keep the already-parsed index resident, then truncate the backing payload halfway
         // through the selected record. The positioned reader must report EOF, never success.

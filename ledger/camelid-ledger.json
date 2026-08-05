@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "f297857f",
+    "source_head": "2ec7e303",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -48,7 +48,7 @@
       {
         "id": "Q4_0 (QAT rows)",
         "status": "supported_named_exact_rows_only",
-        "notes": "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke scoped to the two-Mac distributed serve lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization)."
+        "notes": "gemma4_26b_a4b_it_q4_0 (Q4_0 experts + Q6_K tied head) is supported_exact_row_smoke through either two-Mac distributed serve or the catalog-managed Windows CUDA Ghost-MoE lane; the Gemma 4 E4B QAT row runs the Metal GPU-resident path token-identical to CPU. Engine Q4_0 dequant plus parity-gated wire GEMV kernels (CUDA/Metal) exist as engine facts, not broad quant support; no LLaMA/SPM Q4_0 row is certified (see planned_quantization)."
       },
       {
         "id": "TQ2_0",
@@ -1090,17 +1090,17 @@
         "family": "gemma4_a4b_moe_decoder",
         "quantization": "Q4_0",
         "status": "supported_exact_row_smoke",
-        "support_scope": "exact_row_distributed_serve_smoke_only",
+        "support_scope": "exact_row_distributed_or_windows_cuda_ghost_moe_smoke_only",
         "full_support_status": "blocked_pending_normalized_full_support",
-        "full_support_blockers": "single-node 16GB hosts are memory-bound (13.4GB row; the supported lane is two-Mac distributed layer sharding); the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, performance/RSS gate, portability, or durable current-head refresh exists yet; full-row GPU residency is untested (QAT Q4_0/Q6_K GPU kernels not implemented)",
+        "full_support_blockers": "the 13.4GB full row is not laptop-VRAM-resident and requires either two-node distributed serving or the catalog-prepared Windows CUDA Ghost-MoE lane; the reference flips greedy near-ties at the f32 precision floor (three recorded probe-verified frontiers); no bounded context bucket, cross-platform Ghost promotion, normalized performance/RSS gate, or durable current-head refresh exists yet",
         "metadata_parses": "validated_including_moe_expert_count_router_and_dual_ffn_norms",
         "tokenizer_works": "validated_for_gemma4_spm_with_forced_bos_workaround",
         "tensors_load": "validated_mmap_wire_backed_q4_0_experts_q6_k_head_layer_range_shards",
-        "generation_runs": "distributed_two_node_api_chat_completions_and_sse_smoke",
-        "parity_audited": "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node",
-        "performance_measured": "two_mac_validation_decode_about_0_17_tok_s_recorded_not_a_perf_claim",
-        "frontend_load_path_verified": "served_via_gemma4_runtime_flag_distributed_lane",
-        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q4_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (gemma4 serve lane on by default — opt-out CAMELID_GEMMA4_SERVE=0 — plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
+        "generation_runs": "distributed_two_node_api_chat_completions_and_sse_smoke_plus_windows_cuda_ghost_moe_serve",
+        "parity_audited": "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node_and_windows_cuda_ghost_dp4a_matches_cpu_oracle",
+        "performance_measured": "windows_rtx_3060_laptop_256_token_ghost_decode_12_29_tok_s_sustained_14_73_tok_s_fastest_8_token_window",
+        "frontend_load_path_verified": "catalog_managed_ghost_pair_auto_detected_by_models_load_plus_distributed_runtime_flag",
+        "frontend_readiness_gate": "green for distributed serve, or for the exact catalog-managed Ghost pair when health reports ghost_moe with CUDA common, routed experts, and head active; CPU, Metal, and ad-hoc Ghost runs remain experimental",
         "tested_context": "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
         "chat_template_renderer": "gemma4_marker",
         "chat_template_shape_pack": "not_promoted",
@@ -1120,11 +1120,11 @@
         "bounded_context_8192_pack": "not_promoted",
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
-        "latest_checked_bucket": "distributed_serve_api_smoke",
+        "latest_checked_bucket": "windows_cuda_ghost_moe_256_token_decode",
         "latest_checked_result": "pass",
-        "latest_checked_output": "Paris",
-        "evidence": "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, dense shared-expert MLP + sparse expert branch, Q4_0 expert/dense weights + Q6_K tied head, parsed from the GGUF) runs as two-Mac distributed layer sharding (master layers 0..15 local + worker 15..30 + head on the second 16GB M4; model staged over Thunderbolt with full-file sha256 verified identical). On the committed basic_v1 pack vs the pinned plain-f32 reference (llama.cpp 5d56eff --no-repack -fa off -ctk f32 -ctv f32 -ub 1): count-primes (24 tok) and translate-de (16 tok) are full-budget token-identical, and capital-france/haiku-sea/rust-fn match a probe-verified prefix then flip at knife-edge near-ties (camelid top-2 gaps 0.138/0.203/0.419, the reference token is camelid's immediate #2 in all three). Distributed output equals single-node camelid (f32 wire). The distributed SERVE lane answers /v1/chat/completions (non-streaming and SSE) and /v1/completions end-to-end across the pair. Evidence: qa/evidence-bundles/gemma4-26b-it-q4-0-qat-distributed-parity-20260611T084039Z-head-b117d40cb7c3 and the distributed-serve smoke bundle qa/evidence-bundles/gemma4-26b-a4b-it-q4-0-distributed-serve-20260611T092520Z-head-6482254fca12. Camelid supports exact-row text-token generation + serve smoke for this row only, and only through the two-Mac distributed lane; no single-node, bounded-context, performance, portability, multimodal, or full support is implied",
-        "next_step": "durable current-head refresh, bounded context buckets through the distributed lane, performance/RSS gates, and QAT GPU kernels before any wider 26B claim; single-node support is not a goal on 16GB hosts"
+        "latest_checked_output": "12.29 tok/s sustained; token sequence preserved",
+        "evidence": "the exact tracked gemma-4-26B_q4_0-it.gguf (14,439,361,440 bytes, general.architecture=gemma4, A4B MoE: 30 layers, 128 experts top-8, Q4_0 expert/dense weights plus Q6_K tied head) retains the committed two-Mac distributed parity and serve bundles. The Windows CUDA Ghost-MoE path was validated on an RTX 3060 Laptop 6GB using the fingerprinted sparse common-core shadow plus v2 .cghost: the exact DP4A Q4_0 GEMV matched the CPU oracle 96/96, routed hits and misses used batched pinned transfers, and a 256-token decode preserved the token sequence while sustaining 12.29 tok/s over the second half (14.73 tok/s fastest 8-token window) with an 803-expert adaptive VRAM cache and 160MiB reserve. The supported single-node claim covers this row only, and only through this catalog-managed Windows CUDA Ghost lane; ad-hoc, CPU, and Metal Ghost runs remain experimental. No bounded/model-native context, multimodal, broad Gemma/MoE, portable performance, or full-support claim is implied.",
+        "next_step": "commit a normalized browser/API evidence bundle and bounded-context ladder for Windows Ghost-MoE, then validate the same prepared-artifact flow on additional NVIDIA memory tiers before widening the scope"
       }
     },
     {

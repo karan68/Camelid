@@ -259,7 +259,23 @@ export function partitionByArchSupport(groups) {
    unprobed host must not have its whole catalog folded away. */
 export function partitionCuratedByFit(items) {
   return {
-    runnable: items.filter((item) => !isRefusingFit(item.fit)),
-    blocked: items.filter((item) => isRefusingFit(item.fit)),
+    runnable: items.filter((item) => !isRefusingFit(item.fit) || ghostMoeFits(item)),
+    blocked: items.filter((item) => isRefusingFit(item.fit) && !ghostMoeFits(item)),
   }
+}
+
+/* A Ghost-capable row owns a second, explicitly GPU-resident fit verdict. It may
+   remain in the runnable catalog even when the full GGUF is refused, but only
+   when this exact binary/host combination is eligible and the common core fits. */
+export function ghostMoeFits(item) {
+  return Boolean(
+    item?.ghost_moe?.available
+      && item.ghost_moe.host_eligible
+      // `insufficient_free_memory` means the common set fits this GPU's total
+      // capacity, but the VRAM is occupied right now. A model switch releases
+      // Camelid's current resident model before Ghost-MoE is loaded, so this is
+      // still a valid opt-in/download choice. The load-time guard re-probes after
+      // that release and remains authoritative for memory held by other apps.
+      && ['fits_resident', 'insufficient_free_memory'].includes(item.ghost_moe.fit),
+  )
 }

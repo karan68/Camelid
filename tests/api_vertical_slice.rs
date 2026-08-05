@@ -103,6 +103,12 @@ async fn capabilities_public_contract_omits_local_private_paths() {
 
 #[tokio::test]
 async fn props_reports_public_fail_closed_llama_server_shape() {
+    // On a box with a usable CUDA device the engine truthfully advertises ONE
+    // slot (GPU-resident streams run exclusive), while this test asserts the
+    // llama-server default shape. Pin the CPU lane; never removed, because
+    // tests in this binary run in parallel threads and no test here wants the
+    // GPU lane. CI runners have no GPU and are unaffected.
+    std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -818,6 +824,9 @@ async fn metrics_exposes_prometheus_runtime_counters() {
 
 #[tokio::test]
 async fn slots_reports_public_fail_closed_llama_server_shape() {
+    // See props_reports_public_fail_closed_llama_server_shape: pin the CPU
+    // lane so slot count matches the llama-server default shape on CUDA boxes.
+    std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
     let app = camelid::api::router();
     let response = app
         .clone()
