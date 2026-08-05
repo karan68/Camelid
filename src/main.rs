@@ -4920,6 +4920,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         logit_scale: None,
         mla: None,
     })

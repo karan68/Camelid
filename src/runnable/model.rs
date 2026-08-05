@@ -419,6 +419,11 @@ struct Layer {
 struct KvCache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
+    /// LFM2 short-conv rolling state, per layer: `(l_cache-1) * d_model`,
+    /// layout `[c*(l_cache-1) + t]` with `t=0` oldest. Empty for every layer
+    /// of every other architecture, and for LFM2's own attention layers —
+    /// sized by [`RunnableModel::new_cache`].
+    conv: Vec<Vec<f32>>,
 }
 
 impl KvCache {
@@ -426,6 +431,7 @@ impl KvCache {
         Self {
             k: vec![Vec::new(); n_layers],
             v: vec![Vec::new(); n_layers],
+            conv: vec![Vec::new(); n_layers],
         }
     }
 }
@@ -465,6 +471,12 @@ pub struct RunnableModel {
     /// layers have no K/V attention). When set, the forward path is routed to the
     /// dedicated `*_qwen35` methods and `layers` is empty. See [`Qwen35Runtime`].
     qwen35: Option<Qwen35Runtime>,
+    /// LFM2 / LFM2.5 hybrid short-convolution runtime. `Some` only for the
+    /// `lfm2` architecture, whose conv layers do not fit the generic `Layer`
+    /// (they carry `shortconv.*` and no K/V attention). When set, the forward
+    /// path is routed to the dedicated `*_lfm2` methods and `layers` is empty.
+    /// See [`Lfm2Runtime`].
+    lfm2: Option<Lfm2Runtime>,
     /// Exact artifact identity used to admit hash-pinned CUDA specializations.
     /// Geometry alone is not sufficient because unrelated qwen35 files can share it.
     #[cfg(feature = "cuda")]
@@ -578,7 +590,15 @@ impl RunnableModel {
                 out_features: token_embd.out_features,
             }
         };
-        let output_norm = load_vec(&mut f, "output_norm.weight")?;
+        // LFM2 spells its final RMSNorm `token_embd_norm` rather than
+        // `output_norm` — llama.cpp maps LLM_TENSOR_OUTPUT_NORM_LFM2 to that
+        // name explicitly (`llama-arch.cpp:362`, commented there as a fix for
+        // the wrong tensor name). Every other covered arch keeps `output_norm`.
+        let output_norm = if arch == "lfm2" {
+            load_vec(&mut f, "token_embd_norm.weight")?
+        } else {
+            load_vec(&mut f, "output_norm.weight")?
+        };
 
         // Qwen3.5 (Ornith): hybrid gated-delta-net. Layers do not fit the generic
         // dense `Layer` (recurrent/SSM layers carry no K/V projections), so build a
@@ -742,8 +762,169 @@ impl RunnableModel {
                     value_dim,
                     conv_dim,
                 }),
+                lfm2: None,
                 #[cfg(feature = "cuda")]
                 resident_cuda_artifact,
+                #[cfg(feature = "cuda")]
+                cuda: std::sync::Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                metal_qwen35: std::sync::Mutex::new(None),
+            });
+        }
+
+        // LFM2 / LFM2.5: hybrid double-gated short convolution + GQA attention.
+        // Conv layers carry `shortconv.{conv,in_proj,out_proj}` and NO
+        // `attn_q/k/v`, so they cannot be expressed as the generic dense
+        // `Layer`; build a dedicated runtime and route the forward pass to the
+        // `*_lfm2` path. Graph ported from llama.cpp `src/models/lfm2.cpp`.
+        if arch == "lfm2" {
+            let meta = cfg.lfm2.as_ref().ok_or_else(|| {
+                BackendError::InvalidModelMetadata("lfm2 metadata missing from config".into())
+            })?;
+            let l_cache = meta.shortconv_l_cache as usize;
+            // llama.cpp asserts `n_shortconv_l_cache > 1` (`lfm2.cpp:167`): the
+            // rolling state is `l_cache - 1` wide, so a 0/1 cache has no state
+            // to carry and the file is malformed for this graph.
+            if l_cache < 2 {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "lfm2: shortconv.l_cache must be >= 2, got {l_cache}"
+                )));
+            }
+            if meta.layer_is_conv.len() != n_layers {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "lfm2: per-layer schedule covers {} layers, model has {n_layers}",
+                    meta.layer_is_conv.len()
+                )));
+            }
+            // Every attention layer must agree with the config scalar; a row
+            // with mixed non-zero KV widths would need per-layer KV sizing
+            // that this runtime does not carry, so refuse rather than
+            // mis-shape the cache.
+            for (l, &kv) in meta.kv_heads_per_layer.iter().enumerate() {
+                if kv != 0 && kv as usize != n_kv_heads {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "lfm2: layer {l} declares {kv} kv heads, expected {n_kv_heads} \
+                         (per-layer KV widths are not supported)"
+                    )));
+                }
+            }
+            // SLIDING WINDOW — fail closed. llama.cpp's LFM2 loader reads
+            // `attention.sliding_window` and, when present and non-zero, marks
+            // every ATTENTION layer SWA (`lfm2.cpp:23-28`). This forward is
+            // full-causal and carries no window mask, so a windowed row would
+            // decode fluent-looking garbage rather than erroring — the same
+            // hazard class as gemma3 on the CPU dense path (DECISIONS D20.2).
+            // LFM2.5-2.6B declares no window (`n_swa = 0`), so this refuses
+            // only rows this lane genuinely cannot run.
+            if let Some(window) = gguf.metadata_u32("lfm2.attention.sliding_window") {
+                if window > 0 {
+                    return Err(BackendError::UnsupportedGguf(format!(
+                        "lfm2: attention.sliding_window = {window}, but the runnable \
+                         lfm2 forward is full-causal and implements no window mask; \
+                         refusing rather than decoding with the wrong attention span"
+                    )));
+                }
+            }
+            // An all-conv schedule would leave zero attention layers, and the
+            // forward divides by `n_kv_heads` to derive the GQA group. Refuse
+            // instead of panicking on a divide-by-zero deep in decode.
+            if n_kv_heads == 0 || meta.layer_is_conv.iter().all(|c| *c) {
+                return Err(BackendError::UnsupportedGguf(
+                    "lfm2: no attention layers in the per-layer schedule (all conv); \
+                     this runtime requires at least one GQA layer"
+                        .into(),
+                ));
+            }
+
+            let mut lfm2_layers = Vec::with_capacity(n_layers);
+            for l in 0..n_layers {
+                let p = |t: &str| format!("blk.{l}.{t}.weight");
+                // `attn_norm` is LFM2's `operator_norm`: the pre-block RMSNorm
+                // on BOTH conv and attention layers (`lfm2.cpp:239`).
+                let attn_norm = load_vec(&mut f, &p("attn_norm"))?;
+                let ffn_norm = load_vec(&mut f, &p("ffn_norm"))?;
+                let ffn_gate = load_raw(&mut f, &p("ffn_gate"))?;
+                let ffn_up = load_raw(&mut f, &p("ffn_up"))?;
+                let ffn_down = load_raw(&mut f, &p("ffn_down"))?;
+                let kind = if meta.is_conv_layer(l) {
+                    // shortconv.conv is [l_cache, n_embd]; GGUF is row-major
+                    // over ne[0], so flat[c*l_cache + t] is channel `c`, tap
+                    // `t` — the same channel-major layout the qwen35 conv loop
+                    // consumes. Validate the element count HERE: the forward
+                    // indexes `conv[ch*l_cache + tap]` for every channel, so a
+                    // kernel that disagrees with (l_cache, d_model) would either
+                    // panic mid-decode or silently read a neighbouring
+                    // channel's taps.
+                    let conv = load_vec(&mut f, &p("shortconv.conv"))?;
+                    if conv.len() != l_cache * d_model {
+                        return Err(BackendError::InvalidTensorData(format!(
+                            "lfm2 layer {l}: shortconv.conv has {} elements, expected \
+                             l_cache*embedding = {}*{} = {}",
+                            conv.len(),
+                            l_cache,
+                            d_model,
+                            l_cache * d_model
+                        )));
+                    }
+                    Lfm2Kind::Conv {
+                        conv,
+                        in_proj: load_raw(&mut f, &p("shortconv.in_proj"))?,
+                        out_proj: load_raw(&mut f, &p("shortconv.out_proj"))?,
+                    }
+                } else {
+                    Lfm2Kind::Attn {
+                        wq: load_raw(&mut f, &p("attn_q"))?,
+                        wk: load_raw(&mut f, &p("attn_k"))?,
+                        wv: load_raw(&mut f, &p("attn_v"))?,
+                        wo: load_raw(&mut f, &p("attn_output"))?,
+                        q_norm: load_vec(&mut f, &p("attn_q_norm"))?,
+                        k_norm: load_vec(&mut f, &p("attn_k_norm"))?,
+                    }
+                };
+                lfm2_layers.push(Lfm2Layer {
+                    attn_norm,
+                    ffn_norm,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    kind,
+                });
+            }
+
+            return Ok(RunnableModel {
+                architecture: arch,
+                d_model,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rope_dim,
+                rope_base,
+                eps: cfg.rms_norm_epsilon,
+                vocab,
+                // llama.cpp classifies LLM_ARCH_LFM2 as LLAMA_ROPE_TYPE_NEOX
+                // (`llama-model.cpp:2477` → `:2492`); the converter leaves Q/K
+                // unpermuted, so split-half is what the weights expect.
+                rope_neox: true,
+                n_layers,
+                layer_rope_base: vec![rope_base; n_layers],
+                embed_scale: None,
+                ffn_gelu: false,
+                final_logit_softcap: None,
+                attn_logit_softcap: None,
+                logit_scale: None,
+                token_embd,
+                output,
+                output_norm,
+                layers: Vec::new(),
+                qwen35: None,
+                lfm2: Some(Lfm2Runtime {
+                    layers: lfm2_layers,
+                    l_cache,
+                }),
+                // No hash-pinned CUDA specialization exists for lfm2; the
+                // short-conv lane is CPU-only today.
+                #[cfg(feature = "cuda")]
+                resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact::Generic,
                 #[cfg(feature = "cuda")]
                 cuda: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
@@ -856,6 +1037,7 @@ impl RunnableModel {
             output_norm,
             layers,
             qwen35: None,
+            lfm2: None,
             #[cfg(feature = "cuda")]
             resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact::Generic,
             #[cfg(feature = "cuda")]
@@ -891,6 +1073,18 @@ impl RunnableModel {
         }
         if self.qwen35.is_some() {
             return self.forward_logits_qwen35(tokens);
+        }
+        // LFM2's conv state is inherently sequential (a rolling ring per
+        // channel), so the whole-sequence forward is the incremental step run
+        // over every position — the same lane `generate` uses, which keeps the
+        // smoke gate and decode on one code path.
+        if let Some(rt) = &self.lfm2 {
+            let mut cache = self.new_cache();
+            let mut logits = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                logits = self.forward_step_lfm2(rt, tok, pos, &mut cache)?;
+            }
+            return Ok(logits);
         }
         let seq = tokens.len();
         let dm = self.d_model;
@@ -974,7 +1168,7 @@ impl RunnableModel {
         if self.qwen35.is_some() {
             return self.generate_qwen35(prompt, max_new, &[]);
         }
-        let mut cache = KvCache::new(self.n_layers);
+        let mut cache = self.new_cache();
         let mut last = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {
             last = self.forward_step(tok, pos, &mut cache)?;
@@ -1077,9 +1271,217 @@ impl RunnableModel {
         self.generate_vision_stopping_streaming(prefix, image, suffix, max_new, stop, &mut |_| {})
     }
 
+    /// A `KvCache` sized for this model, including LFM2's per-conv-layer
+    /// rolling short-conv state. Every incremental lane must allocate through
+    /// this rather than `KvCache::new`, or LFM2's conv layers would index an
+    /// empty ring.
+    fn new_cache(&self) -> KvCache {
+        let mut cache = KvCache::new(self.n_layers);
+        if let Some(rt) = &self.lfm2 {
+            for (li, layer) in rt.layers.iter().enumerate() {
+                if matches!(layer.kind, Lfm2Kind::Conv { .. }) {
+                    cache.conv[li] = vec![0.0f32; (rt.l_cache - 1) * self.d_model];
+                }
+            }
+        }
+        cache
+    }
+
+    /// Incremental forward of one LFM2 token at absolute `pos`. Conv layers
+    /// advance their rolling state; attention layers append K/V and attend over
+    /// all cached positions. Returns next-token logits.
+    ///
+    /// Ported from llama.cpp `src/models/lfm2.cpp` (graph at `:235-274`,
+    /// short-conv block at `:156-217`). Per layer:
+    ///
+    /// ```text
+    /// prev = h
+    /// h    = RMSNorm(h, attn_norm)          // LFM2 "operator_norm"
+    /// h    = conv_block(h) | attn_block(h)  // per-layer schedule
+    /// h    = prev + h
+    /// h    = h + SwiGLU_FFN(RMSNorm(h, ffn_norm))
+    /// ```
+    fn forward_step_lfm2(
+        &self,
+        rt: &Lfm2Runtime,
+        token: u32,
+        pos: usize,
+        cache: &mut KvCache,
+    ) -> Result<Vec<f32>> {
+        let dm = self.d_model;
+        let hd = self.head_dim;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = self.n_heads / self.n_kv_heads;
+        let q_dim = self.n_heads * hd;
+        let kv_dim = self.n_kv_heads * hd;
+        let cm1 = rt.l_cache - 1;
+
+        let t = token as usize;
+        if t >= self.vocab {
+            return Err(BackendError::InvalidTensorData(format!(
+                "token id {t} >= vocab {}",
+                self.vocab
+            )));
+        }
+        let mut hidden = self.token_embd.dequant_row(t, "token_embd")?;
+
+        for (li, layer) in rt.layers.iter().enumerate() {
+            let tn = |t: &str| format!("blk.{li}.{t}");
+            // LFM2 applies `operator_norm` before BOTH block kinds. `hidden` is
+            // the residual branch and is not touched again until the add below,
+            // so no separate `prev` copy is needed.
+            let xn = self.apply_norm(&hidden, &layer.attn_norm);
+
+            let mix = match &layer.kind {
+                Lfm2Kind::Conv {
+                    conv,
+                    in_proj,
+                    out_proj,
+                } => {
+                    // in_proj emits 3*d_model, chunked B | C | x (`lfm2.cpp:179-184`).
+                    //
+                    // Every projection here goes through `par_matvec`, the same
+                    // kernel the qwen35 runnable path uses. NOTE it is NOT an
+                    // f32-activation dot: for Q8_0 weights it quantizes the
+                    // activation once and reduces in int8×int8, which is what
+                    // llama.cpp's own q8×q8 path does — so it is numerically
+                    // CLOSER to the reference, not bit-identical to
+                    // `dequant_all().matvec()`. The parity claim it carries is
+                    // greedy-token (argmax) identity, which is exactly what
+                    // `tests/lfm2_parity.rs` certifies. It also avoids
+                    // materializing each weight matrix as f32, which at 2.6B
+                    // would allocate GBs per token.
+                    let bcx = in_proj.par_matvec(&xn, &tn("shortconv.in_proj"))?;
+                    if bcx.len() != 3 * dm {
+                        return Err(BackendError::InvalidTensorData(format!(
+                            "lfm2 layer {li}: shortconv.in_proj produced {} values, expected {}",
+                            bcx.len(),
+                            3 * dm
+                        )));
+                    }
+                    let (b, rest) = bcx.split_at(dm);
+                    let (c, x) = rest.split_at(dm);
+
+                    // Causal depthwise conv of width `l_cache` over `bx = b*x`.
+                    // The window for channel `ch` is
+                    // [state_0 (oldest) .. state_{l_cache-2}, bx_now]; the kernel
+                    // is channel-major (`conv[ch*l_cache + tap]`) because the GGUF
+                    // tensor is [l_cache, n_embd] and rows run along ne[0].
+                    // NOTE: `ggml_ssm_conv` applies NO activation — unlike the
+                    // qwen35 SSM conv, there is no SiLU here (`lfm2.cpp:207`).
+                    let state = &mut cache.conv[li];
+                    let mut y = vec![0.0f32; dm];
+                    for ch in 0..dm {
+                        let bx = b[ch] * x[ch];
+                        let mut acc = 0.0f32;
+                        for tap in 0..cm1 {
+                            acc += conv[ch * rt.l_cache + tap] * state[ch * cm1 + tap];
+                        }
+                        acc += conv[ch * rt.l_cache + cm1] * bx;
+                        // Second gate: elementwise multiply by C (`lfm2.cpp:210`).
+                        y[ch] = c[ch] * acc;
+                        // Roll the ring left and append this position's input.
+                        for tap in 0..cm1.saturating_sub(1) {
+                            state[ch * cm1 + tap] = state[ch * cm1 + tap + 1];
+                        }
+                        state[ch * cm1 + (cm1 - 1)] = bx;
+                    }
+                    out_proj.par_matvec(&y, &tn("shortconv.out_proj"))?
+                }
+                Lfm2Kind::Attn {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => {
+                    let mut qp = wq.par_matvec(&xn, &tn("attn_q"))?;
+                    let mut kp = wk.par_matvec(&xn, &tn("attn_k"))?;
+                    let vp = wv.par_matvec(&xn, &tn("attn_v"))?;
+                    // QK RMSNorm over head_dim, BEFORE RoPE (`lfm2.cpp:137-146`).
+                    self.apply_norm_heads(&mut qp, self.n_heads, hd, q_norm);
+                    self.apply_norm_heads(&mut kp, self.n_kv_heads, hd, k_norm);
+                    let rb = self.layer_rope_base[li];
+                    self.apply_rope(&mut qp, self.n_heads, pos, rb);
+                    self.apply_rope(&mut kp, self.n_kv_heads, pos, rb);
+
+                    cache.k[li].extend_from_slice(&kp);
+                    cache.v[li].extend_from_slice(&vp);
+                    let ck = &cache.k[li];
+                    let cv = &cache.v[li];
+                    // Attention layers are full-causal: LFM2.5-2.6B declares no
+                    // sliding window (`n_swa = 0`), so every cached position is
+                    // visible. Derived from the cache rather than `pos` because
+                    // conv layers do not advance the K/V cache, so an
+                    // attention layer's cache depth is the only truth here.
+                    let n_pos = ck.len() / kv_dim;
+
+                    let mut attn_out = vec![0.0f32; q_dim];
+                    for h in 0..self.n_heads {
+                        let kvh = h / group;
+                        let qh = &qp[h * hd..(h + 1) * hd];
+                        let mut scores = vec![0.0f32; n_pos];
+                        let mut mx = f32::NEG_INFINITY;
+                        for (j, sj) in scores.iter_mut().enumerate() {
+                            let kh = &ck[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                            let s = dot(qh, kh) * scale;
+                            *sj = s;
+                            if s > mx {
+                                mx = s;
+                            }
+                        }
+                        let mut sum = 0.0f32;
+                        for s in scores.iter_mut() {
+                            *s = (*s - mx).exp();
+                            sum += *s;
+                        }
+                        let oh = &mut attn_out[h * hd..(h + 1) * hd];
+                        for (j, s) in scores.iter().enumerate() {
+                            let w = *s / sum;
+                            let vh = &cv[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                            for d in 0..hd {
+                                oh[d] += w * vh[d];
+                            }
+                        }
+                    }
+                    wo.par_matvec(&attn_out, &tn("attn_output"))?
+                }
+            };
+
+            for (h, m) in hidden.iter_mut().zip(mix.iter()) {
+                *h += *m;
+            }
+
+            // SwiGLU FFN, identical on conv and attention layers.
+            let xn2 = self.apply_norm(&hidden, &layer.ffn_norm);
+            let g = layer.ffn_gate.par_matvec(&xn2, &tn("ffn_gate"))?;
+            let u = layer.ffn_up.par_matvec(&xn2, &tn("ffn_up"))?;
+            let act: Vec<f32> = g
+                .iter()
+                .zip(u.iter())
+                .map(|(&gv, &uv)| silu(gv) * uv)
+                .collect();
+            let d = layer.ffn_down.par_matvec(&act, &tn("ffn_down"))?;
+            for (h, dv) in hidden.iter_mut().zip(d.iter()) {
+                *h += *dv;
+            }
+        }
+
+        // Final norm is `token_embd_norm`; the logits matrix is tied to
+        // `token_embd` (LFM2.5 ships no `output.weight`). The 128k-row vocab
+        // projection dominates a decode step, so take the row-parallel form
+        // (same int8-activation caveat as the per-layer projections above).
+        let normed = self.apply_norm(&hidden, &self.output_norm);
+        self.output.par_matvec(&normed, "output")
+    }
+
     /// Incremental forward of a single token at absolute `pos`, appending its K/V to
     /// `cache` and attending over all cached positions. Returns next-token logits.
     fn forward_step(&self, token: u32, pos: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        if let Some(rt) = &self.lfm2 {
+            return self.forward_step_lfm2(rt, token, pos, cache);
+        }
         let hd = self.head_dim;
         let scale = 1.0 / (hd as f32).sqrt();
         let group = self.n_heads / self.n_kv_heads;
@@ -1446,6 +1848,48 @@ struct Qwen35Runtime {
     key_dim: usize,     // d_state * num_k_heads (2048)
     value_dim: usize,   // head_v_dim * num_v_heads (= d_inner, 4096)
     conv_dim: usize,    // 2*key_dim + value_dim (8192)
+}
+
+/// One LFM2 block: either a double-gated short convolution or a GQA attention
+/// mix, followed in both cases by the same SwiGLU FFN.
+enum Lfm2Kind {
+    /// Short-conv layer. `conv` is the depthwise kernel flattened
+    /// `[c*l_cache + t]` (channel `c`, tap `t`); `in_proj` emits `3*n_embd`
+    /// split as `B | C | x`; `out_proj` maps back to `n_embd`.
+    Conv {
+        conv: Vec<f32>,
+        in_proj: RawMat,
+        out_proj: RawMat,
+    },
+    /// GQA attention layer with per-head-dim QK RMSNorm applied BEFORE RoPE
+    /// (`lfm2.cpp:137-146`).
+    Attn {
+        wq: RawMat,
+        wk: RawMat,
+        wv: RawMat,
+        wo: RawMat,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+    },
+}
+
+struct Lfm2Layer {
+    /// LFM2's `operator_norm`: pre-block RMSNorm on conv AND attention layers.
+    attn_norm: Vec<f32>,
+    /// Pre-FFN RMSNorm.
+    ffn_norm: Vec<f32>,
+    ffn_gate: RawMat,
+    ffn_up: RawMat,
+    ffn_down: RawMat,
+    kind: Lfm2Kind,
+}
+
+/// Parsed LFM2 runtime: per-layer weights + the short-conv kernel width.
+struct Lfm2Runtime {
+    layers: Vec<Lfm2Layer>,
+    /// Short-conv kernel width (`lfm2.shortconv.l_cache`, 3). The rolling conv
+    /// state is `l_cache - 1` wide.
+    l_cache: usize,
 }
 
 /// Per-layer incremental state for qwen35 decode. Full-attention layers grow a
@@ -2618,7 +3062,7 @@ impl RunnableModel {
         // (byte-identical forward sequence when no stop token fires) plus stop-token
         // handling and true per-token streaming. A stop token ends the turn and is
         // NOT appended — matching the qwen35 lane and llama.cpp's served output.
-        let mut cache = KvCache::new(self.n_layers);
+        let mut cache = self.new_cache();
         let mut last = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {
             last = self.forward_step(tok, pos, &mut cache)?;

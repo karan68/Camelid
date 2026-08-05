@@ -16,7 +16,10 @@
 //! verbatim from the spec — it intentionally differs from `model.rs`'s
 //! optimized-lane architecture allowlist (see `BACKEND_ASKS.md` RA-4). In
 //! particular the runnable set includes `gemma2` and excludes
-//! `mistral`/`smollm3`/`gemma4`/`lfm2`. That is not an admit-then-fail gap:
+//! `mistral`/`smollm3`/`gemma4`. `lfm2` JOINED the runnable set with the
+//! short-conv bring-up: like `qwen35` its conv layers carry no `attn_q/k/v`,
+//! so the runnable lane is the only lane that can run it correctly (see
+//! `model.rs::is_runnable_only_arch`). That is not an admit-then-fail gap:
 //! admitted files bind through the runnable lane's own generic runtime
 //! (`runnable::model`, which implements the gemma2 attention/final logit
 //! soft-caps), never through `model.rs`'s `LlamaModelConfig`.
@@ -50,7 +53,7 @@ use crate::gguf::{GgufFile, GgufTensorType};
 
 /// v1 covered architectures (`general.architecture`).
 pub const COVERED_ARCHITECTURES: &[&str] = &[
-    "llama", "qwen2", "qwen3", "qwen35", "gemma2", "gemma3", "phi3",
+    "llama", "qwen2", "qwen3", "qwen35", "gemma2", "gemma3", "phi3", "lfm2",
 ];
 
 /// v1 covered tokenizer models (`tokenizer.ggml.model`), grouped by family below.

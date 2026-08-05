@@ -108,7 +108,47 @@ runnable lane (`RUNNABLE_LANE_SPEC.md`). Each entry: what's needed, why, blockin
   `src/inference/rope.rs::gemma3_rope_tables` and drives the Metal resident lane, and a
   gemma3 file reaching the CPU *dense* path fails closed at the per-layer choke point
   (`ensure_windowed_arch_off_cpu_dense_layer`, DECISIONS D20.2) rather than decoding with
-  the wrong schedule; (b) NOT fixed here — `lfm2` is claimed implemented but its recurrent
+  the wrong schedule; (b) `lfm2` was claimed implemented but its recurrent
   layers carry `shortconv.in_proj/out_proj` and no `attn_q/k/v`, so the dense binding
-  fails to bind — a load-time error rather than silent wrongness, but still a claim
-  with no path that can run it.
+  failed to bind — a load-time error rather than silent wrongness, but still a claim
+  with no path that could run it. **CLOSED by the LFM2 short-conv bring-up (RA-8).**
+
+## RA-8 — `lfm2` had no runnable forward — **CLOSED**
+- **What:** `lfm2` sat in the optimized-lane allowlist with no implementation of its
+  double-gated short convolution. Its conv layers carry
+  `shortconv.{conv,in_proj,out_proj}` and no `attn_q/k/v`, so the dense tensor map
+  could not bind them — the same shape as `qwen35`.
+- **Resolution:** `lfm2` is now classified [`is_runnable_only_arch`] and its forward
+  lives in the runnable lane (`Lfm2Runtime`, `RunnableModel::forward_step_lfm2`),
+  ported tensor-for-tensor from llama.cpp `src/models/lfm2.cpp`. `Lfm2Metadata`
+  carries the short-conv kernel width and the per-layer conv/attention schedule,
+  which llama.cpp derives from the per-layer `attention.head_count_kv` array (a `0`
+  marks a conv layer, `lfm2.cpp:10`).
+- **Two latent defects found and fixed in the same pass:**
+  1. `arch_uses_neox_rope_pairing` omitted `lfm2`, so its attention layers would have
+     roped with adjacent even/odd pairing. llama.cpp classifies LLM_ARCH_LFM2 as
+     `LLAMA_ROPE_TYPE_NEOX` (`llama-model.cpp:2477` → `:2492`) and the converter
+     leaves Q/K unpermuted — the old pairing is silently-wrong output, not a refusal.
+  2. `attention_head_count_kv` was read as a scalar. LFM2 stores it as a per-layer
+     **array** whose zeros are structural, so the scalar read missed it entirely and
+     fell back to `attention_head_count` — 32 instead of 8 on the 2.6B row.
+- **A third defect, found only because the forward receipt could not see it:** the
+  greedy parity test feeds both sides frozen prompt ids and never constructs a
+  `Tokenizer`, so it passed while `Tokenizer::from_gguf` was in fact refusing every
+  LFM2 file — `resolve_gpt2_pre_tokenizer` had no arm for `tokenizer.ggml.pre =
+  "lfm2"` and fell into the catch-all reject. That took down `smoke_admit`,
+  `RunnableServeRuntime::load` and `bench-generate` for the row, i.e. every
+  end-to-end path, behind a parity-certified forward. llama.cpp resolves `lfm2` in
+  the same switch arm as `llama-bpe` (`src/llama-vocab.cpp:2111-2123`), so the fix
+  is the alias — but the alias alone only makes the tokenizer *constructible*, and
+  LFM2 carries its own vocab (BOS 124894, not Llama-3's 128000), so it is now
+  backed by its own id-agreement receipt rather than by resemblance.
+- **Evidence:** three checks against llama.cpp b9632 on the LFM2.5-2.6B Q8_0 row —
+  greedy forward parity (`tests/lfm2_parity.rs::lfm2_matches_llamacpp_greedy`,
+  receipt `qa/runnable/lfm2-parity.json`), tokenizer id-agreement
+  (`::lfm2_tokenizer_matches_llamacpp`), and chat-template fidelity
+  (`api::tests::lfm2_renderer_matches_llamacpp_applied_template`).
+- **Scope of the claim:** forward graph, tokenizer, and renderer are each proven at
+  the prompt level on ONE file at ONE quant on CPU. NOT proven: an end-to-end serve
+  run, long context, sampling (the lane decodes greedy), tools (fail closed), other
+  quants, GPU lanes, or any other LFM2 variant. No row should claim those.

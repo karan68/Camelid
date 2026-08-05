@@ -8062,6 +8062,89 @@ mod gemma4_template_tests {
     /// turn (no pre-filled `<think></think>` block) is the one strong, bit-exact
     /// guarantee the opt-in thinking lane carries. The parity-locked exact-row
     /// mode stays thinking-DISABLED; this test does not touch that claim.
+    /// LFM2 chat-template fidelity gate.
+    ///
+    /// `render_lfm2_chatml_prompt` is hand-written Rust standing in for the
+    /// GGUF's Jinja template. This pins it against the template as actually
+    /// applied by llama.cpp b9632 (`/apply-template` on the LFM2.5-2.6B Q8_0
+    /// row), captured by `scripts/capture-lfm2-chat-template-fixture.mjs`.
+    ///
+    /// The reference string carries NO bos_token text — llama.cpp supplies the
+    /// BOS at tokenize time (`add_special`), and so does Camelid
+    /// (`prepare_runnable_prompt` sets `add_special` for lfm2). The fixture's
+    /// `prompt_ids` therefore begin with 124894 while `applied_prompt` does
+    /// not, so this test compares the RENDERED TEXT to `applied_prompt` and
+    /// separately pins where the BOS comes from.
+    ///
+    /// Regression this locks: before the LFM2 bring-up the bridge rendered
+    /// lfm2 through `render_ornith_chatml_prompt`, which emits qwen3's closed
+    /// `<think>\n\n</think>\n\n` block instead of LFM2's open `<think>`.
+    #[test]
+    fn lfm2_renderer_matches_llamacpp_applied_template() {
+        #[derive(serde::Deserialize)]
+        struct WireMsg {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            messages: Vec<WireMsg>,
+            applied_prompt: String,
+            prompt_ids: Vec<u32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            cases: Vec<Case>,
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lfm2_parity/lfm2-chat-template.json");
+        if !path.exists() {
+            eprintln!(
+                "SKIP: lfm2 chat-template fixture absent ({})",
+                path.display()
+            );
+            return;
+        }
+        let doc: Doc = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+            .expect("lfm2 chat-template fixture parses");
+        assert!(!doc.cases.is_empty(), "fixture carries no cases");
+
+        for case in &doc.cases {
+            let messages: Vec<ChatMessage> = case
+                .messages
+                .iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                })
+                .collect();
+            assert_eq!(
+                super::render_lfm2_chatml_prompt(&messages),
+                case.applied_prompt,
+                "lfm2 renderer diverged from llama.cpp's applied template on case {:?}",
+                case.name
+            );
+            // The BOS is not renderer text; it must come from the tokenizer.
+            // Pin that split so a future "just prepend it in the renderer"
+            // change cannot silently double it.
+            assert!(
+                !case.applied_prompt.contains("<|startoftext|>"),
+                "case {:?}: applied template unexpectedly carries literal BOS text",
+                case.name
+            );
+            assert_eq!(
+                case.prompt_ids.first().copied(),
+                Some(124_894),
+                "case {:?}: reference ids must begin with the LFM2 BOS",
+                case.name
+            );
+        }
+    }
+
     #[test]
     fn completions_fail_closed_for_runnable_serve_archs() {
         // Runnable-served archs have no raw-completions bridge: the gate must
@@ -8083,6 +8166,10 @@ mod gemma4_template_tests {
             for q8 in [false, true] {
                 assert!(bridge("qwen35", capable, q8));
                 assert!(bridge("gemma2", capable, q8));
+                // lfm2 joined the bridge-only set with the short-conv
+                // bring-up: its conv layers carry no attn_q/k/v, so no
+                // optimized lane can run it on any host.
+                assert!(bridge("lfm2", capable, q8));
                 for arch in ["llama", "qwen3", "mistral", "gemma4", ""] {
                     assert!(!bridge(arch, capable, q8), "{arch:?} must stay open");
                 }
@@ -9724,6 +9811,59 @@ fn render_ornith_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) 
     prompt
 }
 
+/// Render an LFM2 / LFM2.5 chat prompt, faithful to the GGUF's own template.
+///
+/// LFM2.5's template (`tokenizer.chat_template` on the published row) is plain
+/// ChatML with two properties that the Ornith/qwen35 renderer does NOT share,
+/// which is why LFM2 needs its own:
+///
+///  1. It opens with `{{- bos_token -}}`. The BOS is supplied by the tokenizer
+///     via `add_special` (see `prepare_runnable_prompt`), not emitted as literal
+///     text here — same discipline as the gemma renderer.
+///  2. Its generation prompt is `<|im_start|>assistant\n<think>` — it ALWAYS
+///     opens a reasoning block, and the template offers no thinking-disabled
+///     variant. Injecting qwen3's closed `<think>\n\n</think>\n\n` block (what
+///     `render_ornith_chatml_prompt` does when thinking is off) is a different
+///     model's convention and is not what these weights were trained on.
+///
+/// Because the opening `<think>` is part of the PROMPT, the model's completion
+/// has the shape `REASONING</think>\n\nCONTENT`, which is exactly what
+/// [`split_ornith_generation`] already parses.
+fn render_lfm2_chatml_prompt(messages: &[ChatMessage]) -> String {
+    // The template drops the reasoning of any assistant turn that PRECEDES the
+    // last user turn: `keep_thinking = preserve_thinking or loop.index0 >
+    // ns.last_user_index`, and when that is false it rewrites the content to
+    // `content.split("</think>")[-1] | trim`. `preserve_thinking` defaults to
+    // false, so stale reasoning must not be replayed into the prompt.
+    //
+    // Camelid's bridge already splits reasoning out into `reasoning_content`,
+    // so a well-behaved client never sends `</think>` back inside `content`.
+    // Mirroring the template here means a client that DOES still gets the
+    // reference prompt instead of a silently divergent one.
+    let last_user_index = messages
+        .iter()
+        .rposition(|message| message.role.trim() == "user");
+    let mut prompt = String::new();
+    let mut append_generation_prompt = true;
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.role.trim();
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        let keep_thinking = last_user_index.is_none_or(|last| index > last);
+        match (role, message.content.rsplit_once("</think>")) {
+            ("assistant", Some((_, after))) if !keep_thinking => prompt.push_str(after.trim()),
+            _ => prompt.push_str(&message.content),
+        }
+        prompt.push_str("<|im_end|>\n");
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n<think>");
+    }
+    prompt
+}
+
 /// Render an Ornith/qwen35 ChatML prompt with tool definitions, faithful to the GGUF
 /// template's tools system block + custom `<function=â€¦>` instructions. `tools` are the
 /// flat function objects (`{name,description,parameters}`). Tool results (`role:"tool"`)
@@ -10105,7 +10245,13 @@ fn prepare_runnable_prompt(
         .flat_map(|message| message.image_urls.iter().map(String::as_str))
         .collect();
     if image_urls.is_empty() {
-        let add_special = runtime.architecture == "gemma2" || runtime.architecture == "gemma3";
+        // `add_special` is what supplies the leading BOS. gemma needs it; so
+        // does lfm2 — LFM2.5's chat template opens with `{{- bos_token -}}`
+        // (`<|startoftext|>`, id 124894), and the GGUF omits
+        // `tokenizer.ggml.add_bos_token` so the tokenizer's default `true`
+        // applies. Without this the whole prompt is shifted by a missing BOS
+        // and the forward diverges from the reference.
+        let add_special = matches!(runtime.architecture.as_str(), "gemma2" | "gemma3" | "lfm2");
         let ids = runtime
             .tokenizer
             .encode(prompt_text, add_special, true)
@@ -10215,6 +10361,14 @@ async fn runnable_chat_nonstreaming(
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "lfm2" {
+        // LFM2 has its own template AND its own tool-call envelope; borrowing
+        // the qwen35 tools renderer would emit a format these weights were
+        // never trained on. Fail closed until an LFM2 tool lane is proven.
+        if !tools.is_empty() {
+            return lfm2_runnable_lane_tools_rejection();
+        }
+        render_lfm2_chatml_prompt(&messages)
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -10348,6 +10502,14 @@ async fn runnable_chat_streaming(
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "lfm2" {
+        // LFM2 has its own template AND its own tool-call envelope; borrowing
+        // the qwen35 tools renderer would emit a format these weights were
+        // never trained on. Fail closed until an LFM2 tool lane is proven.
+        if !tools.is_empty() {
+            return lfm2_runnable_lane_tools_rejection();
+        }
+        render_lfm2_chatml_prompt(&messages)
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -18926,6 +19088,23 @@ fn gemma_runnable_lane_tools_rejection() -> Response {
     )
 }
 
+/// The single construction of the LFM2 runnable tool refusal, shared by the
+/// non-streaming and streaming bridges so the two cannot drift.
+///
+/// LFM2.5's template DOES have a tools branch, but it renders a
+/// model-specific tool-call envelope that Camelid neither emits nor lifts back
+/// into structured `tool_calls`. Rendering the qwen35 `<function=…>` format
+/// instead would put a foreign convention in front of these weights, so the
+/// lane fails closed until an LFM2 tool row is actually certified.
+fn lfm2_runnable_lane_tools_rejection() -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_tools",
+        "the lfm2 runnable serve lane does not support tools yet: LFM2's tool-call envelope differs from the qwen35 `<function=…>` format this lane lifts, and no LFM2 tool-call row is certified".to_string(),
+        None,
+    )
+}
+
 /// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
 /// `<end_of_turn>` turn markers plus the `first_user_prefix` system-folding
 /// variable (which distinguishes it from other turn-marker templates). Chat
@@ -25307,6 +25486,7 @@ mod tests {
             gemma3: None,
             gemma4: None,
             qwen35: None,
+            lfm2: None,
             mla: None,
         }
     }

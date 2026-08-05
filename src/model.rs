@@ -92,6 +92,11 @@ pub struct LlamaModelConfig {
     /// the per-layer recurrent/full-attention schedule that a dense Llama config
     /// cannot express. See [`Qwen35Metadata`].
     pub qwen35: Option<Qwen35Metadata>,
+    /// LFM2 / LFM2.5 (`general.architecture = "lfm2"`) hybrid short-convolution
+    /// metadata. `None` for every other architecture. Holds the short-conv
+    /// kernel width and the per-layer conv/attention schedule that a dense
+    /// Llama config cannot express. See [`Lfm2Metadata`].
+    pub lfm2: Option<Lfm2Metadata>,
     /// Multi-Head Latent Attention (MLA) metadata for DeepSeek models.
     pub mla: Option<MlaMetadata>,
 }
@@ -119,6 +124,16 @@ pub struct LlamaModelConfig {
 /// attemptable and its NoPE schedule matches the reference graph" — NOT that
 /// smollm3 is supported. No ledger row claims it, and none should be added until
 /// a receipt exists.
+///
+/// NOTE on `lfm2` (and `qwen35`): these are NOT dense decoders. LFM2 interleaves
+/// double-gated short-convolution blocks with GQA attention, so its only correct
+/// forward lives in the runnable lane ([`is_runnable_only_arch`]); it is listed
+/// here because `from_gguf` must still parse it to build the config that lane
+/// consumes. Unlike smollm3, lfm2 DOES have a greedy-parity receipt — token
+/// identity vs llama.cpp b9632 on the LFM2.5-2.6B Q8_0 row
+/// (`tests/lfm2_parity.rs`, `qa/runnable/lfm2-parity.json`). That receipt proves
+/// the forward GRAPH only; tokenizer parity and chat-template fidelity are
+/// separate gates and no row should claim them off it.
 pub fn is_implemented_architecture(architecture: &str) -> bool {
     matches!(
         architecture,
@@ -141,8 +156,11 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 /// correctly. gemma2: the binder still silently drops its sandwich norms, and
 /// the dense forward lacks its soft-caps and alternating-attention schedule.
 /// qwen35: the hybrid gated-delta-net layers do not fit the dense tensor map
-/// at all. Every lane that would construct a direct dense session for these
-/// archs must fail closed instead of decoding fluent-looking garbage.
+/// at all. lfm2: same shape — its short-conv layers carry
+/// `shortconv.{conv,in_proj,out_proj}` and no `attn_q/k/v`, so the dense
+/// binding cannot bind them (BACKEND_ASKS RA-6b). Every lane that would
+/// construct a direct dense session for these archs must fail closed instead
+/// of decoding fluent-looking garbage.
 ///
 /// gemma3 LEFT this set in Phase 3b of the Metal campaign: the Metal-resident
 /// forward carries its full structure (QK + sandwich norms, GeGLU, dual-theta
@@ -153,7 +171,7 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 /// lanes now key on. The CPU dense forward remains WRONG for gemma3 (no
 /// window mask; hazard H4) and fails closed at forward dispatch.
 pub fn is_runnable_only_arch(architecture: &str) -> bool {
-    matches!(architecture, "qwen35" | "gemma2")
+    matches!(architecture, "qwen35" | "gemma2" | "lfm2")
 }
 
 /// Capability-aware serve/direct-session routing predicate (gemma3→Metal
@@ -166,7 +184,7 @@ pub fn is_runnable_only_arch(architecture: &str) -> bool {
 /// archs at every per-layer dispatch (hazard H4), so a routing mistake
 /// surfaces as a typed error instead of fluent-looking full-causal garbage.
 ///
-/// - qwen35 / gemma2: always true ([`is_runnable_only_arch`]).
+/// - qwen35 / gemma2 / lfm2: always true ([`is_runnable_only_arch`]).
 /// - a Q8_0 gemma3: true only where the Metal-resident lane cannot serve it
 ///   (non-macOS hosts, `CAMELID_METAL_RESIDENT_DECODE=0` / deterministic
 ///   mode, no Metal device, or a CUDA-resident process — the CUDA engine has
@@ -363,6 +381,7 @@ impl LlamaModelConfig {
         let gemma3 = Gemma3Metadata::from_gguf(gguf, architecture)?;
         let gemma4 = Gemma4Metadata::from_gguf(gguf, architecture);
         let qwen35 = Qwen35Metadata::from_gguf(gguf, architecture);
+        let lfm2 = Lfm2Metadata::from_gguf(gguf, architecture);
 
         let attention_head_count = required_u32(
             gguf,
@@ -373,9 +392,16 @@ impl LlamaModelConfig {
         // `Gemma4Metadata` (`ffn_length_at`/`kv_heads_at`); these config scalars
         // hold the per-layer MAX so generic sizing stays safe. Gemma 4 forward
         // paths must use the per-layer accessors, never these scalars.
-        let attention_head_count_kv = match gemma4.as_ref() {
-            Some(g) => g.max_kv_heads(),
-            None => llama_attention_head_count_kv(gguf, architecture, attention_head_count),
+        // LFM2 carries the same per-layer `attention.head_count_kv` array shape,
+        // but its zeros are STRUCTURAL (they mark conv layers, not a KV width).
+        // Taking the max skips them so the scalar describes the attention
+        // layers; `Lfm2Metadata` holds the per-layer truth. A plain
+        // `metadata_u32` read here would miss the array entirely and fall back
+        // to `attention_head_count` (32 instead of 8 for LFM2.5-2.6B).
+        let attention_head_count_kv = match (gemma4.as_ref(), lfm2.as_ref()) {
+            (Some(g), _) => g.max_kv_heads(),
+            (None, Some(l)) => l.max_kv_heads(),
+            (None, None) => llama_attention_head_count_kv(gguf, architecture, attention_head_count),
         };
         let feed_forward_length = match gemma4.as_ref() {
             Some(g) if g.max_ffn_length() > 0 => g.max_ffn_length(),
@@ -467,6 +493,7 @@ impl LlamaModelConfig {
             gemma3,
             gemma4,
             qwen35,
+            lfm2,
             mla: MlaMetadata::from_gguf(gguf, architecture),
         })
     }
@@ -1243,16 +1270,93 @@ impl Qwen35Metadata {
     }
 }
 
-/// NEOX split-half RoPE pairing per architecture: qwen2/qwen3/qwen35 and phi3
-/// (unpermuted weights;
+/// LFM2 / LFM2.5 (`general.architecture = "lfm2"`) hybrid short-convolution
+/// metadata. `None` for every other architecture.
+///
+/// LFM2 interleaves **double-gated short convolution** blocks with GQA
+/// attention blocks. The conv layers carry `shortconv.{conv,in_proj,out_proj}`
+/// and **no `attn_q/k/v` at all**, so a dense Llama tensor map cannot express
+/// the model — the same shape as qwen35, and the reason `lfm2` is classified
+/// [`is_runnable_only_arch`].
+///
+/// The per-layer schedule is NOT a separate key: llama.cpp derives it from the
+/// per-layer `attention.head_count_kv` array, where a **0 marks a conv layer**
+/// (`src/models/lfm2.cpp:10` — `is_recr_impl[il] = n_head_kv(il) == 0`), which
+/// the converter writes from `layer_types` (`conversion/lfm2.py:36-39`). That
+/// zero is also why the scalar `attention_head_count_kv` on
+/// [`LlamaModelConfig`] must come from [`Self::max_kv_heads`] and never from
+/// the raw array: a 0 would size the attention layers' KV to nothing.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Lfm2Metadata {
+    /// Short-conv kernel width — GGUF `lfm2.shortconv.l_cache` (3 for every
+    /// published LFM2 row). The rolling conv state is `l_cache - 1` wide;
+    /// llama.cpp asserts `l_cache > 1` (`lfm2.cpp:167`).
+    pub shortconv_l_cache: u32,
+    /// Per-layer KV head count, verbatim from the GGUF array. `0` entries are
+    /// conv layers; non-zero entries are GQA attention layers.
+    pub kv_heads_per_layer: Vec<u32>,
+    /// Per-layer schedule: `true` = short-conv (recurrent), `false` = attention.
+    pub layer_is_conv: Vec<bool>,
+}
+
+impl Lfm2Metadata {
+    pub fn from_gguf(gguf: &GgufFile, architecture: &str) -> Option<Self> {
+        if architecture != "lfm2" {
+            return None;
+        }
+        let key = |suffix: &str| architecture_key(architecture, suffix);
+        let block_count = gguf.metadata_u32(&key("block_count")).unwrap_or(0);
+        let head_count = gguf.metadata_u32(&key("attention.head_count")).unwrap_or(0);
+        // Per-layer-or-scalar, mirroring `Gemma4Metadata`: a scalar broadcasts,
+        // an array must cover every layer to be honored. A file that honors
+        // neither shape falls back to the scalar head count, which makes every
+        // layer look like attention and fails loudly at conv-tensor binding
+        // rather than silently skipping the conv schedule.
+        let kv_heads_per_layer =
+            if let Some(scalar) = gguf.metadata_u32(&key("attention.head_count_kv")) {
+                vec![scalar; block_count as usize]
+            } else {
+                match gguf.metadata_array_u32_optional(&key("attention.head_count_kv")) {
+                    Ok(Some(values)) if values.len() == block_count as usize => values,
+                    _ => vec![head_count; block_count as usize],
+                }
+            };
+        let layer_is_conv = kv_heads_per_layer.iter().map(|&kv| kv == 0).collect();
+        Some(Self {
+            shortconv_l_cache: gguf.metadata_u32(&key("shortconv.l_cache")).unwrap_or(0),
+            kv_heads_per_layer,
+            layer_is_conv,
+        })
+    }
+
+    /// True if decoder layer `idx` is a short-conv (recurrent) layer.
+    pub fn is_conv_layer(&self, idx: usize) -> bool {
+        self.layer_is_conv.get(idx).copied().unwrap_or(false)
+    }
+
+    /// KV heads for the ATTENTION layers — the largest per-layer value, which
+    /// skips the conv layers' structural zeros. Used for the config scalar and
+    /// for generic KV sizing.
+    pub fn max_kv_heads(&self) -> u32 {
+        self.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// NEOX split-half RoPE pairing per architecture: qwen2/qwen3/qwen3moe/qwen35,
+/// phi3 and lfm2 (unpermuted weights;
 /// proven during MUSTER M-A2 — adjacent even/odd degenerates long generation,
 /// split-half restores coherence; the runnable lane independently asserts NEOX
 /// for phi3). Everything else keeps adjacent even/odd (LLaMA-style permuted
 /// conversions). Pure so the gate is unit-testable.
+///
+/// `lfm2` is NEOX per llama.cpp `llama-model.cpp:2477` (LLM_ARCH_LFM2 falls
+/// into the `LLAMA_ROPE_TYPE_NEOX` group at `:2492`), and its converter
+/// (`conversion/lfm2.py`) does not permute Q/K, so the split-half pairing is
+/// the one that matches the weights on disk.
 fn arch_uses_neox_rope_pairing(architecture: &str) -> bool {
     matches!(
         architecture,
-        "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "phi3"
+        "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "phi3" | "lfm2"
     )
 }
 
@@ -2622,7 +2726,121 @@ pub fn expand_fused_dense_tensors(gguf: &mut GgufFile, config: &LlamaModelConfig
 #[cfg(test)]
 mod tests {
     use super::validate_output_projection_storage_layout;
-    use crate::gguf::{GgufTensorDescriptor, GgufTensorType};
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+
+    /// Builds a bare `GgufFile` carrying only metadata — enough to exercise the
+    /// pure `*Metadata::from_gguf` parsers without touching a real file.
+    fn meta_only_gguf(pairs: Vec<(&str, GgufMetadataValue)>) -> GgufFile {
+        let mut gguf = GgufFile {
+            path: std::path::PathBuf::new(),
+            version: 3,
+            tensor_count: 0,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: Default::default(),
+            tensors: Vec::new(),
+        };
+        for (k, v) in pairs {
+            gguf.metadata.insert(k.to_string(), v);
+        }
+        gguf
+    }
+
+    /// The real LFM2.5-2.6B row: 30 layers, `head_count_kv` an **i32 array**
+    /// whose zeros mark the 22 short-conv layers and whose 8s mark the 8 GQA
+    /// layers (verbatim from the published GGUF).
+    fn lfm2_2_6b_kv_heads() -> Vec<i32> {
+        vec![
+            0, 0, 8, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 8, 0, 0, 8, 0,
+            0,
+        ]
+    }
+
+    #[test]
+    fn lfm2_metadata_reads_the_real_2_6b_row() {
+        let gguf = meta_only_gguf(vec![
+            ("lfm2.block_count", GgufMetadataValue::U32(30)),
+            ("lfm2.attention.head_count", GgufMetadataValue::U32(32)),
+            (
+                "lfm2.attention.head_count_kv",
+                GgufMetadataValue::Array(
+                    lfm2_2_6b_kv_heads()
+                        .into_iter()
+                        .map(GgufMetadataValue::I32)
+                        .collect(),
+                ),
+            ),
+            ("lfm2.shortconv.l_cache", GgufMetadataValue::U32(3)),
+        ]);
+        let meta = super::Lfm2Metadata::from_gguf(&gguf, "lfm2").expect("lfm2 metadata");
+
+        assert_eq!(meta.shortconv_l_cache, 3);
+        // 22 conv + 8 attention, matching the published "22 short-conv + 8 GQA".
+        assert_eq!(meta.layer_is_conv.iter().filter(|c| **c).count(), 22);
+        assert_eq!(meta.layer_is_conv.iter().filter(|c| !**c).count(), 8);
+        // Spot-check the schedule against the array: 0 => conv, 8 => attention.
+        assert!(meta.is_conv_layer(0));
+        assert!(meta.is_conv_layer(1));
+        assert!(!meta.is_conv_layer(2));
+        assert!(!meta.is_conv_layer(29 - 2)); // layer 27 carries 8 kv heads
+        assert!(meta.is_conv_layer(29));
+        // Out-of-range must not panic and must not claim a conv layer.
+        assert!(!meta.is_conv_layer(30));
+
+        // The scalar must skip the structural zeros — 8, never 0 and never the
+        // 32-head fallback. This is the value the KV cache is sized from.
+        assert_eq!(meta.max_kv_heads(), 8);
+    }
+
+    #[test]
+    fn lfm2_metadata_is_none_for_other_architectures() {
+        let gguf = meta_only_gguf(vec![("lfm2.shortconv.l_cache", GgufMetadataValue::U32(3))]);
+        assert!(super::Lfm2Metadata::from_gguf(&gguf, "llama").is_none());
+        assert!(super::Lfm2Metadata::from_gguf(&gguf, "qwen35").is_none());
+        assert!(super::Lfm2Metadata::from_gguf(&gguf, "lfm2").is_some());
+    }
+
+    #[test]
+    fn lfm2_scalar_head_count_kv_broadcasts() {
+        // A hypothetical all-attention LFM2 row carrying a SCALAR head_count_kv
+        // must broadcast to every layer and report zero conv layers, rather
+        // than falling through the array arm to the head-count default.
+        let gguf = meta_only_gguf(vec![
+            ("lfm2.block_count", GgufMetadataValue::U32(4)),
+            ("lfm2.attention.head_count", GgufMetadataValue::U32(32)),
+            ("lfm2.attention.head_count_kv", GgufMetadataValue::U32(8)),
+            ("lfm2.shortconv.l_cache", GgufMetadataValue::U32(3)),
+        ]);
+        let meta = super::Lfm2Metadata::from_gguf(&gguf, "lfm2").expect("lfm2 metadata");
+        assert_eq!(meta.kv_heads_per_layer, vec![8, 8, 8, 8]);
+        assert!(meta.layer_is_conv.iter().all(|c| !*c));
+        assert_eq!(meta.max_kv_heads(), 8);
+    }
+
+    #[test]
+    fn lfm2_short_array_falls_back_instead_of_mis_scheduling() {
+        // An array that does not cover every layer must NOT be honored — a
+        // partial schedule would silently mark real attention layers as conv
+        // and bind the wrong tensors. Falling back to the head-count default
+        // yields an all-attention schedule, which fails loudly at conv-tensor
+        // binding instead.
+        let gguf = meta_only_gguf(vec![
+            ("lfm2.block_count", GgufMetadataValue::U32(30)),
+            ("lfm2.attention.head_count", GgufMetadataValue::U32(32)),
+            (
+                "lfm2.attention.head_count_kv",
+                GgufMetadataValue::Array(vec![
+                    GgufMetadataValue::I32(0),
+                    GgufMetadataValue::I32(8),
+                ]),
+            ),
+            ("lfm2.shortconv.l_cache", GgufMetadataValue::U32(3)),
+        ]);
+        let meta = super::Lfm2Metadata::from_gguf(&gguf, "lfm2").expect("lfm2 metadata");
+        assert_eq!(meta.kv_heads_per_layer.len(), 30);
+        assert!(meta.layer_is_conv.iter().all(|c| !*c));
+    }
 
     #[test]
     fn neox_rope_pairing_covers_exactly_the_proven_archs() {
@@ -2636,6 +2854,10 @@ mod tests {
         assert!(super::arch_uses_neox_rope_pairing("qwen35"));
         assert!(super::arch_uses_neox_rope_pairing("phi3"));
         assert!(super::arch_uses_neox_rope_pairing("qwen2"));
+        // lfm2: llama.cpp classifies LLM_ARCH_LFM2 as LLAMA_ROPE_TYPE_NEOX
+        // (`llama-model.cpp:2477` → `:2492`) and its converter leaves Q/K
+        // unpermuted, so split-half is what the on-disk weights expect.
+        assert!(super::arch_uses_neox_rope_pairing("lfm2"));
         assert!(!super::arch_uses_neox_rope_pairing("llama"));
         assert!(!super::arch_uses_neox_rope_pairing("mistral"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma3"));
@@ -2669,12 +2891,13 @@ mod tests {
     #[test]
     fn runnable_only_arch_set_is_exactly_the_unconditional_bridge_set() {
         // These archs have no correct optimized forward on ANY host: gemma2's
-        // sandwich norms are still dropped at bind, and qwen35's hybrid layers
-        // do not fit the dense tensor map — so every direct dense-session lane
-        // fails closed for them instead of decoding fluent-looking garbage.
-        // gemma3 left this set in Phase 3b of the Metal campaign (its routing
-        // is capability-aware — pinned by the split test below).
-        for arch in ["qwen35", "gemma2"] {
+        // sandwich norms are still dropped at bind, and qwen35's + lfm2's
+        // hybrid layers do not fit the dense tensor map — so every direct
+        // dense-session lane fails closed for them instead of decoding
+        // fluent-looking garbage. gemma3 left this set in Phase 3b of the Metal
+        // campaign (its routing is capability-aware — pinned by the split test
+        // below).
+        for arch in ["qwen35", "gemma2", "lfm2"] {
             assert!(
                 super::is_runnable_only_arch(arch),
                 "{arch} must be classified runnable-lane-only"
@@ -2682,7 +2905,7 @@ mod tests {
         }
         for arch in [
             "llama", "mistral", "qwen2", "qwen3", "qwen3moe", "smollm3", "gemma3", "gemma4",
-            "phi3", "lfm2", "",
+            "phi3", "",
         ] {
             assert!(
                 !super::is_runnable_only_arch(arch),

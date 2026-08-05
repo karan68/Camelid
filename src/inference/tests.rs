@@ -1438,6 +1438,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let dense_vector = |name: &str| CpuTensor::from_f32(name, vec![32], vec![1.0; 32]).unwrap();
@@ -1553,6 +1554,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let dense_vector = |name: &str| CpuTensor::from_f32(name, vec![32], vec![1.0; 32]).unwrap();
@@ -8880,6 +8882,7 @@ fn applies_rope_to_each_attention_head() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
@@ -8926,6 +8929,7 @@ fn apply_rope_uses_configured_frequency_base() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -8982,6 +8986,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -9042,6 +9047,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -9109,6 +9115,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
@@ -9181,6 +9188,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 0.0]).unwrap();
@@ -9267,6 +9275,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 2], vec![1.0, 0.0]).unwrap();
@@ -9352,6 +9361,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 2], vec![1.0, 0.0]).unwrap();
@@ -10973,6 +10983,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
@@ -11268,6 +11279,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
@@ -11503,6 +11515,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let layer = LlamaLayerWeights {
@@ -11622,6 +11635,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let kv_cache = LlamaKvCache::new(
@@ -11778,6 +11792,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
@@ -12668,6 +12683,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let n = 7;
