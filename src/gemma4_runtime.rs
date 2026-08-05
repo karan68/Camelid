@@ -1111,6 +1111,7 @@ impl GhostMoeExpertCache {
     /// frequency, recency, or observable hit/miss counters. The persistent
     /// Metal lane uses this only as a slot-fill source: routing remains owned by
     /// the normal caller, and a miss falls through to direct positioned I/O.
+    #[cfg(any(target_os = "macos", test))]
     fn peek_resident(&self, layer: usize, expert: usize) -> Option<Arc<GhostMoeExpert>> {
         self.state
             .lock()
@@ -1304,6 +1305,7 @@ fn ghost_metal_slots_per_layer_from_env() -> usize {
     slots
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GhostMetalSlotEntry {
     expert: usize,
@@ -1323,6 +1325,7 @@ struct GhostMetalSlotEntry {
 /// experts cannot evict one of its own earlier selections while filling later
 /// misses. Eviction chooses the least frequently used unpinned slot and uses
 /// oldest access as its stable tie-break.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct GhostMetalSlotDirectory {
     entries: Vec<Option<GhostMetalSlotEntry>>,
@@ -1330,6 +1333,7 @@ struct GhostMetalSlotDirectory {
     accesses: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GhostMetalSlotLoad {
     slot: usize,
@@ -1338,6 +1342,7 @@ struct GhostMetalSlotLoad {
     last_used: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, PartialEq, Eq)]
 struct GhostMetalSlotPlan {
     /// Slot IDs in the router's original top-k order.
@@ -1352,6 +1357,7 @@ struct GhostMetalSlotPlan {
     evictions: usize,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl GhostMetalSlotDirectory {
     fn new(slot_count: usize) -> Self {
         Self {
@@ -2248,11 +2254,13 @@ fn packed_band_matvec(packed: &crate::tensor::Q4_0PackedRows8, xq: &[Q8_0Block])
 /// live, so this must be evaluated at each use rather than latched when the model
 /// loads. Deterministic mode remains authoritative even if the runtime switch is
 /// subsequently turned back on.
+#[cfg(any(target_os = "macos", test))]
 #[inline]
 fn ghost_metal_acceleration_allowed(deterministic: bool, runtime_gpu_enabled: bool) -> bool {
     !deterministic && runtime_gpu_enabled
 }
 
+#[cfg(target_os = "macos")]
 #[inline]
 fn ghost_metal_acceleration_enabled() -> bool {
     ghost_metal_acceleration_allowed(
