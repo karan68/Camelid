@@ -77,7 +77,7 @@ impl RuntimeConfig {
                 1,
                 MAX_CONTINUOUS_BATCH_SLOTS,
             ),
-            kquant_prefill_owner: env_flag_default_off(KQUANT_PREFILL_OWNER_ENV),
+            kquant_prefill_owner: kquant_prefill_owner_default(),
             moe_expert_storage: moe_expert_storage_from_env(),
             mixtral_long_generation: env_flag_default_off(MIXTRAL_LONG_GENERATION_ENV),
         }
@@ -153,6 +153,31 @@ pub fn env_flag_default_off(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A shipped default that only an explicit, recognised value can switch off, so
+/// a typo cannot silently disable something that was promoted on measurement.
+pub fn env_flag_default_on(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            !(value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("disabled"))
+        })
+        .unwrap_or(true)
+}
+
+/// Default-on only for `win-x86_64`, the platform the promotion receipt
+/// measured. Every other target keeps the owner opt-in until one is measured.
+fn kquant_prefill_owner_default() -> bool {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        env_flag_default_on(KQUANT_PREFILL_OWNER_ENV)
+    } else {
+        env_flag_default_off(KQUANT_PREFILL_OWNER_ENV)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +211,9 @@ mod tests {
                 ngram_index_max_entries: DEFAULT_NGRAM_INDEX_MAX_ENTRIES,
                 kv_pool_budget_bytes: DEFAULT_KV_POOL_BUDGET_BYTES,
                 continuous_batch_slots: DEFAULT_CONTINUOUS_BATCH_SLOTS,
-                kquant_prefill_owner: false,
+                // Unrecognised is not "off" for this one: it is default-on where the
+                // promotion was measured, and a typo must not disable that.
+                kquant_prefill_owner: cfg!(all(target_os = "windows", target_arch = "x86_64")),
                 moe_expert_storage: MoeExpertStorage::FileBacked,
                 mixtral_long_generation: false,
             }
@@ -240,5 +267,32 @@ mod tests {
         ] {
             env::remove_var(key);
         }
+    }
+
+    /// The owner ships on for win-x86_64, so the operator needs a switch that
+    /// actually restores the previous path -- and it has to be an explicit word,
+    /// not any stray value.
+    #[test]
+    fn kquant_owner_default_is_scoped_and_can_be_switched_off() {
+        let _guard = crate::test_support::env_lock();
+        env::remove_var(KQUANT_PREFILL_OWNER_ENV);
+        let promoted = cfg!(all(target_os = "windows", target_arch = "x86_64"));
+        assert_eq!(RuntimeConfig::from_env().kquant_prefill_owner, promoted);
+
+        for off in ["0", "false", "off", "no", "disabled", "OFF", " off "] {
+            env::set_var(KQUANT_PREFILL_OWNER_ENV, off);
+            assert!(
+                !RuntimeConfig::from_env().kquant_prefill_owner,
+                "{off:?} must switch the owner off on every target"
+            );
+        }
+        for on in ["1", "true", "on", "yes", "enabled"] {
+            env::set_var(KQUANT_PREFILL_OWNER_ENV, on);
+            assert!(
+                RuntimeConfig::from_env().kquant_prefill_owner,
+                "{on:?} must switch the owner on on every target"
+            );
+        }
+        env::remove_var(KQUANT_PREFILL_OWNER_ENV);
     }
 }

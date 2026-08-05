@@ -20005,8 +20005,11 @@ fn matmul_rhs_transposed_q4_k_block_dot(
 }
 
 /// STAMPEDE Phase 3 Lane B — batched K-quant (Q4_K + Q6_K) prefill owner
-/// flag. Default OFF (opt-in until receipts flip it):
-/// `CAMELID_X86_KQUANT_MATMUL_OWNER=1|on`. The shared telemetry counter
+/// flag. **Default ON for `win-x86_64`** (promoted on the 2026-08-04 receipt);
+/// opt-in everywhere else. Kill switch:
+/// `CAMELID_X86_KQUANT_MATMUL_OWNER=0|false|off|no|disabled`; any other value
+/// leaves a promoted default on, so a typo cannot silently disable it.
+/// The shared telemetry counter
 /// `kquant_owner_prefill_taken` counts dispatches of BOTH quants.
 /// Honors the bench sweep's uncached-plan bypass so in-process A/B configs
 /// take effect (the same fake-null trap as the Q8 owner sweep).
