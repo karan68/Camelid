@@ -18,6 +18,8 @@ Desktop app, browser chat, terminal UI, and an OpenAI-compatible API—all backe
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
+<div align="center"><sub>Camelid's local web UI—a dark, collapsed-rail chat surface served directly from the engine binary.</sub></div>
+
 Camelid loads GGUF models and runs inference on your hardware. Its tokenizer, model loader, CPU kernels, and Metal and CUDA execution paths are implemented in this repository and distributed as a single Rust binary—no Python, Node.js, or Docker is required at runtime.
 
 ## What is Camelid?
@@ -136,12 +138,25 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 
 The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Command R requires a workstation-class host.
 
+Experimental exception: the Gemma 4 26B MoE row can also run on a single 16 GB
+Apple-silicon Mac through the opt-in Ghost-MoE Metal lane, which repacks the routed experts into a
+paged `.cghost` artifact and keeps a bounded, persistent expert working set in unified memory
+(measured 17–20 tok/s steady-state decode on an M4). Replies on that lane are marked
+experimental with no parity guarantee. Setup, the recommended serve profile, and measured receipts
+live in [docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gemma-4-26b-a4b).
+
 The full catalog, exact hashes, supported execution paths, and claim boundaries live in:
 
 - [COMPATIBILITY.md](COMPATIBILITY.md)—authoritative supported-row ledger
 - [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md)—per-row support boundaries
 - [RECEIPTS.md](RECEIPTS.md)—reproducible validation receipts
 - [benchmarks](docs/benchmarks/BENCHMARKS.md)—recorded performance measurements
+
+Selected validation highlight:
+
+| Model row | Quant | Evidence |
+|---|---|---|
+| Mistral 7B Instruct v0.3 | Q8_0 | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
 
 ### PrismML Bonsai and vision
 

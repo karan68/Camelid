@@ -223,7 +223,7 @@ try {
       updated_at: '2026-05-13T04:21:00.000Z',
       messages: [
         { id: 'user-1', role: 'user', content: 'Create one self-contained HTML page', created_at: '2026-05-13T04:21:00.000Z' },
-        { id: 'assistant-1', role: 'assistant', content: '```html\n<!doctype html>\n<button id="go">Go</button>', streaming: true, streaming_phase: 'streaming', created_at: '2026-05-13T04:21:01.000Z', model_id: 'llama32_3b_instruct_q8_0', tokens_out_per_sec: 12.7 },
+        { id: 'assistant-1', role: 'assistant', content: '```html\n<!doctype html>\n<button id="go">Go</button>', streaming: true, streaming_phase: 'streaming', created_at: '2026-05-13T04:21:01.000Z', model_id: 'llama32_3b_instruct_q8_0', tokens_out_per_sec: 12.7, usage: { prompt_tokens: 24, completion_tokens: 7, total_tokens: 31 }, usage_source: 'client_estimate' },
       ],
     },
     selectedModel,
@@ -256,6 +256,7 @@ try {
   assert.match(streamingMarkup, /Generation details \(client-measured telemetry\)/, 'the meta footer should render during streaming as the live tok/s readout')
   assert.match(streamingMarkup, /13 tok\/s/, 'the streaming footer should show the live-patched output rate')
   assert.match(streamingMarkup, /End-to-end output rate, measured in this browser/, 'the browser output-rate hover must not imply decode-only timing')
+  assert.match(streamingMarkup, /tokens est\.[\s\S]*in 24[\s\S]*out 7/, 'the streaming footer should show live input and output token counts')
   assert.doesNotMatch(streamingMarkup, /cxturn__meta--reserve/, 'the invisible footer placeholder must not render; the live footer holds the layout slot itself')
 
   const activeSendStreamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {

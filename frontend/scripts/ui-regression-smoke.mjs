@@ -137,6 +137,8 @@ const systemViewSource = read('../src/views/SystemView.jsx')
 const modelsViewSource = read('../src/views/ModelsView.jsx')
 const topBarSource = read('../src/components/TopBar.jsx')
 const analyticsViewSource = read('../src/views/AnalyticsView.jsx')
+const runtimeMemoryPanelSource = read('../src/components/analytics/RuntimeMemoryPanel.jsx')
+const runtimeMemoryHookSource = read('../src/hooks/useRuntimeMemory.js')
 const capabilitiesSource = read('../src/lib/capabilities.js')
 const streamParserSource = read('../src/lib/chatCompletionStream.js')
 const evidenceChipSource = read('../src/components/ui/EvidenceChip.jsx')
@@ -152,10 +154,13 @@ const tokenizerPlaygroundSource = read('../src/components/models/TokenizerPlaygr
 const evidenceStatusSource = read('../src/lib/evidenceStatus.js')
 const useThemeSource = read('../src/hooks/useTheme.js')
 const mainSource = read('../src/main.jsx')
+const settingsViewSource = read('../src/views/SettingsView.jsx')
+const apiAuthSource = read('../src/lib/apiAuth.js')
 const tokensCss = read('../src/styles/tokens.css')
 const evidenceCss = read('../src/styles/evidence.css')
 const chatCss = read('../src/styles/chat.css')
 const uiCss = read('../src/styles/ui.css')
+const viewsCss = read('../src/styles/views.css')
 const statusSheets = ['../src/styles/ui.css', '../src/styles/shell.css', '../src/styles/chat.css', '../src/styles/views.css', '../src/styles/cluster.css', '../src/styles/observatory.css']
   .map((path) => [path, read(path)])
 
@@ -189,6 +194,9 @@ assert.match(messageTurnSource, /\{message\.role === 'assistant' && <MessageMeta
 assert.match(messageTurnSource, /title="End-to-end output rate, measured in this browser"/, 'the browser whole-request output metric must not be mislabeled as model decode throughput')
 assert.doesNotMatch(messageTurnSource, /title="Decode rate, measured in this browser"/, 'the footer must not call its end-to-end browser timing a decode-only rate')
 assert.match(diagnosticsSource, /End-to-end Output Rate/, 'developer diagnostics must use the same truthful browser-rate label')
+assert.match(messageTurnSource, /tokens est\.[\s\S]*in \{usage\.prompt_tokens\}[\s\S]*out \{usage\.completion_tokens/, 'the streaming footer should label live input and output token counts explicitly')
+assert.match(dashboardHookSource, /usage:\s*\{\s*prompt_tokens: promptTokenEstimate,\s*completion_tokens: 0,[\s\S]*usage_source: 'client_estimate'/, 'a new assistant row should expose input tokens and zero output tokens before the first streamed token')
+assert.match(dashboardHookSource, /completion_tokens: realTokens,[\s\S]*total_tokens: promptTokenEstimate \+ realTokens/, 'live assistant patches should advance output token usage during generation')
 assert.doesNotMatch(messageTurnSource, /cxturn__meta--reserve/, 'the invisible footer placeholder is gone; the live footer itself holds the layout slot')
 assert.doesNotMatch(read('../src/styles/chat.css'), /cxturn__meta--reserve/, 'the reserved-footer spacer css must not outlive the placeholder it styled')
 assert.match(messageTurnSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
@@ -310,6 +318,7 @@ const modelLanesSource = read('../src/lib/modelLanes.js')
 const laneRowsSource = read('../src/components/models/LaneRows.jsx')
 const catalogBrowseSource = read('../src/components/models/CatalogLaneBrowse.jsx')
 const downloadsPanelSource = read('../src/components/models/DownloadsPanel.jsx')
+const downloadedModelsViewSource = read('../src/views/DownloadedModelsView.jsx')
 const modelActivationSource = read('../src/lib/modelActivation.js')
 const firstRunCardSource = read('../src/components/onboarding/FirstRunCard.jsx')
 assert.match(modelsViewSource, /bucketByLane\(spine\.local\.models, capabilities\)/, 'Models section membership must be derived from the live scan + contract at render time')
@@ -376,6 +385,14 @@ assert.match(modelsViewSource, /Delete model from disk\?/, 'local model deletion
 assert.match(laneRowsSource, /entry\.delete_token/, 'delete controls must require the scan-issued opaque identity token')
 assert.match(laneRowsSource, /model-delete-guard/, 'disabled delete controls must reference visible guard copy')
 assert.match(downloadsPanelSource, /catalog\/downloads|bytes_downloaded/, 'download progress must come only from the backend downloads poll')
+assert.match(downloadedModelsViewSource, /loadLocalModelForChat\(/, 'each downloaded-model Load action must use the shared inspect-first activation protocol')
+assert.match(downloadedModelsViewSource, /unloadLocalModel\(\{ apiBase: spine\.base, modelId \}\)/, 'each downloaded-model Unload action must target that exact resident model')
+assert.match(downloadedModelsViewSource, /isActive \? spine\.current\?\.id : entry\.filename/, 'an auto-loaded active card must unload by its registry id even when GGUF metadata named it differently')
+assert.match(downloadedModelsViewSource, /spine\.loadedModelIds\.has\(entry\.filename\)/, 'card actions must use the full resident registry, including non-active sidecars')
+assert.match(downloadedModelsViewSource, />\s*Load\s*<\/Button>[\s\S]*>\s*Unload\s*<\/Button>/, 'every downloaded model card must expose both Load and Unload controls')
+assert.match(viewsCss, /\.downloaded-model \.cxv-card__foot\s*\{[^}]*flex-direction:\s*column/, 'downloaded-model metadata and actions must occupy separate footer rows')
+assert.match(viewsCss, /\.downloaded-model \.cxv-card__actions\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*160px\)\)[^}]*width:\s*100%[^}]*min-width:\s*0/, 'downloaded-model actions must use a bounded two-column grid instead of overflowing into adjacent cards')
+assert.match(viewsCss, /\.downloaded-model \.cxv-card__actions \.cxv-danger\s*\{\s*grid-column:\s*2/, 'downloaded-model Delete actions must stay aligned to the lower-right grid cell')
 
 /* ---- Model management (Phase 3) ---- */
 assert.match(modelInspectorSource, /not support evidence/, 'the model inspector must label its contents as descriptive, not support evidence')
@@ -552,6 +569,11 @@ assert.match(appSource, /camelid:open-ledger/, 'the app shell must listen for le
 
 /* ---- Analytics ---- */
 assert.match(analyticsViewSource, /displayCapabilityId\(feature\.id\)/, 'Analytics view should not render raw provider-scoped API feature ids')
+assert.match(analyticsViewSource, /<RuntimeMemoryPanel apiBase=\{apiBase\}/, 'Analytics must render live runtime memory from the configured Camelid API')
+assert.match(runtimeMemoryHookSource, /api\/runtime\/memory/, 'runtime memory must come from the backend rather than browser estimates')
+assert.match(runtimeMemoryHookSource, /api\/runtime\/kv-cache\/purge/, 'the KV purge control must call the dedicated cache-only endpoint')
+assert.match(runtimeMemoryPanelSource, /Model weights[\s\S]*KV cache/, 'Analytics runtime cards must show model and KV-cache memory')
+assert.match(runtimeMemoryPanelSource, /Purge KV cache/, 'Analytics runtime cards must provide a KV-cache purge action')
 
 /* ---- TopBar (re-baselined to the Evidence Chip gate) ---- */
 assert.match(topBarSource, /getChatGateState\(capabilities, selectedModel, runtime\)/, 'TopBar must derive its support claim from the shared chat gate')
@@ -590,6 +612,10 @@ assert.match(tokensCss, /--color-evidence:/, 'tokens must define the bounded-evi
 assert.match(mainSource, /@fontsource-variable\/inter/, 'body font must be self-hosted via Fontsource')
 assert.match(mainSource, /@fontsource\/ibm-plex-mono/, 'mono font must be self-hosted via Fontsource')
 assert.doesNotMatch(mainSource, /fonts\.googleapis|fonts\.gstatic/, 'no third-party font CDN calls')
+assert.match(mainSource, /installApiAuthFetch\(\)/, 'the UI must install authenticated API requests before rendering')
+assert.match(settingsViewSource, /type="password"[\s\S]*Save key/, 'Settings must provide an API-key control for authenticated backends')
+assert.match(apiAuthSource, /requestUrl\.origin !== apiOrigin/, 'API credentials must only be attached to the configured Camelid origin')
+assert.match(apiAuthSource, /headers\.set\('x-api-key', apiKey\)/, 'Camelid requests must include the stored API key')
 assert.match(useThemeSource, /return saved && VALID\.has\(saved\) \? saved : 'dark'/, 'theme preference must default to dark')
 
 /* ---- Brand hygiene across visible UI sources ---- */

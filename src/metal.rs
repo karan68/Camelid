@@ -68,6 +68,14 @@ struct MetalLinearKernel {
     /// partitioned across a SIMD group, but its f32 tail is the CPU oracle's
     /// eight lane accumulators followed by a sequential lane fold.
     q6k_linear_ordered_pipeline: ComputePipelineState,
+    /// Turbo (reassociated) Ghost-MoE siblings, opt-in via
+    /// `CAMELID_GEMMA4_GHOST_METAL_TURBO=1`: identical integer block dots but
+    /// per-lane f32 accumulation folded by `simd_sum`, trading the ordered
+    /// comparator's summation order for bandwidth.
+    q4_0_q8_turbo_pipeline: Option<ComputePipelineState>,
+    gemma4_q4_expert_gate_up_geglu_turbo_pipeline: Option<ComputePipelineState>,
+    gemma4_q4_expert_down_reduce_turbo_pipeline: Option<ComputePipelineState>,
+    q6k_linear_turbo_pipeline: Option<ComputePipelineState>,
     q4k_linear_simd_pipeline: ComputePipelineState,
     q6k_linear_simd_pipeline: ComputePipelineState,
     q4k_linear_tiled_pipeline: ComputePipelineState,
@@ -2865,6 +2873,238 @@ kernel void q6k_linear_ordered(
         float acc = 0.0f;
         for (uint l = 0; l < 8; ++l) acc = acc + sums[l];
         output[row] = acc;
+    }
+}
+
+// ---- Turbo (reassociated) variants. Opt-in speed lane for the experimental
+// Ghost-MoE runtime: per-block integer dots are identical to the ordered
+// kernels, but each lane keeps a private f32 accumulator and the row total is
+// a cross-lane simd_sum, so f32 summation order differs from the CPU
+// comparator. Gated behind CAMELID_GEMMA4_GHOST_METAL_TURBO=1; the ordered
+// kernels above remain the default and the parity reference.
+//
+// The turbo kernels batch FOUR output rows onto each SIMD group (four SIMD
+// groups per 128-wide threadgroup, sixteen rows per threadgroup). The single
+// dominant inefficiency of the one-row-per-simdgroup shape is that every row
+// re-reads the whole shared activation: batching four rows amortizes each
+// activation load across four weight-row dots, cutting total streamed bytes by
+// nearly half for the expert/head geometries.
+
+kernel void q4_0_q8_rows_turbo(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_bytes [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& tokens [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const ulong total_rows = ulong(rows) * ulong(tokens);
+    const ulong row0 = (ulong(group) * 4ul + ulong(sgitg)) * 4ul;
+    if (row0 >= total_rows) return;
+    // Row batches never straddle tokens for the shapes this lane dispatches
+    // (rows is a multiple of 4); the guard below keeps ragged tails correct.
+    const uint token = uint(row0 / rows);
+    const uint row_base = uint(row0 - ulong(token) * rows);
+    const ulong input_block0 = ulong(token) * blocks_per_row;
+    const ulong input_quant0 = input_block0 * 32ul;
+    const uint batch = min(4u, rows - row_base);
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    for (uint b = lane; b < blocks_per_row; b += 32u) {
+        device const char* x = input_quants + input_quant0 + ulong(b) * 32ul;
+        const float in_scale = input_scales[input_block0 + b];
+        for (uint r = 0; r < batch; ++r) {
+            device const uchar* block = weight_bytes
+                + (ulong(row_base + r) * blocks_per_row + b) * 18ul;
+            const float weight_scale =
+                float(*reinterpret_cast<device const half*>(block));
+            int isum = 0;
+            for (uint j = 0; j < 16; ++j) {
+                const uint packed = uint(block[2 + j]);
+                isum += (int(packed & 0x0fu) - 8) * int(x[j]);
+                isum += (int(packed >> 4) - 8) * int(x[j + 16]);
+            }
+            const float term = (float(isum) * weight_scale) * in_scale;
+            if (r == 0) acc0 += term;
+            else if (r == 1) acc1 += term;
+            else if (r == 2) acc2 += term;
+            else acc3 += term;
+        }
+    }
+    const float s0 = simd_sum(acc0);
+    const float s1 = simd_sum(acc1);
+    const float s2 = simd_sum(acc2);
+    const float s3 = simd_sum(acc3);
+    if (lane == 0) {
+        device float* out = output + ulong(token) * rows + row_base;
+        out[0] = s0;
+        if (batch > 1) out[1] = s1;
+        if (batch > 2) out[2] = s2;
+        if (batch > 3) out[3] = s3;
+    }
+}
+
+kernel void gemma4_q4_expert_gate_up_geglu_turbo(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* slot_slab [[buffer(2)]],
+    device const uint* route_slots [[buffer(3)]],
+    device float* activated [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint total = G4Q4_ROUTES * G4Q4_FF;
+    const uint gid0 = (group * 4u + sgitg) * 4u;
+    if (gid0 >= total) return;
+    // G4Q4_FF is a multiple of 4, so a 4-channel batch never straddles routes.
+    const uint route = gid0 / G4Q4_FF;
+    const uint row0 = gid0 - route * G4Q4_FF;
+    const ulong slot_base = ulong(route_slots[route]) * G4Q4_SLOT_STRIDE;
+    device const uchar* rows_base = slot_slab + slot_base;
+    float gate_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float up_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint b = lane; b < G4Q4_GU_BLOCKS; b += 32u) {
+        for (uint r = 0; r < 4u; ++r) {
+            gate_acc[r] += gemma4_q4_expert_block_term_simd(
+                rows_base + ulong(row0 + r) * G4Q4_GU_ROW_BYTES,
+                input_scales, input_quants, b);
+            up_acc[r] += gemma4_q4_expert_block_term_simd(
+                rows_base + ulong(row0 + r + G4Q4_FF) * G4Q4_GU_ROW_BYTES,
+                input_scales, input_quants, b);
+        }
+    }
+    for (uint r = 0; r < 4u; ++r) {
+        const float gate = simd_sum(gate_acc[r]);
+        const float up = simd_sum(up_acc[r]);
+        if (lane == 0) {
+            const float inner =
+                0.7978845608f * (gate + 0.044715f * gate * gate * gate);
+            const float gelu =
+                0.5f * gate * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+            activated[gid0 + r] = gelu * up;
+        }
+    }
+}
+
+kernel void gemma4_q4_expert_down_reduce_turbo(
+    device const float* activation_scales [[buffer(0)]],
+    device const char* activation_quants [[buffer(1)]],
+    device const uchar* slot_slab [[buffer(2)]],
+    device const uint* route_slots [[buffer(3)]],
+    device const float* route_scales [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = (group * 4u + sgitg) * 4u;
+    if (row0 >= G4Q4_HIDDEN) return;
+    const uint terms = G4Q4_ROUTES * G4Q4_DOWN_BLOCKS;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint flat = lane; flat < terms; flat += 32u) {
+        const uint route = flat / G4Q4_DOWN_BLOCKS;
+        const uint b = flat - route * G4Q4_DOWN_BLOCKS;
+        const ulong slot_base = ulong(route_slots[route]) * G4Q4_SLOT_STRIDE;
+        device const uchar* rows_base = slot_slab + slot_base
+            + G4Q4_GATE_UP_BYTES + ulong(b) * G4Q4_WIRE;
+        device const char* x = activation_quants
+            + route * G4Q4_FF + b * 32u;
+        const float block_scale = activation_scales[route * G4Q4_DOWN_BLOCKS + b]
+            * route_scales[route];
+        for (uint r = 0; r < 4u; ++r) {
+            device const uchar* block =
+                rows_base + ulong(row0 + r) * G4Q4_DOWN_ROW_BYTES;
+            const float weight_scale =
+                float(*reinterpret_cast<device const half*>(block));
+            int isum = 0;
+            for (uint j = 0; j < 16; ++j) {
+                const uint packed = uint(block[2 + j]);
+                const int lo = int(packed & 0x0fu) - 8;
+                const int hi = int(packed >> 4) - 8;
+                isum += lo * int(x[j]);
+                isum += hi * int(x[j + 16]);
+            }
+            acc[r] += (float(isum) * weight_scale) * block_scale;
+        }
+    }
+    for (uint r = 0; r < 4u; ++r) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0) output[row0 + r] = total;
+    }
+}
+
+// Turbo Q6_K x Q8_K GEMV. Work is partitioned by quarter-superblock exactly as
+// in the ordered kernel; each lane folds its quarters' full sub-scaled integer
+// dot into a private f32 accumulator scaled by that superblock's d, and the
+// row total is one simd_sum.
+kernel void q6k_linear_turbo(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint row0 = (group * 4u + sgitg) * 4u;
+    if (row0 >= rows) return;
+    const uint batch = min(4u, rows - row0);
+    const uint units = n_sb * 4;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint u = lane; u < units; u += 32u) {
+        const uint sb = u >> 2;
+        const uint quarter = u & 3u;
+        const uint h = quarter >> 1;
+        const uint s = quarter & 1u;
+        device const char* y = input_quants + sb * 256 + h * 128;
+        const float in_scale = input_scales[sb];
+        for (uint r = 0; r < batch; ++r) {
+            device const uchar* block =
+                weight_blocks + (ulong(row0 + r) * n_sb + sb) * 210ul;
+            device const char* scales =
+                reinterpret_cast<device const char*>(block + 192);
+            const int s0 = int(scales[8 * h + s]);
+            const int s1 = int(scales[8 * h + s + 2]);
+            const int s2 = int(scales[8 * h + s + 4]);
+            const int s3 = int(scales[8 * h + s + 6]);
+            // The four 32-value groups of one quarter share their decode
+            // paths: offsets +0/+32/+64/+96 map to fixed (ql byte, nibble,
+            // qh shift) selections, so the value loop is branch-free with
+            // three weight byte loads per four decoded values.
+            device const uchar* ql = block + h * 64;
+            device const uchar* qh = block + 128 + h * 32;
+            int isum = 0;
+            for (uint l = 0; l < 16; ++l) {
+                const uint j = s * 16 + l;
+                const int qla = int(ql[j]);
+                const int qlb = int(ql[32 + j]);
+                const int qhv = int(qh[j]);
+                const int c0 = ((qla & 0x0f) | ((qhv & 3) << 4)) - 32;
+                const int c1 = ((qlb & 0x0f) | (((qhv >> 2) & 3) << 4)) - 32;
+                const int c2 = ((qla >> 4) | (((qhv >> 4) & 3) << 4)) - 32;
+                const int c3 = ((qlb >> 4) | (((qhv >> 6) & 3) << 4)) - 32;
+                isum += s0 * int(y[j]) * c0;
+                isum += s1 * int(y[j + 32]) * c1;
+                isum += s2 * int(y[j + 64]) * c2;
+                isum += s3 * int(y[j + 96]) * c3;
+            }
+            const float weight_scale =
+                float(*reinterpret_cast<device const half*>(block + 208));
+            acc[r] += (weight_scale * in_scale) * float(isum);
+        }
+    }
+    for (uint r = 0; r < 4u; ++r) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0 && r < batch) output[row0 + r] = total;
     }
 }
 "#;
@@ -7222,6 +7462,38 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q6k_linear_ordered_pipeline = device
                 .new_compute_pipeline_state_with_function(&q6k_linear_ordered_function)
                 .ok()?;
+            let q4_0_q8_turbo_pipeline = strict_q8k_library
+                .get_function("q4_0_q8_rows_turbo", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let gemma4_q4_expert_gate_up_geglu_turbo_pipeline = strict_q8k_library
+                .get_function("gemma4_q4_expert_gate_up_geglu_turbo", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let gemma4_q4_expert_down_reduce_turbo_pipeline = strict_q8k_library
+                .get_function("gemma4_q4_expert_down_reduce_turbo", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
+            let q6k_linear_turbo_pipeline = strict_q8k_library
+                .get_function("q6k_linear_turbo", None)
+                .ok()
+                .and_then(|function| {
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .ok()
+                });
             let q4k_linear_simd_function = library.get_function("q4k_linear_simd", None).ok()?;
             let q4k_linear_simd_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4k_linear_simd_function)
@@ -7310,6 +7582,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 gemma4_q4_expert_down_reduce_pipeline,
                 gemma4_q4_expert_down_reduce_simd_pipeline,
                 q6k_linear_ordered_pipeline,
+                q4_0_q8_turbo_pipeline,
+                gemma4_q4_expert_gate_up_geglu_turbo_pipeline,
+                gemma4_q4_expert_down_reduce_turbo_pipeline,
+                q6k_linear_turbo_pipeline,
                 q4k_linear_simd_pipeline,
                 q6k_linear_simd_pipeline,
                 q4k_linear_tiled_pipeline,
@@ -8923,14 +9199,23 @@ impl Gemma4Q4ExpertMetal {
         output: &Buffer,
         simd_fast: bool,
     ) {
-        let simd_pipeline = simd_fast
+        let turbo_pipeline = (simd_fast && gemma4_ghost_turbo_enabled())
+            .then(|| {
+                admitted_32_lane_pipeline(
+                    kernel.gemma4_q4_expert_down_reduce_turbo_pipeline.as_ref(),
+                )
+            })
+            .flatten();
+        let simd_pipeline = (simd_fast && turbo_pipeline.is_none())
             .then(|| {
                 admitted_32_lane_pipeline(
                     kernel.gemma4_q4_expert_down_reduce_simd_pipeline.as_ref(),
                 )
             })
             .flatten();
-        let pipeline = simd_pipeline.unwrap_or(&kernel.gemma4_q4_expert_down_reduce_pipeline);
+        let pipeline = turbo_pipeline
+            .or(simd_pipeline)
+            .unwrap_or(&kernel.gemma4_q4_expert_down_reduce_pipeline);
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(&self.activation_scales), 0);
         encoder.set_buffer(1, Some(&self.activation_quants), 0);
@@ -8938,7 +9223,9 @@ impl Gemma4Q4ExpertMetal {
         encoder.set_buffer(3, Some(&self.route_slots), 0);
         encoder.set_buffer(4, Some(&self.route_scales), 0);
         encoder.set_buffer(5, Some(output), 0);
-        if simd_pipeline.is_some() {
+        if turbo_pipeline.is_some() {
+            dispatch_four_simdgroup_rows(encoder, GEMMA4_Q4_EXPERT_HIDDEN);
+        } else if simd_pipeline.is_some() {
             encoder.set_threadgroup_memory_length(
                 0,
                 (GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS * std::mem::size_of::<f32>())
@@ -8988,7 +9275,18 @@ impl Gemma4Q4ExpertMetal {
         let command_buffer = kernel.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
-        let gate_pipeline = if simd_fast {
+        let turbo_gate = (simd_fast && gemma4_ghost_turbo_enabled())
+            .then(|| {
+                admitted_32_lane_pipeline(
+                    kernel
+                        .gemma4_q4_expert_gate_up_geglu_turbo_pipeline
+                        .as_ref(),
+                )
+            })
+            .flatten();
+        let gate_pipeline = if let Some(turbo) = turbo_gate {
+            turbo
+        } else if simd_fast {
             kernel
                 .gemma4_q4_expert_gate_up_geglu_simd_pipeline
                 .as_ref()
@@ -9002,7 +9300,9 @@ impl Gemma4Q4ExpertMetal {
         encoder.set_buffer(2, Some(&slots.slab), 0);
         encoder.set_buffer(3, Some(&self.route_slots), 0);
         encoder.set_buffer(4, Some(&self.activated), 0);
-        if simd_fast {
+        if turbo_gate.is_some() {
+            dispatch_four_simdgroup_rows(encoder, GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF);
+        } else if simd_fast {
             encoder.set_threadgroup_memory_length(
                 0,
                 (2 * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>()) as u64,
@@ -9045,7 +9345,9 @@ impl Gemma4Q4ExpertMetal {
             cpu_geglu_boundary: false,
         };
         Self::maybe_report(
-            if simd_fast {
+            if turbo_gate.is_some() {
+                "fused-turbo"
+            } else if simd_fast {
                 "fused-simd"
             } else {
                 "fused-scalar"
@@ -9207,7 +9509,18 @@ impl Gemma4Q4ExpertMetal {
         let encoder = command_buffer.new_compute_command_encoder();
         let scratch = common.moe.as_ref()?;
         let simd_fast = common.q4_simd_fast && gemma4_q4_simd_fast_available(kernel);
-        let gate_pipeline = if simd_fast {
+        let turbo_gate = (simd_fast && gemma4_ghost_turbo_enabled())
+            .then(|| {
+                admitted_32_lane_pipeline(
+                    kernel
+                        .gemma4_q4_expert_gate_up_geglu_turbo_pipeline
+                        .as_ref(),
+                )
+            })
+            .flatten();
+        let gate_pipeline = if let Some(turbo) = turbo_gate {
+            turbo
+        } else if simd_fast {
             kernel
                 .gemma4_q4_expert_gate_up_geglu_simd_pipeline
                 .as_ref()
@@ -9221,7 +9534,9 @@ impl Gemma4Q4ExpertMetal {
         encoder.set_buffer(2, Some(&slots.slab), 0);
         encoder.set_buffer(3, Some(&self.route_slots), 0);
         encoder.set_buffer(4, Some(&self.activated), 0);
-        if simd_fast {
+        if turbo_gate.is_some() {
+            dispatch_four_simdgroup_rows(encoder, GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_FF);
+        } else if simd_fast {
             encoder.set_threadgroup_memory_length(
                 0,
                 (2 * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>()) as u64,
@@ -9336,13 +9651,21 @@ fn encode_q6k_ordered_single(
     n_superblocks: usize,
     rows: usize,
 ) {
-    encoder.set_compute_pipeline_state(&kernel.q6k_linear_ordered_pipeline);
+    let turbo_pipeline = gemma4_ghost_turbo_enabled()
+        .then(|| admitted_32_lane_pipeline(kernel.q6k_linear_turbo_pipeline.as_ref()))
+        .flatten();
+    encoder
+        .set_compute_pipeline_state(turbo_pipeline.unwrap_or(&kernel.q6k_linear_ordered_pipeline));
     encoder.set_buffer(0, Some(input_scales), 0);
     encoder.set_buffer(1, Some(input_quants), 0);
     encoder.set_buffer(2, Some(weight), weight_offset);
     encoder.set_buffer(3, Some(output), 0);
     encoder.set_buffer(4, Some(scalar), 0);
     encoder.set_buffer(5, Some(scalar), 4);
+    if turbo_pipeline.is_some() {
+        dispatch_four_simdgroup_rows(encoder, rows);
+        return;
+    }
     let scratch_bytes = (n_superblocks * 8 * std::mem::size_of::<i32>()).next_multiple_of(16);
     assert_threadgroup_fits(
         &kernel.device,
@@ -9909,12 +10232,35 @@ impl Gemma4Q6KHead {
         // SAFETY: `wire_mmap_tensors` returns a page-aligned window entirely
         // inside `mmap`, which this struct retains for the buffer's lifetime.
         let weight_ptr = unsafe { mmap.base_ptr().add(tensor.window.aligned_offset as usize) };
-        let weight = kernel.device.new_buffer_with_bytes_no_copy(
-            weight_ptr.cast(),
-            tensor.window.len as u64,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        );
+        // Default: file-backed no-copy — zero load cost, but the pages are
+        // clean/evictable, so heavy expert paging can silently turn the head
+        // sweep into per-token SSD refaults. The opt-in resident copy pins the
+        // table in an owned allocation at the cost of one ~600 MB load copy.
+        let resident_head = std::env::var("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let weight = if resident_head {
+            let owned = kernel.device.new_buffer(
+                tensor.window.len as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            // SAFETY: source window is `len` readable bytes inside the mmap;
+            // destination is a fresh shared buffer of exactly `len` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    weight_ptr,
+                    owned.contents().cast::<u8>(),
+                    tensor.window.len as usize,
+                );
+            }
+            owned
+        } else {
+            kernel.device.new_buffer_with_bytes_no_copy(
+                weight_ptr.cast(),
+                tensor.window.len as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        };
         let shared = |bytes: usize| {
             kernel
                 .device
@@ -11286,6 +11632,17 @@ fn admitted_32_lane_pipeline(
     })
 }
 
+/// Opt-in reassociated-summation kernels for the experimental Ghost-MoE lane.
+/// Cached once: the flag participates in per-layer per-token dispatch choices.
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_ghost_turbo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// One admission decision covers the generic common-core row dot and both
 /// fixed-geometry expert row dots. Fused-fast falls back as a unit when any
 /// optional SIMD pipeline is unavailable or the device does not expose the
@@ -11313,6 +11670,26 @@ fn dispatch_one_simdgroup_per_row(encoder: &metal::ComputeCommandEncoderRef, row
         },
         metal::MTLSize {
             width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Turbo-kernel geometry: four SIMD groups per 128-wide threadgroup, four
+/// output rows per SIMD group (sixteen rows per threadgroup). The row batching
+/// amortizes shared-activation reads across weight rows; the width keeps
+/// enough traffic in flight to hide device-memory latency.
+#[cfg(target_os = "macos")]
+fn dispatch_four_simdgroup_rows(encoder: &metal::ComputeCommandEncoderRef, rows: usize) {
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(16) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
             height: 1,
             depth: 1,
         },
@@ -12223,12 +12600,18 @@ fn encode_gemma4_q4_0_q8_ordered_single(
     blocks_per_row: usize,
     fused_fast: bool,
 ) {
+    let turbo_pipeline = (fused_fast && gemma4_ghost_turbo_enabled())
+        .then(|| admitted_32_lane_pipeline(k.q4_0_q8_turbo_pipeline.as_ref()))
+        .flatten();
     let simd_scratch_bytes = blocks_per_row.checked_mul(std::mem::size_of::<f32>());
     let simd_pipeline = (fused_fast
+        && turbo_pipeline.is_none()
         && simd_scratch_bytes.is_some_and(|bytes| threadgroup_alloc_fits(&k.device, bytes)))
     .then(|| admitted_32_lane_pipeline(k.q4_0_q8_ordered_simd_pipeline.as_ref()))
     .flatten();
-    let pipeline = simd_pipeline.unwrap_or(&k.q4_0_q8_ordered_pipeline);
+    let pipeline = turbo_pipeline
+        .or(simd_pipeline)
+        .unwrap_or(&k.q4_0_q8_ordered_pipeline);
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(input_scales), 0);
     e.set_buffer(1, Some(input_quants), 0);
@@ -12237,7 +12620,9 @@ fn encode_gemma4_q4_0_q8_ordered_single(
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
     e.set_buffer(6, Some(scalar), 8);
-    if simd_pipeline.is_some() {
+    if turbo_pipeline.is_some() {
+        dispatch_four_simdgroup_rows(e, rows);
+    } else if simd_pipeline.is_some() {
         e.set_threadgroup_memory_length(
             0,
             simd_scratch_bytes.expect("admitted SIMD Q4 scratch length") as u64,

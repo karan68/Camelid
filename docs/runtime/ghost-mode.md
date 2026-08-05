@@ -116,27 +116,44 @@ cargo run --release --bin camelid -- ghost-run \
 ```
 
 On Apple silicon, the browser UI/API can use persistent routed-expert slots, fused expert kernels,
-and the file-backed Q6_K tied head. This is the fastest measured profile on the tested 16 GiB M4:
+and the Q6_K tied head on Metal. This is the fastest measured profile on the tested 16 GiB M4:
 
 ```bash
 CAMELID_GEMMA4_GHOST_METAL_SLOTS=1 \
 CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST=1 \
-CAMELID_GEMMA4_GHOST_METAL_COMMON=0 \
-CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER=24 \
+CAMELID_GEMMA4_GHOST_METAL_TURBO=1 \
+CAMELID_GEMMA4_GHOST_METAL_COMMON=1 \
+CAMELID_GEMMA4_GHOST_METAL_CONTEXT=1024 \
+CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER=80 \
+CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT=1 \
 CAMELID_GEMMA4_GHOST_READ_THREADS=4 \
 cargo run --release --bin camelid -- serve --gpu on \
   --model models/gemma-4-26B_q4_0-it.gguf \
   --cghost models/gemma-4-26B_q4_0-it.cghost \
-  --expert-cache-mib 1024
+  --expert-cache-mib 64
 ```
 
-The profile above is hybrid: common-core math stays on CPU while the selected Q4_0 experts and
-exact ordered Q6_K head run on Metal. To exercise the complete Metal common core and its
-4,096-position f32 KV cache, set `CAMELID_GEMMA4_GHOST_METAL_COMMON=1` and
-`CAMELID_GEMMA4_GHOST_METAL_CONTEXT=4096`. Both modes retain the same fail-closed CPU fallback.
-With fused-fast enabled, the strict 26B Q4_0 projections admit a 32-lane SIMDgroup row kernel that
-keeps the comparator's increasing-block f32 fold; devices or shapes that miss admission stay on
-the scalar ordered kernel.
+The profile above runs the complete common core (attention, router, shared expert), the selected
+Q4_0 experts, and the Q6_K tied head on Metal. With expanded slot residency this full-common lane
+now measures faster than the earlier hybrid recommendation; the hybrid profile
+(`CAMELID_GEMMA4_GHOST_METAL_COMMON=0`) remains available and keeps common-core math on CPU. Both
+modes retain the same fail-closed CPU fallback.
+
+Kernel selection has three tiers. With fused-fast enabled, the strict 26B Q4_0 projections admit a
+32-lane SIMDgroup row kernel that keeps the comparator's increasing-block f32 fold.
+`CAMELID_GEMMA4_GHOST_METAL_TURBO=1` additionally admits reassociated-summation kernels: identical
+per-block integer dots, but per-lane f32 accumulation folded by a cross-lane `simd_sum`, with four
+output rows batched per SIMD group so the shared activation is read once per four weight rows. The
+turbo tier trades the ordered comparator's exact f32 summation order for roughly twice the
+effective kernel bandwidth; on the acceptance prompt it produced greedy token IDs identical to the
+ordered kernels. Devices or shapes that miss admission fall back tier by tier to the scalar
+ordered kernel.
+
+`CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT=1` copies the ~600 MB Q6_K tied table into an owned
+Metal allocation at load instead of the default file-backed no-copy mapping. The default costs
+nothing at load but its clean pages are evictable, so heavy expert paging can silently turn the
+per-token head sweep into SSD refaults; the resident copy pins it at the cost of one load-time
+copy and ~600 MB of anonymous memory.
 
 `CAMELID_GEMMA4_GHOST_METAL_STATS=1` prints one compact per-generation slot hit/I/O summary.
 `CAMELID_GEMMA4_GHOST_READ_THREADS` controls concurrent positioned reads (default 4, range 1–8).
@@ -243,21 +260,35 @@ hits, misses, evictions, bytes read, retained cache bytes, physical footprint, a
 The tracked 14,439,361,440-byte `gemma-4-26B_q4_0-it.gguf` was repacked into 3,840 expert
 groups with 11.96 GiB of routed payload. The production pair is strongly fingerprinted and the
 sparse GGUF shadow occupies about 1.5 GiB physically. On the strict 26B geometry, Camelid can keep
-attention, router, the shared expert, the selected Q4_0 experts, the exact ordered Q6_K head, and a
-4,096-position f32 KV cache on Metal. Persistent expert residency is configurable from 8 through
-32 slots per layer; 24 slots use 2.25 GiB and 32 use 3.00 GiB.
+attention, router, the shared expert, the selected Q4_0 experts, the Q6_K head, and the f32 KV
+cache on Metal. Persistent expert residency is configurable from 8 through 128 slots per layer
+(3.2 MiB per slot per layer): 24 slots use 2.25 GiB, 64 use 6.0 GiB, 80 use 7.5 GiB.
 
-The greedy full-common Metal and hybrid lanes produced the same 32 token IDs on the acceptance
-prompt, `In one sentence, explain why local AI is useful.` On a 16 GiB Apple M4 with both artifacts
-on the internal SSD, 24 slots per layer, four read threads, buffered file I/O, and the final
-SIMDgroup release, three hybrid runs with a 1 GiB host expert cache completed 32 visible tokens in
-8.42–9.04 seconds (3.54–3.80 end-to-end output tokens/second). The fastest warm repeat's
-persistent-slot hit rate was 71.3%; it read 6,674 MiB from `.cghost` (215.3 MiB per routed
-position), while 44 other slot fills came from the host cache. Full-common Metal with a 256 MiB
-host cache took 10.85–11.08 seconds after its SIMDgroup kernel was admitted. A 2 GiB host cache,
-strict/no-cache I/O, and eight read threads were all slower on this machine, so none is enabled in
-the recommended profile. These are exact-machine, exact-prompt measurements rather than a general
-throughput claim.
+Measured on a 16 GiB Apple M4 with both artifacts on the internal SSD, acceptance prompt
+`In one sentence, explain why local AI is useful.`, greedy decoding:
+
+- Earlier hybrid recommendation (24 slots, 1 GiB host cache, ordered kernels): 32 visible tokens
+  in 8.42–9.04 s (3.54–3.80 tok/s end-to-end), reproduced at 3.9–4.1 tok/s. Slot hit rate 61.7%,
+  290 MiB read from `.cghost` per routed position — decode was dominated by synchronous expert
+  page-in on the token critical path.
+- Current recommendation (full-common Metal, 80 slots, turbo kernels, resident head, 64 MiB host
+  cache): 256 visible tokens in 20.2 s (12.7 tok/s end-to-end); steady-state per-token walls of
+  50–58 ms (17–20 tok/s) once residency converges, with a 97.5% slot hit rate and 19.2 MiB read
+  per routed position. The same profile with `CAMELID_GEMMA4_GHOST_STRICT_CACHE=1` measured
+  9.4 tok/s over 128 tokens with lower memory pressure; prefer strict cache when other
+  applications need the page cache.
+- 96 slots per layer exceeded this machine's comfortable budget (swap traffic during warm-up) and
+  bought almost no additional hit rate; 80 is the measured sweet spot on 16 GiB.
+
+The end-to-end figures include the cold warm-up phase in which slots first populate; a persistent
+`serve` process keeps slots resident across requests, so follow-up requests decode at the
+steady-state rate from the first token. Greedy token IDs: the turbo kernels produced IDs identical
+to the ordered kernels for the full acceptance run. Separately, the CPU-storage, hybrid, and
+full-common lanes each diverged from one another within the first few positions on this
+degenerate completion-style prompt — greedy lane-vs-lane agreement is NOT currently a stable
+property of this experimental lane and earlier claims of identical 32-token IDs did not reproduce
+after the artifact was regenerated. These are exact-machine, exact-prompt measurements rather
+than a general throughput claim.
 
 Current boundary: this is an experimental single-node lane. Dense ghost's `--stage-split` and
 `--spec` options are refused because a routed expert cannot be prefetched until that layer's router

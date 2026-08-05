@@ -349,7 +349,7 @@ function App() {
           )}
 
           {tab === 'analytics' && (
-            <AnalyticsView conversations={conversations} models={models} runtime={runtime} capabilities={dashboard?.capabilities} />
+            <AnalyticsView apiBase={apiBase} conversations={conversations} models={models} runtime={runtime} capabilities={dashboard?.capabilities} />
           )}
 
           {tab === 'history' && (
@@ -397,7 +397,7 @@ function App() {
             <DownloadedModelsView
               runtime={runtime}
               apiBase={apiBase}
-              unloadCurrentModel={unloadCurrentModel}
+              refreshDashboard={loadDashboard}
               onOpenModels={() => navigateTab('library')}
             />
           )}
@@ -421,6 +421,7 @@ function App() {
               runtime={runtime}
               apiBase={apiBase}
               setApiBase={setApiBase}
+              refreshDashboard={loadDashboard}
               backend={backend}
               showNotice={showNotice}
               themePreference={preference}

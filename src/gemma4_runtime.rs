@@ -1421,7 +1421,7 @@ const GHOST_METAL_EXPERT_SLOTS_MIN: usize = 8;
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_EXPERT_SLOTS_DEFAULT: usize = 16;
 #[cfg(any(target_os = "macos", test))]
-const GHOST_METAL_EXPERT_SLOTS_MAX: usize = 32;
+const GHOST_METAL_EXPERT_SLOTS_MAX: usize = 128;
 
 #[cfg(any(target_os = "macos", test))]
 fn parse_ghost_metal_slots_per_layer(value: Option<&str>) -> usize {
@@ -2398,12 +2398,14 @@ fn packed_band_matvec(packed: &crate::tensor::Q4_0PackedRows8, xq: &[Q8_0Block])
 /// live, so this must be evaluated at each use rather than latched when the model
 /// loads. Deterministic mode remains authoritative even if the runtime switch is
 /// subsequently turned back on.
+#[cfg(any(target_os = "macos", test))]
 #[inline]
 #[cfg(any(target_os = "macos", test))]
 fn ghost_metal_acceleration_allowed(deterministic: bool, runtime_gpu_enabled: bool) -> bool {
     !deterministic && runtime_gpu_enabled
 }
 
+#[cfg(target_os = "macos")]
 #[inline]
 #[cfg(target_os = "macos")]
 fn ghost_metal_acceleration_enabled() -> bool {
@@ -11553,7 +11555,8 @@ mod ghost_moe_wire_tests {
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("8")), 8);
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("24")), 24);
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("32")), 32);
-        assert_eq!(parse_ghost_metal_slots_per_layer(Some("4096")), 32);
+        assert_eq!(parse_ghost_metal_slots_per_layer(Some("96")), 96);
+        assert_eq!(parse_ghost_metal_slots_per_layer(Some("4096")), 128);
     }
 
     #[cfg(target_os = "macos")]
