@@ -37,6 +37,7 @@ assert.deepEqual(executionRuntimeFields({ execution_plan: healthExecutionPlan, b
   gemma4_ghost_common_gpu_active: null,
   gemma4_ghost_experts_gpu_active: null,
   gemma4_ghost_head_gpu_active: null,
+  gemma4_ghost_catalog_managed: null,
 }, 'dashboard normalization should preserve health execution plan identity and serving backend')
 assert.deepEqual(executionRuntimeFields(null), {
   execution_plan: null,
@@ -49,6 +50,7 @@ assert.deepEqual(executionRuntimeFields(null), {
   gemma4_ghost_common_gpu_active: null,
   gemma4_ghost_experts_gpu_active: null,
   gemma4_ghost_head_gpu_active: null,
+  gemma4_ghost_catalog_managed: null,
 }, 'missing health should fail closed to no plan and no backend')
 
 assert.deepEqual(describeExecutionPlan({ status: 'offline' }), {
@@ -345,7 +347,7 @@ assert.match(catalogBrowseSource, /Download and start/, 'curated catalog rows sh
 assert.match(catalogBrowseSource, /settlementInFlightRef\.current/, 'catalog settlement must be single-flight across polling ticks')
 assert.match(catalogBrowseSource, /canceledCatalogIds\.has\(item\.catalog_id\)/, 'catalog cancellation must be keyed by catalog identity, not filename')
 assert.match(catalogBrowseSource, /aria-label="Search model catalog"/, 'catalog search must have an explicit accessible name')
-assert.match(catalogBrowseSource, /downloadAndStart = lane === 'supported' && !refusedByFit/, 'automatic start must be limited to supported rows that are not known to exceed this host')
+assert.match(catalogBrowseSource, /downloadAndStart = lane === 'supported' && !effectiveFitRefusal/, 'automatic start must be limited to supported rows that are not known to exceed this host')
 assert.match(catalogBrowseSource, /refusedByFit[\s\S]*item\.oracle_qualified/, 'rows this host cannot load must not automatically run generic smoke admission')
 // The refusal set must stay the FULL one. Testing `fit !== 'wont_fit'` alone was a
 // real defect: an `insufficient_free_memory` row would chain into a load that the
