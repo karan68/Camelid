@@ -940,6 +940,18 @@ pub struct GhostMoeTensorView {
     len: usize,
 }
 
+impl GhostMoeTensorView {
+    /// This tensor's byte range inside its own expert record.
+    ///
+    /// Callers that own the record's storage — the CUDA lane's page-locked host
+    /// tier reads whole records into fixed-stride slots with
+    /// [`GhostFile::read_moe_expert_into`] — need the sub-ranges without going
+    /// back through an allocating `GhostMoeExpert`.
+    pub(crate) fn record_range(&self) -> std::ops::Range<usize> {
+        self.offset..self.offset + self.len
+    }
+}
+
 /// Prevalidated coordinates for one routed-expert payload in [`CghostIndex::groups`].
 ///
 /// A Gemma 4 26B artifact has thousands of expert groups. Looking up a selected expert by
@@ -2490,10 +2502,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.cghost");
         write_tiny_moe_cghost(&path);
-        let ghost = GhostFile::open(&path).unwrap();
+        let mut ghost = GhostFile::open(&path).unwrap();
         let (group, _) = ghost.moe_group_access(0, 1).unwrap();
         let start = group.tensors[0].offset;
         let len = ghost.moe_expert_byte_len(0, 1).unwrap();
+
+        // Windows refuses `set_len` on a file with a live user mapping
+        // (ERROR_USER_MAPPED_FILE), so drop the mapping before truncating. The
+        // positioned reader under test never reads through the mapping, so the
+        // path being exercised is unchanged; POSIX hosts allowed the truncate
+        // either way, which is why this only ever failed on Windows.
+        ghost.mmap = None;
 
         // Keep the already-parsed index resident, then truncate the backing payload halfway
         // through the selected record. The positioned reader must report EOF, never success.

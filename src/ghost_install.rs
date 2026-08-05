@@ -34,7 +34,13 @@ pub const GEMMA4_26B_GHOST_COMMON_DISK_BYTES: u64 = 2_250_000_000;
 /// The expert cache consumes only VRAM left after this resident base.
 pub const GEMMA4_26B_GHOST_RESIDENT_BYTES: u64 = 2_650_000_000;
 pub const GEMMA4_26B_GHOST_CACHE_MIB: usize = 64;
-pub const GEMMA4_26B_GHOST_CACHE_EXPERTS: usize = 803;
+/// REQUESTED routed-expert residency for the VRAM cache. The runtime takes
+/// `min(requested, VRAM-fit)`, so this is deliberately above any fit this card
+/// can reach: the free-VRAM probe is what binds. Requesting exactly the measured
+/// fit (803 on the tracked 6 GiB box at the 4096-position KV) was a trap — it
+/// silently turned every later VRAM-freeing improvement (e.g. a smaller KV via
+/// `CAMELID_GEMMA4_GHOST_CUDA_CONTEXT`) into a no-op for the serve lane.
+pub const GEMMA4_26B_GHOST_CACHE_EXPERTS: usize = 1600;
 
 const MARKER_VERSION: u32 = 1;
 
@@ -397,7 +403,7 @@ pub fn prepare(model_path: &Path) -> Result<()> {
 pub fn apply_catalog_cuda_defaults() {
     for (key, value) in [
         ("CAMELID_GEMMA4_GHOST_CUDA_CACHE", "1"),
-        ("CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS", "803"),
+        ("CAMELID_GEMMA4_GHOST_CUDA_CACHE_EXPERTS", "1600"),
         ("CAMELID_GEMMA4_GHOST_CUDA_RESERVE_MIB", "160"),
         ("CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS", "1"),
         ("CAMELID_GEMMA4_CUDA_PINNED_EXPERTS", "1"),

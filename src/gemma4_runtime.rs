@@ -1036,6 +1036,70 @@ impl GhostMoeCacheState {
     }
 }
 
+/// Below this budget the CUDA lane keeps faulting misses in from the `.cghost`
+/// mapping instead of routing them through the host arena. A tier smaller than
+/// one token's routed working set (240 records ≈ 806 MB on the 26B row) cannot
+/// hold anything across a token boundary, so it would only add an allocation
+/// and a copy to every miss. Above it the arena starts retaining real
+/// residency and each retained record converts a storage read into a PCIe copy.
+#[cfg(feature = "cuda")]
+const GHOST_CUDA_HOST_TIER_MIN_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Physical RAM the Ghost-MoE CUDA host expert tier must leave for everything
+/// else: the OS, the caller's desktop session, the sparse GGUF shadow's mapped
+/// common core, and this process's own non-tier heap. Sizing an arena from
+/// "available" RAM without a reserve is how a 16 GiB host starts swapping
+/// mid-generation, which is far worse than a smaller tier. Override with
+/// `CAMELID_GEMMA4_GHOST_HOST_TIER_RESERVE_MIB`.
+#[cfg(feature = "cuda")]
+const GHOST_CUDA_HOST_TIER_RESERVE_MIB: u64 = 3072;
+
+/// Resolve the host expert-tier budget (MiB) for the Ghost-MoE CUDA lane.
+///
+/// `requested_mib` is what the caller asked for (`--expert-cache-mib`). It is
+/// treated as a FLOOR that auto-sizing may raise, not as a ceiling, because its
+/// defaults were chosen for the CPU/storage lane where the tier is only a small
+/// read cache. On the CUDA lane the tier is the difference between a
+/// storage-bound and a PCIe-bound decode, so it wants every byte the host can
+/// safely spare.
+///
+/// Explicit `CAMELID_GEMMA4_GHOST_HOST_TIER_MIB` always wins, including `0`,
+/// which forces the mapped path back on for A/B measurement. A caller-requested
+/// `0` (`--expert-cache-mib 0` is documented as the smallest application-owned
+/// footprint) also wins: auto-sizing must not convert an explicit minimal-memory
+/// request into gigabytes of page-locked RAM.
+#[cfg(feature = "cuda")]
+fn ghost_cuda_host_tier_mib(cghost: &Path, requested_mib: usize) -> usize {
+    if let Some(explicit) = std::env::var("CAMELID_GEMMA4_GHOST_HOST_TIER_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return explicit;
+    }
+    if requested_mib == 0 {
+        return 0;
+    }
+    let reserve_mib = std::env::var("CAMELID_GEMMA4_GHOST_HOST_TIER_RESERVE_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(GHOST_CUDA_HOST_TIER_RESERVE_MIB);
+    let (_total, available) = crate::capability::host_ram_total_available_bytes();
+    if available == 0 {
+        // No probe on this platform: do not guess an arena size from nothing.
+        return requested_mib;
+    }
+    let spare_mib = (available / (1024 * 1024)).saturating_sub(reserve_mib);
+    // Never retain more than the routed payload itself; beyond that the arena
+    // would reserve RAM it can never fill.
+    let payload_mib = std::fs::metadata(cghost)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(u64::MAX);
+    let auto_mib = spare_mib.min(payload_mib);
+    usize::try_from(auto_mib)
+        .unwrap_or(usize::MAX)
+        .max(requested_mib)
+}
+
 /// One cache for the whole model, rather than one nominal budget per layer.
 /// This is the memory-ceiling invariant: regardless of how many of Gemma 4's
 /// 30×128 experts a session routes to, retained wire bytes never exceed the
@@ -1251,6 +1315,16 @@ impl GhostMoeExpertCache {
     /// CUDA normal-cache mode uploads immutable expert ranges directly from
     /// the `.cghost` mapping. Strict cache mode has no mapping and deliberately
     /// falls back to the allocating positioned-reader cache.
+    ///
+    /// Only reached when the page-locked host tier (`SserHostTier`) is absent.
+    /// Routing VRAM misses through the *pageable* `get_many` arena instead was
+    /// measured on the tracked box and is a REGRESSION (6.22 -> 2.29-5.74 tok/s
+    /// across 2-6 GiB budgets): the OS page cache is already an opportunistic
+    /// host tier over this mapping, it uses all free RAM rather than a fixed
+    /// reservation, and an owned arena competes with it for the same pages
+    /// while still costing a staging memcpy per miss. The page-locked tier wins
+    /// for a different reason — a hit there is a pure DMA with no CPU copy —
+    /// so it supersedes this path rather than layering on it.
     #[cfg(feature = "cuda")]
     fn get_many_cuda(&self, layer: usize, experts: &[usize]) -> Result<Vec<GhostCudaExpertRecord>> {
         let mut mapped = Vec::with_capacity(experts.len());
@@ -6531,6 +6605,459 @@ struct SserTransferSlot {
     down: cudarc::driver::PinnedHostSlice<u8>,
 }
 
+/// Page-locked host memory allocated with DEFAULT (cacheable) flags.
+///
+/// `CudaContext::alloc_pinned` hardcodes WRITE_COMBINED. On this platform's PCIe
+/// link, cacheable pinned memory measured ~18% FASTER for host→device DMA (9.4 vs
+/// 7.9 GB/s back to back — see the same finding at `cuda_resident.rs`'s
+/// `CacheablePinned`). The routed-expert tier is read by DMA on every VRAM miss
+/// and written only when a record is first admitted, so it wants the read-fast
+/// flavour. The driver auto-detects the pinned pointer, so a plain slice view
+/// drives the fast async DMA path with no staging copy.
+#[cfg(feature = "cuda")]
+struct SserPinnedSlab {
+    ptr: *mut u8,
+    len: usize,
+    ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+}
+
+// SAFETY: `ptr` is a page-locked host allocation owned solely by this struct and
+// freed on drop. The resident engine is only ever entered under the
+// process-global resident-cache mutex (the same discipline that lets its
+// `CudaGraph` be `Send`), so the pointer is never touched from two threads.
+#[cfg(feature = "cuda")]
+unsafe impl Send for SserPinnedSlab {}
+
+#[cfg(feature = "cuda")]
+impl SserPinnedSlab {
+    fn new(ctx: &std::sync::Arc<cudarc::driver::CudaContext>, len: usize) -> Result<Self> {
+        ctx.bind_to_thread().map_err(cu)?;
+        // flags = 0 → cacheable (NOT write-combined). max(1) avoids a zero-size alloc.
+        let ptr =
+            unsafe { cudarc::driver::result::malloc_host(len.max(1), 0) }.map_err(cu)? as *mut u8;
+        if ptr.is_null() {
+            return Err(BackendError::InvalidModelMetadata(
+                "Ghost-MoE CUDA host tier: malloc_host returned null".into(),
+            ));
+        }
+        Ok(Self {
+            ptr,
+            len,
+            ctx: ctx.clone(),
+        })
+    }
+
+    /// SAFETY contract for both accessors: `range` must lie inside `0..len`, and
+    /// the caller must not alias one slot mutably while a DMA from it is in
+    /// flight. The tier enforces that by never recycling a slot that the current
+    /// route selected (`protected`), mirroring the VRAM arena's own invariant.
+    fn slice(&self, start: usize, len: usize) -> &[u8] {
+        debug_assert!(start + len <= self.len);
+        unsafe { std::slice::from_raw_parts(self.ptr.add(start), len) }
+    }
+
+    fn slice_mut(&mut self, start: usize, len: usize) -> &mut [u8] {
+        debug_assert!(start + len <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(start), len) }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for SserPinnedSlab {
+    fn drop(&mut self) {
+        let _ = self.ctx.bind_to_thread();
+        unsafe {
+            let _ = cudarc::driver::result::free_host(self.ptr as *mut std::ffi::c_void);
+        }
+    }
+}
+
+/// Tier 2 of the routed-expert hierarchy: a bounded, page-locked host arena of
+/// whole `.cghost` expert records, sitting between the VRAM cache and storage.
+///
+/// The tier exists because storage cannot serve this workload. One decode step
+/// routes 240 records (806 MB on the 26B row); the VRAM cache holds ~21% of the
+/// 3840 slices, so ~73 records per token have to come from somewhere else. The
+/// tracked box's NVMe delivers 1.3 GB/s buffered / 1.9 GB/s unbuffered and — the
+/// decisive measurement — is FLAT from queue depth 1 to 16, so read parallelism
+/// buys nothing and storage alone pins decode near 5 tok/s.
+///
+/// Records are held in fixed-stride slots inside ONE page-locked slab rather than
+/// as individual heap allocations, which is what makes a tier hit cost a single
+/// async DMA: the copy stream reads the slot directly and the CPU never touches
+/// the bytes. Staging each miss through a pinned ring instead would add a
+/// ~3.19 MiB host memcpy per miss — about 0.4 ms, or ~30 ms/token at 73 misses.
+/// Page-locked records are allocated in chunks of this many slots rather than as
+/// one slab. Measured on the tracked box: a single 7.9 GiB `malloc_host` fails
+/// with `CUDA_ERROR_OUT_OF_MEMORY` even with 9.7 GiB free, while the same total
+/// in ~800 MiB pieces does not have to find one contiguous locked range. Chunking
+/// also makes the tier degrade gracefully — a request the host cannot fully honour
+/// keeps the chunks it did get instead of collapsing to no tier at all, which is
+/// the difference between a smaller tier and falling all the way back to storage.
+#[cfg(feature = "cuda")]
+const GHOST_CUDA_HOST_TIER_SLOTS_PER_CHUNK: usize = 256;
+
+#[cfg(feature = "cuda")]
+struct SserHostTier {
+    /// Page-locked chunks, each holding `slots_per_chunk` whole records. A record
+    /// never straddles a chunk boundary.
+    chunks: Vec<SserPinnedSlab>,
+    slots_per_chunk: usize,
+    /// Byte stride of one whole expert record (gate_up ‖ down, as `.cghost`
+    /// stores it). Validated against every record read.
+    stride: usize,
+    /// `gate_up` / `down` byte ranges within a record, learned once from a real
+    /// record and re-validated on each admission.
+    gu_off: usize,
+    gu_len: usize,
+    down_off: usize,
+    down_len: usize,
+    entries: std::collections::HashMap<(u16, u16), SserHostEntry>,
+    free_slots: Vec<usize>,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+    bytes_read: u64,
+}
+
+#[cfg(feature = "cuda")]
+struct SserHostEntry {
+    slot: usize,
+    last_used: u64,
+}
+
+/// Resident per-layer scratch for the routed MoE branch.
+///
+/// These were allocated per layer per token. With a 95.9%-hit route — i.e. with
+/// expert transfers all but removed — the expert loop still burned 26.7 ms/token
+/// in prep/alloc, which at 30 layers is 0.89 ms of driver work per layer against
+/// a 50 ms/token budget. Every buffer here is sized to the per-layer maximum at
+/// load, so a layer uses a prefix and the kernels read byte-identical inputs.
+#[cfg(feature = "cuda")]
+struct MoeScratchDev {
+    /// Q8_0 scales of the shared expert input (`hidden / 32`).
+    in_s: cudarc::driver::CudaSlice<f32>,
+    /// Q8_0 quants of the shared expert input (`hidden`).
+    in_q: cudarc::driver::CudaSlice<i8>,
+    /// Fused gate‖up GEMV output, `max_route * 2 * n_ff_exp`.
+    gate_up: cudarc::driver::CudaSlice<f32>,
+    /// GeGLU output requantized to Q8_0, `max_route * n_ff_exp`.
+    geglu_q: cudarc::driver::CudaSlice<i8>,
+    /// GeGLU Q8_0 scales, `max_route * n_ff_exp / 32`.
+    geglu_s: cudarc::driver::CudaSlice<f32>,
+    /// Per-expert down-GEMV outputs in router order, `max_route * hidden`.
+    ///
+    /// The three tiny index/scale uploads inside the routed path (`d_slots`,
+    /// `d_routes`, `d_route_scales`, ≤32 bytes each) are deliberately NOT hoisted
+    /// here: reaching them from `moe_layer_ffn_cached_routed` would need either
+    /// three more parameters on an already 14-argument signature or a second
+    /// `borrow_mut` of this cell while the caller still holds one, which panics.
+    /// They are a small share of the allocation cost the large buffers dominate.
+    y_all: cudarc::driver::CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl SserHostTier {
+    /// Build the tier, or `Ok(None)` when it is disabled or cannot be page-locked.
+    ///
+    /// Failure here is never fatal: the caller keeps the storage-backed path, which
+    /// is slower but correct. Page-locking is the one step that can legitimately
+    /// fail on a loaded host, so it is the last thing done and its error is
+    /// downgraded to a warning.
+    fn new(
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        ghost: &GhostFile,
+        budget_bytes: usize,
+    ) -> Result<Option<Self>> {
+        if budget_bytes == 0 {
+            return Ok(None);
+        }
+        // Learn the record geometry from a real record rather than deriving it, so
+        // a layout change in the repacker surfaces as a refusal instead of silent
+        // garbage.
+        let probe = ghost.read_moe_expert(0, 0)?;
+        let stride = probe.byte_len();
+        let gu = probe.gate_up.record_range();
+        let down = probe.down.record_range();
+        if stride == 0 || gu.end > stride || down.end > stride {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "Ghost-MoE CUDA host tier: record layout out of range (stride {stride}, gate_up {gu:?}, down {down:?})"
+            )));
+        }
+        // The tier is a fixed-offset consumer: `views` applies the probe's
+        // interior offsets to EVERY slot. The generic Ghost readers deliberately
+        // accept any contiguous per-record tensor order, so probing one record
+        // proves nothing about the other 3839 — a format-legal file with one
+        // group serialized `[down][gate_up]` would pass every length and
+        // identity check and DMA down-bytes as gate_up weights, silently. The
+        // Metal persistent-slot lane already refuses such files through this
+        // same canonical-layout gate; review caught that this lane skipped it.
+        // Metadata-only (no I/O), so the cost is negligible.
+        let layers = ghost.index.block_count;
+        let expert_count = ghost.index.expert_count.unwrap_or(0);
+        ghost.validate_moe_expert_record_layouts(layers, expert_count, stride)?;
+        let want_slots = budget_bytes / stride;
+        if want_slots == 0 {
+            return Ok(None);
+        }
+        // Try the whole budget as ONE allocation first. Measured on the tracked
+        // box, a single 7165 MiB `malloc_host` SUCCEEDS while the same total in
+        // 817 MiB pieces stops at 6534 MiB — the driver's page-locking limit is
+        // not simply additive, and chunking cost 198 records (2246 -> 2048) and
+        // 6 points of tier hit rate. So chunks are the FALLBACK, not the default.
+        if let Ok(chunk) = SserPinnedSlab::new(ctx, want_slots * stride) {
+            return Ok(Some(Self {
+                chunks: vec![chunk],
+                slots_per_chunk: want_slots,
+                stride,
+                gu_off: gu.start,
+                gu_len: gu.end - gu.start,
+                down_off: down.start,
+                down_len: down.end - down.start,
+                entries: std::collections::HashMap::with_capacity(want_slots),
+                free_slots: (0..want_slots).rev().collect(),
+                clock: 0,
+                hits: 0,
+                misses: 0,
+                bytes_read: 0,
+            }));
+        }
+        // Otherwise take what the host will give, in chunks, and keep it. Stopping
+        // at the first refusal (rather than erroring) is deliberate: a tier that is
+        // smaller than requested still converts storage reads into PCIe copies,
+        // whereas no tier at all costs ~2 ms per VRAM miss.
+        let slots_per_chunk = GHOST_CUDA_HOST_TIER_SLOTS_PER_CHUNK.min(want_slots.max(1));
+        let mut chunks = Vec::with_capacity(want_slots.div_ceil(slots_per_chunk));
+        let mut slots = 0usize;
+        let mut remaining = want_slots;
+        while remaining > 0 {
+            // The last chunk is sized to what is actually left — rounding it up
+            // to a full chunk would pin up to `slots_per_chunk - 1` records
+            // beyond the caller's budget. `slot_location` stays valid with a
+            // short final chunk because slot ids never reach into its padding.
+            let this_slots = slots_per_chunk.min(remaining);
+            match SserPinnedSlab::new(ctx, this_slots * stride) {
+                Ok(chunk) => {
+                    chunks.push(chunk);
+                    slots += this_slots;
+                    remaining -= this_slots;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ghost] host expert tier: host stopped page-locking after {} MiB of {} MiB \
+                         requested ({e}); keeping the smaller tier",
+                        (slots * stride) / (1024 * 1024),
+                        (want_slots * stride) / (1024 * 1024),
+                    );
+                    break;
+                }
+            }
+        }
+        if chunks.is_empty() {
+            eprintln!(
+                "[ghost] host expert tier: could not page-lock even one {} MiB chunk; \
+                 continuing on the storage-backed path",
+                (slots_per_chunk * stride) / (1024 * 1024)
+            );
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            chunks,
+            slots_per_chunk,
+            stride,
+            gu_off: gu.start,
+            gu_len: gu.end - gu.start,
+            down_off: down.start,
+            down_len: down.end - down.start,
+            entries: std::collections::HashMap::with_capacity(slots),
+            free_slots: (0..slots).rev().collect(),
+            clock: 0,
+            hits: 0,
+            misses: 0,
+            bytes_read: 0,
+        }))
+    }
+
+    /// Make `(layer, expert)` resident and return its slot.
+    ///
+    /// SLOT-REUSE SAFETY. The copy stream DMAs straight out of a slot, so
+    /// overwriting a slot whose transfer is still in flight would silently
+    /// corrupt an expert. Two things together make that unreachable, and BOTH
+    /// are load-bearing:
+    ///
+    /// 1. Within a route, `protected` holds every key this route selected, so a
+    ///    later miss in the same layer cannot recycle an earlier one's slot.
+    /// 2. Across layers, `forward_token` runs a full `cap_stream.synchronize()`
+    ///    at the top of each MoE layer, and the previous layer made `cap_stream`
+    ///    wait on its `copy_done` event — so that synchronize transitively
+    ///    retires the previous layer's copies before any slot here is recycled.
+    ///
+    /// If (2) is ever removed — dropping the per-layer drain is a standing
+    /// optimization candidate, since it costs a WDDM flush 30x per token — this
+    /// tier needs its own per-slot completion tracking (an event or generation
+    /// counter checked before recycling). Do not remove it silently.
+    fn ensure_resident(
+        &mut self,
+        ghost: &GhostFile,
+        layer: usize,
+        expert: usize,
+        protected: &std::collections::HashSet<(u16, u16)>,
+    ) -> Result<usize> {
+        let key = (layer as u16, expert as u16);
+        self.clock += 1;
+        let stamp = self.clock;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = stamp;
+            self.hits += 1;
+            return Ok(entry.slot);
+        }
+        let slot = match self.free_slots.pop() {
+            Some(slot) => slot,
+            None => {
+                let victim = self
+                    .entries
+                    .iter()
+                    .filter(|(k, _)| !protected.contains(*k))
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(k, _)| *k)
+                    .ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "Ghost-MoE CUDA host tier has no recyclable slot for this route".into(),
+                        )
+                    })?;
+                self.entries
+                    .remove(&victim)
+                    .expect("selected host-tier victim is resident")
+                    .slot
+            }
+        };
+        let stride = self.stride;
+        // Reads land straight in the page-locked slot: no intermediate Vec, and
+        // the copy stream can DMA from here without the CPU touching the bytes.
+        let (chunk_idx, chunk_off) = self.slot_location(slot);
+        ghost.read_moe_expert_into(
+            layer,
+            expert,
+            self.chunks[chunk_idx].slice_mut(chunk_off, stride),
+        )?;
+        self.misses += 1;
+        self.bytes_read = self.bytes_read.saturating_add(stride as u64);
+        self.entries.insert(
+            key,
+            SserHostEntry {
+                slot,
+                last_used: stamp,
+            },
+        );
+        Ok(slot)
+    }
+
+    /// Fill free slots with records at load, striped uniformly across layers.
+    ///
+    /// OPT-IN (`CAMELID_GEMMA4_GHOST_TIER_PREFILL=1`), and measured HONESTLY
+    /// NEUTRAL-TO-NEGATIVE on the tracked 16 GiB box: it raised the tier hit
+    /// rate 66.2% -> 74.9% and cut storage reads 26%, but steady decode moved
+    /// 10.62 -> 9.71 tok/s and total wall time got worse — the 6.9 GiB prefill
+    /// read evicts the OS page cache's copy of the same payload, so the misses
+    /// that remain get colder by as much as the tier hits gain. It stays
+    /// available because the trade flips when the tier can hold the entire
+    /// routed payload (host RAM ≥ payload + reserve): one sequential read at
+    /// load then eliminates storage from decode entirely. Records are stamped
+    /// `last_used = 0`, so anything the session actually touches immediately
+    /// outranks an unproven prefill for eviction.
+    fn prefill(&mut self, ghost: &GhostFile) {
+        let enabled = std::env::var("CAMELID_GEMMA4_GHOST_TIER_PREFILL")
+            .ok()
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes" | "enabled"
+                )
+            });
+        if !enabled {
+            return;
+        }
+        let layers = ghost.index.block_count;
+        let expert_count = ghost.index.expert_count.unwrap_or(0);
+        if layers == 0 || expert_count == 0 {
+            return;
+        }
+        let per_layer = (self.free_slots.len() / layers).min(expert_count);
+        if per_layer == 0 {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut filled = 0usize;
+        'fill: for layer in 0..layers {
+            for expert in 0..per_layer {
+                let Some(slot) = self.free_slots.pop() else {
+                    break 'fill;
+                };
+                let stride = self.stride;
+                let (chunk_idx, chunk_off) = self.slot_location(slot);
+                match ghost.read_moe_expert_into(
+                    layer,
+                    expert,
+                    self.chunks[chunk_idx].slice_mut(chunk_off, stride),
+                ) {
+                    Ok(()) => {
+                        self.entries.insert(
+                            (layer as u16, expert as u16),
+                            SserHostEntry { slot, last_used: 0 },
+                        );
+                        filled += 1;
+                    }
+                    Err(e) => {
+                        // A read failure at prefill is not a load failure: give the
+                        // slot back and let the per-miss path (which reports errors
+                        // in context) deal with this record if routing ever wants it.
+                        self.free_slots.push(slot);
+                        eprintln!(
+                            "[ghost] host tier prefill stopped at layer {layer} expert {expert}: {e}"
+                        );
+                        break 'fill;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[ghost] host tier prefill: {filled} records ({:.2} GiB, {}/{} per layer) in {:.1}s",
+            (filled * self.stride) as f64 / (1024.0 * 1024.0 * 1024.0),
+            per_layer,
+            expert_count,
+            started.elapsed().as_secs_f32(),
+        );
+    }
+
+    /// Map a slot to its page-locked chunk and byte offset within it. Records
+    /// never straddle a chunk, so both projections of a record live together.
+    fn slot_location(&self, slot: usize) -> (usize, usize) {
+        (
+            slot / self.slots_per_chunk,
+            (slot % self.slots_per_chunk) * self.stride,
+        )
+    }
+
+    /// The `gate_up` and `down` byte views of a resident slot, ready to DMA.
+    fn views(&self, slot: usize) -> (&[u8], &[u8]) {
+        let (chunk_idx, base) = self.slot_location(slot);
+        let chunk = &self.chunks[chunk_idx];
+        (
+            chunk.slice(base + self.gu_off, self.gu_len),
+            chunk.slice(base + self.down_off, self.down_len),
+        )
+    }
+
+    fn stats(&self) -> (u64, u64, usize, usize) {
+        (
+            self.hits,
+            self.misses,
+            self.entries.len(),
+            self.entries.len() + self.free_slots.len(),
+        )
+    }
+}
+
 /// SSER (self-specializing expert residency) VRAM cache: a per-(layer,expert) LRU
 /// of Q4_0 expert weight slices. A single user's session fires a skewed, stable
 /// subset of the experts; keeping the hot ones resident lets their two GEMVs run on
@@ -6781,6 +7308,13 @@ pub struct Gemma4CudaResident {
     // GEMVs is allocated locally per call (batch-1 tiny GEMVs are launch-bound, so the
     // alloc is negligible and it keeps the hot path `&self`).
     sser: Option<std::cell::RefCell<SserCache>>,
+    /// Tier 2: page-locked host residency for routed expert records, between the
+    /// VRAM cache and `.cghost` on storage. `None` keeps the storage-backed path.
+    /// Same `RefCell` rationale as `sser`.
+    host_tier: Option<std::cell::RefCell<SserHostTier>>,
+    /// Resident routed-MoE scratch, replacing 7 stream-ordered allocations per
+    /// layer per token. Same `RefCell` rationale as `sser`.
+    moe_scratch: Option<std::cell::RefCell<MoeScratchDev>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -6790,7 +7324,7 @@ impl Gemma4CudaResident {
     /// bounds the resident KV cache.
     pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
         let cpu = Gemma4Runtime::load(path)?;
-        Self::from_cpu_runtime(cpu, max_positions)
+        Self::from_cpu_runtime(cpu, max_positions, 0)
     }
 
     /// Load the common Gemma 4 core from the sparse GGUF shadow and routed
@@ -6804,11 +7338,48 @@ impl Gemma4CudaResident {
         evict_page_cache: bool,
         max_positions: usize,
     ) -> Result<Self> {
-        let cpu = Gemma4Runtime::load_ghost_moe(path, cghost, cache_mib, evict_page_cache)?;
-        Self::from_cpu_runtime(cpu, max_positions)
+        // Size the host expert tier from what this host can actually spare. The
+        // caller's `--expert-cache-mib` is a floor, not a ceiling: its defaults
+        // were tuned for the CPU/storage lane, where the tier is a small read
+        // cache, whereas here it decides whether a VRAM miss costs a PCIe copy
+        // or a storage read. The tier budget is deliberately SEPARATE from the
+        // pageable `GhostMoeExpertCache` budget below — review caught that
+        // passing the auto-sized figure to both let the serial-diagnostic +
+        // strict-cache combination hold ~2x spare RAM (pinned tier plus a
+        // pageable arena the batched path never reads).
+        let tier_mib = ghost_cuda_host_tier_mib(cghost, cache_mib);
+        let tier_bytes = tier_mib.saturating_mul(1024 * 1024);
+        // Buffered reads stay ON. Forcing `FILE_FLAG_NO_BUFFERING` here to keep
+        // the tier's residency "exclusive" was measured and is a REGRESSION: the
+        // OS page cache is itself an opportunistic tier over the mapping, and
+        // turning it off costs more on the tier's cold fills than the exclusivity
+        // returns. The tier fills through the same buffered positioned reader, so
+        // a fill that the page cache can serve stays at memcpy speed.
+        let strict_reads = evict_page_cache;
+        // KV context is a direct trade against routed-expert residency, and on the
+        // 26B row it is not the small term the dense-lane comment assumed: all 30
+        // layers own KV and allocate `kv_dim * max_positions` u16 for both K and V,
+        // which is 880 MiB at 4096 positions — 36.7% of everything Camelid puts on
+        // a 6 GiB card. Every 3.19 MiB returned here buys one more resident expert,
+        // so a caller who knows the session is short can convert context into hit
+        // rate. Default is the caller's value, so nothing changes unless asked.
+        // (The Metal ghost lane already exposes the equivalent knob.)
+        let max_positions = std::env::var("CAMELID_GEMMA4_GHOST_CUDA_CONTEXT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= 512)
+            .unwrap_or(max_positions);
+        let cpu = Gemma4Runtime::load_ghost_moe(path, cghost, cache_mib, strict_reads)?;
+        Self::from_cpu_runtime(cpu, max_positions, tier_bytes)
     }
 
-    fn from_cpu_runtime(cpu: Gemma4Runtime, max_positions: usize) -> Result<Self> {
+    /// `host_tier_budget_bytes` sizes the page-locked expert tier; `0` means no
+    /// tier (dense rows, non-ghost loads, or an explicit opt-out).
+    fn from_cpu_runtime(
+        cpu: Gemma4Runtime,
+        max_positions: usize,
+        host_tier_budget_bytes: usize,
+    ) -> Result<Self> {
         let ghost_moe = cpu.ghost_moe_cache.is_some();
         // BASALT Amendment 3 review fix: refuse NVFP4 layer projections with a
         // typed error BEFORE the `GemmaLayerQuant::from_wire` catch-all (`upw`
@@ -7170,7 +7741,90 @@ impl Gemma4CudaResident {
         } else {
             None
         };
+        // Tier 2: page-locked host residency for the VRAM cache's miss tail. Only
+        // worth building alongside the VRAM cache and a `.cghost`; without one it
+        // has nothing to catch, and below the minimum it cannot retain a record
+        // across a token boundary.
+        // The serial diagnostic path (`CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS=0`) has
+        // no tier branch, so building (and possibly prefilling) one it will never
+        // read would only pin RAM.
+        let routed_batch_enabled = std::env::var("CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS")
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+            })
+            .unwrap_or(true);
+        let host_tier = match (sser.as_ref(), cpu.ghost_moe_cache.as_ref()) {
+            (Some(_), Some(ghost_cache))
+                if routed_batch_enabled
+                    && host_tier_budget_bytes >= GHOST_CUDA_HOST_TIER_MIN_BYTES =>
+            {
+                // Tier construction failure is never a load failure: the mapped
+                // storage path is slower but correct, so downgrade to a warning.
+                let mut tier = match SserHostTier::new(
+                    cap_stream.context(),
+                    &ghost_cache.file,
+                    host_tier_budget_bytes,
+                ) {
+                    Ok(tier) => tier,
+                    Err(e) => {
+                        eprintln!(
+                            "[ghost] host expert tier unavailable ({e}); continuing on the storage-backed path"
+                        );
+                        None
+                    }
+                };
+                if let Some(tier) = tier.as_mut() {
+                    let (_, _, _, slots) = tier.stats();
+                    eprintln!(
+                        "[ghost] host expert tier: {} slots ({} MiB page-locked, {:.1} MiB/record) covering the VRAM miss tail",
+                        slots,
+                        (slots * tier.stride) / (1024 * 1024),
+                        tier.stride as f64 / (1024.0 * 1024.0),
+                    );
+                    tier.prefill(&ghost_cache.file);
+                }
+                tier.map(std::cell::RefCell::new)
+            }
+            (Some(_), Some(_))
+                if host_tier_budget_bytes > 0
+                    && host_tier_budget_bytes < GHOST_CUDA_HOST_TIER_MIN_BYTES =>
+            {
+                eprintln!(
+                    "[ghost] host expert tier disabled: {} MiB is below the {} MiB minimum (a tier smaller than one routed working set only adds copies)",
+                    host_tier_budget_bytes / (1024 * 1024),
+                    GHOST_CUDA_HOST_TIER_MIN_BYTES / (1024 * 1024),
+                );
+                None
+            }
+            _ => None,
+        };
+        // Resident routed-MoE scratch, sized to the per-layer maxima across MoE rows.
+        let moe_scratch = match cpu.layers.iter().filter_map(|lw| lw.moe.as_ref()).fold(
+            None::<(usize, usize)>,
+            |acc, m| {
+                let (nff, used) = acc.unwrap_or((0, 0));
+                Some((nff.max(m.n_ff_exp), used.max(m.n_expert_used)))
+            },
+        ) {
+            Some((nff_max, route_max)) if nff_max > 0 && route_max > 0 => {
+                Some(std::cell::RefCell::new(MoeScratchDev {
+                    in_s: alloc_f(hidden / 32).map_err(cu)?,
+                    in_q: alloc_i(hidden).map_err(cu)?,
+                    gate_up: alloc_f(route_max * 2 * nff_max).map_err(cu)?,
+                    geglu_q: alloc_i(route_max * nff_max).map_err(cu)?,
+                    geglu_s: alloc_f(route_max * (nff_max / 32).max(1)).map_err(cu)?,
+                    y_all: alloc_f(route_max * hidden).map_err(cu)?,
+                }))
+            }
+            _ => None,
+        };
         let me = Self {
+            host_tier,
+            moe_scratch,
             norms,
             lweights,
             ple,
@@ -7268,6 +7922,21 @@ impl Gemma4CudaResident {
                 e - hit - miss
             );
         }
+        if let Some(tier) = self.host_tier.as_ref() {
+            let tier = tier.borrow();
+            let (hits, misses, resident, slots) = tier.stats();
+            let total = hits + misses;
+            eprintln!(
+                "[ghost] host tier: {hits} hits / {misses} storage reads = {:.1}% tier hit-rate; \
+                 {resident}/{slots} records resident; {:.2} GiB read from .cghost",
+                if total > 0 {
+                    100.0 * hits as f64 / total as f64
+                } else {
+                    0.0
+                },
+                tier.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
         self.sser.as_ref().map(|c| {
             let c = c.borrow();
             (c.hits, c.misses, c.entries.len(), c.capacity)
@@ -7334,11 +8003,27 @@ impl Gemma4CudaResident {
         let expected_down = hidden * down_row_bytes;
         let gate_up_bytes = moe.gate_up_exps.bytes();
         let down_bytes = moe.down_exps.bytes();
+        // The page-locked tier reads its own records, so it needs the `.cghost`
+        // handle and this layer's index INTO that artifact (which is not `l` on a
+        // sharded range — the same distinction `get_many_cuda` callers make).
+        let ghost_layer = moe
+            .ghost
+            .as_ref()
+            .map(|g| (g.cache.file.as_ref(), g.layer_idx));
 
         let protected = idx
             .iter()
             .map(|&expert| (l as u16, expert as u16))
             .collect::<std::collections::HashSet<_>>();
+        // Same guarantee in the tier's own key space, which indexes the `.cghost`
+        // layer rather than the model layer.
+        let tier_protected = ghost_layer
+            .map(|(_, layer_idx)| {
+                idx.iter()
+                    .map(|&expert| (layer_idx as u16, expert as u16))
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
         let mut hit_slots = Vec::<i32>::with_capacity(route_count);
         let mut hit_routes = Vec::<i32>::with_capacity(route_count);
         let mut miss_slots = Vec::<i32>::with_capacity(route_count);
@@ -7372,7 +8057,12 @@ impl Gemma4CudaResident {
                 continue;
             }
 
-            let (gu_host, down_host) = if let Some(records) = ghost_records.as_deref_mut() {
+            // The page-locked tier owns its own record bytes, so skip resolving a
+            // host slice entirely when it is active — reading `moe.*_exps` here
+            // would read the sparse shadow's deliberately empty routed ranges.
+            let tier_bytes = if self.host_tier.is_some() {
+                (&[][..], &[][..])
+            } else if let Some(records) = ghost_records.as_deref_mut() {
                 let record = records.get(&expert).ok_or_else(|| {
                     BackendError::InvalidModelMetadata(format!(
                         "Ghost-MoE CUDA lost routed expert layer={l} expert={expert}"
@@ -7394,7 +8084,10 @@ impl Gemma4CudaResident {
                     &down_bytes[down_off..down_off + expected_down],
                 )
             };
-            if gu_host.len() != expected_gu || down_host.len() != expected_down {
+            let (gu_host, down_host) = tier_bytes;
+            if self.host_tier.is_none()
+                && (gu_host.len() != expected_gu || down_host.len() != expected_down)
+            {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "Gemma 4 CUDA expert record length mismatch at layer={l} expert={expert}: gate_up={} expected={expected_gu}, down={} expected={expected_down}",
                     gu_host.len(),
@@ -7411,7 +8104,46 @@ impl Gemma4CudaResident {
             })?;
             let gu_start = slot * cache.gate_up_stride;
             let down_start = slot * cache.down_stride;
-            if pinned_transfers {
+            if let Some(tier) = self.host_tier.as_ref() {
+                // Tier 2 hit: the record is already page-locked, so the copy
+                // engine DMAs straight out of it and the CPU never touches the
+                // bytes. That is the whole point of the tier — staging through
+                // the ring instead would add a ~3.19 MiB host memcpy (~0.4 ms)
+                // to every miss, ~30 ms/token at the measured 73 misses.
+                let (ghost_file, ghost_layer_idx) = ghost_layer.ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(
+                        "Ghost-MoE CUDA host tier requires the paired .cghost artifact".into(),
+                    )
+                })?;
+                let mut tier = tier.borrow_mut();
+                let tier_slot =
+                    tier.ensure_resident(ghost_file, ghost_layer_idx, expert, &tier_protected)?;
+                let (gu_pinned, down_pinned) = tier.views(tier_slot);
+                if gu_pinned.len() != expected_gu || down_pinned.len() != expected_down {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "Ghost-MoE CUDA host tier record mismatch at layer={l} expert={expert}: gate_up={} expected={expected_gu}, down={} expected={expected_down}",
+                        gu_pinned.len(),
+                        down_pinned.len()
+                    )));
+                }
+                let SserCache {
+                    gate_up_arena,
+                    down_arena,
+                    ..
+                } = &mut *cache;
+                self.expert_copy_stream
+                    .memcpy_htod(
+                        gu_pinned,
+                        &mut gate_up_arena.slice_mut(gu_start..gu_start + expected_gu),
+                    )
+                    .map_err(cu)?;
+                self.expert_copy_stream
+                    .memcpy_htod(
+                        down_pinned,
+                        &mut down_arena.slice_mut(down_start..down_start + expected_down),
+                    )
+                    .map_err(cu)?;
+            } else if pinned_transfers {
                 let transfer_index = miss_slots.len();
                 let SserCache {
                     gate_up_arena,
@@ -7706,7 +8438,24 @@ impl Gemma4CudaResident {
         // Ghost-MoE shadows intentionally contain zero holes for routed experts.
         // Resolve only SSER misses from the paired `.cghost`, batching positioned
         // reads in physical expert order before restoring router order.
-        let mut ghost_records = if let Some(ghost) = moe.ghost.as_ref() {
+        let routed_batch = std::env::var("CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS")
+            .ok()
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+            })
+            .unwrap_or(true);
+        // The page-locked tier resolves its own records inside the ROUTED miss
+        // path, so skip this pre-pass when both are active: mapping every miss
+        // here as well would fault the same bytes in twice. The serial
+        // diagnostic path (`CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS=0`) has no tier
+        // branch and still reads from these records — without them it would fall
+        // through to `moe.*_exps`, which on a Ghost-MoE shadow is a deliberately
+        // empty routed range, i.e. silently wrong output rather than a failure.
+        let skip_records = routed_batch && self.host_tier.is_some();
+        let mut ghost_records = if let (Some(ghost), false) = (moe.ghost.as_ref(), skip_records) {
             let missing = {
                 let cache = sser.borrow();
                 idx.iter()
@@ -7751,15 +8500,31 @@ impl Gemma4CudaResident {
         for (b, blk) in cur_moe_q.iter().enumerate() {
             in_quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
         }
-        let d_in_s = s.clone_htod(&in_scales).map_err(cu)?;
-        let d_in_q = s.clone_htod(&in_quants).map_err(cu)?;
-        let route_count = idx.len();
-        // The routed kernels write each expert into its original top-k position.
-        // Hits execute together while the copy stream populates missing arena slots.
-        let mut d_gate_up = unsafe { s.alloc::<f32>(route_count * two_nff) }.map_err(cu)?;
-        let mut d_geglu_q = unsafe { s.alloc::<i8>(route_count * nff) }.map_err(cu)?;
-        let mut d_geglu_s = unsafe { s.alloc::<f32>(route_count * down_blocks) }.map_err(cu)?;
-        let mut d_y_all = unsafe { s.alloc::<f32>(route_count * hidden) }.map_err(cu)?;
+        // Per-layer scratch is RESIDENT, not allocated per call. Measured on the
+        // tracked box with a 95.9%-hit route (i.e. transfers almost entirely
+        // removed), the expert loop still spent 26.7 ms/token in
+        // "prep + dtoh + sync" — 0.89 ms per layer with barely any bytes moving.
+        // Allocating here cost 7 stream-ordered allocations plus their
+        // event-tracking teardown, 30x per token; `clone_htod` allocates as well
+        // as copying. Reusing fixed buffers turns ~360 driver round-trips per
+        // token into ~150 plain copies. The buffers are sized at load to the
+        // per-layer maxima, so every layer's view is a prefix of the same
+        // allocation and the kernels see byte-identical inputs.
+        let mut scratch = self
+            .moe_scratch
+            .as_ref()
+            .expect("moe_layer_ffn_cached requires resident MoE scratch")
+            .borrow_mut();
+        let MoeScratchDev {
+            in_s: d_in_s,
+            in_q: d_in_q,
+            gate_up: d_gate_up,
+            geglu_q: d_geglu_q,
+            geglu_s: d_geglu_s,
+            y_all: d_y_all,
+        } = &mut *scratch;
+        s.memcpy_htod(&in_scales, d_in_s).map_err(cu)?;
+        s.memcpy_htod(&in_quants, d_in_q).map_err(cu)?;
         // M3/M4 on-device MoE accumulator: every selected expert (hit OR uploaded-miss)
         // folds its weighted down-GEMV output straight into this device buffer (one
         // scaled_axpy launch each). In M4 the buffer is RETURNED to the caller and
@@ -7769,15 +8534,6 @@ impl Gemma4CudaResident {
         let gate_up_bytes = moe.gate_up_exps.bytes();
         let down_bytes = moe.down_exps.bytes();
 
-        let routed_batch = std::env::var("CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS")
-            .ok()
-            .map(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no" | "disabled"
-                )
-            })
-            .unwrap_or(true);
         if !routed_batch {
             // Allocate fallback-only scratch lazily so the routed hot path pays
             // neither the device allocations nor their event-tracking teardown.
@@ -7921,7 +8677,7 @@ impl Gemma4CudaResident {
                         &gu_dev,
                         two_nff,
                         gu_blocks,
-                        &mut d_gate_up,
+                        d_gate_up,
                         0,
                     )
                     .map_err(cu)?;
@@ -7943,8 +8699,8 @@ impl Gemma4CudaResident {
                         &s,
                         &k.quantize,
                         &d_geglu,
-                        &mut d_geglu_q,
-                        &mut d_geglu_s,
+                        d_geglu_q,
+                        d_geglu_s,
                         down_blocks,
                     )
                     .map_err(cu)?;
@@ -7996,10 +8752,10 @@ impl Gemma4CudaResident {
                 ghost_records.as_mut(),
                 &d_in_s,
                 &d_in_q,
-                &mut d_gate_up,
-                &mut d_geglu_q,
-                &mut d_geglu_s,
-                &mut d_y_all,
+                d_gate_up,
+                d_geglu_q,
+                d_geglu_s,
+                d_y_all,
                 &mut d_moe_acc,
             )?;
         }

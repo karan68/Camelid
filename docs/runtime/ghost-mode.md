@@ -193,13 +193,40 @@ are on by default for the experimental CUDA lane. Set
 `CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS=0` for the serial diagnostic path or
 `CAMELID_GEMMA4_CUDA_PINNED_EXPERTS=0` to bypass the page-locked transfer ring.
 
-On the tracked RTX 3060 Laptop 6 GiB, the mapped 26B Q4_0 row with an 803-expert VRAM cache and the
-160 MiB reserve sustained 12.29 decode tokens/second over the second half of a 256-token greedy run;
-the fastest eight-token window was 14.73 tokens/second. The complete generated token sequence was
-unchanged, and the standalone Q4_0 CUDA oracle remained bit-identical on 96/96 rows. A 64 MiB
-reserve admitted 830 experts and raised the hit rate, but slowed sustained decode to 10.13
-tokens/second under WDDM memory pressure, so the 160 MiB reserve remains the recommended setting.
-These are exact-machine measurements, not a general throughput claim.
+Between the VRAM cache and storage sits a page-locked **host expert tier**: a cacheable pinned
+arena of whole `.cghost` records, auto-sized from available host RAM minus a reserve
+(`CAMELID_GEMMA4_GHOST_HOST_TIER_MIB` overrides it explicitly, `0` disables;
+`CAMELID_GEMMA4_GHOST_HOST_TIER_RESERVE_MIB` adjusts the default 3 GiB reserve). Auto-sizing
+refuses to build a tier smaller than a quarter of the routed payload: the tier only sees the
+VRAM cache's miss tail, and a small arena measured 0% hits on that stream while pinning RAM
+away from the OS page cache that was otherwise absorbing the reads — strictly worse than no
+tier. The explicit override still forces any size for measurement. A VRAM miss that
+the tier holds costs one async DMA straight from pinned memory — the CPU never touches the bytes —
+instead of a storage read. This matters because the tracked machine's NVMe delivers a flat
+1.3–1.9 GB/s regardless of read queue depth, so no amount of read parallelism can serve the
+~800 MB/token routed working set from disk. `CAMELID_GEMMA4_GHOST_TIER_PREFILL=1` optionally
+fills the tier at load with a uniform per-layer stripe of records (mostly sequential reads).
+On the tracked 16 GiB machine this measured neutral-to-negative — the prefill read evicts the OS
+page cache's copy of the same payload, giving back what the extra tier hits gain — so it is off
+by default; it is expected to pay off only when the tier can hold the entire routed payload.
+`CAMELID_GEMMA4_GHOST_CUDA_CONTEXT` bounds the KV window (default 4096): the 26B row's KV costs
+~220 MiB per 1024 positions, and every ~3.2 MiB returned admits one more resident routed expert,
+so short-session deployments can trade context for hit rate.
+
+Throughput on the tracked RTX 3060 Laptop 6 GiB (i7-11800H, 16 GiB RAM) is dominated by how much
+of the 12.0 GiB routed payload is resident somewhere, which makes it strongly dependent on free
+host RAM at load. With ~8–9.5 GiB of host RAM free, a 7.1 GiB pinned tier, the 160 MiB reserve,
+and the KV window at 1024 (1013-expert VRAM cache), a 128-token greedy run sustained 11.99 decode
+tokens/second over its second half; a 256-token run sustained 10.06 (longer sessions route to more
+distinct experts, so the storage tail grows). The same binary with the tier disabled sustained
+8.50 under the same conditions, and only ~4.3 when background applications held most of the
+machine's RAM. The greedy token stream was byte-identical with the tier on and off (96/96), and
+the standalone Q4_0 CUDA oracle remained bit-identical on 96/96 rows. With routing artificially
+concentrated so the VRAM cache hit 95.9% — expert transfers essentially removed — the lane
+measured 19.5–20.6 tokens/second, which bounds what any residency improvement alone can reach on
+this machine. A 64 MiB reserve slowed sustained decode under WDDM memory pressure, so the 160 MiB
+reserve remains the recommended setting. These are exact-machine measurements, not a general
+throughput claim.
 
 The 1 GiB default can retain a little more than one token's 240-expert routed working set on the
 tracked Q4_0 row. `--expert-cache-mib 0` retains no routed expert after the current use and gives
