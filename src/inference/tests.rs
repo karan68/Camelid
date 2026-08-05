@@ -4174,6 +4174,67 @@ fn q6_k_owner_prefill_bitwise_matches_block_dot_core() {
     }
 }
 
+/// Natural-order reference for one superblock's `aux32`, written the way
+/// [`q6_k_wire_row_dot`] states it. Without an independent oracle the kernel
+/// and its twin could agree with each other and both be wrong.
+fn q6_k_reference_aux32(a: &[i8; 256], scales: &[u8; 16], q8: &[i8; 256]) -> [i32; 8] {
+    let mut aux32 = [0i32; 8];
+    for (j, &scale) in scales.iter().enumerate().take(16) {
+        let scale = scale as i8 as i32;
+        let off = j * 16;
+        for l in 0..8 {
+            aux32[l] += scale * (q8[off + l] as i32) * (a[off + l] as i32);
+            aux32[l] += scale * (q8[off + 8 + l] as i32) * (a[off + 8 + l] as i32);
+        }
+    }
+    aux32
+}
+
+/// Both owner `aux32` kernels against the natural-order reference loop.
+#[test]
+fn q6_k_owner_aux32_matches_the_reference_lane_loop() {
+    for salt in 0..8usize {
+        let a: [i8; 256] =
+            std::array::from_fn(|i| ((((i * 17 + salt * 5) % 64) as i16) - 32) as i8);
+        // Scale byte 0 is always 0x80 so the i8 extreme (-128) is exercised.
+        let scales: [u8; 16] = std::array::from_fn(|j| {
+            if j == 0 {
+                0x80
+            } else {
+                ((j * 37 + salt * 13) % 256) as u8
+            }
+        });
+        // salt 7 pins the extreme the zero-point form exists to survive: the
+        // faster sign-folded alternative (`maddubs(|a|, sign(a)·q8)`) is
+        // silently wrong at an activation of -128 because negating it wraps.
+        // `quantize_q8_k_blocks` cannot emit -128 today, and this kernel must
+        // not acquire a dependency on that which the per-cell path lacks.
+        let q8: [i8; 256] = std::array::from_fn(|i| {
+            if salt == 7 && i % 3 == 0 {
+                -128
+            } else {
+                (((i * 23 + salt * 11) % 255) as i16 - 127) as i8
+            }
+        });
+
+        let want = q6_k_reference_aux32(&a, &scales, &q8);
+        assert_eq!(
+            q6_k_owner_aux32_scalar(&a, &scales, &q8),
+            want,
+            "scalar aux32 diverged from the reference (salt={salt})"
+        );
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed present above.
+            let simd = unsafe { q6_k_owner_aux32_avx2(&a, &scales, &q8) };
+            assert_eq!(
+                simd, want,
+                "avx2 aux32 diverged from the reference (salt={salt})"
+            );
+        }
+    }
+}
+
 /// Scalar-vs-AVX2 twin for the Q6_K owner's lifted integer lane dot.
 #[test]
 fn q6_k_owner_aux32_scalar_matches_avx2() {

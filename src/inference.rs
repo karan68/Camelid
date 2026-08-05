@@ -20891,9 +20891,47 @@ fn q6_k_owner_rebuild_superblock(block: &[u8], a: &mut [i8; Q6_K_VALUES_PER_BLOC
     }
 }
 
+/// `shuffle_epi8` control that reorders one 16-value scale group so the two
+/// values sharing an `aux32` lane become adjacent: `dst[2m] = src[m]`,
+/// `dst[2m + 1] = src[m + 8]`. A scale group is exactly one 128-bit lane, so
+/// broadcasting these 16 bytes covers both halves of a 32-byte load.
+#[cfg(target_arch = "x86_64")]
+const Q6_K_OWNER_PAIR_PERM: [i8; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+
+/// Q6_K's reference unpack shifts each 6-bit code by `-32`. `maddubs` needs an
+/// unsigned operand, so the kernel adds that shift back and then removes it
+/// again from the activation pair sums.
+#[cfg(target_arch = "x86_64")]
+const Q6_K_OWNER_ZERO_POINT: i8 = 32;
+#[cfg(target_arch = "x86_64")]
+const Q6_K_OWNER_ZERO_POINT_SHIFT: i32 = 5;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(Q6_K_OWNER_ZERO_POINT as i32 == 1 << Q6_K_OWNER_ZERO_POINT_SHIFT);
+
 /// Q6_K integer lane dot over a pre-rebuilt superblock: the exact integers of
-/// [`q6_k_wire_row_dot`]'s `aux32` loop (associative — lane/order free), AVX2
-/// body lifted from the in-tree bit-identical `q6_k_wire_row_dot_avx2`.
+/// [`q6_k_wire_row_dot`]'s `aux32` loop (associative — lane/order free), so
+/// this is bit-identical to [`q6_k_owner_aux32_scalar`] and to the per-cell
+/// path by construction.
+///
+/// Two 16-value scale groups per iteration through one `maddubs`, against the
+/// previous kernel's one group per 128-bit load widened to i16. Both operands
+/// are shuffled into pair order in-register, so a `maddubs` pair sum IS one
+/// `aux32` lane's contribution for that group. The stored weight layout is
+/// deliberately left alone: pre-permuting it would save the shuffle here but
+/// turns the scalar twin's contiguous reads into strided ones, which measured
+/// 3.5x slower — and the scalar twin is the only path on non-x86 targets.
+///
+/// The zero point is added back rather than folded with `sign_epi8`. The sign
+/// form is marginally faster and is silently wrong at an activation byte of
+/// `-128`, because negating `-128` wraps; `quantize_q8_k_blocks` cannot emit
+/// that today, but the per-cell path this must match does not depend on it and
+/// neither should this.
+///
+/// Exact-integer envelope, all well inside i16 before the widen: `a + 32` is
+/// `0..=63` and `|q8| ≤ 128`, so a `maddubs` pair is ≤ 16,128 in absolute
+/// value; the zero-point term `32·(q8_lo + q8_hi)` is ≤ 8,192; their difference
+/// is ≤ 24,320 < `i16::MAX`. After the widen a lane value is `|a·q8| ≤ 4064`
+/// per pair member, × `|scale| ≤ 128` over 16 groups ⇒ ≤ 16.6M ≪ `i32::MAX`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn q6_k_owner_aux32_avx2(
@@ -20902,24 +20940,43 @@ unsafe fn q6_k_owner_aux32_avx2(
     q8: &[i8; Q6_K_VALUES_PER_BLOCK],
 ) -> [i32; 8] {
     use std::arch::x86_64::*;
+    let perm = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+        Q6_K_OWNER_PAIR_PERM.as_ptr() as *const __m128i
+    ));
+    let ones = _mm256_set1_epi8(1);
+    let zero_point = _mm256_set1_epi8(Q6_K_OWNER_ZERO_POINT);
     let mut acc = _mm256_setzero_si256();
-    let aptr = a.as_ptr();
-    let qptr = q8.as_ptr();
-    for (j, &scale) in scales.iter().enumerate().take(16) {
-        let off = j * 16;
-        let a16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(aptr.add(off) as *const __m128i));
-        let q16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(qptr.add(off) as *const __m128i));
-        // 16 i16 products (exact, fit i16); low 128 = products[0..8], high = [8..16]
-        let prod = _mm256_mullo_epi16(a16, q16);
-        let pair = _mm_add_epi16(
-            _mm256_castsi256_si128(prod),
-            _mm256_extracti128_si256(prod, 1),
-        ); // 8 i16 = prod[l] + prod[l+8]
-        let scaled = _mm256_mullo_epi32(
-            _mm256_cvtepi16_epi32(pair),
-            _mm256_set1_epi32(scale as i8 as i32),
+    for group_pair in 0..8 {
+        let off = group_pair * 32;
+        let q = _mm256_shuffle_epi8(
+            _mm256_loadu_si256(q8.as_ptr().add(off) as *const __m256i),
+            perm,
         );
-        acc = _mm256_add_epi32(acc, scaled);
+        // The rebuild leaves `a` in [-32, 31], so this lands in [0, 63].
+        let au = _mm256_add_epi8(
+            _mm256_shuffle_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(off) as *const __m256i),
+                perm,
+            ),
+            zero_point,
+        );
+        let lanes = _mm256_sub_epi16(
+            _mm256_maddubs_epi16(au, q),
+            _mm256_slli_epi16(_mm256_maddubs_epi16(ones, q), Q6_K_OWNER_ZERO_POINT_SHIFT),
+        );
+        let lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(lanes));
+        let hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(lanes, 1));
+        acc = _mm256_add_epi32(
+            acc,
+            _mm256_mullo_epi32(lo, _mm256_set1_epi32(scales[2 * group_pair] as i8 as i32)),
+        );
+        acc = _mm256_add_epi32(
+            acc,
+            _mm256_mullo_epi32(
+                hi,
+                _mm256_set1_epi32(scales[2 * group_pair + 1] as i8 as i32),
+            ),
+        );
     }
     let mut aux32 = [0i32; 8];
     _mm256_storeu_si256(aux32.as_mut_ptr() as *mut __m256i, acc);
