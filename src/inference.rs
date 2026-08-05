@@ -744,6 +744,15 @@ impl LlamaLoadedWeights {
         };
         let load_moe_experts = |experts: &LlamaMoeExpertTensors| match experts {
             LlamaMoeExpertTensors::Merged(desc) => match moe_expert_storage {
+                // Q4_0 expert packs stream as raw wire regardless of the
+                // storage mode: they have no resident-Q8 representation, and
+                // the Q8 loader's f32 fallback would materialize tens of GiB.
+                _ if store.descriptor(&desc.name).is_ok_and(|d| {
+                    matches!(d.tensor_type, GgufTensorType::Q4_0 | GgufTensorType::Q4_1)
+                }) =>
+                {
+                    store.load_q4_0_file_backed_expert_tensor(&desc.name)
+                }
                 crate::runtime_config::MoeExpertStorage::FileBacked => {
                     store.load_q8_0_file_backed_tensor(&desc.name)
                 }
@@ -1361,31 +1370,23 @@ impl LlamaLoadedWeights {
                     moe.expert_count as usize,
                     &format!("layer {idx} ffn router"),
                 )?;
+                let expert_ff = moe
+                    .expert_feed_forward_length
+                    .map(|v| v as usize)
+                    .unwrap_or(dims.feed_forward_length);
                 require_tensor_shape(
                     &layer.ffn_gate,
-                    &[
-                        dims.embedding_length,
-                        dims.feed_forward_length,
-                        moe.expert_count as usize,
-                    ],
+                    &[dims.embedding_length, expert_ff, moe.expert_count as usize],
                     &format!("layer {idx} ffn gate experts"),
                 )?;
                 require_tensor_shape(
                     &layer.ffn_up,
-                    &[
-                        dims.embedding_length,
-                        dims.feed_forward_length,
-                        moe.expert_count as usize,
-                    ],
+                    &[dims.embedding_length, expert_ff, moe.expert_count as usize],
                     &format!("layer {idx} ffn up experts"),
                 )?;
                 require_tensor_shape(
                     &layer.ffn_down,
-                    &[
-                        dims.feed_forward_length,
-                        dims.embedding_length,
-                        moe.expert_count as usize,
-                    ],
+                    &[expert_ff, dims.embedding_length, moe.expert_count as usize],
                     &format!("layer {idx} ffn down experts"),
                 )?;
             } else {
@@ -11834,10 +11835,11 @@ fn expert_matrix_view(
     let uses_q8_storage = weight.q8_0_shared_blocks.is_some()
         || weight.q8_0_blocks.is_some()
         || weight.q8_0_file_backing.is_some()
-        || weight.q8_0_split_file_backing.is_some();
+        || weight.q8_0_split_file_backing.is_some()
+        || weight.q4_0_file_backing.is_some();
     if uses_q8_storage && !expert_elements.is_multiple_of(Q8_0_BLOCK_VALUES) {
         return Err(BackendError::RuntimeShapeMismatch(format!(
-            "MoE expert element count {expert_elements} is not Q8_0 block aligned"
+            "MoE expert element count {expert_elements} is not 32-value block aligned"
         )));
     }
     if weight.dim(0)? != input_width || weight.dim(1)? != output_width {
@@ -11850,7 +11852,20 @@ fn expert_matrix_view(
         BackendError::RuntimeShapeMismatch("MoE expert offset overflow".to_string())
     })? / Q8_0_BLOCK_VALUES;
     let block_count = expert_elements / Q8_0_BLOCK_VALUES;
-    let mut tensor = if let Some(split_backings) = &weight.q8_0_split_file_backing {
+    let mut tensor = if let Some(backing) = &weight.q4_0_file_backing {
+        // Streamed Q4_0/Q4_1 expert pack: read this expert's contiguous wire
+        // slice (buffered, so the OS page cache retains hot experts) and
+        // dequantize it transiently. Both nibble formats use 32-value blocks
+        // like Q8_0, so the shared block arithmetic above holds unchanged.
+        let wire = backing.read_wire_blocks(block_offset, block_count)?;
+        let data = match weight.source_type {
+            Some(GgufTensorType::Q4_1) => {
+                crate::tensor::decode_q4_1_tensor(&weight.name, &wire, expert_elements)?
+            }
+            _ => crate::tensor::decode_q4_0_tensor(&weight.name, &wire, expert_elements)?,
+        };
+        CpuTensor::from_f32(name, vec![output_width, input_width], data)?
+    } else if let Some(split_backings) = &weight.q8_0_split_file_backing {
         let backing = split_backings.get(expert_idx).ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(format!(
                 "MoE split expert index {expert_idx} missing from {} split backings",

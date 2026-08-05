@@ -7548,9 +7548,10 @@ fn model_family(gguf: &GgufFile) -> &'static str {
     match gguf.architecture() {
         Some("gemma4") => "gemma4",
         Some("nomic-bert") => "embedding",
-        Some("llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3" | "phi3" | "lfm2") => {
-            "llama-family"
-        }
+        Some(
+            "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "smollm3" | "gemma3" | "phi3"
+            | "lfm2",
+        ) => "llama-family",
         Some(_) => "other",
         None => "unknown",
     }
@@ -13630,7 +13631,20 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
                 | GgufTensorType::Q2_0G128
                 | GgufTensorType::Pq2_0
         ) && desc.dimensions.len() == 2;
-        let f32_bytes = if file_backed_q8_linear || wire_resident_kquant || wire_resident_prism {
+        // Rank-3 Q4_0 MoE expert packs stream file-backed unconditionally
+        // (`load_q4_0_file_backed_expert_tensor`): only per-expert slices are
+        // ever dequantized, transiently, at matvec time. Counting them at f32
+        // bytes would refuse every fine-grained Q4_0 MoE (e.g. ~116 GB for a
+        // 30B-A3B pack) that the engine actually runs in a ~2 GB footprint.
+        let file_backed_q4_experts = matches!(
+            desc.tensor_type,
+            GgufTensorType::Q4_0 | GgufTensorType::Q4_1
+        ) && desc.dimensions.len() == 3;
+        let f32_bytes = if file_backed_q8_linear
+            || wire_resident_kquant
+            || wire_resident_prism
+            || file_backed_q4_experts
+        {
             0
         } else {
             element_count.checked_mul(4).ok_or_else(|| {
@@ -18356,8 +18370,21 @@ fn render_chat_prompt_for_tokenization_fallback(
             };
         }
         if is_qwen3_chatml_template(template) {
+            // Non-thinking Qwen3 templates (e.g. Instruct-2507 and qwen3moe
+            // instruct rows) always render the bare assistant generation
+            // prompt: their jinja has no `enable_thinking` branch (they may
+            // still mention <think> for history stripping). Injecting the
+            // empty-think suppression block there is out-of-distribution and
+            // degrades greedy decoding into echo loops, so the think-block
+            // shape is reserved for templates that actually branch on
+            // `enable_thinking`.
+            let thinking_shape = if template.contains("enable_thinking") {
+                enable_thinking
+            } else {
+                true
+            };
             return RenderedPrompt {
-                text: render_qwen3_chatml_prompt(messages, enable_thinking),
+                text: render_qwen3_chatml_prompt(messages, thinking_shape),
                 // Qwen3 has add_bos_token=false; the ChatML template fully
                 // specifies the prompt. Parse specials so <|im_start|>/<|im_end|>
                 // become control token ids (151644/151645), not literal text.
@@ -21601,6 +21628,7 @@ mod tests {
             expert_weights_scale: 1.0,
             expert_weights_norm: true,
             expert_gating_func: 0,
+            expert_feed_forward_length: None,
         };
         let generic_moe = crate::model::MixtralMoeMetadata {
             family_label: "MoE",
