@@ -246,7 +246,7 @@ fn check_tokenizer(file: &GgufFile) -> Result<TokenizerFamily, AdmissionReject> 
 /// bit `j % 8` of byte `j / 8`), NOT the split-half interleave of the legacy
 /// formats, and an MSB-first decode still produces plausible-looking weights.
 ///
-/// Prism Q1_0 and both resolved Q2_0 dialects also have packed native Metal lanes.
+/// Prism Q1_0 and both resolved Q2_0 dialects also have packed native Metal/CUDA lanes.
 /// Runnable admission remains a loadability claim only; model-level support still
 /// requires the architecture and end-to-end gates documented by the support matrix.
 ///

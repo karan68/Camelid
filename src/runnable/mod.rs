@@ -14,6 +14,8 @@ pub mod dequant;
 pub mod model;
 pub mod smoke;
 mod vision;
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+mod vision_cuda;
 
 pub use admit::{admit, AdmissionAxis, AdmissionOk, AdmissionReject, TokenizerFamily};
 pub use dequant::dequantize;

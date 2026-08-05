@@ -431,6 +431,9 @@ jobs:
       - name: Frontend catalog browse smoke
         run: npm run smoke:catalog-browse
 
+      - name: Frontend catalog companion download smoke
+        run: npm run smoke:catalog-companion
+
       - name: Frontend model deletion smoke
         run: npm run smoke:model-deletion
 

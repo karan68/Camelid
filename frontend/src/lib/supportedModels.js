@@ -2,6 +2,13 @@
    to download + run). Catalog ids/repos/filenames/sizes match the backend catalog
    the install endpoint expects, so installCatalogModel(item) and the localStorage
    download-progress tracking (keyed by catalog_id) work directly. */
+export const BONSAI_27B_VISION_PROJECTOR = Object.freeze({
+  role: 'vision_projector',
+  repo_id: 'prism-ml/Ternary-Bonsai-27B-gguf',
+  filename: 'Ternary-Bonsai-27B-mmproj-Q8_0.gguf',
+  size_bytes: 629246880,
+})
+
 export const SUPPORTED_MODELS = [
   {
     catalog_id: 'llama32_3b_instruct_q8_0',
@@ -190,7 +197,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Bonsai-4B-Q1_0.gguf',
     size_bytes: 572270624,
     quant: 'Q1_0',
-    blurb: 'Prism ML’s compact 1-bit Bonsai model, supported on Apple Silicon Metal.',
+    blurb: 'Prism ML’s compact 1-bit Bonsai model, supported on Apple Silicon Metal and Windows CUDA.',
   },
   {
     catalog_id: 'ternary_bonsai_4b_q2_0',
@@ -199,7 +206,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Ternary-Bonsai-4B-Q2_0.gguf',
     size_bytes: 1074969344,
     quant: 'Q2_0',
-    blurb: 'The higher-quality ternary 4B pack, supported on Apple Silicon Metal.',
+    blurb: 'The higher-quality ternary 4B pack, supported on Apple Silicon Metal and Windows CUDA.',
   },
   {
     catalog_id: 'ternary_bonsai_4b_pq2_0',
@@ -208,7 +215,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Ternary-Bonsai-4B-PQ2_0.gguf',
     size_bytes: 1074969344,
     quant: 'PQ2_0',
-    blurb: 'The packed PQ2_0 variant of Ternary Bonsai 4B, supported on Apple Silicon Metal.',
+    blurb: 'The packed PQ2_0 variant of Ternary Bonsai 4B, supported on Apple Silicon Metal and Windows CUDA.',
   },
   {
     catalog_id: 'bonsai_8b_q1_0',
@@ -217,7 +224,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Bonsai-8B-Q1_0.gguf',
     size_bytes: 1158654496,
     quant: 'Q1_0',
-    blurb: 'An 8B Bonsai model in a roughly 1.2 GB 1-bit pack, supported on Apple Silicon Metal.',
+    blurb: 'An 8B Bonsai model in a roughly 1.2 GB 1-bit pack, supported on Apple Silicon Metal and Windows CUDA.',
   },
   {
     catalog_id: 'ternary_bonsai_8b_q2_0',
@@ -226,7 +233,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Ternary-Bonsai-8B-Q2_0.gguf',
     size_bytes: 2182184672,
     quant: 'Q2_0',
-    blurb: 'The higher-quality ternary 8B pack, supported on Apple Silicon Metal.',
+    blurb: 'The higher-quality ternary 8B pack, supported on Apple Silicon Metal and Windows CUDA.',
   },
   {
     catalog_id: 'bonsai_27b_q1_0',
@@ -235,7 +242,8 @@ export const SUPPORTED_MODELS = [
     filename: 'Bonsai-27B-Q1_0.gguf',
     size_bytes: 3803452480,
     quant: 'Q1_0',
-    blurb: 'The full 27B reasoning model in a compact 1-bit pack; vision needs its companion mmproj.',
+    companion_artifacts: [BONSAI_27B_VISION_PROJECTOR],
+    blurb: 'The full 27B reasoning model for Metal and Windows CUDA; the Models download includes its vision projector.',
   },
   {
     catalog_id: 'ternary_bonsai_27b_q2_0',
@@ -244,6 +252,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Ternary-Bonsai-27B-Q2_0.gguf',
     size_bytes: 7165121600,
     quant: 'Q2_0',
-    blurb: 'The higher-quality 27B ternary pack; vision needs its companion mmproj.',
+    companion_artifacts: [BONSAI_27B_VISION_PROJECTOR],
+    blurb: 'The higher-quality 27B ternary pack for Metal and Windows CUDA; the Models download includes its vision projector.',
   },
 ]

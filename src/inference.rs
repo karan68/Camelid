@@ -694,10 +694,9 @@ impl LlamaLoadedWeights {
                     return store.load_iq4_xs_wire_linear(name);
                 }
                 // Prism Q1/Q2 linears stay in their native packed wire format on
-                // macOS. The Metal resident lane consumes these bytes directly;
-                // there is no whole-model Q8/F32 expansion. Keep the pre-existing
-                // lossless Q1->Q8 bridge on other platforms until their native
-                // backend lands; Windows is intentionally the follow-up machine.
+                // macOS Metal and Windows CUDA. Both resident lanes consume these
+                // bytes directly; there is no whole-model Q8/F32 expansion. Keep
+                // the pre-existing lossless Q1->Q8 bridge on other platforms.
                 if matches!(
                     desc.tensor_type,
                     GgufTensorType::Q1_0
@@ -706,7 +705,10 @@ impl LlamaLoadedWeights {
                         | GgufTensorType::Pq2_0
                 ) && desc.dimensions.len() == 2
                 {
-                    if cfg!(target_os = "macos") {
+                    if cfg!(any(
+                        target_os = "macos",
+                        all(target_os = "windows", feature = "cuda")
+                    )) {
                         return store.load_prism_wire_linear(name);
                     }
                     if desc.tensor_type == GgufTensorType::Q1_0 {
@@ -2646,6 +2648,13 @@ impl LlamaInferenceSession {
     /// Current KV position (count of tokens whose K/V entries are committed).
     pub fn kv_position(&self) -> usize {
         self.kv_cache.position
+    }
+
+    /// Bytes currently allocated by this session's CPU-side K/V history.
+    /// Used by the local runtime-memory endpoint to report retained prompt-cache
+    /// cost without exposing cache contents.
+    pub fn kv_cache_allocated_bytes(&self) -> u64 {
+        self.kv_cache.allocated_bytes()
     }
 
     /// Positions still available before the context limit.
@@ -5949,8 +5958,8 @@ fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
     let global = rayon::current_num_threads();
     // Promoted default policy (Windows x86_64): decode runs on a dedicated
     // pool at the DETECTED PHYSICAL core count, never the SMT logical count,
-    // and on a hybrid Intel part at the PERFORMANCE-core count rather than the
-    // raw physical count (see `win_pin`). Fail-closed: no detection → no pool
+    // and on a hybrid part at the PERFORMANCE-core count rather than the raw
+    // physical count (see `win_pin`). Fail-closed: no detection → no pool
     // (pre-promotion behavior); an operator-pinned global (CAMELID_THREADS,
     // mirroring the prefill pool's pinning contract) or a global already
     // narrower than physical is never silently overridden. The per-host
@@ -13067,9 +13076,9 @@ fn build_resident_cuda_engine(
     gemma3: Option<&crate::model::Gemma3Metadata>,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     use crate::cuda_resident::ProjQuant;
-    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks, or the
-    // raw K-quant super-block wire bytes (144 B for Q4_K, 210 B for Q6_K). These are
-    // the bytes `set_layer_located`/`set_output` repack per lane.
+    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks,
+    // raw K-quant super-blocks, or native Prism Q1/Q2 packed blocks. These are the
+    // bytes `set_layer_located`/`set_output` repack per lane.
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
         if let Some(b) = t.q8_0_blocks.as_deref() {
             return Some(q8_0_blocks_as_bytes(b));
@@ -13104,6 +13113,19 @@ fn build_resident_cuda_engine(
                 return Some(w.as_slice());
             }
         }
+        if matches!(
+            t.source_type,
+            Some(
+                GgufTensorType::Q1_0
+                    | GgufTensorType::Q2_0G64
+                    | GgufTensorType::Q2_0G128
+                    | GgufTensorType::Pq2_0
+            )
+        ) {
+            if let Some(w) = t.low_bit_wire() {
+                return Some(w);
+            }
+        }
         None
     }
     // The resident GEMV lane a projection dispatches on (drives the upload repack and
@@ -13116,6 +13138,13 @@ fn build_resident_cuda_engine(
             Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
             Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
             Some(GgufTensorType::IQ4XS) if t.iq4_xs_wire_bytes.is_some() => ProjQuant::IQ4XS,
+            Some(GgufTensorType::Q1_0) if t.low_bit_wire().is_some() => ProjQuant::Q1_0,
+            Some(GgufTensorType::Q2_0G64) if t.low_bit_wire().is_some() => ProjQuant::Q2_0G64,
+            Some(GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0)
+                if t.low_bit_wire().is_some() =>
+            {
+                ProjQuant::Q2_0G128
+            }
             _ => ProjQuant::Q8_0,
         }
     }
@@ -19983,8 +20012,11 @@ fn matmul_rhs_transposed_q4_k_block_dot(
 }
 
 /// STAMPEDE Phase 3 Lane B — batched K-quant (Q4_K + Q6_K) prefill owner
-/// flag. Default OFF (opt-in until receipts flip it):
-/// `CAMELID_X86_KQUANT_MATMUL_OWNER=1|on`. The shared telemetry counter
+/// flag. **Default ON for `win-x86_64`** (promoted on the 2026-08-04 receipt);
+/// opt-in everywhere else. Kill switch:
+/// `CAMELID_X86_KQUANT_MATMUL_OWNER=0|false|off|no|disabled`; any other value
+/// leaves a promoted default on, so a typo cannot silently disable it.
+/// The shared telemetry counter
 /// `kquant_owner_prefill_taken` counts dispatches of BOTH quants.
 /// Honors the bench sweep's uncached-plan bypass so in-process A/B configs
 /// take effect (the same fake-null trap as the Q8 owner sweep).
@@ -20394,6 +20426,78 @@ unsafe fn q4_k_owner_weight_row_block_avx512vnni(
     }
 }
 
+/// v6 inner: 256-bit AVX-VNNI sibling of
+/// [`q4_k_owner_weight_row_block_avx512vnni`], for the Alder-Lake-and-later
+/// consumer parts that carry `vpdpbusd` but have AVX-512 fused off — the whole
+/// 12th-gen-onwards Intel client line, which today falls all the way back to
+/// the AVX2 inner. Same algebra as the AVX-512 sibling with the zmm pair split
+/// into two ymm halves: the low nibbles pair with `y.qs[64j..64j+32]` and the
+/// high nibbles with `y.qs[64j+32..64j+64]`, exactly the halves the 64-byte
+/// zmm load covers, so the operand pairing is unchanged.
+///
+/// Bit-identity: every intermediate is exact integer. A `dpbusd` lane is a quad
+/// sum ≤ 4·15·127 = 7620; ×63 scale ≤ 480,060; `vacc` takes 8 adds (4 chunks ×
+/// 2 halves) ≤ 3.85M; the 8-lane reduce ≤ 30.8M ≪ i32::MAX. Integer addition is
+/// associative, so folding both halves into ONE 8-lane accumulator totals the
+/// same as the AVX-512 path's 16-lane accumulator reduced as two halves. The
+/// f32 chain is the verbatim `q4_k_dot_arm` order shared by every inner.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2,avxvnni")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q4_k_owner_weight_row_block_avxvnni(
+    w_row: &[u8],
+    superblocks: usize,
+    wd: &[f32],
+    wdmin: &[f32],
+    wscales: &[[u8; 8]],
+    wmins: &[[u8; 8]],
+    preps: &[(Vec<Q8KBlock>, Vec<[i32; 8]>)],
+    sumf_block: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let low_mask = _mm256_set1_epi8(0x0f);
+    for i in 0..superblocks {
+        let qs = &w_row[i * Q4_K_WIRE_BYTES_PER_BLOCK + 16..i * Q4_K_WIRE_BYTES_PER_BLOCK + 144];
+        // Hoisted once per row block, as in the AVX-512 sibling.
+        let mut wlo = [_mm256_setzero_si256(); 4];
+        let mut whi = [_mm256_setzero_si256(); 4];
+        let mut slo = [_mm256_setzero_si256(); 4];
+        let mut shi = [_mm256_setzero_si256(); 4];
+        let sc = &wscales[i];
+        for j in 0..4 {
+            let q4 = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+            wlo[j] = _mm256_and_si256(q4, low_mask);
+            whi[j] = _mm256_and_si256(_mm256_srli_epi16(q4, 4), low_mask);
+            slo[j] = _mm256_set1_epi32(sc[2 * j] as i32);
+            shi[j] = _mm256_set1_epi32(sc[2 * j + 1] as i32);
+        }
+        let mins = &wmins[i];
+        for ((blocks, sums), sumf) in preps.iter().zip(sumf_block.iter_mut()) {
+            let y = &blocks[i];
+            let d = y.d * wd[i];
+            let dmin = y.d * wdmin[i];
+            let mut prod: i64 = 0;
+            for g in 0..8 {
+                prod += sums[i][g] as i64 * mins[g] as i64;
+            }
+            *sumf = (-dmin).mul_add(prod as f32, *sumf);
+            let q8p = y.qs.as_ptr();
+            let mut vacc = _mm256_setzero_si256();
+            for j in 0..4 {
+                let qlo = _mm256_loadu_si256(q8p.add(j * 64).cast());
+                let qhi = _mm256_loadu_si256(q8p.add(j * 64 + 32).cast());
+                let dlo = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wlo[j], qlo);
+                let dhi = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), whi[j], qhi);
+                vacc = _mm256_add_epi32(vacc, _mm256_mullo_epi32(dlo, slo[j]));
+                vacc = _mm256_add_epi32(vacc, _mm256_mullo_epi32(dhi, shi[j]));
+            }
+            let main = crate::diffusion_gemma::refmath::hsum_i32_8(vacc) as i64;
+            *sumf = d.mul_add(main as f32, *sumf);
+        }
+    }
+}
+
 /// v2 inner: one weight row × a block of input rows, AVX2. Per superblock the
 /// nibble expansion is hoisted once across the whole row block, and the
 /// main-side dot accumulates in i32 vector lanes with ONE horizontal sum per
@@ -20501,10 +20605,22 @@ fn q4_k_owner_prefill_tiled(
     let use_vnni = x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512vnni_available();
     #[cfg(not(target_arch = "x86_64"))]
     let use_vnni = false;
+    // 256-bit vpdpbusd: same instruction, no AVX-512. Only consulted when the
+    // 512-bit path is unavailable, so an AVX-512 host is completely unaffected.
+    #[cfg(target_arch = "x86_64")]
+    let use_avxvnni = !use_vnni
+        && x86_kquant_matmul_owner_vnni_enabled()
+        && std::arch::is_x86_feature_detected!("avxvnni")
+        && std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avxvnni = false;
     // Per-inner engaged signal: without it a VNNI A/B leg on a non-VNNI host
     // silently measures the AVX2 inner (vacuous comparison).
     if use_vnni {
         Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if use_avxvnni {
+        Q8_SCHED_KQUANT_OWNER_AVXVNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // (1) Parallel Q8_K quantize + per-superblock activation group sums.
@@ -20657,6 +20773,21 @@ fn q4_k_owner_prefill_tiled(
                     // SAFETY: avx512f/bw/vnni confirmed present at dispatch.
                     unsafe {
                         q4_k_owner_weight_row_block_avx512vnni(
+                            w_row,
+                            superblocks,
+                            &wd,
+                            &wdmin,
+                            &wscales,
+                            &wmins,
+                            &preps[row_start..row_end],
+                            &mut sumf_block[..block_rows],
+                        );
+                    }
+                } else if use_avxvnni {
+                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: avx2 + avxvnni confirmed present at dispatch.
+                    unsafe {
+                        q4_k_owner_weight_row_block_avxvnni(
                             w_row,
                             superblocks,
                             &wd,

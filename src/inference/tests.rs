@@ -3816,8 +3816,17 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                 .collect();
             let input =
                 CpuTensor::from_f32("owner-test-in", vec![n_rows, in_dim], input_data).unwrap();
-            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            // The baseline must be the NON-owner path. Clearing the variable would
+            // select the owner on win-x86_64, where it is now default-on, and both
+            // legs would run the same code.
+            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "0");
+            reset_q8_schedule_telemetry();
             let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+            assert_eq!(
+                snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken,
+                0,
+                "baseline leg dispatched the owner (n_rows={n_rows}) — vacuous comparison"
+            );
             // Cover BOTH owner inners: VNNI (default when the CPU has it) and
             // the AVX2 fallback (VNNI sub-flag forced off).
             for vnni in ["1", "0"] {
@@ -3902,8 +3911,15 @@ fn q4_k_repack8_owner_bitwise_matches_block_dot_core() {
                 .collect();
             let input =
                 CpuTensor::from_f32("repack8-in", vec![n_rows, in_dim], input_data).unwrap();
-            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            // Baseline must be the non-owner path; see the note in the Q4_K owner test.
+            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "0");
+            reset_q8_schedule_telemetry();
             let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+            assert_eq!(
+                snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken,
+                0,
+                "baseline leg dispatched the owner (n_rows={n_rows}) — vacuous comparison"
+            );
             std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
             reset_q8_schedule_telemetry();
             let owner = q4_k_block_dot_core_with_repack(
@@ -4008,8 +4024,15 @@ fn q4_k_repack8_budget_zero_degrades_bit_identically() {
         weight.source_type = Some(GgufTensorType::Q4K);
         weight.q4_k_wire_bytes = Some(std::sync::Arc::new(wire.clone()));
 
-        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+        // Baseline must be the non-owner path; see the note in the Q4_K owner test.
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "0");
+        reset_q8_schedule_telemetry();
         let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+        assert_eq!(
+            snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken,
+            0,
+            "baseline leg dispatched the owner — vacuous comparison"
+        );
 
         std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
         std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8", "1");
@@ -4026,6 +4049,66 @@ fn q4_k_repack8_budget_zero_degrades_bit_identically() {
         }
         assert_eq!(telemetry.kquant_owner_repack8_taken, 0);
         for (a, b) in denied.data.iter().zip(base.data.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+}
+
+/// The 256-bit AVX-VNNI inner must be bit-identical to the non-owner path.
+/// Guarded to the hosts that actually reach it — a part with AVX-512 takes the
+/// zmm sibling and a part without `vpdpbusd` takes the AVX2 inner, so on those
+/// the assertion would prove nothing about this kernel. The engaged counter is
+/// asserted first so the comparison can never pass vacuously.
+#[test]
+fn q4_k_owner_avxvnni_inner_is_bit_identical() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !std::arch::is_x86_feature_detected!("avxvnni") || q8_owner_avx512vnni_available() {
+            return;
+        }
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let in_dim = 512usize;
+        let out_dim = 32usize;
+        let row_bytes = (in_dim / 256) * 144;
+        let wire: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let input_data: Vec<f32> = (0..8 * in_dim).map(|i| ((i as f32) * 0.3).cos()).collect();
+        let input = CpuTensor::from_f32("avxvnni-in", vec![8usize, in_dim], input_data).unwrap();
+        let mut weight = CpuTensor::from_f32(
+            "avxvnni-w",
+            vec![out_dim, in_dim],
+            vec![0f32; out_dim * in_dim],
+        )
+        .unwrap();
+        weight.source_type = Some(GgufTensorType::Q4K);
+        weight.q4_k_wire_bytes = Some(std::sync::Arc::new(wire.clone()));
+
+        // Baseline must be the non-owner path; see the note in the Q4_K owner test.
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "0");
+        reset_q8_schedule_telemetry();
+        let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+        assert_eq!(
+            snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken,
+            0,
+            "baseline leg dispatched the owner — vacuous comparison"
+        );
+
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI", "1");
+        reset_q8_schedule_telemetry();
+        let owned = matmul_rhs_transposed_q4_k_block_dot(&input, &weight, "avxvnni").unwrap();
+        let telemetry = snapshot_q8_schedule_telemetry();
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
+
+        assert!(
+            telemetry.kquant_owner_avxvnni_taken > 0,
+            "the 256-bit inner never dispatched; the comparison below would be vacuous"
+        );
+        assert_eq!(telemetry.kquant_owner_vnni_taken, 0);
+        for (a, b) in owned.data.iter().zip(base.data.iter()) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
     }
@@ -4062,8 +4145,15 @@ fn q6_k_owner_prefill_bitwise_matches_block_dot_core() {
                 .collect();
             let input =
                 CpuTensor::from_f32("q6k-owner-in", vec![n_rows, in_dim], input_data).unwrap();
-            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            // Baseline must be the non-owner path; see the note in the Q4_K owner test.
+            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "0");
+            reset_q8_schedule_telemetry();
             let base = q6_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+            assert_eq!(
+                snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken,
+                0,
+                "baseline leg dispatched the owner (n_rows={n_rows}) — vacuous comparison"
+            );
             std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
             reset_q8_schedule_telemetry();
             let owner = q6_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
@@ -14329,6 +14419,22 @@ fn prefix_cache_env_setting_parses_the_documented_opt_out() {
     assert!(!prefix_cache_setting_enables(Some("0")));
     assert!(!prefix_cache_setting_enables(Some("false")));
     assert!(!prefix_cache_setting_enables(Some("FALSE")));
+}
+
+/// An 8 GiB unified-memory host cannot safely retain the resident GPU KV plus
+/// both CPU histories created by mirror-then-clone. Automatic policy refuses
+/// that cache, while preserving both explicit operator overrides and the
+/// historical default when host RAM cannot be measured.
+#[test]
+fn resident_prefix_cache_policy_protects_low_memory_hosts() {
+    use super::metal_resident::resident_prefix_cache_policy;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    assert!(!resident_prefix_cache_policy(None, Some(8 * GIB)));
+    assert!(resident_prefix_cache_policy(None, Some(16 * GIB)));
+    assert!(resident_prefix_cache_policy(None, None));
+    assert!(resident_prefix_cache_policy(Some("1"), Some(8 * GIB)));
+    assert!(!resident_prefix_cache_policy(Some("0"), Some(16 * GIB)));
 }
 
 /// BOTH halves of the mirror must be lossless. An F16 resident cache round-trips

@@ -1,0 +1,71 @@
+{
+  "schema": "camelid.prism_bonsai_windows_exact_row_smoke/v1",
+  "platform": "Windows x86_64 CUDA, NVIDIA RTX 3060 Laptop GPU 6144 MiB",
+  "prompt": "Hello",
+  "max_completion_tokens": 8,
+  "shared_expected_token_ids": [9707, 0, 358, 2776, 425, 2382, 2143, 11],
+  "shared_expected_text": "Hello! I'm Bonsai,",
+  "rows": [
+    {
+      "file": "Bonsai-4B-Q1_0.gguf",
+      "sha256": "4524b3f997f0f06444e568d1f26e2efd69effa3218c7ad3047432fb171e42168",
+      "result": "pass; the committed full raw parity report covers four prompts at 1, 5, and 50 tokens"
+    },
+    {
+      "file": "Ternary-Bonsai-4B-Q2_0.gguf",
+      "sha256": "4e0bf8b737b0431552f8c2c97695ab7c0cb214c94bcdeb4f5f267e67ddf28b8b",
+      "token_ids": [9707, 0, 358, 2776, 425, 2382, 2143, 11],
+      "result": "pass; deterministic chat output matches the vendor CUDA server"
+    },
+    {
+      "file": "Ternary-Bonsai-4B-PQ2_0.gguf",
+      "sha256": "829abec7eb92f5bf464762be7c9e8a45d777c714543a1474fc90cee20e698beb",
+      "token_ids": [9707, 0, 358, 2776, 425, 2382, 2143, 11],
+      "result": "pass"
+    },
+    {
+      "file": "Bonsai-8B-Q1_0.gguf",
+      "sha256": "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+      "token_ids": [9707, 0, 358, 2776, 425, 2382, 2143, 11],
+      "cold_elapsed_ms": 2225,
+      "result": "pass"
+    },
+    {
+      "file": "Ternary-Bonsai-8B-Q2_0.gguf",
+      "sha256": "3c8d70470a5d97e5a2b9410ddd899cb740116591462626c60cb2fead6448f60b",
+      "token_ids": [9707, 0, 358, 2776, 425, 2382, 2143, 11],
+      "cold_elapsed_ms": 3165,
+      "result": "pass"
+    },
+    {
+      "file": "Bonsai-27B-Q1_0.gguf",
+      "sha256": "17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0",
+      "result": "pass; four 64-token text prompts match the vendor CUDA server and the PNG vision request completes"
+    },
+    {
+      "file": "Ternary-Bonsai-27B-Q2_0.gguf",
+      "sha256": "868c11714cf8fe47f5ec9eeb2be0ab1a337112886f92ee0ede6b855c4fa31757",
+      "capacity_plan": {
+        "streamed_trailing_layers": 36,
+        "total_layers": 64,
+        "required_resident_weights_mib": 3813,
+        "resident_weight_budget_mib": 3842,
+        "kv_budget_mib": 512,
+        "headroom_mib": 768
+      },
+      "cold_build_and_one_token_ms": 13137,
+      "warm_eight_token_ms": 7572,
+      "token_ids": [8160, 579, 264, 7047, 1817, 25, 271, 16],
+      "text": "Here's a thinking process:\n\n1",
+      "vision": {
+        "vision_ready": true,
+        "image": "PrismML-Eng/Bonsai-demo assets/frontier.png",
+        "image_token_cap": 128,
+        "prompt_tokens": 133,
+        "elapsed_ms": 56382,
+        "result": "pass"
+      },
+      "result": "pass"
+    }
+  ]
+}

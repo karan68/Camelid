@@ -73,6 +73,17 @@ check(
   'supported',
 )
 
+check(
+  'not_anchored: explicit backend identity mismatch overrides exact-name contract match',
+  laneOf(
+    entry('Llama-3.2-3B-Instruct-Q8_0.gguf', {
+      lane_class: 'experimental_implemented',
+    }),
+    CAPABILITIES,
+  ),
+  'not_anchored',
+)
+
 // The shipped row id carries a `general.finetune` token the canonical release
 // filename omits (qwen3_4b_instruct_q8_0 vs Qwen3-4B-Q8_0.gguf), so the
 // identity match cannot resolve it from the filename alone. The backend's

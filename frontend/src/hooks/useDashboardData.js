@@ -983,7 +983,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           return content && content !== '(empty response)'
         })
         .filter((message) => !message.content.startsWith('Conversation created.'))
-      // The current Metal lane accepts one image. Retain every attachment in
+      // The current Prism vision lanes accept one image. Retain every attachment in
       // the local transcript, but send only the most recent one so follow-ups
       // keep image context and attaching a replacement does not form an
       // unsupported multi-image request.
@@ -1047,7 +1047,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
         tokens_out_per_sec: null,
         generated_token_ids: [],
         timings_ms: null,
-        usage: null,
+        // The prompt is fixed when the request starts, so show its estimated
+        // token count immediately. Output usage advances with the stream and
+        // is replaced by backend-reported totals when they arrive.
+        usage: {
+          prompt_tokens: promptTokenEstimate,
+          completion_tokens: 0,
+          total_tokens: promptTokenEstimate,
+        },
+        usage_source: 'client_estimate',
         streaming: true,
         streaming_phase: 'preparing',
         first_byte_ms: null,
@@ -1169,6 +1177,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
           streaming_phase: 'streaming',
           tokens_in_per_sec: null,
           tokens_out_per_sec: liveTps,
+          usage: {
+            prompt_tokens: promptTokenEstimate,
+            completion_tokens: realTokens,
+            total_tokens: promptTokenEstimate + realTokens,
+          },
+          usage_source: 'client_estimate',
         })
       }, {
         estimateTokenCount,
@@ -1179,6 +1193,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
               first_byte_ms: event.firstByteMs ?? null,
               first_event_ms: event.firstEventMs ?? null,
             }, { immediate: true })
+          }
+          if (event.type === 'usage' && event.usage) {
+            markAssistantStreamState({
+              usage: event.usage,
+              usage_source: 'backend',
+            })
           }
         },
       })

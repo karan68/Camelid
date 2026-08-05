@@ -30,6 +30,8 @@ export function DownloadsPanel({ downloads = [], onCancel, cancelingIds = new Se
               <div className="lane-row-id">
                 <span className="lane-row-name">{dl.filename}</span>
                 <span className="lane-row-meta">
+                  {dl.current_artifact_role === 'vision_projector' ? 'Vision projector' : 'Model'}
+                  {dl.artifact_count > 1 ? ` ${dl.artifact_index} of ${dl.artifact_count}` : ''} ·{' '}
                   {formatBytes(dl.bytes_downloaded)} / {dl.total_bytes ? formatBytes(dl.total_bytes) : 'size unknown'}
                   {dl.total_bytes ? ` · ${pct(dl)}%` : ''}
                 </span>
