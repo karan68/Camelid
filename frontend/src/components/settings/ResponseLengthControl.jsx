@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import {
   DETENTS,
+  gemma4ChatTokenFloorForModel,
+  gemma4GhostChatTokenCap,
   MAX_RESPONSE_TOKENS,
   MIN_RESPONSE_TOKENS,
   modelContextLength,
@@ -20,7 +22,7 @@ import {
 
 const fmt = (n) => n.toLocaleString()
 
-export function ResponseLengthControl({ value, onChange, model = null, capabilities = null }) {
+export function ResponseLengthControl({ value, onChange, model = null, capabilities = null, gemma4ServeLane = null }) {
   /* While dragging, the thumb renders from RAW local position — a controlled
      rewrite that snaps the thumb under the pointer breaks the drag in some
      engines (the thumb stuck at the 256k detent and 1M was unreachable).
@@ -28,6 +30,8 @@ export function ResponseLengthControl({ value, onChange, model = null, capabilit
   const [dragPos, setDragPos] = useState(null)
   const contextLength = modelContextLength(model)
   const verifiedBound = useMemo(() => verifiedContextBound(capabilities, model), [capabilities, model])
+  const gemma4Floor = useMemo(() => gemma4ChatTokenFloorForModel(capabilities, model), [capabilities, model])
+  const ghostMoeCap = gemma4GhostChatTokenCap(gemma4ServeLane)
   const verdict = validateResponseLength({ value, contextLength, verifiedBound, modelName: model?.name || 'the loaded model' })
 
   const setValue = (next) => {
@@ -104,6 +108,18 @@ export function ResponseLengthControl({ value, onChange, model = null, capabilit
         <p className={`rlc__message rlc__message--${verdict.level}`} role="status">
           <span className="rlc__message-icon" aria-hidden="true">{verdict.level === 'error' ? '✕' : '◷'}</span>
           {verdict.message}
+        </p>
+      )}
+      {gemma4Floor !== null && value < gemma4Floor && (
+        <p className="rlc__message rlc__message--caution" role="status">
+          <span className="rlc__message-icon" aria-hidden="true">◷</span>
+          Gemma 4 chat will use at least {gemma4Floor} tokens so its hidden channel envelope cannot consume the entire visible reply.
+        </p>
+      )}
+      {ghostMoeCap !== null && value > ghostMoeCap && (
+        <p className="rlc__message rlc__message--caution" role="status">
+          <span className="rlc__message-icon" aria-hidden="true">◷</span>
+          The active Ghost-MoE WebUI lane will use at most {fmt(ghostMoeCap)} reply tokens, preserving room for normal prompts inside its default 4,096-position Metal common cache. Your saved limit remains available to other model lanes.
         </p>
       )}
       {contextLength === null && (

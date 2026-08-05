@@ -9,7 +9,7 @@ import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { executionRuntimeFields } from '../lib/executionPlan'
 import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
-import { getConfiguredMaxTokens as getModelMaxTokens } from '../lib/responseLimits'
+import { applyGemma4ChatTokenFloor, applyGemma4GhostChatTokenCap, getConfiguredMaxTokens as getModelMaxTokens } from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
@@ -482,6 +482,10 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       generation_ready: Boolean(health?.generation_ready),
       vision_ready: Boolean(health?.vision_ready),
       q8_runtime: health?.q8_runtime || null,
+      // Required for lane-scoped support truth. All Gemma 4 serve variants use
+      // backend="gemma4-runtime"; this stable discriminator keeps experimental
+      // Ghost-MoE from inheriting a distributed-only compatibility receipt.
+      gemma4_serve_lane: optionalString(health?.gemma4_serve_lane),
       ...executionRuntimeFields(health),
       status: health?.ok ? 'online' : 'offline',
       // Absolute path of the running binary, disclosed by loopback servers only.
@@ -969,7 +973,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
         ? (conversation.messages || []).slice(0, truncateIndex)
         : (conversation.messages || [])
       const history = [...baseMessages, userMessage]
-        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        // A token budget can end entirely inside a model-hidden channel. Keep
+        // that diagnostic turn in the transcript, but never feed an empty
+        // assistant message back into the next model prompt.
+        .filter((message) => {
+          if (message.role === 'user') return true
+          if (message.role !== 'assistant') return false
+          const content = String(message.content || '').trim()
+          return content && content !== '(empty response)'
+        })
         .filter((message) => !message.content.startsWith('Conversation created.'))
       // The current Prism vision lanes accept one image. Retain every attachment in
       // the local transcript, but send only the most recent one so follow-ups
@@ -1075,7 +1087,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
           // with the model authors instead of letting low-bit greedy decode fall
           // into exact repetition loops.
           ...(selectedModelExperimental ? { top_p: 0.95, top_k: 20, min_p: 0 } : {}),
-          max_tokens: localChatMaxTokens(history, requestModelId),
+          // Gemma 4 may spend its first four tokens on a hidden channel
+          // envelope before the first visible token. Keep at least that visible
+          // floor, then apply the Ghost-only WebUI ceiling so the global 8,192
+          // default does not pre-admit normal chats to CPU common execution.
+          max_tokens: applyGemma4GhostChatTokenCap(
+            applyGemma4ChatTokenFloor(
+              localChatMaxTokens(history, requestModelId),
+              sendGate.hint?.target?.family,
+            ),
+            runtime?.gemma4_serve_lane,
+          ),
           /* Empty today: a sampling override is sent only when /api/capabilities
              advertises a supported row for that exact parameter. */
           ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
@@ -1129,16 +1151,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       const streamed = await readStreamingChatCompletion(response, (_delta, fullContent, metrics) => {
         const liveElapsedMs = performance.now() - requestStartedAt
-        /* Live decode rate uses the REAL token count (one SSE content delta =
-           one generated token in Camelid) over the decode window, not a
-           word-piece estimate — so the on-screen tok/s is auditable and is
-           backed token-for-token by window.__tpsTrace below. */
+        /* Live end-to-end output rate uses the REAL token count (one SSE
+           content delta = one generated token in Camelid) over wall time from
+           request start, not a word-piece estimate. The on-screen tok/s is
+           auditable and backed token-for-token by window.__tpsTrace below. */
         const realTokens = Number(metrics?.completionTokens) || 0
-        const decodeMs = Number(metrics?.elapsedMs) || liveElapsedMs
-        const liveTps = tokensPerSecond(realTokens, decodeMs)
+        const outputElapsedMs = liveElapsedMs
+        const liveTps = tokensPerSecond(realTokens, outputElapsedMs)
         if (typeof window !== 'undefined' && realTokens > 0) {
           if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
-          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(decodeMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
+          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(outputElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
         }
         if (!firstContentEmitted && fullContent) {
           firstContentEmitted = true
@@ -1184,7 +1206,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const elapsedMs = performance.now() - requestStartedAt
       const assistantMessage = {
         ...assistantMessageBase,
-        content: paceDrain(pacer, streamed.content || '(empty response)'),
+        content: paceDrain(pacer, streamed.content || ''),
         tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, streamed.firstContentMs),
         tokens_out_per_sec: tokensPerSecond(streamed.completionTokens || estimateTokenCount(streamed.content), elapsedMs),
         finish_reason: streamed.finishReason,

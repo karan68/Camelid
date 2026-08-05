@@ -114,6 +114,10 @@ pub struct AppState {
     /// default; opt out with `CAMELID_GEMMA4_SERVE=0`). This is an additive,
     /// parallel path: the Llama/3B backend is untouched.
     gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<Gemma4ServeRuntime>>>>,
+    /// Exact serving lane paired with each Gemma 4 runtime. Kept separately
+    /// from the generic execution plan because Ghost-MoE, local, distributed,
+    /// and CUDA runtimes all share the `gemma4-runtime` API backend.
+    gemma4_serve_lanes: Arc<RwLock<HashMap<String, Gemma4ServeLane>>>,
     /// Runnable-lane serve runtimes (qwen35/Ornith, gemma3), keyed by model id.
     /// Populated when a runnable-served arch is loaded (lane on by default;
     /// opt out with `CAMELID_RUNNABLE_SERVE=0`). Additive, parallel to the
@@ -207,6 +211,7 @@ impl Default for AppState {
         Self {
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            gemma4_serve_lanes: Arc::new(RwLock::new(HashMap::new())),
             runnable_runtimes: Arc::new(RwLock::new(HashMap::new())),
             dg_runtimes: Arc::new(RwLock::new(HashMap::new())),
             embedding_runtimes: Arc::new(RwLock::new(HashMap::new())),
@@ -311,6 +316,10 @@ impl AppState {
             .write()
             .await
             .insert(id.to_string(), Arc::new(Gemma4ServeRuntime::Local(runtime)));
+        self.gemma4_serve_lanes
+            .write()
+            .await
+            .insert(id.to_string(), Gemma4ServeLane::Local);
     }
 
     /// Register a distributed gemma4 runtime under a model id, exactly as the
@@ -326,6 +335,10 @@ impl AppState {
             id.to_string(),
             Arc::new(Gemma4ServeRuntime::Distributed(runtime)),
         );
+        self.gemma4_serve_lanes
+            .write()
+            .await
+            .insert(id.to_string(), Gemma4ServeLane::Distributed);
     }
 }
 
@@ -504,6 +517,26 @@ pub struct LoadModelRequest {
     pub set_active: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gemma4ServeLane {
+    GhostMoe,
+    Local,
+    Distributed,
+    Cuda,
+}
+
+/// Effective accelerator shape for the active single-node Ghost-MoE runtime.
+/// Component booleans alongside this enum carry the exact common/expert/head
+/// breakdown; the string gives clients a stable high-level presentation lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gemma4GhostExecutionMode {
+    FullCommonMetal,
+    HybridMetal,
+    CpuStorage,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub ok: bool,
@@ -533,6 +566,26 @@ pub struct HealthResponse {
     /// True when the gemma4 serve path is enabled (on by default; opt-out
     /// CAMELID_GEMMA4_SERVE=0) and a gemma4 runtime is loaded for the active model.
     pub gemma4_available: bool,
+    /// Concrete Gemma 4 serving lane for the active model. This is the support
+    /// boundary the UI uses to keep single-node Ghost-MoE experimental instead
+    /// of inheriting evidence from a distributed-only compatibility row.
+    pub gemma4_serve_lane: Option<Gemma4ServeLane>,
+    /// Effective common-core accelerator for the active single-node Ghost-MoE
+    /// runtime. `Some(true)` means the exact common Metal runtime was admitted
+    /// and the live GPU switch currently permits dispatch. `Some(false)` means
+    /// only that the common core is on CPU; the expert/head fields may still
+    /// report a hybrid Metal lane. Other lanes, unloaded state, and in-flight
+    /// registry transitions report `None` so the UI never infers a GPU from a
+    /// stale load-time plan.
+    pub gemma4_ghost_common_metal_active: Option<bool>,
+    /// Effective high-level Ghost-MoE execution shape after applying the live
+    /// GPU switch and deterministic-mode gate.
+    pub gemma4_ghost_execution_mode: Option<Gemma4GhostExecutionMode>,
+    /// True when persistent routed Q4_0 expert slots are live on Metal. This
+    /// remains independently useful when the common core runs on CPU.
+    pub gemma4_ghost_experts_metal_active: Option<bool>,
+    /// True when the no-copy Q6_K tied vocabulary head is live on Metal.
+    pub gemma4_ghost_head_metal_active: Option<bool>,
     /// Engine-queue backpressure gauge: generation jobs accepted and not yet
     /// finished (queued + running). Bounded by CAMELID_QUEUE_DEPTH; beyond the
     /// bound requests get a typed 503 (`engine_queue_full`).
@@ -2658,6 +2711,14 @@ pub async fn serve(
         eprintln!("\n  {warming_msg}");
         if tls_enabled {
             tracing::info!("skipping HTTP self-warmup because TLS is enabled");
+        } else if gemma4_ghost_moe_serve_requested() {
+            // A normal resident runtime benefits from paying its one-token
+            // initialization cost before the UI appears. Ghost-MoE is already
+            // initialized at load and a one-token chat would instead page a
+            // full prompt through hundreds of expert records, delaying the UI
+            // by minutes and competing with the user's first request.
+            tracing::info!("skipping generation warm-up for disk-paged Gemma 4 Ghost-MoE");
+            eprintln!("  Ghost-MoE runtime ready; skipping resident-engine warm-up");
         } else {
             warmup_generation_blocking(addr, model_id, policy.auth.bearer_header_line()).await;
         }
@@ -2962,16 +3023,61 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     }
 }
 
+fn active_gemma4_serve_lane(
+    active_model_id: Option<&str>,
+    lanes: &HashMap<String, Gemma4ServeLane>,
+) -> Option<Gemma4ServeLane> {
+    active_model_id.and_then(|id| lanes.get(id).copied())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4GhostExecutionHealth {
+    mode: Gemma4GhostExecutionMode,
+    common_metal_active: bool,
+    experts_metal_active: bool,
+    head_metal_active: bool,
+}
+
+fn gemma4_ghost_execution_health(
+    lane: Option<Gemma4ServeLane>,
+    runtime_present: bool,
+    constructed: crate::gemma4_runtime::Gemma4GhostMetalComponents,
+    gpu_enabled: bool,
+    deterministic: bool,
+) -> Option<Gemma4GhostExecutionHealth> {
+    if lane != Some(Gemma4ServeLane::GhostMoe) || !runtime_present {
+        return None;
+    }
+    let metal_allowed = gpu_enabled && !deterministic;
+    let common_metal_active = constructed.common && metal_allowed;
+    let experts_metal_active = constructed.experts && metal_allowed;
+    let head_metal_active = constructed.head && metal_allowed;
+    let mode = if common_metal_active {
+        Gemma4GhostExecutionMode::FullCommonMetal
+    } else if experts_metal_active || head_metal_active {
+        Gemma4GhostExecutionMode::HybridMetal
+    } else {
+        Gemma4GhostExecutionMode::CpuStorage
+    };
+    Some(Gemma4GhostExecutionHealth {
+        mode,
+        common_metal_active,
+        experts_metal_active,
+        head_metal_active,
+    })
+}
+
 async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
     let active_id_lock = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
     let loaded_now = !loaded_models.is_empty();
     // Is the active model served by a gemma4 runtime?
-    let gemma4_available = match active_id_lock.as_ref() {
-        Some(id) => state.gemma4_runtimes.read().await.contains_key(id),
-        None => false,
+    let gemma4_runtime = match active_id_lock.as_ref() {
+        Some(id) => state.gemma4_runtimes.read().await.get(id).cloned(),
+        None => None,
     };
+    let gemma4_available = gemma4_runtime.is_some();
     let model_family = model.map(|m| model_family(&m.gguf));
     // Specialized serve lanes are ready only when their active runtime instance exists.
     // Model load inserts the generic metadata before initializing these runtimes, and a
@@ -3004,6 +3110,27 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         .as_ref()
         .and_then(|id| execution_plans.get(id))
         .cloned();
+    let gemma4_serve_lanes = state.gemma4_serve_lanes.read().await;
+    let gemma4_serve_lane = if gemma4_available {
+        active_gemma4_serve_lane(active_id_lock.as_deref(), &gemma4_serve_lanes)
+    } else {
+        None
+    };
+    // Ask the active runtime, rather than the generic execution plan, which
+    // exact Ghost Metal components still exist. Then apply both live dispatch
+    // gates so POST /api/runtime/gpu and deterministic mode are reflected on
+    // the very next health poll without a model reload.
+    let metal_constructed = gemma4_runtime
+        .as_deref()
+        .map(Gemma4ServeRuntime::ghost_metal_components_constructed)
+        .unwrap_or_default();
+    let ghost_execution = gemma4_ghost_execution_health(
+        gemma4_serve_lane,
+        gemma4_runtime.is_some(),
+        metal_constructed,
+        crate::cuda::gpu_accel_enabled(),
+        crate::inference::deterministic_mode_enabled(),
+    );
     let slot = state.engine.slot_snapshot();
     HealthResponse {
         ok: true,
@@ -3019,6 +3146,12 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         backend,
         model_family,
         gemma4_available,
+        gemma4_serve_lane,
+        gemma4_ghost_common_metal_active: ghost_execution.map(|health| health.common_metal_active),
+        gemma4_ghost_execution_mode: ghost_execution.map(|health| health.mode),
+        gemma4_ghost_experts_metal_active: ghost_execution
+            .map(|health| health.experts_metal_active),
+        gemma4_ghost_head_metal_active: ghost_execution.map(|health| health.head_metal_active),
         engine_queue_depth: state.engine.depth(),
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
@@ -3122,6 +3255,11 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         backend: health_backend(false, false, false, false),
         model_family: None,
         gemma4_available: false,
+        gemma4_serve_lane: None,
+        gemma4_ghost_common_metal_active: None,
+        gemma4_ghost_execution_mode: None,
+        gemma4_ghost_experts_metal_active: None,
+        gemma4_ghost_head_metal_active: None,
         engine_queue_depth: state.engine.depth(),
         engine_queued_tasks: slot.queued_tasks,
         engine_active_task_id: slot.active_task_id,
@@ -3202,6 +3340,235 @@ fn health_backend(
         "llama"
     } else {
         "none"
+    }
+}
+
+#[cfg(test)]
+mod gemma4_serve_lane_health_tests {
+    use super::*;
+
+    #[test]
+    fn health_lane_is_active_model_scoped_and_serializes_stable_values() {
+        let lanes = HashMap::from([
+            ("ghost".to_string(), Gemma4ServeLane::GhostMoe),
+            ("local".to_string(), Gemma4ServeLane::Local),
+            ("distributed".to_string(), Gemma4ServeLane::Distributed),
+        ]);
+        assert_eq!(
+            active_gemma4_serve_lane(Some("ghost"), &lanes),
+            Some(Gemma4ServeLane::GhostMoe)
+        );
+        assert_eq!(
+            active_gemma4_serve_lane(Some("distributed"), &lanes),
+            Some(Gemma4ServeLane::Distributed)
+        );
+        assert_eq!(active_gemma4_serve_lane(Some("other"), &lanes), None);
+        assert_eq!(active_gemma4_serve_lane(None, &lanes), None);
+
+        for (lane, expected) in [
+            (Gemma4ServeLane::GhostMoe, "ghost_moe"),
+            (Gemma4ServeLane::Local, "local"),
+            (Gemma4ServeLane::Distributed, "distributed"),
+        ] {
+            assert_eq!(serde_json::to_value(lane).unwrap(), expected);
+        }
+        assert_eq!(serde_json::to_value(Gemma4ServeLane::Cuda).unwrap(), "cuda");
+        for (mode, expected) in [
+            (
+                Gemma4GhostExecutionMode::FullCommonMetal,
+                "full_common_metal",
+            ),
+            (Gemma4GhostExecutionMode::HybridMetal, "hybrid_metal"),
+            (Gemma4GhostExecutionMode::CpuStorage, "cpu_storage"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn busy_health_never_reuses_a_stale_gemma4_lane() {
+        let value = serde_json::to_value(busy_health_response(&AppState::default())).unwrap();
+        assert_eq!(value["gemma4_serve_lane"], serde_json::Value::Null);
+        assert_eq!(
+            value["gemma4_ghost_common_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_execution_mode"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_experts_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_head_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["gemma4_available"], false);
+        assert_eq!(value["generation_ready"], false);
+    }
+
+    #[tokio::test]
+    async fn unloaded_health_clears_ghost_common_metal_claim() {
+        let value =
+            serde_json::to_value(health_registry_snapshot(&AppState::default()).await).unwrap();
+        assert_eq!(value["loaded_now"], false);
+        assert_eq!(value["gemma4_serve_lane"], serde_json::Value::Null);
+        assert_eq!(
+            value["gemma4_ghost_common_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_execution_mode"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_experts_metal_active"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["gemma4_ghost_head_metal_active"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn ghost_execution_health_reports_full_hybrid_and_cpu_components() {
+        use crate::gemma4_runtime::Gemma4GhostMetalComponents as Components;
+        use Gemma4ServeLane::{Distributed, GhostMoe};
+
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(Distributed),
+                true,
+                Components {
+                    common: true,
+                    experts: true,
+                    head: true,
+                },
+                true,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                false,
+                Components {
+                    common: true,
+                    experts: true,
+                    head: true,
+                },
+                true,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(Some(GhostMoe), true, Components::default(), true, false,),
+            Some(Gemma4GhostExecutionHealth {
+                mode: Gemma4GhostExecutionMode::CpuStorage,
+                common_metal_active: false,
+                experts_metal_active: false,
+                head_metal_active: false,
+            })
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Components {
+                    common: false,
+                    experts: true,
+                    head: true,
+                },
+                true,
+                false,
+            ),
+            Some(Gemma4GhostExecutionHealth {
+                mode: Gemma4GhostExecutionMode::HybridMetal,
+                common_metal_active: false,
+                experts_metal_active: true,
+                head_metal_active: true,
+            })
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Components {
+                    common: true,
+                    experts: true,
+                    head: true,
+                },
+                false,
+                false,
+            ),
+            Some(Gemma4GhostExecutionHealth {
+                mode: Gemma4GhostExecutionMode::CpuStorage,
+                common_metal_active: false,
+                experts_metal_active: false,
+                head_metal_active: false,
+            })
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Components {
+                    common: true,
+                    experts: true,
+                    head: false,
+                },
+                true,
+                false,
+            ),
+            Some(Gemma4GhostExecutionHealth {
+                mode: Gemma4GhostExecutionMode::FullCommonMetal,
+                common_metal_active: true,
+                experts_metal_active: true,
+                head_metal_active: false,
+            })
+        );
+        assert_eq!(
+            gemma4_ghost_execution_health(
+                Some(GhostMoe),
+                true,
+                Components {
+                    common: false,
+                    experts: false,
+                    head: true,
+                },
+                true,
+                true,
+            )
+            .unwrap()
+            .mode,
+            Gemma4GhostExecutionMode::CpuStorage,
+            "deterministic mode disables every Metal component",
+        );
+    }
+
+    #[test]
+    fn ghost_execution_health_serializes_mode_and_false_components() {
+        let mut response = busy_health_response(&AppState::default());
+        response.gemma4_ghost_common_metal_active = Some(false);
+        response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::HybridMetal);
+        response.gemma4_ghost_experts_metal_active = Some(true);
+        response.gemma4_ghost_head_metal_active = Some(false);
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["gemma4_ghost_common_metal_active"], false);
+        assert_eq!(value["gemma4_ghost_execution_mode"], "hybrid_metal");
+        assert_eq!(value["gemma4_ghost_experts_metal_active"], true);
+        assert_eq!(value["gemma4_ghost_head_metal_active"], false);
+
+        response.gemma4_ghost_common_metal_active = Some(true);
+        response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::FullCommonMetal);
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["gemma4_ghost_common_metal_active"], true);
+        assert_eq!(value["gemma4_ghost_execution_mode"], "full_common_metal");
     }
 }
 
@@ -4288,9 +4655,8 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
         && guard_cpu_weight_materialization_budget(binding).is_ok()
 }
 
-/// Runtime GPU (CUDA) state for the UI toggle. `available` is whether a usable
-/// CUDA device is present (the UI shows the toggle only when true); `enabled` is
-/// the current switch position. On non-CUDA builds/hosts `available` is false.
+/// Runtime GPU state for the UI toggle. `available` covers either a usable CUDA
+/// device or Apple Metal; `backend` and `device` identify the selected platform.
 #[derive(Serialize)]
 struct GpuRuntimeState {
     available: bool,
@@ -4308,15 +4674,24 @@ struct GpuRuntimeRequest {
 }
 
 fn current_gpu_runtime() -> GpuRuntimeState {
+    let info = crate::cuda::gpu_acceleration_info();
     GpuRuntimeState {
-        available: crate::cuda::is_available(),
+        available: info.available,
         // Report the MASTER GPU-acceleration switch (resident decode), which is what
         // actually runs the model on the GPU â€” not the legacy hybrid-matmul flag, which
         // defaults off and made the UI read "GPU off" while the GPU did all the work.
-        enabled: crate::cuda::gpu_accel_enabled(),
-        device: crate::cuda::device_name(),
-        backend: "cuda",
-        run_count: crate::cuda::cuda_q8_run_count(),
+        enabled: info.available
+            && crate::cuda::gpu_accel_enabled()
+            && !crate::inference::deterministic_mode_enabled(),
+        device: info.device_name,
+        backend: info.backend,
+        // The legacy counter measures CUDA Q8 matmuls specifically; a Metal
+        // backend must not mislabel that number as its own work.
+        run_count: if info.backend == "cuda" {
+            crate::cuda::cuda_q8_run_count()
+        } else {
+            0
+        },
     }
 }
 
@@ -4326,8 +4701,8 @@ async fn gpu_runtime() -> Json<GpuRuntimeState> {
 }
 
 /// POST `/api/runtime/gpu` `{ "enabled": bool }` â€” flip GPU acceleration at
-/// runtime (no restart). A no-op effect when no CUDA device is present, since
-/// the inference dispatch falls back to the CPU reference either way.
+/// runtime (no restart). A no-op effect when neither CUDA nor Metal is present,
+/// since inference falls back to the CPU reference either way.
 async fn set_gpu_runtime(Json(req): Json<GpuRuntimeRequest>) -> Json<GpuRuntimeState> {
     // Flip the master GPU-acceleration switch (the resident decode engine) AND the
     // legacy hybrid Q8 matmul switch together, so "GPU acceleration" is one coherent
@@ -7025,6 +7400,113 @@ fn gemma4_serve_flag(value: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+const GEMMA4_GHOST_CGHOST_ENV: &str = "CAMELID_GEMMA4_GHOST_CGHOST";
+const GEMMA4_GHOST_CACHE_MIB_ENV: &str = "CAMELID_GEMMA4_GHOST_CACHE_MIB";
+const GEMMA4_GHOST_STRICT_CACHE_ENV: &str = "CAMELID_GEMMA4_GHOST_STRICT_CACHE";
+const DEFAULT_GEMMA4_GHOST_CACHE_MIB: usize = 1024;
+
+fn gemma4_ghost_moe_serve_requested() -> bool {
+    std::env::var_os(GEMMA4_GHOST_CGHOST_ENV).is_some()
+}
+
+fn parse_gemma4_ghost_moe_serve_config(
+    cghost: Option<PathBuf>,
+    cache_mib: Option<&str>,
+    strict_cache: Option<&str>,
+) -> std::result::Result<Option<(PathBuf, usize, bool)>, String> {
+    let Some(cghost) = cghost else {
+        return Ok(None);
+    };
+    let cache_mib = match cache_mib {
+        Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            format!("{GEMMA4_GHOST_CACHE_MIB_ENV} must be a non-negative MiB count, got {raw:?}")
+        })?,
+        None => DEFAULT_GEMMA4_GHOST_CACHE_MIB,
+    };
+    let strict_cache = match strict_cache.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some(raw)
+            if raw.eq_ignore_ascii_case("false")
+                || raw.eq_ignore_ascii_case("off")
+                || raw.eq_ignore_ascii_case("no")
+                || raw.eq_ignore_ascii_case("disabled") =>
+        {
+            false
+        }
+        Some("1") => true,
+        Some(raw)
+            if raw.eq_ignore_ascii_case("true")
+                || raw.eq_ignore_ascii_case("on")
+                || raw.eq_ignore_ascii_case("yes")
+                || raw.eq_ignore_ascii_case("enabled") =>
+        {
+            true
+        }
+        Some(raw) => {
+            return Err(format!(
+                "{GEMMA4_GHOST_STRICT_CACHE_ENV} must be a boolean, got {raw:?}"
+            ))
+        }
+    };
+    Ok(Some((cghost, cache_mib, strict_cache)))
+}
+
+fn gemma4_ghost_moe_serve_config() -> std::result::Result<Option<(PathBuf, usize, bool)>, String> {
+    let cghost = std::env::var_os(GEMMA4_GHOST_CGHOST_ENV).map(PathBuf::from);
+    let cache_mib = std::env::var(GEMMA4_GHOST_CACHE_MIB_ENV).ok();
+    let strict_cache = std::env::var(GEMMA4_GHOST_STRICT_CACHE_ENV).ok();
+    parse_gemma4_ghost_moe_serve_config(cghost, cache_mib.as_deref(), strict_cache.as_deref())
+}
+
+#[cfg(test)]
+mod gemma4_ghost_moe_serve_config_tests {
+    use super::*;
+
+    #[test]
+    fn absent_artifact_keeps_the_normal_gemma4_runtime() {
+        assert_eq!(
+            parse_gemma4_ghost_moe_serve_config(None, Some("not-a-number"), Some("not-a-boolean"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn artifact_defaults_to_one_gib_and_accepts_an_explicit_budget() {
+        let path = PathBuf::from("model.cghost");
+        assert_eq!(
+            parse_gemma4_ghost_moe_serve_config(Some(path.clone()), None, None).unwrap(),
+            Some((path.clone(), 1024, false))
+        );
+        assert_eq!(
+            parse_gemma4_ghost_moe_serve_config(Some(path), Some("0"), Some("true")).unwrap(),
+            Some((PathBuf::from("model.cghost"), 0, true))
+        );
+    }
+
+    #[test]
+    fn malformed_cache_budget_fails_closed() {
+        let error = parse_gemma4_ghost_moe_serve_config(
+            Some(PathBuf::from("model.cghost")),
+            Some("lots"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains(GEMMA4_GHOST_CACHE_MIB_ENV));
+    }
+
+    #[test]
+    fn malformed_strict_cache_flag_fails_closed() {
+        let error = parse_gemma4_ghost_moe_serve_config(
+            Some(PathBuf::from("model.cghost")),
+            None,
+            Some("sometimes"),
+        )
+        .unwrap_err();
+        assert!(error.contains(GEMMA4_GHOST_STRICT_CACHE_ENV));
+    }
+}
+
 /// Route the gemma4 serve lane through the CUDA-resident decode engine.
 ///
 /// **Default ON** on a host where CUDA is actually driving decode; opt out with
@@ -7715,6 +8197,27 @@ mod gemma4_template_tests {
         let mut g = Gemma4ChannelFilter::new();
         assert_eq!(g.filter("A<|channel>h<channel|>B"), "AB");
     }
+
+    #[test]
+    fn gemma4_finish_reason_distinguishes_hidden_length_exhaustion() {
+        assert_eq!(gemma4_finish_reason(1, 1), "length");
+        assert_eq!(gemma4_finish_reason(8, 8), "length");
+        assert_eq!(gemma4_finish_reason(0, 8), "stop");
+        assert_eq!(gemma4_finish_reason(5, 8), "stop");
+    }
+
+    #[test]
+    fn gemma4_usage_and_telemetry_preserve_real_prompt_tokens() {
+        let usage = serde_json::to_value(gemma4_usage(37, 11)).unwrap();
+        assert_eq!(usage["prompt_tokens"], 37);
+        assert_eq!(usage["completion_tokens"], 11);
+        assert_eq!(usage["total_tokens"], 48);
+
+        let start = gemma4_telemetry_start("gemma4-test", 37, 512, true);
+        assert_eq!(start.prompt_tokens, 37);
+        assert_eq!(start.max_tokens, 512);
+        assert!(start.stream);
+    }
 }
 
 /// Test-only re-export of the gemma4 marker renderer (the template-shapes
@@ -7838,6 +8341,52 @@ impl Gemma4ChannelFilter {
     }
 }
 
+/// Gemma 4 stops before appending an EOT token, so consuming the full returned
+/// token allowance means the request ended at its length boundary. This must
+/// remain visible when every generated token was inside a hidden channel.
+fn gemma4_finish_reason(completion_tokens: usize, max_tokens: usize) -> &'static str {
+    if completion_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
+fn gemma4_usage(prompt_tokens: usize, completion_tokens: usize) -> CompletionUsage {
+    CompletionUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
+async fn gemma4_prompt_token_count(
+    runtime: Arc<Gemma4ServeRuntime>,
+    prompt: String,
+) -> std::result::Result<usize, Response> {
+    match tokio::task::spawn_blocking(move || runtime.prompt_token_count(&prompt)).await {
+        Ok(Ok(count)) => Ok(count),
+        Ok(Err(error)) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "generation_error",
+            format!("could not tokenize the rendered Gemma 4 prompt: {error}"),
+            None,
+        )),
+        Err(error) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "generation_error",
+            format!("Gemma 4 prompt tokenization worker failed: {error}"),
+            None,
+        )),
+    }
+}
+
+enum Gemma4StreamItem {
+    Delta(String),
+    Complete { completion_tokens: usize },
+    Error(String),
+}
+
 /// Resolve the Gemma 4 runtime for a chat request, if this request targets one.
 /// Returns `Err(response)` to short-circuit with a clear error (a gemma4 model is
 /// loaded but its runtime is missing), `Ok(None)` to fall through to the Llama
@@ -7861,33 +8410,247 @@ pub enum Gemma4ServeRuntime {
 }
 
 impl Gemma4ServeRuntime {
-    fn generate_greedy(&self, prompt: &str, max_new: usize) -> crate::Result<(String, Vec<u32>)> {
+    /// Metal components still owned by this live runtime. The process-wide GPU
+    /// and deterministic gates are deliberately applied by the health snapshot,
+    /// not latched here.
+    fn ghost_metal_components_constructed(
+        &self,
+    ) -> crate::gemma4_runtime::Gemma4GhostMetalComponents {
         match self {
-            Self::Local(r) => r.generate_greedy(prompt, max_new),
-            Self::Distributed(r) => r.generate_greedy(prompt, max_new),
+            Self::Local(runtime) => runtime.ghost_metal_components(),
+            Self::Distributed(_) => Default::default(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => Default::default(),
+        }
+    }
+
+    /// Count the exact BOS-bearing token sequence this active runtime will
+    /// prefill for a rendered prompt. Every serve variant uses this same
+    /// tokenizer call inside generation, so API usage is runtime truth rather
+    /// than a browser/server estimate.
+    fn prompt_token_count(&self, prompt: &str) -> crate::Result<usize> {
+        let tokens = match self {
+            Self::Local(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
+            Self::Distributed(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
+            #[cfg(feature = "cuda")]
+            Self::Cuda(runtime) => runtime
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .tokenizer()
+                .encode(prompt, true, true)?,
+        };
+        Ok(tokens.len())
+    }
+
+    fn generate_greedy_cancellable<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        should_cancel: C,
+    ) -> crate::Result<crate::gemma4_runtime::Gemma4GenerationOutcome> {
+        match self {
+            Self::Local(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
+            Self::Distributed(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             #[cfg(feature = "cuda")]
             Self::Cuda(m) => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
-                .generate_greedy(prompt, max_new),
+                .generate_greedy_cancellable(prompt, max_new, should_cancel),
         }
     }
 
-    fn generate_greedy_streaming<F: FnMut(&str)>(
+    fn generate_greedy_streaming_cancellable<F: FnMut(&str), C: FnMut() -> bool>(
         &self,
         prompt: &str,
         max_new: usize,
         on_delta: F,
-    ) -> crate::Result<(String, Vec<u32>)> {
+        should_cancel: C,
+    ) -> crate::Result<crate::gemma4_runtime::Gemma4GenerationOutcome> {
         match self {
-            Self::Local(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
-            Self::Distributed(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
+            Self::Local(r) => {
+                r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
+            }
+            Self::Distributed(r) => {
+                r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
+            }
             #[cfg(feature = "cuda")]
             Self::Cuda(m) => m
                 .lock()
                 .expect("gemma4 cuda runtime lock")
-                .generate_greedy_streaming(prompt, max_new, on_delta),
+                .generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel),
         }
+    }
+}
+
+/// Generic cancellation/ownership seam used by Gemma 4 non-streaming jobs.
+/// Keeping the guard in this awaiting frame is essential: dropping the HTTP
+/// future trips `cancel`, while the engine continues owning the compute slot
+/// until `job` observes it and returns.
+async fn run_cancellable_gemma4_job<T, F>(
+    state: &AppState,
+    job: F,
+) -> std::result::Result<T, engine::EnginePostError>
+where
+    T: Send + 'static,
+    F: FnOnce(tokio_util::sync::CancellationToken) -> T + Send + 'static,
+{
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let _cancel_on_drop = CancelOnDrop(cancel);
+    state.engine.run_exclusive(move || job(worker_cancel)).await
+}
+
+/// Run one Gemma 4 request on the same single-owner engine as every other
+/// decode path. `CancelOnDrop` lives in the awaiting seam above, so aborting a
+/// non-streaming HTTP handler trips the runtime's token-boundary stop check;
+/// the engine retains ownership until that check returns and therefore never
+/// overlaps a replacement request with abandoned Ghost/Metal work.
+async fn gemma4_generate_on_engine(
+    state: &AppState,
+    runtime: Arc<Gemma4ServeRuntime>,
+    prompt: String,
+    max_tokens: usize,
+) -> std::result::Result<crate::gemma4_runtime::Gemma4GenerationOutcome, Box<Response>> {
+    match run_cancellable_gemma4_job(state, move |worker_cancel| {
+        runtime.generate_greedy_cancellable(&prompt, max_tokens, || worker_cancel.is_cancelled())
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(error)) => Err(Box::new(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "generation_error",
+            error.to_string(),
+            None,
+        ))),
+        Err(error) => Err(engine_post_error_response(error)),
+    }
+}
+
+/// Post a streaming Gemma 4 request before returning SSE headers. The returned
+/// guard is moved into the response-body generator, so dropping that body even
+/// before its first poll cancels queued/running work. A bounded channel keeps a
+/// slow client from letting the engine run an unbounded token backlog.
+fn gemma4_stream_on_engine(
+    state: &AppState,
+    runtime: Arc<Gemma4ServeRuntime>,
+    prompt: String,
+    max_tokens: usize,
+) -> std::result::Result<(tokio::sync::mpsc::Receiver<Gemma4StreamItem>, CancelOnDrop), Box<Response>>
+{
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let body_guard = CancelOnDrop(cancel.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let task = engine::EngineTask::Exclusive(Box::new(move || {
+        let delta_cancel = cancel.clone();
+        let send_tx = tx.clone();
+        let result = runtime.generate_greedy_streaming_cancellable(
+            &prompt,
+            max_tokens,
+            move |delta| {
+                if send_tx
+                    .blocking_send(Gemma4StreamItem::Delta(delta.to_string()))
+                    .is_err()
+                {
+                    delta_cancel.cancel();
+                }
+            },
+            || cancel.is_cancelled(),
+        );
+        match result {
+            Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { token_ids, .. }) => {
+                let _ = tx.blocking_send(Gemma4StreamItem::Complete {
+                    completion_tokens: token_ids.len(),
+                });
+            }
+            Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { .. }) => {}
+            Err(error) => {
+                let _ = tx.blocking_send(Gemma4StreamItem::Error(error.to_string()));
+            }
+        }
+    }));
+    state
+        .engine
+        .post(task)
+        .map_err(engine_post_error_response)?;
+    Ok((rx, body_guard))
+}
+
+#[cfg(test)]
+mod gemma4_engine_ownership_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// The HTTP waiter may disappear, but its engine job remains the exclusive
+    /// owner until the cooperative stop signal is observed. This is the exact
+    /// Ghost-MoE safety property: request B cannot mutate Metal slots or page
+    /// expert records while the cancelled request A is winding down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborted_gemma4_waiter_cancels_without_overlapping_its_replacement() {
+        let state = AppState::default();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let cancellation_seen = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+
+        let state_a = state.clone();
+        let active_a = Arc::clone(&active);
+        let max_a = Arc::clone(&max_active);
+        let cancelled_a = Arc::clone(&cancellation_seen);
+        let waiter_a = tokio::spawn(async move {
+            let _ = run_cancellable_gemma4_job(&state_a, move |cancel| {
+                let now = active_a.fetch_add(1, Ordering::SeqCst) + 1;
+                max_a.fetch_max(now, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                while !cancel.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                cancelled_a.store(true, Ordering::SeqCst);
+                // Model one indivisible forward already in flight when the
+                // client disconnected. The engine must not admit B here.
+                std::thread::sleep(Duration::from_millis(25));
+                active_a.fetch_sub(1, Ordering::SeqCst);
+            })
+            .await;
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request A never entered the engine");
+
+        waiter_a.abort();
+        let _ = waiter_a.await;
+
+        let active_b = Arc::clone(&active);
+        let max_b = Arc::clone(&max_active);
+        let active_when_b_started = run_cancellable_gemma4_job(&state, move |_| {
+            let overlap = active_b.load(Ordering::SeqCst);
+            let now = active_b.fetch_add(1, Ordering::SeqCst) + 1;
+            max_b.fetch_max(now, Ordering::SeqCst);
+            active_b.fetch_sub(1, Ordering::SeqCst);
+            overlap
+        })
+        .await
+        .expect("replacement request should run");
+
+        assert!(cancellation_seen.load(Ordering::SeqCst));
+        assert_eq!(active_when_b_started, 0);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    /// The guard is captured by the response body itself, not created on its
+    /// first poll. A client that drops an SSE response before reading the role
+    /// chunk therefore still cancels its queued/running engine job.
+    #[test]
+    fn unpolled_sse_body_drop_fires_its_gemma4_cancel_guard() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let observed = cancel.clone();
+        let guard = CancelOnDrop(cancel);
+        let events = async_stream::stream! {
+            let _cancel_on_drop = guard;
+            yield Ok::<Event, Infallible>(Event::default().data("never-polled"));
+        };
+        drop(events);
+        assert!(observed.is_cancelled());
     }
 }
 
@@ -7974,6 +8737,7 @@ fn unix_secs() -> u64 {
 /// Gemma 4 raw completion (non-streaming): BOS + plain prompt text through the
 /// greedy runtime â€” the same envelope the committed basic_v1 oracle pack checks.
 async fn gemma4_completion_nonstreaming(
+    state: &AppState,
     id: String,
     runtime: Arc<Gemma4ServeRuntime>,
     req: &CompletionRequest,
@@ -7988,27 +8752,16 @@ async fn gemma4_completion_nonstreaming(
     };
     let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
     let t_generate = std::time::Instant::now();
-    let result =
-        tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
+    let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (text, ids) = match result {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "generation_error",
-                e.to_string(),
-                None,
-            )
+        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
+            (text, token_ids)
         }
-        Err(e) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "generation_error",
-                format!("gemma4 generation task panicked: {e}"),
-                None,
-            )
+        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
+            return *generation_cancelled_response(generated_tokens)
         }
+        Err(response) => return *response,
     };
     let body = serde_json::json!({
         "id": "cmpl-gemma4",
@@ -8019,7 +8772,7 @@ async fn gemma4_completion_nonstreaming(
             "index": 0,
             "text": text,
             "logprobs": null,
-            "finish_reason": "stop",
+            "finish_reason": gemma4_finish_reason(ids.len(), max_tokens),
         }],
         "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
         "camelid": {
@@ -8039,6 +8792,7 @@ async fn gemma4_completion_nonstreaming(
 
 /// Gemma 4 raw completion, streaming (SSE `text_completion` chunks + [DONE]).
 async fn gemma4_completion_streaming(
+    state: &AppState,
     id: String,
     runtime: Arc<Gemma4ServeRuntime>,
     req: &CompletionRequest,
@@ -8054,22 +8808,20 @@ async fn gemma4_completion_streaming(
     let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
     let created = unix_secs();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
-    tokio::task::spawn_blocking(move || {
-        let send_tx = tx.clone();
-        let result = runtime.generate_greedy_streaming(&prompt, max_tokens, |delta| {
-            let _ = send_tx.send(Ok(delta.to_string()));
-        });
-        if let Err(e) = result {
-            let _ = tx.send(Err(e.to_string()));
-        }
-    });
+    let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
+    {
+        Ok(stream) => stream,
+        Err(response) => return *response,
+    };
 
     let events = async_stream::stream! {
+        let _cancel_on_drop = cancel_on_drop;
         let mut errored = false;
+        let mut completed = false;
+        let mut completion_tokens = 0usize;
         while let Some(item) = rx.recv().await {
             match item {
-                Ok(delta) => {
+                Gemma4StreamItem::Delta(delta) => {
                     let chunk = serde_json::json!({
                         "id": "cmpl-gemma4",
                         "object": "text_completion",
@@ -8079,7 +8831,11 @@ async fn gemma4_completion_streaming(
                     });
                     yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                 }
-                Err(e) => {
+                Gemma4StreamItem::Complete { completion_tokens: actual } => {
+                    completion_tokens = actual;
+                    completed = true;
+                }
+                Gemma4StreamItem::Error(e) => {
                     let err = serde_json::json!({ "error": { "message": e, "type": "generation_error" } });
                     yield Ok(Event::default().data(err.to_string()));
                     errored = true;
@@ -8087,13 +8843,29 @@ async fn gemma4_completion_streaming(
                 }
             }
         }
+        if !errored && !completed {
+            let err = serde_json::json!({
+                "error": {
+                    "message": "gemma4 generation ended without a completion record",
+                    "type": "generation_error",
+                }
+            });
+            yield Ok(Event::default().data(err.to_string()));
+            errored = true;
+        }
         if !errored {
+            let finish_reason = gemma4_finish_reason(completion_tokens, max_tokens);
             let done = serde_json::json!({
                 "id": "cmpl-gemma4",
                 "object": "text_completion",
                 "created": created,
                 "model": id,
-                "choices": [{ "index": 0, "text": "", "logprobs": null, "finish_reason": "stop" }],
+                "choices": [{ "index": 0, "text": "", "logprobs": null, "finish_reason": finish_reason }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": completion_tokens,
+                },
             });
             yield Ok(Event::default().data(done.to_string()));
         }
@@ -8103,6 +8875,7 @@ async fn gemma4_completion_streaming(
 }
 
 async fn gemma4_chat_nonstreaming(
+    state: &AppState,
     id: String,
     runtime: Arc<Gemma4ServeRuntime>,
     req: &ChatCompletionRequest,
@@ -8110,40 +8883,41 @@ async fn gemma4_chat_nonstreaming(
     let messages = req.messages.clone().unwrap_or_default();
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
+    {
+        Ok(count) => count,
+        Err(response) => return response,
+    };
     let t_generate = std::time::Instant::now();
-    // Lifecycle telemetry only on this lane: the gemma4 runtime does not
-    // (yet) report prompt token counts or per-layer events, so those fields
-    // stay at their "not reported" zero values rather than being estimated.
-    let telemetry_guard =
-        telemetry::RequestGuard::begin(gemma4_telemetry_start(&id, max_tokens as u32, false));
-    let result =
-        tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
+    let telemetry_guard = telemetry::RequestGuard::begin(gemma4_telemetry_start(
+        &id,
+        prompt_tokens,
+        max_tokens as u32,
+        false,
+    ));
+    let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (text, ids) = match result {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            telemetry_guard.finish(gemma4_telemetry_error(e.to_string()));
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "generation_error",
-                e.to_string(),
-                None,
-            );
+        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
+            (text, token_ids)
         }
-        Err(e) => {
-            let message = format!("gemma4 generation task panicked: {e}");
-            telemetry_guard.finish(gemma4_telemetry_error(message.clone()));
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "generation_error",
-                message,
-                None,
-            );
+        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
+            telemetry_guard.finish(gemma4_telemetry_error(
+                "gemma4 generation cancelled by disconnected request".to_string(),
+            ));
+            return *generation_cancelled_response(generated_tokens);
+        }
+        Err(response) => {
+            telemetry_guard.finish(gemma4_telemetry_error(
+                "gemma4 generation failed on the engine worker".to_string(),
+            ));
+            return *response;
         }
     };
+    let finish_reason = gemma4_finish_reason(ids.len(), max_tokens);
     telemetry_guard.finish(telemetry::RequestFinish {
         status: "ok",
-        finish_reason: Some("stop".to_string()),
+        finish_reason: Some(finish_reason.to_string()),
         completion_tokens: ids.len(),
         ttft_ms: None,
         decode_tps: None,
@@ -8160,9 +8934,9 @@ async fn gemma4_chat_nonstreaming(
             // Thinking channels are stripped: hidden reasoning never reaches
             // the client or re-enters chat history.
             "message": { "role": "assistant", "content": gemma4_strip_channels(&text) },
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "usage": gemma4_usage(prompt_tokens, ids.len()),
         "camelid": {
             "generated_token_ids": ids,
             // Wall-clock totals only: the gemma4 lane does not (yet) report
@@ -8178,11 +8952,11 @@ async fn gemma4_chat_nonstreaming(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-/// Telemetry request identity for the gemma4 serve lane. Prompt token count
-/// and context length are not reported by this runtime, so they are recorded
-/// as 0 ("not reported") instead of being estimated.
+/// Telemetry request identity for the gemma4 serve lane. Prompt token count is
+/// exact runtime-tokenizer output; context length remains 0 (not reported).
 fn gemma4_telemetry_start(
     model_id: &str,
+    prompt_tokens: usize,
     max_tokens: u32,
     stream: bool,
 ) -> telemetry::RequestStart {
@@ -8192,7 +8966,7 @@ fn gemma4_telemetry_start(
         backend: "gemma4-runtime".to_string(),
         quantization: String::new(),
         architecture: "gemma4".to_string(),
-        prompt_tokens: 0,
+        prompt_tokens,
         max_tokens,
         context_length: 0,
         temperature: 0.0,
@@ -10007,6 +10781,7 @@ async fn dg_chat_streaming(
 /// finish_reason chunk, then `[DONE]`. Generation runs on a blocking thread and
 /// pushes deltas through an mpsc channel that this stream forwards.
 async fn gemma4_chat_streaming(
+    state: &AppState,
     id: String,
     runtime: Arc<Gemma4ServeRuntime>,
     req: &ChatCompletionRequest,
@@ -10015,27 +10790,30 @@ async fn gemma4_chat_streaming(
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let created = unix_secs();
+    let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
+    {
+        Ok(count) => count,
+        Err(response) => return response,
+    };
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
-    tokio::task::spawn_blocking(move || {
-        let send_tx = tx.clone();
-        let result = runtime.generate_greedy_streaming(&prompt, max_tokens, |delta| {
-            let _ = send_tx.send(Ok(delta.to_string()));
-        });
-        if let Err(e) = result {
-            let _ = tx.send(Err(e.to_string()));
-        }
-    });
+    let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
+    {
+        Ok(stream) => stream,
+        Err(response) => return *response,
+    };
 
     let events = async_stream::stream! {
+        let _cancel_on_drop = cancel_on_drop;
         // Lifecycle telemetry; a dropped stream (client disconnect) closes
         // the run via the guard's Drop.
         let mut telemetry_guard = Some(telemetry::RequestGuard::begin(gemma4_telemetry_start(
             &id,
+            prompt_tokens,
             max_tokens as u32,
             true,
         )));
-        let mut telemetry_tokens = 0usize;
+        let mut completion_tokens = 0usize;
+        let mut completed = false;
         // Role chunk.
         let role = serde_json::json!({
             "id": "chatcmpl-gemma4",
@@ -10050,11 +10828,10 @@ async fn gemma4_chat_streaming(
         let mut channel_filter = Gemma4ChannelFilter::new();
         while let Some(item) = rx.recv().await {
             match item {
-                Ok(delta) => {
-                    // One delta per really-decoded token on this lane (the
-                    // runtime invokes the callback per generated token), so
-                    // this pulse maps 1:1 to real decode work.
-                    telemetry_tokens += 1;
+                Gemma4StreamItem::Delta(delta) => {
+                    // Emit live decode progress for each decoded-text delta.
+                    // The terminal item carries the authoritative generated-id
+                    // count, including hidden/control tokens.
                     telemetry::emit(telemetry::Event::TokenDecoded {
                         token_id: None,
                         context_position: None,
@@ -10075,7 +10852,11 @@ async fn gemma4_chat_streaming(
                     });
                     yield Ok(Event::default().data(chunk.to_string()));
                 }
-                Err(e) => {
+                Gemma4StreamItem::Complete { completion_tokens: actual } => {
+                    completion_tokens = actual;
+                    completed = true;
+                }
+                Gemma4StreamItem::Error(e) => {
                     if let Some(guard) = telemetry_guard.take() {
                         guard.finish(gemma4_telemetry_error(e.clone()));
                     }
@@ -10087,12 +10868,23 @@ async fn gemma4_chat_streaming(
             }
         }
 
+        if !errored && !completed {
+            let message = "gemma4 generation ended without a completion record".to_string();
+            if let Some(guard) = telemetry_guard.take() {
+                guard.finish(gemma4_telemetry_error(message.clone()));
+            }
+            let err = serde_json::json!({ "error": { "message": message, "type": "generation_error" } });
+            yield Ok(Event::default().data(err.to_string()));
+            errored = true;
+        }
+
         if !errored {
+            let finish_reason = gemma4_finish_reason(completion_tokens, max_tokens);
             if let Some(guard) = telemetry_guard.take() {
                 guard.finish(telemetry::RequestFinish {
                     status: "ok",
-                    finish_reason: Some("stop".to_string()),
-                    completion_tokens: telemetry_tokens,
+                    finish_reason: Some(finish_reason.to_string()),
+                    completion_tokens,
                     ttft_ms: None,
                     decode_tps: None,
                     prefill_tps: None,
@@ -10104,7 +10896,8 @@ async fn gemma4_chat_streaming(
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": id,
-                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
+                "usage": gemma4_usage(prompt_tokens, completion_tokens),
             });
             yield Ok(Event::default().data(done.to_string()));
         }
@@ -10326,6 +11119,12 @@ fn build_loaded_model(
     })
 }
 
+/// Drop both halves of the Gemma 4 runtime/identity publication.
+async fn clear_gemma4_serve_runtime(state: &AppState, id: &str) {
+    state.gemma4_runtimes.write().await.remove(id);
+    state.gemma4_serve_lanes.write().await.remove(id);
+}
+
 /// Load (or reload) the gemma4 serve runtime for a model id. With
 /// CAMELID_GEMMA4_WORKER + CAMELID_GEMMA4_SPLIT set, the runtime is the
 /// distributed layer-sharding lane (master shard locally, tail layers on the
@@ -10335,17 +11134,39 @@ async fn load_gemma4_serve_runtime(
     id: &str,
     model_path: &std::path::Path,
 ) -> std::result::Result<(), BackendError> {
+    // A failed reload must never leave a stale lane claim attached to an old
+    // runtime. Health remains conservative until the replacement is complete.
+    clear_gemma4_serve_runtime(state, id).await;
     let distributed =
         gemma4_distributed_serve_config().map_err(BackendError::InvalidModelMetadata)?;
+    let ghost_moe = gemma4_ghost_moe_serve_config().map_err(BackendError::InvalidModelMetadata)?;
+    if distributed.is_some() && ghost_moe.is_some() {
+        return Err(BackendError::InvalidModelMetadata(
+            "Gemma 4 Ghost-MoE and distributed serve are mutually exclusive; unset either CAMELID_GEMMA4_GHOST_CGHOST or CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT"
+                .to_string(),
+        ));
+    }
+    let ghost_moe_requested = ghost_moe.is_some();
     let load_path = model_path.to_path_buf();
-    let runtime = tokio::task::spawn_blocking(move || match distributed {
-        Some((worker_addr, split)) => crate::gemma4_distributed::Gemma4DistributedRuntime::connect(
-            &load_path,
-            &worker_addr,
-            split,
-        )
-        .map(Gemma4ServeRuntime::Distributed),
-        None => {
+    let runtime = tokio::task::spawn_blocking(move || match (ghost_moe, distributed) {
+        (Some((cghost, cache_mib, strict_cache)), None) => {
+            crate::gemma4_runtime::Gemma4Runtime::load_ghost_moe(
+                &load_path,
+                &cghost,
+                cache_mib,
+                strict_cache,
+            )
+            .map(Gemma4ServeRuntime::Local)
+        }
+        (None, Some((worker_addr, split))) => {
+            crate::gemma4_distributed::Gemma4DistributedRuntime::connect(
+                &load_path,
+                &worker_addr,
+                split,
+            )
+            .map(Gemma4ServeRuntime::Distributed)
+        }
+        (None, None) => {
             #[cfg(feature = "cuda")]
             {
                 if gemma4_cuda_enabled() {
@@ -10396,23 +11217,33 @@ async fn load_gemma4_serve_runtime(
             }
             crate::gemma4_runtime::Gemma4Runtime::load(&load_path).map(Gemma4ServeRuntime::Local)
         }
+        (Some(_), Some(_)) => unreachable!("mutual exclusion checked before runtime load"),
     })
     .await
     .map_err(|e| {
         BackendError::InvalidModelMetadata(format!("gemma4 runtime load task panicked: {e}"))
     })??;
-    let lane = match &runtime {
-        Gemma4ServeRuntime::Local(_) => "local",
-        Gemma4ServeRuntime::Distributed(_) => "distributed",
-        #[cfg(feature = "cuda")]
-        Gemma4ServeRuntime::Cuda(_) => "cuda",
+    let lane = if ghost_moe_requested {
+        Gemma4ServeLane::GhostMoe
+    } else {
+        match &runtime {
+            Gemma4ServeRuntime::Local(_) => Gemma4ServeLane::Local,
+            Gemma4ServeRuntime::Distributed(_) => Gemma4ServeLane::Distributed,
+            #[cfg(feature = "cuda")]
+            Gemma4ServeRuntime::Cuda(_) => Gemma4ServeLane::Cuda,
+        }
     };
     state
         .gemma4_runtimes
         .write()
         .await
         .insert(id.to_string(), Arc::new(runtime));
-    tracing::info!(model = %id, lane, "gemma4 runtime loaded for serve path");
+    state
+        .gemma4_serve_lanes
+        .write()
+        .await
+        .insert(id.to_string(), lane);
+    tracing::info!(model = %id, lane = ?lane, "gemma4 runtime loaded for serve path");
     Ok(())
 }
 
@@ -10491,6 +11322,7 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
     if let Some(id) = target {
         state.loaded_models.write().await.remove(&id);
         state.gemma4_runtimes.write().await.remove(&id);
+        state.gemma4_serve_lanes.write().await.remove(&id);
         state.runnable_runtimes.write().await.remove(&id);
         state.dg_runtimes.write().await.remove(&id);
         state.embedding_runtimes.write().await.remove(&id);
@@ -10505,6 +11337,7 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
     } else {
         state.loaded_models.write().await.clear();
         state.gemma4_runtimes.write().await.clear();
+        state.gemma4_serve_lanes.write().await.clear();
         state.runnable_runtimes.write().await.clear();
         state.dg_runtimes.write().await.clear();
         state.embedding_runtimes.write().await.clear();
@@ -11606,9 +12439,9 @@ async fn completions(
     match resolve_gemma4_runtime_for_model(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
             return if req.stream.unwrap_or(false) {
-                gemma4_completion_streaming(id, runtime, &req).await
+                gemma4_completion_streaming(&state, id, runtime, &req).await
             } else {
-                gemma4_completion_nonstreaming(id, runtime, &req).await
+                gemma4_completion_nonstreaming(&state, id, runtime, &req).await
             };
         }
         Ok(None) => {}
@@ -11993,9 +12826,9 @@ async fn chat_completions(
                 return tools_unsupported_on_lane("gemma4");
             }
             return if req.stream.unwrap_or(false) {
-                gemma4_chat_streaming(id, runtime, &req).await
+                gemma4_chat_streaming(&state, id, runtime, &req).await
             } else {
-                gemma4_chat_nonstreaming(id, runtime, &req).await
+                gemma4_chat_nonstreaming(&state, id, runtime, &req).await
             };
         }
         Ok(None) => {}

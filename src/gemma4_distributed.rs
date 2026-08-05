@@ -25,7 +25,7 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::ops::Range;
 use std::path::Path;
 
-use crate::gemma4_runtime::{Gemma4Runtime, Gemma4StepOutput};
+use crate::gemma4_runtime::{Gemma4GenerationOutcome, Gemma4Runtime, Gemma4StepOutput};
 use crate::{BackendError, Result};
 
 /// Wire protocol version. Bump on ANY change to the message layout.
@@ -1054,6 +1054,15 @@ impl Gemma4DistributedRuntime {
         self.generate_greedy_streaming(prompt, max_new, |_| {})
     }
 
+    pub fn generate_greedy_cancellable<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        should_cancel: C,
+    ) -> Result<Gemma4GenerationOutcome> {
+        self.generate_greedy_streaming_cancellable(prompt, max_new, |_| {}, should_cancel)
+    }
+
     /// Greedy decode over the wire with the same incremental-delta contract as
     /// [`Gemma4Runtime::generate_greedy_streaming`]: the delta is the
     /// newly-appended suffix of the cumulative decode (SentencePiece-safe).
@@ -1107,6 +1116,86 @@ impl Gemma4DistributedRuntime {
             last_next = feed(last_next, pos, &mut kc, &mut vc, &mut client)?;
         }
         Ok((emitted, generated))
+    }
+
+    /// Cancellation-aware distributed decode. A TCP step is indivisible; the
+    /// signal is observed before the next prompt/decode step so the worker
+    /// session and local shard are released together without interleaving a
+    /// second request into either side.
+    pub fn generate_greedy_streaming_cancellable<F: FnMut(&str), C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        mut on_delta: F,
+        mut should_cancel: C,
+    ) -> Result<Gemma4GenerationOutcome> {
+        if should_cancel() {
+            return Ok(Gemma4GenerationOutcome::Cancelled {
+                generated_tokens: 0,
+            });
+        }
+        let mut client = Gemma4WorkerClient::connect(&self.worker_addr, &self.handshake)?;
+        let prompt_tokens = self.runtime.tokenizer().encode(prompt, true, true)?;
+        let stop = self.runtime.stop_token_ids();
+        let (mut kc, mut vc) = self.runtime.empty_kv_caches();
+
+        let feed = |token: u32,
+                    pos: usize,
+                    kc: &mut crate::gemma4_runtime::Gemma4KvCache,
+                    vc: &mut crate::gemma4_runtime::Gemma4KvCache,
+                    client: &mut Gemma4WorkerClient|
+         -> Result<u32> {
+            let h = match self.runtime.step_range(token, pos, None, kc, vc)? {
+                Gemma4StepOutput::Hidden(h) => h,
+                Gemma4StepOutput::Logits(_) => {
+                    return Err(BackendError::InvalidModelMetadata(
+                        "gemma4 master unexpectedly owns the full model; use single-node".into(),
+                    ))
+                }
+            };
+            Ok(client.step(token, pos, &h)?.next_token)
+        };
+
+        let mut last_next = 0u32;
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            if should_cancel() {
+                return Ok(Gemma4GenerationOutcome::Cancelled {
+                    generated_tokens: 0,
+                });
+            }
+            last_next = feed(tok, pos, &mut kc, &mut vc, &mut client)?;
+        }
+
+        let mut generated = Vec::new();
+        let mut emitted = String::new();
+        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
+            if should_cancel() {
+                return Ok(Gemma4GenerationOutcome::Cancelled {
+                    generated_tokens: generated.len(),
+                });
+            }
+            if stop.contains(&last_next) {
+                break;
+            }
+            generated.push(last_next);
+            let full = self.runtime.tokenizer().decode(&generated, true)?;
+            if let Some(delta) = full.strip_prefix(&emitted) {
+                if !delta.is_empty() {
+                    on_delta(delta);
+                }
+            }
+            emitted = full;
+            if should_cancel() {
+                return Ok(Gemma4GenerationOutcome::Cancelled {
+                    generated_tokens: generated.len(),
+                });
+            }
+            last_next = feed(last_next, pos, &mut kc, &mut vc, &mut client)?;
+        }
+        Ok(Gemma4GenerationOutcome::Complete {
+            text: emitted,
+            token_ids: generated,
+        })
     }
 }
 

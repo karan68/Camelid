@@ -24,18 +24,95 @@ function backendMarksSupportedRow(model) {
   return model?.lane_class === 'supported'
 }
 
+const GEMMA4_26B_DISTRIBUTED_ONLY_ROW = 'gemma4_26b_a4b_it_q4_0'
+const GEMMA4_SERVE_LANES = new Set(['ghost_moe', 'local', 'distributed', 'cuda'])
+
+function normalizedGemma4ServeLane(runtime) {
+  const lane = String(runtime?.gemma4_serve_lane || '').trim().toLowerCase().replace(/-/g, '_')
+  return GEMMA4_SERVE_LANES.has(lane) ? lane : null
+}
+
+function isGemma426bDistributedOnlyRow(model, hint) {
+  if (hint?.kind === 'compatibility' && hint?.exact === true
+    && hint?.target?.id === GEMMA4_26B_DISTRIBUTED_ONLY_ROW) return true
+  const identities = [
+    model?.catalog_id,
+    model?.compatibility_id,
+    model?.runtime_model_name,
+    model?.id,
+    model?.name,
+    model?.model_path,
+    model?.hf_filename,
+  ]
+  return identities.some((identity) => {
+    const normalized = String(identity || '').toLowerCase().replace(/[^a-z0-9]+/g, '_')
+    return normalized === GEMMA4_26B_DISTRIBUTED_ONLY_ROW
+      || (/gemma_?4_26b(?:_|$)/.test(normalized) && normalized.includes('q4_0'))
+  })
+}
+
+function runtimeLaneHint(hint, distributedOnlyRow, runtimeLane) {
+  const reason = runtimeLane === 'ghost_moe'
+    ? 'Single-node Ghost-MoE is an experimental lane and does not inherit this row\'s distributed serve evidence.'
+    : 'This distributed-only row has no recognized distributed runtime-lane report, so this run remains experimental.'
+  const target = hint?.target || (distributedOnlyRow
+    ? {
+        id: GEMMA4_26B_DISTRIBUTED_ONLY_ROW,
+        family: 'gemma4_a4b_moe_decoder',
+        quantization: 'Q4_0',
+      }
+    : null)
+  if (!target) return hint
+  return {
+    ...(hint || { kind: 'runtime_lane_mismatch', exact: false }),
+    kind: 'runtime_lane_mismatch',
+    confidence: 'runtime lane is outside the row support scope',
+    target: {
+      ...target,
+      status: 'experimental_runtime_lane',
+      evidence: reason,
+      next_step: reason,
+    },
+  }
+}
+
 export function getChatGateState(capabilities, model, runtime) {
   const runtimeLoaded = Boolean(runtime?.loaded_now && modelRuntimeIdMatches(model, runtime))
   const runtimeGenerationReady = Boolean(runtime?.generation_ready && modelRuntimeIdMatches(model, runtime))
   const runtimeReady = Boolean(isRunnableInCurrentRuntime(model, runtime) && runtimeLoaded && runtimeGenerationReady)
-  const hint = findCompatibilityHint(capabilities, model)
+  const discoveredHint = findCompatibilityHint(capabilities, model)
+  const runtimeLane = normalizedGemma4ServeLane(runtime)
+  const distributedOnlyRow = isGemma426bDistributedOnlyRow(model, discoveredHint)
+  const distributedTarget = distributedOnlyRow
+    ? capabilities?.model_compatibility?.find((row) => row?.id === GEMMA4_26B_DISTRIBUTED_ONLY_ROW)
+    : null
+  const contractHint = distributedTarget
+    ? {
+        kind: 'compatibility',
+        target: distributedTarget,
+        confidence: 'exact Gemma 4 26B artifact identity',
+        exact: true,
+      }
+    : discoveredHint
+  // Support evidence is lane-scoped. Ghost-MoE is currently an experimental
+  // single-node lane, while the exact Gemma 4 26B Q4_0 row is supported only
+  // through distributed serve. Missing/unknown lane data therefore fails safe
+  // for that row; an explicit distributed report preserves its supported gate.
+  const runtimeLaneEligible = runtimeLane !== 'ghost_moe'
+    && (!distributedOnlyRow || runtimeLane === 'distributed')
   // Once /api/models/local supplies a lane verdict, it owns artifact identity.
   // Falling back to name matching after an explicit experimental verdict would
   // let a same-named, wrong-hash Prism file inherit the supported contract.
+  // Runtime-lane eligibility composes on top: even a backend-supported row
+  // stays experimental while served through the Ghost-MoE lane.
   const hasBackendLaneVerdict = Boolean(model?.lane_class)
-  const contractSupported = hasBackendLaneVerdict
+  const rowSupported = hasBackendLaneVerdict
     ? backendMarksSupportedRow(model)
     : isCompatibilitySupportedForModel(capabilities, model)
+  const contractSupported = Boolean(runtimeLaneEligible && rowSupported)
+  const hint = runtimeLaneEligible
+    ? contractHint
+    : runtimeLaneHint(contractHint, distributedOnlyRow, runtimeLane)
   const chatUnlocked = Boolean(runtimeReady && contractSupported)
   // Experimental lane: the model loaded and is generation-ready (so its architecture
   // is implemented — generation_ready is false for unimplemented archs) but it is NOT

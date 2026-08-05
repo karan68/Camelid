@@ -3831,6 +3831,13 @@ impl TensorStore {
             .ok_or_else(|| BackendError::TensorNotFound(name.to_string()))
     }
 
+    /// Path backing this tensor store. Crate-internal format converters use this
+    /// to copy bounded tensor ranges without materializing a whole (potentially
+    /// multi-gigabyte) tensor in RAM.
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn tensor_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let desc = self.descriptor(name)?;
         let len = usize::try_from(desc.n_bytes).map_err(|_| {

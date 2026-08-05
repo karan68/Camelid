@@ -138,6 +138,13 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 
 The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Command R requires a workstation-class host.
 
+Experimental exception: the Gemma 4 26B MoE row can also run on a single 16 GB
+Apple-silicon Mac through the opt-in Ghost-MoE Metal lane, which repacks the routed experts into a
+paged `.cghost` artifact and keeps a bounded, persistent expert working set in unified memory
+(measured 17–20 tok/s steady-state decode on an M4). Replies on that lane are marked
+experimental with no parity guarantee. Setup, the recommended serve profile, and measured receipts
+live in [docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gemma-4-26b-a4b).
+
 The full catalog, exact hashes, supported execution paths, and claim boundaries live in:
 
 - [COMPATIBILITY.md](COMPATIBILITY.md)—authoritative supported-row ledger
