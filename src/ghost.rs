@@ -910,6 +910,9 @@ impl GhostMoeExpert {
         (Arc::clone(&self.bytes), view.offset..view.offset + view.len)
     }
 
+    /// Consumed by the CUDA lane's owned expert records; other targets read
+    /// through [`Self::tensor_backing`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> &[u8] {
         &self.bytes[view.offset..view.offset + view.len]
     }
@@ -925,6 +928,7 @@ pub(crate) struct GhostMoeMappedExpert {
     pub down: GhostMoeTensorView,
 }
 
+#[cfg(feature = "cuda")]
 impl GhostMoeMappedExpert {
     pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> Result<&[u8]> {
         self.mmap
@@ -947,6 +951,7 @@ impl GhostMoeTensorView {
     /// tier reads whole records into fixed-stride slots with
     /// [`GhostFile::read_moe_expert_into`] — need the sub-ranges without going
     /// back through an allocating `GhostMoeExpert`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn record_range(&self) -> std::ops::Range<usize> {
         self.offset..self.offset + self.len
     }
@@ -1418,6 +1423,7 @@ impl GhostFile {
     /// Borrow one routed expert directly from the read-only file mapping. The
     /// same payload-identity check as the positioned reader runs before bytes
     /// are exposed. Strict-cache mode returns `None` because it disables mmap.
+    #[cfg(feature = "cuda")]
     pub(crate) fn mapped_moe_expert(
         &self,
         layer_idx: usize,

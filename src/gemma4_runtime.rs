@@ -11,7 +11,9 @@
 //! sharing: layers >= `first_kv_shared` reuse the last same-type layer's cache.
 
 use crate::gguf::{read_metadata, GgufFile, GgufTensorType};
-use crate::ghost::{GhostFile, GhostMoeExpert, GhostMoeMappedExpert, GhostMoeTensorView};
+#[cfg(feature = "cuda")]
+use crate::ghost::GhostMoeMappedExpert;
+use crate::ghost::{GhostFile, GhostMoeExpert, GhostMoeTensorView};
 use crate::inference::gemma4::{gelu_tanh, soft_cap_in_place};
 use crate::inference::{
     nvfp4_wire_block_dequant, nvfp4_wire_row_dot, q2_k_wire_row_dot, q4_0_wire_block_dequant,
