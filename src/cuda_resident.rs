@@ -3848,6 +3848,102 @@ extern "C" __global__ void q4_0_gemv_routed(
     }
 }
 
+// Routed twin of q2k_gemv for the Ghost-MoE expert arenas: blockIdx.y selects
+// one routed expert; slot_ids locate its Q2_K gate_up slab in the fixed-stride
+// VRAM arena and route_ids place the output row block in router order. Every
+// expert dots the SAME shared Q8_K activation (the layer input), so there is no
+// batched-input variant — the only Q2_K projection is gate_up, whose input is
+// the pre-FFN residual; the per-expert down GEMV stays Q4_0. The per-super-block
+// integer core and the lane-0 ordered f32 fold are copied VERBATIM from
+// q2k_gemv, so each expert's output row is bit-identical to a dense q2k_gemv
+// call over the same wire bytes — the dense kernel's oracle-parity contract
+// (matches CPU q2_k_wire_row_dot) carries over unchanged.
+extern "C" __global__ void q2k_gemv_routed(
+    const float* __restrict__ input_scales,        // n_sb f32 (Q8_K d per superblock)
+    const signed char* __restrict__ input_quants,  // n_sb*256 i8 (Q8_K quants)
+    const unsigned char* __restrict__ weight_arena,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ route_ids,
+    unsigned long long weight_stride, int rows, int n_sb,
+    float* __restrict__ output, int expert_count
+) {
+    int expert = blockIdx.y;
+    if (expert >= expert_count) return;
+    int route = route_ids[expert];
+    int slot = slot_ids[expert];
+    const unsigned char* weight_bytes = weight_arena + (long)slot * weight_stride;
+
+    extern __shared__ unsigned char smem2r[];
+    signed char* s_iq = (signed char*)smem2r;                 // n_sb*256 i8 staged input
+    float* s_is = (float*)(smem2r + (long)n_sb * 256);        // n_sb f32 staged scales
+    // per-warp scratch: 2 ints (isum, summs) per superblock.
+    int* acc = (int*)(smem2r + (long)n_sb * 256 + (long)n_sb * 4);
+    int tid = threadIdx.x;
+    for (int i = tid; i < n_sb * 64; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];
+    for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    const int WIRE = 84;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int* myacc = acc + (long)warp * n_sb * 2;
+    if (row < rows) {
+        long row_sb0 = (long)row * n_sb;
+        for (int b = lane; b < n_sb; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            const signed char* y256 = s_iq + (long)b * 256;
+            const unsigned char* sc = blk;          // scales[16]
+            const unsigned char* qs = blk + 16;     // qs[64] (2-bit quants)
+            int summs = 0;
+            for (int j = 0; j < 16; j++) {
+                int bsum = 0;
+                for (int l = 0; l < 16; l++) bsum += (int)y256[j * 16 + l];
+                summs += bsum * (int)(sc[j] >> 4);
+            }
+            int isum = 0;
+            int is = 0;
+            for (int k = 0; k < 2; k++) {
+                int shift = 0;
+                for (int j = 0; j < 4; j++) {
+                    int dlo = (int)(sc[is++] & 0xF);
+                    int isuml = 0;
+                    for (int l = 0; l < 16; l++)
+                        isuml += (int)y256[k * 128 + j * 32 + l]
+                               * (int)((qs[k * 32 + l] >> shift) & 3);
+                    isum += dlo * isuml;
+                    int dhi = (int)(sc[is++] & 0xF);
+                    isuml = 0;
+                    for (int l = 0; l < 16; l++)
+                        isuml += (int)y256[k * 128 + j * 32 + 16 + l]
+                               * (int)((qs[k * 32 + 16 + l] >> shift) & 3);
+                    isum += dhi * isuml;
+                    shift += 2;
+                }
+            }
+            myacc[b * 2 + 0] = isum;
+            myacc[b * 2 + 1] = summs;
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        long row_sb0 = (long)row * n_sb;
+        float sumf = 0.0f;
+        for (int b = 0; b < n_sb; b++) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            float d = f16_bits_to_f32((unsigned short)blk[80] | ((unsigned short)blk[81] << 8));
+            float dmin = f16_bits_to_f32((unsigned short)blk[82] | ((unsigned short)blk[83] << 8));
+            float dact = s_is[b];
+            float dall = d * dact;
+            float dminx = dmin * dact;
+            sumf += dall * (float)myacc[b * 2 + 0] - dminx * (float)myacc[b * 2 + 1];
+        }
+        output[(long)route * rows + row] = sumf;
+    }
+}
+
 // Fuse each routed expert's GeGLU with its Q8_0 quantization. One thread owns a
 // 32-value Q8 block, retaining its GeGLU values locally across the max and quant
 // passes so neither a second tanh nor a global f32 intermediate is needed.
@@ -5701,6 +5797,7 @@ pub struct CudaResidentKernels {
     pub(crate) residual_add: CudaFunction,
     pub(crate) scaled_axpy: CudaFunction,
     pub(crate) q4_0_gemv_routed: CudaFunction,
+    pub(crate) q2k_gemv_routed: CudaFunction,
     pub(crate) geglu_quantize_routed: CudaFunction,
     pub(crate) moe_weighted_sum_routed: CudaFunction,
     pub(crate) argmax: CudaFunction,
@@ -5903,6 +6000,7 @@ impl CudaResidentKernels {
             residual_add: f("residual_add")?,
             scaled_axpy: f("scaled_axpy")?,
             q4_0_gemv_routed: f("q4_0_gemv_routed")?,
+            q2k_gemv_routed: f("q2k_gemv_routed")?,
             geglu_quantize_routed: f("geglu_quantize_routed")?,
             moe_weighted_sum_routed: f("moe_weighted_sum_routed")?,
             argmax: f("argmax_f32")?,

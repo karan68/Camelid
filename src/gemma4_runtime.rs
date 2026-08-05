@@ -14,9 +14,9 @@ use crate::gguf::{read_metadata, GgufFile, GgufTensorType};
 use crate::ghost::{GhostFile, GhostMoeExpert, GhostMoeMappedExpert, GhostMoeTensorView};
 use crate::inference::gemma4::{gelu_tanh, soft_cap_in_place};
 use crate::inference::{
-    nvfp4_wire_block_dequant, nvfp4_wire_row_dot, q4_0_wire_block_dequant, q4_0_wire_row_dot,
-    q4_1_wire_row_dot, q4_k_wire_row_dot, q6_k_wire_block_dequant, q6_k_wire_row_dot,
-    q8_0_wire_row_dot, quantize_q8_0_blocks, quantize_q8_k_blocks,
+    nvfp4_wire_block_dequant, nvfp4_wire_row_dot, q2_k_wire_row_dot, q4_0_wire_block_dequant,
+    q4_0_wire_row_dot, q4_1_wire_row_dot, q4_k_wire_row_dot, q6_k_wire_block_dequant,
+    q6_k_wire_row_dot, q8_0_wire_row_dot, quantize_q8_0_blocks, quantize_q8_k_blocks,
 };
 use crate::model::{Gemma4Binding, Gemma4Metadata, LlamaModelConfig};
 use crate::tensor::{f16_bits_to_f32, Q8_0Block, TensorStore};
@@ -56,6 +56,11 @@ enum WireFormat {
     Q8_0,
     Q4_0,
     Q4_1,
+    /// Q2_K joined the wire lane for the mixed Ghost-MoE expert artifact: the
+    /// routed gate_up projections requantized to 2.625 bpw so the whole expert
+    /// payload can be host/VRAM-resident on a 6 GiB + 16 GiB box. It rides the
+    /// existing Q8_K-activation K-quant family (`q2_k_wire_row_dot`).
+    Q2K,
     Q4K,
     Q5K,
     Q6K,
@@ -67,7 +72,7 @@ impl WireFormat {
     fn values_per_block(self) -> usize {
         match self {
             WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => 32,
-            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => 256,
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => 256,
             WireFormat::Nvfp4 => crate::tensor::NVFP4_VALUES_PER_BLOCK, // 64
         }
     }
@@ -79,6 +84,7 @@ impl WireFormat {
             WireFormat::Q4_0 => crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK,
             // block_q4_1 = f16 d + f16 m + 16 nibbles; Q4_K/Q5_K K-quant superblocks.
             WireFormat::Q4_1 => 20,
+            WireFormat::Q2K => crate::tensor::Q2_K_BLOCK_BYTES,
             WireFormat::Q4K => 144,
             WireFormat::Q5K => 176,
             WireFormat::Q6K => crate::inference::Q6_K_WIRE_BYTES_PER_BLOCK,
@@ -135,12 +141,13 @@ impl WireQuant {
             GgufTensorType::Q8_0 => Ok(WireFormat::Q8_0),
             GgufTensorType::Q4_0 => Ok(WireFormat::Q4_0),
             GgufTensorType::Q4_1 => Ok(WireFormat::Q4_1),
+            GgufTensorType::Q2K => Ok(WireFormat::Q2K),
             GgufTensorType::Q4K => Ok(WireFormat::Q4K),
             GgufTensorType::Q5K => Ok(WireFormat::Q5K),
             GgufTensorType::Q6K => Ok(WireFormat::Q6K),
             GgufTensorType::NVFP4 => Ok(WireFormat::Nvfp4),
             other => Err(BackendError::UnsupportedTensorType(format!(
-                "tensor {name} is {other:?}; gemma4 wire load supports Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and NVFP4"
+                "tensor {name} is {other:?}; gemma4 wire load supports Q8_0, Q4_0, Q4_1, Q2_K, Q4_K, Q5_K, Q6_K, and NVFP4"
             ))),
         }
     }
@@ -293,7 +300,9 @@ impl WireQuant {
             }
             // K-quant rows dot against Q8_K activations (the reference's K-quant
             // activation format) — Q6_K/Q4_K used by the QAT tied embedding head.
-            WireFormat::Q4K | WireFormat::Q6K => self.matvec_q8k(out_dim, &quantize_q8_k_blocks(x)),
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q6K => {
+                self.matvec_q8k(out_dim, &quantize_q8_k_blocks(x))
+            }
             // Q5_K is gather-only here (per_layer_token_embd); never a matvec
             // weight — `require_matvec_capable` refuses it typed at load.
             WireFormat::Q5K => unreachable!("Q5_K is gather-only (per_layer_token_embd)"),
@@ -317,7 +326,9 @@ impl WireQuant {
             WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
                 self.matvec_q(out_dim, x.q8_0())
             }
-            WireFormat::Q4K | WireFormat::Q6K => self.matvec_q8k(out_dim, x.q8_k()),
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q6K => {
+                self.matvec_q8k(out_dim, x.q8_k())
+            }
             // Structurally unreachable: `require_matvec_capable` refuses Q5_K
             // in every matvec-role binding at load (typed, I-unknown-type).
             WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
@@ -332,7 +343,9 @@ impl WireQuant {
             WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
                 self.matmul_q(out_dim, xs.q8_0())
             }
-            WireFormat::Q4K | WireFormat::Q6K => self.matmul_q8k(out_dim, xs.q8_k()),
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q6K => {
+                self.matmul_q8k(out_dim, xs.q8_k())
+            }
             WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
         }
     }
@@ -350,7 +363,7 @@ impl WireQuant {
             WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 | WireFormat::Nvfp4 => {
                 self.matvec_q_rows(row_start, out_count, x.q8_0())
             }
-            WireFormat::Q4K | WireFormat::Q6K => {
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q6K => {
                 self.matvec_q8k_rows(row_start, out_count, x.q8_k())
             }
             WireFormat::Q5K => unreachable!("Q5_K matvec roles are refused at load"),
@@ -376,7 +389,7 @@ impl WireQuant {
             WireFormat::Q4_0 => q4_0_wire_row_dot,
             WireFormat::Q4_1 => q4_1_wire_row_dot,
             WireFormat::Nvfp4 => nvfp4_wire_row_dot,
-            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
                 unreachable!("K-quant matvec routes through matvec_q8k")
             }
         };
@@ -407,7 +420,7 @@ impl WireQuant {
             WireFormat::Q4_0 => q4_0_wire_row_dot,
             WireFormat::Q4_1 => q4_1_wire_row_dot,
             WireFormat::Nvfp4 => nvfp4_wire_row_dot,
-            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
                 unreachable!("K-quant rows route through matvec_q8k")
             }
         };
@@ -467,7 +480,7 @@ impl WireQuant {
             WireFormat::Q4_0 => q4_0_wire_row_dot,
             WireFormat::Q4_1 => q4_1_wire_row_dot,
             WireFormat::Nvfp4 => nvfp4_wire_row_dot,
-            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
+            WireFormat::Q2K | WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
                 unreachable!("K-quant matmul routes through matmul_q8k")
             }
         };
@@ -507,6 +520,7 @@ impl WireQuant {
         let row_dot: fn(&[u8], &[crate::inference::Q8KBlock]) -> f32 = match self.format {
             WireFormat::Q6K => q6_k_wire_row_dot,
             WireFormat::Q4K => q4_k_wire_row_dot,
+            WireFormat::Q2K => q2_k_wire_row_dot,
             _ => unreachable!("matvec_q8k is only for Q6_K/Q4_K weights"),
         };
         let mut out = vec![0f32; out_dim];
@@ -540,6 +554,7 @@ impl WireQuant {
         let row_dot: fn(&[u8], &[crate::inference::Q8KBlock]) -> f32 = match self.format {
             WireFormat::Q6K => q6_k_wire_row_dot,
             WireFormat::Q4K => q4_k_wire_row_dot,
+            WireFormat::Q2K => q2_k_wire_row_dot,
             _ => unreachable!("matvec_q8k_rows is only for Q6_K/Q4_K weights"),
         };
         let mut out = vec![0f32; out_count];
@@ -569,6 +584,7 @@ impl WireQuant {
         let row_dot: fn(&[u8], &[crate::inference::Q8KBlock]) -> f32 = match self.format {
             WireFormat::Q6K => q6_k_wire_row_dot,
             WireFormat::Q4K => q4_k_wire_row_dot,
+            WireFormat::Q2K => q2_k_wire_row_dot,
             _ => unreachable!("matmul_q8k is only for Q6_K/Q4_K weights"),
         };
         let mut flat = vec![0f32; out_dim * k];
@@ -648,6 +664,26 @@ impl WireQuant {
             // Q4_K tied head + Q5_K per_layer_token_embd are gathered for the input
             // embedding / PLE; decode one 256-value superblock at a time via the shared
             // K-quant decoders (reused, not reimplemented).
+            // Q2_K is a matvec-only weight in this lane (routed expert gate_up);
+            // no embedding table is Q2_K, so a gather decode is reused via the
+            // shared block decoder purely for exhaustiveness/debug paths.
+            WireFormat::Q2K => {
+                const BV: usize = 256;
+                let bb = self.format.bytes_per_block();
+                let mut block = usize::MAX;
+                let mut decoded = [0f32; 256];
+                for e in start..end {
+                    if e / BV != block {
+                        block = e / BV;
+                        let sb: &[u8; crate::tensor::Q2_K_BLOCK_BYTES] = bytes
+                            [block * bb..(block + 1) * bb]
+                            .try_into()
+                            .expect("Q2_K wire block span validated at load");
+                        crate::tensor::Q2KBlock::from_bytes(sb).dequantize(&mut decoded);
+                    }
+                    out.push(decoded[e % BV]);
+                }
+            }
             WireFormat::Q4K | WireFormat::Q5K => {
                 const BV: usize = 256;
                 let bb = self.format.bytes_per_block();
@@ -1056,18 +1092,21 @@ const GHOST_CUDA_HOST_TIER_RESERVE_MIB: u64 = 3072;
 
 /// Resolve the host expert-tier budget (MiB) for the Ghost-MoE CUDA lane.
 ///
-/// `requested_mib` is what the caller asked for (`--expert-cache-mib`). It is
-/// treated as a FLOOR that auto-sizing may raise, not as a ceiling, because its
-/// defaults were chosen for the CPU/storage lane where the tier is only a small
-/// read cache. On the CUDA lane the tier is the difference between a
-/// storage-bound and a PCIe-bound decode, so it wants every byte the host can
-/// safely spare.
+/// The tier is all-or-nothing by measurement, not by taste. On the tracked box
+/// a 7 GiB tier lifted steady decode 8.5 -> 12 tok/s, but a 1 GiB tier (an
+/// auto-size taken during a transient RAM dip) ran at **0.0% hit rate** and
+/// dragged decode to 4.85: the tier only ever sees the VRAM cache's miss tail,
+/// whose LRU reuse distance far exceeds a small arena, so every miss paid a
+/// fill + eviction on top of the storage read while the pinned RAM starved the
+/// OS page cache that was previously absorbing those reads. A tier that cannot
+/// hold a meaningful fraction of the routed payload must therefore refuse to
+/// build and leave the page cache alone.
 ///
-/// Explicit `CAMELID_GEMMA4_GHOST_HOST_TIER_MIB` always wins, including `0`,
-/// which forces the mapped path back on for A/B measurement. A caller-requested
-/// `0` (`--expert-cache-mib 0` is documented as the smallest application-owned
-/// footprint) also wins: auto-sizing must not convert an explicit minimal-memory
-/// request into gigabytes of page-locked RAM.
+/// Explicit `CAMELID_GEMMA4_GHOST_HOST_TIER_MIB` always wins, including `0`
+/// (forces the mapped path for A/B) and sub-viable sizes (measurement needs
+/// them). A caller-requested `0` (`--expert-cache-mib 0` is documented as the
+/// smallest application-owned footprint) disables auto-sizing entirely:
+/// a minimal-memory request must not become gigabytes of page-locked RAM.
 #[cfg(feature = "cuda")]
 fn ghost_cuda_host_tier_mib(cghost: &Path, requested_mib: usize) -> usize {
     if let Some(explicit) = std::env::var("CAMELID_GEMMA4_GHOST_HOST_TIER_MIB")
@@ -1085,19 +1124,30 @@ fn ghost_cuda_host_tier_mib(cghost: &Path, requested_mib: usize) -> usize {
         .unwrap_or(GHOST_CUDA_HOST_TIER_RESERVE_MIB);
     let (_total, available) = crate::capability::host_ram_total_available_bytes();
     if available == 0 {
-        // No probe on this platform: do not guess an arena size from nothing.
-        return requested_mib;
+        // No probe on this platform: do not pin an arena sized from nothing.
+        return 0;
     }
     let spare_mib = (available / (1024 * 1024)).saturating_sub(reserve_mib);
     // Never retain more than the routed payload itself; beyond that the arena
     // would reserve RAM it can never fill.
     let payload_mib = std::fs::metadata(cghost)
         .map(|m| m.len() / (1024 * 1024))
-        .unwrap_or(u64::MAX);
+        .unwrap_or(0);
+    if payload_mib == 0 {
+        return 0;
+    }
     let auto_mib = spare_mib.min(payload_mib);
-    usize::try_from(auto_mib)
-        .unwrap_or(usize::MAX)
-        .max(requested_mib)
+    // Viability gate (see above): below a quarter of the payload the tier is
+    // measured to be strictly worse than the page cache it displaces.
+    if auto_mib < payload_mib / 4 {
+        eprintln!(
+            "[ghost] host expert tier skipped: {auto_mib} MiB spare would cover under a quarter of \
+             the {payload_mib} MiB routed payload (a small tier measured 0% hits while starving \
+             the OS page cache); set CAMELID_GEMMA4_GHOST_HOST_TIER_MIB to force one"
+        );
+        return 0;
+    }
+    usize::try_from(auto_mib).unwrap_or(usize::MAX)
 }
 
 /// One cache for the whole model, rather than one nominal budget per layer.
@@ -7399,6 +7449,13 @@ impl Gemma4CudaResident {
         // typed error BEFORE the `GemmaLayerQuant::from_wire` catch-all (`upw`
         // below) can panic. The CPU wire lane serves NVFP4 in this release;
         // CUDA-resident NVFP4 is Phase 4 (BASALT).
+        // Guard exactly the panic seam this check exists for: the DENSE layer
+        // projections that `GemmaLayerQuant::from_wire` repacks. The routed MoE
+        // expert tensors never pass through `from_wire` — they stay raw wire
+        // bytes in the SSER arenas (GPU) or CPU-side `WireQuant`s — and their
+        // formats are validated by the dedicated expert-residency gate below
+        // (Q4_0, or the mixed Q2_K gate_up + Q4_0 down). Including them here
+        // wrongly refused the mixed artifact this lane now serves.
         nvfp4_cuda_lane_check(cpu.layers.iter().flat_map(|lw| {
             [
                 Some(lw.attn_q.format),
@@ -7408,8 +7465,6 @@ impl Gemma4CudaResident {
                 Some(lw.ffn_gate.format),
                 Some(lw.ffn_up.format),
                 Some(lw.ffn_down.format),
-                lw.moe.as_ref().map(|m| m.gate_up_exps.format),
-                lw.moe.as_ref().map(|m| m.down_exps.format),
             ]
             .into_iter()
             .flatten()
@@ -7669,27 +7724,38 @@ impl Gemma4CudaResident {
             .unwrap_or(true);
         let sser_requested = std::env::var_os("CAMELID_SSER_CACHE").is_some()
             || (ghost_moe && ghost_cuda_cache_enabled);
-        let q4_experts = cpu
+        // Residency admits Q4_0 experts (the original certified lane) plus the
+        // mixed representation: Q2_K gate_up + Q4_0 down. The mix is not
+        // arbitrary — gate_up's input dim (hidden, 2816 = 11×256) is K-quant
+        // clean while down's (n_ff_exp, 704) is not divisible by 256, so Q2_K
+        // down is impossible by format arithmetic, and keeping down Q4_0 also
+        // keeps that half of the routed pipeline byte-identical to the
+        // certified path. Each projection dispatches by its own wire format.
+        let experts_supported = cpu
             .layers
             .iter()
             .filter_map(|layer| layer.moe.as_ref())
             .all(|moe| {
-                moe.gate_up_exps.format == WireFormat::Q4_0
+                matches!(moe.gate_up_exps.format, WireFormat::Q4_0 | WireFormat::Q2K)
                     && moe.down_exps.format == WireFormat::Q4_0
             });
-        if ghost_moe && sser_requested && !q4_experts {
+        if ghost_moe && sser_requested && !experts_supported {
             return Err(BackendError::UnsupportedGguf(
-                "Ghost-MoE CUDA expert residency currently requires Q4_0 gate_up and down records"
+                "Ghost-MoE CUDA expert residency requires Q4_0 (or Q2_K gate_up + Q4_0 down) expert records"
                     .into(),
             ));
         }
         let sser = if let (Some(moe), true) = (first_moe, sser_requested) {
-            // Per-expert VRAM cost: the two Q4_0 slices this expert's GEMVs read.
-            // gate_up = 2*n_ff_exp rows of hidden values; down = hidden rows of
-            // n_ff_exp values; Q4_0 packs 32 values per 18-byte block.
+            // Per-expert VRAM cost: the two wire slices this expert's GEMVs
+            // read, derived from each projection's OWN format. gate_up =
+            // 2*n_ff_exp rows of hidden values (Q4_0: 18 B/32 values; Q2_K:
+            // 84 B/256 values — the mixed artifact); down = hidden rows of
+            // n_ff_exp values, always Q4_0.
             const WB: usize = crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
             let two_nff = 2 * moe.n_ff_exp;
-            let per_expert_bytes = two_nff * (hidden / 32) * WB + hidden * (moe.n_ff_exp / 32) * WB;
+            let gu_fmt = moe.gate_up_exps.format;
+            let gate_up_row_bytes = hidden / gu_fmt.values_per_block() * gu_fmt.bytes_per_block();
+            let per_expert_bytes = two_nff * gate_up_row_bytes + hidden * (moe.n_ff_exp / 32) * WB;
             // Budget: keep the cache under ~80% of the free VRAM after the resident set
             // (leaving headroom for the per-token scratch + the KV cache growth).
             let (free, _total) = cudarc::driver::result::mem_get_info().unwrap_or((0, 0));
@@ -7732,14 +7798,15 @@ impl Gemma4CudaResident {
                 per_expert_bytes / (1024 * 1024),
                 free / (1024 * 1024),
             );
-            let gate_up_stride = two_nff * (hidden / 32) * WB;
+            let gate_up_stride = two_nff * gate_up_row_bytes;
             let down_stride = hidden * (moe.n_ff_exp / 32) * WB;
             let uniform_geometry = cpu
                 .layers
                 .iter()
                 .filter_map(|layer| layer.moe.as_ref())
                 .all(|layer_moe| {
-                    2 * layer_moe.n_ff_exp * (hidden / 32) * WB == gate_up_stride
+                    layer_moe.gate_up_exps.format == gu_fmt
+                        && 2 * layer_moe.n_ff_exp * gate_up_row_bytes == gate_up_stride
                         && hidden * (layer_moe.n_ff_exp / 32) * WB == down_stride
                 });
             if !uniform_geometry {
@@ -8011,9 +8078,10 @@ impl Gemma4CudaResident {
         let route_count = idx.len();
         let nff = moe.n_ff_exp;
         let two_nff = 2 * nff;
+        let gu_fmt = moe.gate_up_exps.format;
         let gu_blocks = hidden / 32;
         let down_blocks = nff / 32;
-        let gu_row_bytes = gu_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        let gu_row_bytes = hidden / gu_fmt.values_per_block() * gu_fmt.bytes_per_block();
         let down_row_bytes = down_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
         let expected_gu = two_nff * gu_row_bytes;
         let expected_down = hidden * down_row_bytes;
@@ -8086,9 +8154,17 @@ impl Gemma4CudaResident {
                 })?;
                 let (gu_dtype, gu_bytes) = record.gate_up()?;
                 let (down_dtype, down_bytes) = record.down()?;
-                if gu_dtype != GgufTensorType::Q4_0 || down_dtype != GgufTensorType::Q4_0 {
+                // The record's gate_up must carry the SAME wire format the
+                // model bound (Q4_0, or Q2_K on the mixed artifact); down is
+                // always Q4_0. A mismatch means the .cghost does not pair with
+                // this GGUF — refuse rather than feed the wrong kernel.
+                let gu_expected = match gu_fmt {
+                    WireFormat::Q2K => GgufTensorType::Q2K,
+                    _ => GgufTensorType::Q4_0,
+                };
+                if gu_dtype != gu_expected || down_dtype != GgufTensorType::Q4_0 {
                     return Err(BackendError::UnsupportedGguf(format!(
-                        "Ghost-MoE CUDA requires Q4_0 expert records; layer={l} expert={expert} gate_up={gu_dtype:?} down={down_dtype:?}"
+                        "Ghost-MoE CUDA expert record format mismatch; layer={l} expert={expert} gate_up={gu_dtype:?} (expected {gu_expected:?}) down={down_dtype:?} (expected Q4_0)"
                     )));
                 }
                 (gu_bytes, down_bytes)
@@ -8288,16 +8364,50 @@ impl Gemma4CudaResident {
 
             {
                 let cache = sser.borrow();
-                launch_q4(
-                    &cache.gate_up_arena,
-                    cache.gate_up_stride,
-                    d_in_s,
-                    d_in_q,
-                    two_nff,
-                    gu_blocks,
-                    d_gate_up,
-                    0,
-                )?;
+                match gu_fmt {
+                    // Mixed artifact: Q2_K gate_up dots the shared Q8_K
+                    // activation staged in d_in_s/d_in_q (hidden/256 f32 +
+                    // hidden i8). The kernel's integer core and ordered fold
+                    // are verbatim from the certified dense q2k_gemv.
+                    WireFormat::Q2K => {
+                        let n_sb = hidden / 256;
+                        let cfg = LaunchConfig {
+                            grid_dim: ((two_nff as u32).div_ceil(warps), slots.len() as u32, 1),
+                            block_dim: (block, 1, 1),
+                            // staged Q8_K input: n_sb*256 i8 + n_sb*4 f32;
+                            // per-warp scratch: n_sb * 2 i32 (isum, summs).
+                            shared_mem_bytes: n_sb as u32 * 256
+                                + n_sb as u32 * 4
+                                + warps * n_sb as u32 * 2 * 4,
+                        };
+                        let stride_u64 = cache.gate_up_stride as u64;
+                        let rows_i = two_nff as i32;
+                        let n_sb_i = n_sb as i32;
+                        let mut builder = s.launch_builder(&k.q2k_gemv_routed);
+                        builder
+                            .arg(d_in_s)
+                            .arg(d_in_q)
+                            .arg(&cache.gate_up_arena)
+                            .arg(&d_slots)
+                            .arg(&d_routes)
+                            .arg(&stride_u64)
+                            .arg(&rows_i)
+                            .arg(&n_sb_i)
+                            .arg(&mut *d_gate_up)
+                            .arg(&experts_i);
+                        unsafe { builder.launch(cfg) }.map_err(cu)?;
+                    }
+                    _ => launch_q4(
+                        &cache.gate_up_arena,
+                        cache.gate_up_stride,
+                        d_in_s,
+                        d_in_q,
+                        two_nff,
+                        gu_blocks,
+                        d_gate_up,
+                        0,
+                    )?,
+                }
             }
             {
                 let cfg = LaunchConfig {
@@ -8463,6 +8573,17 @@ impl Gemma4CudaResident {
                 )
             })
             .unwrap_or(true);
+        // The serial diagnostic path launches the Q4_0 GEMV pipeline on
+        // gate_up unconditionally; a Q2_K gate_up there would feed 84-byte
+        // superblocks to an 18-byte-block kernel. Refuse typed rather than
+        // compute garbage — the mixed artifact is batched-path only.
+        if !routed_batch && moe.gate_up_exps.format != WireFormat::Q4_0 {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "CAMELID_GEMMA4_CUDA_BATCHED_EXPERTS=0 (serial diagnostic path) supports only \
+                 Q4_0 experts; this artifact's gate_up is {:?}",
+                moe.gate_up_exps.format
+            )));
+        }
         // The page-locked tier resolves its own records inside the ROUTED miss
         // path, so skip this pre-pass when both are active: mapping every miss
         // here as well would fault the same bytes in twice. The serial
@@ -8499,23 +8620,42 @@ impl Gemma4CudaResident {
 
         // --- Expert branch: quantize the shared input once (CPU), upload once. ---
         let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
-        let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
         let two_nff = 2 * moe.n_ff_exp;
         let nff = moe.n_ff_exp;
-        let gu_blocks = hidden / 32; // gate_up in_dim = hidden
+        let gu_fmt = moe.gate_up_exps.format;
+        let gu_blocks = hidden / 32; // gate_up in_dim = hidden, in Q8_0 blocks
         let down_blocks = nff / 32; // down in_dim = n_ff_exp
-        let gu_row_bytes = gu_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        let gu_row_bytes = hidden / gu_fmt.values_per_block() * gu_fmt.bytes_per_block();
         let down_row_bytes = down_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
 
-        // Upload the shared Q8_0 expert input (scales + concatenated i8 quants) once —
-        // every selected expert dots against the same activation. Device scratch is
-        // allocated locally (keeps the hot path `&self`; batch-1 GEMVs are launch-bound
-        // so the alloc cost is negligible next to the per-expert launch overhead).
-        let in_scales: Vec<f32> = cur_moe_q.iter().map(|b| b.scale).collect();
-        let mut in_quants = vec![0i8; gu_blocks * 32];
-        for (b, blk) in cur_moe_q.iter().enumerate() {
-            in_quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
-        }
+        // Upload the shared expert input once — every selected expert dots
+        // against the same activation. The quantization family follows the
+        // gate_up wire format: Q4_0 gate_up dots a Q8_0 activation (32-value
+        // blocks), Q2_K gate_up dots a Q8_K activation (256-value superblocks)
+        // — the SAME host quantizer the CPU lane's `SharedActivation` uses, so
+        // the CUDA GEMV consumes bit-identical staged inputs to the CPU oracle.
+        // Both layouts fit the resident scratch: `in_s` holds hidden/32 f32
+        // (Q8_K needs only hidden/256) and `in_q` holds exactly `hidden` i8.
+        let (in_scales, in_quants): (Vec<f32>, Vec<i8>) = match gu_fmt {
+            WireFormat::Q2K => {
+                let xq = quantize_q8_k_blocks(&cur_moe);
+                let scales: Vec<f32> = xq.iter().map(|b| b.d).collect();
+                let mut quants = vec![0i8; hidden];
+                for (b, blk) in xq.iter().enumerate() {
+                    quants[b * 256..(b + 1) * 256].copy_from_slice(&blk.qs);
+                }
+                (scales, quants)
+            }
+            _ => {
+                let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
+                let scales: Vec<f32> = cur_moe_q.iter().map(|b| b.scale).collect();
+                let mut quants = vec![0i8; gu_blocks * 32];
+                for (b, blk) in cur_moe_q.iter().enumerate() {
+                    quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+                }
+                (scales, quants)
+            }
+        };
         // Per-layer scratch is RESIDENT, not allocated per call. Measured on the
         // tracked box with a 95.9%-hit route (i.e. transfers almost entirely
         // removed), the expert loop still spent 26.7 ms/token in
@@ -8539,8 +8679,14 @@ impl Gemma4CudaResident {
             geglu_s: d_geglu_s,
             y_all: d_y_all,
         } = &mut *scratch;
-        s.memcpy_htod(&in_scales, d_in_s).map_err(cu)?;
-        s.memcpy_htod(&in_quants, d_in_q).map_err(cu)?;
+        // Exact-length views: the Q8_K layout fills only a prefix of the scale
+        // scratch (hidden/256 f32 vs the Q8_0 layout's hidden/32).
+        {
+            let mut in_s_view = d_in_s.slice_mut(0..in_scales.len());
+            s.memcpy_htod(&in_scales, &mut in_s_view).map_err(cu)?;
+            let mut in_q_view = d_in_q.slice_mut(0..in_quants.len());
+            s.memcpy_htod(&in_quants, &mut in_q_view).map_err(cu)?;
+        }
         // M3/M4 on-device MoE accumulator: every selected expert (hit OR uploaded-miss)
         // folds its weighted down-GEMV output straight into this device buffer (one
         // scaled_axpy launch each). In M4 the buffer is RETURNED to the caller and
