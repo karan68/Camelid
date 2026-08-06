@@ -18999,6 +18999,28 @@ impl Lfm2MetalDecode {
         let q_dim = c.n_heads * c.head_dim;
         let kv_dim = c.n_kv_heads * c.head_dim;
 
+        // Tiled simdgroup-matrix GEMM for the prefill projections. The batched GEMV
+        // re-reads every weight block once per 8 columns; `q8_0_block_wire_mm` reads
+        // it once per 128 and stages both operands in threadgroup memory. It is NOT
+        // bit-identical to the GEMV (half operand staging + tile-MMA accumulation
+        // order), so it is gated and the greedy-parity fixtures are what admit it.
+        let mm_ok = crate::runnable::lfm2_prefill_mm_enabled()
+            && [3 * c.hidden, c.hidden, q_dim, kv_dim, c.ffn_dim]
+                .iter()
+                .all(|r| r.is_multiple_of(2 * PREFILL_MM_ROW_TILE))
+            && [c.hidden, q_dim, c.ffn_dim]
+                .iter()
+                .all(|w| w.is_multiple_of(32))
+            && threadgroup_alloc_fits(&k.device, PREFILL_MM_THREADGROUP_BYTES);
+        // The kernel's direct device loads read whole 128-token tiles, so the half
+        // activation panels are padded up to a tile. Padding rows only feed output
+        // columns past `n_rows_in`, which are never stored.
+        let pad = if mm_ok {
+            n_tokens.next_multiple_of(PREFILL_MM_TOKEN_TILE)
+        } else {
+            n_tokens
+        };
+
         let big_a = pool_get(k, (n_tokens * c.hidden * 4) as u64);
         let big_b = pool_get(k, (n_tokens * c.hidden * 4) as u64);
         write_buffer_f32(&big_a, embeddings);
@@ -19020,6 +19042,77 @@ impl Lfm2MetalDecode {
             *(p as *mut u32) = c.hidden as u32;
             *(p.add(4) as *mut f32) = c.eps;
         }
+
+        // Half staging panels, one per contraction width the prefill uses. Zeroed so
+        // the padding tail is defined rather than whatever the pool handed back.
+        let (half_hidden, half_ffn, stage_counts) = if mm_ok {
+            let hh = pool_get(k, (pad * c.hidden * 2) as u64);
+            let hf = pool_get(k, (pad * c.ffn_dim * 2) as u64);
+            let counts = pool_get(k, 8);
+            unsafe {
+                std::ptr::write_bytes(hh.contents() as *mut u8, 0, pad * c.hidden * 2);
+                std::ptr::write_bytes(hf.contents() as *mut u8, 0, pad * c.ffn_dim * 2);
+                let p = counts.contents() as *mut u32;
+                *p = (n_tokens * c.hidden) as u32;
+                *p.add(1) = (n_tokens * c.ffn_dim) as u32;
+            }
+            (Some(hh), Some(hf), Some(counts))
+        } else {
+            (None, None, None)
+        };
+
+        // One projection. Uses the tiled MM when admitted, else the bit-exact batched
+        // GEMV. `in_width` selects which half panel stages the activation.
+        let gemm = |e: &metal::ComputeCommandEncoderRef,
+                    keep: &mut Vec<Buffer>,
+                    y: &Buffer,
+                    w: &ResidentLinearWeight,
+                    out: &Buffer,
+                    scalar: &Buffer,
+                    in_width: usize,
+                    rows: usize| {
+            if !mm_ok || w.format != ResidentWeightFormat::Q8_0 || !w.q8_wire {
+                encode_resident_matmul_f32(e, k, keep, y, w, out, scalar, in_width, rows, n_tokens);
+                return;
+            }
+            let (panel, count_off) = if in_width == c.ffn_dim {
+                (half_ffn.as_ref().expect("ffn panel"), 4u64)
+            } else {
+                (half_hidden.as_ref().expect("hidden panel"), 0u64)
+            };
+            let counts = stage_counts.as_ref().expect("stage counts");
+            e.set_compute_pipeline_state(&k.f32_to_f16_pipeline);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(1, Some(panel), 0);
+            e.set_buffer(2, Some(counts), count_off);
+            dispatch_1d(e, &k.f32_to_f16_pipeline, n_tokens * in_width);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = (in_width / 32) as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            e.set_compute_pipeline_state(&k.q8_0_block_wire_mm_pipeline);
+            e.set_buffer(0, Some(panel), 0);
+            e.set_buffer(2, Some(&w.buffer), 0);
+            e.set_buffer(3, Some(out), 0);
+            e.set_buffer(4, Some(scalar), 0);
+            e.set_buffer(5, Some(scalar), 4);
+            e.set_buffer(6, Some(scalar), 8);
+            e.set_threadgroup_memory_length(0, PREFILL_MM_THREADGROUP_BYTES as u64);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (rows / PREFILL_MM_ROW_TILE) as u64,
+                    height: (n_tokens as u64).div_ceil(PREFILL_MM_TOKEN_TILE as u64),
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        };
 
         for layer in &self.layers {
             // ---- mixer ----
@@ -19053,9 +19146,8 @@ impl Lfm2MetalDecode {
                         *s.add(1) = c.l_cache as u32;
                         *s.add(2) = n_tokens as u32;
                     }
-                    encode_resident_matmul_f32(
+                    gemm(
                         e,
-                        k,
                         &mut keep,
                         &normed,
                         in_proj,
@@ -19063,7 +19155,6 @@ impl Lfm2MetalDecode {
                         &in_mm,
                         c.hidden,
                         3 * c.hidden,
-                        n_tokens,
                     );
                     e.set_compute_pipeline_state(&k.lfm2_shortconv_batch_pipeline);
                     e.set_buffer(0, Some(&bcx), 0);
@@ -19093,9 +19184,8 @@ impl Lfm2MetalDecode {
                     e.set_buffer(3, Some(&conv_scalar), 4);
                     e.set_buffer(4, Some(&conv_scalar), 8);
                     dispatch_1d(e, &k.lfm2_shortconv_state_update_pipeline, c.hidden);
-                    encode_resident_matmul_f32(
-                        e, k, &mut keep, &mixed, out_proj, &mix, &out_mm, c.hidden, c.hidden,
-                        n_tokens,
+                    gemm(
+                        e, &mut keep, &mixed, out_proj, &mix, &out_mm, c.hidden, c.hidden,
                     );
                     keep.extend([bcx, mixed, in_mm, out_mm, conv_scalar]);
                 }
@@ -19125,15 +19215,9 @@ impl Lfm2MetalDecode {
                         *(n.add(8) as *mut u32) = 1;
                         *(mirror_flag.contents() as *mut u32) = 0;
                     }
-                    encode_resident_matmul_f32(
-                        e, k, &mut keep, &normed, qw, &query, &q_mm, c.hidden, q_dim, n_tokens,
-                    );
-                    encode_resident_matmul_f32(
-                        e, k, &mut keep, &normed, kw, &key, &kv_mm, c.hidden, kv_dim, n_tokens,
-                    );
-                    encode_resident_matmul_f32(
-                        e, k, &mut keep, &normed, vw, &value, &kv_mm, c.hidden, kv_dim, n_tokens,
-                    );
+                    gemm(e, &mut keep, &normed, qw, &query, &q_mm, c.hidden, q_dim);
+                    gemm(e, &mut keep, &normed, kw, &key, &kv_mm, c.hidden, kv_dim);
+                    gemm(e, &mut keep, &normed, vw, &value, &kv_mm, c.hidden, kv_dim);
                     // Per row from here: RoPE angle, cache slot and causal span all
                     // differ by position.
                     for i in 0..n_tokens {
@@ -19241,9 +19325,7 @@ impl Lfm2MetalDecode {
                         );
                         keep.extend([q_rope, k_rope, scatter_scalar, attn_scalar, scores]);
                     }
-                    encode_resident_matmul_f32(
-                        e, k, &mut keep, &context, ow, &mix, &o_mm, q_dim, c.hidden, n_tokens,
-                    );
+                    gemm(e, &mut keep, &context, ow, &mix, &o_mm, q_dim, c.hidden);
                     keep.extend([
                         query,
                         key,
@@ -19289,9 +19371,8 @@ impl Lfm2MetalDecode {
                 &norm_scalar,
                 n_tokens,
             );
-            encode_resident_matmul_f32(
+            gemm(
                 e,
-                k,
                 &mut keep,
                 &fnormed,
                 &layer.ffn_gate,
@@ -19299,11 +19380,9 @@ impl Lfm2MetalDecode {
                 &hidden_mm,
                 c.hidden,
                 c.ffn_dim,
-                n_tokens,
             );
-            encode_resident_matmul_f32(
+            gemm(
                 e,
-                k,
                 &mut keep,
                 &fnormed,
                 &layer.ffn_up,
@@ -19311,7 +19390,6 @@ impl Lfm2MetalDecode {
                 &hidden_mm,
                 c.hidden,
                 c.ffn_dim,
-                n_tokens,
             );
             encode_binary(
                 e,
@@ -19322,9 +19400,8 @@ impl Lfm2MetalDecode {
                 &n_ffn,
                 n_tokens * c.ffn_dim,
             );
-            encode_resident_matmul_f32(
+            gemm(
                 e,
-                k,
                 &mut keep,
                 &act,
                 &layer.ffn_down,
@@ -19332,7 +19409,6 @@ impl Lfm2MetalDecode {
                 &down_mm,
                 c.ffn_dim,
                 c.hidden,
-                n_tokens,
             );
             encode_binary(
                 e,

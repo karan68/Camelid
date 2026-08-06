@@ -3952,6 +3952,16 @@ fn lfm2_metal_context_capacity() -> usize {
 /// Positions per prefill command buffer. The batched Q8 GEMV tiles 8 columns per
 /// weight pass, so anything >= 8 amortises weight streaming; 64 keeps scratch small
 /// (~2.75 MB at this model's FFN width).
+/// Tiled simdgroup-matrix GEMM for LFM2 prefill projections. Default ON; opt out
+/// with `CAMELID_LFM2_PREFILL_MM=0` to force the bit-exact batched GEMV.
+#[cfg(target_os = "macos")]
+pub(crate) fn lfm2_prefill_mm_enabled() -> bool {
+    !std::env::var("CAMELID_LFM2_PREFILL_MM").is_ok_and(|v| {
+        let v = v.trim();
+        v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn lfm2_metal_prefill_chunk() -> usize {
     std::env::var("CAMELID_LFM2_METAL_PREFILL_CHUNK")
