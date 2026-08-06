@@ -18475,6 +18475,789 @@ fn encode_qwen35_ffn(
     ]);
 }
 
+// ===================================================================================
+// LFM2 / LFM2.5 — GPU-resident Metal decode graph.
+//
+// Structurally the qwen35 hybrid engine with a different mixer: every layer wears the
+// same pre-norm 2-norm block (attn_norm -> mixer -> residual -> ffn_norm -> SwiGLU ->
+// residual), and each layer is EITHER a short convolution or GQA attention. Putting the
+// per-layer state inside the kind variant is what gives sparse KV for free: LFM2.5-2.6B
+// attends on only 8 of 30 layers, and the 22 conv layers simply have no cache buffers.
+//
+// LFM2's attention differs from qwen35's in exactly two ways, both by SUBTRACTION: there
+// is no fused query+gate projection (so no deinterleave) and no sigmoid output gate.
+// ===================================================================================
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(crate) struct Lfm2MetalConfig {
+    pub hidden: usize,
+    pub ffn_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    /// Short-conv kernel width (`lfm2.shortconv.l_cache`, 3). The rolling per-channel
+    /// state is `l_cache - 1` columns wide.
+    pub l_cache: usize,
+    pub vocab: usize,
+    pub eps: f32,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) enum Lfm2MetalLayerKindInput<'a> {
+    Attn {
+        q: ResidentWeightBytes<'a>,
+        k: ResidentWeightBytes<'a>,
+        v: ResidentWeightBytes<'a>,
+        output: ResidentWeightBytes<'a>,
+        q_norm: &'a [f32],
+        k_norm: &'a [f32],
+    },
+    Conv {
+        /// `shortconv.in_proj`: hidden -> 3 * hidden, laid out [B | C | X].
+        in_proj: ResidentWeightBytes<'a>,
+        out_proj: ResidentWeightBytes<'a>,
+        /// `shortconv.conv.weight`, channel-major `[hidden, l_cache]` flattened as
+        /// `conv[c * l_cache + tap]`.
+        conv: &'a [f32],
+    },
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct Lfm2MetalLayerInput<'a> {
+    pub attn_norm: &'a [f32],
+    pub ffn_norm: &'a [f32],
+    pub ffn_gate: ResidentWeightBytes<'a>,
+    pub ffn_up: ResidentWeightBytes<'a>,
+    pub ffn_down: ResidentWeightBytes<'a>,
+    pub kind: Lfm2MetalLayerKindInput<'a>,
+}
+
+#[cfg(target_os = "macos")]
+enum Lfm2MetalLayerKind {
+    Attn {
+        q: ResidentLinearWeight,
+        k: ResidentLinearWeight,
+        v: ResidentLinearWeight,
+        output: ResidentLinearWeight,
+        q_norm: Buffer,
+        k_norm: Buffer,
+        cache_k: Buffer,
+        cache_v: Buffer,
+    },
+    Conv {
+        in_proj: ResidentLinearWeight,
+        out_proj: ResidentLinearWeight,
+        conv: Buffer,
+        conv_state: Buffer,
+    },
+}
+
+#[cfg(target_os = "macos")]
+struct Lfm2MetalLayer {
+    attn_norm: Buffer,
+    ffn_norm: Buffer,
+    ffn_gate: ResidentLinearWeight,
+    ffn_up: ResidentLinearWeight,
+    ffn_down: ResidentLinearWeight,
+    kind: Lfm2MetalLayerKind,
+}
+
+/// Complete LFM2 token graph resident on Metal.
+#[cfg(target_os = "macos")]
+pub(crate) struct Lfm2MetalDecode {
+    config: Lfm2MetalConfig,
+    max_positions: usize,
+    layers: Vec<Lfm2MetalLayer>,
+    final_norm: Buffer,
+    output: ResidentLinearWeight,
+    hidden_a: Buffer,
+    hidden_b: Buffer,
+    filled: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl Lfm2MetalDecode {
+    pub(crate) fn new(
+        config: Lfm2MetalConfig,
+        inputs: &[Lfm2MetalLayerInput<'_>],
+        final_norm: &[f32],
+        output: ResidentWeightBytes<'_>,
+        max_positions: usize,
+    ) -> Option<Self> {
+        // Every guard returns None — a partially built engine must never exist,
+        // because the caller's fallback is a full CPU replay.
+        if config.hidden == 0
+            || !config.hidden.is_multiple_of(32)
+            || config.ffn_dim == 0
+            || config.head_dim == 0
+            || config.head_dim > 128
+            || !config.head_dim.is_multiple_of(2)
+            || config.rope_dim == 0
+            || config.rope_dim > config.head_dim
+            || !config.rope_dim.is_multiple_of(2)
+            || config.n_heads == 0
+            || config.n_kv_heads == 0
+            || !config.n_heads.is_multiple_of(config.n_kv_heads)
+            || config.n_heads * config.head_dim != config.hidden
+            || config.l_cache < 2
+            || config.vocab == 0
+            || final_norm.len() != config.hidden
+            || max_positions == 0
+            || !output.matches_shape(config.hidden, config.vocab)
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        let mut cache = metal_linear_cache().lock().ok()?;
+        let mut layers = Vec::with_capacity(inputs.len());
+        let mut attention_layers = 0usize;
+        for input in inputs {
+            if input.attn_norm.len() != config.hidden
+                || input.ffn_norm.len() != config.hidden
+                || !input.ffn_gate.matches_shape(config.hidden, config.ffn_dim)
+                || !input.ffn_up.matches_shape(config.hidden, config.ffn_dim)
+                || !input.ffn_down.matches_shape(config.ffn_dim, config.hidden)
+            {
+                return None;
+            }
+            let ffn_gate = resolve_resident_weight(&mut cache, &k.device, &input.ffn_gate, true)?;
+            let ffn_up = resolve_resident_weight(&mut cache, &k.device, &input.ffn_up, true)?;
+            let ffn_down = resolve_resident_weight(&mut cache, &k.device, &input.ffn_down, true)?;
+            let kind = match &input.kind {
+                Lfm2MetalLayerKindInput::Attn {
+                    q,
+                    k: kw,
+                    v,
+                    output,
+                    q_norm,
+                    k_norm,
+                } => {
+                    let q_dim = config.n_heads * config.head_dim;
+                    let kv_dim = config.n_kv_heads * config.head_dim;
+                    if q_norm.len() != config.head_dim
+                        || k_norm.len() != config.head_dim
+                        || !q.matches_shape(config.hidden, q_dim)
+                        || !kw.matches_shape(config.hidden, kv_dim)
+                        || !v.matches_shape(config.hidden, kv_dim)
+                        || !output.matches_shape(q_dim, config.hidden)
+                    {
+                        return None;
+                    }
+                    attention_layers += 1;
+                    Lfm2MetalLayerKind::Attn {
+                        q: resolve_resident_weight(&mut cache, &k.device, q, true)?,
+                        k: resolve_resident_weight(&mut cache, &k.device, kw, true)?,
+                        v: resolve_resident_weight(&mut cache, &k.device, v, true)?,
+                        output: resolve_resident_weight(&mut cache, &k.device, output, true)?,
+                        q_norm: qwen35_f32_buffer(k, q_norm),
+                        k_norm: qwen35_f32_buffer(k, k_norm),
+                        cache_k: qwen35_zero_buffer(
+                            k,
+                            config.n_kv_heads * max_positions * config.head_dim * 4,
+                        ),
+                        cache_v: qwen35_zero_buffer(
+                            k,
+                            config.n_kv_heads * max_positions * config.head_dim * 4,
+                        ),
+                    }
+                }
+                Lfm2MetalLayerKindInput::Conv {
+                    in_proj,
+                    out_proj,
+                    conv,
+                } => {
+                    if conv.len() != config.hidden * config.l_cache
+                        || !in_proj.matches_shape(config.hidden, 3 * config.hidden)
+                        || !out_proj.matches_shape(config.hidden, config.hidden)
+                    {
+                        return None;
+                    }
+                    Lfm2MetalLayerKind::Conv {
+                        in_proj: resolve_resident_weight(&mut cache, &k.device, in_proj, true)?,
+                        out_proj: resolve_resident_weight(&mut cache, &k.device, out_proj, true)?,
+                        conv: qwen35_f32_buffer(k, conv),
+                        conv_state: qwen35_zero_buffer(k, config.hidden * (config.l_cache - 1) * 4),
+                    }
+                }
+            };
+            layers.push(Lfm2MetalLayer {
+                attn_norm: qwen35_f32_buffer(k, input.attn_norm),
+                ffn_norm: qwen35_f32_buffer(k, input.ffn_norm),
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                kind,
+            });
+        }
+        // A schedule with no attention layer would leave RoPE and the KV cache
+        // meaningless; refuse rather than build a graph that cannot attend.
+        if layers.is_empty() || attention_layers == 0 {
+            return None;
+        }
+        let final_norm = qwen35_f32_buffer(k, final_norm);
+        let output = resolve_resident_weight(&mut cache, &k.device, &output, true)?;
+        let hidden_a = qwen35_zero_buffer(k, config.hidden * 4);
+        let hidden_b = qwen35_zero_buffer(k, config.hidden * 4);
+        Some(Self {
+            config,
+            max_positions,
+            layers,
+            final_norm,
+            output,
+            hidden_a,
+            hidden_b,
+            filled: 0,
+        })
+    }
+
+    /// Clear every per-sequence buffer: the KV caches on attention layers and the
+    /// rolling conv ring on conv layers. The ring MUST be zeroed — a stale window
+    /// silently corrupts the first `l_cache - 1` positions of the next request.
+    pub(crate) fn reset(&mut self) {
+        // SAFETY: every buffer here is StorageModeShared and owned by this engine,
+        // and `reset` is only reachable with no command buffer in flight.
+        let wipe = |b: &Buffer| unsafe {
+            std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize);
+        };
+        for layer in &self.layers {
+            match &layer.kind {
+                Lfm2MetalLayerKind::Attn {
+                    cache_k, cache_v, ..
+                } => {
+                    wipe(cache_k);
+                    wipe(cache_v);
+                }
+                Lfm2MetalLayerKind::Conv { conv_state, .. } => wipe(conv_state),
+            }
+        }
+        self.filled = 0;
+    }
+
+    /// One token through the whole resident stack. `position` must equal the number of
+    /// positions already consumed — the conv ring is order-dependent, so a skipped or
+    /// replayed position silently corrupts the state rather than erroring.
+    fn forward_select(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        selection: Qwen35MetalSelection,
+    ) -> Option<Qwen35MetalStep> {
+        let c = self.config;
+        if embedding.len() != c.hidden
+            || cos.len() != c.rope_dim / 2
+            || sin.len() != c.rope_dim / 2
+            || position != self.filled
+            || position >= self.max_positions
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        write_buffer_f32(&self.hidden_a, embedding);
+        let cos_buf = qwen35_f32_buffer(k, cos);
+        let sin_buf = qwen35_f32_buffer(k, sin);
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = vec![cos_buf.to_owned(), sin_buf.to_owned()];
+        for layer in &self.layers {
+            match &layer.kind {
+                Lfm2MetalLayerKind::Attn { .. } => encode_lfm2_attn_layer(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.hidden_a,
+                    &self.hidden_b,
+                    layer,
+                    &cos_buf,
+                    &sin_buf,
+                    c,
+                    self.max_positions,
+                    position,
+                ),
+                Lfm2MetalLayerKind::Conv { .. } => encode_lfm2_conv_layer(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.hidden_a,
+                    &self.hidden_b,
+                    layer,
+                    c,
+                ),
+            }
+            encode_lfm2_ffn(e, k, &mut keep, &self.hidden_b, &self.hidden_a, layer, c);
+        }
+
+        let normed = pool_get(k, (c.hidden * 4) as u64);
+        let norm_scalar = pool_get(k, 8);
+        let logits = pool_get(k, (c.vocab * 4) as u64);
+        let mm_scalar = pool_get(k, 12);
+        unsafe {
+            let p = norm_scalar.contents() as *mut u8;
+            *(p as *mut u32) = c.hidden as u32;
+            *(p.add(4) as *mut f32) = c.eps;
+        }
+        encode_rms_norm_f32(
+            e,
+            k,
+            &self.hidden_a,
+            &self.final_norm,
+            &normed,
+            &norm_scalar,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &normed,
+            &self.output,
+            &logits,
+            &mm_scalar,
+            c.hidden,
+            c.vocab,
+            1,
+        );
+        let greedy_buffers = if matches!(selection, Qwen35MetalSelection::Greedy) {
+            let selected = pool_get(k, 4);
+            let vocab_scalar = pool_get(k, 4);
+            unsafe { *(vocab_scalar.contents() as *mut u32) = c.vocab as u32 };
+            e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+            e.set_buffer(0, Some(&logits), 0);
+            e.set_buffer(1, Some(&selected), 0);
+            e.set_buffer(2, Some(&vocab_scalar), 0);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Some((selected, vocab_scalar))
+        } else {
+            None
+        };
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let output = match &greedy_buffers {
+            Some((selected, _)) => {
+                Qwen35MetalStep::Token(unsafe { *(selected.contents() as *const u32) })
+            }
+            None => {
+                let values = unsafe {
+                    std::slice::from_raw_parts(logits.contents() as *const f32, c.vocab).to_vec()
+                };
+                Qwen35MetalStep::Logits(values)
+            }
+        };
+        keep.extend([normed, norm_scalar, logits, mm_scalar]);
+        if let Some((selected, vocab_scalar)) = greedy_buffers {
+            keep.extend([selected, vocab_scalar]);
+        }
+        pool_recycle(k, keep);
+        self.filled += 1;
+        Some(output)
+    }
+
+    /// Advance one position and return the greedy token id.
+    pub(crate) fn step_greedy(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+    ) -> Option<u32> {
+        match self.forward_select(embedding, cos, sin, position, Qwen35MetalSelection::Greedy)? {
+            Qwen35MetalStep::Token(t) => Some(t),
+            Qwen35MetalStep::Logits(_) => None,
+        }
+    }
+
+    /// Advance one position and return the full logits row (for sampled requests).
+    pub(crate) fn step_logits(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+    ) -> Option<Vec<f32>> {
+        match self.forward_select(embedding, cos, sin, position, Qwen35MetalSelection::Logits)? {
+            Qwen35MetalStep::Logits(v) => Some(v),
+            Qwen35MetalStep::Token(_) => None,
+        }
+    }
+}
+
+/// LFM2 short-convolution layer: attn_norm -> in_proj -> shortconv -> out_proj -> residual.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_lfm2_conv_layer(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Lfm2MetalLayer,
+    c: Lfm2MetalConfig,
+) {
+    let Lfm2MetalLayerKind::Conv {
+        in_proj,
+        out_proj,
+        conv,
+        conv_state,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let bcx = pool_get(k, (3 * c.hidden * 4) as u64);
+    let mixed = pool_get(k, (c.hidden * 4) as u64);
+    let mix = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let in_mm = pool_get(k, 12);
+    let out_mm = pool_get(k, 12);
+    let conv_scalar = pool_get(k, 8);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        let s = conv_scalar.contents() as *mut u32;
+        *s = c.hidden as u32;
+        *s.add(1) = c.l_cache as u32;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.attn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        in_proj,
+        &bcx,
+        &in_mm,
+        c.hidden,
+        3 * c.hidden,
+        1,
+    );
+    e.set_compute_pipeline_state(&k.lfm2_shortconv_pipeline);
+    e.set_buffer(0, Some(&bcx), 0);
+    e.set_buffer(1, Some(conv), 0);
+    e.set_buffer(2, Some(conv_state), 0);
+    e.set_buffer(3, Some(&mixed), 0);
+    e.set_buffer(4, Some(&conv_scalar), 0);
+    e.set_buffer(5, Some(&conv_scalar), 4);
+    dispatch_1d(e, &k.lfm2_shortconv_pipeline, c.hidden);
+    encode_resident_matmul_f32(
+        e, k, keep, &mixed, out_proj, &mix, &out_mm, c.hidden, c.hidden, 1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        bcx,
+        mixed,
+        mix,
+        norm_scalar,
+        in_mm,
+        out_mm,
+        conv_scalar,
+        n_hidden,
+    ]);
+}
+
+/// LFM2 GQA attention layer. `encode_qwen35_full_layer` minus the fused query+gate
+/// projection (LFM2's `attn_q` is plain `hidden -> q_dim`) and minus the sigmoid output
+/// gate. QK-norm runs BEFORE RoPE, per llama.cpp `src/models/lfm2.cpp` build_attn_block.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_lfm2_attn_layer(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Lfm2MetalLayer,
+    cos: &Buffer,
+    sin: &Buffer,
+    c: Lfm2MetalConfig,
+    max_positions: usize,
+    position: usize,
+) {
+    let Lfm2MetalLayerKind::Attn {
+        q: q_weight,
+        k: k_weight,
+        v: v_weight,
+        output: o_weight,
+        q_norm,
+        k_norm,
+        cache_k,
+        cache_v,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let q_dim = c.n_heads * c.head_dim;
+    let kv_dim = c.n_kv_heads * c.head_dim;
+    let filled = position + 1;
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let query = pool_get(k, (q_dim * 4) as u64);
+    let key = pool_get(k, (kv_dim * 4) as u64);
+    let value = pool_get(k, (kv_dim * 4) as u64);
+    let scores = pool_get(k, (c.n_heads * filled * 4) as u64);
+    let context = pool_get(k, (q_dim * 4) as u64);
+    let mix = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let q_mm = pool_get(k, 12);
+    let kv_mm = pool_get(k, 12);
+    let o_mm = pool_get(k, 12);
+    let qk_norm_scalar = pool_get(k, 12);
+    let q_rope = pool_get(k, 16);
+    let k_rope = pool_get(k, 16);
+    let scatter_scalar = pool_get(k, 16);
+    let mirror_flag = pool_get(k, 4);
+    let attn_scalar = pool_get(k, 32);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        let n = qk_norm_scalar.contents() as *mut u8;
+        *(n as *mut u32) = c.head_dim as u32;
+        *(n.add(4) as *mut f32) = c.eps;
+        *(n.add(8) as *mut u32) = 1;
+        let set_rope = |buffer: &Buffer, heads: usize| {
+            let r = buffer.contents() as *mut u32;
+            *r = heads as u32;
+            *r.add(1) = c.head_dim as u32;
+            *r.add(2) = (c.rope_dim / 2) as u32;
+            // pairing = 1 => NEOX split-half, which llama.cpp assigns LLM_ARCH_LFM2.
+            *r.add(3) = 1;
+        };
+        set_rope(&q_rope, c.n_heads);
+        set_rope(&k_rope, c.n_kv_heads);
+        let sc = scatter_scalar.contents() as *mut u32;
+        *sc = c.head_dim as u32;
+        *sc.add(1) = max_positions as u32;
+        *sc.add(2) = position as u32;
+        *sc.add(3) = kv_dim as u32;
+        *(mirror_flag.contents() as *mut u32) = 0;
+        let a = attn_scalar.contents() as *mut u8;
+        *(a as *mut u32) = c.n_heads as u32;
+        *(a.add(4) as *mut u32) = c.head_dim as u32;
+        *(a.add(8) as *mut u32) = filled as u32;
+        *(a.add(12) as *mut u32) = (c.n_heads / c.n_kv_heads) as u32;
+        *(a.add(16) as *mut f32) = 1.0 / (c.head_dim as f32).sqrt();
+        *(a.add(20) as *mut u32) = c.head_dim as u32;
+        *(a.add(24) as *mut u32) = (max_positions * c.head_dim) as u32;
+        *(a.add(28) as *mut u32) = 0;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.attn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, q_weight, &query, &q_mm, c.hidden, q_dim, 1,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, k_weight, &key, &kv_mm, c.hidden, kv_dim, 1,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, v_weight, &value, &kv_mm, c.hidden, kv_dim, 1,
+    );
+    encode_rms_norm_per_head(e, k, &query, q_norm, &query, &qk_norm_scalar, c.n_heads, 0);
+    encode_rms_norm_per_head(e, k, &key, k_norm, &key, &qk_norm_scalar, c.n_kv_heads, 0);
+    encode_rope(
+        e,
+        k,
+        &query,
+        cos,
+        sin,
+        &q_rope,
+        c.n_heads,
+        c.rope_dim / 2,
+        0,
+        0,
+    );
+    encode_rope(
+        e,
+        k,
+        &key,
+        cos,
+        sin,
+        &k_rope,
+        c.n_kv_heads,
+        c.rope_dim / 2,
+        0,
+        0,
+    );
+    e.set_compute_pipeline_state(&k.kv_scatter_pipeline);
+    e.set_buffer(0, Some(&key), 0);
+    e.set_buffer(1, Some(&value), 0);
+    e.set_buffer(2, Some(cache_k), 0);
+    e.set_buffer(3, Some(cache_v), 0);
+    e.set_buffer(4, Some(&scatter_scalar), 0);
+    e.set_buffer(5, Some(&scatter_scalar), 4);
+    e.set_buffer(6, Some(&scatter_scalar), 8);
+    e.set_buffer(7, Some(&scatter_scalar), 12);
+    e.set_buffer(8, Some(&scatter_scalar), 0);
+    e.set_buffer(9, Some(&scatter_scalar), 0);
+    e.set_buffer(10, Some(&mirror_flag), 0);
+    dispatch_1d(e, &k.kv_scatter_pipeline, kv_dim);
+    encode_attention(
+        e,
+        k,
+        keep,
+        &query,
+        cache_k,
+        cache_v,
+        None,
+        &scores,
+        &context,
+        &attn_scalar,
+        c.n_heads,
+        c.n_kv_heads,
+        c.head_dim,
+        filled,
+        0,
+        0,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &context, o_weight, &mix, &o_mm, q_dim, c.hidden, 1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        query,
+        key,
+        value,
+        scores,
+        context,
+        mix,
+        norm_scalar,
+        q_mm,
+        kv_mm,
+        o_mm,
+        qk_norm_scalar,
+        q_rope,
+        k_rope,
+        scatter_scalar,
+        mirror_flag,
+        attn_scalar,
+        n_hidden,
+    ]);
+}
+
+/// LFM2 SwiGLU FFN — `encode_qwen35_ffn` with `post_attn_norm` renamed to `ffn_norm`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_lfm2_ffn(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Lfm2MetalLayer,
+    c: Lfm2MetalConfig,
+) {
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let gate = pool_get(k, (c.ffn_dim * 4) as u64);
+    let up = pool_get(k, (c.ffn_dim * 4) as u64);
+    let act = pool_get(k, (c.ffn_dim * 4) as u64);
+    let down = pool_get(k, (c.hidden * 4) as u64);
+    let hidden_mm = pool_get(k, 12);
+    let down_mm = pool_get(k, 12);
+    let n_ffn = pool_get(k, 4);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        *(n_ffn.contents() as *mut u32) = c.ffn_dim as u32;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.ffn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        &layer.ffn_gate,
+        &gate,
+        &hidden_mm,
+        c.hidden,
+        c.ffn_dim,
+        1,
+    );
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        &layer.ffn_up,
+        &up,
+        &hidden_mm,
+        c.hidden,
+        c.ffn_dim,
+        1,
+    );
+    encode_binary(e, &k.silu_mul_pipeline, &gate, &up, &act, &n_ffn, c.ffn_dim);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &act,
+        &layer.ffn_down,
+        &down,
+        &down_mm,
+        c.ffn_dim,
+        c.hidden,
+        1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &down,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        norm_scalar,
+        gate,
+        up,
+        act,
+        down,
+        hidden_mm,
+        down_mm,
+        n_ffn,
+        n_hidden,
+    ]);
+}
+
 /// Hand out a scratch buffer of at least `bytes` from the recycle pool, or allocate a
 /// fresh one at the pool's power-of-two class size. Pool-derived buffers are owned by the
 /// per-token `keep` vec and MUST come back via `pool_recycle` only after the command
