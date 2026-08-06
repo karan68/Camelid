@@ -98,6 +98,12 @@ struct MetalLinearKernel {
     gelu_mul_pipeline: ComputePipelineState,
     qwen35_l2_norm_pipeline: ComputePipelineState,
     qwen35_conv1d_pipeline: ComputePipelineState,
+    /// LFM2 short-convolution mixer. Built unconditionally so the kernel is
+    /// compiled and parity-checked on every macOS build; the LFM2 Metal engine
+    /// that dispatches it in a real forward is not wired yet, so outside tests
+    /// nothing reads this field.
+    #[allow(dead_code)]
+    lfm2_shortconv_pipeline: ComputePipelineState,
     qwen35_delta_rule_pipeline: ComputePipelineState,
     qwen35_sigmoid_mul_pipeline: ComputePipelineState,
     qwen35_ssm_gates_pipeline: ComputePipelineState,
@@ -6582,6 +6588,54 @@ kernel void qwen35_conv1d(
     st[cm1 - 1] = x;
 }
 
+// LFM2 / LFM2.5 short-convolution mixer, one decode position.
+//
+// `bcx` is the `in_proj` output for this token: 3 * conv_dim floats laid out as
+// three contiguous chunks [B | C | X] (llama.cpp `src/models/lfm2.cpp`
+// build_shortconv_block views chunk 0 as b, 1 as c, 2 as x).
+//
+// Per channel c:
+//   bx      = B[c] * X[c]                                  the new time column
+//   acc     = SUM_t w[t] * window[t]                       causal depthwise conv1d,
+//                                                          window = [state.., bx],
+//                                                          oldest column at tap 0
+//   out[c]  = C[c] * acc                                   the C gate
+//   state  <- slide left, append bx
+//
+// Deliberately NOT `qwen35_conv1d`: that kernel applies SiLU to the accumulator
+// (`acc/(1+exp(-acc))`), which LFM2 must not — `ggml_ssm_conv` applies no
+// activation, and LFM2 gates by C instead. The weight/state indexing below is
+// otherwise identical, and matches the CPU reference in
+// src/runnable/model.rs (`forward_step_lfm2`) element for element.
+kernel void lfm2_shortconv(
+    device const float* bcx      [[buffer(0)]],
+    device const float* weights  [[buffer(1)]],
+    device float*       state    [[buffer(2)]],
+    device float*       output   [[buffer(3)]],
+    constant uint&      conv_dim [[buffer(4)]],
+    constant uint&      l_cache  [[buffer(5)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= conv_dim) return;
+    const uint cm1 = l_cache - 1;
+    device const float* w  = weights + ulong(c) * l_cache;
+    device float*       st = state   + ulong(c) * cm1;
+
+    const float b_v = bcx[c];
+    const float c_v = bcx[conv_dim + c];
+    const float x_v = bcx[2u * conv_dim + c];
+    const float bx  = b_v * x_v;
+
+    float acc = 0.0f;
+    for (uint t = 0; t < cm1; ++t) acc += w[t] * st[t];
+    acc += w[cm1] * bx;
+
+    output[c] = c_v * acc;
+
+    for (uint t = 0; t + 1 < cm1; ++t) st[t] = st[t + 1];
+    st[cm1 - 1] = bx;
+}
+
 kernel void qwen35_ssm_gates(
     device const float* beta_raw [[buffer(0)]],
     device const float* alpha_raw [[buffer(1)]],
@@ -6957,6 +7011,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let qwen35_conv1d_pipeline = device
                 .new_compute_pipeline_state_with_function(&qwen35_conv1d_function)
                 .ok()?;
+
+            let lfm2_shortconv_function = elementwise_library
+                .get_function("lfm2_shortconv", None)
+                .ok()?;
+            let lfm2_shortconv_pipeline = device
+                .new_compute_pipeline_state_with_function(&lfm2_shortconv_function)
+                .ok()?;
+
             let qwen35_delta_rule_function = elementwise_library
                 .get_function("qwen35_delta_rule", None)
                 .ok()?;
@@ -7608,6 +7670,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 gelu_mul_pipeline,
                 qwen35_l2_norm_pipeline,
                 qwen35_conv1d_pipeline,
+                lfm2_shortconv_pipeline,
                 qwen35_delta_rule_pipeline,
                 qwen35_sigmoid_mul_pipeline,
                 qwen35_ssm_gates_pipeline,
@@ -25084,6 +25147,173 @@ mod tests {
     /// Packed-wire correctness gate for all Prism text quant formats. This
     /// drives the production resident projection encoder for decode and batched
     /// prefill, comparing against the scalar decoders rather than another GPU
+    /// LFM2 short-conv kernel vs a literal transcription of the CPU reference in
+    /// `src/runnable/model.rs`'s `forward_step_lfm2`.
+    ///
+    /// Runs 8 SEQUENTIAL positions so the rolling ring actually rolls — a
+    /// single-position fixture passes even if the state is never read or never
+    /// advanced. Model-free, so CI defends this forever.
+    ///
+    /// Three non-vacuity guards, each aimed at a defect that is INVISIBLE to
+    /// token identity because it perturbs a recurrent state rather than a logit:
+    /// * zeroing C must zero the output — proves the C gate is applied.
+    /// * zeroing tap 0 must change the output only from position >= cm1 — proves
+    ///   the rolling ring is actually read.
+    /// * reversing the taps must change the output — proves tap ORDER, the single
+    ///   most likely silent-wrong-answer bug.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_lfm2_shortconv_matches_cpu_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal pipelines");
+        let device = &kernel.device;
+
+        const CONV_DIM: usize = 2048; // LFM2.5-2.6B n_embd
+        const L_CACHE: usize = 3;
+        const CM1: usize = L_CACHE - 1;
+        const STEPS: usize = 8;
+
+        // Deterministic, sign-varied, and NOT symmetric across taps.
+        let weights: Vec<f32> = (0..CONV_DIM * L_CACHE)
+            .map(|i| (((i * 31 + 7) % 97) as f32 - 48.0) * 0.015_625)
+            .collect();
+        let bcx: Vec<Vec<f32>> = (0..STEPS)
+            .map(|s| {
+                (0..3 * CONV_DIM)
+                    .map(|i| (((i * 17 + s * 53 + 3) % 89) as f32 - 44.0) * 0.031_25)
+                    .collect()
+            })
+            .collect();
+
+        // CPU reference: transcribed from `forward_step_lfm2`.
+        let cpu_run = |w: &[f32]| -> Vec<Vec<f32>> {
+            let mut st = vec![0.0f32; CONV_DIM * CM1];
+            let mut outs = Vec::new();
+            for step in bcx.iter().take(STEPS) {
+                let mut y = vec![0.0f32; CONV_DIM];
+                for c in 0..CONV_DIM {
+                    let bx = step[c] * step[2 * CONV_DIM + c];
+                    let kw = &w[c * L_CACHE..(c + 1) * L_CACHE];
+                    let s = &mut st[c * CM1..(c + 1) * CM1];
+                    let mut acc = 0.0f32;
+                    for (t, sv) in s.iter().enumerate() {
+                        acc += kw[t] * *sv;
+                    }
+                    acc += kw[CM1] * bx;
+                    y[c] = step[CONV_DIM + c] * acc;
+                    for t in 0..CM1 - 1 {
+                        s[t] = s[t + 1];
+                    }
+                    s[CM1 - 1] = bx;
+                }
+                outs.push(y);
+            }
+            outs
+        };
+
+        let f32_buf = |v: &[f32]| {
+            device.new_buffer_with_data(
+                v.as_ptr() as *const _,
+                (v.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let gpu_run = |w: &[f32], feed: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            let w_buf = f32_buf(w);
+            let state = f32_buf(&vec![0.0f32; CONV_DIM * CM1]);
+            let out_buf = f32_buf(&vec![0.0f32; CONV_DIM]);
+            let scalars = f32_buf(&[0.0f32, 0.0]);
+            unsafe {
+                let p = scalars.contents() as *mut u32;
+                *p = CONV_DIM as u32;
+                *p.add(1) = L_CACHE as u32;
+            }
+            let queue = device.new_command_queue();
+            let mut outs = Vec::new();
+            for step in feed.iter() {
+                let in_buf = f32_buf(step);
+                let cmd = queue.new_command_buffer();
+                let e = cmd.new_compute_command_encoder();
+                e.set_compute_pipeline_state(&kernel.lfm2_shortconv_pipeline);
+                e.set_buffer(0, Some(&in_buf), 0);
+                e.set_buffer(1, Some(&w_buf), 0);
+                e.set_buffer(2, Some(&state), 0);
+                e.set_buffer(3, Some(&out_buf), 0);
+                e.set_buffer(4, Some(&scalars), 0);
+                e.set_buffer(5, Some(&scalars), 4);
+                dispatch_1d(e, &kernel.lfm2_shortconv_pipeline, CONV_DIM);
+                e.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let mut got = vec![0.0f32; CONV_DIM];
+                read_buffer_f32(&out_buf, &mut got);
+                outs.push(got);
+            }
+            outs
+        };
+
+        let want = cpu_run(&weights);
+        let got = gpu_run(&weights, &bcx);
+        let mut max_abs = 0.0f32;
+        for (s, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                let d = (x - y).abs();
+                assert!(
+                    d < 1.0e-3,
+                    "step {s} channel {i}: cpu {x} vs gpu {y} (delta {d})"
+                );
+                max_abs = max_abs.max(d);
+            }
+        }
+        eprintln!("[lfm2_shortconv] {STEPS} positions, max_abs_diff={max_abs:.3e}");
+
+        // Guard 1: C == 0 must zero the output.
+        let zero_c: Vec<Vec<f32>> = bcx
+            .iter()
+            .map(|s| {
+                let mut v = s.clone();
+                for x in v[CONV_DIM..2 * CONV_DIM].iter_mut() {
+                    *x = 0.0;
+                }
+                v
+            })
+            .collect();
+        assert!(
+            gpu_run(&weights, &zero_c)
+                .iter()
+                .all(|row| row.iter().all(|v| *v == 0.0)),
+            "zeroing C must zero the output — the C gate is not being applied"
+        );
+
+        // Guard 2: zeroing tap 0 (the OLDEST cached column) must leave position 0
+        // untouched (its window is all-zero state) and change later positions.
+        let mut w_tap0 = weights.clone();
+        for c in 0..CONV_DIM {
+            w_tap0[c * L_CACHE] = 0.0;
+        }
+        let got_tap0 = gpu_run(&w_tap0, &bcx);
+        assert_eq!(
+            got_tap0[0], got[0],
+            "tap 0 multiplies only cached state, so position 0 must be unchanged"
+        );
+        assert!(
+            got_tap0[CM1] != got[CM1],
+            "zeroing tap 0 must change position {CM1} — the ring is not being read"
+        );
+
+        // Guard 3: reversing the taps must change the output.
+        let mut w_rev = weights.clone();
+        for c in 0..CONV_DIM {
+            w_rev[c * L_CACHE..(c + 1) * L_CACHE].reverse();
+        }
+        assert!(
+            gpu_run(&w_rev, &bcx)[STEPS - 1] != got[STEPS - 1],
+            "reversing the conv taps must change the output — tap ORDER is unverified"
+        );
+    }
+
     /// implementation.
     #[cfg(target_os = "macos")]
     #[test]
