@@ -104,6 +104,8 @@ struct MetalLinearKernel {
     /// nothing reads this field.
     #[allow(dead_code)]
     lfm2_shortconv_pipeline: ComputePipelineState,
+    lfm2_shortconv_batch_pipeline: ComputePipelineState,
+    lfm2_shortconv_state_update_pipeline: ComputePipelineState,
     qwen35_delta_rule_pipeline: ComputePipelineState,
     qwen35_sigmoid_mul_pipeline: ComputePipelineState,
     qwen35_ssm_gates_pipeline: ComputePipelineState,
@@ -6636,6 +6638,86 @@ kernel void lfm2_shortconv(
     st[cm1 - 1] = bx;
 }
 
+
+// Batched LFM2 short convolution over `n_tokens` consecutive positions.
+//
+// `bcx` is the in_proj output for the whole chunk, row-major: row t at
+// `t * 3 * conv_dim`, laid out [B | C | X] within the row. `state` holds the
+// `l_cache - 1` pre-conv columns that PRECEDE the chunk (oldest at index 0) and is
+// read-only here — `lfm2_shortconv_state_update` advances it afterwards, so every
+// token in the chunk sees the same starting window regardless of dispatch order.
+//
+// bx(p) = B[p][c] * X[p][c] for p >= 0, and state[c*cm1 + p + cm1] for p < 0.
+// out[t][c] = C[t][c] * SUM_tap w[c*l_cache + tap] * bx(t - cm1 + tap)
+//
+// Accumulation is ascending in tap, matching the single-token kernel and the CPU
+// reference, so a chunked prefill is bit-identical to the same positions decoded
+// one at a time.
+kernel void lfm2_shortconv_batch(
+    device const float* bcx      [[buffer(0)]],
+    device const float* weights  [[buffer(1)]],
+    device const float* state    [[buffer(2)]],
+    device float*       output   [[buffer(3)]],
+    constant uint&      conv_dim [[buffer(4)]],
+    constant uint&      l_cache  [[buffer(5)]],
+    constant uint&      n_tokens [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint c = gid.x;
+    const uint t = gid.y;
+    if (c >= conv_dim || t >= n_tokens) return;
+    const uint cm1 = l_cache - 1;
+    device const float* w  = weights + ulong(c) * l_cache;
+    device const float* st = state   + ulong(c) * cm1;
+    const ulong row = ulong(3u) * conv_dim;
+
+    float acc = 0.0f;
+    for (uint tap = 0; tap < l_cache; ++tap) {
+        const int p = int(t) + int(tap) - int(cm1);
+        float bx;
+        if (p < 0) {
+            bx = st[uint(p + int(cm1))];
+        } else {
+            device const float* r = bcx + ulong(uint(p)) * row;
+            bx = r[c] * r[2u * conv_dim + c];
+        }
+        acc += w[tap] * bx;
+    }
+    device const float* rt = bcx + ulong(t) * row;
+    output[ulong(t) * conv_dim + c] = rt[conv_dim + c] * acc;
+}
+
+// Advance the rolling window past a chunk: the new state is the last `l_cache - 1`
+// pre-conv columns of the chunk, falling back to the incoming state when the chunk
+// is shorter than the window. Must run AFTER `lfm2_shortconv_batch`, which reads
+// the pre-chunk state; Metal's tracked-hazard ordering within one encoder gives
+// that for free.
+kernel void lfm2_shortconv_state_update(
+    device const float* bcx      [[buffer(0)]],
+    device float*       state    [[buffer(1)]],
+    constant uint&      conv_dim [[buffer(2)]],
+    constant uint&      l_cache  [[buffer(3)]],
+    constant uint&      n_tokens [[buffer(4)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= conv_dim) return;
+    const uint cm1 = l_cache - 1;
+    device float* st = state + ulong(c) * cm1;
+    const ulong row = ulong(3u) * conv_dim;
+
+    float next[8];              // l_cache - 1 is 2 on every published LFM2 row
+    for (uint j = 0; j < cm1; ++j) {
+        const int p = int(n_tokens) - int(cm1) + int(j);
+        if (p < 0) {
+            next[j] = st[uint(p + int(cm1))];
+        } else {
+            device const float* r = bcx + ulong(uint(p)) * row;
+            next[j] = r[c] * r[2u * conv_dim + c];
+        }
+    }
+    for (uint j = 0; j < cm1; ++j) st[j] = next[j];
+}
+
 kernel void qwen35_ssm_gates(
     device const float* beta_raw [[buffer(0)]],
     device const float* alpha_raw [[buffer(1)]],
@@ -7017,6 +7099,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .ok()?;
             let lfm2_shortconv_pipeline = device
                 .new_compute_pipeline_state_with_function(&lfm2_shortconv_function)
+                .ok()?;
+            let lfm2_shortconv_batch_function = elementwise_library
+                .get_function("lfm2_shortconv_batch", None)
+                .ok()?;
+            let lfm2_shortconv_batch_pipeline = device
+                .new_compute_pipeline_state_with_function(&lfm2_shortconv_batch_function)
+                .ok()?;
+            let lfm2_shortconv_state_update_function = elementwise_library
+                .get_function("lfm2_shortconv_state_update", None)
+                .ok()?;
+            let lfm2_shortconv_state_update_pipeline = device
+                .new_compute_pipeline_state_with_function(&lfm2_shortconv_state_update_function)
                 .ok()?;
 
             let qwen35_delta_rule_function = elementwise_library
@@ -7671,6 +7765,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 qwen35_l2_norm_pipeline,
                 qwen35_conv1d_pipeline,
                 lfm2_shortconv_pipeline,
+                lfm2_shortconv_batch_pipeline,
+                lfm2_shortconv_state_update_pipeline,
                 qwen35_delta_rule_pipeline,
                 qwen35_sigmoid_mul_pipeline,
                 qwen35_ssm_gates_pipeline,
@@ -18864,6 +18960,429 @@ impl Lfm2MetalDecode {
         pool_recycle(k, keep);
         self.filled += 1;
         Some(output)
+    }
+
+    /// Prefill `k` consecutive positions in one command buffer.
+    ///
+    /// Every projection runs with `n_tokens = k`, so each weight is streamed ONCE
+    /// per chunk instead of once per token — that is the whole point, because 90%
+    /// of this model's per-token bytes are Q8_0 projections. Positional work that
+    /// genuinely differs per row (RoPE, the KV scatter, and the causal attention
+    /// span) stays per-row, exactly as `verify_batch_inner` does it.
+    ///
+    /// The LM head is skipped entirely: a prefill chunk's logits are discarded.
+    /// The caller feeds the final prompt token through `forward_select` to get the
+    /// first sampled position.
+    ///
+    /// Bit-identical to `k` sequential `forward_select` calls: the batched Q8 GEMV
+    /// is exact per column, `rms_norm_batch_f32` is equal per row, and the batched
+    /// conv preserves tap order and reads the pre-chunk state for every row.
+    fn forward_prefill_chunk(
+        &mut self,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        n_tokens: usize,
+    ) -> Option<()> {
+        let c = self.config;
+        let half = c.rope_dim / 2;
+        if n_tokens == 0
+            || embeddings.len() != n_tokens * c.hidden
+            || cos.len() != n_tokens * half
+            || sin.len() != n_tokens * half
+            || self.filled + n_tokens > self.max_positions
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        let base = self.filled;
+        let q_dim = c.n_heads * c.head_dim;
+        let kv_dim = c.n_kv_heads * c.head_dim;
+
+        let big_a = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+        let big_b = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+        write_buffer_f32(&big_a, embeddings);
+        let cos_buf = qwen35_f32_buffer(k, cos);
+        let sin_buf = qwen35_f32_buffer(k, sin);
+
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = vec![
+            big_a.to_owned(),
+            big_b.to_owned(),
+            cos_buf.to_owned(),
+            sin_buf.to_owned(),
+        ];
+
+        let norm_scalar = pool_get(k, 8);
+        unsafe {
+            let p = norm_scalar.contents() as *mut u8;
+            *(p as *mut u32) = c.hidden as u32;
+            *(p.add(4) as *mut f32) = c.eps;
+        }
+
+        for layer in &self.layers {
+            // ---- mixer ----
+            let normed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+            encode_rms_norm_batch(
+                k,
+                e,
+                &big_a,
+                &layer.attn_norm,
+                &normed,
+                &norm_scalar,
+                n_tokens,
+            );
+            let mix = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+
+            match &layer.kind {
+                Lfm2MetalLayerKind::Conv {
+                    in_proj,
+                    out_proj,
+                    conv,
+                    conv_state,
+                } => {
+                    let bcx = pool_get(k, (n_tokens * 3 * c.hidden * 4) as u64);
+                    let mixed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+                    let in_mm = pool_get(k, 12);
+                    let out_mm = pool_get(k, 12);
+                    let conv_scalar = pool_get(k, 12);
+                    unsafe {
+                        let s = conv_scalar.contents() as *mut u32;
+                        *s = c.hidden as u32;
+                        *s.add(1) = c.l_cache as u32;
+                        *s.add(2) = n_tokens as u32;
+                    }
+                    encode_resident_matmul_f32(
+                        e,
+                        k,
+                        &mut keep,
+                        &normed,
+                        in_proj,
+                        &bcx,
+                        &in_mm,
+                        c.hidden,
+                        3 * c.hidden,
+                        n_tokens,
+                    );
+                    e.set_compute_pipeline_state(&k.lfm2_shortconv_batch_pipeline);
+                    e.set_buffer(0, Some(&bcx), 0);
+                    e.set_buffer(1, Some(conv), 0);
+                    e.set_buffer(2, Some(conv_state), 0);
+                    e.set_buffer(3, Some(&mixed), 0);
+                    e.set_buffer(4, Some(&conv_scalar), 0);
+                    e.set_buffer(5, Some(&conv_scalar), 4);
+                    e.set_buffer(6, Some(&conv_scalar), 8);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: (c.hidden as u64).div_ceil(32),
+                            height: n_tokens as u64,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    // Advance the ring only after every row has read the pre-chunk state.
+                    e.set_compute_pipeline_state(&k.lfm2_shortconv_state_update_pipeline);
+                    e.set_buffer(0, Some(&bcx), 0);
+                    e.set_buffer(1, Some(conv_state), 0);
+                    e.set_buffer(2, Some(&conv_scalar), 0);
+                    e.set_buffer(3, Some(&conv_scalar), 4);
+                    e.set_buffer(4, Some(&conv_scalar), 8);
+                    dispatch_1d(e, &k.lfm2_shortconv_state_update_pipeline, c.hidden);
+                    encode_resident_matmul_f32(
+                        e, k, &mut keep, &mixed, out_proj, &mix, &out_mm, c.hidden, c.hidden,
+                        n_tokens,
+                    );
+                    keep.extend([bcx, mixed, in_mm, out_mm, conv_scalar]);
+                }
+                Lfm2MetalLayerKind::Attn {
+                    q: qw,
+                    k: kw,
+                    v: vw,
+                    output: ow,
+                    q_norm,
+                    k_norm,
+                    cache_k,
+                    cache_v,
+                } => {
+                    let query = pool_get(k, (n_tokens * q_dim * 4) as u64);
+                    let key = pool_get(k, (n_tokens * kv_dim * 4) as u64);
+                    let value = pool_get(k, (n_tokens * kv_dim * 4) as u64);
+                    let context = pool_get(k, (n_tokens * q_dim * 4) as u64);
+                    let q_mm = pool_get(k, 12);
+                    let kv_mm = pool_get(k, 12);
+                    let o_mm = pool_get(k, 12);
+                    let qk_norm_scalar = pool_get(k, 12);
+                    let mirror_flag = pool_get(k, 4);
+                    unsafe {
+                        let n = qk_norm_scalar.contents() as *mut u8;
+                        *(n as *mut u32) = c.head_dim as u32;
+                        *(n.add(4) as *mut f32) = c.eps;
+                        *(n.add(8) as *mut u32) = 1;
+                        *(mirror_flag.contents() as *mut u32) = 0;
+                    }
+                    encode_resident_matmul_f32(
+                        e, k, &mut keep, &normed, qw, &query, &q_mm, c.hidden, q_dim, n_tokens,
+                    );
+                    encode_resident_matmul_f32(
+                        e, k, &mut keep, &normed, kw, &key, &kv_mm, c.hidden, kv_dim, n_tokens,
+                    );
+                    encode_resident_matmul_f32(
+                        e, k, &mut keep, &normed, vw, &value, &kv_mm, c.hidden, kv_dim, n_tokens,
+                    );
+                    // Per row from here: RoPE angle, cache slot and causal span all
+                    // differ by position.
+                    for i in 0..n_tokens {
+                        let pos = base + i;
+                        let q_off = (i * q_dim * 4) as u64;
+                        let kv_off = (i * kv_dim * 4) as u64;
+                        encode_rms_norm_per_head(
+                            e,
+                            k,
+                            &query,
+                            q_norm,
+                            &query,
+                            &qk_norm_scalar,
+                            c.n_heads,
+                            q_off,
+                        );
+                        encode_rms_norm_per_head(
+                            e,
+                            k,
+                            &key,
+                            k_norm,
+                            &key,
+                            &qk_norm_scalar,
+                            c.n_kv_heads,
+                            kv_off,
+                        );
+                        let q_rope = pool_get(k, 16);
+                        let k_rope = pool_get(k, 16);
+                        let scatter_scalar = pool_get(k, 16);
+                        let attn_scalar = pool_get(k, 32);
+                        let filled = pos + 1;
+                        unsafe {
+                            let set_rope = |buffer: &Buffer, heads: usize| {
+                                let r = buffer.contents() as *mut u32;
+                                *r = heads as u32;
+                                *r.add(1) = c.head_dim as u32;
+                                *r.add(2) = half as u32;
+                                *r.add(3) = 1;
+                            };
+                            set_rope(&q_rope, c.n_heads);
+                            set_rope(&k_rope, c.n_kv_heads);
+                            let sc = scatter_scalar.contents() as *mut u32;
+                            *sc = c.head_dim as u32;
+                            *sc.add(1) = self.max_positions as u32;
+                            *sc.add(2) = pos as u32;
+                            *sc.add(3) = kv_dim as u32;
+                            let a = attn_scalar.contents() as *mut u8;
+                            *(a as *mut u32) = c.n_heads as u32;
+                            *(a.add(4) as *mut u32) = c.head_dim as u32;
+                            *(a.add(8) as *mut u32) = filled as u32;
+                            *(a.add(12) as *mut u32) = (c.n_heads / c.n_kv_heads) as u32;
+                            *(a.add(16) as *mut f32) = 1.0 / (c.head_dim as f32).sqrt();
+                            *(a.add(20) as *mut u32) = c.head_dim as u32;
+                            *(a.add(24) as *mut u32) = (self.max_positions * c.head_dim) as u32;
+                            *(a.add(28) as *mut u32) = 0;
+                        }
+                        let row_cos = (i * half * 4) as u64;
+                        encode_rope(
+                            e, k, &query, &cos_buf, &sin_buf, &q_rope, c.n_heads, half, q_off,
+                            row_cos,
+                        );
+                        encode_rope(
+                            e,
+                            k,
+                            &key,
+                            &cos_buf,
+                            &sin_buf,
+                            &k_rope,
+                            c.n_kv_heads,
+                            half,
+                            kv_off,
+                            row_cos,
+                        );
+                        e.set_compute_pipeline_state(&k.kv_scatter_pipeline);
+                        e.set_buffer(0, Some(&key), kv_off);
+                        e.set_buffer(1, Some(&value), kv_off);
+                        e.set_buffer(2, Some(cache_k), 0);
+                        e.set_buffer(3, Some(cache_v), 0);
+                        e.set_buffer(4, Some(&scatter_scalar), 0);
+                        e.set_buffer(5, Some(&scatter_scalar), 4);
+                        e.set_buffer(6, Some(&scatter_scalar), 8);
+                        e.set_buffer(7, Some(&scatter_scalar), 12);
+                        e.set_buffer(8, Some(&scatter_scalar), 0);
+                        e.set_buffer(9, Some(&scatter_scalar), 0);
+                        e.set_buffer(10, Some(&mirror_flag), 0);
+                        dispatch_1d(e, &k.kv_scatter_pipeline, kv_dim);
+                        let scores = pool_get(k, (c.n_heads * filled * 4) as u64);
+                        encode_attention(
+                            e,
+                            k,
+                            &mut keep,
+                            &query,
+                            cache_k,
+                            cache_v,
+                            None,
+                            &scores,
+                            &context,
+                            &attn_scalar,
+                            c.n_heads,
+                            c.n_kv_heads,
+                            c.head_dim,
+                            filled,
+                            q_off,
+                            q_off,
+                        );
+                        keep.extend([q_rope, k_rope, scatter_scalar, attn_scalar, scores]);
+                    }
+                    encode_resident_matmul_f32(
+                        e, k, &mut keep, &context, ow, &mix, &o_mm, q_dim, c.hidden, n_tokens,
+                    );
+                    keep.extend([
+                        query,
+                        key,
+                        value,
+                        context,
+                        q_mm,
+                        kv_mm,
+                        o_mm,
+                        qk_norm_scalar,
+                        mirror_flag,
+                    ]);
+                }
+            }
+
+            let n_hidden = pool_get(k, 4);
+            unsafe { *(n_hidden.contents() as *mut u32) = (n_tokens * c.hidden) as u32 };
+            encode_binary(
+                e,
+                &k.residual_add_pipeline,
+                &big_a,
+                &mix,
+                &big_b,
+                &n_hidden,
+                n_tokens * c.hidden,
+            );
+
+            // ---- FFN ----
+            let fnormed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+            let gate = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+            let up = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+            let act = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+            let down = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+            let hidden_mm = pool_get(k, 12);
+            let down_mm = pool_get(k, 12);
+            let n_ffn = pool_get(k, 4);
+            unsafe { *(n_ffn.contents() as *mut u32) = (n_tokens * c.ffn_dim) as u32 };
+            encode_rms_norm_batch(
+                k,
+                e,
+                &big_b,
+                &layer.ffn_norm,
+                &fnormed,
+                &norm_scalar,
+                n_tokens,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                &mut keep,
+                &fnormed,
+                &layer.ffn_gate,
+                &gate,
+                &hidden_mm,
+                c.hidden,
+                c.ffn_dim,
+                n_tokens,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                &mut keep,
+                &fnormed,
+                &layer.ffn_up,
+                &up,
+                &hidden_mm,
+                c.hidden,
+                c.ffn_dim,
+                n_tokens,
+            );
+            encode_binary(
+                e,
+                &k.silu_mul_pipeline,
+                &gate,
+                &up,
+                &act,
+                &n_ffn,
+                n_tokens * c.ffn_dim,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                &mut keep,
+                &act,
+                &layer.ffn_down,
+                &down,
+                &down_mm,
+                c.ffn_dim,
+                c.hidden,
+                n_tokens,
+            );
+            encode_binary(
+                e,
+                &k.residual_add_pipeline,
+                &big_b,
+                &down,
+                &big_a,
+                &n_hidden,
+                n_tokens * c.hidden,
+            );
+            keep.extend([
+                normed, mix, fnormed, gate, up, act, down, hidden_mm, down_mm, n_ffn, n_hidden,
+            ]);
+        }
+
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        keep.push(norm_scalar);
+        pool_recycle(k, keep);
+        self.filled += n_tokens;
+        Some(())
+    }
+
+    /// Chunked prompt prefill. Returns once every prompt position EXCEPT the last
+    /// has been consumed; the caller runs the last one through a normal step so it
+    /// produces logits.
+    pub(crate) fn prefill_prompt(
+        &mut self,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        n_tokens: usize,
+        chunk: usize,
+    ) -> Option<()> {
+        let c = self.config;
+        let half = c.rope_dim / 2;
+        let chunk = chunk.max(1);
+        let mut done = 0usize;
+        while done < n_tokens {
+            let take = chunk.min(n_tokens - done);
+            self.forward_prefill_chunk(
+                &embeddings[done * c.hidden..(done + take) * c.hidden],
+                &cos[done * half..(done + take) * half],
+                &sin[done * half..(done + take) * half],
+                take,
+            )?;
+            done += take;
+        }
+        Some(())
     }
 
     /// Advance one position and return the greedy token id.

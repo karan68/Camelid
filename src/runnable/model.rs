@@ -2557,10 +2557,30 @@ impl RunnableModel {
         let want_logits = sampler.is_some();
         let mut next: u32;
         {
-            let mut last: Option<(Option<u32>, Option<Vec<f32>>)> = None;
-            for (pos, &tok) in prompt.iter().enumerate() {
-                last = Some(step(engine, tok, pos, want_logits)?);
+            // Chunked prefill for everything but the LAST prompt token: each weight
+            // streams once per chunk instead of once per token, and the discarded
+            // logits never touch the 128k-row head. The final token goes through a
+            // normal step so it produces a selection.
+            let head = prompt.len() - 1;
+            if head > 0 {
+                let mut embeds = Vec::with_capacity(head * self.d_model);
+                let mut coss = Vec::with_capacity(head * (self.rope_dim / 2));
+                let mut sins = Vec::with_capacity(head * (self.rope_dim / 2));
+                for (pos, &tok) in prompt.iter().take(head).enumerate() {
+                    embeds.extend_from_slice(
+                        &self.token_embd.dequant_row(tok as usize, "token_embd")?,
+                    );
+                    let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+                    coss.extend_from_slice(&cos);
+                    sins.extend_from_slice(&sin);
+                }
+                engine
+                    .prefill_prompt(&embeds, &coss, &sins, head, lfm2_metal_prefill_chunk())
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData("lfm2 Metal prefill failed".into())
+                    })?;
             }
+            let last = Some(step(engine, prompt[head], head, want_logits)?);
             let (tok, logits) = last.ok_or_else(|| {
                 BackendError::InvalidTensorData("lfm2 Metal lane: empty prompt".into())
             })?;
@@ -3929,6 +3949,18 @@ fn lfm2_metal_context_capacity() -> usize {
 /// Whether the LFM2 resident Metal lane may be used. OPT-IN while it is being
 /// proven: set `CAMELID_LFM2_METAL=1`. It flips to default-on with a `=0` opt-out
 /// once it carries a parity receipt.
+/// Positions per prefill command buffer. The batched Q8 GEMV tiles 8 columns per
+/// weight pass, so anything >= 8 amortises weight streaming; 64 keeps scratch small
+/// (~2.75 MB at this model's FFN width).
+#[cfg(target_os = "macos")]
+fn lfm2_metal_prefill_chunk() -> usize {
+    std::env::var("CAMELID_LFM2_METAL_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
 #[cfg(target_os = "macos")]
 fn lfm2_metal_enabled() -> bool {
     std::env::var("CAMELID_LFM2_METAL").is_ok_and(|v| {
