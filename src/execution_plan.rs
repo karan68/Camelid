@@ -582,6 +582,31 @@ pub fn plan_for_model_with_platform_and_env(
             "prism_low_bit_metal_resident_decode",
             "scalar_prism_block_decode_fallback",
         )
+    } else if has_q8_0_tensors
+        && is_lfm2_metal_arch(gguf)
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && !matches!(profile, ExecutionProfile::Safe)
+        && planner_env.flag_enabled("CAMELID_LFM2_METAL")
+    {
+        // The lfm2 resident Metal graph. Without this arm lfm2 fell through every
+        // arm below to the safe path and `/v1/health` reported `cpu_reference` /
+        // `safe_cpu_decode` WHILE the Metal graph was serving. The gate reads only
+        // operator inputs -- never a plan-written variable, which is the latch that
+        // previously made a plan opt itself out on the second load.
+        reasons.push(
+            "lfm2 resident Metal lane selected; Q8_0 projections stay resident and the              short-conv ring plus the sparse KV cache live on device"
+                .into(),
+        );
+        (
+            "metal_resident_lfm2_runtime",
+            "metal_resident_q8_wire",
+            "lfm2_metal_resident_prefill",
+            "resident_tiled_mm_prefill",
+            "lfm2_metal_resident_decode",
+            "runnable_cpu_decode_fallback",
+        )
     } else if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(
@@ -1560,6 +1585,16 @@ fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
 /// Bonsai on Apple Silicon Metal and Windows CUDA. Sharing the generic predicate made `/v1/health`
 /// disclose `cpu_reference` even while the resident Qwen3.5 Metal graph was
 /// active.
+/// `lfm2` on the resident Metal lane.
+///
+/// Deliberately its own predicate rather than a shared `is_gpu_runnable_arch`:
+/// sharing a generic one is what previously let `/v1/health` disclose
+/// `cpu_reference` while a Metal graph was live. The gate below keys on exactly
+/// the inputs the ROUTING keys on, so the disclosure cannot drift from reality.
+fn is_lfm2_metal_arch(gguf: &GgufFile) -> bool {
+    gguf.architecture() == Some("lfm2")
+}
+
 fn is_prism_low_bit_metal_arch(gguf: &GgufFile) -> bool {
     let arch = gguf.architecture().unwrap_or("");
     if !matches!(arch, "qwen3" | "qwen35") {
