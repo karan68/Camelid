@@ -3946,9 +3946,6 @@ fn lfm2_metal_context_capacity() -> usize {
         .unwrap_or(4096)
 }
 
-/// Whether the LFM2 resident Metal lane may be used. OPT-IN while it is being
-/// proven: set `CAMELID_LFM2_METAL=1`. It flips to default-on with a `=0` opt-out
-/// once it carries a parity receipt.
 /// Positions per prefill command buffer. The batched Q8 GEMV tiles 8 columns per
 /// weight pass, so anything >= 8 amortises weight streaming; 64 keeps scratch small
 /// (~2.75 MB at this model's FFN width).
@@ -3971,12 +3968,21 @@ fn lfm2_metal_prefill_chunk() -> usize {
         .unwrap_or(64)
 }
 
+/// Whether the LFM2 resident Metal lane may be used. DEFAULT-ON; opt out with
+/// `CAMELID_LFM2_METAL=0` (also `off`/`false`/`no`/`disabled`, the documented
+/// opt-out convention).
+///
+/// This predicate MUST stay in lockstep with the execution-plan gate in
+/// `execution_plan.rs`. They answer the same question, and when they disagree
+/// `/v1/health` describes a lane other than the one that ran.
 #[cfg(target_os = "macos")]
-fn lfm2_metal_enabled() -> bool {
-    std::env::var("CAMELID_LFM2_METAL").is_ok_and(|v| {
-        let v = v.trim();
-        v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
-    })
+pub(crate) fn lfm2_metal_enabled() -> bool {
+    // Reuses the planner's own opt-out predicate rather than restating the value
+    // list. Restating it is how the two drift: an independently written list here
+    // already differed from the planner's on `no` and `cpu`, which would have let
+    // routing and disclosure disagree for those two values.
+    !std::env::var("CAMELID_LFM2_METAL")
+        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
 }
 
 fn qwen35_metal_context_capacity() -> usize {
