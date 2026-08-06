@@ -68,6 +68,22 @@ impl RawMatBytes {
     }
 }
 
+/// Tensor types read into `RawMatBytes::WirePages` rather than an owned `Vec`: those
+/// whose GGUF wire layout is already what the resident Metal kernels read, so the
+/// allocation can be wrapped in place with `newBufferWithBytesNoCopy`. Otherwise
+/// unobservable — `as_slice` is identical either way and `wire_pages` is macOS-only —
+/// at the cost of rounding each tensor up to a page.
+fn wants_page_backing(tt: GgufTensorType) -> bool {
+    matches!(
+        tt,
+        GgufTensorType::Q1_0
+            | GgufTensorType::Q2_0G64
+            | GgufTensorType::Q2_0G128
+            | GgufTensorType::Pq2_0
+            | GgufTensorType::Q8_0
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn log_prism_metal_hybrid_once() {
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -539,14 +555,7 @@ impl RunnableModel {
         let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
             let d = find_tensor(&gguf, name)?;
             let (inf, outf) = mat_dims(d, name)?;
-            let bytes = if matches!(
-                d.tensor_type,
-                GgufTensorType::Q1_0
-                    | GgufTensorType::Q2_0G64
-                    | GgufTensorType::Q2_0G128
-                    | GgufTensorType::Pq2_0
-                    | GgufTensorType::Q8_0
-            ) {
+            let bytes = if wants_page_backing(d.tensor_type) {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
@@ -4411,6 +4420,43 @@ impl RunnableModel {
     }
 }
 
+/// Backing selection is platform-independent — `load_raw` chooses `WirePages` on every
+/// target — so these run everywhere, not just where the resident lane exists.
+#[cfg(test)]
+mod page_backing_selection_tests {
+    use super::*;
+
+    #[test]
+    fn packed_wire_formats_are_page_backed() {
+        // Dropping one returns it to `Owned`, where the resident lane refuses it and
+        // the model falls back to CPU decode with no error.
+        for tt in [
+            GgufTensorType::Q1_0,
+            GgufTensorType::Q2_0G64,
+            GgufTensorType::Q2_0G128,
+            GgufTensorType::Pq2_0,
+            GgufTensorType::Q8_0,
+        ] {
+            assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
+        }
+    }
+
+    #[test]
+    fn other_formats_keep_ordinary_owned_backing() {
+        // Page-backing costs a page per tensor, so it stays opt-in per format.
+        // K-quants belong here until the resident lane admits them.
+        for tt in [
+            GgufTensorType::F32,
+            GgufTensorType::F16,
+            GgufTensorType::Q4_0,
+            GgufTensorType::Q4K,
+            GgufTensorType::Q6K,
+        ] {
+            assert!(!wants_page_backing(tt), "{tt:?} must stay Owned");
+        }
+    }
+}
+
 /// Resident-Metal admission for Q8_0 projections. These run on any macOS host with no
 /// GGUF and no GPU: they pin the loader-side contract that lets a Q8_0 `qwen35` model
 /// reach the resident lane at all — the format mapping, the page-backing requirement,
@@ -4521,8 +4567,10 @@ mod resident_metal_q8_admission_tests {
 
     #[test]
     fn owned_q8_0_is_refused_instead_of_silently_copied() {
-        // The resident lane wraps the allocation with newBufferWithBytesNoCopy, so a
-        // non-page-aligned `Owned` buffer must fail closed rather than be uploaded.
+        // Variant check only: `Owned` is refused outright, so an ordinary heap tensor
+        // never reaches the resident lane. The page-alignment invariant itself is
+        // `WirePages`' contract, covered by
+        // `metal::tests::wire_mmap_nocopy_buffer_gpu_reads_file_bytes`.
         let m = raw(
             RawMatBytes::owned(q8_0_wire_bytes(Q8_0_BLOCK_VALUES, 1)),
             GgufTensorType::Q8_0,
