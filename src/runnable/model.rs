@@ -130,6 +130,9 @@ impl RawMat {
             GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
                 Some(crate::metal::ResidentWeightFormat::Q2_0G128)
             }
+            // Q8_0 wire blocks (34B: f16 scale + 32 i8) are already the layout the
+            // resident Metal Q8 GEMV consumes, so they need no repack.
+            GgufTensorType::Q8_0 => Some(crate::metal::ResidentWeightFormat::Q8_0),
             _ => None,
         }
     }
@@ -542,6 +545,7 @@ impl RunnableModel {
                     | GgufTensorType::Q2_0G64
                     | GgufTensorType::Q2_0G128
                     | GgufTensorType::Pq2_0
+                    | GgufTensorType::Q8_0
             ) {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
