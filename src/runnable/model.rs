@@ -3985,6 +3985,7 @@ pub(crate) fn lfm2_metal_enabled() -> bool {
         .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
 }
 
+#[cfg(target_os = "macos")]
 fn qwen35_metal_context_capacity() -> usize {
     std::env::var("CAMELID_QWEN35_METAL_MAXPOS")
         .ok()
