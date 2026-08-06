@@ -1108,6 +1108,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
           // Receipts only attach to non-streaming responses; the JSON
           // fallback in readStreamingChatCompletion handles that shape.
           stream: !receiptMode,
+          // Ask for the authoritative token count in the final stream chunk.
+          // Without it the client can only ESTIMATE from visible content, which
+          // undercounts badly on a thinking model: LFM2 emits its reasoning as
+          // `reasoning_content`, so a reply that is mostly reasoning looked like
+          // almost no tokens and the tok/s readout reported a fraction of the
+          // real rate.
+          ...(receiptMode ? {} : { stream_options: { include_usage: true } }),
           ...(receiptMode ? { camelid_receipt: true } : {}),
         }),
       })

@@ -148,6 +148,33 @@ impl RawMat {
         Ok(crate::metal::ResidentWeightBytes::WirePages { format, pages })
     }
 
+    /// Q8_0 weight bytes for the LFM2 Metal engine.
+    ///
+    /// `prism_metal_weight` is the low-bit path and hard-rejects Q8_0; LFM2 ships
+    /// every projection as Q8_0. Page-backed allocations are handed over in place
+    /// (one resident copy, no upload); anything else goes through the resident
+    /// cache as ordinary wire bytes. `resolve_resident_weight` already accepts
+    /// `Q8_0` on both arms.
+    #[cfg(target_os = "macos")]
+    fn q8_metal_weight(&self) -> Result<crate::metal::ResidentWeightBytes<'_>> {
+        if self.tt != GgufTensorType::Q8_0 {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "lfm2 Metal lane requires Q8_0 projections, got {:?}",
+                self.tt
+            )));
+        }
+        if let Some(pages) = self.bytes.wire_pages() {
+            return Ok(crate::metal::ResidentWeightBytes::WirePages {
+                format: crate::metal::ResidentWeightFormat::Q8_0,
+                pages,
+            });
+        }
+        Ok(crate::metal::ResidentWeightBytes::KQuantBytes {
+            format: crate::metal::ResidentWeightFormat::Q8_0,
+            bytes: self.bytes.as_slice(),
+        })
+    }
+
     /// Dequantize the entire matrix to f32 (used per layer, dropped after the layer).
     fn dequant_all(&self, name: &str) -> Result<Mat> {
         let data = super::dequant::dequantize(
@@ -491,6 +518,10 @@ pub struct RunnableModel {
     /// inspecting/loading a model does not allocate recurrent/KV state.
     #[cfg(target_os = "macos")]
     metal_qwen35: std::sync::Mutex<Option<crate::metal::Qwen35MetalDecode>>,
+    /// Resident LFM2 Metal graph, built on first use and reused. `Mutex` supplies the
+    /// `&mut` a per-token forward needs while `generate_*` take `&self`.
+    #[cfg(target_os = "macos")]
+    metal_lfm2: std::sync::Mutex<Option<crate::metal::Lfm2MetalDecode>>,
 }
 
 impl RunnableModel {
@@ -769,6 +800,8 @@ impl RunnableModel {
                 cuda: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
                 metal_qwen35: std::sync::Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                metal_lfm2: std::sync::Mutex::new(None),
             });
         }
 
@@ -929,6 +962,8 @@ impl RunnableModel {
                 cuda: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
                 metal_qwen35: std::sync::Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                metal_lfm2: std::sync::Mutex::new(None),
             });
         }
 
@@ -1044,6 +1079,8 @@ impl RunnableModel {
             cuda: std::sync::Mutex::new(None),
             #[cfg(target_os = "macos")]
             metal_qwen35: std::sync::Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            metal_lfm2: std::sync::Mutex::new(None),
         })
     }
 
@@ -1081,8 +1118,11 @@ impl RunnableModel {
         if let Some(rt) = &self.lfm2 {
             let mut cache = self.new_cache();
             let mut logits = Vec::new();
+            // This entry point returns the LAST position's logits, so only that
+            // position needs the tied 128k-row head.
+            let last = tokens.len().saturating_sub(1);
             for (pos, &tok) in tokens.iter().enumerate() {
-                logits = self.forward_step_lfm2(rt, tok, pos, &mut cache)?;
+                logits = self.forward_step_lfm2(rt, tok, pos, &mut cache, pos == last)?;
             }
             return Ok(logits);
         }
@@ -1168,10 +1208,22 @@ impl RunnableModel {
         if self.qwen35.is_some() {
             return self.generate_qwen35(prompt, max_new, &[]);
         }
+        // LFM2 resident Metal graph (opt-in via CAMELID_LFM2_METAL while it is
+        // being proven). No silent CPU fallback: the conv ring is order-dependent
+        // and a mid-stream replay would restart from the prompt, so a Metal failure
+        // surfaces as an error rather than a quietly different lane.
+        #[cfg(target_os = "macos")]
+        if self.lfm2.is_some() && lfm2_metal_enabled() {
+            return self.generate_lfm2_metal(prompt, max_new, &[], None, &mut |_| {});
+        }
         let mut cache = self.new_cache();
         let mut last = Vec::new();
+        // Only the LAST prompt position's logits are consumed; the rest exist to
+        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
+        // those positions removes 9.7% of the bytes each prefill step reads.
+        let last_prompt = prompt.len().saturating_sub(1);
         for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step(tok, pos, &mut cache)?;
+            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
         }
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
@@ -1301,12 +1353,17 @@ impl RunnableModel {
     /// h    = prev + h
     /// h    = h + SwiGLU_FFN(RMSNorm(h, ffn_norm))
     /// ```
+    /// `need_logits = false` advances the cache and the conv ring but skips the
+    /// 128,000-row tied LM head. Every prompt-prefill position except the last
+    /// discards its logits, and that projection is 9.7% of the bytes a step
+    /// touches — the same economy `decode_token_qwen35` already takes.
     fn forward_step_lfm2(
         &self,
         rt: &Lfm2Runtime,
         token: u32,
         pos: usize,
         cache: &mut KvCache,
+        need_logits: bool,
     ) -> Result<Vec<f32>> {
         let dm = self.d_model;
         let hd = self.head_dim;
@@ -1472,6 +1529,9 @@ impl RunnableModel {
         // `token_embd` (LFM2.5 ships no `output.weight`). The 128k-row vocab
         // projection dominates a decode step, so take the row-parallel form
         // (same int8-activation caveat as the per-layer projections above).
+        if !need_logits {
+            return Ok(Vec::new());
+        }
         let normed = self.apply_norm(&hidden, &self.output_norm);
         self.output.par_matvec(&normed, "output")
     }
@@ -1479,8 +1539,23 @@ impl RunnableModel {
     /// Incremental forward of a single token at absolute `pos`, appending its K/V to
     /// `cache` and attending over all cached positions. Returns next-token logits.
     fn forward_step(&self, token: u32, pos: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        self.forward_step_maybe_logits(token, pos, cache, true)
+    }
+
+    /// [`forward_step`] with the LM head made optional. Only the lfm2 path honors
+    /// the flag today; every other architecture ignores it and always projects,
+    /// so behaviour there is unchanged.
+    ///
+    /// [`forward_step`]: RunnableModel::forward_step
+    fn forward_step_maybe_logits(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut KvCache,
+        need_logits: bool,
+    ) -> Result<Vec<f32>> {
         if let Some(rt) = &self.lfm2 {
-            return self.forward_step_lfm2(rt, token, pos, cache);
+            return self.forward_step_lfm2(rt, token, pos, cache, need_logits);
         }
         let hd = self.head_dim;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -2311,6 +2386,240 @@ impl RunnableModel {
         Ok(generated)
     }
 
+    /// Build the resident LFM2 Metal graph. Every guard here is deliberately
+    /// independent of `LlamaModelConfig::from_gguf`'s upstream checks: this engine
+    /// bakes in LFM2.5's exact shape, so anything it cannot express must refuse
+    /// rather than decode with the wrong graph.
+    #[cfg(target_os = "macos")]
+    fn build_lfm2_metal(&self, max_positions: usize) -> Result<crate::metal::Lfm2MetalDecode> {
+        use crate::metal::{
+            Lfm2MetalConfig, Lfm2MetalDecode, Lfm2MetalLayerInput, Lfm2MetalLayerKindInput,
+        };
+        let runtime = self
+            .lfm2
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidTensorData("not an lfm2 model".to_string()))?;
+        let refuse = |why: &str| -> BackendError {
+            BackendError::UnsupportedGguf(format!("lfm2 Metal lane: {why}"))
+        };
+        // Structural facts the encoder assumes. LFM2.5 satisfies all of them; a row
+        // that does not gets a typed refusal and stays on the CPU lane.
+        if self.embed_scale.is_some() {
+            return Err(refuse("embedding scale is not modelled"));
+        }
+        if self.ffn_gelu {
+            return Err(refuse("GeGLU FFN is not modelled (SwiGLU only)"));
+        }
+        if self.final_logit_softcap.is_some() || self.attn_logit_softcap.is_some() {
+            return Err(refuse("logit soft-caps are not modelled"));
+        }
+        if self.logit_scale.is_some() {
+            return Err(refuse("logit scale is not modelled"));
+        }
+        if !self.rope_neox {
+            return Err(refuse("only NEOX rope pairing is encoded"));
+        }
+        if self.layer_rope_base.iter().any(|b| *b != self.rope_base) {
+            return Err(refuse("per-layer rope bases are not modelled"));
+        }
+        let ffn_dim = runtime
+            .layers
+            .first()
+            .map(|layer| layer.ffn_gate.out_features)
+            .ok_or_else(|| refuse("model has no layers"))?;
+
+        let mut layers = Vec::with_capacity(runtime.layers.len());
+        for layer in &runtime.layers {
+            if layer.ffn_gate.out_features != ffn_dim || layer.ffn_up.out_features != ffn_dim {
+                return Err(refuse("non-uniform FFN width"));
+            }
+            let kind = match &layer.kind {
+                Lfm2Kind::Attn {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => Lfm2MetalLayerKindInput::Attn {
+                    q: wq.q8_metal_weight()?,
+                    k: wk.q8_metal_weight()?,
+                    v: wv.q8_metal_weight()?,
+                    output: wo.q8_metal_weight()?,
+                    q_norm,
+                    k_norm,
+                },
+                Lfm2Kind::Conv {
+                    conv,
+                    in_proj,
+                    out_proj,
+                } => Lfm2MetalLayerKindInput::Conv {
+                    in_proj: in_proj.q8_metal_weight()?,
+                    out_proj: out_proj.q8_metal_weight()?,
+                    conv,
+                },
+            };
+            layers.push(Lfm2MetalLayerInput {
+                attn_norm: &layer.attn_norm,
+                ffn_norm: &layer.ffn_norm,
+                ffn_gate: layer.ffn_gate.q8_metal_weight()?,
+                ffn_up: layer.ffn_up.q8_metal_weight()?,
+                ffn_down: layer.ffn_down.q8_metal_weight()?,
+                kind,
+            });
+        }
+        let config = Lfm2MetalConfig {
+            hidden: self.d_model,
+            ffn_dim,
+            n_heads: self.n_heads,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            rope_dim: self.rope_dim,
+            l_cache: runtime.l_cache,
+            vocab: self.vocab,
+            eps: self.eps,
+        };
+        Lfm2MetalDecode::new(
+            config,
+            &layers,
+            &self.output_norm,
+            self.output.q8_metal_weight()?,
+            max_positions,
+        )
+        .ok_or_else(|| refuse("resident graph construction refused these dimensions"))
+    }
+
+    /// Greedy/sampled decode on the resident LFM2 Metal graph.
+    ///
+    /// Prefill is one `step_*` per prompt token here — the same shape the qwen35
+    /// Metal lane uses. Batched prefill is a separate, larger change.
+    #[cfg(target_os = "macos")]
+    fn generate_lfm2_metal(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: Option<&SamplingConfig>,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let max_positions = lfm2_metal_context_capacity();
+        if prompt.len() >= max_positions {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "lfm2 Metal lane: prompt of {} tokens exceeds the resident capacity of \
+                 {max_positions} (raise CAMELID_LFM2_METAL_MAXPOS)",
+                prompt.len()
+            )));
+        }
+        let mut guard = self
+            .metal_lfm2
+            .lock()
+            .map_err(|_| BackendError::InvalidTensorData("lfm2 Metal mutex poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(self.build_lfm2_metal(max_positions)?);
+            eprintln!(
+                "[lfm2] resident Metal graph active (Q8_0 weights, short-conv + GQA \
+                 attention, FFN, logits, GPU greedy)"
+            );
+        }
+        let engine = guard
+            .as_mut()
+            .ok_or_else(|| BackendError::InvalidTensorData("lfm2 Metal engine absent".into()))?;
+        // The conv ring is order-dependent, so every request starts from a clean state.
+        engine.reset();
+
+        let sampler = sampling.map(|config| LlamaSampler::Sampling(config.clone()));
+        let mut token_history = prompt.to_vec();
+        let mut out = Vec::with_capacity(max_new);
+
+        let embed =
+            |t: u32| -> Result<Vec<f32>> { self.token_embd.dequant_row(t as usize, "token_embd") };
+        let step = |engine: &mut crate::metal::Lfm2MetalDecode,
+                    tok: u32,
+                    pos: usize,
+                    want_logits: bool|
+         -> Result<(Option<u32>, Option<Vec<f32>>)> {
+            let h = self.token_embd.dequant_row(tok as usize, "token_embd")?;
+            let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+            if want_logits {
+                let logits = engine.step_logits(&h, &cos, &sin, pos).ok_or_else(|| {
+                    BackendError::InvalidTensorData("lfm2 Metal step (logits) failed".into())
+                })?;
+                Ok((None, Some(logits)))
+            } else {
+                let t = engine.step_greedy(&h, &cos, &sin, pos).ok_or_else(|| {
+                    BackendError::InvalidTensorData("lfm2 Metal step (greedy) failed".into())
+                })?;
+                Ok((Some(t), None))
+            }
+        };
+        let _ = &embed;
+
+        let want_logits = sampler.is_some();
+        let mut next: u32;
+        {
+            // Chunked prefill for everything but the LAST prompt token: each weight
+            // streams once per chunk instead of once per token, and the discarded
+            // logits never touch the 128k-row head. The final token goes through a
+            // normal step so it produces a selection.
+            let head = prompt.len() - 1;
+            if head > 0 {
+                let mut embeds = Vec::with_capacity(head * self.d_model);
+                let mut coss = Vec::with_capacity(head * (self.rope_dim / 2));
+                let mut sins = Vec::with_capacity(head * (self.rope_dim / 2));
+                for (pos, &tok) in prompt.iter().take(head).enumerate() {
+                    embeds.extend_from_slice(
+                        &self.token_embd.dequant_row(tok as usize, "token_embd")?,
+                    );
+                    let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+                    coss.extend_from_slice(&cos);
+                    sins.extend_from_slice(&sin);
+                }
+                engine
+                    .prefill_prompt(&embeds, &coss, &sins, head, lfm2_metal_prefill_chunk())
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData("lfm2 Metal prefill failed".into())
+                    })?;
+            }
+            let last = Some(step(engine, prompt[head], head, want_logits)?);
+            let (tok, logits) = last.ok_or_else(|| {
+                BackendError::InvalidTensorData("lfm2 Metal lane: empty prompt".into())
+            })?;
+            next = match (&sampler, tok, logits) {
+                (Some(s), _, Some(l)) => qwen35_sample_logits(l, s, &token_history)?,
+                (None, Some(t), _) => t,
+                _ => {
+                    return Err(BackendError::InvalidTensorData(
+                        "lfm2 Metal lane: selection/logits mismatch".into(),
+                    ))
+                }
+            };
+        }
+
+        let mut pos = prompt.len();
+        for i in 0..max_new {
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            token_history.push(next);
+            on_token(next);
+            if i + 1 < max_new {
+                let (tok, logits) = step(engine, next, pos, want_logits)?;
+                pos += 1;
+                next = match (&sampler, tok, logits) {
+                    (Some(s), _, Some(l)) => qwen35_sample_logits(l, s, &token_history)?,
+                    (None, Some(t), _) => t,
+                    _ => {
+                        return Err(BackendError::InvalidTensorData(
+                            "lfm2 Metal lane: selection/logits mismatch".into(),
+                        ))
+                    }
+                };
+            }
+        }
+        Ok(out)
+    }
+
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_vision_metal(
@@ -3058,14 +3367,26 @@ impl RunnableModel {
         if self.qwen35.is_some() {
             return self.generate_qwen35_streaming(prompt, max_new, stop, None, true, on_token);
         }
+        // LFM2 resident Metal graph (opt-in via CAMELID_LFM2_METAL while it is
+        // being proven). No silent CPU fallback: the conv ring is order-dependent
+        // and a mid-stream replay would restart from the prompt, so a Metal failure
+        // surfaces as an error rather than a quietly different lane.
+        #[cfg(target_os = "macos")]
+        if self.lfm2.is_some() && lfm2_metal_enabled() {
+            return self.generate_lfm2_metal(prompt, max_new, stop, None, on_token);
+        }
         // Dense/generic path (MUSTER M-A1): the same incremental loop as `generate`
         // (byte-identical forward sequence when no stop token fires) plus stop-token
         // handling and true per-token streaming. A stop token ends the turn and is
         // NOT appended — matching the qwen35 lane and llama.cpp's served output.
         let mut cache = self.new_cache();
         let mut last = Vec::new();
+        // Only the LAST prompt position's logits are consumed; the rest exist to
+        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
+        // those positions removes 9.7% of the bytes each prefill step reads.
+        let last_prompt = prompt.len().saturating_sub(1);
         for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step(tok, pos, &mut cache)?;
+            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
         }
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
@@ -3612,6 +3933,58 @@ fn read_tensor_bytes(f: &mut File, d: &GgufTensorDescriptor, name: &str) -> Resu
 /// Physical token slots reserved by the resident Qwen3.5 Metal graph. The
 /// request's `max_tokens` is an upper bound, not a demand, so callers clamp the
 /// generation budget to the unused portion of this capacity.
+#[cfg(target_os = "macos")]
+/// Resident position capacity for the LFM2 Metal graph. KV is allocated for the 8
+/// attention layers only (the 22 conv layers carry a fixed 2-column ring), so 4096
+/// positions cost ~8 MiB of KV, not the dense figure.
+#[cfg(target_os = "macos")]
+fn lfm2_metal_context_capacity() -> usize {
+    std::env::var("CAMELID_LFM2_METAL_MAXPOS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096)
+}
+
+/// Positions per prefill command buffer. The batched Q8 GEMV tiles 8 columns per
+/// weight pass, so anything >= 8 amortises weight streaming; 64 keeps scratch small
+/// (~2.75 MB at this model's FFN width).
+/// Tiled simdgroup-matrix GEMM for LFM2 prefill projections. Default ON; opt out
+/// with `CAMELID_LFM2_PREFILL_MM=0` to force the bit-exact batched GEMV.
+#[cfg(target_os = "macos")]
+pub(crate) fn lfm2_prefill_mm_enabled() -> bool {
+    !std::env::var("CAMELID_LFM2_PREFILL_MM").is_ok_and(|v| {
+        let v = v.trim();
+        v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn lfm2_metal_prefill_chunk() -> usize {
+    std::env::var("CAMELID_LFM2_METAL_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
+/// Whether the LFM2 resident Metal lane may be used. DEFAULT-ON; opt out with
+/// `CAMELID_LFM2_METAL=0` (also `off`/`false`/`no`/`disabled`, the documented
+/// opt-out convention).
+///
+/// This predicate MUST stay in lockstep with the execution-plan gate in
+/// `execution_plan.rs`. They answer the same question, and when they disagree
+/// `/v1/health` describes a lane other than the one that ran.
+#[cfg(target_os = "macos")]
+pub(crate) fn lfm2_metal_enabled() -> bool {
+    // Reuses the planner's own opt-out predicate rather than restating the value
+    // list. Restating it is how the two drift: an independently written list here
+    // already differed from the planner's on `no` and `cpu`, which would have let
+    // routing and disclosure disagree for those two values.
+    !std::env::var("CAMELID_LFM2_METAL")
+        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
+}
+
 #[cfg(target_os = "macos")]
 fn qwen35_metal_context_capacity() -> usize {
     std::env::var("CAMELID_QWEN35_METAL_MAXPOS")

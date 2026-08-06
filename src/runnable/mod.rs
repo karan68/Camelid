@@ -19,6 +19,8 @@ mod vision_cuda;
 
 pub use admit::{admit, AdmissionAxis, AdmissionOk, AdmissionReject, TokenizerFamily};
 pub use dequant::dequantize;
+#[cfg(target_os = "macos")]
+pub(crate) use model::lfm2_prefill_mm_enabled;
 pub use model::RunnableModel;
 pub use smoke::{headline_quant_of, oracle_qualified, smoke_admit, SmokeReport};
 pub use vision::{PrismVisionEmbedding, PrismVisionProjector};

@@ -582,6 +582,33 @@ pub fn plan_for_model_with_platform_and_env(
             "prism_low_bit_metal_resident_decode",
             "scalar_prism_block_decode_fallback",
         )
+    } else if has_q8_0_tensors
+        && is_lfm2_metal_arch(gguf)
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && !matches!(profile, ExecutionProfile::Safe)
+        && !planner_env.flag_disabled("CAMELID_LFM2_METAL")
+    {
+        // The lfm2 resident Metal graph. Without this arm lfm2 fell through every
+        // arm below to the safe path and `/v1/health` reported `cpu_reference` /
+        // `safe_cpu_decode` WHILE the Metal graph was serving. The gate reads only
+        // operator inputs -- never a plan-written variable, which is the latch that
+        // previously made a plan opt itself out on the second load. Default-on with
+        // a `=0` opt-out, matching `lfm2_metal_enabled` exactly -- if these two ever
+        // disagree, health reports a lane other than the one that ran.
+        reasons.push(
+            "lfm2 resident Metal lane selected; Q8_0 projections stay resident and the              short-conv ring plus the sparse KV cache live on device"
+                .into(),
+        );
+        (
+            "metal_resident_lfm2_runtime",
+            "metal_resident_q8_wire",
+            "lfm2_metal_resident_prefill",
+            "resident_tiled_mm_prefill",
+            "lfm2_metal_resident_decode",
+            "runnable_cpu_decode_fallback",
+        )
     } else if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(
@@ -1560,6 +1587,16 @@ fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
 /// Bonsai on Apple Silicon Metal and Windows CUDA. Sharing the generic predicate made `/v1/health`
 /// disclose `cpu_reference` even while the resident Qwen3.5 Metal graph was
 /// active.
+/// `lfm2` on the resident Metal lane.
+///
+/// Deliberately its own predicate rather than a shared `is_gpu_runnable_arch`:
+/// sharing a generic one is what previously let `/v1/health` disclose
+/// `cpu_reference` while a Metal graph was live. The gate below keys on exactly
+/// the inputs the ROUTING keys on, so the disclosure cannot drift from reality.
+fn is_lfm2_metal_arch(gguf: &GgufFile) -> bool {
+    gguf.architecture() == Some("lfm2")
+}
+
 fn is_prism_low_bit_metal_arch(gguf: &GgufFile) -> bool {
     let arch = gguf.architecture().unwrap_or("");
     if !matches!(arch, "qwen3" | "qwen35") {
@@ -2013,7 +2050,7 @@ fn default_thread_count() -> usize {
         .unwrap_or(1)
 }
 
-fn flag_value_disabled(value: &str) -> bool {
+pub(crate) fn flag_value_disabled(value: &str) -> bool {
     let value = value.trim();
     value.eq_ignore_ascii_case("0")
         || value.eq_ignore_ascii_case("off")
@@ -2071,6 +2108,32 @@ fn env_flag_enabled(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The lfm2 Metal lane is default-on, and ROUTING (`lfm2_metal_enabled`) must
+    /// agree with DISCLOSURE (the execution-plan arm) for every value of
+    /// `CAMELID_LFM2_METAL`. When they disagree `/v1/health` names a lane other
+    /// than the one that ran — which is what an independently-written opt-out list
+    /// here produced, differing from the planner's on `no` and `cpu`.
+    ///
+    /// Both now consult `flag_value_disabled`, so this pins that they stay shared
+    /// rather than merely happening to match today.
+    #[test]
+    fn lfm2_metal_routing_and_plan_gates_share_one_predicate() {
+        for v in [
+            "0", "off", "OFF", "false", "False", "disabled", "cpu", " 0 ",
+        ] {
+            assert!(
+                super::flag_value_disabled(v),
+                "{v:?} must read as an opt-out for BOTH gates"
+            );
+        }
+        for v in ["1", "on", "true", "yes", "", "metal", "anything-else"] {
+            assert!(
+                !super::flag_value_disabled(v),
+                "{v:?} must leave the default-on lane enabled for BOTH gates"
+            );
+        }
+    }
+
     use super::*;
     use crate::{
         gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor},

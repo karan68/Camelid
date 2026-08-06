@@ -98,6 +98,14 @@ struct MetalLinearKernel {
     gelu_mul_pipeline: ComputePipelineState,
     qwen35_l2_norm_pipeline: ComputePipelineState,
     qwen35_conv1d_pipeline: ComputePipelineState,
+    /// LFM2 short-convolution mixer. Built unconditionally so the kernel is
+    /// compiled and parity-checked on every macOS build; the LFM2 Metal engine
+    /// that dispatches it in a real forward is not wired yet, so outside tests
+    /// nothing reads this field.
+    #[allow(dead_code)]
+    lfm2_shortconv_pipeline: ComputePipelineState,
+    lfm2_shortconv_batch_pipeline: ComputePipelineState,
+    lfm2_shortconv_state_update_pipeline: ComputePipelineState,
     qwen35_delta_rule_pipeline: ComputePipelineState,
     qwen35_sigmoid_mul_pipeline: ComputePipelineState,
     qwen35_ssm_gates_pipeline: ComputePipelineState,
@@ -6582,6 +6590,134 @@ kernel void qwen35_conv1d(
     st[cm1 - 1] = x;
 }
 
+// LFM2 / LFM2.5 short-convolution mixer, one decode position.
+//
+// `bcx` is the `in_proj` output for this token: 3 * conv_dim floats laid out as
+// three contiguous chunks [B | C | X] (llama.cpp `src/models/lfm2.cpp`
+// build_shortconv_block views chunk 0 as b, 1 as c, 2 as x).
+//
+// Per channel c:
+//   bx      = B[c] * X[c]                                  the new time column
+//   acc     = SUM_t w[t] * window[t]                       causal depthwise conv1d,
+//                                                          window = [state.., bx],
+//                                                          oldest column at tap 0
+//   out[c]  = C[c] * acc                                   the C gate
+//   state  <- slide left, append bx
+//
+// Deliberately NOT `qwen35_conv1d`: that kernel applies SiLU to the accumulator
+// (`acc/(1+exp(-acc))`), which LFM2 must not — `ggml_ssm_conv` applies no
+// activation, and LFM2 gates by C instead. The weight/state indexing below is
+// otherwise identical, and matches the CPU reference in
+// src/runnable/model.rs (`forward_step_lfm2`) element for element.
+kernel void lfm2_shortconv(
+    device const float* bcx      [[buffer(0)]],
+    device const float* weights  [[buffer(1)]],
+    device float*       state    [[buffer(2)]],
+    device float*       output   [[buffer(3)]],
+    constant uint&      conv_dim [[buffer(4)]],
+    constant uint&      l_cache  [[buffer(5)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= conv_dim) return;
+    const uint cm1 = l_cache - 1;
+    device const float* w  = weights + ulong(c) * l_cache;
+    device float*       st = state   + ulong(c) * cm1;
+
+    const float b_v = bcx[c];
+    const float c_v = bcx[conv_dim + c];
+    const float x_v = bcx[2u * conv_dim + c];
+    const float bx  = b_v * x_v;
+
+    float acc = 0.0f;
+    for (uint t = 0; t < cm1; ++t) acc += w[t] * st[t];
+    acc += w[cm1] * bx;
+
+    output[c] = c_v * acc;
+
+    for (uint t = 0; t + 1 < cm1; ++t) st[t] = st[t + 1];
+    st[cm1 - 1] = bx;
+}
+
+
+// Batched LFM2 short convolution over `n_tokens` consecutive positions.
+//
+// `bcx` is the in_proj output for the whole chunk, row-major: row t at
+// `t * 3 * conv_dim`, laid out [B | C | X] within the row. `state` holds the
+// `l_cache - 1` pre-conv columns that PRECEDE the chunk (oldest at index 0) and is
+// read-only here — `lfm2_shortconv_state_update` advances it afterwards, so every
+// token in the chunk sees the same starting window regardless of dispatch order.
+//
+// bx(p) = B[p][c] * X[p][c] for p >= 0, and state[c*cm1 + p + cm1] for p < 0.
+// out[t][c] = C[t][c] * SUM_tap w[c*l_cache + tap] * bx(t - cm1 + tap)
+//
+// Accumulation is ascending in tap, matching the single-token kernel and the CPU
+// reference, so a chunked prefill is bit-identical to the same positions decoded
+// one at a time.
+kernel void lfm2_shortconv_batch(
+    device const float* bcx      [[buffer(0)]],
+    device const float* weights  [[buffer(1)]],
+    device const float* state    [[buffer(2)]],
+    device float*       output   [[buffer(3)]],
+    constant uint&      conv_dim [[buffer(4)]],
+    constant uint&      l_cache  [[buffer(5)]],
+    constant uint&      n_tokens [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint c = gid.x;
+    const uint t = gid.y;
+    if (c >= conv_dim || t >= n_tokens) return;
+    const uint cm1 = l_cache - 1;
+    device const float* w  = weights + ulong(c) * l_cache;
+    device const float* st = state   + ulong(c) * cm1;
+    const ulong row = ulong(3u) * conv_dim;
+
+    float acc = 0.0f;
+    for (uint tap = 0; tap < l_cache; ++tap) {
+        const int p = int(t) + int(tap) - int(cm1);
+        float bx;
+        if (p < 0) {
+            bx = st[uint(p + int(cm1))];
+        } else {
+            device const float* r = bcx + ulong(uint(p)) * row;
+            bx = r[c] * r[2u * conv_dim + c];
+        }
+        acc += w[tap] * bx;
+    }
+    device const float* rt = bcx + ulong(t) * row;
+    output[ulong(t) * conv_dim + c] = rt[conv_dim + c] * acc;
+}
+
+// Advance the rolling window past a chunk: the new state is the last `l_cache - 1`
+// pre-conv columns of the chunk, falling back to the incoming state when the chunk
+// is shorter than the window. Must run AFTER `lfm2_shortconv_batch`, which reads
+// the pre-chunk state; Metal's tracked-hazard ordering within one encoder gives
+// that for free.
+kernel void lfm2_shortconv_state_update(
+    device const float* bcx      [[buffer(0)]],
+    device float*       state    [[buffer(1)]],
+    constant uint&      conv_dim [[buffer(2)]],
+    constant uint&      l_cache  [[buffer(3)]],
+    constant uint&      n_tokens [[buffer(4)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= conv_dim) return;
+    const uint cm1 = l_cache - 1;
+    device float* st = state + ulong(c) * cm1;
+    const ulong row = ulong(3u) * conv_dim;
+
+    float next[8];              // l_cache - 1 is 2 on every published LFM2 row
+    for (uint j = 0; j < cm1; ++j) {
+        const int p = int(n_tokens) - int(cm1) + int(j);
+        if (p < 0) {
+            next[j] = st[uint(p + int(cm1))];
+        } else {
+            device const float* r = bcx + ulong(uint(p)) * row;
+            next[j] = r[c] * r[2u * conv_dim + c];
+        }
+    }
+    for (uint j = 0; j < cm1; ++j) st[j] = next[j];
+}
+
 kernel void qwen35_ssm_gates(
     device const float* beta_raw [[buffer(0)]],
     device const float* alpha_raw [[buffer(1)]],
@@ -6957,6 +7093,26 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let qwen35_conv1d_pipeline = device
                 .new_compute_pipeline_state_with_function(&qwen35_conv1d_function)
                 .ok()?;
+
+            let lfm2_shortconv_function = elementwise_library
+                .get_function("lfm2_shortconv", None)
+                .ok()?;
+            let lfm2_shortconv_pipeline = device
+                .new_compute_pipeline_state_with_function(&lfm2_shortconv_function)
+                .ok()?;
+            let lfm2_shortconv_batch_function = elementwise_library
+                .get_function("lfm2_shortconv_batch", None)
+                .ok()?;
+            let lfm2_shortconv_batch_pipeline = device
+                .new_compute_pipeline_state_with_function(&lfm2_shortconv_batch_function)
+                .ok()?;
+            let lfm2_shortconv_state_update_function = elementwise_library
+                .get_function("lfm2_shortconv_state_update", None)
+                .ok()?;
+            let lfm2_shortconv_state_update_pipeline = device
+                .new_compute_pipeline_state_with_function(&lfm2_shortconv_state_update_function)
+                .ok()?;
+
             let qwen35_delta_rule_function = elementwise_library
                 .get_function("qwen35_delta_rule", None)
                 .ok()?;
@@ -7608,6 +7764,9 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 gelu_mul_pipeline,
                 qwen35_l2_norm_pipeline,
                 qwen35_conv1d_pipeline,
+                lfm2_shortconv_pipeline,
+                lfm2_shortconv_batch_pipeline,
+                lfm2_shortconv_state_update_pipeline,
                 qwen35_delta_rule_pipeline,
                 qwen35_sigmoid_mul_pipeline,
                 qwen35_ssm_gates_pipeline,
@@ -18412,6 +18571,1288 @@ fn encode_qwen35_ffn(
     ]);
 }
 
+// ===================================================================================
+// LFM2 / LFM2.5 — GPU-resident Metal decode graph.
+//
+// Structurally the qwen35 hybrid engine with a different mixer: every layer wears the
+// same pre-norm 2-norm block (attn_norm -> mixer -> residual -> ffn_norm -> SwiGLU ->
+// residual), and each layer is EITHER a short convolution or GQA attention. Putting the
+// per-layer state inside the kind variant is what gives sparse KV for free: LFM2.5-2.6B
+// attends on only 8 of 30 layers, and the 22 conv layers simply have no cache buffers.
+//
+// LFM2's attention differs from qwen35's in exactly two ways, both by SUBTRACTION: there
+// is no fused query+gate projection (so no deinterleave) and no sigmoid output gate.
+// ===================================================================================
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(crate) struct Lfm2MetalConfig {
+    pub hidden: usize,
+    pub ffn_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    /// Short-conv kernel width (`lfm2.shortconv.l_cache`, 3). The rolling per-channel
+    /// state is `l_cache - 1` columns wide.
+    pub l_cache: usize,
+    pub vocab: usize,
+    pub eps: f32,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) enum Lfm2MetalLayerKindInput<'a> {
+    Attn {
+        q: ResidentWeightBytes<'a>,
+        k: ResidentWeightBytes<'a>,
+        v: ResidentWeightBytes<'a>,
+        output: ResidentWeightBytes<'a>,
+        q_norm: &'a [f32],
+        k_norm: &'a [f32],
+    },
+    Conv {
+        /// `shortconv.in_proj`: hidden -> 3 * hidden, laid out [B | C | X].
+        in_proj: ResidentWeightBytes<'a>,
+        out_proj: ResidentWeightBytes<'a>,
+        /// `shortconv.conv.weight`, channel-major `[hidden, l_cache]` flattened as
+        /// `conv[c * l_cache + tap]`.
+        conv: &'a [f32],
+    },
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct Lfm2MetalLayerInput<'a> {
+    pub attn_norm: &'a [f32],
+    pub ffn_norm: &'a [f32],
+    pub ffn_gate: ResidentWeightBytes<'a>,
+    pub ffn_up: ResidentWeightBytes<'a>,
+    pub ffn_down: ResidentWeightBytes<'a>,
+    pub kind: Lfm2MetalLayerKindInput<'a>,
+}
+
+#[cfg(target_os = "macos")]
+enum Lfm2MetalLayerKind {
+    Attn {
+        q: ResidentLinearWeight,
+        k: ResidentLinearWeight,
+        v: ResidentLinearWeight,
+        output: ResidentLinearWeight,
+        q_norm: Buffer,
+        k_norm: Buffer,
+        cache_k: Buffer,
+        cache_v: Buffer,
+    },
+    Conv {
+        in_proj: ResidentLinearWeight,
+        out_proj: ResidentLinearWeight,
+        conv: Buffer,
+        conv_state: Buffer,
+    },
+}
+
+#[cfg(target_os = "macos")]
+struct Lfm2MetalLayer {
+    attn_norm: Buffer,
+    ffn_norm: Buffer,
+    ffn_gate: ResidentLinearWeight,
+    ffn_up: ResidentLinearWeight,
+    ffn_down: ResidentLinearWeight,
+    kind: Lfm2MetalLayerKind,
+}
+
+/// Complete LFM2 token graph resident on Metal.
+#[cfg(target_os = "macos")]
+pub(crate) struct Lfm2MetalDecode {
+    config: Lfm2MetalConfig,
+    max_positions: usize,
+    layers: Vec<Lfm2MetalLayer>,
+    final_norm: Buffer,
+    output: ResidentLinearWeight,
+    hidden_a: Buffer,
+    hidden_b: Buffer,
+    filled: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl Lfm2MetalDecode {
+    pub(crate) fn new(
+        config: Lfm2MetalConfig,
+        inputs: &[Lfm2MetalLayerInput<'_>],
+        final_norm: &[f32],
+        output: ResidentWeightBytes<'_>,
+        max_positions: usize,
+    ) -> Option<Self> {
+        // Every guard returns None — a partially built engine must never exist,
+        // because the caller's fallback is a full CPU replay.
+        if config.hidden == 0
+            || !config.hidden.is_multiple_of(32)
+            || config.ffn_dim == 0
+            || config.head_dim == 0
+            || config.head_dim > 128
+            || !config.head_dim.is_multiple_of(2)
+            || config.rope_dim == 0
+            || config.rope_dim > config.head_dim
+            || !config.rope_dim.is_multiple_of(2)
+            || config.n_heads == 0
+            || config.n_kv_heads == 0
+            || !config.n_heads.is_multiple_of(config.n_kv_heads)
+            || config.n_heads * config.head_dim != config.hidden
+            || config.l_cache < 2
+            || config.vocab == 0
+            || final_norm.len() != config.hidden
+            || max_positions == 0
+            || !output.matches_shape(config.hidden, config.vocab)
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        let mut cache = metal_linear_cache().lock().ok()?;
+        let mut layers = Vec::with_capacity(inputs.len());
+        let mut attention_layers = 0usize;
+        for input in inputs {
+            if input.attn_norm.len() != config.hidden
+                || input.ffn_norm.len() != config.hidden
+                || !input.ffn_gate.matches_shape(config.hidden, config.ffn_dim)
+                || !input.ffn_up.matches_shape(config.hidden, config.ffn_dim)
+                || !input.ffn_down.matches_shape(config.ffn_dim, config.hidden)
+            {
+                return None;
+            }
+            let ffn_gate = resolve_resident_weight(&mut cache, &k.device, &input.ffn_gate, true)?;
+            let ffn_up = resolve_resident_weight(&mut cache, &k.device, &input.ffn_up, true)?;
+            let ffn_down = resolve_resident_weight(&mut cache, &k.device, &input.ffn_down, true)?;
+            let kind = match &input.kind {
+                Lfm2MetalLayerKindInput::Attn {
+                    q,
+                    k: kw,
+                    v,
+                    output,
+                    q_norm,
+                    k_norm,
+                } => {
+                    let q_dim = config.n_heads * config.head_dim;
+                    let kv_dim = config.n_kv_heads * config.head_dim;
+                    if q_norm.len() != config.head_dim
+                        || k_norm.len() != config.head_dim
+                        || !q.matches_shape(config.hidden, q_dim)
+                        || !kw.matches_shape(config.hidden, kv_dim)
+                        || !v.matches_shape(config.hidden, kv_dim)
+                        || !output.matches_shape(q_dim, config.hidden)
+                    {
+                        return None;
+                    }
+                    attention_layers += 1;
+                    Lfm2MetalLayerKind::Attn {
+                        q: resolve_resident_weight(&mut cache, &k.device, q, true)?,
+                        k: resolve_resident_weight(&mut cache, &k.device, kw, true)?,
+                        v: resolve_resident_weight(&mut cache, &k.device, v, true)?,
+                        output: resolve_resident_weight(&mut cache, &k.device, output, true)?,
+                        q_norm: qwen35_f32_buffer(k, q_norm),
+                        k_norm: qwen35_f32_buffer(k, k_norm),
+                        cache_k: qwen35_zero_buffer(
+                            k,
+                            config.n_kv_heads * max_positions * config.head_dim * 4,
+                        ),
+                        cache_v: qwen35_zero_buffer(
+                            k,
+                            config.n_kv_heads * max_positions * config.head_dim * 4,
+                        ),
+                    }
+                }
+                Lfm2MetalLayerKindInput::Conv {
+                    in_proj,
+                    out_proj,
+                    conv,
+                } => {
+                    if conv.len() != config.hidden * config.l_cache
+                        || !in_proj.matches_shape(config.hidden, 3 * config.hidden)
+                        || !out_proj.matches_shape(config.hidden, config.hidden)
+                    {
+                        return None;
+                    }
+                    Lfm2MetalLayerKind::Conv {
+                        in_proj: resolve_resident_weight(&mut cache, &k.device, in_proj, true)?,
+                        out_proj: resolve_resident_weight(&mut cache, &k.device, out_proj, true)?,
+                        conv: qwen35_f32_buffer(k, conv),
+                        conv_state: qwen35_zero_buffer(k, config.hidden * (config.l_cache - 1) * 4),
+                    }
+                }
+            };
+            layers.push(Lfm2MetalLayer {
+                attn_norm: qwen35_f32_buffer(k, input.attn_norm),
+                ffn_norm: qwen35_f32_buffer(k, input.ffn_norm),
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                kind,
+            });
+        }
+        // A schedule with no attention layer would leave RoPE and the KV cache
+        // meaningless; refuse rather than build a graph that cannot attend.
+        if layers.is_empty() || attention_layers == 0 {
+            return None;
+        }
+        let final_norm = qwen35_f32_buffer(k, final_norm);
+        let output = resolve_resident_weight(&mut cache, &k.device, &output, true)?;
+        let hidden_a = qwen35_zero_buffer(k, config.hidden * 4);
+        let hidden_b = qwen35_zero_buffer(k, config.hidden * 4);
+        Some(Self {
+            config,
+            max_positions,
+            layers,
+            final_norm,
+            output,
+            hidden_a,
+            hidden_b,
+            filled: 0,
+        })
+    }
+
+    /// Clear every per-sequence buffer: the KV caches on attention layers and the
+    /// rolling conv ring on conv layers. The ring MUST be zeroed — a stale window
+    /// silently corrupts the first `l_cache - 1` positions of the next request.
+    pub(crate) fn reset(&mut self) {
+        // SAFETY: every buffer here is StorageModeShared and owned by this engine,
+        // and `reset` is only reachable with no command buffer in flight.
+        let wipe = |b: &Buffer| unsafe {
+            std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize);
+        };
+        for layer in &self.layers {
+            match &layer.kind {
+                Lfm2MetalLayerKind::Attn {
+                    cache_k, cache_v, ..
+                } => {
+                    wipe(cache_k);
+                    wipe(cache_v);
+                }
+                Lfm2MetalLayerKind::Conv { conv_state, .. } => wipe(conv_state),
+            }
+        }
+        self.filled = 0;
+    }
+
+    /// One token through the whole resident stack. `position` must equal the number of
+    /// positions already consumed — the conv ring is order-dependent, so a skipped or
+    /// replayed position silently corrupts the state rather than erroring.
+    fn forward_select(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        selection: Qwen35MetalSelection,
+    ) -> Option<Qwen35MetalStep> {
+        let c = self.config;
+        if embedding.len() != c.hidden
+            || cos.len() != c.rope_dim / 2
+            || sin.len() != c.rope_dim / 2
+            || position != self.filled
+            || position >= self.max_positions
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        write_buffer_f32(&self.hidden_a, embedding);
+        let cos_buf = qwen35_f32_buffer(k, cos);
+        let sin_buf = qwen35_f32_buffer(k, sin);
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = vec![cos_buf.to_owned(), sin_buf.to_owned()];
+        for layer in &self.layers {
+            match &layer.kind {
+                Lfm2MetalLayerKind::Attn { .. } => encode_lfm2_attn_layer(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.hidden_a,
+                    &self.hidden_b,
+                    layer,
+                    &cos_buf,
+                    &sin_buf,
+                    c,
+                    self.max_positions,
+                    position,
+                ),
+                Lfm2MetalLayerKind::Conv { .. } => encode_lfm2_conv_layer(
+                    e,
+                    k,
+                    &mut keep,
+                    &self.hidden_a,
+                    &self.hidden_b,
+                    layer,
+                    c,
+                ),
+            }
+            encode_lfm2_ffn(e, k, &mut keep, &self.hidden_b, &self.hidden_a, layer, c);
+        }
+
+        let normed = pool_get(k, (c.hidden * 4) as u64);
+        let norm_scalar = pool_get(k, 8);
+        let logits = pool_get(k, (c.vocab * 4) as u64);
+        let mm_scalar = pool_get(k, 12);
+        unsafe {
+            let p = norm_scalar.contents() as *mut u8;
+            *(p as *mut u32) = c.hidden as u32;
+            *(p.add(4) as *mut f32) = c.eps;
+        }
+        encode_rms_norm_f32(
+            e,
+            k,
+            &self.hidden_a,
+            &self.final_norm,
+            &normed,
+            &norm_scalar,
+        );
+        encode_resident_matmul_f32(
+            e,
+            k,
+            &mut keep,
+            &normed,
+            &self.output,
+            &logits,
+            &mm_scalar,
+            c.hidden,
+            c.vocab,
+            1,
+        );
+        let greedy_buffers = if matches!(selection, Qwen35MetalSelection::Greedy) {
+            let selected = pool_get(k, 4);
+            let vocab_scalar = pool_get(k, 4);
+            unsafe { *(vocab_scalar.contents() as *mut u32) = c.vocab as u32 };
+            e.set_compute_pipeline_state(&k.argmax_f32_greedy_pipeline);
+            e.set_buffer(0, Some(&logits), 0);
+            e.set_buffer(1, Some(&selected), 0);
+            e.set_buffer(2, Some(&vocab_scalar), 0);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Some((selected, vocab_scalar))
+        } else {
+            None
+        };
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let output = match &greedy_buffers {
+            Some((selected, _)) => {
+                Qwen35MetalStep::Token(unsafe { *(selected.contents() as *const u32) })
+            }
+            None => {
+                let values = unsafe {
+                    std::slice::from_raw_parts(logits.contents() as *const f32, c.vocab).to_vec()
+                };
+                Qwen35MetalStep::Logits(values)
+            }
+        };
+        keep.extend([normed, norm_scalar, logits, mm_scalar]);
+        if let Some((selected, vocab_scalar)) = greedy_buffers {
+            keep.extend([selected, vocab_scalar]);
+        }
+        pool_recycle(k, keep);
+        self.filled += 1;
+        Some(output)
+    }
+
+    /// Prefill `k` consecutive positions in one command buffer.
+    ///
+    /// Every projection runs with `n_tokens = k`, so each weight is streamed ONCE
+    /// per chunk instead of once per token — that is the whole point, because 90%
+    /// of this model's per-token bytes are Q8_0 projections. Positional work that
+    /// genuinely differs per row (RoPE, the KV scatter, and the causal attention
+    /// span) stays per-row, exactly as `verify_batch_inner` does it.
+    ///
+    /// The LM head is skipped entirely: a prefill chunk's logits are discarded.
+    /// The caller feeds the final prompt token through `forward_select` to get the
+    /// first sampled position.
+    ///
+    /// Bit-identical to `k` sequential `forward_select` calls: the batched Q8 GEMV
+    /// is exact per column, `rms_norm_batch_f32` is equal per row, and the batched
+    /// conv preserves tap order and reads the pre-chunk state for every row.
+    fn forward_prefill_chunk(
+        &mut self,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        n_tokens: usize,
+    ) -> Option<()> {
+        let c = self.config;
+        let half = c.rope_dim / 2;
+        if n_tokens == 0
+            || embeddings.len() != n_tokens * c.hidden
+            || cos.len() != n_tokens * half
+            || sin.len() != n_tokens * half
+            || self.filled + n_tokens > self.max_positions
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        let base = self.filled;
+        let q_dim = c.n_heads * c.head_dim;
+        let kv_dim = c.n_kv_heads * c.head_dim;
+
+        // Tiled simdgroup-matrix GEMM for the prefill projections. The batched GEMV
+        // re-reads every weight block once per 8 columns; `q8_0_block_wire_mm` reads
+        // it once per 128 and stages both operands in threadgroup memory. It is NOT
+        // bit-identical to the GEMV (half operand staging + tile-MMA accumulation
+        // order), so it is gated and the greedy-parity fixtures are what admit it.
+        let mm_ok = crate::runnable::lfm2_prefill_mm_enabled()
+            && [3 * c.hidden, c.hidden, q_dim, kv_dim, c.ffn_dim]
+                .iter()
+                .all(|r| r.is_multiple_of(2 * PREFILL_MM_ROW_TILE))
+            && [c.hidden, q_dim, c.ffn_dim]
+                .iter()
+                .all(|w| w.is_multiple_of(32))
+            && threadgroup_alloc_fits(&k.device, PREFILL_MM_THREADGROUP_BYTES);
+        // The kernel's direct device loads read whole 128-token tiles, so the half
+        // activation panels are padded up to a tile. Padding rows only feed output
+        // columns past `n_rows_in`, which are never stored.
+        let pad = if mm_ok {
+            n_tokens.next_multiple_of(PREFILL_MM_TOKEN_TILE)
+        } else {
+            n_tokens
+        };
+
+        let big_a = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+        let big_b = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+        write_buffer_f32(&big_a, embeddings);
+        let cos_buf = qwen35_f32_buffer(k, cos);
+        let sin_buf = qwen35_f32_buffer(k, sin);
+
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut keep = vec![
+            big_a.to_owned(),
+            big_b.to_owned(),
+            cos_buf.to_owned(),
+            sin_buf.to_owned(),
+        ];
+
+        let norm_scalar = pool_get(k, 8);
+        unsafe {
+            let p = norm_scalar.contents() as *mut u8;
+            *(p as *mut u32) = c.hidden as u32;
+            *(p.add(4) as *mut f32) = c.eps;
+        }
+
+        // Half staging panels, one per contraction width the prefill uses. Zeroed so
+        // the padding tail is defined rather than whatever the pool handed back.
+        let (half_hidden, half_ffn, stage_counts) = if mm_ok {
+            let hh = pool_get(k, (pad * c.hidden * 2) as u64);
+            let hf = pool_get(k, (pad * c.ffn_dim * 2) as u64);
+            let counts = pool_get(k, 8);
+            unsafe {
+                std::ptr::write_bytes(hh.contents() as *mut u8, 0, pad * c.hidden * 2);
+                std::ptr::write_bytes(hf.contents() as *mut u8, 0, pad * c.ffn_dim * 2);
+                let p = counts.contents() as *mut u32;
+                *p = (n_tokens * c.hidden) as u32;
+                *p.add(1) = (n_tokens * c.ffn_dim) as u32;
+            }
+            (Some(hh), Some(hf), Some(counts))
+        } else {
+            (None, None, None)
+        };
+
+        // One projection. Uses the tiled MM when admitted, else the bit-exact batched
+        // GEMV. `in_width` selects which half panel stages the activation.
+        let gemm = |e: &metal::ComputeCommandEncoderRef,
+                    keep: &mut Vec<Buffer>,
+                    y: &Buffer,
+                    w: &ResidentLinearWeight,
+                    out: &Buffer,
+                    scalar: &Buffer,
+                    in_width: usize,
+                    rows: usize| {
+            if !mm_ok || w.format != ResidentWeightFormat::Q8_0 || !w.q8_wire {
+                encode_resident_matmul_f32(e, k, keep, y, w, out, scalar, in_width, rows, n_tokens);
+                return;
+            }
+            let (panel, count_off) = if in_width == c.ffn_dim {
+                (half_ffn.as_ref().expect("ffn panel"), 4u64)
+            } else {
+                (half_hidden.as_ref().expect("hidden panel"), 0u64)
+            };
+            let counts = stage_counts.as_ref().expect("stage counts");
+            e.set_compute_pipeline_state(&k.f32_to_f16_pipeline);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(1, Some(panel), 0);
+            e.set_buffer(2, Some(counts), count_off);
+            dispatch_1d(e, &k.f32_to_f16_pipeline, n_tokens * in_width);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = (in_width / 32) as u32;
+                *p.add(1) = rows as u32;
+                *p.add(2) = n_tokens as u32;
+            }
+            e.set_compute_pipeline_state(&k.q8_0_block_wire_mm_pipeline);
+            e.set_buffer(0, Some(panel), 0);
+            e.set_buffer(2, Some(&w.buffer), 0);
+            e.set_buffer(3, Some(out), 0);
+            e.set_buffer(4, Some(scalar), 0);
+            e.set_buffer(5, Some(scalar), 4);
+            e.set_buffer(6, Some(scalar), 8);
+            e.set_threadgroup_memory_length(0, PREFILL_MM_THREADGROUP_BYTES as u64);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (rows / PREFILL_MM_ROW_TILE) as u64,
+                    height: (n_tokens as u64).div_ceil(PREFILL_MM_TOKEN_TILE as u64),
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        };
+
+        for layer in &self.layers {
+            // ---- mixer ----
+            let normed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+            encode_rms_norm_batch(
+                k,
+                e,
+                &big_a,
+                &layer.attn_norm,
+                &normed,
+                &norm_scalar,
+                n_tokens,
+            );
+            let mix = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+
+            match &layer.kind {
+                Lfm2MetalLayerKind::Conv {
+                    in_proj,
+                    out_proj,
+                    conv,
+                    conv_state,
+                } => {
+                    let bcx = pool_get(k, (n_tokens * 3 * c.hidden * 4) as u64);
+                    let mixed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+                    let in_mm = pool_get(k, 12);
+                    let out_mm = pool_get(k, 12);
+                    let conv_scalar = pool_get(k, 12);
+                    unsafe {
+                        let s = conv_scalar.contents() as *mut u32;
+                        *s = c.hidden as u32;
+                        *s.add(1) = c.l_cache as u32;
+                        *s.add(2) = n_tokens as u32;
+                    }
+                    gemm(
+                        e,
+                        &mut keep,
+                        &normed,
+                        in_proj,
+                        &bcx,
+                        &in_mm,
+                        c.hidden,
+                        3 * c.hidden,
+                    );
+                    e.set_compute_pipeline_state(&k.lfm2_shortconv_batch_pipeline);
+                    e.set_buffer(0, Some(&bcx), 0);
+                    e.set_buffer(1, Some(conv), 0);
+                    e.set_buffer(2, Some(conv_state), 0);
+                    e.set_buffer(3, Some(&mixed), 0);
+                    e.set_buffer(4, Some(&conv_scalar), 0);
+                    e.set_buffer(5, Some(&conv_scalar), 4);
+                    e.set_buffer(6, Some(&conv_scalar), 8);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: (c.hidden as u64).div_ceil(32),
+                            height: n_tokens as u64,
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    // Advance the ring only after every row has read the pre-chunk state.
+                    e.set_compute_pipeline_state(&k.lfm2_shortconv_state_update_pipeline);
+                    e.set_buffer(0, Some(&bcx), 0);
+                    e.set_buffer(1, Some(conv_state), 0);
+                    e.set_buffer(2, Some(&conv_scalar), 0);
+                    e.set_buffer(3, Some(&conv_scalar), 4);
+                    e.set_buffer(4, Some(&conv_scalar), 8);
+                    dispatch_1d(e, &k.lfm2_shortconv_state_update_pipeline, c.hidden);
+                    gemm(
+                        e, &mut keep, &mixed, out_proj, &mix, &out_mm, c.hidden, c.hidden,
+                    );
+                    keep.extend([bcx, mixed, in_mm, out_mm, conv_scalar]);
+                }
+                Lfm2MetalLayerKind::Attn {
+                    q: qw,
+                    k: kw,
+                    v: vw,
+                    output: ow,
+                    q_norm,
+                    k_norm,
+                    cache_k,
+                    cache_v,
+                } => {
+                    let query = pool_get(k, (n_tokens * q_dim * 4) as u64);
+                    let key = pool_get(k, (n_tokens * kv_dim * 4) as u64);
+                    let value = pool_get(k, (n_tokens * kv_dim * 4) as u64);
+                    let context = pool_get(k, (n_tokens * q_dim * 4) as u64);
+                    let q_mm = pool_get(k, 12);
+                    let kv_mm = pool_get(k, 12);
+                    let o_mm = pool_get(k, 12);
+                    let qk_norm_scalar = pool_get(k, 12);
+                    let mirror_flag = pool_get(k, 4);
+                    unsafe {
+                        let n = qk_norm_scalar.contents() as *mut u8;
+                        *(n as *mut u32) = c.head_dim as u32;
+                        *(n.add(4) as *mut f32) = c.eps;
+                        *(n.add(8) as *mut u32) = 1;
+                        *(mirror_flag.contents() as *mut u32) = 0;
+                    }
+                    gemm(e, &mut keep, &normed, qw, &query, &q_mm, c.hidden, q_dim);
+                    gemm(e, &mut keep, &normed, kw, &key, &kv_mm, c.hidden, kv_dim);
+                    gemm(e, &mut keep, &normed, vw, &value, &kv_mm, c.hidden, kv_dim);
+                    // Per row from here: RoPE angle, cache slot and causal span all
+                    // differ by position.
+                    for i in 0..n_tokens {
+                        let pos = base + i;
+                        let q_off = (i * q_dim * 4) as u64;
+                        let kv_off = (i * kv_dim * 4) as u64;
+                        encode_rms_norm_per_head(
+                            e,
+                            k,
+                            &query,
+                            q_norm,
+                            &query,
+                            &qk_norm_scalar,
+                            c.n_heads,
+                            q_off,
+                        );
+                        encode_rms_norm_per_head(
+                            e,
+                            k,
+                            &key,
+                            k_norm,
+                            &key,
+                            &qk_norm_scalar,
+                            c.n_kv_heads,
+                            kv_off,
+                        );
+                        let q_rope = pool_get(k, 16);
+                        let k_rope = pool_get(k, 16);
+                        let scatter_scalar = pool_get(k, 16);
+                        let attn_scalar = pool_get(k, 32);
+                        let filled = pos + 1;
+                        unsafe {
+                            let set_rope = |buffer: &Buffer, heads: usize| {
+                                let r = buffer.contents() as *mut u32;
+                                *r = heads as u32;
+                                *r.add(1) = c.head_dim as u32;
+                                *r.add(2) = half as u32;
+                                *r.add(3) = 1;
+                            };
+                            set_rope(&q_rope, c.n_heads);
+                            set_rope(&k_rope, c.n_kv_heads);
+                            let sc = scatter_scalar.contents() as *mut u32;
+                            *sc = c.head_dim as u32;
+                            *sc.add(1) = self.max_positions as u32;
+                            *sc.add(2) = pos as u32;
+                            *sc.add(3) = kv_dim as u32;
+                            let a = attn_scalar.contents() as *mut u8;
+                            *(a as *mut u32) = c.n_heads as u32;
+                            *(a.add(4) as *mut u32) = c.head_dim as u32;
+                            *(a.add(8) as *mut u32) = filled as u32;
+                            *(a.add(12) as *mut u32) = (c.n_heads / c.n_kv_heads) as u32;
+                            *(a.add(16) as *mut f32) = 1.0 / (c.head_dim as f32).sqrt();
+                            *(a.add(20) as *mut u32) = c.head_dim as u32;
+                            *(a.add(24) as *mut u32) = (self.max_positions * c.head_dim) as u32;
+                            *(a.add(28) as *mut u32) = 0;
+                        }
+                        let row_cos = (i * half * 4) as u64;
+                        encode_rope(
+                            e, k, &query, &cos_buf, &sin_buf, &q_rope, c.n_heads, half, q_off,
+                            row_cos,
+                        );
+                        encode_rope(
+                            e,
+                            k,
+                            &key,
+                            &cos_buf,
+                            &sin_buf,
+                            &k_rope,
+                            c.n_kv_heads,
+                            half,
+                            kv_off,
+                            row_cos,
+                        );
+                        e.set_compute_pipeline_state(&k.kv_scatter_pipeline);
+                        e.set_buffer(0, Some(&key), kv_off);
+                        e.set_buffer(1, Some(&value), kv_off);
+                        e.set_buffer(2, Some(cache_k), 0);
+                        e.set_buffer(3, Some(cache_v), 0);
+                        e.set_buffer(4, Some(&scatter_scalar), 0);
+                        e.set_buffer(5, Some(&scatter_scalar), 4);
+                        e.set_buffer(6, Some(&scatter_scalar), 8);
+                        e.set_buffer(7, Some(&scatter_scalar), 12);
+                        e.set_buffer(8, Some(&scatter_scalar), 0);
+                        e.set_buffer(9, Some(&scatter_scalar), 0);
+                        e.set_buffer(10, Some(&mirror_flag), 0);
+                        dispatch_1d(e, &k.kv_scatter_pipeline, kv_dim);
+                        let scores = pool_get(k, (c.n_heads * filled * 4) as u64);
+                        encode_attention(
+                            e,
+                            k,
+                            &mut keep,
+                            &query,
+                            cache_k,
+                            cache_v,
+                            None,
+                            &scores,
+                            &context,
+                            &attn_scalar,
+                            c.n_heads,
+                            c.n_kv_heads,
+                            c.head_dim,
+                            filled,
+                            q_off,
+                            q_off,
+                        );
+                        keep.extend([q_rope, k_rope, scatter_scalar, attn_scalar, scores]);
+                    }
+                    gemm(e, &mut keep, &context, ow, &mix, &o_mm, q_dim, c.hidden);
+                    keep.extend([
+                        query,
+                        key,
+                        value,
+                        context,
+                        q_mm,
+                        kv_mm,
+                        o_mm,
+                        qk_norm_scalar,
+                        mirror_flag,
+                    ]);
+                }
+            }
+
+            let n_hidden = pool_get(k, 4);
+            unsafe { *(n_hidden.contents() as *mut u32) = (n_tokens * c.hidden) as u32 };
+            encode_binary(
+                e,
+                &k.residual_add_pipeline,
+                &big_a,
+                &mix,
+                &big_b,
+                &n_hidden,
+                n_tokens * c.hidden,
+            );
+
+            // ---- FFN ----
+            let fnormed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+            let gate = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+            let up = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+            let act = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+            let down = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+            let hidden_mm = pool_get(k, 12);
+            let down_mm = pool_get(k, 12);
+            let n_ffn = pool_get(k, 4);
+            unsafe { *(n_ffn.contents() as *mut u32) = (n_tokens * c.ffn_dim) as u32 };
+            encode_rms_norm_batch(
+                k,
+                e,
+                &big_b,
+                &layer.ffn_norm,
+                &fnormed,
+                &norm_scalar,
+                n_tokens,
+            );
+            gemm(
+                e,
+                &mut keep,
+                &fnormed,
+                &layer.ffn_gate,
+                &gate,
+                &hidden_mm,
+                c.hidden,
+                c.ffn_dim,
+            );
+            gemm(
+                e,
+                &mut keep,
+                &fnormed,
+                &layer.ffn_up,
+                &up,
+                &hidden_mm,
+                c.hidden,
+                c.ffn_dim,
+            );
+            encode_binary(
+                e,
+                &k.silu_mul_pipeline,
+                &gate,
+                &up,
+                &act,
+                &n_ffn,
+                n_tokens * c.ffn_dim,
+            );
+            gemm(
+                e,
+                &mut keep,
+                &act,
+                &layer.ffn_down,
+                &down,
+                &down_mm,
+                c.ffn_dim,
+                c.hidden,
+            );
+            encode_binary(
+                e,
+                &k.residual_add_pipeline,
+                &big_b,
+                &down,
+                &big_a,
+                &n_hidden,
+                n_tokens * c.hidden,
+            );
+            keep.extend([
+                normed, mix, fnormed, gate, up, act, down, hidden_mm, down_mm, n_ffn, n_hidden,
+            ]);
+        }
+
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        keep.push(norm_scalar);
+        pool_recycle(k, keep);
+        self.filled += n_tokens;
+        Some(())
+    }
+
+    /// Chunked prompt prefill. Returns once every prompt position EXCEPT the last
+    /// has been consumed; the caller runs the last one through a normal step so it
+    /// produces logits.
+    pub(crate) fn prefill_prompt(
+        &mut self,
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        n_tokens: usize,
+        chunk: usize,
+    ) -> Option<()> {
+        let c = self.config;
+        let half = c.rope_dim / 2;
+        let chunk = chunk.max(1);
+        let mut done = 0usize;
+        while done < n_tokens {
+            let take = chunk.min(n_tokens - done);
+            self.forward_prefill_chunk(
+                &embeddings[done * c.hidden..(done + take) * c.hidden],
+                &cos[done * half..(done + take) * half],
+                &sin[done * half..(done + take) * half],
+                take,
+            )?;
+            done += take;
+        }
+        Some(())
+    }
+
+    /// Advance one position and return the greedy token id.
+    pub(crate) fn step_greedy(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+    ) -> Option<u32> {
+        match self.forward_select(embedding, cos, sin, position, Qwen35MetalSelection::Greedy)? {
+            Qwen35MetalStep::Token(t) => Some(t),
+            Qwen35MetalStep::Logits(_) => None,
+        }
+    }
+
+    /// Advance one position and return the full logits row (for sampled requests).
+    pub(crate) fn step_logits(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+    ) -> Option<Vec<f32>> {
+        match self.forward_select(embedding, cos, sin, position, Qwen35MetalSelection::Logits)? {
+            Qwen35MetalStep::Logits(v) => Some(v),
+            Qwen35MetalStep::Token(_) => None,
+        }
+    }
+}
+
+/// LFM2 short-convolution layer: attn_norm -> in_proj -> shortconv -> out_proj -> residual.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_lfm2_conv_layer(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Lfm2MetalLayer,
+    c: Lfm2MetalConfig,
+) {
+    let Lfm2MetalLayerKind::Conv {
+        in_proj,
+        out_proj,
+        conv,
+        conv_state,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let bcx = pool_get(k, (3 * c.hidden * 4) as u64);
+    let mixed = pool_get(k, (c.hidden * 4) as u64);
+    let mix = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let in_mm = pool_get(k, 12);
+    let out_mm = pool_get(k, 12);
+    let conv_scalar = pool_get(k, 8);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        let s = conv_scalar.contents() as *mut u32;
+        *s = c.hidden as u32;
+        *s.add(1) = c.l_cache as u32;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.attn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        in_proj,
+        &bcx,
+        &in_mm,
+        c.hidden,
+        3 * c.hidden,
+        1,
+    );
+    e.set_compute_pipeline_state(&k.lfm2_shortconv_pipeline);
+    e.set_buffer(0, Some(&bcx), 0);
+    e.set_buffer(1, Some(conv), 0);
+    e.set_buffer(2, Some(conv_state), 0);
+    e.set_buffer(3, Some(&mixed), 0);
+    e.set_buffer(4, Some(&conv_scalar), 0);
+    e.set_buffer(5, Some(&conv_scalar), 4);
+    dispatch_1d(e, &k.lfm2_shortconv_pipeline, c.hidden);
+    encode_resident_matmul_f32(
+        e, k, keep, &mixed, out_proj, &mix, &out_mm, c.hidden, c.hidden, 1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        bcx,
+        mixed,
+        mix,
+        norm_scalar,
+        in_mm,
+        out_mm,
+        conv_scalar,
+        n_hidden,
+    ]);
+}
+
+/// LFM2 GQA attention layer. `encode_qwen35_full_layer` minus the fused query+gate
+/// projection (LFM2's `attn_q` is plain `hidden -> q_dim`) and minus the sigmoid output
+/// gate. QK-norm runs BEFORE RoPE, per llama.cpp `src/models/lfm2.cpp` build_attn_block.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_lfm2_attn_layer(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Lfm2MetalLayer,
+    cos: &Buffer,
+    sin: &Buffer,
+    c: Lfm2MetalConfig,
+    max_positions: usize,
+    position: usize,
+) {
+    let Lfm2MetalLayerKind::Attn {
+        q: q_weight,
+        k: k_weight,
+        v: v_weight,
+        output: o_weight,
+        q_norm,
+        k_norm,
+        cache_k,
+        cache_v,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let q_dim = c.n_heads * c.head_dim;
+    let kv_dim = c.n_kv_heads * c.head_dim;
+    let filled = position + 1;
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let query = pool_get(k, (q_dim * 4) as u64);
+    let key = pool_get(k, (kv_dim * 4) as u64);
+    let value = pool_get(k, (kv_dim * 4) as u64);
+    let scores = pool_get(k, (c.n_heads * filled * 4) as u64);
+    let context = pool_get(k, (q_dim * 4) as u64);
+    let mix = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let q_mm = pool_get(k, 12);
+    let kv_mm = pool_get(k, 12);
+    let o_mm = pool_get(k, 12);
+    let qk_norm_scalar = pool_get(k, 12);
+    let q_rope = pool_get(k, 16);
+    let k_rope = pool_get(k, 16);
+    let scatter_scalar = pool_get(k, 16);
+    let mirror_flag = pool_get(k, 4);
+    let attn_scalar = pool_get(k, 32);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        let n = qk_norm_scalar.contents() as *mut u8;
+        *(n as *mut u32) = c.head_dim as u32;
+        *(n.add(4) as *mut f32) = c.eps;
+        *(n.add(8) as *mut u32) = 1;
+        let set_rope = |buffer: &Buffer, heads: usize| {
+            let r = buffer.contents() as *mut u32;
+            *r = heads as u32;
+            *r.add(1) = c.head_dim as u32;
+            *r.add(2) = (c.rope_dim / 2) as u32;
+            // pairing = 1 => NEOX split-half, which llama.cpp assigns LLM_ARCH_LFM2.
+            *r.add(3) = 1;
+        };
+        set_rope(&q_rope, c.n_heads);
+        set_rope(&k_rope, c.n_kv_heads);
+        let sc = scatter_scalar.contents() as *mut u32;
+        *sc = c.head_dim as u32;
+        *sc.add(1) = max_positions as u32;
+        *sc.add(2) = position as u32;
+        *sc.add(3) = kv_dim as u32;
+        *(mirror_flag.contents() as *mut u32) = 0;
+        let a = attn_scalar.contents() as *mut u8;
+        *(a as *mut u32) = c.n_heads as u32;
+        *(a.add(4) as *mut u32) = c.head_dim as u32;
+        *(a.add(8) as *mut u32) = filled as u32;
+        *(a.add(12) as *mut u32) = (c.n_heads / c.n_kv_heads) as u32;
+        *(a.add(16) as *mut f32) = 1.0 / (c.head_dim as f32).sqrt();
+        *(a.add(20) as *mut u32) = c.head_dim as u32;
+        *(a.add(24) as *mut u32) = (max_positions * c.head_dim) as u32;
+        *(a.add(28) as *mut u32) = 0;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.attn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, q_weight, &query, &q_mm, c.hidden, q_dim, 1,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, k_weight, &key, &kv_mm, c.hidden, kv_dim, 1,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &normed, v_weight, &value, &kv_mm, c.hidden, kv_dim, 1,
+    );
+    encode_rms_norm_per_head(e, k, &query, q_norm, &query, &qk_norm_scalar, c.n_heads, 0);
+    encode_rms_norm_per_head(e, k, &key, k_norm, &key, &qk_norm_scalar, c.n_kv_heads, 0);
+    encode_rope(
+        e,
+        k,
+        &query,
+        cos,
+        sin,
+        &q_rope,
+        c.n_heads,
+        c.rope_dim / 2,
+        0,
+        0,
+    );
+    encode_rope(
+        e,
+        k,
+        &key,
+        cos,
+        sin,
+        &k_rope,
+        c.n_kv_heads,
+        c.rope_dim / 2,
+        0,
+        0,
+    );
+    e.set_compute_pipeline_state(&k.kv_scatter_pipeline);
+    e.set_buffer(0, Some(&key), 0);
+    e.set_buffer(1, Some(&value), 0);
+    e.set_buffer(2, Some(cache_k), 0);
+    e.set_buffer(3, Some(cache_v), 0);
+    e.set_buffer(4, Some(&scatter_scalar), 0);
+    e.set_buffer(5, Some(&scatter_scalar), 4);
+    e.set_buffer(6, Some(&scatter_scalar), 8);
+    e.set_buffer(7, Some(&scatter_scalar), 12);
+    e.set_buffer(8, Some(&scatter_scalar), 0);
+    e.set_buffer(9, Some(&scatter_scalar), 0);
+    e.set_buffer(10, Some(&mirror_flag), 0);
+    dispatch_1d(e, &k.kv_scatter_pipeline, kv_dim);
+    encode_attention(
+        e,
+        k,
+        keep,
+        &query,
+        cache_k,
+        cache_v,
+        None,
+        &scores,
+        &context,
+        &attn_scalar,
+        c.n_heads,
+        c.n_kv_heads,
+        c.head_dim,
+        filled,
+        0,
+        0,
+    );
+    encode_resident_matmul_f32(
+        e, k, keep, &context, o_weight, &mix, &o_mm, q_dim, c.hidden, 1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        query,
+        key,
+        value,
+        scores,
+        context,
+        mix,
+        norm_scalar,
+        q_mm,
+        kv_mm,
+        o_mm,
+        qk_norm_scalar,
+        q_rope,
+        k_rope,
+        scatter_scalar,
+        mirror_flag,
+        attn_scalar,
+        n_hidden,
+    ]);
+}
+
+/// LFM2 SwiGLU FFN — `encode_qwen35_ffn` with `post_attn_norm` renamed to `ffn_norm`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_lfm2_ffn(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Lfm2MetalLayer,
+    c: Lfm2MetalConfig,
+) {
+    let normed = pool_get(k, (c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let gate = pool_get(k, (c.ffn_dim * 4) as u64);
+    let up = pool_get(k, (c.ffn_dim * 4) as u64);
+    let act = pool_get(k, (c.ffn_dim * 4) as u64);
+    let down = pool_get(k, (c.hidden * 4) as u64);
+    let hidden_mm = pool_get(k, 12);
+    let down_mm = pool_get(k, 12);
+    let n_ffn = pool_get(k, 4);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        *(n_ffn.contents() as *mut u32) = c.ffn_dim as u32;
+        *(n_hidden.contents() as *mut u32) = c.hidden as u32;
+    }
+    encode_rms_norm_f32(e, k, input, &layer.ffn_norm, &normed, &norm_scalar);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        &layer.ffn_gate,
+        &gate,
+        &hidden_mm,
+        c.hidden,
+        c.ffn_dim,
+        1,
+    );
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &normed,
+        &layer.ffn_up,
+        &up,
+        &hidden_mm,
+        c.hidden,
+        c.ffn_dim,
+        1,
+    );
+    encode_binary(e, &k.silu_mul_pipeline, &gate, &up, &act, &n_ffn, c.ffn_dim);
+    encode_resident_matmul_f32(
+        e,
+        k,
+        keep,
+        &act,
+        &layer.ffn_down,
+        &down,
+        &down_mm,
+        c.ffn_dim,
+        c.hidden,
+        1,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &down,
+        output,
+        &n_hidden,
+        c.hidden,
+    );
+    keep.extend([
+        normed,
+        norm_scalar,
+        gate,
+        up,
+        act,
+        down,
+        hidden_mm,
+        down_mm,
+        n_ffn,
+        n_hidden,
+    ]);
+}
+
 /// Hand out a scratch buffer of at least `bytes` from the recycle pool, or allocate a
 /// fresh one at the pool's power-of-two class size. Pool-derived buffers are owned by the
 /// per-token `keep` vec and MUST come back via `pool_recycle` only after the command
@@ -25084,6 +26525,173 @@ mod tests {
     /// Packed-wire correctness gate for all Prism text quant formats. This
     /// drives the production resident projection encoder for decode and batched
     /// prefill, comparing against the scalar decoders rather than another GPU
+    /// LFM2 short-conv kernel vs a literal transcription of the CPU reference in
+    /// `src/runnable/model.rs`'s `forward_step_lfm2`.
+    ///
+    /// Runs 8 SEQUENTIAL positions so the rolling ring actually rolls — a
+    /// single-position fixture passes even if the state is never read or never
+    /// advanced. Model-free, so CI defends this forever.
+    ///
+    /// Three non-vacuity guards, each aimed at a defect that is INVISIBLE to
+    /// token identity because it perturbs a recurrent state rather than a logit:
+    /// * zeroing C must zero the output — proves the C gate is applied.
+    /// * zeroing tap 0 must change the output only from position >= cm1 — proves
+    ///   the rolling ring is actually read.
+    /// * reversing the taps must change the output — proves tap ORDER, the single
+    ///   most likely silent-wrong-answer bug.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_lfm2_shortconv_matches_cpu_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal pipelines");
+        let device = &kernel.device;
+
+        const CONV_DIM: usize = 2048; // LFM2.5-2.6B n_embd
+        const L_CACHE: usize = 3;
+        const CM1: usize = L_CACHE - 1;
+        const STEPS: usize = 8;
+
+        // Deterministic, sign-varied, and NOT symmetric across taps.
+        let weights: Vec<f32> = (0..CONV_DIM * L_CACHE)
+            .map(|i| (((i * 31 + 7) % 97) as f32 - 48.0) * 0.015_625)
+            .collect();
+        let bcx: Vec<Vec<f32>> = (0..STEPS)
+            .map(|s| {
+                (0..3 * CONV_DIM)
+                    .map(|i| (((i * 17 + s * 53 + 3) % 89) as f32 - 44.0) * 0.031_25)
+                    .collect()
+            })
+            .collect();
+
+        // CPU reference: transcribed from `forward_step_lfm2`.
+        let cpu_run = |w: &[f32]| -> Vec<Vec<f32>> {
+            let mut st = vec![0.0f32; CONV_DIM * CM1];
+            let mut outs = Vec::new();
+            for step in bcx.iter().take(STEPS) {
+                let mut y = vec![0.0f32; CONV_DIM];
+                for c in 0..CONV_DIM {
+                    let bx = step[c] * step[2 * CONV_DIM + c];
+                    let kw = &w[c * L_CACHE..(c + 1) * L_CACHE];
+                    let s = &mut st[c * CM1..(c + 1) * CM1];
+                    let mut acc = 0.0f32;
+                    for (t, sv) in s.iter().enumerate() {
+                        acc += kw[t] * *sv;
+                    }
+                    acc += kw[CM1] * bx;
+                    y[c] = step[CONV_DIM + c] * acc;
+                    for t in 0..CM1 - 1 {
+                        s[t] = s[t + 1];
+                    }
+                    s[CM1 - 1] = bx;
+                }
+                outs.push(y);
+            }
+            outs
+        };
+
+        let f32_buf = |v: &[f32]| {
+            device.new_buffer_with_data(
+                v.as_ptr() as *const _,
+                (v.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let gpu_run = |w: &[f32], feed: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            let w_buf = f32_buf(w);
+            let state = f32_buf(&vec![0.0f32; CONV_DIM * CM1]);
+            let out_buf = f32_buf(&vec![0.0f32; CONV_DIM]);
+            let scalars = f32_buf(&[0.0f32, 0.0]);
+            unsafe {
+                let p = scalars.contents() as *mut u32;
+                *p = CONV_DIM as u32;
+                *p.add(1) = L_CACHE as u32;
+            }
+            let queue = device.new_command_queue();
+            let mut outs = Vec::new();
+            for step in feed.iter() {
+                let in_buf = f32_buf(step);
+                let cmd = queue.new_command_buffer();
+                let e = cmd.new_compute_command_encoder();
+                e.set_compute_pipeline_state(&kernel.lfm2_shortconv_pipeline);
+                e.set_buffer(0, Some(&in_buf), 0);
+                e.set_buffer(1, Some(&w_buf), 0);
+                e.set_buffer(2, Some(&state), 0);
+                e.set_buffer(3, Some(&out_buf), 0);
+                e.set_buffer(4, Some(&scalars), 0);
+                e.set_buffer(5, Some(&scalars), 4);
+                dispatch_1d(e, &kernel.lfm2_shortconv_pipeline, CONV_DIM);
+                e.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                let mut got = vec![0.0f32; CONV_DIM];
+                read_buffer_f32(&out_buf, &mut got);
+                outs.push(got);
+            }
+            outs
+        };
+
+        let want = cpu_run(&weights);
+        let got = gpu_run(&weights, &bcx);
+        let mut max_abs = 0.0f32;
+        for (s, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                let d = (x - y).abs();
+                assert!(
+                    d < 1.0e-3,
+                    "step {s} channel {i}: cpu {x} vs gpu {y} (delta {d})"
+                );
+                max_abs = max_abs.max(d);
+            }
+        }
+        eprintln!("[lfm2_shortconv] {STEPS} positions, max_abs_diff={max_abs:.3e}");
+
+        // Guard 1: C == 0 must zero the output.
+        let zero_c: Vec<Vec<f32>> = bcx
+            .iter()
+            .map(|s| {
+                let mut v = s.clone();
+                for x in v[CONV_DIM..2 * CONV_DIM].iter_mut() {
+                    *x = 0.0;
+                }
+                v
+            })
+            .collect();
+        assert!(
+            gpu_run(&weights, &zero_c)
+                .iter()
+                .all(|row| row.iter().all(|v| *v == 0.0)),
+            "zeroing C must zero the output — the C gate is not being applied"
+        );
+
+        // Guard 2: zeroing tap 0 (the OLDEST cached column) must leave position 0
+        // untouched (its window is all-zero state) and change later positions.
+        let mut w_tap0 = weights.clone();
+        for c in 0..CONV_DIM {
+            w_tap0[c * L_CACHE] = 0.0;
+        }
+        let got_tap0 = gpu_run(&w_tap0, &bcx);
+        assert_eq!(
+            got_tap0[0], got[0],
+            "tap 0 multiplies only cached state, so position 0 must be unchanged"
+        );
+        assert!(
+            got_tap0[CM1] != got[CM1],
+            "zeroing tap 0 must change position {CM1} — the ring is not being read"
+        );
+
+        // Guard 3: reversing the taps must change the output.
+        let mut w_rev = weights.clone();
+        for c in 0..CONV_DIM {
+            w_rev[c * L_CACHE..(c + 1) * L_CACHE].reverse();
+        }
+        assert!(
+            gpu_run(&w_rev, &bcx)[STEPS - 1] != got[STEPS - 1],
+            "reversing the conv taps must change the output — tap ORDER is unverified"
+        );
+    }
+
     /// implementation.
     #[cfg(target_os = "macos")]
     #[test]
