@@ -894,6 +894,28 @@ enum FabricAction {
         #[arg(long)]
         json: bool,
     },
+    /// Run a resident HTTP proxy in front of the fabric.
+    ///
+    /// Every request to `/v1/chat/completions` is placed and forwarded through
+    /// the same `Fabric::dispatch` path `fabric run` uses, so a client can point
+    /// at one address instead of the operator invoking the CLI per request.
+    /// Streaming is refused with 400, the same as the CLI path.
+    Serve {
+        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        nodes: Vec<String>,
+        #[arg(long, default_value = "127.0.0.1:8282")]
+        addr: SocketAddr,
+        /// Default placement mode; a client can still request affinity to a
+        /// specific node via the `x-camelid-fabric-sticky` request header.
+        #[arg(long, default_value = "throughput")]
+        mode: String,
+        /// Per-node health probe budget.
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+        /// Budget for the generation itself, which can legitimately take minutes.
+        #[arg(long, default_value_t = 300)]
+        forward_timeout_s: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2510,6 +2532,29 @@ async fn main() -> anyhow::Result<()> {
                         answer.status
                     );
                 }
+            }
+            FabricAction::Serve {
+                nodes,
+                addr,
+                mode,
+                timeout_ms,
+                forward_timeout_s,
+            } => {
+                let mode = route_mode(&mode)?;
+                let specs = camelid::fabric::parse_fabric(&nodes)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let fabric = camelid::fabric::Fabric::new(specs)
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+                println!("fabric serve listening on {addr}");
+                camelid::fabric::server::serve(
+                    addr,
+                    fabric,
+                    camelid::fabric::server::ServeConfig {
+                        mode,
+                        forward_timeout: std::time::Duration::from_secs(forward_timeout_s),
+                    },
+                )
+                .await?;
             }
         },
         Command::Inspect { path } => {
