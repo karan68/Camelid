@@ -39,7 +39,7 @@ enum RawMatBytes {
     /// their bytes instead of duplicating the largest matrix in the model.
     Owned(Arc<Vec<u8>>),
     /// Page-aligned packed backing. Metal wraps this allocation with
-    /// `newBufferWithBytesNoCopy`, so a Q1/Q2 projection has one resident copy.
+    /// `newBufferWithBytesNoCopy`, so a Q1/Q2 or Q8_0 projection has one resident copy.
     WirePages(Arc<crate::wire_mmap::WirePages>),
 }
 
@@ -4408,6 +4408,135 @@ impl RunnableModel {
             }
         }
         Ok(e)
+    }
+}
+
+/// Resident-Metal admission for Q8_0 projections. These run on any macOS host with no
+/// GGUF and no GPU: they pin the loader-side contract that lets a Q8_0 `qwen35` model
+/// reach the resident lane at all — the format mapping, the page-backing requirement,
+/// and the wire block geometry that makes admitting Q8_0 a no-repack change.
+#[cfg(all(test, target_os = "macos"))]
+mod resident_metal_q8_admission_tests {
+    use super::*;
+    use crate::metal::{ResidentWeightBytes, ResidentWeightFormat};
+    use std::io::Write;
+
+    /// One GGUF `Q8_0` block is an f16 scale followed by 32 int8 quants. The resident
+    /// Metal Q8 GEMV consumes exactly this layout, which is why admitting Q8_0 needs no
+    /// repack. If either side ever diverges from 34/32, these tests are the tripwire.
+    const Q8_0_WIRE_BLOCK_BYTES: usize = 34;
+    const Q8_0_BLOCK_VALUES: usize = 32;
+
+    fn raw(
+        bytes: RawMatBytes,
+        tt: GgufTensorType,
+        in_features: usize,
+        out_features: usize,
+    ) -> RawMat {
+        RawMat {
+            bytes,
+            tt,
+            in_features,
+            out_features,
+        }
+    }
+
+    /// `out_features` rows of `in_features` values each, in Q8_0 wire form.
+    fn q8_0_wire_bytes(in_features: usize, out_features: usize) -> Vec<u8> {
+        let blocks_per_row = in_features / Q8_0_BLOCK_VALUES;
+        (0..out_features * blocks_per_row * Q8_0_WIRE_BLOCK_BYTES)
+            .map(|i| i as u8)
+            .collect()
+    }
+
+    #[test]
+    fn q8_0_maps_to_the_resident_q8_wire_format() {
+        let m = raw(
+            RawMatBytes::owned(q8_0_wire_bytes(Q8_0_BLOCK_VALUES, 1)),
+            GgufTensorType::Q8_0,
+            Q8_0_BLOCK_VALUES,
+            1,
+        );
+        assert_eq!(m.prism_metal_format(), Some(ResidentWeightFormat::Q8_0));
+    }
+
+    #[test]
+    fn prism_low_bit_formats_still_map_unchanged() {
+        for (tt, want) in [
+            (GgufTensorType::Q1_0, ResidentWeightFormat::Q1_0),
+            (GgufTensorType::Q2_0G64, ResidentWeightFormat::Q2_0G64),
+            (GgufTensorType::Q2_0G128, ResidentWeightFormat::Q2_0G128),
+            (GgufTensorType::Pq2_0, ResidentWeightFormat::Q2_0G128),
+        ] {
+            let m = raw(RawMatBytes::owned(vec![0u8; 64]), tt, 128, 1);
+            assert_eq!(m.prism_metal_format(), Some(want), "{tt:?} must still map");
+        }
+    }
+
+    #[test]
+    fn k_quants_are_still_refused_by_the_resident_lane() {
+        // The Q4K/Q6K Metal kernels exist, but this loader does not admit them yet;
+        // admitting one is a separate, separately-evidenced change.
+        for tt in [GgufTensorType::Q4K, GgufTensorType::Q6K] {
+            let m = raw(RawMatBytes::owned(vec![0u8; 256]), tt, 256, 1);
+            assert_eq!(m.prism_metal_format(), None, "{tt:?} must not admit");
+        }
+    }
+
+    #[test]
+    fn page_backed_q8_0_admits_as_a_resident_wire_weight() {
+        let (in_features, out_features) = (Q8_0_BLOCK_VALUES * 2, 3);
+        let wire = q8_0_wire_bytes(in_features, out_features);
+        assert_eq!(
+            wire.len(),
+            out_features * 2 * Q8_0_WIRE_BLOCK_BYTES,
+            "fixture must be an exact number of 34-byte Q8_0 wire blocks"
+        );
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&wire).expect("write wire bytes");
+        file.flush().expect("flush");
+        let pages = crate::wire_mmap::WirePages::read_from_file(file.as_file(), 0, wire.len())
+            .expect("Q8_0 tensors must be page-backable");
+        assert_eq!(
+            pages.bytes(),
+            &wire[..],
+            "page-backing must not alter bytes"
+        );
+
+        let m = raw(
+            RawMatBytes::WirePages(pages),
+            GgufTensorType::Q8_0,
+            in_features,
+            out_features,
+        );
+        match m.prism_metal_weight().expect("page-backed Q8_0 must admit") {
+            ResidentWeightBytes::WirePages { format, pages } => {
+                assert_eq!(format, ResidentWeightFormat::Q8_0);
+                assert_eq!(pages.bytes(), &wire[..]);
+            }
+            _ => panic!("expected page-backed WirePages backing for a Q8_0 projection"),
+        }
+    }
+
+    #[test]
+    fn owned_q8_0_is_refused_instead_of_silently_copied() {
+        // The resident lane wraps the allocation with newBufferWithBytesNoCopy, so a
+        // non-page-aligned `Owned` buffer must fail closed rather than be uploaded.
+        let m = raw(
+            RawMatBytes::owned(q8_0_wire_bytes(Q8_0_BLOCK_VALUES, 1)),
+            GgufTensorType::Q8_0,
+            Q8_0_BLOCK_VALUES,
+            1,
+        );
+        let err = match m.prism_metal_weight() {
+            Ok(_) => panic!("owned Q8_0 must not reach the resident lane"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("not page-backed"),
+            "unexpected error: {err}"
+        );
     }
 }
 
