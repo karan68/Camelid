@@ -26,6 +26,9 @@ struct StubConfig {
     health: String,
     completion: String,
     completion_status: u16,
+    /// Held before answering `/v1/chat/completions`, to stand in for a real
+    /// generation that takes a while. Health is never delayed.
+    completion_delay: Duration,
 }
 
 impl StubConfig {
@@ -40,6 +43,7 @@ impl StubConfig {
                 r#"{{"choices":[{{"message":{{"role":"assistant","content":"served by {model}"}}}}]}}"#
             ),
             completion_status: 200,
+            completion_delay: Duration::ZERO,
         }
     }
 
@@ -47,6 +51,13 @@ impl StubConfig {
         Self {
             completion: r#"{"error":{"message":"engine queue full"}}"#.to_string(),
             completion_status: 503,
+            ..Self::ready(model, 0)
+        }
+    }
+
+    fn slow(model: &str, delay: Duration) -> Self {
+        Self {
+            completion_delay: delay,
             ..Self::ready(model, 0)
         }
     }
@@ -108,7 +119,12 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig) {
     };
     let (status, body) = match path.as_str() {
         "/v1/health" => (200_u16, config.health.clone()),
-        "/v1/chat/completions" => (config.completion_status, config.completion.clone()),
+        "/v1/chat/completions" => {
+            if !config.completion_delay.is_zero() {
+                std::thread::sleep(config.completion_delay);
+            }
+            (config.completion_status, config.completion.clone())
+        }
         _ => (404, "{}".to_string()),
     };
     let response = format!(
@@ -303,4 +319,46 @@ async fn a_streaming_request_is_refused_by_the_proxy_before_any_node_is_touched(
 
     assert_eq!(status, 400);
     assert_eq!(body["error"]["type"], "fabric_error");
+}
+
+/// `Fabric::dispatch` is synchronous socket I/O that can legitimately run for
+/// the whole `forward_timeout` — up to minutes for a real generation. If the
+/// handler ran it directly on an async worker thread instead of
+/// `spawn_blocking`, concurrent requests would serialize on that thread once
+/// the runtime is down to one worker: this pins the test runtime to exactly
+/// one worker thread, sends four concurrent requests to four independently
+/// slow nodes, and asserts they complete together rather than one-at-a-time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn concurrent_slow_requests_do_not_serialize_on_the_single_worker_thread() {
+    let delay = Duration::from_millis(300);
+    let nodes: Vec<StubNode> = (0..4)
+        .map(|i| StubNode::start(StubConfig::slow(&format!("model-{i}"), delay)))
+        .collect();
+    let specs = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| node.spec(&format!("node-{i}")))
+        .collect();
+    let fabric = fabric_of(specs);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let started = std::time::Instant::now();
+    let requests = (0..4).map(|i| {
+        let model = format!("model-{i}");
+        async move { post_chat(addr, &serde_json::json!({ "model": model }), &[]).await }
+    });
+    let results = futures_util::future::join_all(requests).await;
+    let elapsed = started.elapsed();
+
+    for (status, _, _) in &results {
+        assert_eq!(*status, 200);
+    }
+    // Serialized on one worker thread: ~4 * 300ms = 1200ms. Concurrent via
+    // spawn_blocking: ~300ms plus scheduling overhead. 700ms cleanly separates
+    // the two without being sensitive to ordinary scheduling jitter.
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "four concurrent slow requests took {elapsed:?}; \
+         they appear to have serialized on the async runtime"
+    );
 }

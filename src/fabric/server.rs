@@ -71,21 +71,36 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let model = body.get("model").and_then(Value::as_str);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let sticky = headers
         .get(STICKY_HEADER)
-        .and_then(|value| value.to_str().ok());
-    let request = RouteRequest::new(state.config.mode)
-        .with_model(model)
-        .with_sticky(sticky);
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
-    match state.fabric.dispatch(
-        "/v1/chat/completions",
-        &body,
-        &request,
-        state.config.forward_timeout,
-    ) {
-        Ok((decision, answer)) => {
+    // Fabric::dispatch is synchronous socket I/O (probes every node, then
+    // forwards) and can legitimately run for the whole forward_timeout — up to
+    // minutes for a real generation. Running it directly on an async worker
+    // thread would starve every other in-flight request once concurrent
+    // dispatches reach the runtime's worker count; spawn_blocking moves it onto
+    // tokio's much larger blocking pool instead.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let request = RouteRequest::new(state.config.mode)
+            .with_model(model.as_deref())
+            .with_sticky(sticky.as_deref());
+        state.fabric.dispatch(
+            "/v1/chat/completions",
+            &body,
+            &request,
+            state.config.forward_timeout,
+        )
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok((decision, answer))) => {
             let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = (status, Json(answer.body)).into_response();
             let out = response.headers_mut();
@@ -100,8 +115,12 @@ async fn chat_completions(
             }
             response
         }
-        Err(DispatchError::Route(error)) => route_error(error),
-        Err(DispatchError::Forward(error)) => forward_error(error),
+        Ok(Err(DispatchError::Route(error))) => route_error(error),
+        Ok(Err(DispatchError::Forward(error))) => forward_error(error),
+        Err(join_error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("dispatch task did not complete: {join_error}"),
+        ),
     }
 }
 
