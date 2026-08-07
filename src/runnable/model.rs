@@ -2306,7 +2306,7 @@ impl RunnableModel {
         }
         #[cfg(feature = "cuda")]
         {
-            let cuda_enabled = match std::env::var("CAMELID_QWEN35_CUDA") {
+            let cuda_requested = match std::env::var("CAMELID_QWEN35_CUDA") {
                 Ok(value) => matches!(
                     value.to_ascii_lowercase().as_str(),
                     "1" | "true" | "on" | "yes"
@@ -2317,6 +2317,15 @@ impl RunnableModel {
                 // still an explicit CPU fallback/debug override.
                 Err(_) => cfg!(windows) && self.output.is_prism_low_bit(),
             };
+            // `--gpu off` (and the UI's live toggle) is the AUTHORITATIVE master switch:
+            // it is documented as "Force the CPU reference path; never use the GPU even
+            // if one is present". Nothing in this lane consulted it, so on Windows --
+            // where the default above is ON for every Prism row -- `--gpu off` could not
+            // select the CPU lane at all for the qwen35 Bonsai rows; they kept building
+            // the resident CUDA graph. `CAMELID_QWEN35_CUDA=1` is an opt-IN to this lane,
+            // not an override of the master switch. `gpu_accel_enabled()` lazily seeds
+            // from platform capability, so the default (auto) path is unchanged.
+            let cuda_enabled = cuda_requested && crate::cuda::gpu_accel_enabled();
             if cuda_enabled {
                 return qwen35_cuda_with_cpu_fallback(
                     on_token,
