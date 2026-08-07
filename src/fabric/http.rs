@@ -25,6 +25,8 @@ pub(crate) enum HttpError {
     Io(String),
     Malformed(String),
     TooLarge(usize),
+    /// The request could not be written safely; refused before any socket work.
+    InvalidRequest(String),
 }
 
 impl std::fmt::Display for HttpError {
@@ -35,6 +37,7 @@ impl std::fmt::Display for HttpError {
             Self::Io(detail) => write!(f, "connection failed: {detail}"),
             Self::Malformed(detail) => write!(f, "malformed HTTP response: {detail}"),
             Self::TooLarge(limit) => write!(f, "response exceeded {limit} bytes"),
+            Self::InvalidRequest(detail) => write!(f, "cannot build request: {detail}"),
         }
     }
 }
@@ -185,21 +188,68 @@ fn connect_any(addrs: &[SocketAddr], deadline: Instant) -> Result<TcpStream, Htt
     })))
 }
 
+/// Build the request head. Pure, so the header set — including whether an
+/// `Authorization` line is present at all — is tested without a server.
+///
+/// A bearer token is written into the head verbatim, so one carrying a control
+/// character could append headers of its own. That is refused rather than sent.
+/// Neither the error nor anything else here repeats the token's value.
+fn request_head(
+    method: &str,
+    path: &str,
+    authority: &str,
+    body: Option<&[u8]>,
+    bearer: Option<&str>,
+) -> Result<String, HttpError> {
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n"
+    );
+    if let Some(token) = bearer {
+        if token.is_empty() {
+            return Err(HttpError::InvalidRequest(
+                "bearer token is empty; pass no token rather than an empty one".to_string(),
+            ));
+        }
+        if token.chars().any(char::is_control) {
+            return Err(HttpError::InvalidRequest(
+                "bearer token contains a control character".to_string(),
+            ));
+        }
+        head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if let Some(body) = body {
+        head.push_str("Content-Type: application/json\r\n");
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    Ok(head)
+}
+
 /// Perform one request/response round trip against a node.
 ///
 /// `timeout` bounds the whole exchange, not each socket operation, so a peer
 /// that dribbles bytes forever still fails on schedule.
+///
+/// `bearer` is sent as `Authorization: Bearer`, which is what a node started
+/// with an API key requires on every route but `/v1/health`.
+// One more parameter than clippy's threshold; every one of them is a distinct
+// property of a single round trip, so bundling them would only move the list.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn request(
     host: &str,
     port: u16,
     method: &str,
     path: &str,
     body: Option<&[u8]>,
+    bearer: Option<&str>,
     timeout: Duration,
     max_body: usize,
 ) -> Result<HttpResponse, HttpError> {
     let deadline = Instant::now() + timeout;
     let authority = format!("{host}:{port}");
+    // Built before resolving, so a request that cannot be written safely is
+    // refused without touching the network.
+    let head = request_head(method, path, &authority, body, bearer)?;
 
     let addrs: Vec<SocketAddr> = authority
         .to_socket_addrs()
@@ -220,13 +270,6 @@ pub(crate) fn request(
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|error| HttpError::Io(error.to_string()))?;
-
-    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n");
-    if let Some(body) = body {
-        head.push_str("Content-Type: application/json\r\n");
-        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    head.push_str("\r\n");
 
     stream
         .write_all(head.as_bytes())
@@ -383,12 +426,103 @@ mod tests {
     }
 
     #[test]
+    fn a_bearer_token_becomes_an_authorization_header() {
+        let head = request_head(
+            "POST",
+            "/v1/chat/completions",
+            "node:8181",
+            Some(b"{}"),
+            Some("s3cret"),
+        )
+        .expect("a well-formed token is sendable");
+        assert!(
+            head.contains("\r\nAuthorization: Bearer s3cret\r\n"),
+            "{head}"
+        );
+        // The rest of the head must survive the new line unchanged.
+        assert!(
+            head.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("\r\nHost: node:8181\r\n"), "{head}");
+        assert!(head.contains("\r\nContent-Length: 2\r\n"), "{head}");
+        assert!(head.ends_with("\r\n\r\n"), "{head}");
+    }
+
+    #[test]
+    fn no_token_means_no_authorization_header_at_all() {
+        // Not an empty one: an unauthenticated node must see the same request it
+        // saw before the fabric learned about bearer tokens.
+        let head = request_head("GET", "/v1/health", "node:8181", None, None).expect("builds");
+        assert!(
+            !head.to_ascii_lowercase().contains("authorization"),
+            "{head}"
+        );
+        assert_eq!(
+            head,
+            "GET /v1/health HTTP/1.1\r\nHost: node:8181\r\nAccept: application/json\r\n\
+             Connection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_token_carrying_a_control_character_is_refused_rather_than_written() {
+        // Writing this verbatim would let the token inject headers of its own.
+        // `s3cret` appears in no refusal wording, so finding it in the message
+        // would mean the value leaked rather than merely the word "token".
+        for token in ["s3cret\r\nX-Injected: 1", "s3cret\n", "s3cret\0"] {
+            let error = request_head("GET", "/v1/health", "node:8181", None, Some(token))
+                .expect_err("a control character is not sendable");
+            match &error {
+                HttpError::InvalidRequest(detail) => {
+                    assert!(
+                        !detail.contains("s3cret"),
+                        "the token must not be echoed: {detail}"
+                    )
+                }
+                other => panic!("expected InvalidRequest, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_token_is_refused_rather_than_sent_as_a_bare_bearer() {
+        // `Authorization: Bearer ` is rejected by the server anyway; failing here
+        // says why instead of arriving as an unexplained 401.
+        assert!(matches!(
+            request_head("GET", "/v1/health", "node:8181", None, Some("")),
+            Err(HttpError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn an_unsendable_token_is_refused_before_a_socket_is_opened() {
+        // Port 1 is closed, so a connect error here would prove we dialled first.
+        let error = request(
+            "127.0.0.1",
+            1,
+            "GET",
+            "/v1/health",
+            None,
+            Some("bad\r\ntoken"),
+            Duration::from_millis(500),
+            LIMIT,
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(error, HttpError::InvalidRequest(_)),
+            "must refuse before dialling, got {error:?}"
+        );
+    }
+
+    #[test]
     fn a_closed_port_reports_connect_failure_not_a_panic() {
         let error = request(
             "127.0.0.1",
             1,
             "GET",
             "/v1/health",
+            None,
             None,
             Duration::from_millis(500),
             LIMIT,
@@ -407,6 +541,7 @@ mod tests {
             8181,
             "GET",
             "/v1/health",
+            None,
             None,
             Duration::from_millis(500),
             LIMIT,
