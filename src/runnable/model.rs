@@ -69,11 +69,22 @@ impl RawMatBytes {
 }
 
 /// The resident Metal format a GGUF tensor type maps to, or `None` if the resident lane
-/// cannot consume it. Single source of truth: admitting a type here is what makes it
-/// page-backed at load (see [`wants_page_backing`]), so the two cannot drift apart.
+/// cannot consume it. Single source of truth *for the loader*: admitting a type here is
+/// what makes it page-backed at load (see [`wants_page_backing`]), so those two cannot
+/// drift apart.
 ///
 /// Not macOS-gated, because `wants_page_backing` is not: the loader makes the same
 /// backing choice on every target.
+///
+/// **It is not the only gate on the way to the GPU.** Admitting a type here also routes it
+/// into the *hybrid* Prism wire path from [`RawMat::par_matvec`]/[`RawMat::par_matmul`],
+/// which keeps its own separate admission list —
+/// `metal::ResidentWeightFormat::hybrid_prism_wire_supported`. `Q8_0` is admitted here and
+/// declined there on purpose, so it falls through to the CPU kernel instead of taking a
+/// second GPU path with none of the resident lane's parity evidence. Anyone extending this
+/// match (the K-quant follow-up is the obvious next one) has to decide that lane
+/// deliberately too; `metal::tests::prism_wire_hybrid_admission_is_pinned_per_format`
+/// fails until they do.
 fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
     match tt {
         GgufTensorType::Q1_0 => Some(crate::metal::ResidentWeightFormat::Q1_0),

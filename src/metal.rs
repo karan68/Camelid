@@ -12393,12 +12393,7 @@ fn try_prism_wire_matmul_flat(
         || input.len() != input_width.checked_mul(n_tokens)?
         || n_tokens == 0
         || output_rows == 0
-        || !matches!(
-            format,
-            ResidentWeightFormat::Q1_0
-                | ResidentWeightFormat::Q2_0G64
-                | ResidentWeightFormat::Q2_0G128
-        )
+        || !format.hybrid_prism_wire_supported()
     {
         return None;
     }
@@ -20521,6 +20516,28 @@ impl ResidentWeightFormat {
             Self::Q2_0G128 => 34,
         }
     }
+
+    /// Whether the **hybrid** Prism wire path ([`try_prism_wire_matvec_f32`] /
+    /// [`try_prism_wire_matmul_f32`]) will run this format on the GPU.
+    ///
+    /// This is a third admission gate, independent of
+    /// `runnable::model::resident_metal_format` — which decides page-backing and the
+    /// fully *resident* graph. The two sets are deliberately not equal: `Q8_0` is
+    /// admitted there and declined here, so a page-backed `Q8_0` projection arriving via
+    /// `par_matvec`/`par_matmul` falls through to the CPU kernel rather than taking a
+    /// second GPU path that carries none of the resident lane's parity evidence.
+    ///
+    /// Admitting a type to `resident_metal_format` therefore does **not** enable it here;
+    /// that is a separate lane change with its own evidence needs. The match is kept
+    /// exhaustive on purpose: a new `ResidentWeightFormat` variant must fail to compile
+    /// here rather than inherit a silent `false` from a `_` arm.
+    #[cfg(target_os = "macos")]
+    fn hybrid_prism_wire_supported(self) -> bool {
+        match self {
+            Self::Q1_0 | Self::Q2_0G64 | Self::Q2_0G128 => true,
+            Self::DenseF32 | Self::DenseF16 | Self::Q8_0 | Self::Q4K | Self::Q6K => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -26934,6 +26951,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Page-backed wire fixture of `bytes` length. Contents are arbitrary — every test
+    /// below asserts on admission decisions, never on kernel output.
+    #[cfg(target_os = "macos")]
+    fn page_backed_wire_fixture(bytes: usize) -> std::sync::Arc<crate::wire_mmap::WirePages> {
+        use std::io::Write;
+        let wire: Vec<u8> = (0..bytes).map(|i| i as u8).collect();
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&wire).expect("write wire bytes");
+        file.flush().expect("flush");
+        crate::wire_mmap::WirePages::read_from_file(file.as_file(), 0, wire.len())
+            .expect("page-backed wire fixture")
+    }
+
+    /// The hybrid Prism wire path keeps its own admission list, separate from the loader's
+    /// `resident_metal_format`. Admitting `Q8_0` to the loader also wired it into
+    /// `par_matvec`/`par_matmul`, so every format the resident lane admits now *reaches*
+    /// this gate. Pin the answer per variant, so widening the resident lane — the K-quant
+    /// follow-up is the obvious next one — cannot silently widen this path too.
+    ///
+    /// Policy, not dispatch: needs no GPU and no GGUF, so it cannot pass by declining for
+    /// the wrong reason on a host without Metal.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prism_wire_hybrid_admission_is_pinned_per_format() {
+        for (format, admitted) in [
+            (ResidentWeightFormat::Q1_0, true),
+            (ResidentWeightFormat::Q2_0G64, true),
+            (ResidentWeightFormat::Q2_0G128, true),
+            (ResidentWeightFormat::Q8_0, false),
+            (ResidentWeightFormat::Q4K, false),
+            (ResidentWeightFormat::Q6K, false),
+            (ResidentWeightFormat::DenseF32, false),
+            (ResidentWeightFormat::DenseF16, false),
+        ] {
+            assert_eq!(
+                format.hybrid_prism_wire_supported(),
+                admitted,
+                "{format:?} changed hybrid-path admission. That is a lane change with its \
+                 own evidence needs, not a loader change — see `resident_metal_format`."
+            );
+        }
+    }
+
+    /// `Q8_0` must be declined by the hybrid path **because of its format**, not because
+    /// the fixture is malformed — so the geometry is asserted valid first, leaving the
+    /// format gate as the only reason a `None` can come back. Both entry points are
+    /// covered: `par_matvec` calls the first, `par_matmul` the second.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prism_wire_hybrid_path_declines_page_backed_q8_0() {
+        let format = ResidentWeightFormat::Q8_0;
+        let (rows, blocks_per_row) = (4usize, 2usize);
+        let input_width = blocks_per_row * format.values_per_block();
+        let pages = page_backed_wire_fixture(rows * blocks_per_row * format.wire_bytes_per_block());
+
+        assert!(
+            ResidentWeightBytes::WirePages {
+                format,
+                pages: &pages,
+            }
+            .matches_shape(input_width, rows),
+            "fixture geometry must be valid, or a None below proves nothing"
+        );
+
+        let input = vec![0.5f32; input_width];
+        assert!(
+            try_prism_wire_matvec_f32(&input, &pages, format, rows).is_none(),
+            "page-backed Q8_0 must fall through to the CPU kernel, not this path"
+        );
+        assert!(
+            try_prism_wire_matmul_f32(&[input.clone(), input], &pages, format, rows).is_none(),
+            "the batched form must decline Q8_0 as well"
+        );
+    }
+
+    /// Wire mode off (`CAMELID_METAL_WIRE=0`) must make the resolver **decline** a
+    /// page-backed `Q8_0` weight rather than hand its 34-byte GGUF blocks to a kernel
+    /// expecting the 36-byte decoded layout — the model then falls back to CPU decode
+    /// instead of producing silent garbage. The Prism case is checked alongside to prove
+    /// the guard is `Q8_0`-specific and does not over-reject: those formats are 34-byte
+    /// page-backed wire too, but have only one layout, so wire mode must not gate them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_wire_pages_q8_0_fails_closed_when_wire_mode_is_off() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal pipelines");
+        let q8 = page_backed_wire_fixture(4 * 2 * 34);
+        let prism = page_backed_wire_fixture(4 * 2 * 34);
+        let mut cache = metal_linear_cache().lock().expect("linear cache");
+
+        let q8_weight = ResidentWeightBytes::WirePages {
+            format: ResidentWeightFormat::Q8_0,
+            pages: &q8,
+        };
+        assert!(
+            resolve_resident_weight(&mut cache, &kernel.device, &q8_weight, false).is_none(),
+            "wire mode off must decline 34-byte page-backed Q8_0, never reinterpret it as \
+             36-byte blocks"
+        );
+        let resolved = resolve_resident_weight(&mut cache, &kernel.device, &q8_weight, true)
+            .expect("wire mode on must admit page-backed Q8_0");
+        assert_eq!(resolved.format, ResidentWeightFormat::Q8_0);
+        assert!(resolved.q8_wire, "page-backed Q8_0 is physically wire");
+
+        let prism_weight = ResidentWeightBytes::WirePages {
+            format: ResidentWeightFormat::Q2_0G128,
+            pages: &prism,
+        };
+        let resolved = resolve_resident_weight(&mut cache, &kernel.device, &prism_weight, false)
+            .expect("Prism wire pages must resolve regardless of Q8 wire mode");
+        assert_eq!(resolved.format, ResidentWeightFormat::Q2_0G128);
+        assert!(!resolved.q8_wire, "the physical wire flag is Q8_0-only");
     }
 
     /// End-to-end tied-head gate: verifies RMSNorm, no-copy mmap offset binding,
