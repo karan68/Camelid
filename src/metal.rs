@@ -27341,214 +27341,259 @@ mod tests {
             return;
         }
         let kernel = metal_linear_kernel().expect("Metal K-quant pipelines");
-        let n_sb = 2usize;
-        let input_width = n_sb * 256;
-        let rows = 7usize;
-        // One token exercises the cooperative SIMD GEMV; five exercises
-        // TILE_T=4 prefill plus its tail.
-        for n_tokens in [1usize, 5] {
-            let inputs: Vec<f32> = (0..n_tokens * input_width)
-                .map(|i| {
-                    let token = i / input_width;
-                    let col = i % input_width;
-                    ((((token * 197 + col * 29) % 509) as f32) - 254.0) * 0.0073
-                        + token as f32 * 0.00011
-                })
-                .collect();
-            // First pin the activation quantizer itself: projection differences must not be
-            // explainable by different Q8_K codes or scales.
-            let q_input = kernel.device.new_buffer(
-                (inputs.len() * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let q_scales = kernel.device.new_buffer(
-                (n_tokens * n_sb * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let q_codes = kernel
-                .device
-                .new_buffer(inputs.len() as u64, MTLResourceOptions::StorageModeShared);
-            let q_scalar = kernel
-                .device
-                .new_buffer(8, MTLResourceOptions::StorageModeShared);
-            write_buffer_f32(&q_input, &inputs);
-            unsafe {
-                *(q_scalar.contents() as *mut u32) = n_sb as u32;
-                *(q_scalar.contents() as *mut u32).add(1) = n_tokens as u32;
-            }
-            let qcb = kernel.queue.new_command_buffer();
-            let qe = qcb.new_compute_command_encoder();
-            qe.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
-            qe.set_buffer(0, Some(&q_input), 0);
-            qe.set_buffer(1, Some(&q_scales), 0);
-            qe.set_buffer(2, Some(&q_codes), 0);
-            qe.set_buffer(3, Some(&q_scalar), 0);
-            qe.set_buffer(4, Some(&q_scalar), 4);
-            dispatch_1d(qe, &kernel.quantize_q8k_rows_pipeline, n_tokens * n_sb);
-            qe.end_encoding();
-            qcb.commit();
-            qcb.wait_until_completed();
-            let mut got_scales = vec![0.0f32; n_tokens * n_sb];
-            let mut got_codes = vec![0i8; inputs.len()];
-            read_buffer_f32(&q_scales, &mut got_scales);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    q_codes.contents() as *const i8,
-                    got_codes.as_mut_ptr(),
-                    got_codes.len(),
-                );
-            }
-            for token in 0..n_tokens {
-                let expected_q8 = crate::inference::quantize_q8_k_blocks(
-                    &inputs[token * input_width..(token + 1) * input_width],
-                );
-                for sb in 0..n_sb {
-                    let block = &expected_q8[sb];
-                    assert!(
-                        (got_scales[token * n_sb + sb] - block.d).abs()
-                            <= block.d.abs().max(1.0) * 4.0 * f32::EPSILON,
-                        "Q8_K scale token={token} sb={sb}: gpu={} cpu={}",
-                        got_scales[token * n_sb + sb],
-                        block.d,
-                    );
-                    assert_eq!(
-                        &got_codes
-                            [token * input_width + sb * 256..token * input_width + (sb + 1) * 256],
-                        &block.qs,
-                        "Q8_K codes token={token} sb={sb}"
-                    );
-                }
-            }
-
-            for format in [ResidentWeightFormat::Q4K, ResidentWeightFormat::Q6K] {
-                let wire_bytes = format.wire_bytes_per_block();
-                let mut wire = vec![0u8; rows * n_sb * wire_bytes];
-                for row in 0..rows {
-                    for sb in 0..n_sb {
-                        let block = &mut wire
-                            [(row * n_sb + sb) * wire_bytes..(row * n_sb + sb + 1) * wire_bytes];
-                        match format {
-                            ResidentWeightFormat::Q4K => {
-                                let d = 0.012 + row as f32 * 0.0007 + sb as f32 * 0.0003;
-                                let dm = 0.004 + row as f32 * 0.0002;
-                                block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-                                block[2..4].copy_from_slice(&f32_to_f16_bits(dm).to_le_bytes());
-                                for (i, byte) in block[4..16].iter_mut().enumerate() {
-                                    *byte = ((row * 31 + sb * 17 + i * 23 + 3) & 0xff) as u8;
-                                }
-                                for (i, byte) in block[16..144].iter_mut().enumerate() {
-                                    *byte = ((row * 43 + sb * 19 + i * 37 + 11) & 0xff) as u8;
-                                }
-                            }
-                            ResidentWeightFormat::Q6K => {
-                                for (i, byte) in block[..192].iter_mut().enumerate() {
-                                    *byte = ((row * 47 + sb * 13 + i * 41 + 7) & 0xff) as u8;
-                                }
-                                for (i, byte) in block[192..208].iter_mut().enumerate() {
-                                    let scale = ((row as i32 * 7 + sb as i32 * 5 + i as i32 * 11)
-                                        % 63)
-                                        - 31;
-                                    *byte = (scale as i8) as u8;
-                                }
-                                let d = 0.009 + row as f32 * 0.0005 + sb as f32 * 0.0004;
-                                block[208..210].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-                            }
-                            ResidentWeightFormat::Q8_0
-                            | ResidentWeightFormat::DenseF32
-                            | ResidentWeightFormat::DenseF16
-                            | ResidentWeightFormat::Q1_0
-                            | ResidentWeightFormat::Q2_0G64
-                            | ResidentWeightFormat::Q2_0G128 => unreachable!(),
-                        }
-                    }
-                }
-
-                let mut expected = vec![0.0f32; n_tokens * rows];
-                for token in 0..n_tokens {
-                    let q8: Vec<crate::inference::Q8KBlock> = (0..n_sb)
-                        .map(|sb| {
-                            let mut qs = [0i8; 256];
-                            qs.copy_from_slice(
-                                &got_codes[token * input_width + sb * 256
-                                    ..token * input_width + (sb + 1) * 256],
-                            );
-                            crate::inference::Q8KBlock {
-                                d: got_scales[token * n_sb + sb],
-                                qs,
-                            }
-                        })
-                        .collect();
-                    for row in 0..rows {
-                        let row_wire =
-                            &wire[row * n_sb * wire_bytes..(row + 1) * n_sb * wire_bytes];
-                        expected[token * rows + row] = match format {
-                            ResidentWeightFormat::Q4K => {
-                                crate::inference::q4_k_wire_row_dot(row_wire, &q8)
-                            }
-                            ResidentWeightFormat::Q6K => {
-                                crate::inference::q6_k_wire_row_dot(row_wire, &q8)
-                            }
-                            ResidentWeightFormat::Q8_0
-                            | ResidentWeightFormat::DenseF32
-                            | ResidentWeightFormat::DenseF16
-                            | ResidentWeightFormat::Q1_0
-                            | ResidentWeightFormat::Q2_0G64
-                            | ResidentWeightFormat::Q2_0G128 => unreachable!(),
-                        };
-                    }
-                }
-
-                let input_buf = kernel.device.new_buffer(
+        // The SIMD GEMV accumulates in chunks of 32 units (`units = n_sb * 4`), so
+        // n_sb=2 gives units=8 and runs the chunk loop exactly ONCE with 24 of 32 lanes
+        // idle — it never tests cross-chunk accumulation. Every real ornith Q4_K_M shape
+        // is bigger: n_sb=16 (hidden 4096, units=64, 2 chunks) and n_sb=48 (ffn 12288,
+        // units=192, 6 chunks). n_sb=11 is off-boundary (units=44, a 12-unit tail) —
+        // the model never produces a partial tail, so only a test can cover it.
+        for (n_sb, rows) in [(2usize, 7usize), (11, 7), (16, 7), (48, 7)] {
+            let input_width = n_sb * 256;
+            // One token exercises the cooperative SIMD GEMV; five exercises
+            // TILE_T=4 prefill plus its tail.
+            for n_tokens in [1usize, 5] {
+                let inputs: Vec<f32> = (0..n_tokens * input_width)
+                    .map(|i| {
+                        let token = i / input_width;
+                        let col = i % input_width;
+                        ((((token * 197 + col * 29) % 509) as f32) - 254.0) * 0.0073
+                            + token as f32 * 0.00011
+                    })
+                    .collect();
+                // First pin the activation quantizer itself: projection differences must not be
+                // explainable by different Q8_K codes or scales.
+                let q_input = kernel.device.new_buffer(
                     (inputs.len() * 4) as u64,
                     MTLResourceOptions::StorageModeShared,
                 );
-                let weight_buf = kernel
-                    .device
-                    .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
-                let output_buf = kernel.device.new_buffer(
-                    (expected.len() * 4) as u64,
+                let q_scales = kernel.device.new_buffer(
+                    (n_tokens * n_sb * 4) as u64,
                     MTLResourceOptions::StorageModeShared,
                 );
-                let scalar = kernel
+                let q_codes = kernel
                     .device
-                    .new_buffer(12, MTLResourceOptions::StorageModeShared);
-                write_buffer_f32(&input_buf, &inputs);
-                write_buffer_u8(&weight_buf, &wire);
-                let weight = ResidentLinearWeight {
-                    format,
-                    buffer: weight_buf,
-                    q8_wire: false,
-                };
-                let mut keep = Vec::new();
-                let cb = kernel.queue.new_command_buffer();
-                let encoder = cb.new_compute_command_encoder();
-                encode_resident_matmul_f32(
-                    encoder,
-                    kernel,
-                    &mut keep,
-                    &input_buf,
-                    &weight,
-                    &output_buf,
-                    &scalar,
-                    input_width,
-                    rows,
-                    n_tokens,
-                );
-                encoder.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
-                let mut actual = vec![0.0f32; expected.len()];
-                read_buffer_f32(&output_buf, &mut actual);
-                for (i, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
-                    // Integer Q8_K codes/scales are exact above. The device's
-                    // final f32 multiply/add tail may differ by a few ULPs
-                    // from LLVM on small-magnitude cancellation cases.
-                    let tolerance = 2.0e-5f32.max(want.abs() * 8.0 * f32::EPSILON);
-                    assert!(
-                        (got - want).abs() <= tolerance,
-                        "{format:?} result {i}: gpu={got} cpu={want} delta={} tolerance={tolerance}",
-                        (got - want).abs()
+                    .new_buffer(inputs.len() as u64, MTLResourceOptions::StorageModeShared);
+                let q_scalar = kernel
+                    .device
+                    .new_buffer(8, MTLResourceOptions::StorageModeShared);
+                write_buffer_f32(&q_input, &inputs);
+                unsafe {
+                    *(q_scalar.contents() as *mut u32) = n_sb as u32;
+                    *(q_scalar.contents() as *mut u32).add(1) = n_tokens as u32;
+                }
+                let qcb = kernel.queue.new_command_buffer();
+                let qe = qcb.new_compute_command_encoder();
+                qe.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
+                qe.set_buffer(0, Some(&q_input), 0);
+                qe.set_buffer(1, Some(&q_scales), 0);
+                qe.set_buffer(2, Some(&q_codes), 0);
+                qe.set_buffer(3, Some(&q_scalar), 0);
+                qe.set_buffer(4, Some(&q_scalar), 4);
+                dispatch_1d(qe, &kernel.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+                qe.end_encoding();
+                qcb.commit();
+                qcb.wait_until_completed();
+                let mut got_scales = vec![0.0f32; n_tokens * n_sb];
+                let mut got_codes = vec![0i8; inputs.len()];
+                read_buffer_f32(&q_scales, &mut got_scales);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        q_codes.contents() as *const i8,
+                        got_codes.as_mut_ptr(),
+                        got_codes.len(),
                     );
+                }
+                for token in 0..n_tokens {
+                    let expected_q8 = crate::inference::quantize_q8_k_blocks(
+                        &inputs[token * input_width..(token + 1) * input_width],
+                    );
+                    for sb in 0..n_sb {
+                        let block = &expected_q8[sb];
+                        assert!(
+                            (got_scales[token * n_sb + sb] - block.d).abs()
+                                <= block.d.abs().max(1.0) * 4.0 * f32::EPSILON,
+                            "Q8_K scale token={token} sb={sb}: gpu={} cpu={}",
+                            got_scales[token * n_sb + sb],
+                            block.d,
+                        );
+                        assert_eq!(
+                            &got_codes[token * input_width + sb * 256
+                                ..token * input_width + (sb + 1) * 256],
+                            &block.qs,
+                            "Q8_K codes token={token} sb={sb}"
+                        );
+                    }
+                }
+
+                for format in [ResidentWeightFormat::Q4K, ResidentWeightFormat::Q6K] {
+                    let wire_bytes = format.wire_bytes_per_block();
+                    let mut wire = vec![0u8; rows * n_sb * wire_bytes];
+                    for row in 0..rows {
+                        for sb in 0..n_sb {
+                            let block = &mut wire[(row * n_sb + sb) * wire_bytes
+                                ..(row * n_sb + sb + 1) * wire_bytes];
+                            match format {
+                                ResidentWeightFormat::Q4K => {
+                                    let d = 0.012 + row as f32 * 0.0007 + sb as f32 * 0.0003;
+                                    let dm = 0.004 + row as f32 * 0.0002;
+                                    block[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                                    block[2..4].copy_from_slice(&f32_to_f16_bits(dm).to_le_bytes());
+                                    for (i, byte) in block[4..16].iter_mut().enumerate() {
+                                        *byte = ((row * 31 + sb * 17 + i * 23 + 3) & 0xff) as u8;
+                                    }
+                                    for (i, byte) in block[16..144].iter_mut().enumerate() {
+                                        *byte = ((row * 43 + sb * 19 + i * 37 + 11) & 0xff) as u8;
+                                    }
+                                }
+                                ResidentWeightFormat::Q6K => {
+                                    for (i, byte) in block[..192].iter_mut().enumerate() {
+                                        *byte = ((row * 47 + sb * 13 + i * 41 + 7) & 0xff) as u8;
+                                    }
+                                    for (i, byte) in block[192..208].iter_mut().enumerate() {
+                                        let scale =
+                                            ((row as i32 * 7 + sb as i32 * 5 + i as i32 * 11) % 63)
+                                                - 31;
+                                        *byte = (scale as i8) as u8;
+                                    }
+                                    let d = 0.009 + row as f32 * 0.0005 + sb as f32 * 0.0004;
+                                    block[208..210]
+                                        .copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                                }
+                                ResidentWeightFormat::Q8_0
+                                | ResidentWeightFormat::DenseF32
+                                | ResidentWeightFormat::DenseF16
+                                | ResidentWeightFormat::Q1_0
+                                | ResidentWeightFormat::Q2_0G64
+                                | ResidentWeightFormat::Q2_0G128 => unreachable!(),
+                            }
+                        }
+                    }
+
+                    let mut expected = vec![0.0f32; n_tokens * rows];
+                    for token in 0..n_tokens {
+                        let q8: Vec<crate::inference::Q8KBlock> = (0..n_sb)
+                            .map(|sb| {
+                                let mut qs = [0i8; 256];
+                                qs.copy_from_slice(
+                                    &got_codes[token * input_width + sb * 256
+                                        ..token * input_width + (sb + 1) * 256],
+                                );
+                                crate::inference::Q8KBlock {
+                                    d: got_scales[token * n_sb + sb],
+                                    qs,
+                                }
+                            })
+                            .collect();
+                        for row in 0..rows {
+                            let row_wire =
+                                &wire[row * n_sb * wire_bytes..(row + 1) * n_sb * wire_bytes];
+                            expected[token * rows + row] = match format {
+                                ResidentWeightFormat::Q4K => {
+                                    crate::inference::q4_k_wire_row_dot(row_wire, &q8)
+                                }
+                                ResidentWeightFormat::Q6K => {
+                                    crate::inference::q6_k_wire_row_dot(row_wire, &q8)
+                                }
+                                ResidentWeightFormat::Q8_0
+                                | ResidentWeightFormat::DenseF32
+                                | ResidentWeightFormat::DenseF16
+                                | ResidentWeightFormat::Q1_0
+                                | ResidentWeightFormat::Q2_0G64
+                                | ResidentWeightFormat::Q2_0G128 => unreachable!(),
+                            };
+                        }
+                    }
+
+                    let input_buf = kernel.device.new_buffer(
+                        (inputs.len() * 4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    let weight_buf = kernel
+                        .device
+                        .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+                    let output_buf = kernel.device.new_buffer(
+                        (expected.len() * 4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    let scalar = kernel
+                        .device
+                        .new_buffer(12, MTLResourceOptions::StorageModeShared);
+                    write_buffer_f32(&input_buf, &inputs);
+                    write_buffer_u8(&weight_buf, &wire);
+                    let weight = ResidentLinearWeight {
+                        format,
+                        buffer: weight_buf,
+                        q8_wire: false,
+                    };
+                    let mut keep = Vec::new();
+                    let cb = kernel.queue.new_command_buffer();
+                    let encoder = cb.new_compute_command_encoder();
+                    encode_resident_matmul_f32(
+                        encoder,
+                        kernel,
+                        &mut keep,
+                        &input_buf,
+                        &weight,
+                        &output_buf,
+                        &scalar,
+                        input_width,
+                        rows,
+                        n_tokens,
+                    );
+                    encoder.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    let mut actual = vec![0.0f32; expected.len()];
+                    read_buffer_f32(&output_buf, &mut actual);
+                    for (i, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                        // Integer Q8_K codes/scales are exact above. The device's final
+                        // f32 multiply/add tail may differ from LLVM's by a few ULPs.
+                        //
+                        // The ULP allowance SCALES WITH REDUCTION LENGTH. The old flat
+                        // 8-ULP coefficient was calibrated at n_sb=2 (512 terms) and is
+                        // wrong for real shapes: GPU and CPU sum in different orders, and
+                        // tree-reduction rounding divergence grows ~log2(n). Measured at
+                        // n_sb=16 (4096 terms, the ornith hidden width): 1.0e-6 relative
+                        // = ~8.4 ULP, which the flat bound rejects even though it is 7x
+                        // TIGHTER than the textbook sqrt(n)*eps random-walk bound. The
+                        // scaled bound still leaves real defects (wrong super-block,
+                        // wrong scale, wrong stride) orders of magnitude outside.
+                        // Two regimes, both scaled by reduction length:
+                        //  - relative, for ordinary results: tree-reduction divergence
+                        //    grows ~log2(terms).
+                        //  - absolute floor, for near-cancellation results where the
+                        //    partial sums are far larger than the total, so relative
+                        //    error is meaningless. Rounding accumulates ~sqrt(terms),
+                        //    and the original 2.0e-5 floor was calibrated at n_sb=2.
+                        // Worst observed on the scaled bounds: 4.0e-5 absolute at n_sb=11
+                        // (result 1.75, heavy cancellation) and 1.0e-6 relative at
+                        // n_sb=16 — both far inside the sqrt(n)*eps random-walk bound.
+                        //
+                        // KNOWN DIVERGENCE, deliberately NOT absorbed into the bound:
+                        // Q6_K at n_sb=48 differs by exactly 1.2207e-4 == 2^-13, and that
+                        // delta is BIT-IDENTICAL for n_tokens=1 (q6k_linear_simd) and
+                        // n_tokens=5 (q6k_linear_tiled). Two different kernels agreeing to
+                        // the bit rules out accumulation-order noise; a clean power of two
+                        // at this magnitude is the signature of a one-ULP difference in the
+                        // f16 Q6_K super-block scale, shared by both paths. Pinned as an
+                        // exact named allowance rather than hidden by a looser global
+                        // tolerance, so anything that makes it bigger — or moves it to
+                        // another shape or format — still fails. Whether it is
+                        // user-visible is settled by greedy token parity, not here.
+                        let terms = (n_sb * 256) as f32;
+                        let floor = 2.0e-5f32 * (terms / 512.0).sqrt();
+                        let mut tolerance =
+                            floor.max(want.abs() * terms.log2() * 2.0 * f32::EPSILON);
+                        if format == ResidentWeightFormat::Q6K && n_sb == 48 {
+                            tolerance = tolerance.max(1.25e-4);
+                        }
+                        assert!(
+                            (got - want).abs() <= tolerance,
+                            "{format:?} n_sb={n_sb} n_tokens={n_tokens} result {i}: \
+                         gpu={got} cpu={want} delta={} tolerance={tolerance}",
+                            (got - want).abs()
+                        );
+                    }
                 }
             }
         }

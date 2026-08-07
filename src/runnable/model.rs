@@ -80,15 +80,23 @@ impl RawMatBytes {
 /// Not macOS-gated, because `wants_page_backing` is not: the loader makes the same
 /// backing choice on every target.
 ///
-/// **It is not the only gate on the way to the GPU.** Admitting a type here also routes it
-/// into the *hybrid* Prism wire path from [`RawMat::par_matvec`]/[`RawMat::par_matmul`],
-/// which keeps its own separate admission list —
-/// `metal::ResidentWeightFormat::hybrid_prism_wire_supported`. `Q8_0` is admitted here and
-/// declined there on purpose, so it falls through to the CPU kernel instead of taking a
-/// second GPU path with none of the resident lane's parity evidence. Anyone extending this
-/// match (the K-quant follow-up is the obvious next one) has to decide that lane
-/// deliberately too; `metal::tests::prism_wire_hybrid_admission_is_pinned_per_format`
-/// fails until they do.
+/// **It is not the only gate on the way to the GPU, and the others do NOT fail loudly.**
+/// Admitting a type here has two silent knock-on effects, both of which must be decided
+/// deliberately:
+///
+/// 1. It routes the type into the *hybrid* Prism wire path from
+///    [`RawMat::par_matvec`]/[`RawMat::par_matmul`], which keeps its own separate list —
+///    `metal::ResidentWeightFormat::hybrid_prism_wire_supported`. `Q8_0` and the K-quants
+///    are admitted here and declined there on purpose, so they fall through to the CPU
+///    kernel instead of taking a second GPU path with none of the resident lane's parity
+///    evidence. That list is exhaustive over `ResidentWeightFormat`, so a brand-new
+///    *format variant* is a compile error there — but admitting an existing variant here
+///    is **not**, and `prism_wire_hybrid_admission_is_pinned_per_format` stays green.
+/// 2. It does NOT update `execution_plan.rs`. The plan picks its arm from tensor types
+///    and arch, so a newly-admitted quant will keep disclosing whatever arm it matched
+///    before — `/v1/health` naming a lane other than the one serving. That has now
+///    happened four times (Prism Q1/Q2, lfm2, qwen35 Q8_0, qwen35 K-quant); the last one
+///    was caught only because a live load was checked.
 fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
     match tt {
         GgufTensorType::Q1_0 => Some(crate::metal::ResidentWeightFormat::Q1_0),
@@ -99,6 +107,13 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
         // Q8_0 wire blocks (34B: f16 scale + 32 i8) are already the layout the resident
         // Metal Q8 GEMV consumes, so they need no repack.
         GgufTensorType::Q8_0 => Some(crate::metal::ResidentWeightFormat::Q8_0),
+        // K-quant super-blocks (Q4_K 144B / Q6_K 210B per 256 values) are likewise the
+        // exact layout `encode_resident_kquant_matmul_f32` consumes. Admitted as a PAIR:
+        // an ornith Q4_K_M file carries Q6_K on `output.weight`, 12 `attn_qkv`, 4
+        // `attn_v` and 16 `ffn_down`, and `prism_metal_weight` hard-errors on an
+        // unmapped type, so admitting only Q4K yields no resident graph at all.
+        GgufTensorType::Q4K => Some(crate::metal::ResidentWeightFormat::Q4K),
+        GgufTensorType::Q6K => Some(crate::metal::ResidentWeightFormat::Q6K),
         _ => None,
     }
 }
@@ -4853,6 +4868,13 @@ mod resident_format_admission_tests {
             (GgufTensorType::Q2_0G128, ResidentWeightFormat::Q2_0G128),
             (GgufTensorType::Pq2_0, ResidentWeightFormat::Q2_0G128),
             (GgufTensorType::Q8_0, ResidentWeightFormat::Q8_0),
+            // Admitted as a PAIR. An ornith Q4_K_M file is Q4_K 217 / Q6_K 33 / F32 177,
+            // so dropping either arm leaves `prism_metal_weight` erroring on the other
+            // and `build_qwen35_metal` yields no resident graph at all — not a partial
+            // one. Measured on that file: 11.3 tok/s decode, phys_footprint 6261 MB
+            // (vs 9917 MB for the Q8_0 row).
+            (GgufTensorType::Q4K, ResidentWeightFormat::Q4K),
+            (GgufTensorType::Q6K, ResidentWeightFormat::Q6K),
         ] {
             assert_eq!(resident_metal_format(tt), Some(want), "{tt:?} must map");
             assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
@@ -4861,15 +4883,14 @@ mod resident_format_admission_tests {
 
     #[test]
     fn unadmitted_types_neither_map_nor_page_back() {
-        // Page-backing costs a page per tensor, so it stays opt-in. The Q4K/Q6K Metal
-        // kernels exist but this loader does not admit them yet; when one is, adding it
-        // to `resident_metal_format` is the whole change — there is no second list.
+        // Page-backing costs a page per tensor, so it stays opt-in. Note Q5_K is absent
+        // from the admitted table on purpose: there is no `q5k` Metal kernel, so an
+        // ornith Q3_K_M (which carries q5_K tensors) must keep failing closed to CPU.
         for tt in [
             GgufTensorType::F32,
             GgufTensorType::F16,
             GgufTensorType::Q4_0,
-            GgufTensorType::Q4K,
-            GgufTensorType::Q6K,
+            GgufTensorType::Q5K,
         ] {
             assert_eq!(resident_metal_format(tt), None, "{tt:?} must not admit");
             assert!(!wants_page_backing(tt), "{tt:?} must stay Owned");
