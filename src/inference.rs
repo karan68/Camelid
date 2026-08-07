@@ -118,6 +118,8 @@ use crate::{
         with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
         Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block, Q8_0PackedRows4Interleave,
         Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape, TensorStore,
+        Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMENTS, Q2_0_G128_BLOCK_BYTES, Q2_0_G128_BLOCK_ELEMENTS,
+        Q2_0_G64_BLOCK_BYTES, Q2_0_G64_BLOCK_ELEMENTS,
     },
     BackendError, Result,
 };
@@ -694,9 +696,22 @@ impl LlamaLoadedWeights {
                     return store.load_iq4_xs_wire_linear(name);
                 }
                 // Prism Q1/Q2 linears stay in their native packed wire format on
-                // macOS Metal and Windows CUDA. Both resident lanes consume these
-                // bytes directly; there is no whole-model Q8/F32 expansion. Keep
-                // the pre-existing lossless Q1->Q8 bridge on other platforms.
+                // EVERY platform. The macOS Metal and Windows CUDA resident lanes
+                // consume these bytes directly, and `matmul_rhs_transposed_prism_
+                // block_dot` streams the SAME bytes on the CPU, so no platform
+                // pays a whole-model Q8/F32 expansion.
+                //
+                // This used to be gated on `cfg!(macos | windows+cuda)`, which was a
+                // COMPILE-time stand-in for a RUNTIME question. `build.rs` turns the
+                // `cuda` feature on for every Windows build, so a Windows box with no
+                // usable NVIDIA device still took the packed-wire branch while the
+                // planner (which reads the runtime `platform.cuda_resident_active`)
+                // routed decode to the CPU. The CPU had no Q1_0/Q2_0 consumer, so the
+                // wire-only tensor -- `data: Vec::new()` -- reached the f32 matmul and
+                // every Bonsai row died on `require_row_major_f32_data` at its first
+                // forward. A loader keyed on the target triple can never agree with a
+                // planner keyed on the device actually present; the fix is to give the
+                // CPU a consumer so the branch does not need to guess.
                 if matches!(
                     desc.tensor_type,
                     GgufTensorType::Q1_0
@@ -705,16 +720,7 @@ impl LlamaLoadedWeights {
                         | GgufTensorType::Pq2_0
                 ) && desc.dimensions.len() == 2
                 {
-                    if cfg!(any(
-                        target_os = "macos",
-                        all(target_os = "windows", feature = "cuda")
-                    )) {
-                        return store.load_prism_wire_linear(name);
-                    }
-                    if desc.tensor_type == GgufTensorType::Q1_0 {
-                        return store.load_q1_0_as_q8_0_blocks_linear(name);
-                    }
-                    return store.load_cpu_f32(name);
+                    return store.load_prism_wire_linear(name);
                 }
                 if matches!(
                     desc.tensor_type,
@@ -9421,7 +9427,15 @@ fn linear_with_diagnostic_layouts_with_plan(
     {
         return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name);
     }
-    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+    // Prism packed low-bit weights, for the same reason and with the same
+    // unconditional urgency as IQ4_XS above. Their blocks are 128/64 elements
+    // wide, so they are NOT gated on the 256-element K-quant modulus.
+    if prism_wire_of(weight).is_some() {
+        return matmul_rhs_transposed_prism_block_dot(input, weight, name);
+    }
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_width % Q6_K_VALUES_PER_BLOCK == 0
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q2_k_block_dot(input, weight, name);
         }
@@ -9558,6 +9572,9 @@ struct BorrowedLinearWeight<'a> {
     q8_0_file_backing: Option<&'a Q8_0FileBacking>,
     tq2_0_wire_bytes: Option<&'a [u8]>,
     iq4_xs_wire_bytes: Option<&'a [u8]>,
+    /// Packed wire for the Prism low-bit family only (never TQ2_0 — see
+    /// [`prism_wire_of`]), so `source_type` alone selects the right geometry.
+    prism_wire_bytes: Option<&'a [u8]>,
     q2_k_wire_bytes: Option<&'a [u8]>,
     q3_k_wire_bytes: Option<&'a [u8]>,
     q4_k_wire_bytes: Option<&'a [u8]>,
@@ -9585,6 +9602,7 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_file_backing: weight.q8_0_file_backing.as_ref(),
             tq2_0_wire_bytes: weight.tq2_0_wire_bytes.as_deref().map(|v| v.as_slice()),
             iq4_xs_wire_bytes: weight.iq4_xs_wire_bytes.as_deref().map(|v| v.as_slice()),
+            prism_wire_bytes: prism_wire_of(weight).map(|(wire, _)| wire),
             q2_k_wire_bytes: weight.q2_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q3_k_wire_bytes: weight.q3_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q4_k_wire_bytes: weight.q4_k_wire(),
@@ -9791,6 +9809,10 @@ fn output_projection_with_layout_with_plan(
             {
                 return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name.as_str());
             }
+            // Tied Prism Q1_0/Q2_0 embed/lm_head: stream the packed wire blocks.
+            if prism_wire_of(weight).is_some() {
+                return matmul_rhs_transposed_prism_block_dot(input, weight, name.as_str());
+            }
             if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
                 return matmul_rhs_transposed_q2_k_block_dot(input, weight, name.as_str());
             }
@@ -9887,10 +9909,19 @@ fn matmul_rhs_transposed_with_precision_with_plan(
     if weight.source_type == Some(GgufTensorType::IQ4XS) && weight.iq4_xs_wire_bytes.is_some() {
         return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name);
     }
+    // Prism Q1_0/Q2_0/PQ2_0 carry only wire bytes (empty f32 data), so like IQ4_XS
+    // they must always take the streaming block-dot — there is no f32 to fall back to.
+    if prism_wire_of(weight).is_some() {
+        return matmul_rhs_transposed_prism_block_dot(input, weight, name);
+    }
     // K-quant (Q4_K / Q6_K) 2-D linears retain wire bytes with no f32 data, so
     // without an in-place CPU dot they have no CPU consumer. Dispatch them to the
-    // bit-exact block-dot kernels (gated; a Q4_K_M model mixes both quants).
-    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+    // bit-exact block-dot kernels (a Q4_K_M model mixes both quants). The env flag
+    // may only express a kernel preference, never disable the sole consumer --
+    // see `kquant_block_dot_selected`.
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_width % Q6_K_VALUES_PER_BLOCK == 0
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q2_k_block_dot(input, weight, name);
         }
@@ -9968,7 +9999,14 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
             return iq4_xs_block_dot_core(input, wire, output_width, input_width, name);
         }
     }
-    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+    // Prism packed low-bit: wire-only, and on 128/64-element blocks rather than
+    // the 256-element K-quant modulus, so it is not gated on that check.
+    if let (Some(wire), Some(tensor_type)) = (weight.prism_wire_bytes, weight.source_type) {
+        return prism_block_dot_core(input, wire, output_width, input_width, tensor_type, name);
+    }
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_width % Q6_K_VALUES_PER_BLOCK == 0
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) {
             if let Some(wire) = weight.q2_k_wire_bytes {
                 return q2_k_block_dot_core(input, wire, output_width, input_width, name);
@@ -19789,6 +19827,210 @@ fn accumulate_transposed_linear_row_tq2_0(input_row: &[f32], wire: &[u8], output
     });
 }
 
+/// `(elements_per_block, bytes_per_block)` for the Prism packed low-bit family.
+///
+/// `Pq2_0` (GGUF type id 142) is wire-identical to the legacy g128 layout — it
+/// exists only so Prism's packed Q2 can coexist with upstream's type-42 g64 —
+/// so it shares g128's geometry here and everywhere downstream.
+fn prism_block_geometry(tensor_type: GgufTensorType) -> Option<(usize, usize)> {
+    match tensor_type {
+        GgufTensorType::Q1_0 => Some((Q1_0_BLOCK_ELEMENTS, Q1_0_BLOCK_BYTES)),
+        GgufTensorType::Q2_0G64 => Some((Q2_0_G64_BLOCK_ELEMENTS, Q2_0_G64_BLOCK_BYTES)),
+        GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+            Some((Q2_0_G128_BLOCK_ELEMENTS, Q2_0_G128_BLOCK_BYTES))
+        }
+        _ => None,
+    }
+}
+
+/// The packed wire bytes for a weight, if it is one of the Prism low-bit types.
+///
+/// Deliberately NARROWER than [`CpuTensor::low_bit_wire`], which also answers for
+/// TQ2_0: that type has its own 256-element / 66-byte kernel and completely
+/// different block math, so it must never be routed here by a shared accessor.
+fn prism_wire_of(weight: &CpuTensor) -> Option<(&[u8], GgufTensorType)> {
+    let tensor_type = weight.source_type?;
+    prism_block_geometry(tensor_type)?;
+    Some((weight.low_bit_wire()?, tensor_type))
+}
+
+/// Dot ONE packed Prism weight row against one f32 activation row.
+///
+/// The weight values are reconstructed exactly as `decode_q1_0_tensor` and
+/// `decode_q2_0_tensor` reconstruct them, and multiplied into the activation in
+/// element order:
+///
+/// * Q1_0 decodes to `{-d, +d}` per sign bit. The negative branch uses a
+///   precomputed `neg_d = -d` rather than `-1.0 * d` so a ZERO scale keeps the
+///   sign of zero the pin specifies (`+0.0` set, `-0.0` clear).
+/// * Q2_0 / PQ2_0 decode to `(q - 1) * d` over `q in {0,1,2,3}`, giving
+///   `{-d, 0, +d, +2d}`.
+///
+/// The per-element multiply is deliberate: factoring `d` out of a block sum
+/// (`d * sum(a)`) would be faster but is NOT the same float, and it would break
+/// the invariant the unit tests pin — that this kernel is bit-identical to
+/// `decode_*_tensor` followed by a scalar dot. The `(coef * d) * a` grouping
+/// matters for the same reason and must not be reassociated.
+fn prism_row_dot(w_row: &[u8], act: &[f32], tensor_type: GgufTensorType) -> f32 {
+    let mut acc = 0f32;
+    match tensor_type {
+        GgufTensorType::Q1_0 => {
+            for (block, chunk) in w_row
+                .chunks_exact(Q1_0_BLOCK_BYTES)
+                .zip(act.chunks(Q1_0_BLOCK_ELEMENTS))
+            {
+                let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let neg_d = -d;
+                let qs = &block[2..Q1_0_BLOCK_BYTES];
+                for (j, &a) in chunk.iter().enumerate() {
+                    let bit = (qs[j / 8] >> (j % 8)) & 1;
+                    acc += (if bit == 1 { d } else { neg_d }) * a;
+                }
+            }
+        }
+        GgufTensorType::Q2_0G64 | GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+            let (block_elements, block_bytes) = match prism_block_geometry(tensor_type) {
+                Some(geometry) => geometry,
+                None => return 0.0,
+            };
+            for (block, chunk) in w_row
+                .chunks_exact(block_bytes)
+                .zip(act.chunks(block_elements))
+            {
+                let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let qs = &block[2..];
+                for (j, &a) in chunk.iter().enumerate() {
+                    let q = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+                    acc += ((i32::from(q) - 1) as f32 * d) * a;
+                }
+            }
+        }
+        _ => {}
+    }
+    acc
+}
+
+/// Shared core for the streaming Prism linear: every output row dots its own
+/// packed wire row against the activations, rayon-parallel over the output
+/// dimension. Takes the contraction width from the input and the output width
+/// from the caller, so a GGUF `[in, out]` weight (GQA k/v projections) works
+/// unchanged — the same layout-agnostic contract the K-quant cores use.
+fn prism_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    tensor_type: GgufTensorType,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    let (block_elements, block_bytes) = prism_block_geometry(tensor_type).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!(
+            "Prism block-dot received non-Prism tensor type {tensor_type:?}"
+        ))
+    })?;
+    if !in_dim.is_multiple_of(block_elements) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "{tensor_type:?} block-dot requires in_dim multiple of {block_elements}, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / block_elements) * block_bytes;
+    if wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{tensor_type:?} weight wire length {} != out_dim {out_dim} * {row_bytes}",
+            wire.len()
+        )));
+    }
+    let n_rows = input.dim(0)?;
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            (0..n_rows)
+                .map(|r| {
+                    prism_row_dot(
+                        w_row,
+                        &input.data[r * in_dim..(r + 1) * in_dim],
+                        tensor_type,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+/// Streaming CPU linear for the Prism packed low-bit family (Q1_0, Q2_0 g64/g128,
+/// PQ2_0). These tensors are loaded wire-only with EMPTY f32 data, so without this
+/// kernel they have no CPU consumer at all — the exact gap that made every Bonsai
+/// row fail its first forward whenever the resident GPU lane was not driving decode.
+/// Mirrors [`matmul_rhs_transposed_tq2_0_block_dot`].
+fn matmul_rhs_transposed_prism_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let (wire, tensor_type) = prism_wire_of(weight).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Prism weight missing wire bytes".to_string())
+    })?;
+    let (block_elements, block_bytes) = prism_block_geometry(tensor_type).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!(
+            "Prism block-dot received non-Prism tensor type {tensor_type:?}"
+        ))
+    })?;
+    let in_dim = input.dim(1)?;
+    if !in_dim.is_multiple_of(block_elements) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "{tensor_type:?} block-dot requires in_dim multiple of {block_elements}, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / block_elements) * block_bytes;
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{tensor_type:?} weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    // Output width comes from the WIRE LENGTH, never from `weight.dim(0)`: Bonsai's
+    // tied embed/lm_head is a GGUF `[in, out]` tensor ([2560, 151669]), so dim(0) is
+    // the contraction width, not the output width. Same layout-agnostic contract the
+    // K-quant and IQ4_XS cores use — reading dim(0) here made the real 4B rows fail
+    // their first forward with a wire-length mismatch.
+    let out_dim = wire.len() / row_bytes;
+    prism_block_dot_core(input, wire, out_dim, in_dim, tensor_type, name)
+}
+
+/// Single-row (decode) variant of the streaming Prism linear. Mirrors
+/// [`accumulate_transposed_linear_row_tq2_0`].
+fn accumulate_transposed_linear_row_prism(
+    input_row: &[f32],
+    wire: &[u8],
+    tensor_type: GgufTensorType,
+    output: &mut [f32],
+) {
+    use rayon::prelude::*;
+    let Some((block_elements, block_bytes)) = prism_block_geometry(tensor_type) else {
+        return;
+    };
+    if !input_row.len().is_multiple_of(block_elements) {
+        return;
+    }
+    let row_bytes = (input_row.len() / block_elements) * block_bytes;
+    if wire.len() < output.len() * row_bytes {
+        return;
+    }
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = prism_row_dot(w_row, input_row, tensor_type);
+    });
+}
+
 /// Per-input-row Q4_K accumulate: quantise the row to Q8_K, dot against each
 /// output row's Q4_K wire super-blocks via the bit-exact kernel (rayon over the
 /// output dimension). Mirrors [`accumulate_transposed_linear_row_tq2_0`].
@@ -19895,6 +20137,23 @@ fn matmul_rhs_transposed_q6_k_block_dot(
 /// `q6_k_wire_row_dot`). Windows greedy parity is proven vs llama.cpp acd79d6
 /// (K-quant conductor Phase 2); Linux/macOS f32-near-tie parity confirmation is a
 /// documented follow-up.
+/// Whether the K-quant streaming block-dot must run for this weight.
+///
+/// `CAMELID_X86_Q4K_DECODE=0` expresses a PREFERENCE between CPU kernels. It cannot
+/// mean "materialize f32 instead", because for a 2-D K-quant linear nothing ever
+/// materializes it: `load_kquant_wire_linear` retains wire bytes and leaves `data`
+/// EMPTY (an 8B model decoded to f32 is ~32 GB). So when the weight carries no f32
+/// data the block-dot is the only consumer and the flag must not be able to turn it
+/// off -- exactly the rule the IQ4_XS dispatch above already states for itself.
+///
+/// Before this guard, `CAMELID_X86_Q4K_DECODE=0` made EVERY K-quant model fail its
+/// first forward on CPU with `matmul rhs-transposed rhs cannot read tensor ... as
+/// row-major f32: storage=no-row-major-data, data_len=0` -- the same defect as the
+/// Prism lane's, reachable through an env var instead of a target triple.
+fn kquant_block_dot_selected(weight_has_f32_data: bool) -> bool {
+    q4_k_cpu_block_dot_enabled() || !weight_has_f32_data
+}
+
 pub(crate) fn q4_k_cpu_block_dot_enabled() -> bool {
     // Read once per process (non-test): this predicate runs per projection
     // call on the decode hot loop, and env reads allocate on Windows.
@@ -23800,10 +24059,17 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
             return;
         }
     }
+    // Prism packed low-bit: wire-only, so this is the decode-path consumer.
+    if let (Some(wire), Some(tensor_type)) = (weight.prism_wire_bytes, weight.source_type) {
+        accumulate_transposed_linear_row_prism(input_row, wire, tensor_type, output);
+        return;
+    }
     // K-quant (Q4_K / Q6_K) wire weights: no f32 data to accumulate, so dot the
     // retained wire blocks in place. This is the universal funnel for the
     // accumulate-based (descriptor/borrowed) matmul layouts.
-    if q4_k_cpu_block_dot_enabled() && input_row.len().is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_row.len().is_multiple_of(Q6_K_VALUES_PER_BLOCK)
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) {
             if let Some(wire) = weight.q2_k_wire_bytes {
                 accumulate_transposed_linear_row_q2_k(input_row, wire, output);

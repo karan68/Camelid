@@ -1688,8 +1688,12 @@ fn is_prism_low_bit_metal_arch(gguf: &GgufFile) -> bool {
 /// `q6k_gemv`) when CUDA resident decode is driving this process, or by the CPU
 /// block-dot (`q4_k_dot_avx2` + `q6_k_wire_row_dot`) otherwise — neither materializes
 /// f32. Descriptive only (no env_updates): the actual route is chosen at runtime by
-/// `resident_decode_cuda_active()` + `q4_k_cpu_block_dot_enabled()`. This replaces the
-/// old `cpu_reference`/`dense_or_other` mislabel that reported a CPU fallback for a lane
+/// `resident_decode_cuda_active()` and, off the GPU, by `kquant_block_dot_selected()` —
+/// which for these wire-only linears is unconditionally the block-dot, since they carry
+/// no f32 `data` for anything else to consume. (It is NOT
+/// `q4_k_cpu_block_dot_enabled()` any more: that flag chooses between CPU kernels and
+/// must not be able to delete the last consumer.) This replaces the old
+/// `cpu_reference`/`dense_or_other` mislabel that reported a CPU fallback for a lane
 /// that actually runs GPU-resident (K-quant conductor disclosure fix). Greedy parity vs
 /// llama.cpp is recorded in the `*-q4_k_m-*-parity-*` evidence bundles.
 fn select_kquant_plan(
@@ -1743,7 +1747,20 @@ fn select_kquant_plan(
             "kquant_metal_resident_decode",
             "kquant_cpu_block_dot_reference_path",
         )
-    } else if crate::inference::q4_k_cpu_block_dot_enabled() {
+    } else {
+        // Unconditional, because the ROUTING is now unconditional. Every 2-D K-quant
+        // linear is loaded wire-only (`load_kquant_wire_linear` leaves `data` empty),
+        // and `kquant_block_dot_selected` therefore picks the block-dot whatever
+        // `CAMELID_X86_Q4K_DECODE` says — a flag may choose between kernels, it may not
+        // delete the only consumer.
+        //
+        // This arm used to be gated on `q4_k_cpu_block_dot_enabled()`, with an `else`
+        // that disclosed `cpu_reference` / `safe_cpu_decode` and the reason "K-quant
+        // linears have no CPU consumer". Once routing stopped honouring the flag, that
+        // fallback described a lane no run could take: with the flag off the plan would
+        // have claimed a safe CPU path while the block-dot actually decoded. That is the
+        // disclosure drift this function exists to prevent (see the doc comment above),
+        // so the branch is gone rather than merely reworded.
         reasons.push(
             "CPU K-quant block-dot decode reads Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS wire blocks; no f32 materialization"
                 .into(),
@@ -1755,19 +1772,6 @@ fn select_kquant_plan(
             "always_retained_reference_path",
             "kquant_cpu_block_dot_decode",
             "kquant_cpu_block_dot_reference_path",
-        )
-    } else {
-        reasons.push(
-            "K-quant CPU block-dot disabled (CAMELID_X86_Q4K_DECODE=0) and no resident GPU; K-quant linears have no CPU consumer"
-                .into(),
-        );
-        (
-            "cpu_reference",
-            "safe_dense_or_q8_cpu",
-            "safe_cpu_prefill",
-            "always_retained_reference_path",
-            "safe_cpu_decode",
-            "safe_cpu_reference_path",
         )
     }
 }
@@ -3288,6 +3292,11 @@ mod tests {
         assert_eq!(gpu.plan.decode_path, "kquant_cuda_resident_decode");
         assert!(gpu.plan.cuda_resident_active);
 
+        // CAMELID_X86_Q4K_DECODE=0 no longer changes the LANE, so it must no longer
+        // change the DISCLOSURE. K-quant 2-D linears load wire-only, so the block-dot
+        // is their only consumer and `kquant_block_dot_selected` keeps it regardless of
+        // the flag; this assertion used to expect `cpu_reference`, which would now be a
+        // plan describing a run that cannot happen.
         env::set_var("CAMELID_X86_Q4K_DECODE", "0");
         let off = plan_for_model_with_platform(
             &path,
@@ -3295,7 +3304,8 @@ mod tests {
             Some(8),
             platform("windows", "x86_64", &["avx2"]),
         );
-        assert_eq!(off.plan.selected_backend, "cpu_reference");
+        assert_eq!(off.plan.selected_backend, "cpu_kquant_block_dot");
+        assert_eq!(off.plan.decode_path, "kquant_cpu_block_dot_decode");
         env::remove_var("CAMELID_X86_Q4K_DECODE");
         clear_profile_env();
     }
