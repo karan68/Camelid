@@ -39,7 +39,7 @@ enum RawMatBytes {
     /// their bytes instead of duplicating the largest matrix in the model.
     Owned(Arc<Vec<u8>>),
     /// Page-aligned packed backing. Metal wraps this allocation with
-    /// `newBufferWithBytesNoCopy`, so a Q1/Q2 projection has one resident copy.
+    /// `newBufferWithBytesNoCopy`, so a Q1/Q2 or Q8_0 projection has one resident copy.
     WirePages(Arc<crate::wire_mmap::WirePages>),
 }
 
@@ -66,6 +66,40 @@ impl RawMatBytes {
             Self::Owned(_) => None,
         }
     }
+}
+
+/// The resident Metal format a GGUF tensor type maps to, or `None` if the resident lane
+/// cannot consume it. Single source of truth: admitting a type here is what makes it
+/// page-backed at load (see [`wants_page_backing`]), so the two cannot drift apart.
+///
+/// Not macOS-gated, because `wants_page_backing` is not: the loader makes the same
+/// backing choice on every target.
+fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
+    match tt {
+        GgufTensorType::Q1_0 => Some(crate::metal::ResidentWeightFormat::Q1_0),
+        GgufTensorType::Q2_0G64 => Some(crate::metal::ResidentWeightFormat::Q2_0G64),
+        GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+            Some(crate::metal::ResidentWeightFormat::Q2_0G128)
+        }
+        // Q8_0 wire blocks (34B: f16 scale + 32 i8) are already the layout the resident
+        // Metal Q8 GEMV consumes, so they need no repack.
+        GgufTensorType::Q8_0 => Some(crate::metal::ResidentWeightFormat::Q8_0),
+        _ => None,
+    }
+}
+
+/// Tensor types read into `RawMatBytes::WirePages` rather than an owned `Vec`, so the
+/// allocation can be wrapped in place with `newBufferWithBytesNoCopy`.
+///
+/// Derived from [`resident_metal_format`] rather than listed again: `prism_metal_weight`
+/// needs a tensor to be *both* page-backed and format-mapped, and when those were two
+/// hand-maintained lists, adding a type to only one left it silently failing the
+/// page-backed check and falling back to CPU decode.
+///
+/// Page-backing is otherwise unobservable — `as_slice` is identical either way and
+/// `wire_pages` is macOS-only — at the cost of rounding each tensor up to a page.
+fn wants_page_backing(tt: GgufTensorType) -> bool {
+    resident_metal_format(tt).is_some()
 }
 
 #[cfg(target_os = "macos")]
@@ -123,23 +157,11 @@ impl RawMat {
     }
 
     #[cfg(target_os = "macos")]
-    fn prism_metal_format(&self) -> Option<crate::metal::ResidentWeightFormat> {
-        match self.tt {
-            GgufTensorType::Q1_0 => Some(crate::metal::ResidentWeightFormat::Q1_0),
-            GgufTensorType::Q2_0G64 => Some(crate::metal::ResidentWeightFormat::Q2_0G64),
-            GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
-                Some(crate::metal::ResidentWeightFormat::Q2_0G128)
-            }
-            _ => None,
-        }
-    }
-
-    #[cfg(target_os = "macos")]
     fn prism_metal_weight(&self) -> Result<crate::metal::ResidentWeightBytes<'_>> {
         let pages = self.bytes.wire_pages().ok_or_else(|| {
             BackendError::InvalidTensorData("Prism Metal weight is not page-backed".into())
         })?;
-        let format = self.prism_metal_format().ok_or_else(|| {
+        let format = resident_metal_format(self.tt).ok_or_else(|| {
             BackendError::InvalidTensorData(format!(
                 "unsupported Qwen3.5 Metal projection type {:?}",
                 self.tt
@@ -226,7 +248,7 @@ impl RawMat {
         debug_assert_eq!(x.len(), self.in_features);
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = self.prism_metal_format().and_then(|format| {
+            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matvec_f32(x, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -365,7 +387,7 @@ impl RawMat {
         let out_f = self.out_features;
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = self.prism_metal_format().and_then(|format| {
+            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matmul_f32(xs, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -567,13 +589,7 @@ impl RunnableModel {
         let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
             let d = find_tensor(&gguf, name)?;
             let (inf, outf) = mat_dims(d, name)?;
-            let bytes = if matches!(
-                d.tensor_type,
-                GgufTensorType::Q1_0
-                    | GgufTensorType::Q2_0G64
-                    | GgufTensorType::Q2_0G128
-                    | GgufTensorType::Pq2_0
-            ) {
+            let bytes = if wants_page_backing(d.tensor_type) {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
@@ -4777,6 +4793,146 @@ impl RunnableModel {
             }
         }
         Ok(e)
+    }
+}
+
+/// The resident-format list and the page-backing it drives. Both are platform-
+/// independent — `load_raw` makes the same backing choice on every target — so these
+/// run everywhere, not only where the resident lane exists.
+#[cfg(test)]
+mod resident_format_admission_tests {
+    use super::*;
+    use crate::metal::ResidentWeightFormat;
+
+    #[test]
+    fn admitted_types_map_to_a_resident_format_and_page_back() {
+        // One table pins both halves, because page-backing is derived from the mapping.
+        // Dropping an entry returns that type to `Owned`, where the resident lane
+        // refuses it and the model falls back to CPU decode with no error.
+        for (tt, want) in [
+            (GgufTensorType::Q1_0, ResidentWeightFormat::Q1_0),
+            (GgufTensorType::Q2_0G64, ResidentWeightFormat::Q2_0G64),
+            (GgufTensorType::Q2_0G128, ResidentWeightFormat::Q2_0G128),
+            (GgufTensorType::Pq2_0, ResidentWeightFormat::Q2_0G128),
+            (GgufTensorType::Q8_0, ResidentWeightFormat::Q8_0),
+        ] {
+            assert_eq!(resident_metal_format(tt), Some(want), "{tt:?} must map");
+            assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
+        }
+    }
+
+    #[test]
+    fn unadmitted_types_neither_map_nor_page_back() {
+        // Page-backing costs a page per tensor, so it stays opt-in. The Q4K/Q6K Metal
+        // kernels exist but this loader does not admit them yet; when one is, adding it
+        // to `resident_metal_format` is the whole change — there is no second list.
+        for tt in [
+            GgufTensorType::F32,
+            GgufTensorType::F16,
+            GgufTensorType::Q4_0,
+            GgufTensorType::Q4K,
+            GgufTensorType::Q6K,
+        ] {
+            assert_eq!(resident_metal_format(tt), None, "{tt:?} must not admit");
+            assert!(!wants_page_backing(tt), "{tt:?} must stay Owned");
+        }
+    }
+}
+
+/// The macOS-only half of Q8_0 admission: `prism_metal_weight`'s page-backing
+/// requirement and the wire block geometry that makes admitting Q8_0 a no-repack
+/// change. The format mapping itself is platform-independent and covered above. Runs
+/// on any macOS host with no GGUF and no GPU.
+#[cfg(all(test, target_os = "macos"))]
+mod resident_metal_q8_admission_tests {
+    use super::*;
+    use crate::metal::{ResidentWeightBytes, ResidentWeightFormat};
+    use std::io::Write;
+
+    /// One GGUF `Q8_0` block is an f16 scale followed by 32 int8 quants. The resident
+    /// Metal Q8 GEMV consumes exactly this layout, which is why admitting Q8_0 needs no
+    /// repack. If either side ever diverges from 34/32, these tests are the tripwire.
+    const Q8_0_WIRE_BLOCK_BYTES: usize = 34;
+    const Q8_0_BLOCK_VALUES: usize = 32;
+
+    fn raw(
+        bytes: RawMatBytes,
+        tt: GgufTensorType,
+        in_features: usize,
+        out_features: usize,
+    ) -> RawMat {
+        RawMat {
+            bytes,
+            tt,
+            in_features,
+            out_features,
+        }
+    }
+
+    /// `out_features` rows of `in_features` values each, in Q8_0 wire form.
+    fn q8_0_wire_bytes(in_features: usize, out_features: usize) -> Vec<u8> {
+        let blocks_per_row = in_features / Q8_0_BLOCK_VALUES;
+        (0..out_features * blocks_per_row * Q8_0_WIRE_BLOCK_BYTES)
+            .map(|i| i as u8)
+            .collect()
+    }
+
+    #[test]
+    fn page_backed_q8_0_admits_as_a_resident_wire_weight() {
+        let (in_features, out_features) = (Q8_0_BLOCK_VALUES * 2, 3);
+        let wire = q8_0_wire_bytes(in_features, out_features);
+        assert_eq!(
+            wire.len(),
+            out_features * 2 * Q8_0_WIRE_BLOCK_BYTES,
+            "fixture must be an exact number of 34-byte Q8_0 wire blocks"
+        );
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&wire).expect("write wire bytes");
+        file.flush().expect("flush");
+        let pages = crate::wire_mmap::WirePages::read_from_file(file.as_file(), 0, wire.len())
+            .expect("Q8_0 tensors must be page-backable");
+        assert_eq!(
+            pages.bytes(),
+            &wire[..],
+            "page-backing must not alter bytes"
+        );
+
+        let m = raw(
+            RawMatBytes::WirePages(pages),
+            GgufTensorType::Q8_0,
+            in_features,
+            out_features,
+        );
+        match m.prism_metal_weight().expect("page-backed Q8_0 must admit") {
+            ResidentWeightBytes::WirePages { format, pages } => {
+                assert_eq!(format, ResidentWeightFormat::Q8_0);
+                assert_eq!(pages.bytes(), &wire[..]);
+            }
+            _ => panic!("expected page-backed WirePages backing for a Q8_0 projection"),
+        }
+    }
+
+    #[test]
+    fn owned_q8_0_is_refused_instead_of_silently_copied() {
+        // Variant check only: `Owned` is refused outright, so an ordinary heap tensor
+        // never reaches the resident lane. The page-alignment invariant itself is
+        // `WirePages`' contract, covered by
+        // `metal::tests::wire_mmap_nocopy_buffer_gpu_reads_file_bytes`.
+        let m = raw(
+            RawMatBytes::owned(q8_0_wire_bytes(Q8_0_BLOCK_VALUES, 1)),
+            GgufTensorType::Q8_0,
+            Q8_0_BLOCK_VALUES,
+            1,
+        );
+        let err = match m.prism_metal_weight() {
+            Ok(_) => panic!("owned Q8_0 must not reach the resident lane"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("not page-backed"),
+            "unexpected error: {err}"
+        );
     }
 }
 

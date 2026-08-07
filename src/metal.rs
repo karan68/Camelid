@@ -26822,6 +26822,120 @@ mod tests {
         }
     }
 
+    /// Resolver gate for the resident `Q8_0` projection. The runnable loader admits
+    /// GGUF `Q8_0` with no repack, so what needs proving is the seam: that
+    /// `ResidentWeightFormat::Q8_0` plus 34-byte wire blocks resolve through the
+    /// production projection encoder — block-count math and the `n_tokens == 1` decode
+    /// vs batched-prefill split — to the scalar decoder's values. The Q8 GEMV kernels
+    /// themselves are covered by `metal_q8_0_ksplit_gemv_matches_cpu_reference`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_q8_0_resident_projection_matches_scalar_decode() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Q8 Metal pipelines");
+        let format = ResidentWeightFormat::Q8_0;
+        let block_elements = format.values_per_block();
+        let block_bytes = format.wire_bytes_per_block();
+
+        // One block per row is the degenerate K-split case (a single live block slot);
+        // eight crosses the stride. 19 rows is odd, so the row-tiling tail guard runs
+        // rather than only SIMD group zero.
+        for blocks_per_row in [1usize, 8] {
+            let input_width = blocks_per_row * block_elements;
+            let rows = 19usize;
+            for n_tokens in [1usize, 2] {
+                let inputs: Vec<f32> = (0..n_tokens * input_width)
+                    .map(|i| (((i * 37 + 11) % 101) as f32 - 50.0) * 0.03125)
+                    .collect();
+
+                let mut wire = vec![0u8; rows * blocks_per_row * block_bytes];
+                for row in 0..rows {
+                    for block_idx in 0..blocks_per_row {
+                        let off = (row * blocks_per_row + block_idx) * block_bytes;
+                        let block = &mut wire[off..off + block_bytes];
+                        let scale = 0.125 + row as f32 * 0.0625 + block_idx as f32 * 0.03125;
+                        block[..2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                        for (i, byte) in block[2..].iter_mut().enumerate() {
+                            let q = ((row * 53 + block_idx * 29 + i * 7) % 255) as i32 - 127;
+                            *byte = (q as i8) as u8;
+                        }
+                    }
+                }
+
+                let row_bytes = blocks_per_row * block_bytes;
+                let mut expected = vec![0.0f32; n_tokens * rows];
+                for row in 0..rows {
+                    let decoded = crate::tensor::decode_q8_0_tensor(
+                        "test",
+                        &wire[row * row_bytes..(row + 1) * row_bytes],
+                        input_width,
+                    )
+                    .unwrap();
+                    for token in 0..n_tokens {
+                        expected[token * rows + row] = decoded
+                            .iter()
+                            .zip(&inputs[token * input_width..(token + 1) * input_width])
+                            .map(|(w, x)| w * x)
+                            .sum();
+                    }
+                }
+
+                let input_buf = kernel.device.new_buffer(
+                    (inputs.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let weight_buf = kernel
+                    .device
+                    .new_buffer(wire.len() as u64, MTLResourceOptions::StorageModeShared);
+                let output_buf = kernel.device.new_buffer(
+                    (expected.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let scalar = kernel
+                    .device
+                    .new_buffer(12, MTLResourceOptions::StorageModeShared);
+                write_buffer_f32(&input_buf, &inputs);
+                write_buffer_bytes(&weight_buf, &wire);
+                let resident = ResidentLinearWeight {
+                    format,
+                    buffer: weight_buf,
+                    // Page-backed GGUF bytes are 34-byte wire blocks, not the 36-byte
+                    // decoded CPU layout.
+                    q8_wire: true,
+                };
+                let cb = kernel.queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                encode_resident_matmul_f32(
+                    encoder,
+                    kernel,
+                    &mut Vec::new(),
+                    &input_buf,
+                    &resident,
+                    &output_buf,
+                    &scalar,
+                    input_width,
+                    rows,
+                    n_tokens,
+                );
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let mut got = vec![0.0f32; expected.len()];
+                read_buffer_f32(&output_buf, &mut got);
+                for (i, (&actual, &want)) in got.iter().zip(&expected).enumerate() {
+                    let tolerance = 2.0e-5 * want.abs().max(1.0);
+                    assert!(
+                        (actual - want).abs() <= tolerance,
+                        "Q8_0 blocks_per_row={blocks_per_row} n_tokens={n_tokens} output {i}: \
+                         gpu={actual} cpu={want} tolerance={tolerance}"
+                    );
+                }
+            }
+        }
+    }
+
     /// End-to-end tied-head gate: verifies RMSNorm, no-copy mmap offset binding,
     /// Q8_K activation quantization, Q6_K projection, and final soft-cap against
     /// the established CPU oracles.
