@@ -4947,7 +4947,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3 or qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -5051,10 +5051,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke_lanes",
                 notes: "exact dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking DISABLED) have row-specific smoke support: qwen2 BPE pre-tokenizer + hardcoded ChatML renderer, per-head QK-norm + NEOX (split-half) RoPE, and token-AND-text-identical greedy parity vs llama.cpp at 1/5/50 tokens on macOS/Ubuntu and on Windows x86_64 CPU (both the cpu_reference scalar path and the x86_q8 AVX2 runtime-repack path, bit-identical). 1.7B additionally runs the GPU-resident decode+prefill path and a 15,373-token single-shot prefill lane on macOS, with opt-in thinking-mode leading-trace parity. Exact rows only; other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the validated envelope, and broad Qwen-family support are not implied.",
             },
+            // The `qwen35` in this id is a STABLE JOIN KEY, not a description:
+            // the ledger and the docs surfaces address this row by exact id, so
+            // respelling it would orphan the join. The family is mixed-arch --
+            // see `notes` -- and the per-row architecture labels in the curated
+            // catalog are the authority.
             SupportItem {
                 id: "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal and Windows x86_64 CUDA. Both exact 27B rows have API/WebUI single-image smoke with the checked Q8_0 projector; constrained Windows GPUs use capacity-planned pinned-host layer streaming. Exact rows and these two GPU platforms only; neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied.",
+                notes: "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed Prism low-bit graph on macOS Apple Silicon Metal and Windows x86_64 CUDA. The family is NOT one architecture: the 4B and 8B files declare general.architecture=qwen3 and carry a dense attention stack (11 per-layer tensors, no ssm_* weights), while only the 27B files declare qwen35 with the hybrid gated-delta-net stack (ssm_conv1d/ssm_dt/ssm_out). Both exact 27B rows have API/WebUI single-image smoke with the checked Q8_0 projector; constrained Windows GPUs use capacity-planned pinned-host layer streaming. Exact rows and these two GPU platforms only; neighboring files, broader qwen3 or qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied.",
             },
         ],
         planned_model_families: vec![
@@ -5900,17 +5905,35 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             // packed macOS Metal and Windows CUDA lanes. Every id below is also a
             // curated catalog id, so the Models page derives Supported from this
             // contract. The receipts hash-pin all seven files and the projector.
+            //
+            // MIXED-ARCH FAMILY -- do not normalize these labels. Header read of
+            // all seven artifacts on 2026-08-07: the 4B and 8B files declare
+            // `general.architecture=qwen3` with a DENSE stack (36 blocks, 11
+            // per-layer tensors: attn_q/k/v + q_norm/k_norm + ffn, tied head,
+            // tokenizer pre `qwen2`, no ssm_* weights anywhere). Only the 27B
+            // files declare `qwen35` with the hybrid gated-delta-net stack (64
+            // blocks, 20 per-layer tensors incl. ssm_conv1d/ssm_dt/ssm_out,
+            // untied head, tokenizer pre `qwen35`). The rows below therefore
+            // split: qwen3_* labels for 4B/8B, qwen35_* for the 27B pair.
+            //
+            // `family` is NOT cosmetic: crate::chat::tool_parse::parse matches
+            // `family.contains("qwen35")` to pick the Ornith XML tool-call
+            // parser ahead of the hermes/JSON arm. Every Bonsai row is
+            // `tool_capable: false` and both agent entry points return early on
+            // `!active_tool_capable()`, so no Bonsai row reaches that parser
+            // today -- but if one is ever promoted, `qwen3_*` correctly lands it
+            // on the hermes arm the dense Qwen3 rows already use.
             ModelCompatibilityTarget {
                 id: "bonsai_4b_q1_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q1_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_vendor_token_and_text_parity",
@@ -5918,7 +5941,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -5944,15 +5967,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_q2_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q2_0/Q2_0_G128",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata_and_prism_q2_g128_geometry",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_vendor_short_decode_parity",
@@ -5960,7 +5983,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -5986,15 +6009,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_pq2_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "PQ2_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_pq2_type_142",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata_and_prism_pq2_type_142",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_pq2_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "pq2_wire_identity_plus_deterministic_windows_cuda_chat_probe",
@@ -6002,7 +6025,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -6028,15 +6051,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "bonsai_8b_q1_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q1_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
@@ -6044,7 +6067,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -6070,15 +6093,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_8b_q2_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q2_0/Q2_0_G128",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata_and_prism_q2_g128_geometry",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
@@ -6086,7 +6109,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -26634,6 +26657,19 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
         // join is what makes the Models page say Supported rather than merely
         // decorating an unverified download. Sizes are the HF LFS byte counts,
         // rechecked against the hash-pinned test files on 2026-08-01.
+        //
+        // The architecture labels are NOT uniform across the family, and that is
+        // deliberate: this field is what the GGUF actually declares, not the
+        // family name. Read from the headers of all seven artifacts on
+        // 2026-08-07, the 4B and 8B rows declare `general.architecture=qwen3`
+        // (398/399 tensors) and only the 27B rows declare `qwen35` (851
+        // tensors). They were all labelled `qwen35` here until then, which
+        // misdescribed the lane: `qwen3` binds the dense engine in
+        // src/inference.rs while `qwen35` binds the runnable lane in
+        // src/runnable/model.rs. Routing was never affected -- it reads
+        // gguf.architecture() from the file and is_prism_low_bit_metal_arch
+        // accepts both -- so this is the metadata catching up to the bytes. Do
+        // not "restore" the missing `5`.
         CatalogItem {
             catalog_id: "bonsai_4b_q1_0",
             name: "Bonsai 4B Q1_0",
@@ -26643,7 +26679,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 16415,
             likes: 53,
             quant: "Q1_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26656,7 +26692,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 7994,
             likes: 30,
             quant: "Q2_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26669,7 +26705,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 7994,
             likes: 30,
             quant: "PQ2_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26682,7 +26718,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 64163,
             likes: 762,
             quant: "Q1_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26695,7 +26731,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 120197,
             likes: 130,
             quant: "Q2_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
