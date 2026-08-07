@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::{
-    api_error, capabilities_response_with_plan, curated_catalog, AppState, CatalogItemView,
-    LoadedModel, NON_CATALOG_SUPPORTED_ARTIFACTS,
+    api_error, capabilities_response_with_plan, curated_catalog,
+    supported_artifact_expected_sha256, AppState, CatalogItemView, LoadedModel,
+    NON_CATALOG_SUPPORTED_ARTIFACTS,
 };
 use crate::chat::agent::LoopEnd;
 use crate::chat::workspace_bridge::{
@@ -757,7 +758,7 @@ fn workspace_model_options(models_dir: &std::path::Path) -> Vec<WorkspaceModelOp
         }
     }
 
-    for (filename, row_id) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+    for (filename, row_id, _) in NON_CATALOG_SUPPORTED_ARTIFACTS {
         let Some(row) = rows.iter().find(|row| row.id == *row_id) else {
             continue;
         };
@@ -1910,7 +1911,7 @@ async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, Str
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let row = tool_capable_row_for_filename(filename);
+    let row = tool_capable_row_for_loaded_artifact(filename, &model.lane.gguf_sha256);
     match row {
         Some((_, family)) => Ok((model, family.to_string())),
         None => Err(api_error(
@@ -1922,6 +1923,9 @@ async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, Str
     }
 }
 
+/// Name-only resolution, for listing which rows COULD serve Workspace (nothing
+/// is loaded, so there are no bytes to check). Never use this to authorize a
+/// loaded model — see `tool_capable_row_for_loaded_artifact`.
 fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'static str)> {
     let row_id = curated_catalog()
         .iter()
@@ -1930,8 +1934,8 @@ fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'stat
         .or_else(|| {
             NON_CATALOG_SUPPORTED_ARTIFACTS
                 .iter()
-                .find(|(artifact, _)| *artifact == filename)
-                .map(|(_, row_id)| *row_id)
+                .find(|(artifact, _, _)| *artifact == filename)
+                .map(|(_, row_id, _)| *row_id)
         });
     row_id.and_then(|row_id| {
         tool_capable_compatibility_rows()
@@ -1939,6 +1943,23 @@ fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'stat
             .find(|row| row.id == row_id)
             .map(|row| (row.id, row.family))
     })
+}
+
+/// Tool capability for a LOADED artifact. `tool_capable` is earned per exact row
+/// by a committed agent-eval receipt against specific bytes (the Ornith Q4_K_M
+/// row is the live example), so a hash-pinned artifact must present its
+/// certified digest before Workspace will drive it — otherwise a same-named
+/// replacement inherits an agent battery it never passed.
+fn tool_capable_row_for_loaded_artifact(
+    filename: &str,
+    gguf_sha256: &str,
+) -> Option<(&'static str, &'static str)> {
+    if supported_artifact_expected_sha256(filename)
+        .is_some_and(|expected| !gguf_sha256.eq_ignore_ascii_case(expected))
+    {
+        return None;
+    }
+    tool_capable_row_for_filename(filename)
 }
 
 #[cfg(test)]
@@ -2028,6 +2049,43 @@ mod tests {
         assert!(!options
             .iter()
             .any(|model| model.filename == "ornith-1.0-9b-Q3_K_M.gguf"));
+    }
+
+    #[test]
+    fn tool_capability_requires_the_certified_bytes_not_just_the_name() {
+        // `tool_capable` is earned per exact row by a committed agent-eval receipt
+        // against specific bytes. The Ornith Q4_K_M name is shared by the certified
+        // in-house requant and a different public HuggingFace imatrix quant, so the
+        // digest — not the filename — has to authorize Workspace.
+        const CERTIFIED: &str = "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
+        const HF_IMATRIX_SAME_NAME: &str =
+            "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106";
+        let filename = "ornith-1.0-9b-Q4_K_M.gguf";
+        assert!(
+            tool_capable_row_for_filename(filename).is_some(),
+            "precondition: this row is tool-capable by name"
+        );
+        assert!(tool_capable_row_for_loaded_artifact(filename, CERTIFIED).is_some());
+        assert!(
+            tool_capable_row_for_loaded_artifact(filename, HF_IMATRIX_SAME_NAME).is_none(),
+            "uncertified bytes must not inherit the agent battery this row passed"
+        );
+        // A row with no recorded digest keeps its existing filename gating.
+        // Resolved dynamically: naming a specific file here rots the moment that
+        // row gains a pin (it did — Qwen3-4B-Q4_K_M was the original example).
+        let unpinned = curated_catalog()
+            .into_iter()
+            .map(|item| item.filename)
+            .find(|name| {
+                supported_artifact_expected_sha256(name).is_none()
+                    && tool_capable_row_for_filename(name).is_some()
+            })
+            .expect("some tool-capable curated row still has no recorded digest");
+        assert_eq!(
+            tool_capable_row_for_loaded_artifact(unpinned, &"00".repeat(32)),
+            tool_capable_row_for_filename(unpinned),
+            "{unpinned} has no pin, so bytes must not gate it"
+        );
     }
 
     #[test]
