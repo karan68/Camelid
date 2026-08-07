@@ -814,6 +814,88 @@ fn resolved_gpu_switch(gpu: GpuMode, deterministic: bool) -> Option<bool> {
     }
 }
 
+/// Parse the `--mode` flag shared by `fabric route` and `fabric run`.
+fn route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
+    match raw {
+        "throughput" => Ok(camelid::fabric::RouteMode::Throughput),
+        "affinity" => Ok(camelid::fabric::RouteMode::Affinity),
+        other => anyhow::bail!("unknown mode `{other}`; expected `throughput` or `affinity`"),
+    }
+}
+
+/// Actions over a fabric of independent Camelid nodes.
+///
+/// A fabric places whole requests on nodes that each own a complete model and
+/// session, so nothing crosses the network inside the token loop. This is the
+/// throughput complement to `serve-distributed`, which shards one model's layers
+/// across machines and is slower than a single node by construction.
+#[derive(Debug, Subcommand)]
+enum FabricAction {
+    /// Probe every node once and report what the fabric can serve.
+    Status {
+        /// A node, as `LABEL=HOST[:PORT]`. Repeat for each node.
+        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        nodes: Vec<String>,
+        /// Per-node probe budget. Nodes are probed concurrently, so this bounds
+        /// the whole command, not each node in turn.
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+        /// Emit the observation as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show which node a request would be placed on, without sending it.
+    ///
+    /// Placement is deterministic, so this dry run predicts the real decision.
+    Route {
+        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        nodes: Vec<String>,
+        /// `throughput` spreads independent requests; `affinity` keeps a session
+        /// on the node whose prefix and KV cache are already warm.
+        #[arg(long, default_value = "throughput")]
+        mode: String,
+        /// Only consider nodes serving this exact model id.
+        #[arg(long)]
+        model: Option<String>,
+        /// Label of the node that served this session previously.
+        #[arg(long)]
+        sticky: Option<String>,
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send one chat request through the fabric and print the answer.
+    ///
+    /// Placement, then forward: the request crosses the network once, not once
+    /// per token.
+    Run {
+        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        nodes: Vec<String>,
+        /// The user message to send.
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value = "throughput")]
+        mode: String,
+        /// Require a node serving this exact model id. When omitted, the fabric
+        /// picks a node and uses whatever that node has loaded.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        sticky: Option<String>,
+        #[arg(long, default_value_t = 64)]
+        max_tokens: u32,
+        /// Per-node health probe budget.
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+        /// Budget for the generation itself, which can legitimately take minutes.
+        #[arg(long, default_value_t = 300)]
+        forward_timeout_s: u64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the local HTTP API server.
@@ -1143,6 +1225,11 @@ enum Command {
         /// Amount of megabytes to stream for throughput testing (default: 100 MB)
         #[arg(long, default_value_t = 100)]
         bandwidth_mb: usize,
+    },
+    /// Inspect and route across a fabric of independent Camelid nodes.
+    Fabric {
+        #[command(subcommand)]
+        action: FabricAction,
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
@@ -2280,6 +2367,151 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("Invalid role: {role}. Must be 'coordinator' or 'worker'");
             }
         }
+        Command::Fabric { action } => match action {
+            FabricAction::Status {
+                nodes,
+                timeout_ms,
+                json,
+            } => {
+                let specs = camelid::fabric::parse_fabric(&nodes)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let fabric = camelid::fabric::Fabric::new(specs)
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+                let snapshots = fabric.observe();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                } else {
+                    print!("{}", camelid::fabric::render_status(&snapshots));
+                }
+            }
+            FabricAction::Route {
+                nodes,
+                mode,
+                model,
+                sticky,
+                timeout_ms,
+                json,
+            } => {
+                let mode = route_mode(&mode)?;
+                let specs = camelid::fabric::parse_fabric(&nodes)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let fabric = camelid::fabric::Fabric::new(specs)
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+                let snapshots = fabric.observe();
+                let request = camelid::fabric::RouteRequest::new(mode)
+                    .with_model(model.as_deref())
+                    .with_sticky(sticky.as_deref());
+
+                // A fabric that cannot place the request is a failure the caller
+                // must see in the exit code, not only in the text.
+                let decision = camelid::fabric::route(&snapshots, &request)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "label": decision.label,
+                            "reason": format!("{:?}", decision.reason),
+                            "affinity_lost": decision.affinity_lost,
+                        }))?
+                    );
+                } else {
+                    println!("route -> {} ({:?})", decision.label, decision.reason);
+                    if let Some(previous) = &decision.affinity_lost {
+                        println!(
+                            "note: affinity to `{previous}` could not be honoured; \
+                             this request re-prefills on a cold node"
+                        );
+                    }
+                }
+            }
+            FabricAction::Run {
+                nodes,
+                prompt,
+                mode,
+                model,
+                sticky,
+                max_tokens,
+                timeout_ms,
+                forward_timeout_s,
+                json,
+            } => {
+                let mode = route_mode(&mode)?;
+                let specs = camelid::fabric::parse_fabric(&nodes)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let fabric = camelid::fabric::Fabric::new(specs)
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+
+                let request = camelid::fabric::RouteRequest::new(mode)
+                    .with_model(model.as_deref())
+                    .with_sticky(sticky.as_deref());
+                let (decision, chosen) = fabric
+                    .place(&request)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+                // The request must name a model. Prefer the operator's choice,
+                // otherwise use whatever the chosen node has loaded.
+                let model_id = match model {
+                    Some(model) => model,
+                    None => chosen
+                        .active_model_id()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "node `{}` reports no active model; pass --model",
+                                decision.label
+                            )
+                        })?
+                        .to_string(),
+                };
+
+                let body = camelid::fabric::forward::chat_request(&model_id, &prompt, max_tokens);
+                let answer = camelid::fabric::forward::forward(
+                    &chosen.spec,
+                    "/v1/chat/completions",
+                    &body,
+                    std::time::Duration::from_secs(forward_timeout_s),
+                )
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "node": answer.label,
+                            "reason": format!("{:?}", decision.reason),
+                            "affinity_lost": decision.affinity_lost,
+                            "model": model_id,
+                            "status": answer.status,
+                            "elapsed_ms": answer.elapsed.as_millis() as u64,
+                            "body": answer.body,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[{} · {:?} · {} · {} ms]",
+                        answer.label,
+                        decision.reason,
+                        model_id,
+                        answer.elapsed.as_millis()
+                    );
+                    match camelid::fabric::forward::completion_text(&answer.body) {
+                        Some(text) => println!("{text}"),
+                        None => println!("(no completion text; HTTP {})", answer.status),
+                    }
+                }
+
+                if !answer.is_success() {
+                    let detail = camelid::fabric::forward::error_message(&answer.body)
+                        .unwrap_or("no message");
+                    anyhow::bail!(
+                        "node `{}` answered HTTP {}: {detail}",
+                        answer.label,
+                        answer.status
+                    );
+                }
+            }
+        },
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);

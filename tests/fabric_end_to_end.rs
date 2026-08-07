@@ -1,0 +1,438 @@
+//! End-to-end fabric behaviour against stub nodes.
+//!
+//! The two-machine runs that validated this feature needed real engines, real
+//! models and a real network, so they cannot run in CI. These tests stand in
+//! two HTTP nodes on loopback that answer `/v1/health` and
+//! `/v1/chat/completions` from canned data, which makes the same paths — model
+//! scoped placement, affinity, forwarding, failure — reproducible anywhere.
+//!
+//! They also assert what the fabric *sends*, not only what it does with the
+//! reply. Nothing else covers the request side.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use camelid::fabric::{
+    forward, parse_node_spec, route, Fabric, NodeSpec, RouteError, RouteMode, RouteReason,
+    RouteRequest,
+};
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One request the stub actually received.
+#[derive(Debug, Clone)]
+struct Received {
+    method: String,
+    path: String,
+    body: String,
+}
+
+#[derive(Clone)]
+struct StubConfig {
+    /// Body served from `/v1/health`.
+    health: String,
+    /// Body served from `/v1/chat/completions`.
+    completion: String,
+    completion_status: u16,
+}
+
+impl StubConfig {
+    fn ready(model: &str, in_flight: usize) -> Self {
+        Self {
+            health: format!(
+                r#"{{"ok":true,"generation_ready":true,"active_model_id":"{model}",
+                    "backend":"llama","version":"0.5.4",
+                    "engine_queued_tasks":0,"engine_queue_depth":{in_flight}}}"#
+            ),
+            completion: format!(
+                r#"{{"choices":[{{"message":{{"role":"assistant","content":"served by {model}"}}}}]}}"#
+            ),
+            completion_status: 200,
+        }
+    }
+
+    fn not_ready() -> Self {
+        Self {
+            health: r#"{"ok":true,"generation_ready":false,"active_model_id":null}"#.to_string(),
+            completion: "{}".to_string(),
+            completion_status: 200,
+        }
+    }
+
+    fn refusing(model: &str) -> Self {
+        Self {
+            completion: r#"{"error":{"message":"engine queue full"}}"#.to_string(),
+            completion_status: 503,
+            ..Self::ready(model, 0)
+        }
+    }
+}
+
+/// A stand-in Camelid node on loopback.
+struct StubNode {
+    port: u16,
+    shutdown: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<Received>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl StubNode {
+    fn start(config: StubConfig) -> Self {
+        // Port 0 lets the OS pick, so tests never collide with each other or
+        // with a real engine on 8181.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread_requests = Arc::clone(&requests);
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { continue };
+                serve_once(&mut stream, &config, &thread_requests);
+            }
+        });
+
+        Self {
+            port,
+            shutdown,
+            requests,
+            thread: Some(thread),
+        }
+    }
+
+    fn spec(&self, label: &str) -> NodeSpec {
+        NodeSpec {
+            label: label.to_string(),
+            host: "127.0.0.1".to_string(),
+            port: self.port,
+        }
+    }
+
+    fn received(&self) -> Vec<Received> {
+        self.requests.lock().expect("stub lock").clone()
+    }
+}
+
+impl Drop for StubNode {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        // Unblock the accept() the worker is parked in.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<Received>>) {
+    let Some(received) = read_request(stream) else {
+        return;
+    };
+
+    let (status, body) = match received.path.as_str() {
+        "/v1/health" => (200_u16, config.health.clone()),
+        "/v1/chat/completions" => (config.completion_status, config.completion.clone()),
+        _ => (404, "{}".to_string()),
+    };
+
+    // Record only after deciding, so a malformed request never poisons the log.
+    requests.lock().expect("stub lock").push(received);
+
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<Received> {
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    // Read until the headers are complete, then until Content-Length is met.
+    loop {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+
+        let Some(header_end) = find_header_end(&raw) else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+        let expected = content_length(&head).unwrap_or(0);
+        if raw.len() >= header_end + 4 + expected {
+            let body = String::from_utf8_lossy(&raw[header_end + 4..]).to_string();
+            let mut parts = head.lines().next()?.split_whitespace();
+            return Some(Received {
+                method: parts.next()?.to_string(),
+                path: parts.next()?.to_string(),
+                body,
+            });
+        }
+    }
+    None
+}
+
+fn find_header_end(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn content_length(head: &str) -> Option<usize> {
+    head.lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// A port that nothing listens on.
+fn dead_spec(label: &str) -> NodeSpec {
+    NodeSpec {
+        label: label.to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 9,
+    }
+}
+
+fn fabric_of(specs: Vec<NodeSpec>) -> Fabric {
+    Fabric::new(specs).with_timeout(PROBE_TIMEOUT)
+}
+
+#[test]
+fn a_two_node_fabric_reports_both_models() {
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let beta = StubNode::start(StubConfig::ready("model-beta", 0));
+    let fabric = fabric_of(vec![alpha.spec("alpha"), beta.spec("beta")]);
+
+    let snapshots = fabric.observe();
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].active_model_id(), Some("model-alpha"));
+    assert_eq!(snapshots[1].active_model_id(), Some("model-beta"));
+}
+
+#[test]
+fn placement_is_scoped_to_the_node_actually_serving_the_model() {
+    // The live two-machine run proved this; the stubs make it reproducible.
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let beta = StubNode::start(StubConfig::ready("model-beta", 0));
+    let fabric = fabric_of(vec![alpha.spec("alpha"), beta.spec("beta")]);
+    let snapshots = fabric.observe();
+
+    let to_alpha = route(
+        &snapshots,
+        &RouteRequest::new(RouteMode::Throughput).with_model(Some("model-alpha")),
+    )
+    .expect("alpha serves it");
+    assert_eq!(to_alpha.label, "alpha");
+
+    let to_beta = route(
+        &snapshots,
+        &RouteRequest::new(RouteMode::Throughput).with_model(Some("model-beta")),
+    )
+    .expect("beta serves it");
+    assert_eq!(to_beta.label, "beta");
+}
+
+#[test]
+fn an_unserved_model_is_refused_naming_what_the_fabric_does_serve() {
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let fabric = fabric_of(vec![alpha.spec("alpha")]);
+
+    let error = route(
+        &fabric.observe(),
+        &RouteRequest::new(RouteMode::Throughput).with_model(Some("model-absent")),
+    )
+    .expect_err("nothing serves it");
+
+    match error {
+        RouteError::ModelUnavailable { model, serving } => {
+            assert_eq!(model, "model-absent");
+            assert_eq!(serving, vec!["model-alpha".to_string()]);
+        }
+        other => panic!("expected ModelUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_node_that_is_not_ready_is_never_placed_on() {
+    let warming = StubNode::start(StubConfig::not_ready());
+    let ready = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let fabric = fabric_of(vec![warming.spec("warming"), ready.spec("ready")]);
+
+    let decision = route(&fabric.observe(), &RouteRequest::new(RouteMode::Throughput))
+        .expect("one node can serve");
+    assert_eq!(decision.label, "ready");
+    assert_eq!(decision.reason, RouteReason::OnlyCandidate);
+}
+
+#[test]
+fn the_least_loaded_node_wins_and_a_dead_peer_does_not_stall_the_view() {
+    let busy = StubNode::start(StubConfig::ready("model-alpha", 5));
+    let idle = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let fabric = fabric_of(vec![
+        dead_spec("dead"),
+        busy.spec("busy"),
+        idle.spec("idle"),
+    ]);
+
+    let snapshots = fabric.observe();
+    assert_eq!(snapshots.len(), 3, "every node is reported, dead included");
+
+    let decision =
+        route(&snapshots, &RouteRequest::new(RouteMode::Throughput)).expect("two nodes can serve");
+    assert_eq!(decision.label, "idle");
+    assert_eq!(decision.reason, RouteReason::LeastLoaded);
+}
+
+#[test]
+fn affinity_holds_on_a_live_node_and_degrades_on_a_dead_one() {
+    let warm = StubNode::start(StubConfig::ready("model-alpha", 3));
+    let cold = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let fabric = fabric_of(vec![warm.spec("warm"), cold.spec("cold")]);
+    let snapshots = fabric.observe();
+
+    let held = route(
+        &snapshots,
+        &RouteRequest::new(RouteMode::Affinity).with_sticky(Some("warm")),
+    )
+    .expect("warm is alive");
+    assert_eq!(held.label, "warm");
+    assert_eq!(held.reason, RouteReason::Affinity);
+    assert_eq!(held.affinity_lost, None);
+
+    // Same fabric, but the session's node is not in it at all.
+    let degraded = route(
+        &snapshots,
+        &RouteRequest::new(RouteMode::Affinity).with_sticky(Some("vanished")),
+    )
+    .expect("degrades rather than failing");
+    assert_eq!(degraded.label, "cold");
+    assert_eq!(degraded.affinity_lost.as_deref(), Some("vanished"));
+}
+
+#[test]
+fn forwarding_sends_a_well_formed_request_and_returns_the_answer() {
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let spec = alpha.spec("alpha");
+
+    let body = forward::chat_request("model-alpha", "ping", 8);
+    let answer = forward::forward(&spec, "/v1/chat/completions", &body, FORWARD_TIMEOUT)
+        .expect("stub answers");
+
+    assert!(answer.is_success());
+    assert_eq!(answer.label, "alpha");
+    assert_eq!(
+        forward::completion_text(&answer.body),
+        Some("served by model-alpha")
+    );
+
+    // The request side: a health probe, then the completion carrying our body.
+    let seen = alpha.received();
+    let completion = seen
+        .iter()
+        .find(|request| request.path == "/v1/chat/completions")
+        .expect("the completion reached the node");
+    assert_eq!(completion.method, "POST");
+
+    let sent: serde_json::Value =
+        serde_json::from_str(&completion.body).expect("we send valid JSON");
+    assert_eq!(sent["model"], "model-alpha");
+    assert_eq!(sent["messages"][0]["content"], "ping");
+    assert_eq!(sent["stream"], false);
+}
+
+#[test]
+fn an_engine_refusal_is_the_nodes_answer_not_a_transport_failure() {
+    let refusing = StubNode::start(StubConfig::refusing("model-alpha"));
+    let spec = refusing.spec("refusing");
+
+    let answer = forward::forward(
+        &spec,
+        "/v1/chat/completions",
+        &forward::chat_request("model-alpha", "ping", 8),
+        FORWARD_TIMEOUT,
+    )
+    .expect("a 503 is an answer, not an error");
+
+    assert!(!answer.is_success());
+    assert_eq!(answer.status, 503);
+    assert_eq!(
+        forward::error_message(&answer.body),
+        Some("engine queue full")
+    );
+}
+
+#[test]
+fn dispatch_places_and_sends_in_one_call() {
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 4));
+    let beta = StubNode::start(StubConfig::ready("model-beta", 0));
+    let fabric = fabric_of(vec![alpha.spec("alpha"), beta.spec("beta")]);
+
+    let (decision, answer) = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &forward::chat_request("model-beta", "ping", 8),
+            &RouteRequest::new(RouteMode::Throughput).with_model(Some("model-beta")),
+            FORWARD_TIMEOUT,
+        )
+        .expect("beta serves model-beta");
+
+    assert_eq!(decision.label, "beta");
+    assert_eq!(answer.label, "beta");
+    assert_eq!(
+        forward::completion_text(&answer.body),
+        Some("served by model-beta")
+    );
+    // The request must not have touched the node that does not hold the model.
+    assert!(
+        alpha
+            .received()
+            .iter()
+            .all(|request| request.path == "/v1/health"),
+        "alpha should only have been probed, never sent the completion"
+    );
+}
+
+#[test]
+fn dispatch_refuses_streaming_before_touching_the_network() {
+    // Every node is dead: if dispatch probed first this would be a routing
+    // failure, so seeing the streaming refusal proves the order.
+    let fabric = fabric_of(vec![dead_spec("dead")]);
+    let error = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &serde_json::json!({ "model": "m", "stream": true }),
+            &RouteRequest::new(RouteMode::Throughput),
+            Duration::from_millis(300),
+        )
+        .expect_err("streaming is unsupported");
+    assert!(
+        error.to_string().contains("streaming"),
+        "unexpected: {error}"
+    );
+}
+
+#[test]
+fn an_operator_node_string_drives_a_real_placement() {
+    // Proves the parsed CLI form reaches a live node, not just the struct form.
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let spec = parse_node_spec(&format!("alpha=127.0.0.1:{}", alpha.port)).expect("parses");
+
+    let fabric = fabric_of(vec![spec]);
+    let decision = route(&fabric.observe(), &RouteRequest::new(RouteMode::Throughput))
+        .expect("the parsed node serves");
+    assert_eq!(decision.label, "alpha");
+}

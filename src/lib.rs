@@ -16,6 +16,7 @@ pub mod distributed;
 pub mod embedding;
 pub mod error;
 pub mod execution_plan;
+pub mod fabric;
 pub mod fit;
 pub mod fit_dims;
 pub mod gait;
