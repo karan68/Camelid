@@ -609,7 +609,7 @@ pub fn plan_for_model_with_platform_and_env(
             "lfm2_metal_resident_decode",
             "runnable_cpu_decode_fallback",
         )
-    } else if has_q8_0_tensors && is_supported_exact_q8_row(&row) {
+    } else if has_q8_0_tensors && is_supported_exact_q8_row(&row, gguf) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(
                 &profile,
@@ -1829,6 +1829,27 @@ fn recognized_row_level(row: &str) -> &'static str {
         // Non-Q8_0 quants of the same name report unknown via `support_level`
         // and are declined by the resident admission (hazard H5).
         "supported_exact_row_smoke_sub512"
+    } else if normalized.contains("ornith_1_0_9b") {
+        // Ornith-1.0-9B (qwen35 hybrid gated-delta-net), certified on the
+        // runnable serve lane. `/api/capabilities` has carried
+        // `supported_exact_row_smoke` for this row since that certification,
+        // but this table had no arm — so the load-time plan disclosed
+        // `support_level=unknown_or_unvalidated` for the very same file, and
+        // two runtime surfaces contradicted each other about a row that is in
+        // fact certified.
+        //
+        // Adding the arm is only safe because `is_supported_exact_q8_row`
+        // excludes runnable-only archs BEFORE it consults this table. qwen35
+        // has no optimized dense lane on ANY host; without that exclusion this
+        // arm would hand the row to `select_macos_q8_plan` /
+        // `select_x86_q8_plan`, describing an engine that cannot express its
+        // gated-delta-net layers.
+        //
+        // Quant-blind, like every arm here: the Q4_K_M and Q3_K_M Ornith rows
+        // match this substring too, and `support_level` maps them back to
+        // unknown because they are not Q8_0. Their own claims live in
+        // `/api/capabilities`, which is quant-aware.
+        "supported_exact_row_smoke"
     } else if prism_bonsai_expected_quant(row).is_some() {
         // Recognition only. The plan promotes this to the supported level iff
         // the quant and full macOS Metal routing predicate match above.
@@ -1840,7 +1861,28 @@ fn recognized_row_level(row: &str) -> &'static str {
     }
 }
 
-fn is_supported_exact_q8_row(row: &str) -> bool {
+/// Whether the OPTIMIZED-ENGINE Q8 plan arm may claim this row. Not "is this row
+/// supported" — `/api/capabilities` answers that, and the two questions diverge
+/// for a row that is certified on a lane this engine does not own.
+///
+/// Runnable-only archs are excluded FIRST, before the table is consulted at all.
+/// `crate::model::is_runnable_only_arch` (qwen35, gemma2, lfm2) marks the archs
+/// whose only correct forward pass lives in `crate::runnable` on EVERY host. The
+/// arm this predicate gates dispatches to `select_macos_q8_plan` and
+/// `select_x86_q8_plan`, which would describe an engine that cannot run them and
+/// would also write dense-Q8 tuning env (`CAMELID_MAC_Q8_REPACK`,
+/// `CAMELID_X86_Q8_*`) into a load that never touches those kernels.
+///
+/// The exclusion lives INSIDE this predicate, not at its call site, so that a
+/// certified runnable-only row can be named in `recognized_row_level` — the
+/// Ornith Q8_0 row is — without silently acquiring an optimized-lane claim.
+fn is_supported_exact_q8_row(row: &str, gguf: &GgufFile) -> bool {
+    if crate::model::is_runnable_only_arch(gguf.architecture().unwrap_or_default()) {
+        return false;
+    }
+    // `supported_exact_row_smoke` (the Ornith rows) is deliberately absent: it is
+    // a runnable-lane level, and no row carrying it is served by this engine. The
+    // arch guard above is the load-bearing lock; this omission is the second one.
     matches!(
         recognized_row_level(row),
         "supported_current_gate"
@@ -2418,7 +2460,7 @@ mod tests {
             &fixture("hub"),
         );
         assert!(
-            is_supported_exact_q8_row(&row),
+            is_supported_exact_q8_row(&row, &fixture("hub")),
             "junk general.name must fall back to the recognized filename; got {row:?}"
         );
         // Junk name AND unrecognizable filename stays unrecognized.
@@ -3402,7 +3444,122 @@ mod tests {
             support_level("Llama 3.2 3B Instruct", "Q4_K_M"),
             "unknown_or_unvalidated"
         );
-        assert!(is_supported_exact_q8_row("Llama 3.2 3B Instruct"));
+        assert!(is_supported_exact_q8_row(
+            "Llama 3.2 3B Instruct",
+            &fixture("Llama 3.2 3B Instruct")
+        ));
+    }
+
+    /// Two runtime surfaces describe the Ornith Q8_0 row — the load-time plan
+    /// (`/v1/health`, the System page) and `/api/capabilities` — and they used to
+    /// contradict each other: the plan emitted
+    /// `support_level=unknown_or_unvalidated` because `recognized_row_level` had
+    /// no ornith arm, while the capabilities row had read
+    /// `supported_exact_row_smoke` since the runnable-lane certification.
+    ///
+    /// The capabilities status is read from the live table rather than spelled
+    /// out here, so the two surfaces cannot drift apart again silently: a change
+    /// to that row's status fails this test instead of quietly re-opening the
+    /// contradiction.
+    #[test]
+    fn ornith_q8_plan_support_level_agrees_with_the_capabilities_row() {
+        let _guard = env_lock();
+        clear_profile_env();
+
+        let capabilities_status = crate::api::capabilities_response()
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "Ornith 1.0 9B")
+            .expect("the Ornith Q8_0 row must be advertised in model_compatibility")
+            .status;
+        assert_eq!(
+            capabilities_status, "supported_exact_row_smoke",
+            "the plan's ornith arm carries this exact string; update both together"
+        );
+
+        // Shaped like ornith-1.0-9b-Q8_0: Q8_0 projections + F32 norms, the bare
+        // `general.name` the loader reports, and the qwen35 arch string.
+        let mut gguf = quant_fixture(
+            "Ornith 1.0 9B",
+            None,
+            &[GgufTensorType::Q8_0, GgufTensorType::F32],
+        );
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen35".into()),
+        );
+
+        // Platform-blind, like the table itself: the row is certified on the
+        // runnable lane, which exists on every host.
+        for platform in [
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+            platform("windows", "x86_64", &["avx2"]),
+            platform("linux", "x86_64", &["avx2"]),
+        ] {
+            let label = platform.platform_label.clone();
+            let outcome = plan_for_model_with_platform(
+                &PathBuf::from("/models/ornith-1.0-9b-Q8_0.gguf"),
+                &gguf,
+                Some(8),
+                platform,
+            );
+            assert_eq!(outcome.plan.quant_type, "Q8_0", "{label}");
+            assert_eq!(outcome.plan.support_level, capabilities_status, "{label}");
+            assert!(
+                outcome
+                    .plan
+                    .reasons
+                    .contains(&format!("support_level={capabilities_status}")),
+                "{label}: reasons must carry the same level the capabilities row states: {:?}",
+                outcome.plan.reasons
+            );
+        }
+        clear_profile_env();
+    }
+
+    /// The row being named in `recognized_row_level` must NOT hand it to the
+    /// optimized dense Q8 engine. qwen35 is runnable-only on every host, so
+    /// `select_macos_q8_plan` / `select_x86_q8_plan` would describe kernels that
+    /// cannot express its gated-delta-net layers — and would write dense-Q8
+    /// tuning env into a load that never runs them.
+    #[test]
+    fn runnable_only_archs_never_claim_the_optimized_q8_row_plan() {
+        let ornith = {
+            let mut gguf = quant_fixture(
+                "Ornith 1.0 9B",
+                None,
+                &[GgufTensorType::Q8_0, GgufTensorType::F32],
+            );
+            gguf.metadata.insert(
+                "general.architecture".into(),
+                GgufMetadataValue::String("qwen35".into()),
+            );
+            gguf
+        };
+        assert!(
+            !is_supported_exact_q8_row("Ornith 1.0 9B", &ornith),
+            "the ornith row is certified on the runnable lane, not this engine"
+        );
+
+        // The guard is keyed on the ARCH, not on the row name being absent from
+        // the level list — so it still holds if a runnable-only arch ever ships
+        // under a row name the optimized engine does recognize, and it keeps
+        // holding if `supported_exact_row_smoke` is later added to that list.
+        for arch in ["qwen35", "gemma2", "lfm2"] {
+            assert!(
+                crate::model::is_runnable_only_arch(arch),
+                "{arch} must stay in the runnable-only set for this guard to mean anything"
+            );
+            let mut gguf = fixture("Llama 3.2 3B Instruct");
+            gguf.metadata.insert(
+                "general.architecture".into(),
+                GgufMetadataValue::String(arch.into()),
+            );
+            assert!(
+                !is_supported_exact_q8_row("Llama 3.2 3B Instruct", &gguf),
+                "{arch} is runnable-only and must be refused before the row table is read"
+            );
+        }
     }
 
     #[test]

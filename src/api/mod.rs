@@ -4928,7 +4928,10 @@ async fn execution_plan(State(state): State<AppState>) -> Json<Option<ExecutionP
 }
 
 #[cfg(test)]
-fn capabilities_response() -> CapabilitiesResponse {
+/// `pub(crate)` so the execution planner's tests can pin their `support_level`
+/// disclosure against the very row this table advertises, rather than against a
+/// copy of the string that can drift.
+pub(crate) fn capabilities_response() -> CapabilitiesResponse {
     capabilities_response_with_plan(None)
 }
 
