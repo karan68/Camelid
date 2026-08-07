@@ -534,8 +534,9 @@ impl Client {
     /// `tool_calls` here — reading only the text loses every tool call.
     pub fn chat_turn(&self, request: &Value) -> anyhow::Result<ChatTurn> {
         // Read deadline: a fast model answers in seconds; the 30-min ceiling is only
-        // hit by the slow pure-f32 runnable oracle lane (e.g. a 9B qwen35 prefilling a
-        // long tool prompt at ~1s/token), without masking a genuinely hung server.
+        // hit by slow runnable-lane prefill (a 9B qwen35 prefills a long tool prompt
+        // at ~1s/token on CPU, and still ~76ms/token on the macOS resident Metal
+        // lane), without masking a genuinely hung server.
         let (status, body) = self.request(
             "POST",
             "/v1/chat/completions",

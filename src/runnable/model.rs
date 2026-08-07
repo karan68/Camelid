@@ -2,10 +2,14 @@
 //!
 //! One configurable transformer (parameterized from GGUF KV via [`LlamaModelConfig`]):
 //! embeddings → N pre-norm blocks (RMSNorm → GQA attention with RoPE → RMSNorm →
-//! SwiGLU FFN) → final RMSNorm → logits. No Metal/CUDA, no fused quantized kernels —
-//! weights are dequantized to f32 ([`super::dequant`]) and run through naive f32 math.
-//! Speed is the supported lane's job; this path's job is to be obviously correct and
-//! deterministic so it can serve as the promotion oracle.
+//! SwiGLU FFN) → final RMSNorm → logits. The generic reference graph itself uses no
+//! Metal/CUDA and no fused quantized kernels — weights are dequantized to f32
+//! ([`super::dequant`]) and run through naive f32 math. Speed is the supported lane's
+//! job; this path's job is to be obviously correct and deterministic so it can serve
+//! as the promotion oracle. This module ALSO hosts the arch-specific routing that
+//! sends qwen35 to its resident Metal (macOS default) or CUDA graph and lfm2 to its
+//! Metal engine — those lanes consume packed quantized weights directly, and the f32
+//! reference below is their fallback and oracle.
 //!
 //! Memory: weights stay resident in their compact **quantized** form; each layer's
 //! matrices are dequantized to f32 once per forward pass and dropped, and the
@@ -69,11 +73,30 @@ impl RawMatBytes {
 }
 
 /// The resident Metal format a GGUF tensor type maps to, or `None` if the resident lane
-/// cannot consume it. Single source of truth: admitting a type here is what makes it
-/// page-backed at load (see [`wants_page_backing`]), so the two cannot drift apart.
+/// cannot consume it. Single source of truth *for the loader*: admitting a type here is
+/// what makes it page-backed at load (see [`wants_page_backing`]), so those two cannot
+/// drift apart.
 ///
 /// Not macOS-gated, because `wants_page_backing` is not: the loader makes the same
 /// backing choice on every target.
+///
+/// **It is not the only gate on the way to the GPU, and the others do NOT fail loudly.**
+/// Admitting a type here has two silent knock-on effects, both of which must be decided
+/// deliberately:
+///
+/// 1. It routes the type into the *hybrid* Prism wire path from
+///    [`RawMat::par_matvec`]/[`RawMat::par_matmul`], which keeps its own separate list —
+///    `metal::ResidentWeightFormat::hybrid_prism_wire_supported`. `Q8_0` and the K-quants
+///    are admitted here and declined there on purpose, so they fall through to the CPU
+///    kernel instead of taking a second GPU path with none of the resident lane's parity
+///    evidence. That list is exhaustive over `ResidentWeightFormat`, so a brand-new
+///    *format variant* is a compile error there — but admitting an existing variant here
+///    is **not**, and `prism_wire_hybrid_admission_is_pinned_per_format` stays green.
+/// 2. It does NOT update `execution_plan.rs`. The plan picks its arm from tensor types
+///    and arch, so a newly-admitted quant will keep disclosing whatever arm it matched
+///    before — `/v1/health` naming a lane other than the one serving. That has now
+///    happened four times (Prism Q1/Q2, lfm2, qwen35 Q8_0, qwen35 K-quant); the last one
+///    was caught only because a live load was checked.
 fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
     match tt {
         GgufTensorType::Q1_0 => Some(crate::metal::ResidentWeightFormat::Q1_0),
@@ -84,6 +107,13 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
         // Q8_0 wire blocks (34B: f16 scale + 32 i8) are already the layout the resident
         // Metal Q8 GEMV consumes, so they need no repack.
         GgufTensorType::Q8_0 => Some(crate::metal::ResidentWeightFormat::Q8_0),
+        // K-quant super-blocks (Q4_K 144B / Q6_K 210B per 256 values) are likewise the
+        // exact layout `encode_resident_kquant_matmul_f32` consumes. Admitted as a PAIR:
+        // an ornith Q4_K_M file carries Q6_K on `output.weight`, 12 `attn_qkv`, 4
+        // `attn_v` and 16 `ffn_down`, and `prism_metal_weight` hard-errors on an
+        // unmapped type, so admitting only Q4K yields no resident graph at all.
+        GgufTensorType::Q4K => Some(crate::metal::ResidentWeightFormat::Q4K),
+        GgufTensorType::Q6K => Some(crate::metal::ResidentWeightFormat::Q6K),
         _ => None,
     }
 }
@@ -172,11 +202,14 @@ impl RawMat {
 
     /// Q8_0 weight bytes for the LFM2 Metal engine.
     ///
-    /// `prism_metal_weight` is the low-bit path and hard-rejects Q8_0; LFM2 ships
-    /// every projection as Q8_0. Page-backed allocations are handed over in place
-    /// (one resident copy, no upload); anything else goes through the resident
-    /// cache as ordinary wire bytes. `resolve_resident_weight` already accepts
-    /// `Q8_0` on both arms.
+    /// Since Q8_0 joined `resident_metal_format`, `prism_metal_weight` returns the
+    /// identical value for a page-backed Q8_0 tensor. This helper stays separate for
+    /// the two ways it behaves differently: it hard-requires Q8_0 (LFM2 ships every
+    /// projection as Q8_0, so any other type is a load error, not a fallback), and it
+    /// tolerates non-page-backed bytes — page-backed allocations are handed over in
+    /// place (one resident copy, no upload), while `Owned` bytes go through the
+    /// resident cache as ordinary wire bytes where `prism_metal_weight` fails closed.
+    /// `resolve_resident_weight` already accepts `Q8_0` on both arms.
     #[cfg(target_os = "macos")]
     fn q8_metal_weight(&self) -> Result<crate::metal::ResidentWeightBytes<'_>> {
         if self.tt != GgufTensorType::Q8_0 {
@@ -1875,7 +1908,10 @@ impl RunnableModel {
 // Qwen3.5 (Ornith) — hybrid gated-delta-net (linear attention) + full attention lane.
 //
 // Faithful re-implementation of llama.cpp's `qwen35` graph (arch string "qwen35",
-// `src/models/qwen35.cpp` + `delta-net-base.cpp`) in pure f32 for the runnable lane.
+// `src/models/qwen35.cpp` + `delta-net-base.cpp`) in pure f32 as the runnable lane's
+// CPU reference and fallback. On macOS, decode defaults to the full Metal resident
+// graph built from these same structs (`generate_qwen35_metal`; opt-out
+// `CAMELID_QWEN35_METAL=0`); the pure-f32 forward below remains the oracle.
 // The runnable lane decodes one token at a time, so the gated-delta-net AUTOREGRESSIVE
 // recurrence covers both prefill and decode (the batched "chunking" path is never
 // needed). Each layer is either:
@@ -2233,9 +2269,13 @@ impl RunnableModel {
     /// for the shared prefix (same per-token math, same accumulation order).
     ///
     /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
-    /// qwen35 greedy decode. Routes to the GPU resident lane when `CAMELID_QWEN35_CUDA=1`
-    /// (lazy-built, reused, recurrent state reset per call), and falls back to the CPU
-    /// runnable lane on any CUDA error. The CPU lane is the certified oracle and default.
+    /// qwen35 greedy decode. On macOS, routes to the full Metal resident graph by
+    /// default (opt-out `CAMELID_QWEN35_METAL=0` via [`qwen35_metal_enabled`]), falling
+    /// back to the CPU hybrid lane on any Metal error. With the `cuda` feature, routes
+    /// to the CUDA resident lane when `CAMELID_QWEN35_CUDA=1` (default-on for Prism
+    /// low-bit rows on Windows; lazy-built, reused, recurrent state reset per call),
+    /// falling back to the CPU runnable lane on any CUDA error. The CPU lane is the
+    /// certified oracle, and the default only where neither GPU lane applies.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
         self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {})
     }
@@ -2256,9 +2296,7 @@ impl RunnableModel {
         let _ = stream_tokens_observable;
 
         #[cfg(target_os = "macos")]
-        if !std::env::var("CAMELID_QWEN35_METAL")
-            .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
-        {
+        if qwen35_metal_enabled() {
             match self.generate_qwen35_metal(prompt, max_new, stop, sampling, on_token) {
                 Ok(tokens) => return Ok(tokens),
                 Err(err) => {
@@ -4001,6 +4039,21 @@ pub(crate) fn lfm2_metal_enabled() -> bool {
         .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
 }
 
+/// Whether qwen35 decode routes to the resident Metal graph (default on; `=0`
+/// opt-out convention).
+///
+/// This predicate MUST stay in lockstep with the execution-plan gate in
+/// `execution_plan.rs` — same rule as [`lfm2_metal_enabled`], and the same
+/// history: the inline `== "0" || == "false"` check this replaces already
+/// differed from the planner's vocabulary on `off`/`disabled`/`cpu`, which
+/// would have let those opt-out spellings flip the disclosed lane while
+/// routing kept serving Metal.
+#[cfg(target_os = "macos")]
+pub(crate) fn qwen35_metal_enabled() -> bool {
+    !std::env::var("CAMELID_QWEN35_METAL")
+        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
+}
+
 #[cfg(target_os = "macos")]
 fn qwen35_metal_context_capacity() -> usize {
     std::env::var("CAMELID_QWEN35_METAL_MAXPOS")
@@ -4815,6 +4868,13 @@ mod resident_format_admission_tests {
             (GgufTensorType::Q2_0G128, ResidentWeightFormat::Q2_0G128),
             (GgufTensorType::Pq2_0, ResidentWeightFormat::Q2_0G128),
             (GgufTensorType::Q8_0, ResidentWeightFormat::Q8_0),
+            // Admitted as a PAIR. An ornith Q4_K_M file is Q4_K 217 / Q6_K 33 / F32 177,
+            // so dropping either arm leaves `prism_metal_weight` erroring on the other
+            // and `build_qwen35_metal` yields no resident graph at all — not a partial
+            // one. Measured on that file: 11.3 tok/s decode, phys_footprint 6261 MB
+            // (vs 9917 MB for the Q8_0 row).
+            (GgufTensorType::Q4K, ResidentWeightFormat::Q4K),
+            (GgufTensorType::Q6K, ResidentWeightFormat::Q6K),
         ] {
             assert_eq!(resident_metal_format(tt), Some(want), "{tt:?} must map");
             assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
@@ -4823,15 +4883,14 @@ mod resident_format_admission_tests {
 
     #[test]
     fn unadmitted_types_neither_map_nor_page_back() {
-        // Page-backing costs a page per tensor, so it stays opt-in. The Q4K/Q6K Metal
-        // kernels exist but this loader does not admit them yet; when one is, adding it
-        // to `resident_metal_format` is the whole change — there is no second list.
+        // Page-backing costs a page per tensor, so it stays opt-in. Note Q5_K is absent
+        // from the admitted table on purpose: there is no `q5k` Metal kernel, so an
+        // ornith Q3_K_M (which carries q5_K tensors) must keep failing closed to CPU.
         for tt in [
             GgufTensorType::F32,
             GgufTensorType::F16,
             GgufTensorType::Q4_0,
-            GgufTensorType::Q4K,
-            GgufTensorType::Q6K,
+            GgufTensorType::Q5K,
         ] {
             assert_eq!(resident_metal_format(tt), None, "{tt:?} must not admit");
             assert!(!wants_page_backing(tt), "{tt:?} must stay Owned");

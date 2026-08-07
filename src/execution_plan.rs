@@ -609,6 +609,38 @@ pub fn plan_for_model_with_platform_and_env(
             "lfm2_metal_resident_decode",
             "runnable_cpu_decode_fallback",
         )
+    } else if has_q8_0_tensors
+        && gguf.architecture() == Some("qwen35")
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && !planner_env.flag_disabled("CAMELID_QWEN35_METAL")
+    {
+        // The qwen35 resident Metal graph, reachable for Q8_0 rows since the
+        // loader admission. Without this arm the ornith Q8_0 row fell through
+        // every arm below to the final else and `/v1/health` reported
+        // `cpu_reference`/`safe_cpu_decode` WHILE the Metal graph was serving —
+        // the third recurrence of the fell-through-while-resident defect (Q1/Q2
+        // Bonsai, lfm2, now qwen35 Q8_0). The gate reads exactly what the
+        // routing reads (`qwen35_metal_enabled`: arch, macOS Metal, the env
+        // opt-out via the shared `flag_value_disabled` vocabulary) and
+        // deliberately NOT the Safe profile or any plan-written variable:
+        // `generate_qwen35_streaming` consults neither, so gating on them here
+        // would disclose a lane other than the one that runs.
+        reasons.push(
+            "qwen35 resident Metal lane selected; Q8_0 wire weights stay resident and \
+             attention, gated-delta recurrence, FFN, logits and greedy sampling run on \
+             device (opt-out CAMELID_QWEN35_METAL=0; CPU hybrid on resident-build error)"
+                .into(),
+        );
+        (
+            "metal_resident_qwen35_runtime",
+            "metal_resident_q8_wire",
+            "qwen35_metal_resident_prefill",
+            "resident_batched_prefill",
+            "qwen35_metal_resident_decode",
+            "runnable_cpu_decode_fallback",
+        )
     } else if has_q8_0_tensors && is_supported_exact_q8_row(&row, gguf) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(
@@ -686,6 +718,48 @@ pub fn plan_for_model_with_platform_and_env(
                 .into(),
         );
         cuda_resident_q8_runnable_plan()
+    } else if has_kquant_tensors
+        && metal_kquant_tensor_mix_supported
+        && gguf.architecture() == Some("qwen35")
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && !planner_env.flag_disabled("CAMELID_QWEN35_METAL")
+    {
+        // qwen35 K-quant on the resident Metal graph. Sibling of the Q8_0 arm above —
+        // that one keys on `has_q8_0_tensors`, which is FALSE for a Q4_K_M file, so
+        // without this arm an ornith Q4_K_M fell through to `select_kquant_plan` and
+        // `/v1/health` disclosed `cpu_kquant_block_dot` / `kquant_cpu_block_dot_decode`
+        // WHILE the resident Metal graph served it. Verified live before this arm
+        // existed. That reason string also asserts "no f32 materialization", which is a
+        // specific technical claim about a lane that was not running.
+        //
+        // `metal_kquant_tensor_mix_supported` is doing real work here, not decoration:
+        // routing admits a tensor iff `runnable::model::resident_metal_format` maps it,
+        // and a q5_K tensor (ornith Q3_K_M) maps to None -> `prism_metal_weight` errors
+        // -> the whole graph declines to the CPU hybrid. The mix predicate excludes
+        // exactly Q5_K/Q3_K/Q2_K, so the two agree file-for-file. Gating on bare
+        // `has_kquant_tensors` would over-disclose Metal for Q3_K_M — the same defect,
+        // sign-flipped.
+        //
+        // Deliberately NOT gated on the Safe profile or any plan-written variable:
+        // `generate_qwen35_streaming` consults neither, and gating on them would
+        // reintroduce the latch defect.
+        reasons.push(
+            "qwen35 K-quant resident Metal lane selected; Q4_K/Q6_K super-blocks stay \
+             resident at wire size and attention, gated-delta recurrence, FFN and logits \
+             run on device (opt-out CAMELID_QWEN35_METAL=0; CPU hybrid on resident-build \
+             error)"
+                .into(),
+        );
+        (
+            "metal_resident_qwen35_kquant_runtime",
+            "metal_resident_kquant_wire",
+            "qwen35_metal_resident_prefill",
+            "resident_batched_prefill",
+            "qwen35_metal_resident_decode",
+            "runnable_cpu_decode_fallback",
+        )
     } else if !has_q8_0_tensors && has_kquant_tensors {
         select_kquant_plan(
             &profile,
@@ -1548,7 +1622,9 @@ fn cuda_resident_q8_runnable_plan() -> (
 /// Architectures the CUDA resident engine implements token-identically to the CPU
 /// reference, and for which the GPU-runnable tier is eligible when a model is Q8_0 but
 /// not a curated support row. Deliberately narrow — dense llama/qwen/mistral only; MoE
-/// (expert routing) and not-yet-resident archs (gemma/phi/ssm/qwen35) are excluded so we
+/// (expert routing) and archs the generic dense resident kernels cannot express are
+/// excluded (gemma — see the gemma3 paragraph below; phi; ssm; qwen35 — served by its
+/// own dedicated resident Metal/CUDA graphs, never by this tier) so we
 /// never route a model the resident dense kernel cannot run under a GPU label. The
 /// runtime `resident_decode_eligible` check + the parity self-check are the backstops.
 ///
@@ -2236,6 +2312,160 @@ mod tests {
                 n_bytes: 34,
             }],
         }
+    }
+
+    /// A qwen35 row shaped like ornith-1.0-9b-Q4_K_M: Q4_K + Q6_K projections plus F32
+    /// norms. `extra` lets a test add a type the Metal lane cannot run (e.g. Q5_K).
+    fn qwen35_kquant_fixture(name: &str, extra: &[GgufTensorType]) -> GgufFile {
+        let mut types = vec![
+            GgufTensorType::Q4K,
+            GgufTensorType::Q6K,
+            GgufTensorType::F32,
+        ];
+        types.extend_from_slice(extra);
+        let mut gguf = quant_fixture(name, None, &types);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen35".into()),
+        );
+        gguf
+    }
+
+    /// The qwen35 K-quant Metal arm. Before it existed, an ornith Q4_K_M load disclosed
+    /// `cpu_kquant_block_dot` while the resident Metal graph served — verified on a live
+    /// load, the fourth instance of that defect. The Q8_0 arm could not cover this row
+    /// because it keys on `has_q8_0_tensors`.
+    ///
+    /// Also pins the Q5_K exclusion: there is no `q5k` Metal kernel, so
+    /// `resident_metal_format` maps it to None, `prism_metal_weight` errors and routing
+    /// falls back to CPU. Disclosure must fall back with it.
+    #[test]
+    fn qwen35_kquant_macos_metal_plan_follows_the_routing_gate() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::remove_var("CAMELID_QWEN35_METAL");
+        let path = PathBuf::from("/models/ornith-1.0-9b-Q4_K_M.gguf");
+        let metal = || metal_platform("macos", "aarch64", &["dotprod", "i8mm"]);
+        let plan_for = |gguf: &GgufFile, platform: PlanPlatform| {
+            plan_for_model_with_platform_and_env(
+                &path,
+                gguf,
+                Some(8),
+                platform,
+                &PlannerEnv::capture(),
+            )
+        };
+
+        let runnable = qwen35_kquant_fixture("Ornith 1.0 9B", &[]);
+        let on = plan_for(&runnable, metal());
+        assert_eq!(
+            on.plan.selected_backend, "metal_resident_qwen35_kquant_runtime",
+            "a Q4_K/Q6_K qwen35 row on Metal must disclose the lane that serves it"
+        );
+        assert_eq!(on.plan.decode_path, "qwen35_metal_resident_decode");
+
+        // Every opt-out spelling the routing honours must flip disclosure too.
+        for v in ["0", "off", "disabled", "cpu", "False"] {
+            env::set_var("CAMELID_QWEN35_METAL", v);
+            assert_ne!(
+                plan_for(&runnable, metal()).plan.selected_backend,
+                "metal_resident_qwen35_kquant_runtime",
+                "opt-out {v:?} must deselect the Metal arm"
+            );
+        }
+        env::remove_var("CAMELID_QWEN35_METAL");
+
+        // Q5_K has no Metal kernel: routing declines, so disclosure must decline.
+        let q5k = qwen35_kquant_fixture("Ornith 1.0 9B", &[GgufTensorType::Q5K]);
+        assert_ne!(
+            plan_for(&q5k, metal()).plan.selected_backend,
+            "metal_resident_qwen35_kquant_runtime",
+            "a q5_K tensor makes prism_metal_weight error — disclosure must not claim Metal"
+        );
+
+        // Not on hosts where the resident graph cannot run.
+        assert_ne!(
+            plan_for(&runnable, platform("linux", "x86_64", &["avx2"]))
+                .plan
+                .selected_backend,
+            "metal_resident_qwen35_kquant_runtime"
+        );
+        assert_ne!(
+            plan_for(&runnable, platform("macos", "aarch64", &["dotprod"]))
+                .plan
+                .selected_backend,
+            "metal_resident_qwen35_kquant_runtime",
+            "no Metal device means no Metal lane"
+        );
+        clear_profile_env();
+    }
+
+    /// A qwen35 row shaped like ornith-1.0-9b-Q8_0: Q8_0 projections plus F32
+    /// norms, no Prism low-bit and no K-quant tensors.
+    fn qwen35_q8_fixture(name: &str) -> GgufFile {
+        let mut gguf = quant_fixture(name, None, &[GgufTensorType::Q8_0, GgufTensorType::F32]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen35".into()),
+        );
+        gguf
+    }
+
+    /// The qwen35 resident Metal arm (Q8_0 admission) — disclosure must follow
+    /// the routing gate for every opt-out spelling. Without the arm the ornith
+    /// Q8_0 row fell through to the final else and `/v1/health` reported
+    /// `cpu_reference`/`safe_cpu_decode` while the Metal graph was serving; the
+    /// routing side shares `flag_value_disabled` via `qwen35_metal_enabled`, so
+    /// this pins the two gates end to end rather than merely today's values.
+    #[test]
+    fn qwen35_q8_macos_metal_plan_follows_the_routing_gate() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::remove_var("CAMELID_QWEN35_METAL");
+        let path = PathBuf::from("/models/ornith-1.0-9b-Q8_0.gguf");
+        let gguf = qwen35_q8_fixture("Ornith 1.0 9B");
+        let plan_on = |platform: PlanPlatform| {
+            plan_for_model_with_platform_and_env(
+                &path,
+                &gguf,
+                Some(8),
+                platform,
+                &PlannerEnv::capture(),
+            )
+        };
+
+        let on = plan_on(metal_platform("macos", "aarch64", &["dotprod", "i8mm"]));
+        assert_eq!(on.plan.selected_backend, "metal_resident_qwen35_runtime");
+        assert_eq!(on.plan.decode_path, "qwen35_metal_resident_decode");
+        assert!(
+            on.plan
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("qwen35 resident Metal lane")),
+            "the selected lane must be named in reasons: {:?}",
+            on.plan.reasons
+        );
+
+        // Every opt-out spelling the ROUTING honors must flip the disclosure too.
+        for v in ["0", "off", "disabled", "cpu", "False", " 0 "] {
+            env::set_var("CAMELID_QWEN35_METAL", v);
+            let off = plan_on(metal_platform("macos", "aarch64", &["dotprod", "i8mm"]));
+            assert_eq!(
+                off.plan.selected_backend, "cpu_reference",
+                "opt-out {v:?} must deselect the Metal arm"
+            );
+        }
+        env::remove_var("CAMELID_QWEN35_METAL");
+
+        // The arm must not fire where the resident graph cannot serve.
+        let linux = plan_on(platform("linux", "x86_64", &["avx2"]));
+        assert_ne!(linux.plan.selected_backend, "metal_resident_qwen35_runtime");
+        let no_metal_device = plan_on(platform("macos", "aarch64", &["dotprod"]));
+        assert_ne!(
+            no_metal_device.plan.selected_backend,
+            "metal_resident_qwen35_runtime"
+        );
+        clear_profile_env();
     }
 
     /// `fixture` with explicit tensor types and an optional declared
