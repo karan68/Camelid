@@ -2,10 +2,14 @@
 //!
 //! One configurable transformer (parameterized from GGUF KV via [`LlamaModelConfig`]):
 //! embeddings → N pre-norm blocks (RMSNorm → GQA attention with RoPE → RMSNorm →
-//! SwiGLU FFN) → final RMSNorm → logits. No Metal/CUDA, no fused quantized kernels —
-//! weights are dequantized to f32 ([`super::dequant`]) and run through naive f32 math.
-//! Speed is the supported lane's job; this path's job is to be obviously correct and
-//! deterministic so it can serve as the promotion oracle.
+//! SwiGLU FFN) → final RMSNorm → logits. The generic reference graph itself uses no
+//! Metal/CUDA and no fused quantized kernels — weights are dequantized to f32
+//! ([`super::dequant`]) and run through naive f32 math. Speed is the supported lane's
+//! job; this path's job is to be obviously correct and deterministic so it can serve
+//! as the promotion oracle. This module ALSO hosts the arch-specific routing that
+//! sends qwen35 to its resident Metal (macOS default) or CUDA graph and lfm2 to its
+//! Metal engine — those lanes consume packed quantized weights directly, and the f32
+//! reference below is their fallback and oracle.
 //!
 //! Memory: weights stay resident in their compact **quantized** form; each layer's
 //! matrices are dequantized to f32 once per forward pass and dropped, and the
@@ -183,11 +187,14 @@ impl RawMat {
 
     /// Q8_0 weight bytes for the LFM2 Metal engine.
     ///
-    /// `prism_metal_weight` is the low-bit path and hard-rejects Q8_0; LFM2 ships
-    /// every projection as Q8_0. Page-backed allocations are handed over in place
-    /// (one resident copy, no upload); anything else goes through the resident
-    /// cache as ordinary wire bytes. `resolve_resident_weight` already accepts
-    /// `Q8_0` on both arms.
+    /// Since Q8_0 joined `resident_metal_format`, `prism_metal_weight` returns the
+    /// identical value for a page-backed Q8_0 tensor. This helper stays separate for
+    /// the two ways it behaves differently: it hard-requires Q8_0 (LFM2 ships every
+    /// projection as Q8_0, so any other type is a load error, not a fallback), and it
+    /// tolerates non-page-backed bytes — page-backed allocations are handed over in
+    /// place (one resident copy, no upload), while `Owned` bytes go through the
+    /// resident cache as ordinary wire bytes where `prism_metal_weight` fails closed.
+    /// `resolve_resident_weight` already accepts `Q8_0` on both arms.
     #[cfg(target_os = "macos")]
     fn q8_metal_weight(&self) -> Result<crate::metal::ResidentWeightBytes<'_>> {
         if self.tt != GgufTensorType::Q8_0 {
@@ -1886,7 +1893,10 @@ impl RunnableModel {
 // Qwen3.5 (Ornith) — hybrid gated-delta-net (linear attention) + full attention lane.
 //
 // Faithful re-implementation of llama.cpp's `qwen35` graph (arch string "qwen35",
-// `src/models/qwen35.cpp` + `delta-net-base.cpp`) in pure f32 for the runnable lane.
+// `src/models/qwen35.cpp` + `delta-net-base.cpp`) in pure f32 as the runnable lane's
+// CPU reference and fallback. On macOS, decode defaults to the full Metal resident
+// graph built from these same structs (`generate_qwen35_metal`; opt-out
+// `CAMELID_QWEN35_METAL=0`); the pure-f32 forward below remains the oracle.
 // The runnable lane decodes one token at a time, so the gated-delta-net AUTOREGRESSIVE
 // recurrence covers both prefill and decode (the batched "chunking" path is never
 // needed). Each layer is either:
@@ -2244,9 +2254,13 @@ impl RunnableModel {
     /// for the shared prefix (same per-token math, same accumulation order).
     ///
     /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
-    /// qwen35 greedy decode. Routes to the GPU resident lane when `CAMELID_QWEN35_CUDA=1`
-    /// (lazy-built, reused, recurrent state reset per call), and falls back to the CPU
-    /// runnable lane on any CUDA error. The CPU lane is the certified oracle and default.
+    /// qwen35 greedy decode. On macOS, routes to the full Metal resident graph by
+    /// default (opt-out `CAMELID_QWEN35_METAL=0` via [`qwen35_metal_enabled`]), falling
+    /// back to the CPU hybrid lane on any Metal error. With the `cuda` feature, routes
+    /// to the CUDA resident lane when `CAMELID_QWEN35_CUDA=1` (default-on for Prism
+    /// low-bit rows on Windows; lazy-built, reused, recurrent state reset per call),
+    /// falling back to the CPU runnable lane on any CUDA error. The CPU lane is the
+    /// certified oracle, and the default only where neither GPU lane applies.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
         self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {})
     }
@@ -2267,9 +2281,7 @@ impl RunnableModel {
         let _ = stream_tokens_observable;
 
         #[cfg(target_os = "macos")]
-        if !std::env::var("CAMELID_QWEN35_METAL")
-            .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
-        {
+        if qwen35_metal_enabled() {
             match self.generate_qwen35_metal(prompt, max_new, stop, sampling, on_token) {
                 Ok(tokens) => return Ok(tokens),
                 Err(err) => {
@@ -4009,6 +4021,21 @@ pub(crate) fn lfm2_metal_enabled() -> bool {
     // already differed from the planner's on `no` and `cpu`, which would have let
     // routing and disclosure disagree for those two values.
     !std::env::var("CAMELID_LFM2_METAL")
+        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
+}
+
+/// Whether qwen35 decode routes to the resident Metal graph (default on; `=0`
+/// opt-out convention).
+///
+/// This predicate MUST stay in lockstep with the execution-plan gate in
+/// `execution_plan.rs` — same rule as [`lfm2_metal_enabled`], and the same
+/// history: the inline `== "0" || == "false"` check this replaces already
+/// differed from the planner's vocabulary on `off`/`disabled`/`cpu`, which
+/// would have let those opt-out spellings flip the disclosed lane while
+/// routing kept serving Metal.
+#[cfg(target_os = "macos")]
+pub(crate) fn qwen35_metal_enabled() -> bool {
+    !std::env::var("CAMELID_QWEN35_METAL")
         .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
 }
 

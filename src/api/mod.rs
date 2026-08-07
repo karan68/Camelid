@@ -5240,7 +5240,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke",
                 support_scope: "exact_row_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "model-native/larger context, broader arbitrary templates beyond the native Ornith ChatML renderer, production throughput on the pure-f32 runnable lane, portability, and durable repeated current-head bundles remain missing",
+                full_support_blockers: "model-native/larger context, broader arbitrary templates beyond the native Ornith ChatML renderer, production throughput on the runnable lane (macOS decodes on the resident Metal graph by default since the Q8_0 admission; prefill remains slow and no throughput is promised), portability, and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated_qwen35_bpe_mark_folding_deferred",
                 tensors_load: "validated_all_427_qwen35_tensors",
@@ -5271,8 +5271,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "agent_eval_read_list_write",
                 latest_checked_result: "pass",
                 latest_checked_output: "3x camelid.agent_eval/v1 PASS",
-                evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the runnable lane is correct but slow vs an optimized SIMD/CUDA kernel).",
-                next_step: "preserve the parity-certified runnable lane + the read/list/write agent capability for this exact row; an optimized-lane qwen35 kernel for production throughput, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
+                evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the CPU hybrid path is correct but slow; on macOS this row decodes on the qwen35 resident Metal graph by default — opt-out CAMELID_QWEN35_METAL=0 — re-certified greedy token-identical 4/4 vs the same pinned acd79d6 reference token IDs on that lane, qa/ornith/G-PARITY-qwen35-metal-macos.md; prefill remains slow on every lane and no throughput is promised).",
+                next_step: "preserve the parity-certified lanes (CPU hybrid + the default-on macOS resident Metal graph, qa/ornith/G-PARITY-qwen35-metal-macos.md) + the read/list/write agent capability for this exact row; Metal-lane prefill throughput, optimized qwen35 kernels on non-macOS hosts, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
             },
             // MUSTER M-A1 (2026-07-16), re-anchored onto the Metal GPU-resident
             // lane by the gemma3→Metal campaign (2026-07-30, Phases 0-5;
@@ -9360,9 +9360,10 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 // ===================================================================================
 // Runnable-lane serve bridge (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0).
 //
-// Architectures implemented only in the runnable (pure-f32 oracle) lane â€” currently
-// `qwen35` (Ornith) â€” are not in the optimized inference engine, so the Llama serve
-// path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
+// Architectures implemented only in the runnable lane (`model::is_runnable_only_arch`
+// is the authoritative list; "runnable" names the bridge, not a CPU claim — within it
+// qwen35 decodes on resident Metal/CUDA graphs where available, lfm2 on Metal) are
+// not in the optimized inference engine, so the Llama serve path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
 // per-model-id runtime map, a short-circuit at the top of `chat_completions`, and a
 // dedicated chat handler. The optimized lane is untouched. Generation is greedy
 // (matches the brief) on a blocking thread; the runtime is `&self`-immutable so it

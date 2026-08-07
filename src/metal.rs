@@ -12337,11 +12337,14 @@ fn encode_resident_matmul_f32(
 
 /// Run one packed Prism projection against a page-backed Q1/Q2 matrix.
 ///
-/// This is the 27B Qwen3.5 bring-up bridge: its recurrent graph remains in the
-/// runnable implementation while every large projection executes through the
-/// same native Metal kernels and the same NoCopy buffer cache as the fully
-/// resident dense engine. Keeping this small API here avoids a second packed
-/// decoder or a second Metal allocation of the weights.
+/// Originally the 27B Qwen3.5 bring-up bridge, now the hybrid CPU-fallback path:
+/// on macOS the default is the fully resident Metal graph ([`Qwen35MetalDecode`];
+/// opt-out `CAMELID_QWEN35_METAL=0`, and a resident-build error also lands here).
+/// When the fallback runs, the recurrent graph stays in the runnable
+/// implementation while Q1/Q2 projections execute through the same native Metal
+/// kernels and the same NoCopy buffer cache as the fully resident dense engine.
+/// Keeping this small API here avoids a second packed decoder or a second Metal
+/// allocation of the weights.
 #[cfg(target_os = "macos")]
 pub(crate) fn try_prism_wire_matvec_f32(
     input: &[f32],

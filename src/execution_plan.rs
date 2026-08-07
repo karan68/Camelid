@@ -609,6 +609,38 @@ pub fn plan_for_model_with_platform_and_env(
             "lfm2_metal_resident_decode",
             "runnable_cpu_decode_fallback",
         )
+    } else if has_q8_0_tensors
+        && gguf.architecture() == Some("qwen35")
+        && platform.operating_system == "macos"
+        && platform.architecture == "aarch64"
+        && platform.metal_available
+        && !planner_env.flag_disabled("CAMELID_QWEN35_METAL")
+    {
+        // The qwen35 resident Metal graph, reachable for Q8_0 rows since the
+        // loader admission. Without this arm the ornith Q8_0 row fell through
+        // every arm below to the final else and `/v1/health` reported
+        // `cpu_reference`/`safe_cpu_decode` WHILE the Metal graph was serving —
+        // the third recurrence of the fell-through-while-resident defect (Q1/Q2
+        // Bonsai, lfm2, now qwen35 Q8_0). The gate reads exactly what the
+        // routing reads (`qwen35_metal_enabled`: arch, macOS Metal, the env
+        // opt-out via the shared `flag_value_disabled` vocabulary) and
+        // deliberately NOT the Safe profile or any plan-written variable:
+        // `generate_qwen35_streaming` consults neither, so gating on them here
+        // would disclose a lane other than the one that runs.
+        reasons.push(
+            "qwen35 resident Metal lane selected; Q8_0 wire weights stay resident and \
+             attention, gated-delta recurrence, FFN, logits and greedy sampling run on \
+             device (opt-out CAMELID_QWEN35_METAL=0; CPU hybrid on resident-build error)"
+                .into(),
+        );
+        (
+            "metal_resident_qwen35_runtime",
+            "metal_resident_q8_wire",
+            "qwen35_metal_resident_prefill",
+            "resident_batched_prefill",
+            "qwen35_metal_resident_decode",
+            "runnable_cpu_decode_fallback",
+        )
     } else if has_q8_0_tensors && is_supported_exact_q8_row(&row, gguf) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(
@@ -1548,7 +1580,9 @@ fn cuda_resident_q8_runnable_plan() -> (
 /// Architectures the CUDA resident engine implements token-identically to the CPU
 /// reference, and for which the GPU-runnable tier is eligible when a model is Q8_0 but
 /// not a curated support row. Deliberately narrow — dense llama/qwen/mistral only; MoE
-/// (expert routing) and not-yet-resident archs (gemma/phi/ssm/qwen35) are excluded so we
+/// (expert routing) and archs the generic dense resident kernels cannot express are
+/// excluded (gemma — see the gemma3 paragraph below; phi; ssm; qwen35 — served by its
+/// own dedicated resident Metal/CUDA graphs, never by this tier) so we
 /// never route a model the resident dense kernel cannot run under a GPU label. The
 /// runtime `resident_decode_eligible` check + the parity self-check are the backstops.
 ///
@@ -2236,6 +2270,74 @@ mod tests {
                 n_bytes: 34,
             }],
         }
+    }
+
+    /// A qwen35 row shaped like ornith-1.0-9b-Q8_0: Q8_0 projections plus F32
+    /// norms, no Prism low-bit and no K-quant tensors.
+    fn qwen35_q8_fixture(name: &str) -> GgufFile {
+        let mut gguf = quant_fixture(name, None, &[GgufTensorType::Q8_0, GgufTensorType::F32]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen35".into()),
+        );
+        gguf
+    }
+
+    /// The qwen35 resident Metal arm (Q8_0 admission) — disclosure must follow
+    /// the routing gate for every opt-out spelling. Without the arm the ornith
+    /// Q8_0 row fell through to the final else and `/v1/health` reported
+    /// `cpu_reference`/`safe_cpu_decode` while the Metal graph was serving; the
+    /// routing side shares `flag_value_disabled` via `qwen35_metal_enabled`, so
+    /// this pins the two gates end to end rather than merely today's values.
+    #[test]
+    fn qwen35_q8_macos_metal_plan_follows_the_routing_gate() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::remove_var("CAMELID_QWEN35_METAL");
+        let path = PathBuf::from("/models/ornith-1.0-9b-Q8_0.gguf");
+        let gguf = qwen35_q8_fixture("Ornith 1.0 9B");
+        let plan_on = |platform: PlanPlatform| {
+            plan_for_model_with_platform_and_env(
+                &path,
+                &gguf,
+                Some(8),
+                platform,
+                &PlannerEnv::capture(),
+            )
+        };
+
+        let on = plan_on(metal_platform("macos", "aarch64", &["dotprod", "i8mm"]));
+        assert_eq!(on.plan.selected_backend, "metal_resident_qwen35_runtime");
+        assert_eq!(on.plan.decode_path, "qwen35_metal_resident_decode");
+        assert!(
+            on.plan
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("qwen35 resident Metal lane")),
+            "the selected lane must be named in reasons: {:?}",
+            on.plan.reasons
+        );
+
+        // Every opt-out spelling the ROUTING honors must flip the disclosure too.
+        for v in ["0", "off", "disabled", "cpu", "False", " 0 "] {
+            env::set_var("CAMELID_QWEN35_METAL", v);
+            let off = plan_on(metal_platform("macos", "aarch64", &["dotprod", "i8mm"]));
+            assert_eq!(
+                off.plan.selected_backend, "cpu_reference",
+                "opt-out {v:?} must deselect the Metal arm"
+            );
+        }
+        env::remove_var("CAMELID_QWEN35_METAL");
+
+        // The arm must not fire where the resident graph cannot serve.
+        let linux = plan_on(platform("linux", "x86_64", &["avx2"]));
+        assert_ne!(linux.plan.selected_backend, "metal_resident_qwen35_runtime");
+        let no_metal_device = plan_on(platform("macos", "aarch64", &["dotprod"]));
+        assert_ne!(
+            no_metal_device.plan.selected_backend,
+            "metal_resident_qwen35_runtime"
+        );
+        clear_profile_env();
     }
 
     /// `fixture` with explicit tensor types and an optional declared

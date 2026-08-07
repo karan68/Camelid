@@ -164,9 +164,10 @@ fn battery() -> Vec<EvalCase> {
             },
         },
     ];
-    // The pure-f32 runnable lane is slow for a 9B (a full multi-tool prompt prefills
-    // at ~200s/turn on this host), so a full multi-case battery overruns the agent
-    // client's read budget. `CAMELID_EVAL_CASE=<name>` runs exactly one case per
+    // Runnable-lane prefill is slow for a 9B (a full multi-tool prompt prefills at
+    // ~200s/turn on this CPU host, and the macOS resident Metal lane only improves
+    // prefill ~1.4x), so a full multi-case battery overruns the agent client's read
+    // budget. `CAMELID_EVAL_CASE=<name>` runs exactly one case per
     // invocation, keeping each run within budget; absent the env, the full battery
     // runs (the fast path for optimized-lane models). Each single-case run still
     // mints a full promotion-eligible receipt for that case.
