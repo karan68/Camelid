@@ -110,6 +110,80 @@ const RECEIPT_RE = /qa\/evidence-bundles\/[A-Za-z0-9._/-]+?\/(?:manifest\.json|S
 
 async function exists(p) { try { await access(p); return true } catch { return false } }
 
+// --- hash-pinned artifact identities ---------------------------------------
+// Some supported rows are pinned to EXACT BYTES, not just an exact filename:
+// the paired Prism evidence bundles, every NON_CATALOG_SUPPORTED_ARTIFACTS
+// entry (in-house requants and side-loads the operator cannot re-download to
+// compare), and the curated rows carrying a recorded digest. src/api/mod.rs
+// enforces those digests at classification time, so they are contract facts and
+// belong in identity.sha256 — not scraped out of prose, where the ornith rows
+// only ever carried an 8-hex display prefix.
+//
+// Read as a flat top-level const: slice from the declaration to the closing
+// `];`, drop `//` comments (they contain quotes), then take the quoted strings
+// in order. A tuple-arity change fails loudly rather than emitting a wrong pin.
+function rustConstTuples(src, name, arity) {
+  const decl = new RegExp(`const\\s+${name}\\s*:[^=]*=\\s*&\\[`).exec(src)
+  if (!decl) throw new Error(`${name} not found in src/api/mod.rs`)
+  const start = decl.index + decl[0].length
+  const end = src.indexOf('\n];', start)
+  if (end < 0) throw new Error(`${name} literal is not a flat top-level const array`)
+  const body = src.slice(start, end).replace(/\/\/[^\n]*/g, '')
+  if (body.includes('\\')) throw new Error(`${name} contains a string escape the extractor cannot represent`)
+  const strings = [...body.matchAll(/"([^"]*)"/g)].map((m) => m[1])
+  if (strings.length === 0 || strings.length % arity !== 0) {
+    throw new Error(`${name} did not parse as ${arity}-tuples (${strings.length} strings) — update scripts/extract-capabilities-to-ledger.mjs to match the new shape`)
+  }
+  const tuples = []
+  for (let i = 0; i < strings.length; i += arity) tuples.push(strings.slice(i, i + arity))
+  return tuples
+}
+
+// catalog_id -> filename, from the curated_catalog() literal. Lets a curated pin
+// reach its ledger row by ID, which prose-scraping cannot do: some rows never
+// name their own .gguf in prose (llama32_3b_instruct_q8_0 cites only a digest).
+function curatedFilenamesByCatalogId(src) {
+  const start = src.indexOf('pub fn curated_catalog()')
+  if (start < 0) throw new Error('curated_catalog() not found in src/api/mod.rs')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const byCatalogId = new Map()
+  for (const item of body.split('CatalogItem {').slice(1)) {
+    const id = /catalog_id:\s*"([^"]+)"/.exec(item)
+    const filename = /filename:\s*"([^"]+)"/.exec(item)
+    if (id && filename) byCatalogId.set(id[1], filename[1])
+  }
+  if (byCatalogId.size === 0) throw new Error('curated_catalog() parsed to zero (catalog_id, filename) pairs')
+  return byCatalogId
+}
+
+// -> { byRowId: Map<row_id, {filename, sha256}>, byFilename: Map<filename, sha256> }
+function extractHashPinnedArtifacts(src) {
+  const byRowId = new Map()
+  const byFilename = new Map()
+  for (const [filename, rowId, sha256] of rustConstTuples(src, 'NON_CATALOG_SUPPORTED_ARTIFACTS', 3)) {
+    byRowId.set(rowId, { filename, sha256 })
+    byFilename.set(filename, sha256)
+  }
+  for (const table of ['PRISM_SUPPORTED_ARTIFACT_SHA256', 'CURATED_SUPPORTED_ARTIFACT_SHA256']) {
+    for (const [filename, sha256] of rustConstTuples(src, table, 2)) {
+      const prior = byFilename.get(filename)
+      if (prior && prior !== sha256) throw new Error(`${filename} is pinned to two different digests across the artifact tables`)
+      byFilename.set(filename, sha256)
+    }
+  }
+  // Catalog-backed pins join by row id too, so a row whose prose never names its
+  // artifact still carries the enforced digest.
+  const catalogFilenames = curatedFilenamesByCatalogId(src)
+  for (const [catalogId, filename] of catalogFilenames) {
+    const sha256 = byFilename.get(filename)
+    if (sha256 && !byRowId.has(catalogId)) byRowId.set(catalogId, { filename, sha256 })
+  }
+  for (const [filename, sha256] of byFilename) {
+    if (!SHA_RE.test(sha256)) throw new Error(`hash-pinned artifact ${filename} has a malformed sha256`)
+  }
+  return { byRowId, byFilename }
+}
+
 // --- api_features: projected from the typed registry in contract.rs --------
 // balancedBlock and tokenize assume the Rust-literal subset: no escape
 // sequences and no comments inside the extracted block. Violations would
@@ -203,6 +277,8 @@ export async function buildLedger(root = ROOT) {
   if (!Array.isArray(rows)) throw new Error('model_compatibility did not parse to an array')
   const apiFeatures = await extractApiFeatureContract(root)
 
+  const pinned = extractHashPinnedArtifacts(src)
+
   const receiptWarnings = []
   const model_rows = []
   for (const contract of rows) {
@@ -212,6 +288,17 @@ export async function buildLedger(root = ROOT) {
     if (gguf) identity.gguf_filename = gguf[1]
     const sha = SHA_RE.exec(prose)
     if (sha) identity.sha256 = sha[1]
+    // A code-enforced pin outranks the prose scrape: it is the digest the server
+    // actually checks before granting this row, and the prose may carry only a
+    // display prefix (or a receipt hash that happens to appear first).
+    const pin = pinned.byRowId.get(contract.id)
+      || (identity.gguf_filename && pinned.byFilename.has(identity.gguf_filename)
+        ? { filename: identity.gguf_filename, sha256: pinned.byFilename.get(identity.gguf_filename) }
+        : null)
+    if (pin) {
+      identity.gguf_filename = pin.filename
+      identity.sha256 = pin.sha256
+    }
 
     const receipts = []
     const seen = new Set()

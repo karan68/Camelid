@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "25aa4b09",
+    "source_head": "4e599238",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -322,7 +322,8 @@
         "id": "ornith_1_0_9b_q4_k_m",
         "family": "ornith",
         "quantization": "Q4_K_M",
-        "gguf_filename": "ornith-1.0-9b-Q4_K_M.gguf"
+        "gguf_filename": "ornith-1.0-9b-Q4_K_M.gguf",
+        "sha256": "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f"
       },
       "contract": {
         "id": "ornith_1_0_9b_q4_k_m",
@@ -372,7 +373,8 @@
         "id": "ornith_1_0_9b_q3_k_m",
         "family": "ornith",
         "quantization": "Q3_K_M",
-        "gguf_filename": "ornith-1.0-9b-Q3_K_M.gguf"
+        "gguf_filename": "ornith-1.0-9b-Q3_K_M.gguf",
+        "sha256": "16f54df50e44bcaed854941835e595e60a12db48d3b2248af2a1959fc91b6eaa"
       },
       "contract": {
         "id": "ornith_1_0_9b_q3_k_m",
@@ -421,7 +423,9 @@
       "identity": {
         "id": "Ornith 1.0 9B",
         "family": "ornith",
-        "quantization": "Q8_0"
+        "quantization": "Q8_0",
+        "gguf_filename": "ornith-1.0-9b-Q8_0.gguf",
+        "sha256": "d0e4bebaa8b3450c62090df1408f2ee5ccb2094f9c610ffde564a654483d4f37"
       },
       "contract": {
         "id": "Ornith 1.0 9B",
@@ -619,7 +623,9 @@
       "identity": {
         "id": "llama32_3b_instruct_q8_0",
         "family": "llama_bpe_decoder",
-        "quantization": "Q8_0"
+        "quantization": "Q8_0",
+        "gguf_filename": "Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "sha256": "f34112a11b7dad74ab517dedf6dcf00d624c9adac2dc0c72c719ca0478554ef2"
       },
       "contract": {
         "id": "llama32_3b_instruct_q8_0",

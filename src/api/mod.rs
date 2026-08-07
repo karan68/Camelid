@@ -21708,7 +21708,7 @@ mod tests {
             .collect();
         let allowlisted_rows: std::collections::HashSet<&str> = NON_CATALOG_SUPPORTED_ARTIFACTS
             .iter()
-            .map(|(_, row_id)| *row_id)
+            .map(|(_, row_id, _)| *row_id)
             .collect();
 
         let unreachable: Vec<&str> = supported_compatibility_row_ids()
@@ -21732,7 +21732,7 @@ mod tests {
         // The allowlist is keyed by row id, so a typo (or a row that was renamed
         // out from under it) fails open into "this artifact is not supported"
         // rather than loudly. Both halves must resolve.
-        for (filename, row_id) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+        for (filename, row_id, _) in NON_CATALOG_SUPPORTED_ARTIFACTS {
             assert!(
                 supported_compatibility_row_ids().contains(row_id),
                 "allowlisted artifact {filename} names {row_id}, which is not a \
@@ -21849,14 +21849,36 @@ mod tests {
         );
     }
 
+    /// Every artifact whose supported-row identity is pinned to exact bytes:
+    /// the paired Prism evidence bundles, the non-catalog allowlist, and the
+    /// curated rows carrying a recorded digest. `classify_model_lane` only
+    /// requires the architecture to be IMPLEMENTED (it never cross-checks arch
+    /// against the row), so one implemented arch drives the whole table.
+    fn hash_pinned_supported_artifacts() -> Vec<(&'static str, &'static str)> {
+        PRISM_SUPPORTED_ARTIFACT_SHA256
+            .iter()
+            .map(|(filename, sha256)| (*filename, *sha256))
+            .chain(
+                NON_CATALOG_SUPPORTED_ARTIFACTS
+                    .iter()
+                    .map(|(filename, _, sha256)| (*filename, *sha256)),
+            )
+            .chain(
+                CURATED_SUPPORTED_ARTIFACT_SHA256
+                    .iter()
+                    .map(|(filename, sha256)| (*filename, *sha256)),
+            )
+            .collect()
+    }
+
     #[test]
-    fn loaded_prism_support_requires_each_exact_recorded_sha256() {
-        for (filename, expected_sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
-            assert!(prism_supported_artifact_identity_matches(
+    fn loaded_support_requires_each_exact_recorded_sha256() {
+        for (filename, expected_sha256) in hash_pinned_supported_artifacts() {
+            assert!(supported_artifact_identity_matches(
                 filename,
                 expected_sha256
             ));
-            assert!(!prism_supported_artifact_identity_matches(
+            assert!(!supported_artifact_identity_matches(
                 filename,
                 &"00".repeat(32)
             ));
@@ -21876,6 +21898,13 @@ mod tests {
                 "{filename} must remain unverified until the load path supplies its digest"
             );
         }
+        // A curated row with NO recorded digest keeps its filename-only gating.
+        // Absence of a pin must fail OPEN (the row stays supported), because the
+        // alternative is inventing a digest from whatever file is lying around.
+        assert!(
+            supported_artifact_expected_sha256("tinyllama-1.1b-chat-v1.0.Q8_0.gguf").is_none(),
+            "precondition: no digest is recorded for the TinyLlama gate row"
+        );
         assert_eq!(
             classify_loaded_model_identity(
                 Some("llama"),
@@ -21883,8 +21912,111 @@ mod tests {
                 &"00".repeat(32),
             ),
             ModelLaneClass::Supported,
-            "this hardening is scoped to the seven Prism identities"
+            "an unpinned curated row stays filename-gated until a digest is captured"
         );
+    }
+
+    #[test]
+    fn pinned_curated_rows_check_bytes_but_stay_downloadable() {
+        // Curated rows differ from the allowlist in RECOURSE, not in principle:
+        // the certified bytes are a public upload, so tripping this gate is
+        // fixable by re-downloading. The pin must not remove the row from the
+        // catalog (that would break `camelid pull` and the Models page).
+        let catalog: std::collections::HashMap<&str, &str> = curated_catalog()
+            .into_iter()
+            .map(|item| (item.filename, item.catalog_id))
+            .collect();
+        for (filename, sha256) in CURATED_SUPPORTED_ARTIFACT_SHA256 {
+            let catalog_id = catalog.get(filename).unwrap_or_else(|| {
+                panic!("{filename} is pinned as a curated row but is not in curated_catalog()")
+            });
+            assert!(
+                supported_compatibility_row_ids().contains(catalog_id),
+                "{filename} pins {catalog_id}, which is not a supported row"
+            );
+            assert_eq!(
+                classify_loaded_model_identity(Some("llama"), filename, sha256),
+                ModelLaneClass::Supported,
+                "{filename} with its certified bytes keeps the row"
+            );
+            assert_eq!(
+                classify_loaded_model_identity(Some("llama"), filename, &"00".repeat(32)),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} with other bytes must not inherit the row"
+            );
+        }
+    }
+
+    #[test]
+    fn certified_filename_with_wrong_bytes_is_not_a_supported_row() {
+        // THE REGRESSION this guard exists for. `ornith-1.0-9b-Q4_K_M.gguf` names
+        // two different sets of weights: the CERTIFIED in-house requant with no
+        // imatrix (2711bf1e..., 5,629,108,416 B) that the CUDA parity + agent-eval
+        // receipts were captured against, and the public HuggingFace imatrix quant
+        // of the exact same name (5720d1f6..., 5,629,108,704 B). Classifying on the
+        // filename alone made the second one report the first one's support claims
+        // and parity evidence through /api/capabilities and the frontend.
+        const CERTIFIED: &str = "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
+        const HF_IMATRIX_SAME_NAME: &str =
+            "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106";
+
+        assert_eq!(
+            classify_loaded_model_identity(Some("qwen35"), "ornith-1.0-9b-Q4_K_M.gguf", CERTIFIED),
+            ModelLaneClass::Supported,
+            "the certified bytes keep the row"
+        );
+        assert_eq!(
+            classify_loaded_model_identity(
+                Some("qwen35"),
+                "ornith-1.0-9b-Q4_K_M.gguf",
+                HF_IMATRIX_SAME_NAME,
+            ),
+            ModelLaneClass::ExperimentalImplemented,
+            "a same-named file with uncertified bytes must NOT inherit the row"
+        );
+        // Case-insensitive on the hex, since digests reach us from several
+        // producers, but never lenient about which digest.
+        assert_eq!(
+            classify_loaded_model_identity(
+                Some("qwen35"),
+                "ornith-1.0-9b-Q4_K_M.gguf",
+                &CERTIFIED.to_uppercase(),
+            ),
+            ModelLaneClass::Supported,
+        );
+    }
+
+    #[test]
+    fn every_non_catalog_allowlist_entry_is_hash_pinned() {
+        // The 3-tuple makes a pin-less allowlist entry unrepresentable; this pins
+        // the digest SHAPE and that the entry resolves to its own recorded value
+        // (a copy/paste that duplicates a filename would otherwise resolve to
+        // whichever row came first).
+        let mut seen = std::collections::HashMap::new();
+        for (filename, _, sha256) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+            assert_eq!(sha256.len(), 64, "{filename} digest is not a sha256");
+            assert!(
+                sha256
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{filename} digest must be lowercase hex"
+            );
+            assert_eq!(
+                supported_artifact_expected_sha256(filename),
+                Some(*sha256),
+                "{filename} must resolve to its own recorded digest"
+            );
+            assert!(
+                seen.insert(*filename, *sha256).is_none(),
+                "{filename} is allowlisted twice"
+            );
+        }
+        // The two hash-pinned tables must never disagree about the same file.
+        for (filename, sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
+            if let Some(other) = seen.get(filename) {
+                assert_eq!(other, sha256, "{filename} is pinned to two digests");
+            }
+        }
     }
 
     #[test]
@@ -28223,36 +28355,124 @@ fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'sta
 
 /// Supported exact rows whose GGUF artifact is NOT a curated-catalog download —
 /// in-house imatrix requants (and the side-loaded Q8_0) with no HF catalog
-/// source. Exact filename → compatibility row id; the row must still be
-/// `supported_*` in the ledger, so this stays fail-closed at the same trust
-/// level as the curated-catalog path (exact-artifact filename match).
-const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
-    ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
-    ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
-    ("ornith-1.0-9b-Q3_K_M.gguf", "ornith_1_0_9b_q3_k_m"),
-    // Local requantization (BASALT/GABBRO pilot artifact, sha256 eb293344...,
-    // 6,058,607,776 B). There is no upstream upload to pull, so the row can only
-    // reach the Supported lane through this allowlist -- SUPPORT_MATRIX_v0.1.md
-    // already records "no frontend pull-catalog entry" for it.
-    ("gemma-4-E4B-it-NVFP4-mm.gguf", "gemma4_e4b_it_nvfp4"),
+/// source. `(exact filename, compatibility row id, certified sha256)`; the row
+/// must still be `supported_*` in the ledger.
+///
+/// The digest is the anchor, not the filename. Every entry here names bytes that
+/// exist nowhere the user can re-download, so a same-named neighbour is the
+/// EXPECTED failure mode rather than an exotic one: the certified
+/// `ornith-1.0-9b-Q4_K_M.gguf` is an in-house requant (`2711bf1e...`,
+/// 5,629,108,416 B) while the public HuggingFace file of that exact name is a
+/// different imatrix quant (`5720d1f6...`, 5,629,108,704 B) — different weights,
+/// not just different metadata. Classification therefore fails closed to
+/// `ExperimentalImplemented` until the load path has confirmed the digest; see
+/// `supported_artifact_expected_sha256`.
+const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
+    // HF pristine upload; local recompute matches the HF LFS oid (9,527,500,992 B).
+    (
+        "ornith-1.0-9b-Q8_0.gguf",
+        "Ornith 1.0 9B",
+        "d0e4bebaa8b3450c62090df1408f2ee5ccb2094f9c610ffde564a654483d4f37",
+    ),
+    // In-house requant from the Q8_0 parent (5,629,108,416 B). NOT the
+    // same-named HuggingFace imatrix file -- see the note above.
+    (
+        "ornith-1.0-9b-Q4_K_M.gguf",
+        "ornith_1_0_9b_q4_k_m",
+        "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f",
+    ),
+    (
+        "ornith-1.0-9b-Q3_K_M.gguf",
+        "ornith_1_0_9b_q3_k_m",
+        "16f54df50e44bcaed854941835e595e60a12db48d3b2248af2a1959fc91b6eaa",
+    ),
+    // Local requantization (BASALT/GABBRO pilot artifact, 6,058,607,776 B).
+    // There is no upstream upload to pull, so the row can only reach the
+    // Supported lane through this allowlist -- SUPPORT_MATRIX_v0.1.md already
+    // records "no frontend pull-catalog entry" for it.
+    (
+        "gemma-4-E4B-it-NVFP4-mm.gguf",
+        "gemma4_e4b_it_nvfp4",
+        "eb293344972e2b292a043b8e7649b9788dca915b034e5c2721cfc531cf9863d9",
+    ),
     // Community-sourced (superkaiii/Ternary-Bonsai-4B). The Hub API refuses the
     // repo tree (gated or withdrawn), so no catalog row can be honestly pinned
-    // to it; a file the operator already has still classifies from its exact
-    // certified name (sha256 b85dcbaa...).
-    ("Ternary-Bonsai-4B-TQ2_0.gguf", "ternary_bonsai_4b_tq2_0"),
-    // Provenance unresolved by design: the certified bytes (sha256 6a746610...,
-    // 807,693,984 B) match NO surveyed publisher upload -- bartowski's
-    // same-named file is 6f85a640.../807,694,464 B. Catalog-free on purpose.
+    // to it; a file the operator already has classifies from these exact bytes.
+    (
+        "Ternary-Bonsai-4B-TQ2_0.gguf",
+        "ternary_bonsai_4b_tq2_0",
+        "b85dcbaa6f57a9c71252371c97f4c68602c2c5fc61a9e1ce74d963d6fee5047c",
+    ),
+    // Provenance unresolved by design: the certified bytes (807,693,984 B) match
+    // NO surveyed publisher upload -- bartowski's same-named file is
+    // 6f85a640.../807,694,464 B. Catalog-free on purpose, and a live example of
+    // why the digest rather than the name has to be the anchor.
     (
         "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
         "llama_3_2_1b_instruct_q4_k_m",
+        "6a74661014a3e2f139871f81e6cec852c489a627d169de503a3c0434a10c503d",
     ),
     // NB: Qwen3-4B-Q4_K_M.gguf is intentionally NOT here -- it is an official
     // Qwen/Qwen3-4B-GGUF upload, so it lives in curated_catalog() and is covered
     // by the curated-catalog branch of filename_is_supported_exact_row. The
     // Llama 3.2 3B K-quants and the 1B IQ4_XS are likewise catalog rows (their
-    // certified bytes ARE a public upload), not allowlist entries: the catalog
-    // branch carries an exact size, while this one matches on filename alone.
+    // certified bytes ARE a public upload), not allowlist entries. Those rows are
+    // hash-pinned too -- see CURATED_SUPPORTED_ARTIFACT_SHA256 -- but through the
+    // catalog, so `camelid pull` keeps working for them.
+];
+
+/// Curated-catalog rows whose certified bytes are ALSO recorded, so the loaded
+/// digest is checked rather than the filename alone.
+///
+/// These differ from the non-catalog allowlist in recourse, not in principle: the
+/// certified bytes ARE a public upload, so an operator who trips this gate can
+/// re-download and compare. That makes the pin cheap to satisfy and the failure
+/// mode actionable — but it also means an upstream RE-UPLOAD under the same name
+/// will demote the row to experimental until someone re-certifies the new bytes.
+/// That is the intended behavior: `supported_exact_row_smoke` is a claim about
+/// specific bytes, and silently transferring it to a file no evidence covers is
+/// exactly the defect this table exists to prevent.
+///
+/// Only rows whose digest is corroborated on a public surface (README /
+/// COMPATIBILITY / STATUS / SUPPORT_MATRIX / the contract literal, filename and
+/// digest on the same line) belong here. Curated rows with no recorded digest
+/// stay filename-gated until one is captured — an absent pin must never be
+/// invented from a local file.
+const CURATED_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
+    (
+        "nomic-embed-text-v1.5.Q8_0.gguf",
+        "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7",
+    ),
+    (
+        "gemma-3-1b-it-Q8_0.gguf",
+        "b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5",
+    ),
+    (
+        "Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+        "69e85c871a13a99e4008c09916a957d170e4e5623a5b2e06be46408029a7afba",
+    ),
+    // The one row where the re-upload case is not hypothetical: COMPATIBILITY.md
+    // anchors the current 512-8192 ladder to THIS digest and records the earlier
+    // b5607b50... upload as historical evidence for that file, from which
+    // "nothing is inherited by the canonical file". Without the pin, a b5607b50
+    // copy on disk classifies as supported and inherits the anchored ladder --
+    // which the release contract already says in writing that it must not.
+    (
+        "Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "f34112a11b7dad74ab517dedf6dcf00d624c9adac2dc0c72c719ca0478554ef2",
+    ),
+    (
+        "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+    ),
+    (
+        "Llama-3.2-3B-Instruct-Q5_K_M.gguf",
+        "0b94ccd04d908304cec5246a3d942b64417a423bc5c6d47c73bc557e590b5194",
+    ),
+    (
+        "Qwen3-4B-Q4_K_M.gguf",
+        "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    ),
 ];
 
 /// Exact Prism model identities proven by the paired Metal/CUDA evidence
@@ -28296,17 +28516,56 @@ fn prism_supported_artifact_expected_sha256(filename: &str) -> Option<&'static s
         .find_map(|(artifact, sha256)| (*artifact == filename).then_some(*sha256))
 }
 
+/// Prism-scoped identity check. Kept separate from the general one below because
+/// it also decides whether to bind the companion vision projector — a capability
+/// question, not a support-claim question.
 fn prism_supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
     prism_supported_artifact_expected_sha256(filename)
         .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
 }
 
+/// The certified digest for an exact supported artifact whose row identity is
+/// pinned to specific bytes. Three sources, one rule: the paired Metal/CUDA
+/// Prism bundles, every non-catalog allowlist entry, and the curated rows whose
+/// digest is recorded. A filename with no pin here keeps its existing
+/// filename-only gating — absence means "no digest was ever captured for this
+/// row", never "any bytes will do knowingly".
+fn supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
+    prism_supported_artifact_expected_sha256(filename)
+        .or_else(|| {
+            NON_CATALOG_SUPPORTED_ARTIFACTS
+                .iter()
+                .find_map(|(artifact, _, sha256)| (*artifact == filename).then_some(*sha256))
+        })
+        .or_else(|| {
+            CURATED_SUPPORTED_ARTIFACT_SHA256
+                .iter()
+                .find_map(|(artifact, sha256)| (*artifact == filename).then_some(*sha256))
+        })
+}
+
+/// True when `gguf_sha256` is the certified digest recorded for `filename`.
+/// False both for a mismatch and for a filename that carries no pin at all —
+/// callers must therefore ask `supported_artifact_expected_sha256` first if they
+/// need to distinguish "wrong bytes" from "not hash-pinned".
+fn supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
+    supported_artifact_expected_sha256(filename)
+        .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
+}
+
 /// True when `filename` is the exact GGUF artifact of a curated row whose
 /// `catalog_id` is a `supported_*` compatibility row, or an allowlisted
-/// non-catalog artifact of a `supported_*` row. The ledger is exact-artifact
-/// gated, so an exact-filename match is the honest server-side "is this a supported
-/// row?" test. Deliberately conservative: a supported model loaded under a
-/// non-curated filename classifies as experimental, never falsely as supported.
+/// non-catalog artifact of a `supported_*` row. Deliberately conservative in the
+/// widening direction: a supported model loaded under a non-curated filename
+/// classifies as experimental, never falsely as supported.
+///
+/// This is a NAME test, not an identity test, and it is not on its own the
+/// server's answer to "is this a supported row?" — every caller must go through
+/// `classify_model_lane_with_verified_sha256` / `classify_loaded_model_identity`,
+/// which additionally require the certified digest for any hash-pinned artifact.
+/// Curated rows are not hash-pinned because their certified bytes ARE a public
+/// upload the user can re-fetch and compare; the non-catalog rows have no such
+/// recourse, which is exactly why they carry a digest here.
 fn filename_is_supported_exact_row(filename: &str) -> bool {
     let supported = supported_compatibility_row_ids();
     curated_catalog()
@@ -28314,7 +28573,7 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
         .any(|c| c.filename == filename && supported.contains(c.catalog_id))
         || NON_CATALOG_SUPPORTED_ARTIFACTS
             .iter()
-            .any(|(artifact, row_id)| *artifact == filename && supported.contains(row_id))
+            .any(|(artifact, row_id, _)| *artifact == filename && supported.contains(row_id))
 }
 
 /// Classify a model from real header metadata. `architecture` is the parsed
@@ -28333,18 +28592,17 @@ fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneC
     }
 }
 
-/// Prism's public support boundary is hash-pinned. Filename/header-only views
-/// (local library and inspect) therefore remain experimental until the ordinary
-/// load path has computed the exact digest; other established rows retain their
-/// existing filename-gated classification.
+/// The hash-pinned support boundary (Prism + every non-catalog allowlist row).
+/// Filename/header-only views (local library and inspect) therefore remain
+/// experimental until the ordinary load path has computed the exact digest;
+/// other established rows retain their existing filename-gated classification.
 fn classify_model_lane_with_verified_sha256(
     architecture: Option<&str>,
     filename: &str,
     verified_sha256: Option<&str>,
 ) -> ModelLaneClass {
     let class = classify_model_lane(architecture, filename);
-    if class != ModelLaneClass::Supported
-        || prism_supported_artifact_expected_sha256(filename).is_none()
+    if class != ModelLaneClass::Supported || supported_artifact_expected_sha256(filename).is_none()
     {
         return class;
     }
@@ -28353,6 +28611,11 @@ fn classify_model_lane_with_verified_sha256(
     })
 }
 
+/// Classify from the exact bytes. A hash-pinned artifact loaded under its
+/// certified NAME but with uncertified BYTES is demoted to
+/// `ExperimentalImplemented`, so it cannot inherit the row's parity evidence,
+/// support claims, or tool capability. Costs nothing at load: `gguf_sha256` is
+/// the digest `build_loaded_model` already computes for `LaneIdentity`.
 fn classify_loaded_model_identity(
     architecture: Option<&str>,
     filename: &str,
@@ -28360,8 +28623,8 @@ fn classify_loaded_model_identity(
 ) -> ModelLaneClass {
     let class = classify_model_lane(architecture, filename);
     if class == ModelLaneClass::Supported
-        && prism_supported_artifact_expected_sha256(filename).is_some()
-        && !prism_supported_artifact_identity_matches(filename, gguf_sha256)
+        && supported_artifact_expected_sha256(filename).is_some()
+        && !supported_artifact_identity_matches(filename, gguf_sha256)
     {
         ModelLaneClass::ExperimentalImplemented
     } else {

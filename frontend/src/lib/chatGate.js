@@ -5,7 +5,10 @@ import { isRunnableInCurrentRuntime, modelRuntimeIdMatches } from './modelState.
    `/api/models/local`. `classify_model_lane()` requires BOTH an implemented
    `general.architecture` parsed from the real header AND
    `filename_is_supported_exact_row()` — an exact filename equality against the
-   curated catalog whose row id must also be `supported_*`. That conjunction is
+   curated catalog whose row id must also be `supported_*` — plus, for the
+   hash-pinned artifacts (Prism, the non-catalog allowlist, and the curated
+   rows carrying a recorded digest), the certified sha256 of the bytes
+   actually loaded. That conjunction is
    strictly stronger evidence than matching a display name against a row id, and
    lib/modelLanes.js has treated it as authoritative for the Models page since the
    same problem was found there.
