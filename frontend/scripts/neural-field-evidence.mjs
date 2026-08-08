@@ -14,7 +14,7 @@
 */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import puppeteer from 'puppeteer-core'
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const MODE = process.argv[2] || 'full'
 const LABEL = process.argv[3] || 'default'
@@ -23,13 +23,12 @@ mkdirSync(OUT, { recursive: true })
 
 const API = 'http://127.0.0.1:8181'
 const APP = 'http://127.0.0.1:4175/#observatory'
-const CHROME = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'
 const PROMPT = 'Explain, in plain language and complete sentences, how a transformer language model turns a prompt into a reply: tokenization, embeddings, the stack of layers with attention and feed-forward blocks, the key-value cache that grows one entry per token, and the final sampling step that picks each next token. Then list five everyday analogies for attention, one per line, and keep going with more detail about each analogy until you run out of room. '.repeat(2)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function launch(dpr = 1) {
-  const browser = await puppeteer.launch({ executablePath: CHROME, headless: 'new', args: ['--enable-gpu', '--ignore-gpu-blocklist'] })
+  const browser = await launchBrowser({ purpose: 'the neural field evidence capture', headless: 'new', args: ['--enable-gpu', '--ignore-gpu-blocklist'] })
   const page = await browser.newPage()
   await page.setViewport({ width: 1600, height: 900, deviceScaleFactor: dpr })
   await page.evaluateOnNewDocument(() => {

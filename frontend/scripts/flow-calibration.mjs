@@ -6,7 +6,7 @@
    traffic. Saves frames + coverage stats for tuning iterations.
    Usage: node scripts/flow-calibration.mjs --out design-evidence/phase-6.2/iterations/iter1 [--theme dark] [--quick] */
 import { mkdirSync } from 'node:fs'
-import puppeteer from 'puppeteer-core'
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const args = new Map()
 for (let i = 2; i < process.argv.length; i += 1) {
@@ -18,7 +18,7 @@ const theme = args.get('theme') || 'dark'
 const quick = args.has('quick')
 mkdirSync(out, { recursive: true })
 
-const browser = await puppeteer.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
+const browser = await launchBrowser({ purpose: 'the flow calibration', headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
 const page = await browser.newPage()
 await page.setViewport({ width: 1440, height: 900 })
 await page.evaluateOnNewDocument((t) => window.localStorage.setItem('camelid-theme', t), theme)

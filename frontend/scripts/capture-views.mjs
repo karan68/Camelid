@@ -8,7 +8,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import puppeteer from 'puppeteer-core'
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const args = new Map()
 for (let i = 2; i < process.argv.length; i += 2) {
@@ -24,17 +24,9 @@ const onlyViews = args.get('views')?.split(',') || null
 const VIEWS = ['chat', 'library', 'api', 'compatibility', 'telemetry', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory']
 const HEIGHTS = { 1440: 900, 1024: 768, 768: 1024, 390: 844 }
 
-const CHROME_PATHS = [
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-]
-const { existsSync } = await import('node:fs')
-const executablePath = CHROME_PATHS.find((p) => existsSync(p))
-if (!executablePath) throw new Error('No local Chrome found for capture')
-
 await mkdir(outDir, { recursive: true })
 const captured = []
-const browser = await puppeteer.launch({ executablePath, headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
+const browser = await launchBrowser({ purpose: 'the view capture', headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
 
 try {
   for (const theme of themes) {

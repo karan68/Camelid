@@ -5,7 +5,7 @@
    and flush count (each flush = one full or partial markdown render).
    Usage: node scripts/chat-perf-profile.mjs --label baseline --out design-evidence/phase-8 */
 import { mkdirSync, writeFileSync } from 'node:fs'
-import puppeteer from 'puppeteer-core'
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const args = new Map()
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i]?.replace(/^--/, ''), process.argv[i + 1])
@@ -13,7 +13,7 @@ const label = args.get('label') || 'run'
 const out = args.get('out') || 'design-evidence/phase-8'
 mkdirSync(`${out}/${label}-frames`, { recursive: true })
 
-const browser = await puppeteer.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
+const browser = await launchBrowser({ purpose: 'the chat perf profile', headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
 const page = await browser.newPage()
 await page.setViewport({ width: 1440, height: 900 })
 await page.evaluateOnNewDocument(() => {
