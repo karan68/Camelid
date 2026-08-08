@@ -11,16 +11,20 @@
 .cxchat__experimental-banner strong { color: var(--color-text); }
 
 /* ---- Empty state ---- */
+/* Centered via auto margins (not justify-content: center) so that when the
+   content is taller than the viewport — small screens — the top stays
+   reachable in the scroll container instead of bleeding behind the composer. */
 .cxchat__empty {
   flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
   gap: var(--space-8);
   padding: var(--space-9) 0;
   text-align: center;
 }
+.cxchat__empty > :first-child { margin-top: auto; }
+.cxchat__empty > :last-child { margin-bottom: auto; }
 .cxchat-hero { display: flex; flex-direction: column; align-items: center; }
 .cxchat-hero__mark { margin-bottom: var(--space-4); color: var(--color-text-muted); }
 .cxchat-hero__title {
@@ -74,6 +78,18 @@
 }
 .cxchat__followup:hover { background: var(--color-surface-hover); color: var(--color-text); }
 .cxchat__anchor { height: 1px; }
+.cxchat__day-sep {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+.cxchat__day-sep::before,
+.cxchat__day-sep::after { content: ''; height: 1px; flex: 1; background: var(--color-border-soft); }
 
 /* ---- Turns ---- */
 .cxturn { display: flex; gap: var(--space-3); animation: camelidFadeInUp var(--dur-base) var(--ease-standard); }
@@ -107,7 +123,12 @@
 }
 .cxturn__warning--error { color: var(--color-error); }
 .cxturn__warning--interrupted { color: var(--color-warning); }
-.cxturn__actions { display: flex; gap: var(--space-2); margin-top: var(--space-3); }
+.cxturn__actions { display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-3); }
+.cxturn__action-time {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-faint);
+}
 .cxturn__action {
   display: inline-flex;
   align-items: center;
@@ -125,17 +146,19 @@
 .cxturn__body .message-markdown > * + * { margin-top: var(--space-4); }
 .cxturn__body .message-markdown h2 { font-size: var(--text-xl); margin-top: var(--space-5); }
 .cxturn__body .message-markdown h3 { font-size: var(--text-lg); margin-top: var(--space-4); }
+.cxturn__body .message-markdown h4 { font-size: var(--text-md); font-weight: 650; margin-top: var(--space-4); }
+.cxturn__body .message-markdown blockquote {
+  margin: 0;
+  padding: var(--space-1) var(--space-4);
+  border-left: 3px solid var(--color-border-strong);
+  color: var(--color-text-muted);
+}
+.cxturn__body .message-markdown blockquote > p + p { margin-top: var(--space-2); }
+.cxturn__body .message-markdown hr { border: none; border-top: 1px solid var(--color-border-soft); }
 .cxturn__body .message-markdown ul { display: flex; flex-direction: column; gap: var(--space-1); }
 .cxturn__body .message-markdown li { line-height: var(--leading-normal); }
 .message-section-heading { color: var(--color-text); }
-.inline-code {
-  font-family: var(--font-mono);
-  font-size: 0.88em;
-  padding: 0.12em 0.4em;
-  border-radius: 6px;
-  background: var(--color-code-bg);
-  border: 1px solid var(--color-code-border);
-}
+/* Inline code in markdown uses the shared .cx-code treatment (ui.css). */
 
 /* ---- Code card ---- */
 .message-code-card {
@@ -154,7 +177,7 @@
   border-bottom: 1px solid var(--color-code-border);
   font-size: var(--text-xs);
 }
-.message-code-card-title { font-weight: 600; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.message-code-card-title { font-weight: 600; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
 .message-code-card-status { color: var(--color-warning); }
 .message-code-card figcaption button {
   margin-left: auto;
@@ -237,6 +260,9 @@
   background: var(--color-evidence-soft);
 }
 .parity-receipt-matches { list-style: none; padding: 0; margin: 0 0 var(--space-2); display: flex; flex-direction: column; gap: 2px; font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted); }
+.parity-receipt-mark { display: inline-flex; vertical-align: middle; }
+.parity-receipt-mark.is-match { color: var(--color-ready); }
+.parity-receipt-mark.is-miss { color: var(--color-error); }
 .parity-receipt-id { display: flex; align-items: center; gap: var(--space-2); font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted); margin-bottom: var(--space-2); }
 .parity-receipt-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
 .message-action-button { padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); border: 1px solid var(--color-border-soft); background: var(--color-bg-elevated); color: var(--color-text-muted); font-size: var(--text-xs); font-weight: 600; }
@@ -284,7 +310,6 @@
    Composer dock
    ========================================================================== */
 .cxchat__dock { flex: none; padding-bottom: var(--space-3); }
-.cxchat__disclaimer { text-align: center; font-size: var(--text-xs); color: var(--color-text-faint); margin-top: var(--space-2); }
 
 .cxcomposer { display: flex; flex-direction: column; }
 .cxcomposer__box {
@@ -399,25 +424,41 @@
   font-size: var(--text-xs);
   color: var(--color-text-muted);
 }
-.cxcomposer__status-label { color: var(--color-text); font-weight: 600; }
-.cxcomposer__status.is-ready .cxcomposer__status-label { color: var(--color-ready); }
-.cxcomposer__status.is-warn .cxcomposer__status-label { color: var(--color-warning); }
-.cxcomposer__status.is-offline .cxcomposer__status-label { color: var(--color-error); }
-.cxcomposer__status-sep { color: var(--color-text-faint); }
-.cxcomposer__status-row { font-family: var(--font-mono); }
-.cxcomposer__detail { margin-top: var(--space-1); padding: 0 var(--space-2); font-size: var(--text-xs); color: var(--color-text-faint); }
-.cxcomposer__hint { margin-top: 2px; padding: 0 var(--space-2); font-size: var(--text-xs); color: var(--color-text-faint); }
+.cxcomposer__status-line { display: inline-flex; align-items: center; gap: var(--space-2); min-width: 0; }
+.cxcomposer__status-text { color: var(--color-text-muted); }
+.cxcomposer__status-info {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  color: var(--color-text-faint);
+}
+.cxcomposer__status-info:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.cxcomposer__status.is-ready .cxcomposer__status-text { color: var(--color-ready); }
+.cxcomposer__status.is-warn .cxcomposer__status-text { color: var(--color-warning); }
+.cxcomposer__status.is-offline .cxcomposer__status-text { color: var(--color-error); }
 
 @media (max-width: 860px) {
   .cxchat__suggestions { grid-template-columns: 1fr; }
   .cxturn__user-chip { max-width: 90%; }
 }
 
+/* Narrow composer: the labeled toolbar buttons collapse to icon-only (their
+   aria-labels and title tooltips keep them identifiable) so the toolbar stays
+   a single row and the docked composer keeps its height in check. */
+@media (max-width: 640px) {
+  .cxcomposer__tool--collapsible .cxcomposer__tool-label { display: none; }
+  .cxcomposer__tool--collapsible { width: 32px; padding: 0; justify-content: center; }
+  .cxcomposer__model-select { max-width: 150px; }
+  .cxchat__empty { gap: var(--space-6); padding: var(--space-6) 0; }
+}
+
 /* ---- Ported from the retired pre-redesign sheet: streaming-loader + diagnostics-trigger
    cosmetics, so chat.css fully owns the chat surface once legacy is dropped. ---- */
 .streaming-loader-compact { padding: 0 0 8px; }
 .streaming-loader-dot-1 { animation-delay: 0ms; }
-.developer-diagnostics-trigger .trigger-icon { font-size: 0.88rem; }
+.developer-diagnostics-trigger .trigger-icon { display: inline-flex; align-items: center; }
 .developer-diagnostics-trigger.is-open {
   background: color-mix(in srgb, var(--color-chip) 80%, transparent);
   border-color: var(--color-border-strong);
@@ -431,7 +472,7 @@
   text-align: left;
   padding: var(--space-2) var(--space-3);
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: var(--text-2xs);
   font-weight: 600;
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -457,14 +498,14 @@
 }
 .cxturn__meta-item {
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: var(--text-2xs);
   color: var(--color-text-faint);
   white-space: nowrap;
 }
 .cxturn__meta-model { color: var(--color-text-muted); }
 .cxturn__meta-usage { color: var(--color-text-muted); }
 .cxturn__meta-usage strong { color: var(--color-text); font-weight: 600; }
-.cxturn__meta-note { margin-left: auto; opacity: 0.75; font-style: normal; letter-spacing: var(--tracking-wide); text-transform: uppercase; font-size: 0.625rem; }
+.cxturn__meta-note { margin-left: auto; opacity: 0.75; font-style: normal; letter-spacing: var(--tracking-wide); text-transform: uppercase; font-size: var(--text-micro); }
 
 /* ---- User-row edit & resend (Phase 2) ---- */
 .cxturn--user { position: relative; }
@@ -497,16 +538,13 @@
   background: var(--color-surface-subtle);
 }
 .chat-controls__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-3); }
-.chat-controls__head h3 { margin: 0; font-family: var(--font-display); font-size: var(--text-md); font-weight: 600; }
+.chat-controls__head h3 { margin: 0; font-family: var(--font-display); font-size: var(--text-md); font-weight: 650; }
 .chat-controls__group { margin-bottom: var(--space-4); }
 .chat-controls__group:last-child { margin-bottom: 0; }
 .chat-controls__group-head { display: flex; align-items: baseline; gap: var(--space-3); margin-bottom: var(--space-2); flex-wrap: wrap; }
+/* Composes .cx-caption (ui.css) in JSX; local tone/weight only. */
 .chat-controls__label {
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
   font-weight: 600;
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
   color: var(--color-text-muted);
 }
 .chat-controls__note { font-size: var(--text-xs); color: var(--color-text-faint); }
@@ -541,8 +579,8 @@
   border-bottom: 1px solid var(--color-border-soft);
 }
 .chat-controls__param:last-child { border-bottom: none; }
-.chat-controls__param-name { font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-text); }
-.chat-controls__param-current { font-family: var(--font-mono); font-size: 0.6875rem; color: var(--color-text-faint); }
+.chat-controls__param-name { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text); }
+.chat-controls__param-current { font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--color-text-faint); }
 .chat-controls__param-input {
   width: 120px;
   border: 1px solid var(--color-border-strong);
@@ -550,7 +588,7 @@
   background: var(--color-bg-elevated);
   color: var(--color-text);
   font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: var(--text-xs);
   padding: 3px var(--space-2);
 }
 
@@ -562,7 +600,7 @@
   margin-left: auto;
   display: none;
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: var(--text-2xs);
   letter-spacing: 0.04em;
   color: var(--color-accent-text);
   background: var(--color-glass-strong);
@@ -572,7 +610,7 @@
   z-index: 5;
   cursor: pointer;
 }
-.cxchat.is-user-scrolled .cxchat__jump-latest { display: block; }
+.cxchat.is-user-scrolled .cxchat__jump-latest { display: inline-flex; align-items: center; gap: var(--space-1); }
 
 /* Phase 9: send-time context-budget error */
 .cxcomposer__budget-error {
@@ -581,7 +619,7 @@
   color: var(--color-error);
   display: flex;
   gap: var(--space-2);
-  align-items: baseline;
+  align-items: flex-start;
 }
 
 .cxcomposer__budget-notice {
@@ -590,8 +628,10 @@
   color: var(--color-text-muted);
   display: flex;
   gap: var(--space-2);
-  align-items: baseline;
+  align-items: flex-start;
 }
+.cxcomposer__budget-error svg,
+.cxcomposer__budget-notice svg { flex: none; margin-top: 1px; }
 
 /* ---- First-run activation card ----
    Sits in the app shell above the chat view (not inside its scroller) so it stays
@@ -627,7 +667,7 @@
   margin: 0;
   font-size: var(--text-xs);
   font-weight: 700;
-  letter-spacing: 0.06em;
+  letter-spacing: var(--tracking-label);
   text-transform: uppercase;
   color: var(--color-accent-text);
 }
@@ -719,7 +759,7 @@
   flex: none;
   border: 1px solid var(--color-border-soft);
   border-radius: 50%;
-  font-size: 10px;
+  font-size: var(--text-micro);
 }
 .cxfirstrun__steps li.is-active { color: var(--color-text); }
 .cxfirstrun__steps li.is-active span { border-color: var(--color-evidence-border); background: var(--color-evidence-soft); color: var(--color-evidence); }

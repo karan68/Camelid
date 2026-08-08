@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { IconCheck } from '../ui/icons'
 
 /* Tokenizer playground (Phase 3): drives the live encode/decode endpoints
    (api feature row `tokenizer_encode_decode`). Type text → token ids + pieces
@@ -36,7 +37,17 @@ export function TokenizerPlayground({ apiBase }) {
       const encoded = await encodeRes.json()
       if (!encodeRes.ok) {
         setResult(null)
-        setError(encoded?.error?.message || `encode failed (${encodeRes.status})`)
+        const message = encoded?.error?.message || `encode failed (${encodeRes.status})`
+        /* Only advise loading a model when the backend's refusal is actually
+           about a missing model/tokenizer — the same suffix on a network failure
+           is wrong advice. */
+        const needsModel = /tokenizer|no model|not loaded|model.*load/i.test(
+          `${encoded?.error?.code || ''} ${message}`,
+        )
+        setError({
+          message,
+          hint: needsModel ? 'load a model with an available tokenizer first.' : null,
+        })
         return
       }
       const tokens = encoded.tokens || []
@@ -79,7 +90,7 @@ export function TokenizerPlayground({ apiBase }) {
       })
     } catch (err) {
       setResult(null)
-      setError(`Backend did not answer: ${err.message}`)
+      setError({ message: `Backend did not answer: ${err.message}`, hint: null })
     } finally {
       setBusy(false)
     }
@@ -96,7 +107,7 @@ export function TokenizerPlayground({ apiBase }) {
           size="sm"
         />
       </div>
-      <p className="cxv-sub">Round-trip the loaded model&apos;s tokenizer: text → ids → pieces → text. Byte-exact round-trips are the same property the parity evidence leans on.</p>
+      <p className="cxv-sub">Round-trip the loaded model&apos;s tokenizer: text → ids → pieces → text. Byte-exact round-trips are the same property the model validation checks rely on.</p>
 
       <div className="tokenizer-playground__controls">
         <textarea
@@ -122,14 +133,19 @@ export function TokenizerPlayground({ apiBase }) {
         </div>
       </div>
 
-      {error && <p className="tokenizer-playground__error" role="status">{error} — load a model with an available tokenizer first.</p>}
+      {error && (
+        <p className="tokenizer-playground__error" role="alert">
+          {error.message}
+          {error.hint ? ` — ${error.hint}` : ''}
+        </p>
+      )}
 
       {result && (
         <div className="tokenizer-playground__result">
           <div className="tokenizer-playground__stat-row">
             <span className="tokenizer-playground__stat"><b>{result.tokenCount}</b> tokens</span>
             <span className={`tokenizer-playground__verdict ${result.roundTripExact ? 'is-exact' : ''}`}>
-              round-trip {result.roundTripExact ? 'byte-exact ✓' : 'differs from input'}
+              round-trip {result.roundTripExact ? <>byte-exact <IconCheck size={12} /></> : 'differs from input'}
             </span>
             {!result.roundTripExact && addSpecial && (
               <span className="tokenizer-playground__hint">expected with add_special on — special tokens decode into the output</span>

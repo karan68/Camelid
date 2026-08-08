@@ -200,10 +200,10 @@ export default function CompatibilityView({ capabilities, focusRowId = null, onF
       <header className="cxv-head">
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconReceipt size={14} /> Compatibility</p>
-          <h1>The evidence ledger</h1>
+          <h1>Compatibility</h1>
           <p className="cxv-sub">
-            Every row below is the live /api/capabilities contract — nothing on this screen is
-            written by hand. Support is exact-row: one artifact, one quant, one set of checked
+            Every row below is read live from the engine — nothing on this screen is
+            written by hand. Support is exact: one file, one quantization, one set of checked
             evidence. Resemblance is not evidence; a family name, a filename, or a neighboring
             size proves nothing here, and the “not claimed” column carries the same weight as
             the proven one.
@@ -213,9 +213,9 @@ export default function CompatibilityView({ capabilities, focusRowId = null, onF
 
       {supportContract && (
         <div className="cxv-card cxv-card--flat ledger-contract">
-          <strong>Support contract</strong>
+          <strong>Support summary</strong>
           <div className="ledger-contract__summary">
-            <span><b>{supportedCount}</b> supported exact rows</span>
+            <span><b>{supportedCount}</b> supported model builds</span>
             <span><b>{rows.length - supportedCount}</b> guarded or unclaimed rows</span>
           </div>
           {supportContract.current_gate && (
@@ -224,8 +224,8 @@ export default function CompatibilityView({ capabilities, focusRowId = null, onF
               <CanonicalStatement text={displayCapabilityCopy(supportContract.current_gate)} />
             </details>
           )}
-          {supportContract.support_policy && <p className="ledger-contract__line"><span className="ledger-contract__key">support policy</span>{displayCapabilityCopy(supportContract.support_policy)}</p>}
-          {supportContract.unsupported_policy && <p className="ledger-contract__line"><span className="ledger-contract__key">unsupported policy</span>{displayCapabilityCopy(supportContract.unsupported_policy)}</p>}
+          {supportContract.support_policy && <p className="ledger-contract__line"><span className="cx-caption ledger-contract__key">support policy</span>{displayCapabilityCopy(supportContract.support_policy)}</p>}
+          {supportContract.unsupported_policy && <p className="ledger-contract__line"><span className="cx-caption ledger-contract__key">unsupported policy</span>{displayCapabilityCopy(supportContract.unsupported_policy)}</p>}
         </div>
       )}
 
@@ -234,13 +234,13 @@ export default function CompatibilityView({ capabilities, focusRowId = null, onF
           className="cx-empty--inline"
           icon={<IconReceipt size={22} />}
           title="Ledger unavailable"
-          description="No compatibility rows were read from /api/capabilities. The ledger renders only the live contract — start the backend (cargo run -- serve) or fix the API base in Settings; nothing is shown from memory or assumption."
+          description="No compatibility rows were read from the engine. The ledger renders only live data — start the engine or fix the API address in Settings; nothing is shown from memory or assumption."
         />
       ) : (
         <>
           <div className="cxv-stat-grid">
             <div className="cxv-stat"><span>Rows</span><strong>{rows.length}</strong><small>exact lanes tracked</small></div>
-            <div className="cxv-stat"><span>Supported</span><strong>{supportedCount}</strong><small>exact rows, bounded envelopes</small></div>
+            <div className="cxv-stat"><span>Supported</span><strong>{supportedCount}</strong><small>exact model builds</small></div>
             <div className="cxv-stat"><span>Everything else</span><strong>{rows.length - supportedCount}</strong><small>tracked, honestly not claimed</small></div>
           </div>
 
@@ -274,7 +274,7 @@ export default function CompatibilityView({ capabilities, focusRowId = null, onF
       {apiFeatures.length > 0 && (
         <section className="cxv-card cxv-panel ledger-features">
           <div className="cxv-section__head"><h2>API feature rows</h2><span className="cxv-section__count">{apiFeatures.length} advertised</span></div>
-          <p className="cxv-sub">Feature lanes from the same contract. They gate API affordances and never widen any model row above.</p>
+          <p className="cxv-sub">API features reported by the same live data. They control what the API offers and never widen any model row above.</p>
           <ul className="ledger-features__list">
             {apiFeatures.map((feature) => (
               <li key={feature.id} className="ledger-features__item" ref={(node) => registerRef(feature.id, node)} data-row-id={feature.id} tabIndex={-1}>

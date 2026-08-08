@@ -15,6 +15,7 @@ import {
 import { formatBytes } from '../../lib/formatters'
 import { loadLocalModelForChat, warmGenerationPath } from '../../lib/modelActivation'
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { IconCheck } from '../ui/icons'
 
 /* First-run activation — one click from a fresh install to a streaming token.
 
@@ -448,7 +449,7 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
               label={`${size} · validated`}
               source={{
                 rowId: hint?.target?.id,
-                note: 'A validated exact row: Camelid cross-checks this exact file against the reference implementation.',
+                note: 'A validated model build: Camelid cross-checks this exact file against the reference implementation.',
               }}
               size="sm"
             />
@@ -481,13 +482,13 @@ export function FirstRunCard({ apiBase = '', capabilities = null, onActivated, o
           <ol className="cxfirstrun__steps" aria-label="Setup progress">
             {STEPS.map((label, index) => (
               <li key={label} className={index < active ? 'is-done' : index === active ? 'is-active' : ''}>
-                <span aria-hidden="true">{index < active ? '✓' : index + 1}</span>
+                <span aria-hidden="true">{index < active ? <IconCheck size={12} /> : index + 1}</span>
                 {label}
               </li>
             ))}
           </ol>
           {percent === null ? null : (
-            <div className="cxfirstrun__bar" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
+            <div className="cxfirstrun__bar" role="progressbar" aria-label="Model download progress" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
               <span style={{ width: `${percent}%` }} />
             </div>
           )}

@@ -38,7 +38,7 @@ export function DiscoverDevices({ open, onClose, onDiscover, onAdd }) {
           Safe local discovery only — this machine plus LAN neighbors from the ARP table. Nothing is added without your approval.
         </p>
         {!state.loading && !state.available && (
-          <p className="cluster-discover__note">Live discovery needs the local dev server (npm run dev). You can still add machines manually with “Add Server”.</p>
+          <p className="cluster-discover__note">Live discovery needs the local agent. You can still add machines manually with “Add server”.</p>
         )}
         {state.loading ? (
           <div className="cluster-discover__loading">Scanning the local network…</div>

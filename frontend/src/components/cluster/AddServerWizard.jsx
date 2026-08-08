@@ -56,7 +56,7 @@ export function AddServerWizard({ open, onClose, onAdd, initial }) {
     const checks = []
     const probe = await probeNode({ host, port: Number(draft.port) || 22 })
     if (!probe.available) {
-      checks.push({ label: 'Reachability', state: 'skip', note: 'needs the local dev server (npm run dev)' })
+      checks.push({ label: 'Reachability', state: 'skip', note: 'needs the local agent' })
     } else if (probe.reachable) {
       checks.push({ label: 'Reachability', state: 'ok', note: `${Math.round(probe.latencyMs)}ms` })
     } else {
@@ -215,7 +215,7 @@ export function AddServerWizard({ open, onClose, onAdd, initial }) {
               )}
               {test?.verdict && (
                 <div className={`cluster-test__verdict is-${test.verdict}`}>
-                  {test.verdict === 'ready' ? 'Ready to add.' : test.verdict === 'warnings' ? 'Added with warnings — some checks need the local agent.' : 'Connection failed — you can still add it as a manual/offline node.'}
+                  {test.verdict === 'ready' ? 'Ready to add.' : test.verdict === 'warnings' ? 'Ready to add — some checks were skipped and need the local agent.' : 'Connection failed — you can still add it as a manual/offline node.'}
                 </div>
               )}
             </div>

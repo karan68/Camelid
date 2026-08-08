@@ -1,25 +1,36 @@
+import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
-import { IconTrash } from '../ui/icons'
+import { IconPlay, IconTrash } from '../ui/icons'
 import { ParityReceiptCard } from '../chat/render/ParityReceipt'
+import { quantAdvice } from '../../lib/catalogBrowse'
+import { formatBytes } from '../../lib/formatters'
 
 /* Lane row components for the Models page — moved verbatim from
    LocalLaneSections when the page was consolidated into zones. Copper is
    reserved for supported; runnable is amber and never copper; the
    not-yet-runnable state is shown, never hidden. */
 
-const GB = 1024 * 1024 * 1024
-
-export function prettySize(bytes) {
-  if (!bytes) return ''
-  if (bytes >= GB) return `${(bytes / GB).toFixed(bytes >= 10 * GB ? 0 : 1)} GB`
-  return `${Math.round(bytes / (1024 * 1024))} MB`
-}
-
 export function metaLine(entry) {
+  /* Context windows are powers of two: divide by 1024 so 32768 reads as the
+     conventional 32K (and 131072 as 128K), never 33K. */
   const ctx = entry.context_length
-    ? `${entry.context_length >= 1000 ? `${Math.round(entry.context_length / 1000)}K` : entry.context_length} ctx`
+    ? `${entry.context_length >= 1024 ? `${Math.round(entry.context_length / 1024)}K` : entry.context_length} ctx`
     : null
-  return [entry.architecture, entry.quantization, entry.tokenizer_kind, prettySize(entry.size_bytes), ctx]
+  /* The quant token alone is jargon; attach the human-language note from the
+     shared quant table. tokenizer_kind stays in the ModelInspector, where it
+     belongs — it carries no decision value on this surface. */
+  const advice = quantAdvice(entry.quantization).note
+  const quant = entry.quantization
+    ? advice
+      ? `${entry.quantization} (${advice})`
+      : entry.quantization
+    : null
+  return [
+    entry.architecture,
+    quant,
+    entry.size_bytes ? formatBytes(entry.size_bytes) : null,
+    ctx,
+  ]
     .filter(Boolean)
     .join(' · ')
 }
@@ -52,9 +63,9 @@ export function Section({ title, subtitle, count, children }) {
   return (
     <section className="lane-section">
       <header className="lane-section-head">
-        <h3>
+        <h2>
           {title} {count !== undefined && <span className="lane-section-count">{count}</span>}
-        </h3>
+        </h2>
         {subtitle ? <p className="lane-section-sub">{subtitle}</p> : null}
       </header>
       <div className="lane-section-body">{children}</div>
@@ -65,21 +76,23 @@ export function Section({ title, subtitle, count, children }) {
 function DeleteModelButton({ entry, busy, blockedReason, onDelete }) {
   if (!entry.delete_token) return null
   return (
-    <button
-      type="button"
-      className="lane-row-delete"
+    <Button
+      variant="ghost"
+      size="sm"
+      className="cxv-danger"
+      icon={<IconTrash size={17} />}
       onClick={() => onDelete(entry)}
       disabled={busy || Boolean(blockedReason)}
       aria-label={`Delete ${entry.filename} from disk`}
       aria-describedby={blockedReason ? 'model-delete-guard' : undefined}
       title={blockedReason || 'Delete from disk'}
     >
-      <IconTrash size={18} />
-    </button>
+      Delete
+    </Button>
   )
 }
 
-function DefaultModelControl({ entry, isDefault, busy, onMakeDefault }) {
+function DefaultModelControl({ entry, isDefault, busy, saving, onMakeDefault }) {
   if (isDefault) {
     return (
       <span className="lane-row-default" title="Camelid loads this model when the app starts">
@@ -88,15 +101,16 @@ function DefaultModelControl({ entry, isDefault, busy, onMakeDefault }) {
     )
   }
   return (
-    <button
-      type="button"
-      className="lane-row-default-action"
+    <Button
+      variant="ghost"
+      size="sm"
       onClick={() => onMakeDefault(entry.filename)}
+      loading={saving}
       disabled={busy}
-      title="Load this model automatically the next time Camelid starts"
+      title="Load this model automatically when Camelid starts"
     >
-      {busy ? 'Saving…' : 'Make default'}
-    </button>
+      Make default
+    </Button>
   )
 }
 
@@ -128,14 +142,24 @@ export function SupportedRow({
       {active ? <p className="lane-row-loaded">● Loaded — this is the active chat model.</p> : null}
       <div className="lane-row-actions">
         {!active ? (
-          <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
-            {busy ? 'Loading…' : 'Use for chat'}
-          </button>
+          <Button
+            variant="tonal"
+            size="sm"
+            icon={<IconPlay size={16} />}
+            onClick={onUse}
+            loading={busy}
+            disabled={busy || deleteBusy}
+            aria-label={`Load ${entry.filename}`}
+            title="Load this model into Camelid"
+          >
+            Load
+          </Button>
         ) : null}
         <DefaultModelControl
           entry={entry}
           isDefault={isDefault}
           busy={defaultBusy || busy || deleteBusy}
+          saving={defaultBusy}
           onMakeDefault={onMakeDefault}
         />
         {!active ? (
@@ -165,28 +189,35 @@ export function CompatibleRow({
           <span className="lane-row-name">{entry.filename}</span>
           <span className="lane-row-meta">{metaLine(entry)}</span>
         </div>
-        <EvidenceChip state="runnable" asText>Runnable</EvidenceChip>
+        <EvidenceChip state="runnable" asText>Experimental</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
       {receipt ? (
         <ParityReceiptCard receipt={receipt} />
       ) : (
-        <p className="lane-row-faint">Loading runnable receipt…</p>
+        <p className="lane-row-faint">Loading test results…</p>
       )}
       <p className="lane-row-faint">
-        The receipt above attests one deterministic CLI run on the generic f32 lane
-        (<code>camelid runnable-smoke</code>) — it is not a parity contract. Loading it for
-        chat serves it the same way any implemented-but-unanchored model is served, so its
-        chat output carries no parity claim and is not cross-validated against the reference.
+        This model passed a quick local test, but its chat output isn&rsquo;t verified for correctness.
       </p>
       <div className="lane-row-actions">
-        <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
-          {busy ? 'Loading…' : 'Use for chat (experimental)'}
-        </button>
+        <Button
+          variant="tonal"
+          size="sm"
+          icon={<IconPlay size={16} />}
+          onClick={onUse}
+          loading={busy}
+          disabled={busy || deleteBusy}
+          aria-label={`Load ${entry.filename}`}
+          title="Load this model into Camelid"
+        >
+          Load
+        </Button>
         <DefaultModelControl
           entry={entry}
           isDefault={isDefault}
           busy={defaultBusy || busy || deleteBusy}
+          saving={defaultBusy}
           onMakeDefault={onMakeDefault}
         />
         <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />
@@ -197,19 +228,26 @@ export function CompatibleRow({
 
 export function EligibleRow({ entry, busy, deleteBusy, blockedReason, onRun, onDelete }) {
   return (
-    <article className="lane-row lane-row--runnable" aria-label={`Smoke-eligible model ${entry.filename}`}>
+    <article className="lane-row lane-row--runnable" aria-label={`Ready-to-test model ${entry.filename}`}>
       <div className="lane-row-head">
         <div className="lane-row-id">
           <span className="lane-row-name">{entry.filename}</span>
           <span className="lane-row-meta">{metaLine(entry)}</span>
         </div>
-        <EvidenceChip state="runnable" asText>Oracle-qualified</EvidenceChip>
+        <EvidenceChip state="runnable" asText>Ready to test</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
       <div className="lane-row-actions">
-        <button type="button" className="lane-row-action" onClick={onRun} disabled={busy || deleteBusy}>
-          {busy ? 'Running smoke-admission…' : 'Run smoke-admission'}
-        </button>
+        <Button
+          variant="tonal"
+          size="sm"
+          onClick={onRun}
+          loading={busy}
+          disabled={busy || deleteBusy}
+          title="Run a quick local test of this model"
+        >
+          Run quick test
+        </Button>
         <DeleteModelButton entry={entry} busy={busy || deleteBusy} blockedReason={blockedReason} onDelete={onDelete} />
       </div>
     </article>
@@ -234,22 +272,31 @@ export function NotAnchoredRow({
           <span className="lane-row-name">{entry.filename}</span>
           <span className="lane-row-meta">{metaLine(entry)}</span>
         </div>
-        <EvidenceChip state="unsupported" asText>Experimental — unverified</EvidenceChip>
+        <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
       <p className="lane-row-note">
-        Implemented but not parity-anchored: it loads and runs (GPU-resident when it
-        fits), but its output is not cross-validated against the reference. For
-        experimentation only.
+        This model loads and runs, but its output isn&rsquo;t verified for correctness.
+        For experimentation only.
       </p>
       <div className="lane-row-actions">
-        <button type="button" className="lane-row-action" onClick={onUse} disabled={busy || deleteBusy}>
-          {busy ? 'Loading…' : 'Use for chat (experimental)'}
-        </button>
+        <Button
+          variant="tonal"
+          size="sm"
+          icon={<IconPlay size={16} />}
+          onClick={onUse}
+          loading={busy}
+          disabled={busy || deleteBusy}
+          aria-label={`Load ${entry.filename}`}
+          title="Load this model into Camelid"
+        >
+          Load
+        </Button>
         <DefaultModelControl
           entry={entry}
           isDefault={isDefault}
           busy={defaultBusy || busy || deleteBusy}
+          saving={defaultBusy}
           onMakeDefault={onMakeDefault}
         />
         <DeleteModelButton entry={entry} busy={busy || deleteBusy || defaultBusy} blockedReason={blockedReason} onDelete={onDelete} />

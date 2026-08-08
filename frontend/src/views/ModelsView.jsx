@@ -5,13 +5,16 @@ import { ActiveModelBar } from '../components/models/ActiveModelBar'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
 import { DownloadsPanel } from '../components/models/DownloadsPanel'
 import { UnsupportedBlocker } from '../components/models/UnsupportedBlocker'
-import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow, prettySize } from '../components/models/LaneRows'
+import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow } from '../components/models/LaneRows'
+import { Button } from '../components/ui/Button'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
+import { Notice } from '../components/ui/Notice'
 import { useModelsPageData } from '../hooks/useModelsPageData'
+import { formatBytes } from '../lib/formatters'
 import { bucketByLane } from '../lib/modelLanes'
 import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
-import { IconModels } from '../components/ui/icons'
+import { IconModels, IconRefresh } from '../components/ui/icons'
 
 /* The Models page: one scroll, five zones.
      1. Active model bar — what is loaded now, with Unload.
@@ -219,7 +222,7 @@ export default function ModelsView({
     setDeleteNotice('')
     try {
       await spine.setDefaultModel(filename)
-      setDeleteNotice(`${filename} will load automatically the next time Camelid starts.`)
+      setDeleteNotice(`${filename} will load automatically when Camelid starts.`)
     } catch (error) {
       setLaneError(String(error?.message || error))
     } finally {
@@ -252,7 +255,9 @@ export default function ModelsView({
         return next
       })
       setPendingDeleteEntry(null)
-      setDeleteNotice(`Deleted ${entry.filename} and freed ${prettySize(result.bytes_freed)}.`)
+      setDeleteNotice(result.bytes_freed
+        ? `Deleted ${entry.filename} and freed ${formatBytes(result.bytes_freed)}.`
+        : `Deleted ${entry.filename}.`)
     } catch (error) {
       setPendingDeleteEntry(null)
       setLaneError(String(error?.message || error))
@@ -275,7 +280,7 @@ export default function ModelsView({
         setReceipts((r) => ({ ...r, [filename]: body.receipt }))
         await spine.refreshLocal()
       } else {
-        setLaneError(body?.error?.message || `Smoke-admission did not pass for ${filename}.`)
+        setLaneError(body?.error?.message || `The quick test did not pass for ${filename}.`)
       }
     } catch (err) {
       setLaneError(String(err?.message || err))
@@ -321,19 +326,19 @@ export default function ModelsView({
           <p className="cxv-kicker"><IconModels size={14} /> Model support</p>
           <h1>Models</h1>
           <p className="cxv-sub">
-            Load, download, and manage local GGUF models. Section membership is derived live from the
-            disk scan and the /api/capabilities support contract.
+            Load, download, and manage the models on this machine.
           </p>
         </div>
         <div className="cxv-head__actions">
-          <button
-            type="button"
-            className="lane-refresh"
+          <Button
+            variant="outline"
+            size="sm"
+            icon={<IconRefresh size={16} />}
             onClick={() => spine.refreshAll()}
             disabled={spine.localLoading}
           >
             {spine.localLoading ? 'Refreshing…' : 'Refresh'}
-          </button>
+          </Button>
         </div>
       </header>
 
@@ -350,20 +355,20 @@ export default function ModelsView({
         onVerify={runVerification}
         onUnload={handleUnload}
       />
-      {laneError ? <p className="lane-error">{laneError}</p> : null}
-      {deleteNotice ? <p className="lane-delete-success" role="status">{deleteNotice}</p> : null}
+      <Notice notice={laneError} tone="error" onDismiss={() => setLaneError('')} />
+      <Notice notice={deleteNotice} tone="success" onDismiss={() => setDeleteNotice('')} />
       {deleteBlockedReason ? (
         <p className="lane-delete-guard" id="model-delete-guard">{deleteBlockedReason}</p>
       ) : null}
       {spine.localError && !spine.local ? (
-        <p className="lane-empty">Could not list local models: {spine.localError}</p>
+        <Notice notice={`Could not list local models: ${spine.localError}`} tone="error" />
       ) : null}
 
       {/* Zone 2 — supported local models (derived membership only) */}
       <Section
         title="Supported"
         count={laneBuckets ? laneBuckets.supported.length : undefined}
-        subtitle="Local models matching an exact supported /api/capabilities row — cross-validated parity."
+        subtitle="Verified to run correctly here."
       >
         {!laneBuckets ? (
           <p className="lane-empty">
@@ -386,7 +391,7 @@ export default function ModelsView({
             />
           ))
         ) : (
-          <p className="lane-empty">No local model matches a supported row yet — download one below in “Get models”.</p>
+          <p className="lane-empty">No verified models on this machine yet — download one below in “Get models”.</p>
         )}
       </Section>
 
@@ -394,7 +399,7 @@ export default function ModelsView({
       <Section
         title="Experimental"
         count={laneBuckets ? experimentalRows.length : undefined}
-        subtitle="These run without parity anchoring — output is not cross-validated against the reference."
+        subtitle="These run, but their output isn't verified."
       >
         {blocker ? <UnsupportedBlocker blocker={blocker} className="local-lane-blocker" /> : null}
         {!laneBuckets ? (
@@ -445,7 +450,7 @@ export default function ModelsView({
             ))}
           </>
         ) : (
-          <p className="lane-empty">Nothing experimental on disk — every local model matches a supported row.</p>
+          <p className="lane-empty">Nothing experimental on this machine — every downloaded model is verified.</p>
         )}
       </Section>
 
@@ -467,7 +472,7 @@ export default function ModelsView({
         installBlockedReason={
           !runtimeOnline
             ? 'The runtime is offline — start the Camelid backend to download models.'
-            : 'The backend does not advertise a catalog-install capability, so downloads stay disabled.'
+            : 'This backend does not support model downloads.'
         }
         onInstallStarted={spine.kickDownloadsPoll}
         onDownloadAcknowledged={spine.refreshDownloads}
@@ -485,22 +490,22 @@ export default function ModelsView({
         <summary>Diagnostics</summary>
         <div className="models-diagnostics__body">
           <div className="models-diagnostics__tools">
-            <button
-              type="button"
-              className="lane-refresh"
+            <Button
+              variant="outline"
+              size="sm"
               onClick={() => setInspectorOpen(true)}
-              title="GGUF metadata, tokenizer, tensors — descriptive only, not support evidence"
+              title="View the loaded model's metadata, tokenizer, and tensors"
             >
               Inspect loaded model metadata
-            </button>
+            </Button>
           </div>
 
           <div className="models-diagnostics__import">
             <h3>Import a GGUF by path</h3>
             <p className="lane-empty">
               Models inside the <code>models/</code> folder appear above automatically. Use this only
-              for a GGUF stored elsewhere; it loads immediately and support still comes from
-              /api/capabilities, not filename optimism.
+              for a model file stored elsewhere; it loads immediately and is verified the same way as
+              the models above.
             </p>
             <div className="models-diagnostics__import-grid">
               <input
@@ -513,14 +518,15 @@ export default function ModelsView({
                 onChange={(e) => setRegisterForm((form) => ({ ...form, model_path: e.target.value }))}
                 placeholder="/path/to/your-model.gguf"
               />
-              <button
-                type="button"
-                className="lane-row-action"
+              <Button
+                variant="tonal"
+                size="sm"
                 onClick={importFromPath}
+                loading={importing || Boolean(loadingModelId)}
                 disabled={importing || Boolean(loadingModelId)}
               >
-                {importing || loadingModelId ? 'Loading…' : 'Import and load'}
-              </button>
+                Import and load
+              </Button>
             </div>
           </div>
 
@@ -534,11 +540,11 @@ export default function ModelsView({
 
       <ConfirmDialog
         open={Boolean(pendingDeleteEntry)}
-        title="Delete model from disk?"
+        title={pendingDeleteEntry ? `Delete ${pendingDeleteEntry.filename}?` : 'Delete model?'}
         detail={pendingDeleteEntry
-          ? `${pendingDeleteEntry.filename} (${prettySize(pendingDeleteEntry.size_bytes)}; ${pendingDeleteEntry.size_bytes.toLocaleString()} bytes)${pendingDeleteEntry.ghost_moe_prepared ? ' and its Ghost MoE expert pack' : ''} will be permanently removed. This cannot be undone.`
+          ? `This permanently removes ${pendingDeleteEntry.size_bytes ? formatBytes(pendingDeleteEntry.size_bytes) : 'this file'}${pendingDeleteEntry.ghost_moe_prepared ? ' and its Ghost MoE expert pack' : ''} from disk. This cannot be undone.`
           : ''}
-        confirmLabel="Delete from disk"
+        confirmLabel="Delete model"
         busy={Boolean(deletingFilename)}
         onCancel={() => { if (!deletingFilename) setPendingDeleteEntry(null) }}
         onConfirm={deleteModelFromDisk}

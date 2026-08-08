@@ -86,7 +86,7 @@
 .cx-btn--outline:hover:not(:disabled) { background: var(--color-surface-hover); border-color: var(--color-text-faint); }
 
 .cx-btn--danger { background: color-mix(in srgb, var(--color-error) 14%, transparent); color: var(--color-error); }
-.cx-btn--danger:hover:not(:disabled) { background: var(--color-error); color: #fff; }
+.cx-btn--danger:hover:not(:disabled) { background: var(--color-error); color: var(--color-error-ink); }
 
 .cx-btn.is-loading { color: transparent; }
 .cx-btn__spinner {
@@ -101,6 +101,7 @@
 .cx-btn--ghost .cx-btn__spinner,
 .cx-btn--tonal .cx-btn__spinner,
 .cx-btn--outline .cx-btn__spinner { color: var(--color-accent); }
+.cx-btn--danger .cx-btn__spinner { color: var(--color-error); }
 .cx-btn { position: relative; }
 
 /* ---- IconButton ---- */
@@ -114,7 +115,7 @@
     color var(--dur-fast) var(--ease-standard), transform var(--dur-fast) var(--ease-standard);
 }
 .cx-iconbtn--sm { width: 32px; height: 32px; }
-.cx-iconbtn--lg { width: 46px; height: 46px; }
+.cx-iconbtn--lg { width: 48px; height: 48px; }
 .cx-iconbtn:hover:not(:disabled) { background: var(--color-surface-hover); color: var(--color-text); }
 .cx-iconbtn:active:not(:disabled) { transform: scale(0.94); }
 .cx-iconbtn:disabled { opacity: 0.4; }
@@ -164,7 +165,7 @@
 .cx-card__header-icon { display: inline-flex; color: var(--color-accent-text); margin-top: 2px; }
 .cx-card__header-copy { flex: 1; min-width: 0; }
 .cx-card__header-actions { display: flex; gap: var(--space-2); flex: none; }
-.cx-card__eyebrow { display: block; font-size: var(--text-xs); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-faint); }
+.cx-card__eyebrow { display: block; font-size: var(--text-xs); font-weight: 600; letter-spacing: var(--tracking-label); text-transform: uppercase; color: var(--color-text-faint); }
 .cx-card__title { font-size: var(--text-lg); margin-top: 2px; }
 .cx-card__body { color: var(--color-text-muted); font-size: var(--text-sm); line-height: var(--leading-normal); }
 
@@ -275,8 +276,16 @@
 }
 .cx-notice__icon { display: inline-flex; flex: none; }
 .cx-notice__text { flex: 1; min-width: 0; }
-.cx-notice__close { display: inline-flex; color: var(--color-text-faint); border-radius: var(--radius-sm); }
-.cx-notice__close:hover { color: var(--color-text); }
+.cx-notice__close {
+  display: inline-flex;
+  color: var(--color-text-faint);
+  border-radius: var(--radius-sm);
+  /* Enlarge the hit target to 24px (WCAG 2.5.8) without shifting layout. */
+  padding: var(--space-1);
+  margin: calc(var(--space-1) * -1);
+  transition: background var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
+}
+.cx-notice__close:hover { color: var(--color-text); background: var(--color-surface-hover); }
 .cx-notice--success { border-left: 3px solid var(--color-ready); }
 .cx-notice--success .cx-notice__icon { color: var(--color-ready); }
 .cx-notice--error { border-left: 3px solid var(--color-error); }
@@ -292,17 +301,6 @@
 .cx-field__hint { font-size: var(--text-xs); color: var(--color-text-faint); }
 
 /* ---- EmptyState ---- */
-/* Inline (left-aligned, bordered) empty/error card used inside dense views. */
-.cx-empty--inline {
-  align-items: flex-start;
-  text-align: left;
-  padding: var(--space-4) var(--space-5);
-  border: 1px solid var(--color-border-soft);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface-subtle);
-  margin: 0 0 var(--space-4);
-}
-
 .cx-empty {
   display: flex;
   flex-direction: column;
@@ -323,3 +321,58 @@
 .cx-empty__title { font-size: var(--text-lg); color: var(--color-text); }
 .cx-empty__desc { max-width: 42ch; font-size: var(--text-sm); }
 .cx-empty__action { margin-top: var(--space-2); }
+
+/* Inline (left-aligned, bordered) empty/error card used inside dense views.
+   Declared after the base (and with compound specificity) so it wins. */
+.cx-empty.cx-empty--inline {
+  align-items: flex-start;
+  text-align: left;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-subtle);
+  margin: 0 0 var(--space-4);
+}
+
+/* ==========================================================================
+   Shared micro-typography utilities
+   The app's signature uppercase micro-label comes in exactly two voices —
+   use these instead of ad-hoc font-size/letter-spacing declarations:
+
+   .cx-kicker  — sans eyebrow: section/kicker label above a title or group
+                 (UI font, --text-2xs, --tracking-label).
+   .cx-caption — mono caption: instrument-style readout/data label
+                 (mono font, --text-2xs, --tracking-wide).
+   .cx-code    — inline code fragment inside running text (paths, ids,
+                 config keys); em-sized so it tracks the surrounding text.
+
+   --text-micro (10px) is the absolute legibility floor, reserved for the
+   densest instrument readouts; never go below it.
+   ========================================================================== */
+.cx-kicker {
+  display: block;
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--color-text-faint);
+}
+.cx-caption {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-text-faint);
+}
+.cx-code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  color: var(--color-text);
+}

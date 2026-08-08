@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { copyText } from '../../lib/markdown'
 import { workbenchEndpoints } from '../../lib/apiExamples'
@@ -159,16 +160,16 @@ function EndpointCard({ endpoint, gateState, onRun, running }) {
 
       <div className="wb-endpoint__actions">
         {gateState.runnable ? (
-          <button
-            type="button"
-            className="cxv-button"
+          <Button
+            variant="primary"
+            size="sm"
             data-tryit-ready="true"
             data-endpoint={endpoint.id}
             disabled={running}
             onClick={() => onRun(endpoint)}
           >
             {running ? 'Running…' : 'Try it'}
-          </button>
+          </Button>
         ) : (
           <p className="wb-endpoint__guarded" data-tryit-ready="false" data-endpoint={endpoint.id}>
             {gateState.reason}
@@ -229,8 +230,8 @@ export function ApiWorkbench({ apiBase, modelId, backendOnline, chatUnlocked, to
             <h3>Request inspector</h3>
             <EvidenceChip
               state="neutral"
-              label="operational telemetry — not compatibility evidence"
-              source={{ note: 'Timings and payloads from a single local request in this browser. They prove the wire worked once, not that any row is supported.' }}
+              label="Live request stats — measured in this browser, nothing persisted"
+              source={{ note: 'Timings and payloads from a single request made in this browser. Nothing is stored or shared.' }}
               size="sm"
             />
           </div>
@@ -240,11 +241,11 @@ export function ApiWorkbench({ apiBase, modelId, backendOnline, chatUnlocked, to
             <>
               <div className="wb-inspector__cols">
                 <div className="wb-inspector__col">
-                  <h4>Rendered request</h4>
+                  <h4 className="cx-caption">Rendered request</h4>
                   <pre><code>{`${inspection.request.method} ${inspection.request.url}`}{inspection.request.body ? `\n\n${JSON.stringify(inspection.request.body, null, 2)}` : ''}</code></pre>
                 </div>
                 <div className="wb-inspector__col">
-                  <h4>Response</h4>
+                  <h4 className="cx-caption">Response</h4>
                   <p className="wb-inspector__timing">
                     <span>status <b>{inspection.status || '—'}</b></span>
                     <span>headers <b>{inspection.headersMs === null ? '—' : `${Math.round(inspection.headersMs)}ms`}</b></span>

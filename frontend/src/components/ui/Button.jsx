@@ -6,6 +6,7 @@ export function Button({
   iconRight = null,
   block = false,
   loading = false,
+  disabled = false,
   className = '',
   children,
   type = 'button',
@@ -22,7 +23,7 @@ export function Button({
   ].filter(Boolean).join(' ')
 
   return (
-    <button type={type} className={classes} aria-busy={loading || undefined} {...rest}>
+    <button type={type} className={classes} aria-busy={loading || undefined} disabled={disabled || loading} {...rest}>
       {loading && <span className="cx-btn__spinner" aria-hidden="true" />}
       {!loading && icon && <span className="cx-btn__icon">{icon}</span>}
       {children && <span className="cx-btn__label">{children}</span>}

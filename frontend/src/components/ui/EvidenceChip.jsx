@@ -5,6 +5,7 @@ import {
   EVIDENCE_STATE_COPY,
   EVIDENCE_STATE_LABELS,
 } from '../../lib/evidenceStatus.js'
+import { IconChevronRight } from './icons'
 
 /* EvidenceChip — the signature component. Renders anywhere the UI makes a
    claim, with a row-scoped label and a verify-popover citing the claim's
@@ -195,7 +196,7 @@ export function EvidenceChip({
                 window.dispatchEvent(new CustomEvent('camelid:open-ledger', { detail: { rowId: source.rowId } }))
               }}
             >
-              View in the evidence ledger →
+              View in the evidence ledger <IconChevronRight size={12} />
             </button>
           )}
         </div>

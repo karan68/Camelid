@@ -6,16 +6,14 @@ import { useInferenceTelemetry } from '../hooks/useInferenceTelemetry'
 import { getTelemetrySnapshot, subscribeTelemetry, summarizeTelemetry } from '../lib/telemetryLog'
 import { getChatGateState } from '../lib/chatGate'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
-import { IconObservatory } from '../components/ui/icons'
+import { IconChevronRight, IconObservatory } from '../components/ui/icons'
+import { fmtMs, fmtRate } from '../components/observatory/format'
 
 /* Observatory (Phase 6.1 — "The Flow Bench"): inference rendered as liquid.
    The centerpiece canvas and the instrument rail consume the SAME lifecycle
    bus as the Telemetry view, so the art and the numbers cannot disagree. The
    backend-reported run panel (camelid.telemetry/v1 SSE) remains below as a
    separate, explicitly backend-side instrument. */
-
-const fmtMs = (value) => (Number.isFinite(value) ? (value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`) : '—')
-const fmtRate = (value) => (Number.isFinite(value) ? `${value >= 10 ? Math.round(value) : value.toFixed(1)} tok/s` : '—')
 
 /* Renderer mode. Neural Field is the default: its Phase 5 gate passed
    2026-07-02 (frames + PERF p95 2.3ms@DPR1 + truthfulness audit + build —
@@ -30,17 +28,6 @@ function initialRenderer() {
   } catch {
     return 'neuralfield'
   }
-}
-
-const HEADER_COPY = {
-  flowbench: {
-    title: 'The Flow Bench',
-    sub: 'Inference as liquid: prompt ink drifts until the first token bursts it, generation ink flows at the real decode rate, errors bloom and refuse to mix. Every motion traces to a request in the log — an idle backend settles to stillness, never fake motion.',
-  },
-  neuralfield: {
-    title: 'The Neural Field',
-    sub: 'The loaded model as geometry, inference as light: real layer counts shape the tunnel, real KV occupancy fills the column, real sampler candidates bloom at the outlet. The 18-node discs are stylized layer cross-sections (head counts are not in telemetry), and on GPU-resident lanes the traversal is a token-paced sweep — the token really crossed every layer; per-layer timing is not observable there. Idle = the network at rest.',
-  },
 }
 
 export default function InferenceObservatoryView({ apiBase, runtime = null, selectedModel = null, capabilities = null }) {
@@ -73,8 +60,8 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
       <header className="cxv-head">
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconObservatory size={14} /> Observatory</p>
-          <h1>{HEADER_COPY[renderer].title}</h1>
-          <p className="cxv-sub">{HEADER_COPY[renderer].sub}</p>
+          <h1>Observatory</h1>
+          <p className="cxv-sub">A live picture of inference on this machine, drawn from the real requests made in this session. When nothing is running, the view stays still.</p>
         </div>
         <div className="cxv-head__actions">
           <div className="observatory-renderer-toggle" role="group" aria-label="Centerpiece renderer">
@@ -97,8 +84,8 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
           </div>
           <EvidenceChip
             state="neutral"
-            label="operational telemetry — not compatibility evidence"
-            source={{ note: 'The fluid renders counts and timings from this session’s real requests only — never token text, never support claims. Bounded contract evidence lives in the Compatibility ledger.' }}
+            label="live session stats"
+            source={{ note: 'Drawn from this session’s real requests only — counts and timings, never message text. Verified model support lives on the Compatibility page.' }}
             size="sm"
           />
         </div>
@@ -145,14 +132,14 @@ export default function InferenceObservatoryView({ apiBase, runtime = null, sele
             <button type="button" className="cxturn__action" onClick={() => setManualReduced((value) => !value)} aria-pressed={manualReduced}>
               {reducedMotion ? 'Motion: static field' : 'Motion: live'}
             </button>
-            <a className="flowbench-rail__link" href="#telemetry">full request log &amp; health history →</a>
+            <a className="flowbench-rail__link" href="#telemetry">full request log &amp; health history <IconChevronRight size={12} /></a>
           </div>
         </aside>
       </div>
 
       <div className="flowbench-backend">
         <DetailsPanel store={store} collapsed={detailsCollapsed} onToggle={() => setDetailsCollapsed((value) => !value)} />
-        <p className="tele-note">backend-reported stream (camelid.telemetry/v1) — a separate backend-side instrument, also not support evidence</p>
+        <p className="tele-note">Backend stream · camelid.telemetry/v1</p>
       </div>
     </section>
   )

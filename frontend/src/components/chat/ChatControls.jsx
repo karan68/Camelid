@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react'
-import { EvidenceChip } from '../ui/EvidenceChip'
+import { ConfirmDialog } from '../ui/ConfirmDialog'
 import {
   SAMPLING_PARAMS,
-  findSamplingFeature,
   isSamplingParamSupported,
   loadSavedSamplingParams,
   saveSamplingParams,
@@ -41,6 +40,7 @@ export function ChatControls({ capabilities, modelId, onClose }) {
   const [systemPrompt, setSystemPrompt] = useState(readStoredPrompt)
   const [presets, setPresets] = useState(readPresets)
   const [presetName, setPresetName] = useState('')
+  const [confirmClearPresets, setConfirmClearPresets] = useState(false)
   const [savedParams, setSavedParams] = useState(() => loadSavedSamplingParams(modelId))
 
   useEffect(() => {
@@ -78,7 +78,7 @@ export function ChatControls({ capabilities, modelId, onClose }) {
 
       <div className="chat-controls__group">
         <div className="chat-controls__group-head">
-          <span className="chat-controls__label">System prompt</span>
+          <span className="cx-caption chat-controls__label">System prompt</span>
           <span className="chat-controls__note">applies to the next send · stored locally</span>
         </div>
         <textarea
@@ -116,23 +116,33 @@ export function ChatControls({ capabilities, modelId, onClose }) {
             <button
               type="button"
               className="cxturn__action"
-              onClick={() => persistPresets([])}
+              onClick={() => setConfirmClearPresets(true)}
               title="Delete all presets"
             >
               Clear presets
             </button>
           )}
         </div>
+        <ConfirmDialog
+          open={confirmClearPresets}
+          title="Delete all presets?"
+          detail={`This deletes ${presets.length === 1 ? 'your saved system prompt preset' : `all ${presets.length} saved system prompt presets`}. This can't be undone.`}
+          confirmLabel="Delete all"
+          onCancel={() => setConfirmClearPresets(false)}
+          onConfirm={() => {
+            persistPresets([])
+            setConfirmClearPresets(false)
+          }}
+        />
       </div>
 
       <div className="chat-controls__group">
         <div className="chat-controls__group-head">
-          <span className="chat-controls__label">Sampling</span>
-          <span className="chat-controls__note">controls unlock only when /api/capabilities advertises the exact parameter row</span>
+          <span className="cx-caption chat-controls__label">Sampling</span>
+          <span className="chat-controls__note">These unlock when the local server supports adjusting them.</span>
         </div>
         <ul className="chat-controls__params">
           {SAMPLING_PARAMS.map((param) => {
-            const feature = findSamplingFeature(apiFeatures, param.key)
             const supported = isSamplingParamSupported(apiFeatures, param.key)
             return (
               <li key={param.key} className="chat-controls__param">
@@ -146,13 +156,7 @@ export function ChatControls({ capabilities, modelId, onClose }) {
                     aria-label={`${param.label} value`}
                   />
                 ) : (
-                  <EvidenceChip
-                    status={feature?.status || ''}
-                    state={feature ? null : 'unsupported'}
-                    label={feature ? undefined : 'no contract row'}
-                    source={{ rowId: feature?.id, note: `${param.hint} Fail-closed: without a supported contract row this control stays read-only.` }}
-                    size="sm"
-                  />
+                  <span className="chat-controls__param-current" title="Locked" aria-label={`${param.label} locked`}>—</span>
                 )}
               </li>
             )

@@ -5,12 +5,38 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Camelid Desktop</title>
     <style>
-      :root { color-scheme: dark; }
+      /* Palette mirrors frontend/src/styles/tokens.css (--color-bg/-text/-accent/…)
+         so the splash and the app it hands off to read as one product. Dark values
+         are the canonical defaults; the light block follows the OS preference the
+         same way the frontend's prefers-color-scheme tokens do. */
+      :root {
+        color-scheme: light dark;
+        --bg: #0e1216;
+        --text: #dde5ed;
+        --muted: #9caab9;
+        --border: rgba(148, 178, 209, 0.26);
+        --track: #2a323c;
+        --accent: #8fb6dc;
+        --accent-ink: #0a1828;
+        --error: #e9928a;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f6f8fa;
+          --text: #1b2530;
+          --muted: #4d5d6d;
+          --border: rgba(26, 43, 59, 0.24);
+          --track: #e1e8ef;
+          --accent: #2b5c84;
+          --accent-ink: #ffffff;
+          --error: #b3261e;
+        }
+      }
       html, body {
         margin: 0;
         height: 100%;
-        background: #0e1216;
-        color: #d8dee6;
+        background: var(--bg);
+        color: var(--text);
         font: 15px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
       }
       .wrap {
@@ -24,17 +50,27 @@
         padding: 24px;
         box-sizing: border-box;
       }
+      .mark { color: var(--text); }
       .title { font-size: 20px; font-weight: 600; letter-spacing: 0.2px; }
-      .status { color: #9aa6b2; min-height: 1.4em; }
-      .err { color: #f0a3a3; text-align: left; max-width: min(90%, 680px); }
+      .status { color: var(--muted); min-height: 1.4em; }
+      .err { color: var(--error); text-align: left; max-width: min(90%, 680px); }
       .err-title { font-size: 16px; font-weight: 600; }
-      .err-guidance { color: #d8dee6; margin-top: 6px; }
-      .err-details { margin-top: 12px; }
+      .err-guidance { color: var(--text); margin-top: 6px; }
+      .err-actions { display: flex; gap: 10px; margin-top: 14px; }
+      .btn {
+        font: inherit; font-size: 14px; border-radius: 8px; padding: 6px 16px;
+        cursor: pointer; border: 1px solid transparent;
+      }
+      .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .btn-primary { background: var(--accent); color: var(--accent-ink); }
+      .btn-secondary { background: transparent; color: var(--text); border-color: var(--border); }
+      .err-details { margin-top: 12px; color: var(--text); }
+      .err-details summary { cursor: pointer; color: var(--muted); }
       .err-detail { margin: 8px 0 0; max-height: 15rem; overflow: auto; white-space: pre-wrap;
             font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px; }
       .spinner {
         width: 26px; height: 26px; border-radius: 50%;
-        border: 3px solid #2a323c; border-top-color: #6ea8fe;
+        border: 3px solid var(--track); border-top-color: var(--accent);
         animation: spin 0.9s linear infinite;
       }
       @keyframes spin { to { transform: rotate(360deg); } }
@@ -43,15 +79,28 @@
   </head>
   <body>
     <div class="wrap">
-      <div id="spinner" class="spinner"></div>
+      <!-- The Camelid mark; keep in sync with frontend/src/components/ui/CamelidMark.jsx. -->
+      <svg class="mark" width="44" height="44" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2.1" stroke-linecap="round"
+           stroke-linejoin="round" aria-hidden="true">
+        <path d="M7.4 21V11.2Q7.4 8.7 9.8 8.7H14.2V11" />
+        <path d="M9.6 8.4L8.9 4.2" />
+        <path d="M12.6 8.4L13.5 4.2" />
+      </svg>
       <div class="title">Camelid Desktop</div>
+      <div id="spinner" class="spinner"></div>
        <!-- Updated by the Rust side via emit("engine-status", ...), then replayed from native
          state after listener registration. Never shows a fake ready state. -->
       <div id="status" class="status">Starting engine&hellip;</div>
       <div id="error" class="err hidden" role="alert">
         <div id="error-title" class="err-title"></div>
         <div id="error-guidance" class="err-guidance"></div>
-        <details id="error-details" class="err-details" open>
+        <div class="err-actions">
+          <button id="retry" class="btn btn-primary" type="button">Retry</button>
+          <button id="copy-details" class="btn btn-secondary" type="button">Copy details</button>
+        </div>
+        <!-- Collapsed by default: the title and guidance lead; raw diagnostics are one click away. -->
+        <details id="error-details" class="err-details">
           <summary>Technical details</summary>
           <pre id="error-detail" class="err-detail"></pre>
         </details>
@@ -64,9 +113,10 @@
       const errEl = document.getElementById("error");
       const errTitleEl = document.getElementById("error-title");
       const errGuidanceEl = document.getElementById("error-guidance");
-      const errDetailsEl = document.getElementById("error-details");
       const errDetailEl = document.getElementById("error-detail");
       const spinnerEl = document.getElementById("spinner");
+      const retryEl = document.getElementById("retry");
+      const copyEl = document.getElementById("copy-details");
       function renderStartupState(payload) {
         const p = payload || {};
         if (p.message) statusEl.textContent = p.message;
@@ -80,14 +130,27 @@
           errTitleEl.textContent = error.title || "Engine startup failed";
           errGuidanceEl.textContent = error.guidance || "Review the technical details and retry.";
           errDetailEl.textContent = error.detail || "No additional diagnostics were available.";
-          errDetailsEl.open = true;
         }
       }
+      copyEl.addEventListener("click", () => {
+        const details = [errTitleEl.textContent, errGuidanceEl.textContent, "", errDetailEl.textContent]
+          .join("\n").trim();
+        navigator.clipboard.writeText(details).then(() => {
+          copyEl.textContent = "Copied";
+          setTimeout(() => { copyEl.textContent = "Copy details"; }, 1500);
+        }).catch(() => {});
+      });
       // Requires `app.withGlobalTauri` in tauri.conf.json. This page has no bundler and no
       // npm dependency, so the API has to arrive as a global; without that flag __TAURI__ is
       // undefined, this guard is false, and every startup failure -- including a missing
       // sidecar -- renders as a spinner that turns forever.
       if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.core) {
+        retryEl.addEventListener("click", () => {
+          errEl.classList.add("hidden");
+          spinnerEl.classList.remove("hidden");
+          statusEl.textContent = "Starting engine…";
+          window.__TAURI__.core.invoke("retry_startup").catch(() => {});
+        });
         window.__TAURI__.event.listen("engine-status", (e) => {
           renderStartupState(e.payload);
         }).then(() => {

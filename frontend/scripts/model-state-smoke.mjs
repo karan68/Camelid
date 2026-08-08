@@ -448,7 +448,9 @@ assert.deepEqual(
     chatUnlocked: true,
     experimentalUnlocked: false,
     chatMode: 'supported',
-    label: 'llama32_1b_instruct_q8_0: supported exact row smoke',
+    // `label` is the human layer shown in the UI; the raw row id and its
+    // evidence stay in `hint`, which this same assertion pins above.
+    label: 'Verified',
     copy: compatibilityHintCopy(llama32OneBHint),
   },
   'Llama 3.2 1B runtime-green exact rows should unlock supported WebUI chat without broad family claims',

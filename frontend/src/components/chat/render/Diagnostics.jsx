@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { formatDurationMs, formatRate } from '../../../lib/formatters'
+import { IconChart } from '../../ui/icons'
 
 /* Developer diagnostics panel — extracted verbatim from ChatWorkspace.
    Surfaces TTFT, end-to-end output rate, generation time, weight-load, and a per-layer
@@ -28,7 +29,7 @@ export function DeveloperDiagnosticsBlock({ message }) {
         className={`developer-diagnostics-trigger ${isOpen ? 'is-open' : ''}`}
         onClick={() => setIsOpen(!isOpen)}
       >
-        <span className="trigger-icon" aria-hidden="true">📊</span>
+        <span className="trigger-icon" aria-hidden="true"><IconChart size={14} /></span>
         <span>Developer Diagnostics</span>
         {outputRate && <span className="trigger-badge">{outputRate}</span>}
       </button>
@@ -56,7 +57,7 @@ export function DeveloperDiagnosticsBlock({ message }) {
             )}
             {weightLoadTime && (
               <div className="summary-card">
-                <span className="card-label">Weight Load (VM Map)</span>
+                <span className="card-label" title="Time to map the model weights into memory (VM map)">Model load time</span>
                 <strong className="card-value">{weightLoadTime}</strong>
               </div>
             )}

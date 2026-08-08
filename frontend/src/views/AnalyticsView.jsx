@@ -95,20 +95,20 @@ export default function AnalyticsView({ apiBase, conversations, models, runtime,
       <header className="cxv-head">
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconAnalytics size={14} /> Analytics</p>
-          <h1>Usage</h1>
-          <p className="cxv-sub">A calm internal view of prompts, replies, and which local models do the work. Telemetry shows usage — not support; family, quant, and API readiness still come from /api/capabilities.</p>
+          <h1>Analytics</h1>
+          <p className="cxv-sub">Prompts, replies, and model usage from this browser. Usage shows activity — not support; family, quant, and API readiness still come from /api/capabilities.</p>
         </div>
         <div className="cxv-head__actions">
           <StatusDot tone={runtime?.generation_ready ? 'ready' : 'warn'} pulse={runtime?.generation_ready} label={runtime?.generation_ready ? 'Generation-ready' : runtime?.loaded_now ? 'Loaded, not ready' : 'No ready model'} />
         </div>
       </header>
 
-      <div className="cxv-stat-grid">
+      <div className="cxv-stat-grid cxv-stat-grid--five">
         <div className="cxv-stat"><span>Conversations</span><strong>{formatCompactNumber(conversations.length)}</strong><small>{activeToday} active today</small></div>
         <div className="cxv-stat"><span>Prompts</span><strong>{formatCompactNumber(totalUserPrompts)}</strong><small>{formatCompactNumber(totalMessages)} messages</small></div>
         <div className="cxv-stat"><span>Replies</span><strong>{formatCompactNumber(totalAssistantReplies)}</strong><small>{totalTrackedEvents ? `${Math.round((totalAssistantReplies / totalTrackedEvents) * 100)}% of activity` : '—'}</small></div>
-        <div className="cxv-stat"><span>Avg speed</span><strong>{averageReplyRate ? formatRate(averageReplyRate).replace(' tokens/sec', '') : '—'}</strong><small>{averageReplyRate ? 'tokens/sec out' : 'after first reply'}</small></div>
-        <div className="cxv-stat"><span>Chat-ready</span><strong>{chatReadyModels}</strong><small>{runtime?.generation_ready ? 'runtime is green' : 'load a local GGUF'}</small></div>
+        <div className="cxv-stat"><span>Avg speed</span><strong>{averageReplyRate ? averageReplyRate.toFixed(1) : '—'}</strong><small>{averageReplyRate ? 'tok/s out' : 'no replies yet'}</small></div>
+        <div className="cxv-stat"><span>Chat-ready</span><strong>{chatReadyModels}</strong><small>{runtime?.generation_ready ? 'runtime ready' : 'load a local GGUF'}</small></div>
       </div>
 
       <RuntimeMemoryPanel apiBase={apiBase} />
@@ -144,9 +144,14 @@ export default function AnalyticsView({ apiBase, conversations, models, runtime,
               const total = day.prompts + day.replies
               return (
                 <div key={day.key} className="a-week__day">
-                  <div className="a-week__bars" title={`${day.prompts} prompts · ${day.replies} replies`}>
-                    <div className="a-week__bar a-week__bar--prompt" style={{ height: `${Math.max(4, (day.prompts / maxWeekTotal) * 100)}%` }} />
-                    <div className="a-week__bar a-week__bar--reply" style={{ height: `${Math.max(4, (day.replies / maxWeekTotal) * 100)}%` }} />
+                  <div
+                    className="a-week__bars"
+                    role="img"
+                    aria-label={`${day.label}: ${day.prompts} prompts, ${day.replies} replies`}
+                    title={`${day.prompts} prompts · ${day.replies} replies`}
+                  >
+                    <div className="a-week__bar a-week__bar--prompt" style={{ height: `${day.prompts ? Math.max(4, (day.prompts / maxWeekTotal) * 100) : 0}%` }} />
+                    <div className="a-week__bar a-week__bar--reply" style={{ height: `${day.replies ? Math.max(4, (day.replies / maxWeekTotal) * 100) : 0}%` }} />
                   </div>
                   <strong>{day.label}</strong>
                   <span>{total}</span>
@@ -167,21 +172,23 @@ export default function AnalyticsView({ apiBase, conversations, models, runtime,
         {modelRows.length === 0 ? (
           <EmptyState icon={<IconChart size={24} />} title="Nothing to compare yet" description="Model usage will show here once you start chatting locally." />
         ) : (
-          <div className="a-table">
-            <div className="a-table__row a-table__head">
-              <span>Model</span><span>Chats</span><span>Prompts</span><span>Replies</span><span>Avg out</span><span>Last used</span>
-            </div>
-            {modelRows.map((model) => (
-              <div key={model.id} className="a-table__row">
-                <strong title={model.id}>{model.name}</strong>
-                <span>{model.conversationCount}</span>
-                <span>{model.prompts}</span>
-                <span>{model.replies}</span>
-                <span>{model.avgOutRate ? formatRate(model.avgOutRate) : '—'}</span>
-                <span>{model.lastUsedAt ? formatDate(model.lastUsedAt.toISOString()) : '—'}</span>
-              </div>
-            ))}
-          </div>
+          <table className="cxv-table a-table">
+            <thead>
+              <tr><th>Model</th><th>Chats</th><th>Prompts</th><th>Replies</th><th>Avg out</th><th>Last used</th></tr>
+            </thead>
+            <tbody>
+              {modelRows.map((model) => (
+                <tr key={model.id}>
+                  <td><strong title={model.id}>{model.name}</strong></td>
+                  <td>{model.conversationCount}</td>
+                  <td>{model.prompts}</td>
+                  <td>{model.replies}</td>
+                  <td>{model.avgOutRate ? formatRate(model.avgOutRate) : '—'}</td>
+                  <td>{model.lastUsedAt ? formatDate(model.lastUsedAt.toISOString()) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </section>
 
@@ -207,9 +214,9 @@ export default function AnalyticsView({ apiBase, conversations, models, runtime,
       </section>
 
       <details className="cxv-disclosure">
-        <summary>Support-contract boundary — usage analytics never expand model support</summary>
+        <summary>Model-support boundary — usage analytics never expand model support</summary>
         <div className="cxv-disclosure__body">
-          <p className="cxv-sub">Aligned with the same /api/capabilities + COMPATIBILITY.md contract used by Chat, Models, API, and System.</p>
+          <p className="cxv-sub">Aligned with the same live model-support data used by Chat, Models, API, and System.</p>
           <div className="cxv-grid cxv-grid--two">
             <div className="cxv-card cxv-card--flat">
               <strong>Current validated gate</strong>

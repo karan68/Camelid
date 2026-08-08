@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { wrapDialogFocus } from '../ui/Modal'
 import { UnsupportedBlocker } from './UnsupportedBlocker'
 import { quantLabelFromGgufFileType } from '../../lib/capabilities'
 
@@ -32,6 +34,32 @@ const contextLengthFrom = (metadata = {}) => {
 
 export function ModelInspector({ apiBase, onClose }) {
   const [state, setState] = useState({ loading: true, error: null, current: null, tokenizer: null })
+  const panelRef = useRef(null)
+
+  /* Dialog behavior (Esc-to-close, focus capture/restore, scroll lock) matching
+     the shared Modal; the drawer keeps its own chrome, so it is wired up here. */
+  useEffect(() => {
+    const previouslyFocused = typeof document !== 'undefined' ? document.activeElement : null
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        onClose()
+        return
+      }
+      wrapDialogFocus(event, panelRef.current)
+    }
+    window.addEventListener('keydown', onKey)
+    const { body } = document
+    const prevOverflow = body.style.overflow
+    body.style.overflow = 'hidden'
+    const frame = window.requestAnimationFrame(() => panelRef.current?.focus())
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      body.style.overflow = prevOverflow
+      window.cancelAnimationFrame(frame)
+      if (previouslyFocused && typeof previouslyFocused.focus === 'function') previouslyFocused.focus()
+    }
+  }, [onClose])
 
   useEffect(() => {
     let cancelled = false
@@ -69,13 +97,13 @@ export function ModelInspector({ apiBase, onClose }) {
 
   return (
     <div className="model-inspector-overlay" role="dialog" aria-modal="true" aria-label="Model inspector" onClick={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <aside className="model-inspector">
+      <aside ref={panelRef} className="model-inspector" tabIndex={-1}>
         <header className="model-inspector__head">
           <div>
             <h2>Model inspector</h2>
             {current && <code className="model-inspector__id">{current.id}</code>}
           </div>
-          <button type="button" className="cxturn__action" onClick={onClose}>Close</button>
+          <Button variant="outline" size="sm" onClick={onClose}>Close</Button>
         </header>
 
         <EvidenceChip
@@ -102,7 +130,7 @@ export function ModelInspector({ apiBase, onClose }) {
                 <div><dt>gguf version</dt><dd>{current.gguf?.version}</dd></div>
                 <div><dt>quant</dt><dd>{quant || 'unknown'}</dd></div>
                 <div><dt>tensors</dt><dd>{current.gguf?.tensor_count?.toLocaleString()} tensors · data offset {current.gguf?.data_start_offset?.toLocaleString()} · align {current.gguf?.alignment}</dd></div>
-                <div><dt>context length</dt><dd>{contextLength ? `${Number(contextLength).toLocaleString()} (model-native metadata; checked context support comes only from bounded packs on the contract row)` : 'not present in metadata'}</dd></div>
+                <div><dt>context length</dt><dd>{contextLength ? `${Number(contextLength).toLocaleString()} (from model metadata; the verified limit may be lower)` : 'not present in metadata'}</dd></div>
                 <div><dt>runtime</dt><dd>config {current.llama_config ? 'parsed' : '—'} · tensors {current.llama_tensors ? 'bound' : '—'}{current.lane ? ` · lane ${current.lane}` : ''}</dd></div>
               </dl>
             </section>

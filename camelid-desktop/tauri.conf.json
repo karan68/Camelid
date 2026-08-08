@@ -16,6 +16,8 @@
         "height": 820,
         "minWidth": 720,
         "minHeight": 560,
+        "center": true,
+        "backgroundColor": "#0e1216",
         "url": "index.html"
       }
     ],

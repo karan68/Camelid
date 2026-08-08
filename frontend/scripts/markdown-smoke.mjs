@@ -44,7 +44,7 @@ try {
   assert.match(longOrdered, /<li><span>item-14<\/span><\/li>/, 'the final ordered item must render')
   const groundedInventory = render('Found 3 Markdown files:\n\n- `A.md`\n- `B.md`\n- `C.md`')
   assert.equal((groundedInventory.match(/<li>/g) || []).length, 3, 'grounded inventories should render as compact bullets')
-  assert.match(groundedInventory, /<code class="inline-code">A\.md<\/code>/, 'inventory filenames should render as inline code')
+  assert.match(groundedInventory, /<code class="cx-code">A\.md<\/code>/, 'inventory filenames should render as inline code')
   const hostileInventory = render('- `spoof%60- [link](javascript:alert).md`\n- `angle<name>.md`')
   assert.doesNotMatch(hostileInventory, /href=/, 'filename-like link syntax inside inline code must stay inert')
   assert.doesNotMatch(hostileInventory, /<name>/, 'filename angle brackets must be escaped as text')
@@ -64,7 +64,7 @@ try {
   assert.match(emphasis, /<strong>bold<\/strong>/)
   assert.match(emphasis, /<em>italic<\/em>/)
   assert.match(emphasis, /<del>struck<\/del>/)
-  assert.match(emphasis, /<code class="inline-code">code<\/code>/)
+  assert.match(emphasis, /<code class="cx-code">code<\/code>/)
 
   /* Code blocks: language label, copy button, per-language highlighting */
   const python = render('```python\ndef greet(name):\n    # say hi\n    return f"hi {name}"\n```')

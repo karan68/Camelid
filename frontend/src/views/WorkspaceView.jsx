@@ -129,6 +129,25 @@ function ActivityRow({ event }) {
   return <li className="workspace-event workspace-event--system"><IconBolt size={16} /><div><strong>Workspace</strong><span>{event.content || kind}</span></div></li>
 }
 
+/* Folder and up-arrow glyphs for the picker, drawn in the icons.jsx style
+   (24-viewBox, currentColor fill). The shared set has no folder glyph, a
+   magnifier would misread as search, and IconSend stays reserved for
+   message-send actions — so these live with their only consumer. */
+function IconFolder({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+      <path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" />
+    </svg>
+  )
+}
+function IconArrowUp({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+      <path d="M12 4 6 10l1.4 1.4L11 7.8V20h2V7.8l3.6 3.6L18 10l-6-6z" />
+    </svg>
+  )
+}
+
 function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
   const [view, setView] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -188,7 +207,7 @@ function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
       <div className="folder-picker">
         <div className="folder-picker__bar">
           <button type="button" className="folder-picker__up" onClick={goUp} disabled={!canGoUp}>
-            <IconSend size={16} /> Up
+            <IconArrowUp size={16} /> Up
           </button>
           <code className="folder-picker__path">{atRoots ? 'This PC' : (view?.path || '…')}</code>
         </div>
@@ -200,7 +219,7 @@ function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
             view.entries.map((entry) => (
               <li key={entry.path}>
                 <button type="button" className="folder-picker__entry" onClick={() => load(entry.path)}>
-                  <IconSearch size={16} /> <span>{entry.name}</span>
+                  <IconFolder size={16} /> <span>{entry.name}</span>
                 </button>
               </li>
             ))

@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useRef } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 /* Assistant markdown + fenced-code rendering.
    Extracted verbatim from the original ChatWorkspace so the parsing/rendering
@@ -35,6 +35,17 @@ export const copyText = async (text) => {
    data:, file:) stays plain text — model output never picks the protocol. */
 const SAFE_LINK_SCHEME = /^(https?:|mailto:)/i
 
+/* The desktop (Tauri) webview has no browser tabs, so target="_blank" cannot
+   open anything there; route http(s) links through the system browser via the
+   opener plugin instead. In the web build (no window.__TAURI__) the handler is
+   inert and the anchor opens a new tab as usual. */
+const openLinkExternally = (event, href) => {
+  const opener = typeof window !== 'undefined' ? window.__TAURI__?.opener : undefined
+  if (!opener?.openUrl || !/^https?:/i.test(href)) return
+  event.preventDefault()
+  Promise.resolve(opener.openUrl(href)).catch(() => {})
+}
+
 const renderInlineMarkdown = (text, keyPrefix) => {
   const parts = String(text || '')
     .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\))/g)
@@ -42,7 +53,7 @@ const renderInlineMarkdown = (text, keyPrefix) => {
   return parts.map((part, index) => {
     const key = `${keyPrefix}-${index}`
     if (part.startsWith('`') && part.endsWith('`')) {
-      return <code key={key} className="inline-code">{part.slice(1, -1)}</code>
+      return <code key={key} className="cx-code">{part.slice(1, -1)}</code>
     }
     if (part.startsWith('**') && part.endsWith('**')) {
       return <strong key={key}>{part.slice(2, -2)}</strong>
@@ -57,7 +68,7 @@ const renderInlineMarkdown = (text, keyPrefix) => {
     if (link) {
       const [, label, href] = link
       if (SAFE_LINK_SCHEME.test(href)) {
-        return <a key={key} href={href} target="_blank" rel="noopener noreferrer">{label}</a>
+        return <a key={key} href={href} target="_blank" rel="noopener noreferrer" onClick={(event) => openLinkExternally(event, href)}>{label}</a>
       }
       return <span key={key}>{label} ({href})</span>
     }
@@ -144,6 +155,30 @@ const renderMarkdownText = (text, keyPrefix) => {
   let list = []
   let orderedList = []
   let tableLines = []
+  let quoteLines = []
+
+  const flushQuote = () => {
+    if (!quoteLines.length) return
+    const groupIndex = blocks.length
+    const quoteParagraphs = []
+    let current = []
+    quoteLines.forEach((line) => {
+      if (line) current.push(line)
+      else if (current.length) {
+        quoteParagraphs.push(current.join(' '))
+        current = []
+      }
+    })
+    if (current.length) quoteParagraphs.push(current.join(' '))
+    blocks.push(
+      <blockquote key={`${keyPrefix}-q-${groupIndex}`}>
+        {quoteParagraphs.map((value, index) => (
+          <p key={`${keyPrefix}-q-${groupIndex}-${index}`}>{renderInlineMarkdown(value, `${keyPrefix}-q-${groupIndex}-${index}`)}</p>
+        ))}
+      </blockquote>,
+    )
+    quoteLines = []
+  }
 
   const flushParagraph = () => {
     if (paragraph.length) {
@@ -186,20 +221,40 @@ const renderMarkdownText = (text, keyPrefix) => {
     if (!line) {
       flushParagraph()
       flushList()
+      flushQuote()
       return
     }
     if (isTableLine(line)) {
       flushParagraph()
+      flushQuote()
       if (!tableLines.length) flushList()
       tableLines.push(line)
       return
     }
     if (tableLines.length) flushList()
-    const heading = line.match(/^(#{1,3})\s+(.+)$/)
+    /* Blockquote lines group into one <blockquote>; a bare ">" separates
+       paragraphs inside it. */
+    const quoted = line.match(/^>\s?(.*)$/)
+    if (quoted) {
+      flushParagraph()
+      flushList()
+      quoteLines.push(quoted[1].trim())
+      return
+    }
+    flushQuote()
+    /* Thematic break: --- / *** / ___ renders as a rule, not literal dashes. */
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line)) {
+      flushParagraph()
+      flushList()
+      blocks.push(<hr key={`${keyPrefix}-hr-${blocks.length}`} />)
+      return
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/)
     if (heading) {
       flushParagraph()
       flushList()
-      const Tag = heading[1].length === 1 ? 'h2' : 'h3'
+      const depth = heading[1].length
+      const Tag = depth === 1 ? 'h2' : depth <= 3 ? 'h3' : 'h4'
       blocks.push(<Tag key={`${keyPrefix}-h-${blocks.length}`}>{renderInlineMarkdown(heading[2], `${keyPrefix}-h-${blocks.length}`)}</Tag>)
       return
     }
@@ -242,6 +297,7 @@ const renderMarkdownText = (text, keyPrefix) => {
   })
   flushParagraph()
   flushList()
+  flushQuote()
   return blocks
 }
 
@@ -328,6 +384,20 @@ export const CODE_CARD_STREAMING_LABEL = 'Still generating — code block incomp
 export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
   const preRef = useRef(null)
   const autoFollowCodeRef = useRef(true)
+  const [copied, setCopied] = useState(false)
+  const copiedResetRef = useRef(null)
+
+  useEffect(() => () => {
+    if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
+  }, [])
+
+  /* Only confirm "Copied" when the text actually reached the clipboard. */
+  const handleCopy = async () => {
+    if (!(await copyText(code))) return
+    setCopied(true)
+    if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
+    copiedResetRef.current = window.setTimeout(() => setCopied(false), 1600)
+  }
 
   useEffect(() => {
     if (!stillGenerating) return undefined
@@ -357,7 +427,7 @@ export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
       <figcaption>
         <span className="message-code-card-title">{language}</span>
         {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
-        <button type="button" onClick={() => copyText(code)} aria-label={`Copy ${language} code`}>Copy</button>
+        <button type="button" onClick={handleCopy} aria-label={`Copy ${language} code`}>{copied ? 'Copied' : 'Copy'}</button>
       </figcaption>
       {/* Highlighting deferred while the fence is open (Phase 8B): plain text
           per flush; full per-language highlighting applies once the fence

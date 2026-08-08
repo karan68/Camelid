@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import { IconChevronDown, IconCheckCircle, IconInfo, IconWarning, IconError } from '../ui/icons'
 
 const LEVEL = {
@@ -15,22 +14,38 @@ function timeLabel(iso) {
   try { return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) } catch { return '' }
 }
 
-export function ClusterDrawer({ events, issues, summary, open, onToggle }) {
-  const [tab, setTab] = useState('events')
+export function ClusterDrawer({ events, issues, summary, open, tab, onSelectTab: setTab, onToggle }) {
   const problems = issues.filter((i) => i.level === 'warn' || i.level === 'error')
   const latest = events[0]
 
   return (
     <section className={`cluster-drawer ${open ? 'is-open' : ''}`}>
       <div className="cluster-drawer__bar">
-        <div className="cluster-drawer__tabs" role="tablist">
-          <button type="button" role="tab" aria-selected={tab === 'events'} className={tab === 'events' ? 'is-active' : ''} onClick={() => { setTab('events'); if (!open) onToggle() }}>
+        {/* Tabs pattern: roving tabindex; Left/Right/Home/End move selection. */}
+        <div
+          className="cluster-drawer__tabs"
+          role="tablist"
+          onKeyDown={(event) => {
+            const order = ['events', 'validation', 'health']
+            const index = order.indexOf(tab)
+            let next = null
+            if (event.key === 'ArrowRight') next = order[(index + 1) % order.length]
+            else if (event.key === 'ArrowLeft') next = order[(index + order.length - 1) % order.length]
+            else if (event.key === 'Home') next = order[0]
+            else if (event.key === 'End') next = order[order.length - 1]
+            if (!next) return
+            event.preventDefault()
+            setTab(next)
+            event.currentTarget.querySelector(`[data-tab="${next}"]`)?.focus()
+          }}
+        >
+          <button type="button" role="tab" data-tab="events" tabIndex={tab === 'events' ? 0 : -1} aria-selected={tab === 'events'} className={tab === 'events' ? 'is-active' : ''} onClick={() => { setTab('events'); if (!open) onToggle() }}>
             Events <span className="cluster-drawer__count">{events.length}</span>
           </button>
-          <button type="button" role="tab" aria-selected={tab === 'validation'} className={tab === 'validation' ? 'is-active' : ''} onClick={() => { setTab('validation'); if (!open) onToggle() }}>
+          <button type="button" role="tab" data-tab="validation" tabIndex={tab === 'validation' ? 0 : -1} aria-selected={tab === 'validation'} className={tab === 'validation' ? 'is-active' : ''} onClick={() => { setTab('validation'); if (!open) onToggle() }}>
             Validation {problems.length > 0 && <span className="cluster-drawer__count is-warn">{problems.length}</span>}
           </button>
-          <button type="button" role="tab" aria-selected={tab === 'health'} className={tab === 'health' ? 'is-active' : ''} onClick={() => { setTab('health'); if (!open) onToggle() }}>
+          <button type="button" role="tab" data-tab="health" tabIndex={tab === 'health' ? 0 : -1} aria-selected={tab === 'health'} className={tab === 'health' ? 'is-active' : ''} onClick={() => { setTab('health'); if (!open) onToggle() }}>
             Health
           </button>
         </div>

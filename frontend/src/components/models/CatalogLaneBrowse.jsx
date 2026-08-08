@@ -20,7 +20,11 @@ import {
   quantAdvice,
 } from '../../lib/catalogBrowse'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
+import { formatBytes } from '../../lib/formatters'
+import { Button } from '../ui/Button'
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { IconCheck } from '../ui/icons'
+import { Notice } from '../ui/Notice'
 
 /* Zone 5 — Get models. Curated picks first, then live Hugging Face GGUF search
    (>= 2 chars). Each row shows which lane it WOULD land in (derived: supported
@@ -37,13 +41,6 @@ import { EvidenceChip } from '../ui/EvidenceChip'
    the same weights, so rendering them flat turned a 15-repo search into a 250-row
    wall. Grouping is presentation only: a download is still one exact file,
    confirmed by name. */
-
-const GB = 1024 * 1024 * 1024
-function prettySize(bytes) {
-  if (!bytes) return ''
-  if (bytes >= GB) return `${(bytes / GB).toFixed(bytes >= 10 * GB ? 0 : 1)} GB`
-  return `${Math.round(bytes / (1024 * 1024))} MB`
-}
 
 /* Curated download suggestions (blurbs, "Recommended") may DECORATE catalog rows,
    never place them: lane membership and outcome chips stay derived. */
@@ -66,9 +63,9 @@ function predictedLane(item, capabilities) {
 }
 
 function laneChip(lane) {
-  if (lane === 'supported') return <EvidenceChip status="supported" asText>Lands in Supported</EvidenceChip>
-  if (lane === 'compatible') return <EvidenceChip state="runnable" asText>Experimental · runnable</EvidenceChip>
-  return <EvidenceChip state="unsupported" asText>Experimental · unverified</EvidenceChip>
+  if (lane === 'supported') return <EvidenceChip state="supported" asText>Supported</EvidenceChip>
+  if (lane === 'compatible') return <EvidenceChip state="runnable" asText>Experimental</EvidenceChip>
+  return <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
 }
 
 /* A small CPU/chip glyph so the capacity chip reads as "your hardware" — distinct
@@ -111,22 +108,9 @@ function FitAdvisory({ item, onCheckFit, checking }) {
   const transient = item.fit === 'insufficient_free_memory'
 
   if (!label) {
-    if (fitIsSettled(item)) {
-      return (
-        <div className="catalog-fit-row">
-          <span
-            className="catalog-fit-chip catalog-fit-chip--unknown"
-            title="Camelid looked at this model and will not promise a verdict here — either its dimensions cannot be read, this machine's memory cannot be probed, or the GPU has room while free system memory is too low to stage the weights."
-          >
-            <FitIcon />
-            Fit can’t be determined here
-          </span>
-          <span className="catalog-fit-detail">
-            The download is not blocked — Camelid just will not claim a fit it cannot verify.
-          </span>
-        </div>
-      )
-    }
+    /* A settled question with no verdict is described ONCE above the list (see
+       UndeterminedFitNotice) instead of repeating the same disclaimer on every card. */
+    if (fitIsSettled(item)) return null
     if (!onCheckFit) return null
     return (
       <div className="catalog-fit-row">
@@ -134,18 +118,18 @@ function FitAdvisory({ item, onCheckFit, checking }) {
           <FitIcon />
           Fit unknown until checked
         </span>
-        <button
-          type="button"
-          className="catalog-fit-check"
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={onCheckFit}
+          loading={checking}
           disabled={checking}
-          aria-busy={checking || undefined}
         >
           {checking ? 'Checking…' : item.fit_checked === false ? 'Try again' : 'Check if it fits'}
-        </button>
+        </Button>
         {item.fit_checked === false ? (
           <span className="catalog-fit-detail">
-            Could not reach Hugging Face for this model’s header. Retrying may work.
+            Could not reach Hugging Face for this model’s details. Retrying may work.
           </span>
         ) : null}
       </div>
@@ -172,16 +156,16 @@ function FitAdvisory({ item, onCheckFit, checking }) {
           needs a live re-probe: the listing's verdicts come from a startup
           snapshot, so reloading the page cannot pick up freed memory. */}
       {transient && onCheckFit ? (
-        <button
-          type="button"
-          className="catalog-fit-check"
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={onCheckFit}
+          loading={checking}
           disabled={checking}
-          aria-busy={checking || undefined}
           title="Re-read this machine's free memory and this model's size, right now"
         >
           {checking ? 'Re-checking…' : 'Re-check'}
-        </button>
+        </Button>
       ) : null}
       {Array.isArray(item.task_tags) && item.task_tags.length ? (
         <span className="catalog-fit-tags">
@@ -194,6 +178,34 @@ function FitAdvisory({ item, onCheckFit, checking }) {
         </span>
       ) : null}
       {detail ? <span className="catalog-fit-detail">{detail}</span> : null}
+      {/* The estimate caveat must be visible, not title-only: tooltips never reach
+          keyboard or touch users, who are exactly who the ~ prefix confuses. */}
+      {item.fit_confidence === 'approx' ? (
+        <span className="catalog-fit-detail">
+          Estimated from file size — the verdict becomes exact once the model header has been read.
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
+/* Some models' size simply can't be verified on this machine. Said ONCE, above the
+   list, instead of stamping the same chip and sentence onto every affected card. */
+function UndeterminedFitNotice({ items }) {
+  const anyUndetermined = items.some((item) => !fitLabel(item.fit) && fitIsSettled(item))
+  if (!anyUndetermined) return null
+  return (
+    <div className="catalog-fit-row">
+      <span className="catalog-fit-chip catalog-fit-chip--unknown">
+        <FitIcon />
+        Fit can’t be checked for some models
+      </span>
+      {/* The reason lives in visible text, not a title tooltip — tooltips never
+          reach keyboard or touch users. */}
+      <span className="catalog-fit-detail">
+        Their dimensions can’t be read, or this machine’s free memory can’t be measured. Their
+        downloads aren’t blocked — Camelid just can’t confirm in advance that they fit this machine.
+      </span>
     </div>
   )
 }
@@ -218,11 +230,11 @@ function GhostMoeOption({ item, selected, prepared, disabled, onChange }) {
       </label>
       <p>
         Keeps the common core and hot experts on CUDA, then pages routed experts from disk.
-        The prepared install uses about {prettySize(ghost.installed_bytes)}; preparation temporarily
-        needs up to {prettySize(ghost.peak_disk_bytes)} total.
+        The prepared install uses about {formatBytes(ghost.installed_bytes)}; preparation temporarily
+        needs up to {formatBytes(ghost.peak_disk_bytes)} total.
       </p>
       {!ghost.host_eligible ? (
-        <p className="catalog-ghost-warning">This supported lane requires Windows and a compatible CUDA GPU.</p>
+        <p className="catalog-ghost-warning">Ghost MoE requires Windows and a compatible CUDA GPU.</p>
       ) : ghost.fit === 'insufficient_free_memory' ? (
         <p className="catalog-ghost-warning">
           This GPU has enough total VRAM. Camelid will release its current model before starting Ghost MoE;
@@ -371,7 +383,7 @@ function CatalogRow({
 
   const retryAcquisition = () => {
     if (onAcquisitionPending?.(item) === false) {
-      setMessage('Wait for the current model acquisition to finish, then retry.')
+      setMessage('Wait for the current download to finish, then retry.')
       return
     }
     settlementInFlightRef.current = false
@@ -490,7 +502,7 @@ function CatalogRow({
               {decoration?.recommended ? <span className="catalog-row-recommended">Recommended</span> : null}
             </span>
             <span className="catalog-row-meta">
-              {item.repo_id} · {item.filename} · {prettySize(item.size_bytes)}
+              {item.repo_id} · {item.filename} · {formatBytes(item.size_bytes)}
               {item.architecture ? ` · ${item.architecture}` : ''}
             </span>
           </div>
@@ -513,7 +525,7 @@ function CatalogRow({
             <ol className="catalog-start-steps" aria-label="Download and start progress">
               {['Download', 'Check', 'Load'].map((label, index) => (
                 <li key={label} className={index < activeStage ? 'is-done' : index === activeStage ? 'is-active' : ''}>
-                  <span>{index < activeStage ? '✓' : index + 1}</span>
+                  <span>{index < activeStage ? <IconCheck size={12} /> : index + 1}</span>
                   {label}
                 </li>
               ))}
@@ -522,7 +534,7 @@ function CatalogRow({
             <ol className="catalog-start-steps catalog-start-steps--two" aria-label="Download and check progress">
               {['Download', 'Check'].map((label, index) => (
                 <li key={label} className={index < activeStage ? 'is-done' : index === activeStage ? 'is-active' : ''}>
-                  <span>{index < activeStage ? '✓' : index + 1}</span>
+                  <span>{index < activeStage ? <IconCheck size={12} /> : index + 1}</span>
                   {label}
                 </li>
               ))}
@@ -546,11 +558,11 @@ function CatalogRow({
         <div className="catalog-start-failure" role="alert">
           <p className="catalog-row-error">{message}</p>
           <p className="catalog-row-faint">
-            Any completed file remains on disk, but Camelid has not opened Chat without the complete bundle.
+            Anything already downloaded stays on disk. Chat opens only once everything needed has finished downloading.
           </p>
-          <button type="button" className="catalog-row-action" onClick={retryAcquisition}>
+          <Button variant="outline" size="sm" onClick={retryAcquisition}>
             {failedStage === 'checking' ? 'Retry check' : 'Retry start'}
-          </button>
+          </Button>
         </div>
       ) : phase === 'done' ? (
         <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p>
@@ -567,18 +579,18 @@ function CatalogRow({
           ) : null}
           {item.group !== 'experimental' && lane === 'not_anchored' ? (
             <p className="catalog-row-faint">
-              Its {item.architecture}/{item.quant} combo is not yet in the runnable lane — still
-              downloadable; it lands in Experimental and loads through the experimental chat path.
+              This model can still be downloaded — it will appear under Experimental, and its
+              output isn&rsquo;t verified.
             </p>
           ) : null}
           {message ? <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p> : null}
           {installAvailable ? (
-            <button
-              type="button"
-              className="catalog-row-action"
+            <Button
+              variant="tonal"
+              size="sm"
               onClick={openConfirmation}
               disabled={acquisitionLocked}
-              title={acquisitionLocked ? 'Wait for the current model acquisition to finish' : undefined}
+              title={acquisitionLocked ? 'Wait for the current download to finish' : undefined}
             >
               {onlyCompanionsMissing
                 ? downloadAndStart
@@ -589,12 +601,12 @@ function CatalogRow({
                 : downloadAndStart
                   ? 'Download and start…'
                   : 'Download…'}
-            </button>
+            </Button>
           ) : (
             <>
-              <button type="button" className="catalog-row-action" disabled>
+              <Button variant="tonal" size="sm" disabled>
                 Download unavailable
-              </button>
+              </Button>
               <p className="catalog-row-faint">{installBlockedReason}</p>
             </>
           )}
@@ -604,14 +616,14 @@ function CatalogRow({
           {onlyCompanionsMissing ? (
             <p>
               Download the required vision projector <strong>{missingArtifacts[0]?.filename}</strong> from{' '}
-              <code>{missingArtifacts[0]?.repo_id}</code> ({prettySize(missingBytes)})? The model is already on disk;
+              <code>{missingArtifacts[0]?.repo_id}</code> ({formatBytes(missingBytes)})? The model is already on disk;
               Camelid will reuse it without downloading it again.
               {downloadAndStart ? ' Camelid will load the model and open Chat after the projector lands.' : ''}
             </p>
           ) : companions.length ? (
             <p>
               Download <strong>{item.filename}</strong> plus its required vision projector{' '}
-              <strong>{companions[0].filename}</strong> ({prettySize(missingBytes)})? Camelid downloads both into your
+              <strong>{companions[0].filename}</strong> ({formatBytes(missingBytes)})? Camelid downloads both into your
               local models folder and enables image prompts only after both files land.
               {downloadAndStart ? ' It will then check the model, load it, and open Chat.' : ''}
             </p>
@@ -625,7 +637,7 @@ function CatalogRow({
               ) : (
                 <>
                   Download <strong>{item.filename}</strong> from <code>{item.repo_id}</code> (
-                  {prettySize(item.size_bytes)})? This pulls from HuggingFace into your local models folder.
+                  {formatBytes(item.size_bytes)})? This pulls from HuggingFace into your local models folder.
                 </>
               )}
               {useGhostMoe
@@ -636,19 +648,19 @@ function CatalogRow({
             </p>
           )}
           <div className="catalog-confirm-actions">
-            <button type="button" className="catalog-row-action" onClick={confirmDownload}>
+            <Button variant="tonal" size="sm" onClick={confirmDownload}>
               {installed ? 'Confirm preparation' : 'Confirm download'}
-            </button>
-            <button
-              type="button"
-              className="catalog-row-cancel"
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => {
                 setPhase('idle')
                 onAcquisitionSettled?.(item.catalog_id)
               }}
             >
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       ) : null}
@@ -690,11 +702,11 @@ function HfModelCard({ group, renderRow, onCheckFit, isCheckingFit }) {
               {group.files.length} quantization{group.files.length === 1 ? '' : 's'}
             </span>
             {group.archSupport === 'not_implemented' ? (
-              <span className="hf-model-unsupported">Camelid does not implement this architecture</span>
+              <span className="hf-model-unsupported">Camelid can&rsquo;t run this model type</span>
             ) : null}
           </p>
         </div>
-        <EvidenceChip state="unsupported" asText>Experimental · unverified</EvidenceChip>
+        <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
       </div>
 
       <div className="hf-quant-picker">
@@ -709,7 +721,7 @@ function HfModelCard({ group, renderRow, onCheckFit, isCheckingFit }) {
         >
           {group.files.map((candidate) => (
             <option key={candidate.catalog_id} value={candidate.catalog_id}>
-              {candidate.quant || 'unlabelled'} · {prettySize(candidate.size_bytes)}
+              {candidate.quant || 'unlabelled'} · {formatBytes(candidate.size_bytes)}
               {quantAdvice(candidate.quant).note ? ` · ${quantAdvice(candidate.quant).note}` : ''}
             </option>
           ))}
@@ -1000,23 +1012,25 @@ export function CatalogLaneBrowse({
         <h2>Get models</h2>
       </div>
       <p className="local-lane-intro">
-        Curated picks are pinned and known-good. Searching also browses live Hugging Face GGUFs as an
-        experimental group — those are unverified and carry no parity claim. Downloads are explicit
-        and confirmed; progress appears in Downloads above, and the model joins its derived section
-        when the file lands.
+        Curated picks are verified to run well here. Searching also browses live Hugging Face
+        models — those are experimental, and their output isn&rsquo;t verified. Every download asks
+        for confirmation first; progress appears in Downloads above, and finished downloads join
+        the sections above.
       </p>
       <input
         className="catalog-search"
         aria-label="Search model catalog"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        disabled={Boolean(pendingCatalogId)}
         placeholder="Search curated picks and live Hugging Face GGUFs (name, repo, filename)"
       />
+      <UndeterminedFitNotice items={visibleItems} />
       {error ? (
-        <p className="lane-error">
-          {items === null ? `Catalog unavailable: ${error}` : error}
-        </p>
+        <Notice
+          notice={items === null ? `Catalog unavailable: ${error}` : error}
+          tone="error"
+          onDismiss={() => setError('')}
+        />
       ) : null}
       {items === null && !error ? <p className="lane-empty">Loading catalog…</p> : null}
 
@@ -1057,7 +1071,7 @@ export function CatalogLaneBrowse({
             title="Experimental (Hugging Face)"
             marker={
               <span className="catalog-experimental-marker">
-                <EvidenceChip state="unsupported" asText>Experimental — unverified, no parity claim</EvidenceChip>
+                <EvidenceChip state="unsupported" asText>Unverified</EvidenceChip>
               </span>
             }
             count={loading ? 1 : loadable.length}
@@ -1066,7 +1080,7 @@ export function CatalogLaneBrowse({
               // folded into the section below would be false, and it hides the one
               // place the user should look next.
               unimplemented.length
-                ? `Every match (${unimplemented.length}) uses an architecture Camelid does not implement — see below.`
+                ? `Every match (${unimplemented.length}) is a model type Camelid can't run — see below.`
                 : 'No live Hugging Face GGUFs match (or the Hub is unreachable).'
             }
           >
@@ -1075,22 +1089,23 @@ export function CatalogLaneBrowse({
           {!loading && unimplemented.length ? (
             <details className="catalog-collapsed">
               <summary>
-                {unimplemented.length} result{unimplemented.length === 1 ? '' : 's'} whose architecture
-                Camelid does not implement
+                {unimplemented.length} result{unimplemented.length === 1 ? '' : 's'} of a model type
+                Camelid can&rsquo;t run
               </summary>
               <p className="catalog-row-faint">{HF_GUESS_EXPLANATION}</p>
               <div className="catalog-list">{unimplemented.map(renderHfCard)}</div>
             </details>
           ) : null}
           {nextCursor && !loading ? (
-            <button
-              type="button"
-              className="catalog-row-action"
+            <Button
+              variant="outline"
+              size="sm"
               onClick={loadMore}
-              disabled={loadingMore || Boolean(pendingCatalogId)}
+              loading={loadingMore}
+              disabled={loadingMore}
             >
-              {loadingMore ? 'Loading…' : 'Load more from Hugging Face'}
-            </button>
+              Load more from Hugging Face
+            </Button>
           ) : null}
         </>
       ) : null}

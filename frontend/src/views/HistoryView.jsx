@@ -1,8 +1,8 @@
-import { clampText, formatCompactNumber, formatHistoryDate, formatPreview } from '../lib/formatters'
+import { clampText, formatCompactNumber, formatHistoryDate, formatModelLabel, formatPreview } from '../lib/formatters'
 import { Button } from '../components/ui/Button'
 import { downloadConversation } from '../lib/conversationExport'
 import { EmptyState } from '../components/ui/EmptyState'
-import { IconHistory, IconChat, IconTrash } from '../components/ui/icons'
+import { IconHistory, IconChat, IconDownload, IconTrash } from '../components/ui/icons'
 
 function getConversationStats(conversation) {
   const messageCount = conversation.messages?.length || 0
@@ -24,7 +24,7 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
       <header className="cxv-head">
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconHistory size={14} /> Chat history</p>
-          <h1>Conversations</h1>
+          <h1>Chat history</h1>
           <p className="cxv-sub">Every thread stays searchable on this machine — jump back into earlier work, skim what changed, and pick up the next prompt without losing context.</p>
         </div>
         <div className="cxv-stats">
@@ -44,8 +44,8 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
       {!hasConversations ? (
         <EmptyState
           icon={<IconHistory size={26} />}
-          title="No conversations yet"
-          description="No threads matched this view. Try a broader search, or start a fresh chat to build local history."
+          title="No conversations to show"
+          description="Nothing matches this view yet. Try a broader search, or start a fresh chat to build local history."
           action={<Button variant="primary" icon={<IconChat size={16} />} onClick={() => setTab('chat')}>New chat</Button>}
         />
       ) : (
@@ -57,9 +57,9 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
                 <header className="cxv-card__head">
                   <div className="cxv-card__titles">
                     <strong title={conversation.title || 'Untitled chat'}>{clampText(conversation.title || 'Untitled chat', 70) || 'Untitled chat'}</strong>
-                    <span className="cxv-card__sub" title={conversation.model_id || 'No model recorded'}>{conversation.model_id || 'No model recorded'}</span>
+                    <span className="cxv-card__sub" title={conversation.model_id || 'No model recorded'}>{formatModelLabel(conversation.model_id)}</span>
                   </div>
-                  <span className="cxv-tag">{formatCompactNumber(messageCount)} msgs</span>
+                  <span className="cxv-tag">{formatCompactNumber(messageCount)} messages</span>
                 </header>
 
                 <p className="cxv-card__preview">{formatPreview(latestMessage?.content, 180)}</p>
@@ -82,14 +82,16 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
                     <Button
                       variant="ghost"
                       size="sm"
+                      icon={<IconDownload size={15} />}
                       title="Export as Markdown (local download; never includes file paths)"
                       onClick={() => downloadConversation(conversation, 'markdown')}
                     >
-                      MD
+                      Markdown
                     </Button>
                     <Button
                       variant="ghost"
                       size="sm"
+                      icon={<IconDownload size={15} />}
                       title="Export as JSON (local download; never includes file paths)"
                       onClick={() => downloadConversation(conversation, 'json')}
                     >

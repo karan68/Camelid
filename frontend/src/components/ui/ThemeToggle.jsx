@@ -1,12 +1,12 @@
+import { THEME_ORDER } from '../../hooks/useTheme'
 import { IconMonitor, IconMoon, IconSun } from './icons'
 
-const NEXT_LABEL = { system: 'light', light: 'dark', dark: 'system' }
-
-/* Cycles theme preference system → light → dark. Shows the active preference. */
+/* Cycles theme preference dark → light → system (THEME_ORDER). Shows the active preference. */
 export function ThemeToggle({ preference, resolved, onCycle, compact = false }) {
   const Icon = preference === 'system' ? IconMonitor : preference === 'light' ? IconSun : IconMoon
   const labelFor = { system: 'System', light: 'Light', dark: 'Dark' }
-  const aria = `Theme: ${labelFor[preference]} (${resolved}). Switch to ${labelFor[NEXT_LABEL[preference]]}.`
+  const next = THEME_ORDER[(THEME_ORDER.indexOf(preference) + 1) % THEME_ORDER.length]
+  const aria = `Theme: ${labelFor[preference]} (${resolved}). Switch to ${labelFor[next]}.`
   return (
     <button
       type="button"

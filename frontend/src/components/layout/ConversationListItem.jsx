@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { clampText } from '../../lib/formatters'
 import { IconDots, IconEdit, IconTrash } from '../ui/icons'
 
@@ -10,30 +11,89 @@ function ConversationListItemInner({
   onRename,
   onDelete,
 }) {
-  const [menuOpen, setMenuOpen] = useState(false)
+  /* Non-null while the menu is open: viewport coordinates for the portalled
+     popover. Portalling (instead of position:absolute in the row) lets the
+     menu escape the sidebar's overflow-y:auto scroll container. */
+  const [menuPos, setMenuPos] = useState(null)
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
   const rootRef = useRef(null)
+  const triggerRef = useRef(null)
+  const menuRef = useRef(null)
+  const menuOpen = Boolean(menuPos)
 
   const rawTitle = conversation.title || 'Untitled conversation'
   const title = clampText(rawTitle, 52) || 'Untitled conversation'
 
+  const openMenu = () => {
+    const rect = triggerRef.current?.getBoundingClientRect()
+    if (!rect) return
+    setMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right })
+  }
+  const closeMenu = ({ refocus = false } = {}) => {
+    setMenuPos(null)
+    if (refocus) triggerRef.current?.focus()
+  }
+
   useEffect(() => {
     if (!menuOpen) return undefined
     const onDocDown = (event) => {
-      if (!rootRef.current?.contains(event.target)) setMenuOpen(false)
+      if (rootRef.current?.contains(event.target) || menuRef.current?.contains(event.target)) return
+      setMenuPos(null)
     }
-    const onKey = (event) => { if (event.key === 'Escape') setMenuOpen(false) }
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        setMenuPos(null)
+        triggerRef.current?.focus()
+      }
+    }
+    /* The fixed-position menu goes stale the moment the list scrolls. */
+    const onMove = () => setMenuPos(null)
     window.addEventListener('pointerdown', onDocDown)
     window.addEventListener('keydown', onKey)
+    window.addEventListener('scroll', onMove, true)
+    window.addEventListener('resize', onMove)
     return () => {
       window.removeEventListener('pointerdown', onDocDown)
       window.removeEventListener('keydown', onKey)
+      window.removeEventListener('scroll', onMove, true)
+      window.removeEventListener('resize', onMove)
     }
   }, [menuOpen])
 
+  /* role='menu' contract: focus moves into the menu on open. */
+  useEffect(() => {
+    if (!menuOpen) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      menuRef.current?.querySelector('[role="menuitem"]')?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [menuOpen])
+
+  /* role='menu' contract: ArrowUp/Down cycle items, Home/End jump, Tab closes. */
+  const onMenuKeyDown = (event) => {
+    const items = Array.from(menuRef.current?.querySelectorAll('[role="menuitem"]') || [])
+    if (!items.length) return
+    const index = items.indexOf(document.activeElement)
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      items[(index + 1) % items.length].focus()
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      items[(index - 1 + items.length) % items.length].focus()
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      items[0].focus()
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      items[items.length - 1].focus()
+    } else if (event.key === 'Tab') {
+      closeMenu({ refocus: true })
+    }
+  }
+
   const beginRename = () => {
-    setMenuOpen(false)
+    closeMenu()
     setDraftTitle(rawTitle)
     setEditing(true)
   }
@@ -76,16 +136,24 @@ function ConversationListItemInner({
         <div className="rail-convo__actions">
           <button
             type="button"
+            ref={triggerRef}
             className="rail-convo__menu-btn"
             aria-label={`Options for ${title}`}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
-            onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v) }}
+            onClick={(e) => { e.stopPropagation(); if (menuOpen) closeMenu(); else openMenu() }}
           >
             <IconDots size={18} />
           </button>
-          {menuOpen && (
-            <div className="rail-menu" role="menu">
+          {menuOpen && createPortal(
+            <div
+              className="rail-menu"
+              role="menu"
+              aria-label={`Options for ${title}`}
+              ref={menuRef}
+              style={{ top: menuPos.top, right: menuPos.right }}
+              onKeyDown={onMenuKeyDown}
+            >
               <button type="button" role="menuitem" className="rail-menu__item" onClick={beginRename}>
                 <IconEdit size={16} /> <span>Rename</span>
               </button>
@@ -93,11 +161,12 @@ function ConversationListItemInner({
                 type="button"
                 role="menuitem"
                 className="rail-menu__item rail-menu__item--danger"
-                onClick={() => { setMenuOpen(false); onDelete(conversation.id) }}
+                onClick={() => { closeMenu(); onDelete(conversation.id) }}
               >
                 <IconTrash size={16} /> <span>Delete</span>
               </button>
-            </div>
+            </div>,
+            document.body,
           )}
         </div>
       )}

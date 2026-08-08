@@ -4,7 +4,6 @@ import { getChatGateState } from '../lib/chatGate'
 import { modelRuntimeIdMatches } from '../lib/modelState'
 import { IconMenu } from './ui/icons'
 import { StatusDot } from './ui/StatusDot'
-import { EvidenceChip } from './ui/EvidenceChip'
 import { CamelidMark } from './ui/CamelidMark'
 
 const TITLES = {
@@ -13,15 +12,15 @@ const TITLES = {
   library: 'Models',
   downloads: 'Downloaded models',
   api: 'API',
-  compatibility: 'Compatibility ledger',
+  compatibility: 'Compatibility',
   analytics: 'Analytics',
-  telemetry: 'Session telemetry',
+  telemetry: 'Telemetry',
   history: 'Chat history',
   memory: 'Memory',
   system: 'System',
   settings: 'Settings',
-  cluster: 'Cluster Topology',
-  observatory: 'Inference Observatory',
+  cluster: 'Cluster',
+  observatory: 'Observatory',
 }
 
 /* Slim top bar. Chat tab shows the conversation title + a compact model status
@@ -36,6 +35,8 @@ function TopBar({
   selectedModelId,
   models = [],
   onToggleSidebar = null,
+  mobileNavOpen = false,
+  menuButtonRef = null,
   demoMode = false,
 }) {
   const rawTitle = selectedConversationTitle?.trim()
@@ -50,11 +51,22 @@ function TopBar({
   const apiUnavailable = runtime?.status === 'offline'
   const tone = gate.chatUnlocked ? 'ready' : apiUnavailable ? 'offline' : runtime?.loaded_now ? 'warn' : 'neutral'
   const modelName = selectedModel?.name || 'No model selected'
+  /* Narrow screens swap the full name for this short form (dot + first word)
+     so the view title keeps the room; see the 480px rules in shell.css. */
+  const modelShortName = selectedModel ? clampText(modelName.split(/\s+/)[0], 14) : 'No model'
 
   return (
     <header className={`topbar ${demoMode ? 'topbar--demo' : ''}`}>
       {onToggleSidebar && (
-        <button type="button" className="topbar__menu" aria-label="Toggle sidebar" onClick={onToggleSidebar}>
+        <button
+          type="button"
+          ref={menuButtonRef}
+          className="topbar__menu"
+          aria-label="Toggle sidebar"
+          aria-expanded={mobileNavOpen}
+          aria-controls="camelid-sidebar"
+          onClick={onToggleSidebar}
+        >
           <IconMenu size={22} />
         </button>
       )}
@@ -63,16 +75,8 @@ function TopBar({
       <div className="topbar__spacer" />
       {!demoMode && (
         <div className="topbar__gate">
-          {/* Support-gate claim: rendered by the EvidenceChip, sourced from the
-              shared chat gate. Runtime + contract stay visible on every tab. */}
-          <EvidenceChip
-            status={gate.hint?.target?.status || ''}
-            state={gate.contractSupported ? 'supported' : gate.hint?.target?.status ? null : 'unsupported'}
-            label={gate.label}
-            source={{ rowId: gate.hint?.target?.id, note: gate.copy }}
-            size="sm"
-            className="topbar__gate-chip"
-          />
+          {/* Model chip only. Support detail lives in the Models and System
+              views; the header stays free of internal status strings. */}
           <button
             type="button"
             className="topbar__model"
@@ -81,6 +85,10 @@ function TopBar({
           >
             <StatusDot tone={tone} pulse={gate.chatUnlocked} />
             <span className="topbar__model-name">{clampText(modelName, 32)}</span>
+            <span className="topbar__model-short">{modelShortName}</span>
+            {selectedModel && !gate.contractSupported && !apiUnavailable && (
+              <span className="topbar__model-hint">· Unverified model</span>
+            )}
           </button>
         </div>
       )}

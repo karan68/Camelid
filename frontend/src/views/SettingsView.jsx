@@ -5,7 +5,8 @@ import { Chip } from '../components/ui/Chip'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Field } from '../components/ui/Field'
 import { CamelidMark } from '../components/ui/CamelidMark'
-import { IconPlay, IconStop, IconCopy, IconCheck, IconServer, IconMonitor, IconSun, IconMoon, IconNetwork, IconChevronRight } from '../components/ui/icons'
+import { ConfirmDialog } from '../components/ui/ConfirmDialog'
+import { IconPlay, IconStop, IconCopy, IconCheck, IconServer, IconSettings, IconMonitor, IconSun, IconMoon, IconNetwork, IconChevronRight } from '../components/ui/icons'
 import { copyText } from '../lib/markdown'
 import { getConfiguredMaxTokens, setConfiguredMaxTokens } from '../lib/responseLimits'
 import { getStoredApiKey, setStoredApiKey } from '../lib/apiAuth'
@@ -33,6 +34,7 @@ export default function SettingsView({
   capabilities = null,
 }) {
   const [confirmWipe, setConfirmWipe] = useState(false)
+  const [wiping, setWiping] = useState(false)
   const online = runtime?.status === 'online'
   const { status, command, setCommand, resolvedCommand, starting, start, stop } = backend
   const [copied, setCopied] = useState(false)
@@ -113,9 +115,12 @@ export default function SettingsView({
 
   return (
     <div className="settings-view">
-      <header className="settings-view__head">
-        <h1>Settings</h1>
-        <p>Start the local Camelid backend, point the UI at it, and tune appearance.</p>
+      <header className="cxv-head">
+        <div className="cxv-head__copy">
+          <p className="cxv-kicker"><IconSettings size={14} /> Settings</p>
+          <h1>Settings</h1>
+          <p className="cxv-sub">Start the local Camelid backend, point the UI at it, and tune appearance.</p>
+        </div>
       </header>
 
       <Card>
@@ -206,7 +211,10 @@ export default function SettingsView({
           } />
           <CardBody>
             <p className="settings-help">
-              Run the Q8_0 decode on {gpu.device || 'the CUDA GPU'} instead of the CPU. The CPU path stays the correctness reference and the output is token-identical either way. Small models (e.g. TinyLlama) speed up noticeably; larger models may not, because this path uploads weights to the GPU per step.
+              Use {gpu.device || 'your GPU'} to speed up generation. Output is identical either way.
+            </p>
+            <p className="settings-help settings-help--muted">
+              Smaller models benefit most; very large models may not speed up much on this engine version.
             </p>
             <div className="settings-actions">
               <Button
@@ -222,8 +230,7 @@ export default function SettingsView({
         </Card>
       )}
 
-      <Card interactive className="settings-cluster-card" onClick={onOpenCluster} role="button" tabIndex={0}
-        onKeyDown={(e) => { if (e.key === 'Enter') onOpenCluster() }}>
+      <Card interactive className="settings-cluster-card" onClick={onOpenCluster}>
         <CardHeader
           icon={<IconNetwork size={20} />}
           eyebrow="Infrastructure"
@@ -236,7 +243,7 @@ export default function SettingsView({
       <Card>
         <CardHeader eyebrow="Chat" title="Response length" />
         <CardBody>
-          <p className="settings-help">How many tokens Camelid can generate per reply. Larger means more complete answers and full programs (less truncation), but slower. Supported rows are validated to ~2K context; larger values still run model-native.</p>
+          <p className="settings-help">How many tokens Camelid can generate per reply. Higher limits give more complete answers but take longer.</p>
           <ResponseLengthControl
             value={Number(maxTokens)}
             onChange={(next) => handleMaxTokens(next)}
@@ -252,28 +259,32 @@ export default function SettingsView({
         <CardBody>
           <p className="settings-help">Conversations live only in this browser&apos;s storage. Deleting them does not touch models, memories, or anything on disk.</p>
           <div className="settings-select-row">
-            {deleteAllConversations && (confirmWipe ? (
-              <>
-                <button
-                  type="button"
-                  className="primary-button settings-danger"
-                  onClick={async () => { await deleteAllConversations(); setConfirmWipe(false) }}
-                >
-                  Confirm — delete {conversationCount} conversation{conversationCount === 1 ? '' : 's'}
-                </button>
-                <button type="button" className="ghost-button" onClick={() => setConfirmWipe(false)}>Cancel</button>
-              </>
-            ) : (
-              <button
-                type="button"
-                className="ghost-button settings-danger-ghost"
+            {deleteAllConversations && (
+              <Button
+                variant="ghost"
+                className="cxv-danger"
                 disabled={conversationCount === 0}
                 onClick={() => setConfirmWipe(true)}
               >
                 {conversationCount === 0 ? 'No conversations stored' : `Delete all ${conversationCount} conversations…`}
-              </button>
-            ))}
+              </Button>
+            )}
           </div>
+          <ConfirmDialog
+            open={confirmWipe}
+            title="Delete all conversations?"
+            detail={`This removes ${conversationCount} conversation${conversationCount === 1 ? '' : 's'} from this browser only. Models, memories, and files on disk are not affected.`}
+            confirmLabel="Delete all"
+            busy={wiping}
+            onConfirm={async () => {
+              setWiping(true)
+              try { await deleteAllConversations() } finally {
+                setWiping(false)
+                setConfirmWipe(false)
+              }
+            }}
+            onCancel={() => setConfirmWipe(false)}
+          />
         </CardBody>
       </Card>
 
