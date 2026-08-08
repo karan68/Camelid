@@ -104,7 +104,7 @@ function pathBasename(value) {
   return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
 }
 
-function exactArtifactFilenameForRow(row) {
+export function exactArtifactFilenameForRow(row) {
   return EXACT_ARTIFACT_GATED_ROWS[row?.id] || null
 }
 

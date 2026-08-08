@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
+import { exactArtifactFilenameForRow } from '../lib/capabilities'
 import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
@@ -201,6 +202,11 @@ export default function ChatWorkspace({
   const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
+  /* Only set when the row was matched but the loaded GGUF is not its exact
+     artifact — the one blocked state with a concrete next step. */
+  const blockedArtifactFilename = selectedChatGate.hint?.kind === 'artifact_mismatch'
+    ? exactArtifactFilenameForRow(selectedChatGate.hint.target)
+    : null
   const selectedRuntimeMatchesLoadedModel = Boolean(selectedChatGate.runtimeLoaded)
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const selectedModelIssue = selectedModel?.load_error || selectedModel?.install_error || ''
@@ -237,7 +243,12 @@ export default function ChatWorkspace({
     : apiUnavailable
       ? 'Keep writing here. Send unlocks again once the local API responds.'
       : supportBlocked
-        ? "This model isn't verified for chat yet. Pick a verified model to unlock send."
+        /* When the blocker is a near-miss GGUF, naming the file the reader
+           actually needs is far more actionable than "pick a verified model" —
+           they are usually one download away, not one decision away. */
+        ? (blockedArtifactFilename
+            ? `This model isn't verified for chat yet: it requires the exact ${blockedArtifactFilename} artifact. Pick a verified model to unlock send.`
+            : "This model isn't verified for chat yet. Pick a verified model to unlock send.")
         : selectedModel
           ? 'Your draft is ready now. Send unlocks as soon as this model is ready.'
           // The activation card above already names the one thing to do; repeating
@@ -549,7 +560,7 @@ export default function ChatWorkspace({
                   onClick={() => imageInputRef.current?.click()}
                   disabled={generationActive}
                   aria-label="Attach image"
-                  title="Attach one PNG or JPEG image"
+                  title="Attach one PNG or JPEG for the loaded Prism vision model"
                 >
                   <IconImage size={16} /> <span className="cxcomposer__tool-label">{composerImage ? 'Image ready' : 'Image'}</span>
                 </button>

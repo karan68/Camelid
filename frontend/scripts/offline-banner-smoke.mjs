@@ -104,7 +104,7 @@ const origin = `http://127.0.0.1:${server.address().port}`
 const browser = await puppeteer.launch({ executablePath, headless: 'new' })
 const pageErrors = []
 
-async function openBanner({ clipboard = 'ok', storage = {} } = {}) {
+async function openBanner({ clipboard = 'ok', storage = {}, platform = null } = {}) {
   const page = await browser.newPage()
   page.on('pageerror', (error) => pageErrors.push(String(error)))
   // Nothing may leave the harness. One scenario points the app at an engine on
@@ -119,8 +119,12 @@ async function openBanner({ clipboard = 'ok', storage = {} } = {}) {
   // copyText() calls navigator.clipboard.writeText. Drive all three real shapes:
   // present and working, ABSENT (what a non-secure context gives you, e.g. a
   // plain-http LAN address), and present but rejecting (permission denied).
-  await page.evaluateOnNewDocument((mode, seed) => {
+  await page.evaluateOnNewDocument((mode, seed, platformOverride) => {
     window.__copied = []
+    /* The banner's wording is platform-aware: only Windows users are told to run
+       camelid.exe. Scenarios that assert that phrasing must say which platform
+       they are standing on rather than inheriting the runner's. */
+    if (platformOverride) Object.defineProperty(navigator, 'platform', { configurable: true, value: platformOverride })
     // Pages share the browser profile, so a key seeded by an earlier scenario
     // would survive into the next one and silently test the wrong thing.
     window.localStorage.clear()
@@ -139,7 +143,7 @@ async function openBanner({ clipboard = 'ok', storage = {} } = {}) {
         },
       },
     })
-  }, clipboard, storage)
+  }, clipboard, storage, platform)
   // NOT networkidle2: one scenario points the app at an engine on another host,
   // whose probe never settles, and the banner does not depend on it.
   await page.goto(origin, { waitUntil: 'domcontentloaded' })
@@ -186,7 +190,7 @@ function check(name, fn) { fn(); results.push(name) }
 try {
   /* ---- Scenario 1: a downloaded build. No launcher hook exists. ---- */
   resetStub()
-  let page = await openBanner()
+  let page = await openBanner({ platform: 'Win32' })
   let banner = await page.evaluate(readBanner)
 
   check('packaged build offers no Start button it cannot honour', () => {
@@ -205,6 +209,24 @@ try {
   })
   check('packaged build explains why the page cannot restart the engine', () => {
     assert.match(banner.text, /served by the engine/i)
+  })
+  await page.close()
+
+  /* ---- Scenario 1b: the same packaged build on macOS/Linux. camelid.exe does
+     not exist there, so naming it was an instruction the reader could not
+     follow; the guidance must be platform-correct in both directions. ---- */
+  resetStub()
+  page = await openBanner({ platform: 'MacIntel' })
+  const macBanner = await page.evaluate(readBanner)
+  check('a non-Windows packaged build is never told to run camelid.exe', () => {
+    assert.equal(macBanner.text.includes('camelid.exe'), false,
+      `macOS/Linux was told to run a Windows executable: ${macBanner.text}`)
+    assert.equal(macBanner.text.includes('unzipped'), false,
+      'unzipped-folder phrasing is Windows-specific packaging')
+  })
+  check('a non-Windows packaged build still explains how to restart', () => {
+    assert.match(macBanner.text, /served by the engine/i)
+    assert.match(macBanner.text, /Start the Camelid app again|re-run the command/i)
   })
   check('the retired dead-end sentence is gone', () => {
     assert.equal(banner.text.includes(RETIRED_COPY), false)
@@ -229,7 +251,7 @@ try {
      secure context). Claiming "Copied" there would be the same lie. Run at
      390px: the failure label is the longest string this banner can show. ---- */
   resetStub()
-  page = await openBanner({ clipboard: 'absent' })
+  page = await openBanner({ clipboard: 'absent', platform: 'Win32' })
   await page.setViewport({ width: 390, height: 844 })
   await new Promise((done) => setTimeout(done, 150))
   await clickBannerButton(page, 'Copy')

@@ -208,8 +208,15 @@ try {
     setTab: noop,
   }))
 
-  assert.match(blockedWrongArtifactMarkup, /Runtime ready, support gated/, '3B live chat should show runtime readiness while support remains artifact-gated')
-  assert.match(blockedWrongArtifactMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B live chat must name the exact artifact blocker')
+  /* The composer's readiness copy moved to plain language (2026-08); the
+   invariant is unchanged -- a model whose runtime is up but whose artifact is
+   not verified must be shown as NOT ready to chat, never as ready. */
+assert.match(blockedWrongArtifactMarkup, /isn(?:&#x27;|')t verified for chat yet/, '3B live chat should show support is still gated while the runtime is up')
+assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an artifact-gated model must never be presented as ready to chat')
+  /* The readiness LINE now explains the blocker in the reader's language; the
+     exact row id it refers to still travels with the message footer's Evidence
+     Chip, which is the surface built to carry it. */
+  assert.match(blockedWrongArtifactMarkup, /Pick a verified model to unlock send/, '3B live chat must explain the artifact blocker and the way out')
   assert.match(blockedWrongArtifactMarkup, /requires the exact Llama-3\.2-3B-Instruct-Q8_0\.gguf artifact/, '3B artifact blocker must name the canonical GGUF filename')
   assert.match(blockedWrongArtifactMarkup, /data-send-ready="false"/, '3B composer send must stay disabled for a runtime-ready neighboring artifact')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Message Camelid"[^>]*disabled/, '3B draft composer should stay editable while exact-row support is still gated')
@@ -245,9 +252,13 @@ try {
   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
   // Redesign (2026-06): consolidated status line keeps runtime-ready + exact-row support visible
   // after messages exist (capability-lane detail now lives in System/API views, asserted there).
-  assert.match(streamingMarkup, /Local chat ready/, 'non-empty live 3B chats should keep the runtime-ready state visible after messages exist')
-  assert.match(streamingMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'non-empty live 3B chats should keep the exact-row support label visible after messages exist')
-  assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
+  assert.match(streamingMarkup, /is loaded and ready\./, 'non-empty live 3B chats should keep the runtime-ready state visible after messages exist')
+    /* The row id still travels with the message footer's Evidence Chip; only its
+     label wording changed, so pin the id itself rather than the old phrasing. */
+  assert.match(streamingMarkup, /llama32_3b_instruct_q8_0/, 'non-empty live 3B chats should keep the exact-row support evidence visible after messages exist')
+  /* Chat copy no longer names internal doc files (2026-08); the requirement it
+     described is still enforced by the gate and stated in plain language. */
+  assert.match(streamingMarkup, /is loaded and ready\./, 'live 3B chat readiness must state the verified-and-loaded requirement in the reader\'s language')
   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
   assert.match(streamingMarkup, /Still generating — code block incomplete/, 'open streaming code should visibly say it is incomplete')
   assert.match(streamingMarkup, /Streaming code response/, 'streaming code rows should keep an active live-generation label')
