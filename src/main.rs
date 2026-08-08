@@ -5351,6 +5351,7 @@ fn run_bench_owner_sweep(
         Lane::KQuant => &[
             "CAMELID_X86_KQUANT_MATMUL_OWNER",
             "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+            "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256",
             "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8",
         ],
     };
@@ -5419,16 +5420,22 @@ fn run_bench_owner_sweep(
     }
 
     // Lane B. The 512-bit inner and the 8-row repack need AVX-512; the 256-bit
-    // inner needs only `vpdpbusd`. Both answer the same env flag, so which one
-    // runs is a property of the host — hence the label is picked from the
-    // host's capabilities, and kernels this CPU cannot reach are not measured.
+    // inner needs only `vpdpbusd`. The 512-bit inner answers the shared VNNI
+    // flag while the 256-bit one is opt-in, so which one runs is a property of
+    // the host — hence the label is picked from the host's capabilities, and
+    // kernels this CPU cannot reach are not measured.
     const KQ_OWNER: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER";
     const KQ_VNNI: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI";
+    const KQ_AVXVNNI256: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256";
     const KQ_REPACK8: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8";
     let kq_off: SweepConfig = ("off", false, &[(KQ_OWNER, "0")]);
     let kq_avx2: SweepConfig = ("owner_avx2", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "0")]);
     let kq_vnni512: SweepConfig = ("owner_vnni512", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
-    let kq_avxvnni: SweepConfig = ("owner_avxvnni256", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
+    let kq_avxvnni: SweepConfig = (
+        "owner_avxvnni256",
+        true,
+        &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_AVXVNNI256, "1")],
+    );
     let kq_repack8: SweepConfig = (
         "owner_vnni512_repack8",
         true,

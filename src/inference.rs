@@ -20461,6 +20461,32 @@ fn x86_kquant_matmul_owner_vnni_enabled() -> bool {
     }
 }
 
+/// The 256-bit `vpdpbusd` inner, default OFF: the AVX2 inner carries the group
+/// scale inside its widening `madd_epi16`, and measured faster than
+/// `vpdpbusd` + `mullo_epi32` at both shapes tried — 1.19x at in_dim 2048 and
+/// 1.17x at 8192 in isolation, 1.09x on 1B Q4_K_M prefill, on an i9-14900HX.
+/// Retained behind `CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256=1` because that
+/// comparison has only been made on one microarchitecture; dispatch is
+/// bit-identical either way. Resolved once like its siblings, with the same
+/// bypass so an A/B sweep is not pinned to whichever arm ran first.
+#[cfg(target_arch = "x86_64")]
+fn x86_kquant_matmul_owner_avxvnni256_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256")
+    }
+    #[cfg(not(test))]
+    {
+        if q8_runtime::bench_uncached_runtime_plan() {
+            return q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256");
+        }
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256")
+        })
+    }
+}
+
 /// Shared-base output pointer for the K-quant owner's rayon tasks. Tasks
 /// partition the output-channel dimension into disjoint chunks — no two tasks
 /// ever write the same (row, channel) cell despite the shared base pointer.
@@ -20702,12 +20728,17 @@ unsafe fn q4_k_owner_weight_row_block_avx512vnni(
 
 /// v6 inner: 256-bit AVX-VNNI sibling of
 /// [`q4_k_owner_weight_row_block_avx512vnni`], for the Alder-Lake-and-later
-/// consumer parts that carry `vpdpbusd` but have AVX-512 fused off — the whole
-/// 12th-gen-onwards Intel client line, which today falls all the way back to
-/// the AVX2 inner. Same algebra as the AVX-512 sibling with the zmm pair split
-/// into two ymm halves: the low nibbles pair with `y.qs[64j..64j+32]` and the
-/// high nibbles with `y.qs[64j+32..64j+64]`, exactly the halves the 64-byte
-/// zmm load covers, so the operand pairing is unchanged.
+/// consumer parts that carry `vpdpbusd` but have AVX-512 fused off. Same
+/// algebra as the AVX-512 sibling with the zmm pair split into two ymm halves:
+/// the low nibbles pair with `y.qs[64j..64j+32]` and the high nibbles with
+/// `y.qs[64j+32..64j+64]`, exactly the halves the 64-byte zmm load covers, so
+/// the operand pairing is unchanged.
+///
+/// Opt-in via `CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256=1`: `vpdpbusd`
+/// returns i32, so the group scale needs a 2-uop `mullo_epi32`, whereas the
+/// AVX2 inner folds the same scale into a widening `madd_epi16` for free and
+/// measured faster here. Kept because that was measured on one
+/// microarchitecture only.
 ///
 /// Bit-identity: every intermediate is exact integer. A `dpbusd` lane is a quad
 /// sum ≤ 4·15·127 = 7620; ×63 scale ≤ 480,060; `vacc` takes 8 adds (4 chunks ×
@@ -20779,12 +20810,19 @@ unsafe fn q4_k_owner_weight_row_block_avxvnni(
 /// q8 lanes are in [-127, 127] (`quantize_q8_k_blocks` uses iscale = -127/max
 /// plus a .min(127) clamp, so -128 is unreachable) ⇒ |maddubs pair| ≤ 2·15·127
 /// = 3810, no i16 saturation (the raw instruction bound would be 3840 at
-/// q8 = -128); madd lane ≤ 7620; × the post-kmask 6-bit scale cap of 63 ⇒
-/// ≤ 480,060; vacc lane over 8 adds ≤ 3.85M; hsum ≤ 30.8M ≈ 1.4% of i32::MAX.
-/// Integer addition is associative, so the per-cell total equals the
-/// per-chunk-hsum path bit for bit. The f32 chain per cell is verbatim
+/// q8 = -128); × the post-kmask 6-bit scale cap of 63 and summed in pairs ⇒
+/// |madd lane| ≤ 480,060; vacc lane over 8 adds ≤ 3.85M; hsum ≤ 30.8M ≈ 1.4%
+/// of i32::MAX. Integer addition is associative, so the per-cell total equals
+/// the per-chunk-hsum path bit for bit. The f32 chain per cell is verbatim
 /// `q4_k_dot_arm` order: per superblock mins-side `(-dmin).mul_add` then
 /// main-side `d.mul_add`, ascending superblocks (i outer, row inner).
+///
+/// The group scale rides in the widening `madd_epi16` instead of a separate
+/// `mullo_epi32`, which is what makes this inner beat `vpdpbusd`: that
+/// instruction hands back i32, so scaling it costs a 2-uop `mullo_epi32`,
+/// while `madd_epi16` reduces AND scales in one 1-uop instruction. This is an
+/// identity, not an associativity argument — `madd(p, ones) * s` and
+/// `madd(p, s)` are both `s·p[2k] + s·p[2k+1]` in every lane.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
@@ -20800,42 +20838,40 @@ unsafe fn q4_k_owner_weight_row_block_avx2(
 ) {
     use std::arch::x86_64::*;
     let low_mask = _mm256_set1_epi8(0x0f);
-    let ones16 = _mm256_set1_epi16(1);
     for i in 0..superblocks {
         let qs = &w_row[i * Q4_K_WIRE_BYTES_PER_BLOCK + 16..i * Q4_K_WIRE_BYTES_PER_BLOCK + 144];
         let mut low = [_mm256_setzero_si256(); 4];
         let mut high = [_mm256_setzero_si256(); 4];
+        let mut slo = [_mm256_setzero_si256(); 4];
+        let mut shi = [_mm256_setzero_si256(); 4];
+        let sc = &wscales[i];
         for j in 0..4 {
             let q4 = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
             low[j] = _mm256_and_si256(q4, low_mask);
             high[j] = _mm256_and_si256(_mm256_srli_epi16(q4, 4), low_mask);
+            slo[j] = _mm256_set1_epi16(sc[2 * j] as i16);
+            shi[j] = _mm256_set1_epi16(sc[2 * j + 1] as i16);
         }
-        let sc = &wscales[i];
-        let mins = &wmins[i];
+        // Mins are per (weight row, superblock), so the widen is hoisted too.
+        let minv = _mm256_cvtepu8_epi32(_mm_loadl_epi64(wmins[i].as_ptr() as *const __m128i));
         for ((blocks, sums), sumf) in preps.iter().zip(sumf_block.iter_mut()) {
             let y = &blocks[i];
             let d = y.d * wd[i];
             let dmin = y.d * wdmin[i];
-            let mut prod: i64 = 0;
-            for g in 0..8 {
-                prod += sums[i][g] as i64 * mins[g] as i64;
-            }
+            // |group sum| ≤ 32·127 = 4064 and the scale ≤ 63, so a lane is
+            // ≤ 256,032 and the total ≤ 2.05M — exact in i32 and in f32.
+            let sumv = _mm256_loadu_si256(sums[i].as_ptr() as *const __m256i);
+            let prod =
+                crate::diffusion_gemma::refmath::hsum_i32_8(_mm256_mullo_epi32(sumv, minv)) as i64;
             *sumf = (-dmin).mul_add(prod as f32, *sumf);
             let q8p = y.qs.as_ptr();
             let mut vacc = _mm256_setzero_si256();
             for j in 0..4 {
                 let q8lo = _mm256_loadu_si256(q8p.add(j * 64) as *const __m256i);
                 let q8hi = _mm256_loadu_si256(q8p.add(j * 64 + 32) as *const __m256i);
-                let slo = _mm256_madd_epi16(_mm256_maddubs_epi16(low[j], q8lo), ones16);
-                let shi = _mm256_madd_epi16(_mm256_maddubs_epi16(high[j], q8hi), ones16);
-                vacc = _mm256_add_epi32(
-                    vacc,
-                    _mm256_mullo_epi32(slo, _mm256_set1_epi32(sc[2 * j] as i32)),
-                );
-                vacc = _mm256_add_epi32(
-                    vacc,
-                    _mm256_mullo_epi32(shi, _mm256_set1_epi32(sc[2 * j + 1] as i32)),
-                );
+                let plo = _mm256_madd_epi16(_mm256_maddubs_epi16(low[j], q8lo), slo[j]);
+                let phi = _mm256_madd_epi16(_mm256_maddubs_epi16(high[j], q8hi), shi[j]);
+                vacc = _mm256_add_epi32(vacc, _mm256_add_epi32(plo, phi));
             }
             let main = crate::diffusion_gemma::refmath::hsum_i32_8(vacc) as i64;
             *sumf = d.mul_add(main as f32, *sumf);
@@ -20880,10 +20916,11 @@ fn q4_k_owner_prefill_tiled(
     #[cfg(not(target_arch = "x86_64"))]
     let use_vnni = false;
     // 256-bit vpdpbusd: same instruction, no AVX-512. Only consulted when the
-    // 512-bit path is unavailable, so an AVX-512 host is completely unaffected.
+    // 512-bit path is unavailable, and now opt-in — see the flag's doc comment.
     #[cfg(target_arch = "x86_64")]
     let use_avxvnni = !use_vnni
         && x86_kquant_matmul_owner_vnni_enabled()
+        && x86_kquant_matmul_owner_avxvnni256_enabled()
         && std::arch::is_x86_feature_detected!("avxvnni")
         && std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]

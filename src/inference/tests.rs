@@ -2213,6 +2213,7 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_Q8_0_PACKED_4X8_DOT",
         "CAMELID_X86_KQUANT_MATMUL_OWNER",
         "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+        "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256",
         "CAMELID_X86_Q6K_AVX2",
         "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
         "CAMELID_Q8_0_FILE_CACHE_BYTES",
@@ -3856,6 +3857,14 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                      host_vnni={})",
                     q8_owner_avx512vnni_available()
                 );
+                // The 256-bit inner is opt-in, so neither leg may reach it —
+                // without this the non-512 host's legs could silently be
+                // measuring that kernel instead of the AVX2 one.
+                assert_eq!(
+                    telemetry.kquant_owner_avxvnni_taken, 0,
+                    "the 256-bit inner engaged without its opt-in flag \
+                     (n_rows={n_rows}, vnni={vnni})"
+                );
                 std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
                 std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
                 assert_eq!(owner.data.len(), base.data.len());
@@ -4099,11 +4108,13 @@ fn q4_k_owner_avxvnni_inner_is_bit_identical() {
 
         std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
         std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI", "1");
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256", "1");
         reset_q8_schedule_telemetry();
         let owned = matmul_rhs_transposed_q4_k_block_dot(&input, &weight, "avxvnni").unwrap();
         let telemetry = snapshot_q8_schedule_telemetry();
         std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
         std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256");
 
         assert!(
             telemetry.kquant_owner_avxvnni_taken > 0,
