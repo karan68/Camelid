@@ -20,8 +20,15 @@ These bytes are **NOT** the certified `ornith_1_0_9b_q4_k_m` row. That row is sh
 
 This receipt therefore covers a *distinct artifact* and makes **no claim** about the
 certified row. It was run against a path renamed to break the filename match, because
-row classification keys on filename alone and would otherwise report the certified
-row's claims for these bytes.
+at the time of the run row classification keyed on filename alone and would otherwise
+have reported the certified row's claims for these bytes.
+
+> **Correction, 2026-08-07 (same day, after this run):** that filename-only hazard is
+> **fixed** — `ornith-1.0-9b-Q4_K_M.gguf` is now pinned to sha256 `2711bf1e…` in
+> `NON_CATALOG_SUPPORTED_ARTIFACTS`, so these bytes are refused as that row rather
+> than inheriting its claims. The rename was necessary when this receipt was taken and
+> is no longer. Nothing else here changes: the measurement still describes the
+> `5720d1f6` artifact, and the certified bytes still have no Metal receipt.
 
 ## Method
 
