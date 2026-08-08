@@ -900,6 +900,10 @@ enum FabricAction {
     /// the same `Fabric::dispatch` path `fabric run` uses, so a client can point
     /// at one address instead of the operator invoking the CLI per request.
     /// Streaming is refused with 400, the same as the CLI path.
+    ///
+    /// The proxy has no authentication of its own and forwards no credentials,
+    /// so it binds loopback by default and refuses a routable address unless
+    /// the exposure is acknowledged explicitly.
     Serve {
         #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
         nodes: Vec<String>,
@@ -915,6 +919,15 @@ enum FabricAction {
         /// Budget for the generation itself, which can legitimately take minutes.
         #[arg(long, default_value_t = 300)]
         forward_timeout_s: u64,
+        /// Explicitly permit an unauthenticated non-loopback listener. Without
+        /// this acknowledgement the proxy refuses the bind, because anything
+        /// that can reach it can drive every node in the fabric.
+        #[arg(
+            long,
+            env = "CAMELID_ALLOW_UNAUTHENTICATED_REMOTE",
+            default_value_t = false
+        )]
+        allow_unauthenticated_remote: bool,
     },
 }
 
@@ -2434,12 +2447,12 @@ async fn main() -> anyhow::Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "label": decision.label,
-                            "reason": format!("{:?}", decision.reason),
+                            "reason": decision.reason.as_str(),
                             "affinity_lost": decision.affinity_lost,
                         }))?
                     );
                 } else {
-                    println!("route -> {} ({:?})", decision.label, decision.reason);
+                    println!("route -> {} ({})", decision.label, decision.reason.as_str());
                     if let Some(previous) = &decision.affinity_lost {
                         println!(
                             "note: affinity to `{previous}` could not be honoured; \
@@ -2501,7 +2514,7 @@ async fn main() -> anyhow::Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "node": answer.label,
-                            "reason": format!("{:?}", decision.reason),
+                            "reason": decision.reason.as_str(),
                             "affinity_lost": decision.affinity_lost,
                             "model": model_id,
                             "status": answer.status,
@@ -2511,9 +2524,9 @@ async fn main() -> anyhow::Result<()> {
                     );
                 } else {
                     println!(
-                        "[{} · {:?} · {} · {} ms]",
+                        "[{} · {} · {} · {} ms]",
                         answer.label,
-                        decision.reason,
+                        decision.reason.as_str(),
                         model_id,
                         answer.elapsed.as_millis()
                     );
@@ -2539,15 +2552,21 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 timeout_ms,
                 forward_timeout_s,
+                allow_unauthenticated_remote,
             } => {
                 let mode = route_mode(&mode)?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
                     .with_timeout(std::time::Duration::from_millis(timeout_ms));
-                println!("fabric serve listening on {addr}");
-                camelid::fabric::server::serve(
-                    addr,
+
+                // Bind before announcing, so a refused or already-taken address
+                // never prints a listening line it did not earn.
+                let listener =
+                    camelid::fabric::server::bind(addr, allow_unauthenticated_remote).await?;
+                println!("fabric serve listening on {}", listener.local_addr()?);
+                camelid::fabric::server::serve_on(
+                    listener,
                     fabric,
                     camelid::fabric::server::ServeConfig {
                         mode,

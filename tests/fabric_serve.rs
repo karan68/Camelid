@@ -78,13 +78,19 @@ impl StubNode {
         let port = listener.local_addr().expect("local addr").port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
+        let config = Arc::new(config);
         let thread = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if thread_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(mut stream) = stream else { continue };
-                serve_once(&mut stream, &config);
+                // Each connection gets its own thread: a real node answers a
+                // health probe while it is generating for someone else, and a
+                // serial accept loop would make the proxy look slower than it
+                // is when several requests probe the same node at once.
+                let config = Arc::clone(&config);
+                std::thread::spawn(move || serve_once(&mut stream, &config));
             }
         });
         Self {
@@ -330,7 +336,7 @@ async fn a_streaming_request_is_refused_by_the_proxy_before_any_node_is_touched(
 /// slow nodes, and asserts they complete together rather than one-at-a-time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn concurrent_slow_requests_do_not_serialize_on_the_single_worker_thread() {
-    let delay = Duration::from_millis(300);
+    let delay = Duration::from_millis(500);
     let nodes: Vec<StubNode> = (0..4)
         .map(|i| StubNode::start(StubConfig::slow(&format!("model-{i}"), delay)))
         .collect();
@@ -353,11 +359,11 @@ async fn concurrent_slow_requests_do_not_serialize_on_the_single_worker_thread()
     for (status, _, _) in &results {
         assert_eq!(*status, 200);
     }
-    // Serialized on one worker thread: ~4 * 300ms = 1200ms. Concurrent via
-    // spawn_blocking: ~300ms plus scheduling overhead. 700ms cleanly separates
-    // the two without being sensitive to ordinary scheduling jitter.
+    // Serialized on one worker thread: ~4 * 500ms = 2000ms. Concurrent via
+    // spawn_blocking: ~500ms plus scheduling overhead. 1200ms sits well clear
+    // of both, so neither CI jitter nor a slow stub can decide the outcome.
     assert!(
-        elapsed < Duration::from_millis(700),
+        elapsed < Duration::from_millis(1200),
         "four concurrent slow requests took {elapsed:?}; \
          they appear to have serialized on the async runtime"
     );

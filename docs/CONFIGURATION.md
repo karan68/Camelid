@@ -93,6 +93,29 @@ Resource ceilings are resolved once at startup. Their CLI names and environment 
 prompt/decode tokens, prompt and weight cache outcomes, engine queue/slot progress, process RSS,
 and CUDA VRAM. It contains no model-path, prompt, API-key, or per-user labels.
 
+## Fabric proxy policy
+
+`camelid fabric serve` puts one HTTP address in front of several independent nodes. It defaults to
+`127.0.0.1:8282` and, like `camelid serve`, refuses a non-loopback address unless the exposure is
+acknowledged with `--allow-unauthenticated-remote` (or `CAMELID_ALLOW_UNAUTHENTICATED_REMOTE`):
+
+```bash
+target/release/camelid fabric serve \
+  --node a=host-a --node b=host-b \
+  --addr 127.0.0.1:8282
+```
+
+Two limits are deliberate and worth knowing before you deploy it:
+
+- The proxy has no key of its own. The acknowledgement flag is the only way to bind it to a routable
+  address, and it should only be used behind something that authenticates.
+- Forwarded requests carry no credentials. A node started with `--api-key` still answers the
+  auth-exempt `/v1/health` probe, so it looks routable, and then refuses every forwarded request
+  with 401. Run the nodes behind a fabric proxy anonymously on a trusted network.
+
+Request bodies are bounded at the same 16 MiB default the node itself uses, and streaming requests
+are refused with 400 rather than half-supported.
+
 ## Mixtral diagnostic gate
 
 The checked Mixtral 8×7B Q8 row has one-token evidence, but its longer continuation parity gate is

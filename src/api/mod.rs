@@ -38,6 +38,9 @@ mod server;
 mod workspace;
 
 pub use server::ServeOptions;
+/// Re-exported so anything else in the crate that fronts this server bounds
+/// request bodies at the same size the server itself does.
+pub(crate) use server::DEFAULT_MAX_REQUEST_BODY_BYTES;
 
 use crate::{
     embedding::{cosine_similarity, EncoderConfig, NomicBertRuntime},
