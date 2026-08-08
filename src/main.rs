@@ -5352,6 +5352,7 @@ fn run_bench_owner_sweep(
             "CAMELID_X86_KQUANT_MATMUL_OWNER",
             "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
             "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256",
+            "CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI",
             "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8",
         ],
     };
@@ -5369,6 +5370,13 @@ fn run_bench_owner_sweep(
     let avx_vnni = std::arch::is_x86_feature_detected!("avxvnni");
     #[cfg(not(target_arch = "x86_64"))]
     let avx_vnni = false;
+    // The folded 512-bit K-quant inner needs no VNNI, so it is reachable on a
+    // strictly wider set than `avx512_vnni` — measure it wherever it can run.
+    #[cfg(target_arch = "x86_64")]
+    let avx512_bw = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx512_bw = false;
 
     // Lane A (Q8).
     let vnni4x4: SweepConfig = (
@@ -5419,33 +5427,53 @@ fn run_bench_owner_sweep(
         q8_configs.push(avxvnni256);
     }
 
-    // Lane B. The 512-bit inner and the 8-row repack need AVX-512; the 256-bit
-    // inner needs only `vpdpbusd`. The 512-bit inner answers the shared VNNI
-    // flag while the 256-bit one is opt-in, so which one runs is a property of
-    // the host — hence the label is picked from the host's capabilities, and
-    // kernels this CPU cannot reach are not measured.
+    // Lane B. The folded 512-bit inner needs avx512f+bw; the legacy dpbusd
+    // inner and the 8-row repack additionally need avx512vnni; the 256-bit
+    // inner needs only `vpdpbusd`. Every arm pins its own sub-flag, so which
+    // kernel runs is a property of the arm rather than of whichever ran first —
+    // the label is still picked from the host's capabilities, and kernels this
+    // CPU cannot reach are not measured.
     const KQ_OWNER: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER";
     const KQ_VNNI: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI";
     const KQ_AVXVNNI256: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256";
+    const KQ_A512VNNI: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI";
     const KQ_REPACK8: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8";
     let kq_off: SweepConfig = ("off", false, &[(KQ_OWNER, "0")]);
     let kq_avx2: SweepConfig = ("owner_avx2", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "0")]);
-    let kq_vnni512: SweepConfig = ("owner_vnni512", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
+    let kq_a512fold: SweepConfig = ("owner_avx512fold", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
+    let kq_vnni512: SweepConfig = (
+        "owner_vnni512",
+        true,
+        &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_A512VNNI, "1")],
+    );
     let kq_avxvnni: SweepConfig = (
         "owner_avxvnni256",
         true,
         &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_AVXVNNI256, "1")],
     );
+    // Pins the dpbusd single-row inner too: repack8 only covers
+    // floor(out_dim/8)*8 rows, so the ragged tail and any non-repacked tensor
+    // fall to the single-row path. Without this the arm would be a mix of
+    // repack8 and the folded inner, and would not be comparable with the
+    // pre-fold repack8 receipts its label refers to.
     let kq_repack8: SweepConfig = (
         "owner_vnni512_repack8",
         true,
-        &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_REPACK8, "1")],
+        &[
+            (KQ_OWNER, "1"),
+            (KQ_VNNI, "1"),
+            (KQ_A512VNNI, "1"),
+            (KQ_REPACK8, "1"),
+        ],
     );
     let mut kquant_configs: Vec<SweepConfig> = vec![kq_off, kq_avx2];
+    if avx512_bw {
+        kquant_configs.push(kq_a512fold);
+    }
     if avx512_vnni {
         kquant_configs.push(kq_vnni512);
         kquant_configs.push(kq_repack8);
-    } else if avx_vnni {
+    } else if avx_vnni && !avx512_bw {
         kquant_configs.push(kq_avxvnni);
     }
     let configs: Vec<SweepConfig> = match lane {
@@ -5474,10 +5502,17 @@ fn run_bench_owner_sweep(
         configs.len()
     );
     // Both lanes are capability-aware now, so this applies to either one.
+    // Capability disclosure. The folded 512-bit inner exists only in Lane B, so
+    // say so only when Lane B is what is being measured — otherwise a Q8 run
+    // reports a kernel it never touches.
     if !avx512_vnni {
-        if avx_vnni {
+        if avx512_bw && matches!(lane, Lane::KQuant) {
             eprintln!(
-                "[bench-owner-sweep] no avx512f/bw/vnni: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
+                "[bench-owner-sweep] avx512f/bw without vnni: measuring the folded 512-bit inner; the dpbusd and repack8 arms are unreachable here"
+            );
+        } else if avx_vnni {
+            eprintln!(
+                "[bench-owner-sweep] no AVX-512 at all: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
             );
         } else {
             eprintln!("[bench-owner-sweep] no vpdpbusd at all: only the AVX2 inner is measured");
@@ -5539,6 +5574,7 @@ fn run_bench_owner_sweep(
                 "owner_prefill_taken": owner_taken,
                 "q8_avxvnni256_taken": telemetry_snapshot.matmul_owner_avxvnni_taken,
                 "kquant_vnni512_taken": telemetry_snapshot.kquant_owner_vnni_taken,
+                "kquant_avx512fold_taken": telemetry_snapshot.kquant_owner_avx512fold_taken,
                 "kquant_avxvnni256_taken": telemetry_snapshot.kquant_owner_avxvnni_taken,
             });
             println!("{}", serde_json::to_string(&rec)?);

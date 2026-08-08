@@ -16866,6 +16866,26 @@ fn q8_owner_avx512vnni_available() -> bool {
     false
 }
 
+/// Whether the *folded* 512-bit K-quant inner can run on this CPU. It reaches
+/// for `vpmaddubsw`/`vpmaddwd` instead of `vpdpbusd`, so it needs no VNNI —
+/// which brings in the AVX-512 parts that have none (Skylake-SP/X and Cannon
+/// Lake; Cascade Lake onwards do carry VNNI). Those fall all the way back to
+/// the AVX2 inner today.
+#[cfg(target_arch = "x86_64")]
+fn q8_owner_avx512bw_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx2")
+}
+// Unlike its two neighbours, every non-test caller of this one is arch-gated
+// (the `use_a512fold` binding), so off x86_64 the stub is live only for the
+// parity test — which is NOT arch-gated and needs it to state its expectations.
+#[cfg(not(target_arch = "x86_64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn q8_owner_avx512bw_available() -> bool {
+    false
+}
+
 /// Whether the 256-bit AVX-VNNI owner microkernel can run on this CPU. `vpdpbusd`
 /// without AVX-512 is the whole consumer Intel line from Alder Lake onwards.
 #[cfg(target_arch = "x86_64")]
@@ -20437,6 +20457,35 @@ fn q4_k_repack8_for_weight(
         .clone()
 }
 
+/// The legacy `dpbusd` AVX-512 inner, default OFF: the folded inner
+/// ([`q4_k_owner_weight_row_block_avx512fold`]) carries the group scale inside
+/// its widening `madd_epi16` and measured faster at both shapes tried —
+/// 1.297x at in_dim 2048 and 1.173x at 8192 in isolation, on an i7-11800H
+/// (7/7 paired rounds at both shapes, worst round 1.155x). Retained behind
+/// `CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI=1` because that comparison has
+/// only been made on one microarchitecture — Sapphire Rapids (two FMA ports)
+/// and Zen 4/5 (double-pumped 512-bit) can rebalance `dpbusd` against
+/// `maddubs`. Dispatch is bit-identical either way. Resolved once like its
+/// siblings, with the same bypass so an A/B sweep is not pinned to whichever
+/// arm ran first.
+#[cfg(target_arch = "x86_64")]
+fn x86_kquant_matmul_owner_avx512vnni_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI")
+    }
+    #[cfg(not(test))]
+    {
+        if q8_runtime::bench_uncached_runtime_plan() {
+            return q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI");
+        }
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI")
+        })
+    }
+}
+
 /// AVX-512 VNNI inner for the K-quant owner: default ON whenever the owner is
 /// on (the GEMM4 split-flag-trap lesson) and the CPU has the features; runtime
 /// dispatch stays bit-identical either way (exact integers, associative).
@@ -20726,6 +20775,102 @@ unsafe fn q4_k_owner_weight_row_block_avx512vnni(
     }
 }
 
+/// v7 inner: [`q4_k_owner_weight_row_block_avx512vnni`] with the group scale
+/// carried inside a widening `madd_epi16` instead of a separate `mullo_epi32`,
+/// and the mins side vectorised. Default over the `dpbusd` sibling; roll back
+/// with `CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI=1`.
+///
+/// Why it wins: `vpdpbusd` hands back i32, so scaling its result costs a 2-uop
+/// `vpmulld`, giving `dpbusd` + `mullo` + `add` = 4 uops per chunk. The folded
+/// form reduces AND scales in one 1-uop instruction — `vpmaddubsw` +
+/// `vpmaddwd` + `vpaddd` = 3. This is an identity, not an associativity
+/// argument: `madd(p, ones) * s` and `madd(p, s)` are both `s·p[2k] +
+/// s·p[2k+1]` in every lane, so no VNNI instruction is needed at all — hence
+/// the `avx512f,avx512bw` gate, which also reaches the AVX-512 parts that have
+/// no VNNI.
+///
+/// Lane correspondence (why the i16 scale vector lands where `svec` did):
+/// `wvec[j]` bytes `0..32` are the low nibbles (scale `sc[2j]`) and `32..64`
+/// the high nibbles (`sc[2j+1]`). `maddubs` maps bytes `0..32` to i16 lanes
+/// `0..16` and `32..64` to `16..32`; `madd` then maps i16 `0..16` to i32 lanes
+/// `0..8` and i16 `16..32` to i32 `8..16` — exactly the halves the existing
+/// `inserti64x4` split scaled, so the same split with i16 broadcasts is
+/// correct.
+///
+/// Bit-identity: every intermediate is exact integer. q8 lanes are in
+/// [-127, 127] (`quantize_q8_k_blocks` clamps, so -128 is unreachable) ⇒
+/// |maddubs pair| ≤ 2·15·127 = 3810, no i16 saturation (the raw instruction
+/// bound would be 3840 at q8 = -128); × the post-kmask 6-bit scale cap of 63
+/// and summed in pairs ⇒ |madd lane| ≤ 480,060 — the same per-lane value the
+/// `dpbusd` sibling's `mullo` produced; `vacc` over 4 adds ≤ 1.93M; the 16-lane
+/// reduce ≤ 30.8M ≈ 1.4% of `i32::MAX`. The mins side is smaller still: a group
+/// sum is ≤ 32·127 = 4064 and the total ≤ 2.05M, so the `i64` it used was never
+/// needed, and 2.05M < 2^24 keeps the `as f32` exact. The load-bearing f32
+/// chain is untouched, verbatim `q4_k_dot_arm` order.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q4_k_owner_weight_row_block_avx512fold(
+    w_row: &[u8],
+    superblocks: usize,
+    wd: &[f32],
+    wdmin: &[f32],
+    wscales: &[[u8; 8]],
+    wmins: &[[u8; 8]],
+    preps: &[(Vec<Q8KBlock>, Vec<[i32; 8]>)],
+    sumf_block: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let low_mask = _mm256_set1_epi8(0x0f);
+    for i in 0..superblocks {
+        let qs = &w_row[i * Q4_K_WIRE_BYTES_PER_BLOCK + 16..i * Q4_K_WIRE_BYTES_PER_BLOCK + 144];
+        // Hoist per row block: [low_j | high_j] zmm per chunk plus the matching
+        // [scale_2j x16 | scale_2j+1 x16] i16 lanes.
+        let mut wvec = [_mm512_setzero_si512(); 4];
+        let mut svec = [_mm512_setzero_si512(); 4];
+        let sc = &wscales[i];
+        for j in 0..4 {
+            let q4 = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+            let low = _mm256_and_si256(q4, low_mask);
+            let high = _mm256_and_si256(_mm256_srli_epi16(q4, 4), low_mask);
+            wvec[j] = _mm512_inserti64x4(_mm512_castsi256_si512(low), high, 1);
+            svec[j] = _mm512_inserti64x4(
+                _mm512_castsi256_si512(_mm256_set1_epi16(sc[2 * j] as i16)),
+                _mm256_set1_epi16(sc[2 * j + 1] as i16),
+                1,
+            );
+        }
+        // Mins are per (weight row, superblock), so the widen is hoisted too.
+        let minv = _mm256_cvtepu8_epi32(_mm_loadl_epi64(wmins[i].as_ptr() as *const __m128i));
+        for ((blocks, sums), sumf) in preps.iter().zip(sumf_block.iter_mut()) {
+            let y = &blocks[i];
+            let d = y.d * wd[i];
+            let dmin = y.d * wdmin[i];
+            // |group sum| ≤ 32·127 = 4064 and the min ≤ 63, so a lane is
+            // ≤ 256,032 and the total ≤ 2.05M — exact in i32 and in f32.
+            let sumv = _mm256_loadu_si256(sums[i].as_ptr() as *const __m256i);
+            let prod =
+                crate::diffusion_gemma::refmath::hsum_i32_8(_mm256_mullo_epi32(sumv, minv)) as i64;
+            *sumf = (-dmin).mul_add(prod as f32, *sumf);
+            let q8p = y.qs.as_ptr();
+            let mut vacc = _mm512_setzero_si512();
+            for j in 0..4 {
+                // One contiguous 64-byte activation load: [q8lo_j | q8hi_j].
+                let q = _mm512_loadu_si512(q8p.add(j * 64).cast());
+                let p = _mm512_madd_epi16(_mm512_maddubs_epi16(wvec[j], q), svec[j]);
+                vacc = _mm512_add_epi32(vacc, p);
+            }
+            // Exact-integer 16-lane reduce via the proven 8-lane hsum.
+            let lo = _mm512_castsi512_si256(vacc);
+            let hi = _mm512_extracti64x4_epi64(vacc, 1);
+            let main = crate::diffusion_gemma::refmath::hsum_i32_8(lo) as i64
+                + crate::diffusion_gemma::refmath::hsum_i32_8(hi) as i64;
+            *sumf = d.mul_add(main as f32, *sumf);
+        }
+    }
+}
+
 /// v6 inner: 256-bit AVX-VNNI sibling of
 /// [`q4_k_owner_weight_row_block_avx512vnni`], for the Alder-Lake-and-later
 /// consumer parts that carry `vpdpbusd` but have AVX-512 fused off. Same
@@ -20911,14 +21056,32 @@ fn q4_k_owner_prefill_tiled(
     let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
+    // "The 512-bit VNNI kernels are usable on this host." The 8-row repack
+    // group kernel keys off THIS, not off which single-row inner is selected —
+    // it is a different kernel with its own algebra (its `mullo` is already
+    // amortized across four accumulating `dpbusd`s and its mins side is already
+    // vectorised), so the fold below neither applies to it nor gates it.
+    // (x86_64 only: every reader of it is behind the same cfg.)
     #[cfg(target_arch = "x86_64")]
-    let use_vnni = x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512vnni_available();
+    let avx512vnni_host = x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512vnni_available();
+    // The legacy `dpbusd` single-row inner, now opt-in — see the flag's doc comment.
+    #[cfg(target_arch = "x86_64")]
+    let use_vnni = avx512vnni_host && x86_kquant_matmul_owner_avx512vnni_enabled();
     #[cfg(not(target_arch = "x86_64"))]
     let use_vnni = false;
-    // 256-bit vpdpbusd: same instruction, no AVX-512. Only consulted when the
-    // 512-bit path is unavailable, and now opt-in — see the flag's doc comment.
+    // Folded 512-bit inner: the default whenever the host has avx512f+bw, which
+    // is a strictly wider set than the `dpbusd` sibling's (no VNNI required).
+    #[cfg(target_arch = "x86_64")]
+    let use_a512fold =
+        !use_vnni && x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512bw_available();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_a512fold = false;
+    // 256-bit vpdpbusd: same instruction, no AVX-512. Only consulted when both
+    // 512-bit paths are unavailable — so an AVX-512 host never reaches it — and
+    // itself opt-in since #617; see that flag's doc comment.
     #[cfg(target_arch = "x86_64")]
     let use_avxvnni = !use_vnni
+        && !use_a512fold
         && x86_kquant_matmul_owner_vnni_enabled()
         && x86_kquant_matmul_owner_avxvnni256_enabled()
         && std::arch::is_x86_feature_detected!("avxvnni")
@@ -20929,6 +21092,9 @@ fn q4_k_owner_prefill_tiled(
     // silently measures the AVX2 inner (vacuous comparison).
     if use_vnni {
         Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if use_a512fold {
+        Q8_SCHED_KQUANT_OWNER_AVX512FOLD_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if use_avxvnni {
         Q8_SCHED_KQUANT_OWNER_AVXVNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -20968,7 +21134,7 @@ fn q4_k_owner_prefill_tiled(
     // below — bit-identical either way.
     #[cfg(target_arch = "x86_64")]
     if let Some(pack) = repack8 {
-        if use_vnni && pack.superblocks_per_row == superblocks && pack.rows <= out_dim {
+        if avx512vnni_host && pack.superblocks_per_row == superblocks && pack.rows <= out_dim {
             Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let groups = pack.rows / 8;
             const GROUPS_PER_TASK: usize = 4; // 32 output rows per task, as below
@@ -21084,6 +21250,21 @@ fn q4_k_owner_prefill_tiled(
                     // SAFETY: avx512f/bw/vnni confirmed present at dispatch.
                     unsafe {
                         q4_k_owner_weight_row_block_avx512vnni(
+                            w_row,
+                            superblocks,
+                            &wd,
+                            &wdmin,
+                            &wscales,
+                            &wmins,
+                            &preps[row_start..row_end],
+                            &mut sumf_block[..block_rows],
+                        );
+                    }
+                } else if use_a512fold {
+                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: avx512f/bw + avx2 confirmed present at dispatch.
+                    unsafe {
+                        q4_k_owner_weight_row_block_avx512fold(
                             w_row,
                             superblocks,
                             &wd,

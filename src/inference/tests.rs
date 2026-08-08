@@ -2214,6 +2214,7 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_X86_KQUANT_MATMUL_OWNER",
         "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
         "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256",
+        "CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI",
         "CAMELID_X86_Q6K_AVX2",
         "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
         "CAMELID_Q8_0_FILE_CACHE_BYTES",
@@ -3830,11 +3831,23 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                 0,
                 "baseline leg dispatched the owner (n_rows={n_rows}) — vacuous comparison"
             );
-            // Cover BOTH owner inners: VNNI (default when the CPU has it) and
-            // the AVX2 fallback (VNNI sub-flag forced off).
-            for vnni in ["1", "0"] {
+            // Cover EVERY owner inner reachable on this host: the folded
+            // 512-bit inner (default), the legacy dpbusd 512-bit inner
+            // (opt-in), and the AVX2 fallback (wide-inner flag off). A leg the
+            // CPU cannot reach legitimately falls back, so the engaged-checks
+            // below state exactly which inner each leg is ALLOWED to have run —
+            // without them a leg silently measures a kernel its name disclaims.
+            for leg in ["a512fold", "a512vnni", "avx2"] {
                 std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
-                std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI", vnni);
+                std::env::set_var(
+                    "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+                    if leg == "avx2" { "0" } else { "1" },
+                );
+                if leg == "a512vnni" {
+                    std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI", "1");
+                } else {
+                    std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI");
+                }
                 reset_q8_schedule_telemetry();
                 let owner = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
                 // Engaged-check: if the dispatch silently stopped firing, the
@@ -3843,37 +3856,48 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                 let telemetry = snapshot_q8_schedule_telemetry();
                 assert!(
                     telemetry.kquant_owner_prefill_taken > 0,
-                    "owner leg did not dispatch (n_rows={n_rows}, vnni={vnni}) — vacuous comparison"
+                    "owner leg did not dispatch (n_rows={n_rows}, leg={leg}) — vacuous comparison"
                 );
-                // Per-inner engaged check: the vnni=1 leg must actually run
-                // the VNNI inner when the host has the features; on hosts
-                // without them the leg legitimately falls back to AVX2 (the
-                // AVX2 inner is still covered by the vnni=0 leg).
-                let vnni_expected = vnni == "1" && q8_owner_avx512vnni_available();
+                let host_vnni512 = q8_owner_avx512vnni_available();
+                let host_bw512 = q8_owner_avx512bw_available();
+                // The folded inner needs only avx512f+bw, so on an AVX-512 host
+                // WITHOUT vnni the a512vnni leg legitimately lands on it too.
+                let (want_vnni, want_fold) = match leg {
+                    "a512vnni" => (host_vnni512, !host_vnni512 && host_bw512),
+                    "a512fold" => (false, host_bw512),
+                    _ => (false, false),
+                };
                 assert_eq!(
-                    vnni_expected,
+                    want_vnni,
                     telemetry.kquant_owner_vnni_taken > 0,
-                    "VNNI inner engagement mismatch (n_rows={n_rows}, vnni={vnni}, \
-                     host_vnni={})",
-                    q8_owner_avx512vnni_available()
+                    "dpbusd 512-bit inner engagement mismatch (n_rows={n_rows}, leg={leg}, \
+                     host_vnni512={host_vnni512}, host_bw512={host_bw512})"
                 );
-                // The 256-bit inner is opt-in, so neither leg may reach it —
-                // without this the non-512 host's legs could silently be
-                // measuring that kernel instead of the AVX2 one.
+                assert_eq!(
+                    want_fold,
+                    telemetry.kquant_owner_avx512fold_taken > 0,
+                    "folded 512-bit inner engagement mismatch (n_rows={n_rows}, leg={leg}, \
+                     host_vnni512={host_vnni512}, host_bw512={host_bw512})"
+                );
+                // The 256-bit inner sits strictly below both 512-bit paths AND
+                // is opt-in since #617. No leg here sets its flag, so it must
+                // never engage — without this a non-AVX-512 host's legs could
+                // silently be measuring that kernel instead of the AVX2 one.
                 assert_eq!(
                     telemetry.kquant_owner_avxvnni_taken, 0,
                     "the 256-bit inner engaged without its opt-in flag \
-                     (n_rows={n_rows}, vnni={vnni})"
+                     (n_rows={n_rows}, leg={leg})"
                 );
                 std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
                 std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
+                std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI");
                 assert_eq!(owner.data.len(), base.data.len());
                 for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
                     assert_eq!(
                         a.to_bits(),
                         b.to_bits(),
                         "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, \
-                         out_dim={out_dim}, vnni={vnni})"
+                         out_dim={out_dim}, leg={leg})"
                     );
                 }
             }
@@ -4074,7 +4098,10 @@ fn q4_k_repack8_budget_zero_degrades_bit_identically() {
 fn q4_k_owner_avxvnni_inner_is_bit_identical() {
     #[cfg(target_arch = "x86_64")]
     {
-        if !std::arch::is_x86_feature_detected!("avxvnni") || q8_owner_avx512vnni_available() {
+        // The 256-bit inner sits below BOTH 512-bit paths, and the folded one
+        // needs only avx512f+bw — so `avx512bw` (not `avx512vnni`) is what
+        // makes this kernel unreachable and the assertion vacuous.
+        if !std::arch::is_x86_feature_detected!("avxvnni") || q8_owner_avx512bw_available() {
             return;
         }
         let _env_guard = env_lock();
