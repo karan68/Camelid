@@ -21,23 +21,12 @@ import { createServer } from 'node:http'
 import { existsSync, readFileSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import puppeteer from 'puppeteer-core'
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const scriptDir = fileURLToPath(new URL('.', import.meta.url))
 const distDir = resolve(scriptDir, '../dist')
 
 if (!existsSync(distDir)) throw new Error(`missing ${distDir} -- run "npm run build" first`)
-
-const executablePath = [
-  process.env.PUPPETEER_EXECUTABLE_PATH,
-  'C:/Program Files/Google/Chrome/Application/chrome.exe',
-  'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-  '/usr/bin/google-chrome',
-  '/usr/bin/google-chrome-stable',
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser',
-].filter(Boolean).find(existsSync)
-if (!executablePath) throw new Error('Chrome or Edge is required for the offline banner smoke')
 
 /* The exact sentence the packaged build used to show. Asserting its ABSENCE is
    what keeps the dead end from coming back. */
@@ -101,7 +90,7 @@ const server = createServer(async (req, res) => {
 await new Promise((done) => server.listen(0, '127.0.0.1', done))
 const origin = `http://127.0.0.1:${server.address().port}`
 
-const browser = await puppeteer.launch({ executablePath, headless: 'new' })
+const browser = await launchBrowser({ purpose: 'the offline banner smoke', headless: 'new' })
 const pageErrors = []
 
 async function openBanner({ clipboard = 'ok', storage = {}, platform = null } = {}) {

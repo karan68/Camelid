@@ -1,28 +1,16 @@
 #!/usr/bin/env node
 
-import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
-import puppeteer from 'puppeteer-core'
-
-const executablePath = [
-  process.env.PUPPETEER_EXECUTABLE_PATH,
-  'C:/Program Files/Google/Chrome/Application/chrome.exe',
-  'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-  '/usr/bin/google-chrome',
-  '/usr/bin/google-chrome-stable',
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser',
-].filter(Boolean).find(existsSync)
-if (!executablePath) throw new Error('Chrome or Edge is required for Workspace visual smoke')
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const baseUrl = process.env.CAMELID_CAPTURE_URL || 'http://127.0.0.1:4175'
 const outputDir = process.env.CAMELID_CAPTURE_DIR
   ? resolve(process.env.CAMELID_CAPTURE_DIR)
   : fileURLToPath(new URL('../../target/', import.meta.url))
 await mkdir(outputDir, { recursive: true })
-const browser = await puppeteer.launch({ executablePath, headless: 'new' })
+const browser = await launchBrowser({ purpose: 'the Workspace visual smoke', headless: 'new' })
 const markdownFiles = [
   'CONFIGURATION.md',
   'CONFORMANCE.md',

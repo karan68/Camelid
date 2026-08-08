@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -21,6 +21,15 @@ use camelid::fabric::{Fabric, NodeSpec, RouteMode};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One request a stub received: enough to say which route it was and what
+/// credential the proxy presented on it.
+#[derive(Debug, Clone)]
+struct Received {
+    path: String,
+    /// The `Authorization` header verbatim, or `None` if the request carried none.
+    authorization: Option<String>,
+}
+
 #[derive(Clone)]
 struct StubConfig {
     health: String,
@@ -29,6 +38,10 @@ struct StubConfig {
     /// Held before answering `/v1/chat/completions`, to stand in for a real
     /// generation that takes a while. Health is never delayed.
     completion_delay: Duration,
+    /// When set, every route but `/v1/health` answers 401 unless the request
+    /// carries exactly this bearer token — the arrangement a node started with
+    /// `CAMELID_API_KEY` actually presents to the proxy.
+    required_key: Option<String>,
 }
 
 impl StubConfig {
@@ -44,6 +57,15 @@ impl StubConfig {
             ),
             completion_status: 200,
             completion_delay: Duration::ZERO,
+            required_key: None,
+        }
+    }
+
+    /// A node with an API key set: health stays open, generation does not.
+    fn requiring_key(model: &str, key: &str) -> Self {
+        Self {
+            required_key: Some(key.to_string()),
+            ..Self::ready(model, 0)
         }
     }
 
@@ -69,6 +91,7 @@ impl StubConfig {
 struct StubNode {
     port: u16,
     shutdown: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<Received>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -77,7 +100,9 @@ impl StubNode {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let thread_shutdown = Arc::clone(&shutdown);
+        let thread_requests = Arc::clone(&requests);
         let config = Arc::new(config);
         let thread = std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -90,12 +115,14 @@ impl StubNode {
                 // serial accept loop would make the proxy look slower than it
                 // is when several requests probe the same node at once.
                 let config = Arc::clone(&config);
-                std::thread::spawn(move || serve_once(&mut stream, &config));
+                let requests = Arc::clone(&thread_requests);
+                std::thread::spawn(move || serve_once(&mut stream, &config, &requests));
             }
         });
         Self {
             port,
             shutdown,
+            requests,
             thread: Some(thread),
         }
     }
@@ -106,6 +133,10 @@ impl StubNode {
             host: "127.0.0.1".to_string(),
             port: self.port,
         }
+    }
+
+    fn received(&self) -> Vec<Received> {
+        self.requests.lock().expect("stub lock").clone()
     }
 }
 
@@ -119,11 +150,27 @@ impl Drop for StubNode {
     }
 }
 
-fn serve_once(stream: &mut TcpStream, config: &StubConfig) {
-    let Some(path) = read_request_path(stream) else {
+fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<Received>>) {
+    let Some(received) = read_request(stream) else {
         return;
     };
-    let (status, body) = match path.as_str() {
+
+    // Mirrors `route_requires_auth` in the real server: `/v1/health` is exempt,
+    // everything else is gated.
+    let authorized = match &config.required_key {
+        Some(key) => {
+            received.path == "/v1/health"
+                || received.authorization.as_deref() == Some(&format!("Bearer {key}"))
+        }
+        None => true,
+    };
+
+    let (status, body) = match received.path.as_str() {
+        _ if !authorized => (
+            401_u16,
+            r#"{"error":{"message":"provide Authorization: Bearer <key> or X-API-Key"}}"#
+                .to_string(),
+        ),
         "/v1/health" => (200_u16, config.health.clone()),
         "/v1/chat/completions" => {
             if !config.completion_delay.is_zero() {
@@ -133,6 +180,10 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig) {
         }
         _ => (404, "{}".to_string()),
     };
+
+    // Record only after deciding, so a malformed request never poisons the log.
+    requests.lock().expect("stub lock").push(received);
+
     let response = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -141,7 +192,7 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig) {
     let _ = stream.flush();
 }
 
-fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+fn read_request(stream: &mut TcpStream) -> Option<Received> {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     let mut raw = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -162,11 +213,24 @@ fn read_request_path(stream: &mut TcpStream) -> Option<String> {
             if raw.len() >= header_end + 4 + expected {
                 let mut parts = head.lines().next()?.split_whitespace();
                 parts.next()?; // method
-                return Some(parts.next()?.to_string());
+                return Some(Received {
+                    path: parts.next()?.to_string(),
+                    authorization: authorization(&head),
+                });
             }
         }
     }
     None
+}
+
+/// The `Authorization` header from a request head, matched case-insensitively
+/// the way a real server matches it.
+fn authorization(head: &str) -> Option<String> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.trim().to_string())
 }
 
 fn fabric_of(specs: Vec<NodeSpec>) -> Fabric {
@@ -291,6 +355,79 @@ async fn a_node_5xx_reaches_the_client_verbatim_not_as_a_proxy_error() {
 
     assert_eq!(status, 503);
     assert_eq!(body["error"]["message"], "engine queue full");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_proxys_bearer_reaches_the_node_on_every_request_it_makes() {
+    // `fabric serve --bearer` is only worth having if the token survives the
+    // whole resident path. The proxy has no auth of its own, so the client sends
+    // none: this asserts the credential on the wire is the fabric's, presented
+    // to the node.
+    let node = StubNode::start(StubConfig::requiring_key("model-alpha", "s3cret"));
+    let fabric = fabric_of(vec![node.spec("solo")]).with_bearer(Some("s3cret"));
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, body, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "model-alpha" }), &[]).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "served by model-alpha"
+    );
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("solo"));
+
+    // The probe is authenticated as well as the forward. Health is exempt from
+    // the node's auth today, so that buys nothing now — it means placement keeps
+    // working if the exemption is ever tightened.
+    let seen = node.received();
+    assert!(
+        seen.iter().any(|request| request.path == "/v1/health"),
+        "the node was probed as well as forwarded to"
+    );
+    assert!(
+        seen.iter()
+            .any(|request| request.path == "/v1/chat/completions"),
+        "the forward reached the node"
+    );
+    for request in &seen {
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer s3cret"),
+            "`{}` went out unauthenticated",
+            request.path
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proxy_without_the_bearer_relays_the_nodes_401_rather_than_looking_healthy() {
+    // The defect the flag exists for, and the proof the gate in the test above
+    // is live rather than a no-op that would pass whatever the proxy sent.
+    // `/v1/health` is exempt, so an unauthenticated proxy observes this node as
+    // ready and places onto it fine; only the forward is refused, and that
+    // refusal is the node answering, so it must reach the client with its own
+    // status rather than as a proxy error naming a dead node.
+    let node = StubNode::start(StubConfig::requiring_key("model-alpha", "s3cret"));
+    let fabric = fabric_of(vec![node.spec("solo")]);
+    let addr = start_proxy(fabric, RouteMode::Throughput).await;
+
+    let (status, body, headers) =
+        post_chat(addr, &serde_json::json!({ "model": "model-alpha" }), &[]).await;
+
+    assert_eq!(status, 401);
+    assert!(
+        body["error"]["message"].is_string(),
+        "the refusal must carry a message an operator can act on: {body}"
+    );
+    // Placement still happened, so the answer is the node's, not the proxy's.
+    assert_eq!(header(&headers, "x-camelid-fabric-node"), Some("solo"));
+    assert!(
+        node.received()
+            .iter()
+            .all(|request| request.authorization.is_none()),
+        "an unconfigured proxy must not send an Authorization header"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

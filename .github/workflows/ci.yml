@@ -389,15 +389,24 @@ jobs:
         run: npm ci
 
       - name: Build frontend
+        id: build
         run: npm run build
 
+      # Every smoke below carries this. The smokes are independent of each other,
+      # so stopping at the first failure only hides the rest: a red gate then
+      # takes one round trip per broken smoke to fully diagnose. Guarding on the
+      # build keeps that from turning a broken build into a wall of identical
+      # "missing dist" errors, and the job still fails on any smoke failure.
       - name: Frontend support-contract smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:model-state
 
       - name: Frontend model-lanes smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:model-lanes
 
       - name: Frontend catalog activation smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:catalog-activation
 
       # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
@@ -406,6 +415,7 @@ jobs:
       # click. Also asserts the shipped ledger row and the shipped catalog id still
       # join, which is what makes the offer derived rather than hard-coded.
       - name: Frontend first-run activation smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:first-run
 
       # Component-level: mounts the real first-run card in a browser against a
@@ -414,6 +424,7 @@ jobs:
       # re-download it) and cancelling when the backend disagrees that anything was
       # cancelled (404 mid-start, 409 after completion, unreadable probes).
       - name: Frontend first-run card component smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:first-run-card
 
       # Component-level: the offline banner is the only surface a user sees when
@@ -422,6 +433,7 @@ jobs:
       # packaged build can never regress to offering a control it cannot honour,
       # and the dev-server one-click Start keeps working.
       - name: Frontend offline banner smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:offline-banner
 
       # Covers frontend/src/lib/catalogBrowse.js: fit labels/details, the
@@ -429,24 +441,31 @@ jobs:
       # script shipped with the lane but was never wired here, so none of that
       # logic was gated.
       - name: Frontend catalog browse smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:catalog-browse
 
       - name: Frontend catalog companion download smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:catalog-companion
 
       - name: Frontend model deletion smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:model-deletion
 
       - name: Frontend 3B exact-row closure smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:3b-closure
 
       - name: Frontend integration smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:integration
 
       - name: Workspace logic smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:workspace
 
       - name: Workspace read-only visual smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           set -euo pipefail
           npm run preview > /tmp/camelid-workspace-preview.log 2>&1 &
@@ -460,6 +479,7 @@ jobs:
           npm run smoke:workspace-visual
 
       - name: Frontend UI regression smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: npm run smoke:ui
 
   # ---------------------------------------------------------------------------

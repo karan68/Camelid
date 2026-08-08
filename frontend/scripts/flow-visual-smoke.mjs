@@ -4,7 +4,7 @@
    invisible, not aesthetic targets. Needs backend + dev server + a loaded
    generation-ready model. */
 import assert from 'node:assert/strict'
-import puppeteer from 'puppeteer-core'
+import { launchBrowser } from './lib/launch-browser.mjs'
 
 const IDLE_WAIT_MS = Number(process.env.FLOW_SMOKE_IDLE_MS || 60000)
 const lum = ([r, g, b]) => {
@@ -13,7 +13,7 @@ const lum = ([r, g, b]) => {
 }
 const contrast = (a, b) => { const [hi, lo] = lum(a) >= lum(b) ? [lum(a), lum(b)] : [lum(b), lum(a)]; return (hi + 0.05) / (lo + 0.05) }
 
-const browser = await puppeteer.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
+const browser = await launchBrowser({ purpose: 'the flow visual smoke', headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
 
 async function runTheme(theme, withIdleCheck) {
   const page = await browser.newPage()
