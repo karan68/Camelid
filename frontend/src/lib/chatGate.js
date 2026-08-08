@@ -1,4 +1,4 @@
-import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from './capabilities.js'
+import { compatibilityHintCopy, findCompatibilityHint, isCompatibilitySupportedForModel } from './capabilities.js'
 import { isRunnableInCurrentRuntime, modelRuntimeIdMatches } from './modelState.js'
 
 /* The backend's exact-artifact verdict for this model's GGUF, from
@@ -66,8 +66,8 @@ function supportedCatalogGhostCuda(runtime, runtimeLane) {
 
 function runtimeLaneHint(hint, laneScopedRow, runtimeLane) {
   const reason = runtimeLane === 'ghost_moe'
-    ? 'This Ghost-MoE run is outside the supported catalog-managed Windows CUDA lane, or one of its GPU components is inactive.'
-    : 'This row has no recognized distributed or catalog-managed Windows CUDA Ghost runtime report, so this run remains experimental.'
+    ? 'This model is running in a configuration that has not been verified, so replies are treated as experimental.'
+    : 'No verified run configuration was detected for this model, so replies are treated as experimental.'
   const target = hint?.target || (laneScopedRow
     ? {
         id: GEMMA4_26B_LANE_SCOPED_ROW,
@@ -79,7 +79,7 @@ function runtimeLaneHint(hint, laneScopedRow, runtimeLane) {
   return {
     ...(hint || { kind: 'runtime_lane_mismatch', exact: false }),
     kind: 'runtime_lane_mismatch',
-    confidence: 'experimental runtime lane is outside the row support scope',
+    confidence: 'this run configuration is not covered by verification',
     target: {
       ...target,
       status: 'experimental_runtime_lane',
@@ -143,7 +143,15 @@ export function getChatGateState(capabilities, model, runtime) {
     chatUnlocked,
     experimentalUnlocked,
     chatMode,
-    label: compatibilityHintLabel(hint, 'No matching COMPATIBILITY.md row'),
+    // Human label layer: plain product language for every surface that shows
+    // the gate. Raw row ids stay in `hint` for technical views and popovers.
+    label: !model
+      ? 'No model loaded'
+      : contractSupported
+        ? 'Verified'
+        : experimentalUnlocked
+          ? 'Runnable (unverified)'
+          : 'Not verified',
     copy: compatibilityHintCopy(hint),
   }
 }

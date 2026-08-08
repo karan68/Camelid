@@ -22,9 +22,9 @@
   background: var(--color-unsupported-soft);
   color: var(--color-unsupported);
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: var(--text-2xs);
   font-weight: 500;
-  letter-spacing: 0.04em;
+  letter-spacing: var(--tracking-label);
   line-height: 1.5;
   text-transform: uppercase;
   white-space: nowrap;
@@ -43,7 +43,7 @@
 
 .ev-chip--sm {
   padding: 1px 6px;
-  font-size: 0.625rem;
+  font-size: var(--text-micro);
   gap: 4px;
 }
 
@@ -139,7 +139,7 @@
   align-items: center;
   gap: 5px;
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: var(--text-2xs);
   font-weight: 600;
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -161,7 +161,7 @@
 
 .ev-pop__status {
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: var(--text-2xs);
   color: var(--color-text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -188,7 +188,7 @@
   flex: none;
   width: 64px;
   font-family: var(--font-mono);
-  font-size: 0.625rem;
+  font-size: var(--text-micro);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--color-text-faint);
@@ -205,7 +205,7 @@
   font-family: var(--font-mono);
   word-break: break-all;
 }
-.ev-pop__cite-row dd code { font-size: 0.75rem; color: var(--color-text); }
+.ev-pop__cite-row dd code { font-size: var(--text-xs); color: var(--color-text); }
 
 .ev-pop__note {
   margin: var(--space-2) 0 0;

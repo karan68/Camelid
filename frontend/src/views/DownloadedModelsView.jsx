@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import { Button } from '../components/ui/Button'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
+import { Notice } from '../components/ui/Notice'
 import {
   IconDownload,
   IconModels,
@@ -11,6 +12,7 @@ import {
   IconTrash,
 } from '../components/ui/icons'
 import { useModelsPageData } from '../hooks/useModelsPageData'
+import { formatBytes } from '../lib/formatters'
 import {
   loadLocalModelForChat,
   modelFilenameFromPath,
@@ -20,7 +22,6 @@ import { modelDeleteBlockedReason } from '../lib/modelDeletion'
 import {
   describeModel,
   metaLine,
-  prettySize,
 } from '../components/models/LaneRows'
 
 function desktopInvoke() {
@@ -44,7 +45,10 @@ export default function DownloadedModelsView({
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [storageBusy, setStorageBusy] = useState(false)
-  const [nextStoragePath, setNextStoragePath] = useState('')
+  // { path: string | null, restartRequired: boolean } — null path means the
+  // desktop default folder. Kept out of the transient notice state so the
+  // pending-restart banner survives clearMessages().
+  const [pendingStorage, setPendingStorage] = useState(null)
   const modelActionInFlightRef = useRef('')
 
   const models = spine.local?.models || []
@@ -143,7 +147,9 @@ export default function DownloadedModelsView({
     try {
       const result = await spine.deleteLocalModel(entry)
       setPendingDelete(null)
-      setNotice(`Deleted ${entry.filename} and freed ${prettySize(result.bytes_freed)}.`)
+      setNotice(result.bytes_freed
+        ? `Deleted ${entry.filename} and freed ${formatBytes(result.bytes_freed)}.`
+        : `Deleted ${entry.filename}.`)
     } catch (err) {
       setPendingDelete(null)
       setError(String(err?.message || err))
@@ -159,8 +165,7 @@ export default function DownloadedModelsView({
     try {
       const choice = await invoke('choose_models_directory')
       if (choice?.path) {
-        setNextStoragePath(choice.path)
-        setNotice('The new model folder will be used after Camelid Desktop restarts.')
+        setPendingStorage({ path: choice.path, restartRequired: Boolean(choice.restart_required) })
       }
     } catch (err) {
       setError(String(err?.message || err))
@@ -174,9 +179,10 @@ export default function DownloadedModelsView({
     clearMessages()
     setStorageBusy(true)
     try {
+      // The command may return no path (the desktop resolves its default at
+      // startup); render that as plain language, never as a fake path string.
       const choice = await invoke('reset_models_directory')
-      setNextStoragePath(choice?.path || 'Camelid Desktop default')
-      setNotice('The default model folder will be restored after Camelid Desktop restarts.')
+      setPendingStorage({ path: choice?.path || null, restartRequired: Boolean(choice?.restart_required) })
     } catch (err) {
       setError(String(err?.message || err))
     } finally {
@@ -203,7 +209,7 @@ export default function DownloadedModelsView({
           </div>
           <div className="cxv-stat">
             <span>Storage</span>
-            <strong>{prettySize(totalBytes) || '0 MB'}</strong>
+            <strong>{formatBytes(totalBytes)}</strong>
             <small>GGUF files</small>
           </div>
         </div>
@@ -222,11 +228,20 @@ export default function DownloadedModelsView({
         <code className="downloaded-storage__path">
           {spine.local?.models_dir || (spine.localLoading ? 'Loading…' : 'Unavailable')}
         </code>
-        {nextStoragePath ? (
+        {pendingStorage ? (
           <div className="downloaded-storage__next" role="status">
             <span>After restart</span>
-            <code>{nextStoragePath}</code>
+            {pendingStorage.path ? (
+              <code>{pendingStorage.path}</code>
+            ) : (
+              <span>The default model folder</span>
+            )}
           </div>
+        ) : null}
+        {pendingStorage?.restartRequired ? (
+          <p className="downloaded-storage__note" role="status">
+            Quit and reopen Camelid Desktop to start using this folder.
+          </p>
         ) : null}
         <p className="downloaded-storage__note">
           Changing folders takes effect after restart. Existing model files stay in the current
@@ -267,10 +282,10 @@ export default function DownloadedModelsView({
         </div>
       ) : null}
 
-      {error ? <p className="lane-error" role="alert">{error}</p> : null}
-      {notice ? <p className="lane-delete-success" role="status">{notice}</p> : null}
+      <Notice notice={error} tone="error" onDismiss={() => setError('')} />
+      <Notice notice={notice} tone="success" onDismiss={() => setNotice('')} />
       {spine.localError && !spine.local ? (
-        <p className="lane-error">Could not list downloaded models: {spine.localError}</p>
+        <Notice notice={`Could not list downloaded models: ${spine.localError}`} tone="error" />
       ) : null}
 
       <div className="cxv-toolbar downloaded-toolbar">
@@ -322,7 +337,7 @@ export default function DownloadedModelsView({
                 <div className="cxv-card__head">
                   <div className="cxv-card__titles">
                     <strong title={entry.filename}>{entry.filename}</strong>
-                    <span className="cxv-card__sub">{metaLine(entry) || prettySize(entry.size_bytes)}</span>
+                    <span className="cxv-card__sub">{metaLine(entry) || (entry.size_bytes ? formatBytes(entry.size_bytes) : '')}</span>
                   </div>
                   <div className="downloaded-model__tags">
                     {isLoaded ? <span className="cxv-tag cxv-tag--ready">Loaded</span> : null}
@@ -332,7 +347,7 @@ export default function DownloadedModelsView({
                 <p className="cxv-card__preview">{describeModel(entry)}</p>
                 <div className="cxv-card__foot">
                   <div className="cxv-card__meta">
-                    <strong>{prettySize(entry.size_bytes) || 'Unknown size'}</strong>
+                    <strong>{entry.size_bytes ? formatBytes(entry.size_bytes) : 'Unknown size'}</strong>
                     <span className="cxv-dot">·</span>
                     <span>{entry.chat_capable ? 'Chat model' : 'Text model'}</span>
                   </div>
@@ -348,36 +363,36 @@ export default function DownloadedModelsView({
                         Make default
                       </Button>
                     ) : null}
-                    <Button
-                      variant="tonal"
-                      size="sm"
-                      icon={<IconPlay size={16} />}
-                      onClick={() => load(entry.filename)}
-                      loading={modelAction.filename === entry.filename && modelAction.type === 'load'}
-                      disabled={isLoaded || !canLoad || actionBusy || Boolean(deletingFilename)}
-                      aria-label={`Load ${entry.filename}`}
-                      title={
-                        isLoaded
-                          ? 'This model is already loaded'
-                          : canLoad
-                            ? 'Load this model into Camelid'
-                            : 'Camelid cannot load this model architecture'
-                      }
-                    >
-                      Load
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      icon={<IconStop size={15} />}
-                      onClick={() => unload(entry.filename, loadedModelId)}
-                      loading={modelAction.filename === entry.filename && modelAction.type === 'unload'}
-                      disabled={!isLoaded || actionBusy || Boolean(deletingFilename)}
-                      aria-label={`Unload ${entry.filename}`}
-                      title={isLoaded ? 'Unload this model from memory' : 'This model is not loaded'}
-                    >
-                      Unload
-                    </Button>
+                    {/* Load and Unload are one mutually exclusive control: only
+                        one of them is ever actionable, and a row of permanently
+                        disabled Unload buttons made the grid look unfinished. */}
+                    {isLoaded ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        icon={<IconStop size={15} />}
+                        onClick={() => unload(entry.filename, loadedModelId)}
+                        loading={modelAction.filename === entry.filename && modelAction.type === 'unload'}
+                        disabled={actionBusy || Boolean(deletingFilename)}
+                        aria-label={`Unload ${entry.filename}`}
+                        title="Unload this model from memory"
+                      >
+                        Unload
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="tonal"
+                        size="sm"
+                        icon={<IconPlay size={16} />}
+                        onClick={() => load(entry.filename)}
+                        loading={modelAction.filename === entry.filename && modelAction.type === 'load'}
+                        disabled={!canLoad || actionBusy || Boolean(deletingFilename)}
+                        aria-label={`Load ${entry.filename}`}
+                        title={canLoad ? 'Load this model into Camelid' : 'Camelid can’t run this model type'}
+                      >
+                        Load
+                      </Button>
+                    )}
                     <Button
                       variant="ghost"
                       size="sm"
@@ -418,7 +433,7 @@ export default function DownloadedModelsView({
         open={Boolean(pendingDelete)}
         title={pendingDelete ? `Delete ${pendingDelete.filename}?` : 'Delete model?'}
         detail={pendingDelete
-          ? `This permanently removes ${prettySize(pendingDelete.size_bytes) || 'this file'} from disk. This cannot be undone.`
+          ? `This permanently removes ${pendingDelete.size_bytes ? formatBytes(pendingDelete.size_bytes) : 'this file'}${pendingDelete.ghost_moe_prepared ? ' and its Ghost MoE expert pack' : ''} from disk. This cannot be undone.`
           : ''}
         confirmLabel="Delete model"
         busy={Boolean(deletingFilename)}

@@ -64,7 +64,8 @@ impl StartupSnapshot {
 
 impl Default for StartupSnapshot {
     fn default() -> Self {
-        Self::status("Starting engine...")
+        // Typographic ellipsis, matching every emitted status and the splash's static text.
+        Self::status("Starting engine\u{2026}")
     }
 }
 
@@ -93,6 +94,22 @@ impl StartupState {
 #[tauri::command]
 fn startup_snapshot(state: State<'_, StartupState>) -> StartupSnapshot {
     state.snapshot()
+}
+
+/// Re-run engine startup after the splash reports a failure, so the error pane's
+/// Retry button works in place instead of demanding a quit-and-relaunch. Any
+/// half-started sidecar is torn down first so a retry always begins clean.
+/// Async so this never runs on the main thread; the health-gated startup still
+/// moves to a dedicated thread, matching the setup-time launch.
+#[tauri::command]
+async fn retry_startup(app: tauri::AppHandle) {
+    shutdown_engine(&app);
+    let snapshot = StartupSnapshot::default();
+    if let Some(state) = app.try_state::<StartupState>() {
+        state.replace(snapshot.clone());
+    }
+    let _ = app.emit("engine-status", snapshot);
+    std::thread::spawn(move || start_engine(app));
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -255,6 +272,7 @@ fn main() {
         .manage(StartupState::default())
         .invoke_handler(tauri::generate_handler![
             startup_snapshot,
+            retry_startup,
             choose_models_directory,
             reset_models_directory
         ])
@@ -329,7 +347,7 @@ fn start_engine(app: tauri::AppHandle) {
                             emit_error(
                                 &app,
                                 "Engine UI could not load",
-                                "Retry the desktop app. If it persists, review the technical details.",
+                                "Retry. If the problem persists, review the technical details.",
                                 &format!("could not load the engine UI: {e}"),
                             );
                         }
@@ -337,7 +355,7 @@ fn start_engine(app: tauri::AppHandle) {
                     Err(e) => emit_error(
                         &app,
                         "Engine UI could not load",
-                        "Retry the desktop app. If it persists, review the technical details.",
+                        "Retry. If the problem persists, review the technical details.",
                         &format!("invalid engine URL {url}: {e}"),
                     ),
                 }
@@ -345,7 +363,7 @@ fn start_engine(app: tauri::AppHandle) {
                 emit_error(
                     &app,
                     "Desktop window unavailable",
-                    "Close Camelid Desktop and try again.",
+                    "Quit and reopen Camelid Desktop.",
                     "internal error: main window not found",
                 );
             }

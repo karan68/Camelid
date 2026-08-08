@@ -1,8 +1,9 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { clampText, formatDate } from '../lib/formatters'
+import { copyText } from '../lib/markdown'
 import { Button } from '../components/ui/Button'
 import { EmptyState } from '../components/ui/EmptyState'
-import { IconMemory, IconPin, IconCopy, IconEdit, IconTrash, IconChat, IconPlus, IconSearch } from '../components/ui/icons'
+import { IconMemory, IconPin, IconCopy, IconCheck, IconClose, IconEdit, IconTrash, IconChat, IconPlus, IconSearch } from '../components/ui/icons'
 
 export default function MemoryView({
   memories,
@@ -23,6 +24,10 @@ export default function MemoryView({
   const [editDraft, setEditDraft] = useState({ title: '', scope: '', body: '' })
   const [pendingDeleteId, setPendingDeleteId] = useState(null)
   const [busyAction, setBusyAction] = useState('')
+  const [copyFeedback, setCopyFeedback] = useState(null)
+  const copyResetRef = useRef(null)
+
+  useEffect(() => () => { if (copyResetRef.current) window.clearTimeout(copyResetRef.current) }, [])
 
   const searchableMemories = useMemo(() => {
     if (!memorySearch.trim()) return memories
@@ -85,7 +90,10 @@ export default function MemoryView({
   }
 
   const handleCopy = async (memory) => {
-    try { await navigator.clipboard.writeText(`${memory.title}\n\n${memory.body}`) } catch { /* notices handled elsewhere */ }
+    const ok = await copyText(`${memory.title}\n\n${memory.body}`)
+    setCopyFeedback({ id: memory.id, ok })
+    if (copyResetRef.current) window.clearTimeout(copyResetRef.current)
+    copyResetRef.current = window.setTimeout(() => setCopyFeedback(null), 1600)
   }
 
   const handleDelete = async (memoryId) => {
@@ -183,6 +191,7 @@ export default function MemoryView({
             const isPinning = busyAction === `pin:${memory.id}`
             const isSavingEdit = busyAction === `edit:${memory.id}`
             const confirming = pendingDeleteId === memory.id
+            const copyStatus = copyFeedback?.id === memory.id ? copyFeedback : null
 
             return (
               <article key={memory.id} className={`cxv-card cxv-mem ${memory.pinned ? 'is-pinned' : ''}`}>
@@ -196,7 +205,13 @@ export default function MemoryView({
                   </div>
                   <div className="cxv-card__actions">
                     <Button variant="ghost" size="sm" icon={<IconPin size={15} />} aria-label={memory.pinned ? 'Unpin' : 'Pin'} className={memory.pinned ? 'is-active' : ''} loading={isPinning} onClick={() => handleTogglePin(memory)} disabled={Boolean(busyAction)} />
-                    <Button variant="ghost" size="sm" icon={<IconCopy size={15} />} aria-label="Copy" onClick={() => handleCopy(memory)} />
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon={copyStatus ? (copyStatus.ok ? <IconCheck size={15} /> : <IconClose size={15} />) : <IconCopy size={15} />}
+                      aria-label={copyStatus ? (copyStatus.ok ? 'Copied' : 'Copy failed') : 'Copy'}
+                      onClick={() => handleCopy(memory)}
+                    />
                   </div>
                 </div>
 
@@ -222,6 +237,7 @@ export default function MemoryView({
                           size="sm"
                           className={confirming ? 'cxv-danger is-armed' : 'cxv-danger'}
                           icon={<IconTrash size={15} />}
+                          aria-label={confirming ? 'Confirm delete' : 'Delete memory'}
                           loading={isDeleting}
                           onClick={() => handleDelete(memory.id)}
                           disabled={isDeleting || (Boolean(busyAction) && !confirming)}

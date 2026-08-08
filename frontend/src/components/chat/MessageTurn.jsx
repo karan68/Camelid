@@ -24,6 +24,20 @@ const formatRate = (value) => {
   return `${rate >= 10 ? Math.round(rate) : rate.toFixed(1)} tok/s`
 }
 
+const formatTimeOfDay = (value) => {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+const formatFullTimestamp = (value) => {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+}
+
 /* Per-message metadata footer. Token counts are labeled by source (backend
    usage vs client estimate); TTFT and tok/s are always client-measured and say
    so — operational telemetry, never support evidence (I4). The Evidence Chip
@@ -34,7 +48,8 @@ function MessageMetaFooter({ message }) {
   const rate = formatRate(message.tokens_out_per_sec)
   const duration = formatMs(message.elapsed_ms)
   const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
-  if (!usage && !ttft && !rate && !message.model_id) return null
+  const sentAt = formatTimeOfDay(message.created_at)
+  if (!usage && !ttft && !rate && !message.model_id && !sentAt) return null
   return (
     <footer className="cxturn__meta" aria-label="Generation details (client-measured telemetry)">
       {message.model_id && <span className="cxturn__meta-item cxturn__meta-model">{message.model_id}</span>}
@@ -50,7 +65,7 @@ function MessageMetaFooter({ message }) {
         <EvidenceChip
           state="unsupported"
           asText
-          source={{ detail: 'Experimental lane: implemented architecture, not a supported row. Unverified, no parity claim.' }}
+          source={{ detail: 'Experimental support: this model type runs, but this build has not been validated against the reference implementation.' }}
           size="sm"
         >
           Experimental — unverified
@@ -64,20 +79,36 @@ function MessageMetaFooter({ message }) {
       {ttft && <span className="cxturn__meta-item" title="Time to first content, measured in this browser">TTFT {ttft}</span>}
       {rate && <span className="cxturn__meta-item" title="End-to-end output rate, measured in this browser">{rate}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
+      {sentAt && <time className="cxturn__meta-item" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>}
       <span className="cxturn__meta-item cxturn__meta-note">client-measured</span>
     </footer>
   )
 }
 
 /* User rows: copy + inline edit-and-resend. Editing truncates the thread at
-   this message and resends through the normal gate-checked send path. */
+   this message and resends through the normal gate-checked send path. Copy is
+   always available — only "Edit & resend" is gated on resend being possible. */
 function UserTurn({ message, messageContent, onEditResend }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(messageContent)
+  const [copied, setCopied] = useState(false)
+  const copiedResetRef = useRef(null)
+  const sentAt = formatTimeOfDay(message.created_at)
   const submitEdit = () => {
     const next = draft.trim()
     setEditing(false)
     if (next && next !== messageContent) onEditResend?.(message.id, next)
+  }
+
+  useEffect(() => () => {
+    if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
+  }, [])
+
+  const handleCopy = async () => {
+    if (!(await copyText(messageContent))) return
+    setCopied(true)
+    if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
+    copiedResetRef.current = window.setTimeout(() => setCopied(false), 1600)
   }
   return (
     <article className="cxturn cxturn--user">
@@ -119,14 +150,19 @@ function UserTurn({ message, messageContent, onEditResend }) {
           <p>{messageContent}</p>
         )}
       </div>
-      {!editing && onEditResend && (
+      {!editing && (
         <div className="cxturn__actions cxturn__actions--user" aria-label="Message actions">
-          <button type="button" className="cxturn__action" onClick={() => copyText(messageContent)} title="Copy message">
-            <IconCopy size={14} /> <span>Copy</span>
+          {sentAt && (
+            <time className="cxturn__action-time" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>
+          )}
+          <button type="button" className="cxturn__action" onClick={handleCopy} title="Copy message">
+            {copied ? <IconCheck size={14} /> : <IconCopy size={14} />} <span>{copied ? 'Copied' : 'Copy'}</span>
           </button>
-          <button type="button" className="cxturn__action" onClick={() => { setDraft(messageContent); setEditing(true) }} title="Edit this message and resend — replaces the replies after it">
-            <IconEdit size={14} /> <span>Edit &amp; resend</span>
-          </button>
+          {onEditResend && (
+            <button type="button" className="cxturn__action" onClick={() => { setDraft(messageContent); setEditing(true) }} title="Edit this message and resend — replaces the replies after it">
+              <IconEdit size={14} /> <span>Edit &amp; resend</span>
+            </button>
+          )}
         </div>
       )}
     </article>
@@ -158,8 +194,10 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
     if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
   }, [])
 
+  /* Only confirm "Copied" when the text actually reached the clipboard —
+     copyText returns false when clipboard access is unavailable or denied. */
   const handleCopyMessage = async () => {
-    await copyText(messageContent)
+    if (!(await copyText(messageContent))) return
     setCopied(true)
     if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
     copiedResetRef.current = window.setTimeout(() => setCopied(false), 1600)

@@ -3,6 +3,32 @@ import { createPortal } from 'react-dom'
 import { IconClose } from './icons'
 import { IconButton } from './IconButton'
 
+const FOCUSABLE_SELECTOR = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
+/* Keeps Tab/Shift+Tab cycling inside `panel`. Shared with the few surfaces
+   (ShortcutsOverlay, ModelInspector) that render their own dialog chrome. */
+export function wrapDialogFocus(event, panel) {
+  if (event.key !== 'Tab' || !panel) return
+  const focusables = panel.querySelectorAll(FOCUSABLE_SELECTOR)
+  if (!focusables.length) {
+    event.preventDefault()
+    panel.focus()
+    return
+  }
+  const first = focusables[0]
+  const last = focusables[focusables.length - 1]
+  const active = document.activeElement
+  if (event.shiftKey) {
+    if (active === first || active === panel || !panel.contains(active)) {
+      event.preventDefault()
+      last.focus()
+    }
+  } else if (active === last || !panel.contains(active)) {
+    event.preventDefault()
+    first.focus()
+  }
+}
+
 /* Modal — accessible dialog with backdrop, Esc-to-close, scroll lock, focus capture. */
 export function Modal({ open, onClose, title, children, footer = null, labelledById, size = 'md', className = '' }) {
   const panelRef = useRef(null)
@@ -14,7 +40,9 @@ export function Modal({ open, onClose, title, children, footer = null, labelledB
       if (event.key === 'Escape') {
         event.stopPropagation()
         onClose?.()
+        return
       }
+      wrapDialogFocus(event, panelRef.current)
     }
     window.addEventListener('keydown', onKey)
     const { body } = document

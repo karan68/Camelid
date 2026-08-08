@@ -194,7 +194,7 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
           <h3>No cluster nodes yet.</h3>
           <p>Add your first Mac, Windows PC, Linux server, or Raspberry Pi to start building your local compute fabric.</p>
           <div className="cluster-empty__actions">
-            <Button variant="primary" icon={<IconPlus size={16} />} onClick={onAddServer}>Add Server</Button>
+            <Button variant="primary" icon={<IconPlus size={16} />} onClick={onAddServer}>Add server</Button>
             {onLoadSample && <Button variant="ghost" onClick={onLoadSample}>Load a sample fabric</Button>}
           </div>
         </div>
@@ -272,8 +272,8 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
         <span className="cluster-canvas__zoom">{Math.round(view.scale * 100)}%</span>
         <Button variant="ghost" size="sm" className="cluster-ctl" icon={<IconFit size={16} />} onClick={fit}>Fit</Button>
         <Button variant="ghost" size="sm" className="cluster-ctl" icon={<IconGrid size={16} />} onClick={() => onAutoLayout?.()}>Auto-layout</Button>
-        <button type="button" className={`cluster-toggle ${snap ? 'is-on' : ''}`} onClick={() => setSnap((s) => !s)} title="Snap to grid">Snap</button>
-        <button type="button" className={`cluster-toggle ${showGrid ? 'is-on' : ''}`} onClick={() => setShowGrid((g) => !g)} title="Toggle grid">Grid</button>
+        <button type="button" className={`cluster-toggle ${snap ? 'is-on' : ''}`} aria-pressed={snap} onClick={() => setSnap((s) => !s)} title="Snap to grid">Snap</button>
+        <button type="button" className={`cluster-toggle ${showGrid ? 'is-on' : ''}`} aria-pressed={showGrid} onClick={() => setShowGrid((g) => !g)} title="Toggle grid">Grid</button>
       </div>
 
       <Minimap nodes={nodes} view={view} size={size} setView={setView} />

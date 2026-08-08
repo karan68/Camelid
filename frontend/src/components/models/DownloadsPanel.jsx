@@ -1,3 +1,4 @@
+import { Button } from '../ui/Button'
 import { formatBytes } from '../../lib/formatters'
 
 /* Zone 4 — one global live status area for active downloads. Progress comes ONLY
@@ -18,10 +19,10 @@ export function DownloadsPanel({ downloads = [], onCancel, cancelingIds = new Se
   return (
     <section className="lane-section downloads-panel" aria-label="Downloads in progress">
       <header className="lane-section-head">
-        <h3>
+        <h2>
           Downloads <span className="lane-section-count">{active.length}</span>
-        </h3>
-        <p className="lane-section-sub">Live from the backend download list; canceling removes the partial file.</p>
+        </h2>
+        <p className="lane-section-sub">Canceling a download removes the partially downloaded file.</p>
       </header>
       <div className="lane-section-body">
         {active.map((dl) => (
@@ -46,18 +47,24 @@ export function DownloadsPanel({ downloads = [], onCancel, cancelingIds = new Se
                   )}
                 </span>
               </div>
-              <button
-                type="button"
-                className="lane-row-action downloads-cancel"
-                onClick={() => onCancel(dl.id)}
-                disabled={cancelingIds.has(dl.id) || dl.status === 'preparing'}
-              >
-                {dl.status === 'preparing' ? 'Finalizing…' : cancelingIds.has(dl.id) ? 'Canceling…' : 'Cancel'}
-              </button>
+              {/* Preparing is not cancelable; the meta line already says so, and a
+                  Cancel button relabeled into a status caption reads as broken. */}
+              {dl.status === 'preparing' ? null : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onCancel(dl.id)}
+                  loading={cancelingIds.has(dl.id)}
+                  disabled={cancelingIds.has(dl.id)}
+                >
+                  Cancel
+                </Button>
+              )}
             </div>
             <div
               className="downloads-progress"
               role="progressbar"
+              aria-label={`Download progress for ${dl.filename}`}
               aria-valuenow={dl.status === 'preparing' ? 100 : pct(dl)}
               aria-valuemin={0}
               aria-valuemax={100}

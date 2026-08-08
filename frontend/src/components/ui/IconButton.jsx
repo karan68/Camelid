@@ -17,7 +17,7 @@ export function IconButton({
   ].filter(Boolean).join(' ')
 
   return (
-    <button type="button" className={classes} aria-label={label} title={label} aria-pressed={active || undefined} {...rest}>
+    <button type="button" className={classes} aria-label={label} aria-pressed={active || undefined} {...rest}>
       {children}
     </button>
   )

@@ -23,7 +23,7 @@ export function ConfirmDialog({
       footer={
         <>
           <Button variant="ghost" onClick={onCancel} disabled={busy}>{cancelLabel}</Button>
-          <Button variant={tone} onClick={onConfirm} loading={busy}>{confirmLabel}</Button>
+          <Button variant={tone} onClick={onConfirm} loading={busy} disabled={busy}>{confirmLabel}</Button>
         </>
       }
     >

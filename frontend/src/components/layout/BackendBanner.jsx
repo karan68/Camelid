@@ -36,6 +36,22 @@ function readEnginePath() {
   return readStored(ENGINE_PATH_STORAGE_KEY)
 }
 
+/* Inside Camelid Desktop the sidecar engine is bundled and supervised by the
+   shell — terminal restart commands are wrong there, so the banner switches to
+   app-level guidance instead. Same detection as DownloadedModelsView. */
+function isDesktopShell() {
+  if (typeof window === 'undefined') return false
+  return Boolean(window.__TAURI__?.core?.invoke)
+}
+
+/* `camelid.exe` / "unzipped" phrasing is only right on Windows. The stored
+   engine path is the most reliable signal (it names the machine the engine is
+   actually on); navigator.platform is the fallback when no path was cached. */
+function isWindowsEngine(enginePath) {
+  if (enginePath) return /^[A-Za-z]:[\\/]/.test(enginePath) || enginePath.startsWith('\\\\')
+  return typeof navigator !== 'undefined' && /^win/i.test(navigator.platform || '')
+}
+
 /* Build a command the user can paste and run, from an absolute executable path.
 
    Quoting is not cosmetic here. On Windows a path with a space MUST be quoted,
@@ -111,6 +127,8 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
     : backend.resolvedCommand || RESTART_COMMAND
   const host = engineHostFrom(apiBase, typeof window === 'undefined' ? '' : window.location.href)
   const isLocalEngine = isLoopbackHost(host)
+  const isDesktopApp = isDesktopShell()
+  const windowsEngine = isWindowsEngine(enginePath)
   // 'idle' | 'copied' | 'failed'. Distinguishing the last two matters: the
   // clipboard API is absent outside secure contexts, and claiming "Copied"
   // there would be the same class of lie this whole change is removing.
@@ -136,11 +154,17 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
         <strong>Camelid engine isn’t running</strong>
         <span>
           {canStart && 'Start it to load a model and chat — no setup needed.'}
-          {!canStart && isLocalEngine && enginePath && (
-            <>This page is served by the engine, so it can’t restart it. Start it again with <code>{restartCommand}</code> — or just run <code>camelid.exe</code> from where you unzipped Camelid.</>
+          {!canStart && isLocalEngine && isDesktopApp && (
+            <>The engine that powers Camelid stopped. Quit and reopen Camelid Desktop to restart it.</>
           )}
-          {!canStart && isLocalEngine && !enginePath && (
+          {!canStart && isLocalEngine && !isDesktopApp && enginePath && (
+            <>This page is served by the engine, so it can’t restart it. Start it again with <code>{restartCommand}</code>{windowsEngine ? <> — or just run <code>camelid.exe</code> from where you unzipped Camelid</> : null}.</>
+          )}
+          {!canStart && isLocalEngine && !isDesktopApp && !enginePath && windowsEngine && (
             <>This page is served by the engine, so it can’t restart it. Start <code>camelid.exe</code> again from the folder you unzipped Camelid into — or re-run the command you launched it with.</>
+          )}
+          {!canStart && isLocalEngine && !isDesktopApp && !enginePath && !windowsEngine && (
+            <>This page is served by the engine, so it can’t restart it. Start the Camelid app again from where you installed it — or re-run the command you launched it with.</>
           )}
           {!canStart && !isLocalEngine && (
             <>The engine this UI points at — <code>{host}</code> — isn’t answering. Check that Camelid is running on that machine, or point this UI somewhere else in Settings.</>
@@ -160,7 +184,7 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
             {running ? 'Starting…' : 'Start Camelid'}
           </Button>
         )}
-        {!canStart && isLocalEngine && (
+        {!canStart && isLocalEngine && !isDesktopApp && (
           <Button
             variant="primary"
             size="sm"

@@ -1,7 +1,7 @@
 /* NeuralField — canvas host for the Neural Field renderer: the loaded
    model's real structure (layers, attention flow, KV growth, sampling) lit
    by live telemetry. Same rAF/DPR/ResizeObserver/cleanup skeleton as
-   InferenceCanvas; data path is the backend SSE store
+   the Flow Bench canvas host; data path is the backend SSE store
    (useInferenceTelemetry + store.drainEvents), NOT the client-side
    telemetryLog bus — the backend is the source of truth for model internals.
 

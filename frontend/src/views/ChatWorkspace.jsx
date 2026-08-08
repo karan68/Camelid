@@ -1,12 +1,12 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint } from '../lib/capabilities'
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
 import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
-import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconEdit, IconImage, IconClose } from '../components/ui/icons'
+import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconChevronDown, IconEdit, IconImage, IconInfo, IconClose } from '../components/ui/icons'
+import { Tooltip } from '../components/ui/Tooltip'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
@@ -20,13 +20,6 @@ const isInterruptedPlaceholderMessage = (message) => {
   if (message?.role !== 'assistant') return false
   const content = String(message?.content || '').trim().toLowerCase()
   return content === '(generation interrupted)' || content === '(generation stopped)'
-}
-
-function readinessTone({ ready = false, blocked = false, offline = false, waiting = false } = {}) {
-  if (ready) return 'ready'
-  if (offline || blocked) return 'blocked'
-  if (waiting) return 'waiting'
-  return 'idle'
 }
 
 const SUGGESTIONS = [
@@ -44,6 +37,25 @@ const FOLLOW_UP_PROMPTS = [
 
 const MAX_VISION_UPLOAD_BYTES = 3 * 1024 * 1024
 const MAX_VISION_EDGE = 1600
+
+/* Day separators: a calendar-day key plus a short label ("Today", "Yesterday",
+   "Tue, Aug 4") rendered between turns whenever the day changes. */
+const dayKeyOf = (value) => {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`
+}
+
+const formatDayLabel = (value) => {
+  const date = new Date(value)
+  const now = new Date()
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+  if (dayKeyOf(date) === dayKeyOf(now)) return 'Today'
+  if (dayKeyOf(date) === dayKeyOf(yesterday)) return 'Yesterday'
+  const sameYear = date.getFullYear() === now.getFullYear()
+  return date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }) })
+}
 
 const readAsDataUrl = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader()
@@ -190,97 +202,42 @@ export default function ChatWorkspace({
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
   const selectedRuntimeMatchesLoadedModel = Boolean(selectedChatGate.runtimeLoaded)
-  const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
-  const selectedCompatibilityLabel = selectedModel
-    ? compatibilityHintLabel(selectedCompatibilityHint, 'No matching COMPATIBILITY.md row')
-    : 'No model selected'
-  const selectedCompatibilityCopy = selectedModel
-    ? compatibilityHintCopy(selectedCompatibilityHint)
-    : 'Choose a model before inferring any support boundary. Camelid will not promote filenames or saved paths into compatibility claims.'
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const selectedModelIssue = selectedModel?.load_error || selectedModel?.install_error || ''
 
-  const runtimeStatusLabel = apiUnavailable
-    ? 'API unavailable'
+  /* One-line composer status: dot + a single short sentence. The longer detail
+     (send gate, reply cap, local-inference note) folds into the tooltip below. */
+  const statusLine = apiUnavailable
+    ? 'Not connected — start the local server to chat.'
     : selectedModelRunnable
-      ? 'Local chat ready'
+      ? `${selectedModelName} is loaded and ready.`
       : experimentalChatReady
-        ? 'Experimental chat ready'
-      : selectedRuntimeReady
-        ? 'Runtime ready, support gated'
-        : runtime?.loaded_now
-          ? 'Loaded, not generation-ready'
-          : 'No generation-ready model'
-  const runtimeStatusCopy = apiUnavailable
-    ? 'Camelid did not respond. Start the server or check the API base before loading a model.'
-    : selectedModelRunnable
-      ? `${selectedModelName} is loaded now and generation_ready=true.`
-      : experimentalChatReady
-        ? `${selectedModelName} is loaded and generation_ready=true on the experimental lane.`
-      : selectedRuntimeReady
-        ? 'The runtime is ready; Camelid still needs an exact supported row before chat unlocks.'
-        : runtime?.loaded_now
-          ? 'Wait for generation_ready=true before sending prompts.'
-          : 'Load a local GGUF from Models to start the readiness check.'
-  const supportStatusLabel = selectedModelCapabilitySupported
-    ? selectedCompatibilityLabel
-    : apiUnavailable
-      ? 'Contract unavailable'
-      : selectedModel
-        ? selectedCompatibilityLabel
-        : 'Choose model first'
-  const supportStatusCopy = selectedModelCapabilitySupported
-    ? `${selectedCompatibilityLabel}. COMPATIBILITY.md and /api/capabilities agree for this model and quant.`
-    : apiUnavailable
-      ? 'The /api/capabilities contract could not be read while the API is unavailable.'
-      : selectedModel
-        ? selectedCompatibilityCopy
-        : 'Camelid does not infer broad support from filenames, families, or saved paths.'
-  const readinessFinePrint = selectedModelRunnable
-    ? `${selectedCompatibilityLabel}. Ready for this loaded exact row.`
-    : experimentalChatReady
-      ? 'Ready for experimental chat; replies are unverified and carry no supported-row or parity claim.'
-    : apiUnavailable
-      ? 'Drafts stay editable while the Camelid API reconnects.'
-      : selectedModel
-        ? 'Chat unlocks only after loaded_now=true, generation_ready=true, and an exact supported compatibility row all match.'
-        // The activation card above owns the instruction during first run; repeating
-        // it here is the third copy of the same sentence on one screen.
-        : firstRunActive
-          ? 'Send unlocks as soon as the model above finishes setting up.'
-          : 'Choose a model, then Camelid will show what still needs to pass before send unlocks.'
-  const selectedModelReadinessCopy = selectedModelRunnable
-    ? 'Selected model is ready for Camelid chat.'
-    : experimentalChatReady
-      ? 'Selected model is ready for experimental Camelid chat.'
-    : apiUnavailable
-      ? 'The API is offline, so readiness cannot be checked yet.'
+        ? `${selectedModelName} is ready — replies are not verified.`
       : selectedModelIssue
         ? selectedModelIssue
         : supportBlocked
-          ? selectedCompatibilityCopy
+          ? `${selectedModelName} isn't verified for chat yet.`
           : selectedRuntimeMatchesLoadedModel
-            ? 'This model is loaded and still warming up. Send unlocks once generation readiness turns on.'
+            ? `${selectedModelName} is warming up — send unlocks shortly.`
             : selectedModel
-              ? 'Keep drafting here while Camelid prepares this model.'
-              : 'Choose a model before starting a Camelid chat.'
-  const selectedModelGateSummary = selectedModel
-    ? selectedModelRunnable
-      ? 'Selected model is ready for Camelid chat.'
-      : experimentalChatReady
-        ? 'Selected model is ready for experimental Camelid chat.'
-      : selectedModelIssue || selectedModelReadinessCopy
-    : 'Choose a model before starting a Camelid chat.'
+              ? `${selectedModelName} is getting ready — you can draft now.`
+              // The activation card above owns the instruction during first run;
+              // this line just points at it instead of restating it.
+              : firstRunActive
+                ? 'Send unlocks as soon as the model above finishes setting up.'
+                : models.length
+                  ? 'No model loaded — choose one above to chat.'
+                  : 'No model loaded — add one above to chat.'
 
   const productHeroTitle = canChat ? 'How can I help?' : "Hi there, let's get into it"
   const productHeroSummary = selectedModelRunnable
     ? 'Local chat is ready. Ask anything — responses stay grounded in the loaded model.'
     : experimentalChatReady
-      ? 'Experimental local chat is ready. Replies are unverified and have no parity guarantee.'
+      ? 'Experimental local chat is ready. Replies are not verified.'
     : apiUnavailable
       ? 'Keep writing here. Send unlocks again once the local API responds.'
       : supportBlocked
-        ? 'The runtime is up, but chat still needs an exact supported row before send unlocks.'
+        ? "This model isn't verified for chat yet. Pick a verified model to unlock send."
         : selectedModel
           ? 'Your draft is ready now. Send unlocks as soon as this model is ready.'
           // The activation card above already names the one thing to do; repeating
@@ -290,22 +247,7 @@ export default function ChatWorkspace({
             : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
   const readinessState = canChat ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
-  const runtimeTone = readinessTone({ ready: selectedModelRunnable, offline: apiUnavailable, waiting: Boolean(runtime?.loaded_now || selectedModel) })
   const statusTone = selectedModelRunnable ? 'ready' : experimentalChatReady ? 'warn' : apiUnavailable ? 'offline' : supportBlocked ? 'warn' : runtime?.loaded_now ? 'warn' : 'neutral'
-
-  const selectionSummaryCopy = selectedModelRunnable
-    ? `${selectedModelName} is loaded now and generation_ready=true. The current exact-row contract is unlocked.`
-    : experimentalChatReady
-      ? `${selectedModelName} is loaded now and generation_ready=true on the experimental lane. Replies remain unverified.`
-    : apiUnavailable
-      ? 'The frontend is available, but the Camelid API must respond before model readiness can be checked.'
-      : selectedModelIssue
-        ? selectedModelIssue
-        : supportBlocked
-          ? selectedCompatibilityCopy
-          : selectedModel
-            ? 'Drafting stays unlocked. Camelid will unlock send as soon as this selected row is loaded, generation-ready, and supported.'
-            : 'Pick a local model first, then Camelid will keep the runtime and support boundary visible here.'
 
   const canSubmit = Boolean(composer.trim()) && canChat && !generationActive
   const sendDisabledReason = canChat
@@ -313,28 +255,12 @@ export default function ChatWorkspace({
     : generationActive
       ? 'Wait for the current reply to finish or stop it before sending again.'
       : apiUnavailable
-        ? 'Send unlocks after the Camelid API reconnects.'
+        ? 'Sending unlocks once the connection is back.'
         : supportBlocked
-          ? 'Choose a supported model.'
+          ? 'Choose a verified model to send.'
           : selectedModel
-            ? 'Send unlocks when Camelid marks this model ready and supported.'
+            ? 'Sending unlocks once this model is ready.'
             : 'Choose a model before sending.'
-  const promptHintCopy = canChat
-    ? 'Enter sends · Shift+Enter for a new line'
-    : apiUnavailable
-      ? 'Draft now · send unlocks after the API reconnects'
-      : supportBlocked
-        ? 'Send unlocks after exact-row readiness passes'
-        : selectedModel
-          ? 'Draft now · send unlocks after readiness passes'
-          : 'Choose a model to unlock sending'
-  /* During first run the activation card is the instruction. The send button keeps its
-     own tooltip, but this line would be the fourth restatement on one screen. */
-  const composerHintCopy = canSubmit
-    ? promptHintCopy
-    : firstRunActive && !selectedModel
-      ? ''
-      : sendDisabledReason || promptHintCopy
 
   const composerDraftUnlocked = Boolean(selectedModel || apiUnavailable)
   const composerDisabled = !composerDraftUnlocked
@@ -450,9 +376,18 @@ export default function ChatWorkspace({
     }
   }
 
+  /* Focus the composer with the caret at the end, so Enter sends instead of
+     re-triggering the clicked suggestion (matches the vision-attach flow). */
   const handleSuggestion = (prompt) => {
     if (!composerDraftUnlocked) return
     setComposer(prompt)
+    window.requestAnimationFrame(() => {
+      const input = composerRef.current
+      if (!input) return
+      input.focus()
+      const end = input.value.length
+      input.setSelectionRange(end, end)
+    })
   }
 
   // ----- Model picker -----
@@ -464,8 +399,8 @@ export default function ChatWorkspace({
     const gate = getChatGateState(capabilities, model, runtime)
     if (gate.chatUnlocked) return `${model.name} · Ready`
     if (gate.chatMode === 'experimental') return `${model.name} · Experimental ready`
-    if (apiUnavailable) return `${model.name} · API unavailable`
-    if (gate.runtimeReady) return `${model.name} · Support gated`
+    if (apiUnavailable) return `${model.name} · Not connected`
+    if (gate.runtimeReady) return `${model.name} · Not verified`
     if (gate.runtimeLoaded) return `${model.name} · Loading`
     return `${model.name} · Not loaded`
   }
@@ -492,7 +427,14 @@ export default function ChatWorkspace({
     contextLength: modelContextLength(selectedModel),
   })
 
-  const detailCopy = canChat ? selectionSummaryCopy : (supportBlocked || selectedModelIssue ? selectedCompatibilityCopy : readinessFinePrint)
+  /* Folded fine print: everything that used to stack under the composer now
+     lives in the status line's tooltip. Error and budget notices still render
+     their own line while active. */
+  const statusDetail = [
+    canChat ? 'Enter sends. Shift+Enter starts a new line.' : sendDisabledReason,
+    ghostBudgetCapped ? `Replies from this model are capped at ${effectiveMaxTokens.toLocaleString()} tokens to keep memory usage stable.` : '',
+    'Camelid runs the loaded model locally. Verify important output.',
+  ].filter(Boolean).join(' ')
 
   const renderComposer = () => (
     <div className={`cxcomposer is-${readinessState}`}>
@@ -536,7 +478,7 @@ export default function ChatWorkspace({
         <div className="cxcomposer__toolbar">
           <div className="cxcomposer__tools">
             {models.length ? (
-              <label className="cxcomposer__model" title={selectedModel ? supportStatusCopy : 'Choose what Camelid should use for this chat.'}>
+              <label className="cxcomposer__model" title="Choose what Camelid should use for this chat.">
                 <span className="sr-only">Choose model for chat</span>
                 <select
                   className="cxcomposer__model-select"
@@ -581,51 +523,62 @@ export default function ChatWorkspace({
                 />
                 <button
                   type="button"
-                  className={`cxcomposer__tool ${composerImage ? 'is-on' : ''}`}
+                  className={`cxcomposer__tool cxcomposer__tool--collapsible ${composerImage ? 'is-on' : ''}`}
                   onClick={() => imageInputRef.current?.click()}
                   disabled={generationActive}
-                  title="Attach one PNG or JPEG for the loaded Prism vision model"
+                  aria-label="Attach image"
+                  title="Attach one PNG or JPEG image"
                 >
-                  <IconImage size={16} /> {composerImage ? 'Image ready' : 'Image'}
+                  <IconImage size={16} /> <span className="cxcomposer__tool-label">{composerImage ? 'Image ready' : 'Image'}</span>
                 </button>
               </>
             )}
             {!demoMode && setReceiptMode && (
               <button
                 type="button"
-                className={`cxcomposer__tool ${receiptMode ? 'is-on' : ''}`}
-                title="Attach a verifiable parity receipt to the next reply (non-streaming). A receipt records one request only; it is not a support claim."
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${receiptMode ? 'is-on' : ''}`}
+                title="Attach a verification receipt to the next reply"
+                aria-label="Verification receipt"
                 aria-pressed={receiptMode}
                 onClick={() => setReceiptMode(!receiptMode)}
               >
-                <IconReceipt size={16} /> {receiptMode ? 'Receipt on' : 'Receipt'}
+                <IconReceipt size={16} /> <span className="cxcomposer__tool-label">{receiptMode ? 'Receipt on' : 'Receipt'}</span>
               </button>
             )}
             {!demoMode && setThinkingMode && (
               <button
                 type="button"
-                className={`cxcomposer__tool ${thinkingMode ? 'is-on' : ''}`}
-                title="Thinking mode (experimental — not parity-locked). The model emits its own <think>…</think> reasoning. Only the leading reasoning trace is evidenced against llama.cpp; the parity-locked exact-row mode stays thinking-disabled."
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${thinkingMode ? 'is-on' : ''}`}
+                title="Show the model's reasoning before the final answer (experimental)"
+                aria-label="Thinking mode"
                 aria-pressed={thinkingMode}
                 onClick={() => setThinkingMode(!thinkingMode)}
               >
-                <IconThinking size={16} /> {thinkingMode ? 'Thinking on (experimental)' : 'Thinking'}
-              </button>
-            )}
-            {!demoMode && (
-              <button type="button" className="cxcomposer__tool" onClick={secondaryAction} disabled={secondaryActionDisabled}>
-                <IconMemory size={16} /> {secondaryActionLabel}
+                <IconThinking size={16} /> <span className="cxcomposer__tool-label">{thinkingMode ? 'Thinking on (experimental)' : 'Thinking'}</span>
               </button>
             )}
             {!demoMode && (
               <button
                 type="button"
-                className={`cxcomposer__tool ${showControls ? 'is-on' : ''}`}
-                aria-expanded={showControls}
-                onClick={() => setShowControls((value) => !value)}
-                title="System prompt and contract-gated sampling controls"
+                className="cxcomposer__tool cxcomposer__tool--collapsible"
+                onClick={secondaryAction}
+                disabled={secondaryActionDisabled}
+                aria-label={secondaryActionLabel}
+                title={secondaryActionLabel}
               >
-                <IconBolt size={16} /> Controls
+                <IconMemory size={16} /> <span className="cxcomposer__tool-label">{secondaryActionLabel}</span>
+              </button>
+            )}
+            {!demoMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool cxcomposer__tool--collapsible ${showControls ? 'is-on' : ''}`}
+                aria-expanded={showControls}
+                aria-label="Generation controls"
+                onClick={() => setShowControls((value) => !value)}
+                title="System prompt and generation settings"
+              >
+                <IconBolt size={16} /> <span className="cxcomposer__tool-label">Controls</span>
               </button>
             )}
           </div>
@@ -640,7 +593,7 @@ export default function ChatWorkspace({
               className="cxcomposer__send"
               aria-label="Send message"
               data-send-ready={canSubmit ? 'true' : 'false'}
-              title={!canSubmit ? sendDisabledReason : 'Send message to Camelid'}
+              title={sendBudget.level === 'error' ? sendBudget.message : !canSubmit ? sendDisabledReason : 'Send message to Camelid'}
               onClick={handleSendMessage}
               disabled={!canSubmit || sendBudget.level === 'error'}
             >
@@ -654,40 +607,29 @@ export default function ChatWorkspace({
 
       {sendBudget.level === 'error' && (
         <p className="cxcomposer__budget-error" role="alert">
-          <span aria-hidden="true">✕</span> {sendBudget.message}
+          <IconClose size={14} /> {sendBudget.message}
         </p>
       )}
       {sendBudget.level === 'notice' && (
         <p className="cxcomposer__budget-notice">
-          <span aria-hidden="true">ⓘ</span> {sendBudget.message}
+          <IconInfo size={14} /> {sendBudget.message}
         </p>
       )}
-      {ghostBudgetCapped && (
-        <p className="cxcomposer__budget-notice">
-          <span aria-hidden="true">ⓘ</span> Ghost-MoE uses a {effectiveMaxTokens.toLocaleString()}-token WebUI reply ceiling so normal chats stay inside the default 4,096-position Metal common cache.
-        </p>
-      )}
-      <div className={`cxcomposer__status is-${statusTone}`} role="status" aria-live="polite" title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>
-        <StatusDot tone={statusTone} pulse={selectedModelRunnable} />
-        <strong className="cxcomposer__status-label">{runtimeStatusLabel}</strong>
-        <span className="cxcomposer__status-sep" aria-hidden="true">·</span>
-        <span className="cxcomposer__status-model">{selectedModelName}</span>
-        {selectedModel && (
-          <>
-            <span className="cxcomposer__status-sep" aria-hidden="true">·</span>
-            <EvidenceChip
-              status={selectedChatGate.hint?.target?.status || ''}
-              state={selectedChatGate.contractSupported ? 'supported' : selectedChatGate.hint?.target?.status ? null : 'unsupported'}
-              label={supportStatusLabel}
-              source={{ rowId: selectedChatGate.hint?.target?.id, note: selectedChatGate.copy }}
-              size="sm"
-              className="cxcomposer__status-row"
-            />
-          </>
+      {/* The live region wraps only the one-line status; the longer detail sits
+         in an accessible Tooltip trigger beside it instead of a native title. */}
+      <div id={composerReadinessId} className={`cxcomposer__status is-${statusTone}`}>
+        <span className="cxcomposer__status-line" role="status" aria-live="polite">
+          <StatusDot tone={statusTone} pulse={selectedModelRunnable} />
+          <span className="cxcomposer__status-text">{statusLine}</span>
+        </span>
+        {statusDetail && (
+          <Tooltip content={statusDetail} placement="top">
+            <button type="button" className="cxcomposer__status-info" aria-label="Chat status details">
+              <IconInfo size={14} />
+            </button>
+          </Tooltip>
         )}
       </div>
-      <p id={composerReadinessId} className="cxcomposer__detail">{detailCopy}</p>
-      {composerHintCopy ? <p className="cxcomposer__hint">{composerHintCopy}</p> : null}
     </div>
   )
 
@@ -699,9 +641,9 @@ export default function ChatWorkspace({
             <div className="cxchat__experimental-banner" role="note">
               <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
               <span>
-                Output is <strong>unverified and has no parity guarantee</strong>. This model's
-                architecture is implemented, but it is not a supported row — every reply below is
-                marked experimental.
+                Replies from this model are <strong>not verified</strong>. It can chat, but its
+                output has not been checked against a reference — every reply below is marked
+                experimental.
               </span>
             </div>
           )}
@@ -725,13 +667,6 @@ export default function ChatWorkspace({
             </div>
           ) : (
             <div className="cxchat__thread">
-              {visibleMessages.length > 0 && !generationActive && canChat && (
-                <div className="cxchat__followups" aria-label="Follow-up prompts">
-                  {FOLLOW_UP_PROMPTS.map((prompt) => (
-                    <button key={prompt} type="button" className="cxchat__followup" onClick={() => handleSuggestion(prompt)}>{prompt}</button>
-                  ))}
-                </div>
-              )}
               {/* Long-thread windowing (Phase 7): render the latest 60 turns;
                   earlier turns mount on demand. Keeps streaming smooth without
                   a virtualization dependency. */}
@@ -747,16 +682,26 @@ export default function ChatWorkspace({
                   : null
                 const priorUserPrompt = priorUserMessage?.content || null
                 const canResend = Boolean(resendFromMessage) && !generationActive && canChat
+                const priorMessage = index > 0 ? visibleMessages[index - 1] : null
+                const dayKey = dayKeyOf(message.created_at)
+                const priorDayKey = priorMessage ? dayKeyOf(priorMessage.created_at) : null
+                const showDaySeparator = Boolean(dayKey && priorDayKey && dayKey !== priorDayKey)
                 return (
-                  <MessageTurn
-                    key={message.id}
-                    message={message}
-                    generationElapsedSeconds={generationElapsedSeconds}
-                    priorUserPrompt={priorUserPrompt}
-                    onReusePrompt={setComposer}
-                    onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
-                    onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
-                  />
+                  <Fragment key={message.id}>
+                    {showDaySeparator && (
+                      <div className="cxchat__day-sep" role="separator">
+                        <span>{formatDayLabel(message.created_at)}</span>
+                      </div>
+                    )}
+                    <MessageTurn
+                      message={message}
+                      generationElapsedSeconds={generationElapsedSeconds}
+                      priorUserPrompt={priorUserPrompt}
+                      onReusePrompt={setComposer}
+                      onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
+                      onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
+                    />
+                  </Fragment>
                 )
               })}
               {generationActive && (
@@ -766,7 +711,7 @@ export default function ChatWorkspace({
                   data-autofollow-affordance
                   onClick={() => { autoFollowGenerationRef.current = true; setUserScrolledAway(false); chatBottomRef.current?.scrollIntoView({ block: 'end' }) }}
                 >
-                  ↓ jump to latest
+                  <IconChevronDown size={12} /> Jump to latest
                 </button>
               )}
               {awaitingAssistant && (
@@ -780,6 +725,14 @@ export default function ChatWorkspace({
                   </article>
                 </>
               )}
+              {/* Follow-up prompts sit under the latest reply — they act on it. */}
+              {visibleMessages.length > 0 && !generationActive && canChat && (
+                <div className="cxchat__followups" aria-label="Follow-up prompts">
+                  {FOLLOW_UP_PROMPTS.map((prompt) => (
+                    <button key={prompt} type="button" className="cxchat__followup" onClick={() => handleSuggestion(prompt)}>{prompt}</button>
+                  ))}
+                </div>
+              )}
               <div className="cxchat__anchor" ref={chatBottomRef} aria-hidden="true" />
             </div>
           )}
@@ -789,7 +742,6 @@ export default function ChatWorkspace({
       <div className="cxchat__dock">
         <div className="cxchat__column">
           {renderComposer()}
-          <p className="cxchat__disclaimer">Camelid runs the loaded model locally. Verify important output.</p>
         </div>
       </div>
     </section>

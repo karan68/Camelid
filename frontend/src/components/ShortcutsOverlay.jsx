@@ -1,3 +1,6 @@
+import { useEffect, useRef } from 'react'
+import { wrapDialogFocus } from './ui/Modal'
+
 /* Keyboard shortcut map (Phase 7). Opened with “?” outside text inputs. */
 
 const SHORTCUTS = [
@@ -9,10 +12,30 @@ const SHORTCUTS = [
 ]
 
 export function ShortcutsOverlay({ open, onClose }) {
+  const panelRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return undefined
+    const previouslyFocused = typeof document !== 'undefined' ? document.activeElement : null
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        onClose()
+        return
+      }
+      wrapDialogFocus(event, panelRef.current)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      if (previouslyFocused && typeof previouslyFocused.focus === 'function') previouslyFocused.focus()
+    }
+  }, [open, onClose])
+
   if (!open) return null
   return (
     <div className="palette-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <div className="shortcuts" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+      <div ref={panelRef} className="shortcuts" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
         <header className="shortcuts__head">
           <h2>Keyboard shortcuts</h2>
           <button type="button" className="cxturn__action" onClick={onClose} autoFocus>Close</button>

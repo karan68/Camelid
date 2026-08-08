@@ -14,7 +14,14 @@ export function UnsupportedBlocker({ blocker, className = '' }) {
   const redirect = blocker.message.match(DEDICATED_LANE_COMMAND)?.[1]?.trim() || null
 
   return (
-    <div className={`unsupported-blocker ${className}`.trim()} role="alert">
+    /* views.css colors this surface's edge with --color-danger, a token
+       tokens.css never defines (its fallback hex was rendering instead). Bind it
+       to the real error token here so the edge tracks the theme. */
+    <div
+      className={`unsupported-blocker ${className}`.trim()}
+      role="alert"
+      style={{ '--color-danger': 'var(--color-error)' }}
+    >
       <div className="unsupported-blocker__head">
         <EvidenceChip state="unsupported" asText size="sm">Fail-closed</EvidenceChip>
         {blocker.code ? <code className="unsupported-blocker__code">{blocker.code}</code> : null}

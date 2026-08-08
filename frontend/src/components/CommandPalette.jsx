@@ -12,13 +12,13 @@ const VIEW_LABELS = [
   ['library', 'Models'],
   ['history', 'Chat history'],
   ['analytics', 'Analytics'],
-  ['telemetry', 'Session telemetry'],
+  ['telemetry', 'Telemetry'],
   ['memory', 'Memory'],
   ['system', 'System'],
   ['api', 'API'],
-  ['compatibility', 'Compatibility ledger'],
-  ['cluster', 'Cluster topology'],
-  ['observatory', 'Inference Observatory'],
+  ['compatibility', 'Compatibility'],
+  ['cluster', 'Cluster'],
+  ['observatory', 'Observatory'],
   ['settings', 'Settings'],
 ]
 
@@ -41,7 +41,7 @@ export function buildPaletteActions({ setTab, showNewChatLanding, cyclePreferenc
   for (const row of capabilities) {
     actions.push({
       id: `row-${row.id}`,
-      group: 'Ledger',
+      group: 'Compatibility',
       label: row.id,
       hint: `${row.family} · ${row.quantization}`,
       run: () => {
@@ -78,6 +78,30 @@ export function CommandPalette({ open, onClose, ...sources }) {
     }
   }, [open])
 
+  /* Closing returns focus to whatever had it before Cmd/Ctrl+K — same contract
+     as Modal.jsx. Depends on `open` alone so the cleanup (and the focus jump)
+     only fires when the palette actually closes, not on parent re-renders. */
+  useEffect(() => {
+    if (!open) return undefined
+    const previouslyFocused = document.activeElement
+    return () => {
+      if (previouslyFocused && typeof previouslyFocused.focus === 'function') previouslyFocused.focus()
+    }
+  }, [open])
+
+  /* Escape must close the palette no matter where focus sits (frame, footer). */
+  useEffect(() => {
+    if (!open) return undefined
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
   useEffect(() => {
     setCursor((current) => Math.min(current, Math.max(filtered.length - 1, 0)))
   }, [filtered.length])
@@ -90,7 +114,6 @@ export function CommandPalette({ open, onClose, ...sources }) {
   if (!open) return null
 
   const onKeyDown = (event) => {
-    if (event.key === 'Escape') { event.preventDefault(); onClose() }
     if (event.key === 'ArrowDown') { event.preventDefault(); setCursor((c) => Math.min(c + 1, filtered.length - 1)) }
     if (event.key === 'ArrowUp') { event.preventDefault(); setCursor((c) => Math.max(c - 1, 0)) }
     if (event.key === 'Enter') { event.preventDefault(); filtered[cursor]?.run() }
@@ -102,7 +125,8 @@ export function CommandPalette({ open, onClose, ...sources }) {
         <input
           ref={inputRef}
           className="palette__input"
-          placeholder="Navigate, switch model, jump to a ledger row…"
+          aria-label="Search commands"
+          placeholder="Navigate, switch model, jump to a compatibility row…"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           onKeyDown={onKeyDown}
@@ -111,8 +135,8 @@ export function CommandPalette({ open, onClose, ...sources }) {
           aria-controls="palette-results"
           aria-activedescendant={filtered[cursor] ? `palette-item-${filtered[cursor].id}` : undefined}
         />
+        {filtered.length === 0 && <div className="palette__empty">Nothing matches “{query}”.</div>}
         <ul className="palette__list" id="palette-results" role="listbox" ref={listRef}>
-          {filtered.length === 0 && <li className="palette__empty">Nothing matches “{query}”.</li>}
           {filtered.map((action, index) => (
             <li
               key={action.id}

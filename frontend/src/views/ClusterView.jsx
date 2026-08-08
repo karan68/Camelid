@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { useClusterTopology } from '../hooks/useClusterTopology'
 import { TopologyCanvas } from '../components/cluster/TopologyCanvas'
 import { NodeInventory } from '../components/cluster/NodeInventory'
@@ -9,18 +9,31 @@ import { DiscoverDevices } from '../components/cluster/DiscoverDevices'
 import { Button } from '../components/ui/Button'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import {
-  IconPlus, IconNetwork, IconCheckCircle, IconCheck, IconDownload, IconGrid, IconChart, IconTrash,
+  IconPlus, IconNetwork, IconCheckCircle, IconDownload, IconGrid, IconChart, IconTrash,
 } from '../components/ui/icons'
 
 export default function ClusterView({ showNotice }) {
-  const cluster = useClusterTopology({ showNotice })
+  // Validation results open in the drawer's Validation tab below, so the
+  // hook's "see the events drawer" toast would point at the wrong place.
+  const notify = useCallback((message, tone) => {
+    if (typeof message === 'string' && message.startsWith('Cluster validation complete')) return
+    showNotice?.(message, tone)
+  }, [showNotice])
+  const cluster = useClusterTopology({ showNotice: notify })
   const canvasRef = useRef(null)
   const [wizardOpen, setWizardOpen] = useState(false)
   const [discoverOpen, setDiscoverOpen] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [drawerTab, setDrawerTab] = useState('events')
   const [clearOpen, setClearOpen] = useState(false)
 
   const resetLayout = () => { cluster.applyAutoLayout(); window.setTimeout(() => canvasRef.current?.fit(), 60) }
+
+  const openDrawer = (tab) => { setDrawerTab(tab); setDrawerOpen(true) }
+  const runValidation = async () => {
+    await cluster.validateCluster()
+    openDrawer('validation')
+  }
 
   const inspectorActions = {
     testNode: cluster.testNode,
@@ -38,22 +51,23 @@ export default function ClusterView({ showNotice }) {
     <div className="cluster-view">
       <header className="cluster-header">
         <div className="cluster-header__copy">
-          <h1>Cluster Topology</h1>
-          <p>Connect Macs, Windows PCs, Linux servers, and Raspberry Pis into one local Camelid compute fabric.</p>
+          <p className="cxv-kicker"><IconNetwork size={14} /> Cluster</p>
+          <h1>Cluster</h1>
+          <p className="cxv-sub">Connect Macs, Windows PCs, Linux servers, and Raspberry Pis into one local Camelid compute fabric.</p>
         </div>
         <div className="cluster-header__actions">
           <div className="cluster-header__primary">
-            <Button variant="primary" icon={<IconPlus size={16} />} onClick={() => setWizardOpen(true)}>Add Server</Button>
-            <Button variant="tonal" icon={<IconNetwork size={16} />} onClick={() => setDiscoverOpen(true)}>Discover Devices</Button>
-            <Button variant="tonal" icon={<IconCheckCircle size={16} />} onClick={cluster.validateCluster}>Validate Cluster</Button>
-            <Button variant="tonal" icon={<IconCheck size={16} />} onClick={cluster.save}>Save Topology</Button>
+            <Button variant="primary" icon={<IconPlus size={16} />} onClick={() => setWizardOpen(true)}>Add server</Button>
+            <Button variant="tonal" icon={<IconNetwork size={16} />} onClick={() => setDiscoverOpen(true)}>Discover devices</Button>
+            <Button variant="tonal" icon={<IconCheckCircle size={16} />} onClick={runValidation}>Validate cluster</Button>
           </div>
           <div className="cluster-header__secondary">
-            <Button variant="ghost" size="sm" icon={<IconDownload size={15} />} onClick={cluster.exportTopology}>Export Diagram</Button>
-            <Button variant="ghost" size="sm" icon={<IconGrid size={15} />} onClick={resetLayout}>Reset Layout</Button>
-            <Button variant="ghost" size="sm" icon={<IconChart size={15} />} onClick={() => setDrawerOpen(true)}>View Logs</Button>
+            <span className="cluster-header__autosave">Changes save automatically</span>
+            <Button variant="ghost" size="sm" icon={<IconDownload size={15} />} onClick={cluster.exportTopology}>Export diagram</Button>
+            <Button variant="ghost" size="sm" icon={<IconGrid size={15} />} onClick={resetLayout}>Reset layout</Button>
+            <Button variant="ghost" size="sm" icon={<IconChart size={15} />} onClick={() => openDrawer('events')}>View logs</Button>
             {cluster.nodes.length > 0 && (
-              <Button variant="ghost" size="sm" icon={<IconTrash size={15} />} onClick={() => setClearOpen(true)}>Clear Cluster</Button>
+              <Button variant="ghost" size="sm" icon={<IconTrash size={15} />} onClick={() => setClearOpen(true)}>Clear cluster</Button>
             )}
           </div>
         </div>
@@ -87,7 +101,7 @@ export default function ClusterView({ showNotice }) {
           selectedConnection={cluster.selectedConnection}
           nodes={cluster.nodes}
           actions={inspectorActions}
-          onViewLogs={() => setDrawerOpen(true)}
+          onViewLogs={() => openDrawer('events')}
         />
       </div>
 
@@ -96,6 +110,8 @@ export default function ClusterView({ showNotice }) {
         issues={cluster.issues}
         summary={cluster.summary}
         open={drawerOpen}
+        tab={drawerTab}
+        onSelectTab={setDrawerTab}
         onToggle={() => setDrawerOpen((v) => !v)}
       />
 

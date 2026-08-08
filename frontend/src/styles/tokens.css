@@ -1,12 +1,15 @@
 /* ==========================================================================
    Camelid design tokens — "instrument panel" identity (Phase 1)
 
-   Dark-first: the DARK palette is the canonical :root definition. Light is an
-   override, applied explicitly via [data-theme="light"] or, when no preference
-   attribute is present (preference = "system"), via prefers-color-scheme.
-   useTheme() deletes the data-theme attribute for "system" so the media query
-   can win. Keep the [data-theme="light"] block and the media-query block
-   byte-identical.
+   Dark-first: :root declares the canonical dark palette. The light palette
+   overrides every themed token in TWO places that must stay in sync:
+   [data-theme="light"] (explicit choice) and the prefers-color-scheme: light
+   media block guarded by :root:not([data-theme]) (preference = "system";
+   useTheme() deletes the data-theme attribute so the media query can win).
+   Explicit duplicated blocks are deliberate: light-dark() would be more
+   compact but needs Safari 17.5+/Chrome 123+, and the web UI is served to
+   whatever browser the user opens — do not migrate to light-dark() without
+   raising the app's stated browser floor.
 
    Status color doctrine (the identity — do not dilute):
    - VERIFIED COPPER is reserved exclusively for supported/verified claims.
@@ -25,6 +28,7 @@
    during the redesign transition.
    ========================================================================== */
 
+
 :root {
   color-scheme: dark;
 
@@ -32,6 +36,8 @@
   --font-ui: 'Inter Variable', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-display: 'Space Grotesk Variable', 'Space Grotesk', 'Inter Variable', system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --text-micro: 0.625rem;   /* 10px — legibility floor; densest instrument readouts only */
+  --text-2xs: 0.6875rem;    /* 11px — micro labels: kickers, mono captions */
   --text-xs: 0.75rem;
   --text-sm: 0.8125rem;
   --text-md: 0.9375rem;
@@ -44,6 +50,7 @@
   --leading-normal: 1.6;
   --leading-relaxed: 1.75;
   --tracking-wide: 0.08em;        /* mono labels, instrument captions */
+  --tracking-label: 0.06em;       /* uppercase sans kickers / eyebrow labels */
 
   /* ---- Space ---- */
   --space-1: 4px;
@@ -89,7 +96,7 @@
   --content-wide: 1100px;
 
   /* ====================================================================
-     DARK palette (canonical)
+     PALETTE — dark canonical; light overrides live in the two light blocks below.
      ==================================================================== */
   --color-bg: #0e1216;
   --color-bg-elevated: #141a21;
@@ -104,7 +111,7 @@
 
   --color-text: #dde5ed;
   --color-text-muted: #9caab9;
-  --color-text-faint: #8190a0;
+  --color-text-faint: #8392a1;
 
   /* Interactive / informational accent: steel blue */
   --color-accent: #8fb6dc;
@@ -134,6 +141,7 @@
   --color-ready: #8cc9a0;
   --color-warning: #d8b86a;
   --color-error: #e9928a;
+  --color-error-ink: #2a0f0c;                       /* text on error fill */
   --color-info: #8fb6dc;
 
   --color-spectrum-blue: #8fb6dc;
@@ -160,12 +168,13 @@
   --color-glass: rgba(20, 26, 33, 0.80);
   --color-glass-strong: rgba(14, 18, 22, 0.96);
 
-  /* ---- Elevation ---- */
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.32);
+  /* ---- Elevation (--shadow-2/-3 geometry differs per theme; see below) ---- */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45),
+    0 1px 3px rgba(0, 0, 0, 0.32);
   --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.50), 0 2px 6px rgba(0, 0, 0, 0.35);
   --shadow-3: 0 16px 40px rgba(0, 0, 0, 0.58), 0 6px 14px rgba(0, 0, 0, 0.40);
   --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  --shadow-focus: 0 0 0 3px rgba(143, 182, 220, 0.38);
+  --shadow-focus: var(--focus-ring);   /* legacy alias — one focus treatment app-wide */
   --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
 
   /* ---- Brand (legacy aurora names now carry the instrument gradient) ---- */
@@ -175,12 +184,21 @@
 }
 
 /* ====================================================================
-   LIGHT palette — applied explicitly via [data-theme="light"].
-   Keep this block byte-identical to the prefers-color-scheme block below.
+   LIGHT theme switch — explicit overrides for every themed token.
+   geometry differs per theme); keep those two declarations in sync in
+   BOTH blocks below.
    ==================================================================== */
 :root[data-theme='light'] {
+  --shadow-1: 0 1px 2px rgba(20, 30, 40, 0.07),
+    0 1px 3px rgba(20, 30, 40, 0.05);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  --camelid-aurora: linear-gradient(120deg, #2b5c84 0%, #6d6347 52%, #96531c 100%);
+  --camelid-aurora-soft: linear-gradient(120deg, rgba(43, 92, 132, 0.12), rgba(109, 99, 71, 0.10), rgba(150, 83, 28, 0.11));
+  --camelid-aurora-glow: radial-gradient(circle, rgba(150, 83, 28, 0.07) 0%, rgba(43, 92, 132, 0.06) 50%, transparent 78%);
   color-scheme: light;
 
+  --shadow-2: 0 4px 12px rgba(20, 30, 40, 0.09), 0 2px 4px rgba(20, 30, 40, 0.05);
+  --shadow-3: 0 12px 32px rgba(20, 30, 40, 0.13), 0 4px 10px rgba(20, 30, 40, 0.07);
   --color-bg: #f6f8fa;
   --color-bg-elevated: #ffffff;
   --color-canvas: #f6f8fa;
@@ -188,21 +206,17 @@
   --color-surface-subtle: #f2f5f8;
   --color-surface-strong: #e1e8ef;
   --color-surface-hover: #e7edf3;
-
   --color-border-soft: rgba(26, 43, 59, 0.12);
   --color-border-strong: rgba(26, 43, 59, 0.24);
-
   --color-text: #1b2530;
   --color-text-muted: #4d5d6d;
   --color-text-faint: #56656f;
-
   --color-accent: #2b5c84;
   --color-accent-hover: #224a6c;
   --color-accent-soft: rgba(43, 92, 132, 0.10);
   --color-accent-ink: #ffffff;
   --color-accent-text: #2b5c84;
   --color-chip: rgba(43, 92, 132, 0.07);
-
   --color-verified: #96531c;
   --color-verified-strong: #7c4413;
   --color-verified-soft: rgba(150, 83, 28, 0.10);
@@ -217,53 +231,43 @@
   --color-unsupported: #5a6a79;
   --color-unsupported-soft: rgba(90, 106, 121, 0.09);
   --color-unsupported-border: rgba(90, 106, 121, 0.26);
-
-  --color-ready: #20713c;
-  --color-warning: #82610e;
-  --color-error: #b3261e;
+  --color-ready: #1e6938;
+  --color-warning: #71550c;
+  --color-error: #ac251d;
+  --color-error-ink: #ffffff;
   --color-info: #2b5c84;
-
   --color-spectrum-blue: #2b5c84;
   --color-spectrum-green: #20713c;
   --color-spectrum-yellow: #75601a;
   --color-spectrum-red: #b3261e;
-
   --color-user-bubble: #e4ebf2;
   --color-user-chip: #e4ebf2;
-  --color-assistant-bubble: transparent;
-  --color-assistant-wash: transparent;
-  --color-thread-surface: transparent;
   --color-sidebar-section: #edf1f5;
   --color-composer-surface: #ffffff;
   --color-code-bg: #f3f6f9;
   --color-code-border: rgba(26, 43, 59, 0.13);
-
   --color-selected-row: rgba(43, 92, 132, 0.10);
   --color-selected-row-border: rgba(43, 92, 132, 0.26);
   --color-overlay: rgba(20, 30, 40, 0.42);
-
   --color-hero-glow: rgba(43, 92, 132, 0.06);
   --color-hero-glow-strong: rgba(150, 83, 28, 0.05);
   --color-glass: rgba(255, 255, 255, 0.84);
   --color-glass-strong: rgba(246, 248, 250, 0.96);
-
-  --shadow-1: 0 1px 2px rgba(20, 30, 40, 0.07), 0 1px 3px rgba(20, 30, 40, 0.05);
-  --shadow-2: 0 4px 12px rgba(20, 30, 40, 0.09), 0 2px 4px rgba(20, 30, 40, 0.05);
-  --shadow-3: 0 12px 32px rgba(20, 30, 40, 0.13), 0 4px 10px rgba(20, 30, 40, 0.07);
-  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.65);
-  --shadow-focus: 0 0 0 3px rgba(43, 92, 132, 0.30);
-  --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
-
-  --camelid-aurora: linear-gradient(120deg, #2b5c84 0%, #6d6347 52%, #96531c 100%);
-  --camelid-aurora-soft: linear-gradient(120deg, rgba(43, 92, 132, 0.12), rgba(109, 99, 71, 0.10), rgba(150, 83, 28, 0.11));
-  --camelid-aurora-glow: radial-gradient(circle, rgba(150, 83, 28, 0.07) 0%, rgba(43, 92, 132, 0.06) 50%, transparent 78%);
 }
 
 /* System preference = light, and no explicit data-theme attribute present. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
+    --shadow-1: 0 1px 2px rgba(20, 30, 40, 0.07),
+    0 1px 3px rgba(20, 30, 40, 0.05);
+    --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+    --camelid-aurora: linear-gradient(120deg, #2b5c84 0%, #6d6347 52%, #96531c 100%);
+    --camelid-aurora-soft: linear-gradient(120deg, rgba(43, 92, 132, 0.12), rgba(109, 99, 71, 0.10), rgba(150, 83, 28, 0.11));
+    --camelid-aurora-glow: radial-gradient(circle, rgba(150, 83, 28, 0.07) 0%, rgba(43, 92, 132, 0.06) 50%, transparent 78%);
     color-scheme: light;
 
+    --shadow-2: 0 4px 12px rgba(20, 30, 40, 0.09), 0 2px 4px rgba(20, 30, 40, 0.05);
+    --shadow-3: 0 12px 32px rgba(20, 30, 40, 0.13), 0 4px 10px rgba(20, 30, 40, 0.07);
     --color-bg: #f6f8fa;
     --color-bg-elevated: #ffffff;
     --color-canvas: #f6f8fa;
@@ -271,21 +275,17 @@
     --color-surface-subtle: #f2f5f8;
     --color-surface-strong: #e1e8ef;
     --color-surface-hover: #e7edf3;
-
     --color-border-soft: rgba(26, 43, 59, 0.12);
     --color-border-strong: rgba(26, 43, 59, 0.24);
-
     --color-text: #1b2530;
     --color-text-muted: #4d5d6d;
     --color-text-faint: #56656f;
-
     --color-accent: #2b5c84;
     --color-accent-hover: #224a6c;
     --color-accent-soft: rgba(43, 92, 132, 0.10);
     --color-accent-ink: #ffffff;
     --color-accent-text: #2b5c84;
     --color-chip: rgba(43, 92, 132, 0.07);
-
     --color-verified: #96531c;
     --color-verified-strong: #7c4413;
     --color-verified-soft: rgba(150, 83, 28, 0.10);
@@ -300,46 +300,28 @@
     --color-unsupported: #5a6a79;
     --color-unsupported-soft: rgba(90, 106, 121, 0.09);
     --color-unsupported-border: rgba(90, 106, 121, 0.26);
-
-    --color-ready: #20713c;
-    --color-warning: #82610e;
-    --color-error: #b3261e;
+    --color-ready: #1e6938;
+    --color-warning: #71550c;
+    --color-error: #ac251d;
+    --color-error-ink: #ffffff;
     --color-info: #2b5c84;
-
     --color-spectrum-blue: #2b5c84;
     --color-spectrum-green: #20713c;
     --color-spectrum-yellow: #75601a;
     --color-spectrum-red: #b3261e;
-
     --color-user-bubble: #e4ebf2;
     --color-user-chip: #e4ebf2;
-    --color-assistant-bubble: transparent;
-    --color-assistant-wash: transparent;
-    --color-thread-surface: transparent;
     --color-sidebar-section: #edf1f5;
     --color-composer-surface: #ffffff;
     --color-code-bg: #f3f6f9;
     --color-code-border: rgba(26, 43, 59, 0.13);
-
     --color-selected-row: rgba(43, 92, 132, 0.10);
     --color-selected-row-border: rgba(43, 92, 132, 0.26);
     --color-overlay: rgba(20, 30, 40, 0.42);
-
     --color-hero-glow: rgba(43, 92, 132, 0.06);
     --color-hero-glow-strong: rgba(150, 83, 28, 0.05);
     --color-glass: rgba(255, 255, 255, 0.84);
     --color-glass-strong: rgba(246, 248, 250, 0.96);
-
-    --shadow-1: 0 1px 2px rgba(20, 30, 40, 0.07), 0 1px 3px rgba(20, 30, 40, 0.05);
-    --shadow-2: 0 4px 12px rgba(20, 30, 40, 0.09), 0 2px 4px rgba(20, 30, 40, 0.05);
-    --shadow-3: 0 12px 32px rgba(20, 30, 40, 0.13), 0 4px 10px rgba(20, 30, 40, 0.07);
-    --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.65);
-    --shadow-focus: 0 0 0 3px rgba(43, 92, 132, 0.30);
-    --focus-ring: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-accent);
-
-    --camelid-aurora: linear-gradient(120deg, #2b5c84 0%, #6d6347 52%, #96531c 100%);
-    --camelid-aurora-soft: linear-gradient(120deg, rgba(43, 92, 132, 0.12), rgba(109, 99, 71, 0.10), rgba(150, 83, 28, 0.11));
-    --camelid-aurora-glow: radial-gradient(circle, rgba(150, 83, 28, 0.07) 0%, rgba(43, 92, 132, 0.06) 50%, transparent 78%);
   }
 }
 

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import SidebarRail from './components/layout/SidebarRail'
 import TopBar from './components/TopBar'
 import { BackendBanner, ENGINE_PATH_STORAGE_KEY, ENGINE_ADDR_STORAGE_KEY } from './components/layout/BackendBanner'
@@ -55,6 +55,8 @@ function App() {
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
   const [firstRunCardActive, setFirstRunCardActive] = useState(false)
+  const viewRef = useRef(null)
+  const hamburgerRef = useRef(null)
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined
@@ -102,6 +104,23 @@ function App() {
 
   const closeMobileNav = () => setMobileNavOpen(false)
 
+  /* The persistent .camelid-view div is the scroll container for page views;
+     because the node survives tab switches, each navigation must reset it or
+     the previous view's scroll offset leaks into the next one. */
+  useEffect(() => {
+    viewRef.current?.scrollTo(0, 0)
+  }, [tab])
+
+  /* Mobile drawer: move focus into the drawer when it opens so keyboard and
+     screen-reader users land where the navigation is. */
+  useEffect(() => {
+    if (!mobileNavOpen) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById('camelid-sidebar')?.querySelector('button, input')?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [mobileNavOpen])
+
   /* Observatory stream listens from app start (Phase 6.1 DEFECT 1): runs made
      before the view's first mount must not be invisible. */
   useEffect(() => {
@@ -133,13 +152,20 @@ function App() {
     return () => window.removeEventListener('camelid:open-ledger', onOpenLedger)
   }, [setTab])
 
-  /* Global keys: Cmd/Ctrl+K command palette; "?" shortcut map outside inputs. */
+  /* Global keys: Cmd/Ctrl+K command palette; "?" shortcut map outside inputs;
+     Escape closes the mobile nav drawer (palette/shortcuts handle their own). */
   useEffect(() => {
     const onKeyDown = (event) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
         setShortcutsOpen(false)
         setPaletteOpen((value) => !value)
+        return
+      }
+      if (event.key === 'Escape' && mobileNavOpen && !paletteOpen && !shortcutsOpen) {
+        event.preventDefault()
+        setMobileNavOpen(false)
+        hamburgerRef.current?.focus()
         return
       }
       const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable
@@ -151,7 +177,7 @@ function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [])
+  }, [mobileNavOpen, paletteOpen, shortcutsOpen])
 
   const navigateTab = (next) => {
     setTab(next)
@@ -274,6 +300,8 @@ function App() {
           selectedModelId={selectedModelId}
           models={models}
           onToggleSidebar={DEMO_UI ? null : () => setMobileNavOpen((v) => !v)}
+          mobileNavOpen={mobileNavOpen}
+          menuButtonRef={hamburgerRef}
           demoMode={DEMO_UI}
         />
 
@@ -302,7 +330,7 @@ function App() {
         {/* --chat is the full-bleed frame for views that own their own edges and
            manage their own height (chat, workspace, cluster canvas). Every
            other view is a .cxv page and needs the padded page frame. */}
-        <div className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace

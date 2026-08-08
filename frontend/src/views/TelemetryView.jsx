@@ -6,6 +6,7 @@ import {
   subscribeTelemetry,
   summarizeTelemetry,
 } from '../lib/telemetryLog'
+import { Button } from '../components/ui/Button'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { EmptyState } from '../components/ui/EmptyState'
 import { IconChart } from '../components/ui/icons'
@@ -14,11 +15,11 @@ import { IconChart } from '../components/ui/icons'
 
    Every number on this screen is computed from real requests made in this
    browser session — chat sends, workbench try-its, health polls. There is no
-   seed data and nothing persists across reloads. The page-level chip and the
-   per-panel captions keep the I4 framing pinned: operational telemetry, never
-   compatibility or support evidence, and perf numbers never render inside an
-   Evidence Chip. Bounded perf/RSS evidence from the contract lives in the
-   Compatibility ledger, not here. */
+   seed data and nothing persists across reloads. The page-level chip states
+   that caveat once (I4 framing: operational telemetry, never compatibility or
+   support evidence) — it is deliberately not repeated per panel. Bounded
+   perf/RSS evidence from the contract lives in the Compatibility ledger, not
+   here. */
 
 const fmtMs = (value) => (Number.isFinite(value) ? (value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`) : '—')
 const fmtRate = (value) => (Number.isFinite(value) ? `${value >= 10 ? Math.round(value) : value.toFixed(1)} tok/s` : '—')
@@ -26,7 +27,7 @@ const fmtTime = (at) => new Date(at).toLocaleTimeString()
 
 function Sparkline({ values, width = 220, height = 36, ariaLabel }) {
   const points = values.filter((v) => Number.isFinite(v))
-  if (points.length < 2) return <span className="tele-spark tele-spark--empty">need ≥2 requests</span>
+  if (points.length < 2) return <span className="tele-spark tele-spark--empty">Needs at least 2 requests</span>
   const min = Math.min(...points)
   const max = Math.max(...points)
   const span = max - min || 1
@@ -69,14 +70,14 @@ export default function TelemetryView() {
       <header className="cxv-head">
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconChart size={14} /> Telemetry</p>
-          <h1>Session telemetry</h1>
-          <p className="cxv-sub">Computed only from requests this browser actually made this session — chat sends, workbench try-its, health polls. Nothing is seeded, nothing persists, and none of it is support evidence.</p>
+          <h1>Telemetry</h1>
+          <p className="cxv-sub">Computed from the requests this browser made this session — chat sends, workbench try-its, health polls.</p>
         </div>
         <div className="cxv-head__actions">
           <EvidenceChip
             state="neutral"
-            label="operational telemetry — not compatibility evidence"
-            source={{ note: 'Single-session, single-browser measurements. Bounded perf/RSS evidence from the contract lives in the Compatibility ledger, deliberately separated from these live numbers.' }}
+            label="Live session stats — measured in this browser, nothing persisted"
+            source={{ note: 'Every number here comes from requests this browser made this session. Nothing is seeded, stored, or shared, and it all resets on reload.' }}
             size="sm"
           />
         </div>
@@ -87,11 +88,11 @@ export default function TelemetryView() {
           className="cx-empty--inline"
           icon={<IconChart size={22} />}
           title="No session traffic yet"
-          description="Send a chat or run a workbench try-it and this dashboard fills in from those real requests. It never seeds or invents data."
+          description="Send a chat or run a workbench try-it and this dashboard fills in from those real requests."
         />
       ) : (
         <>
-          <div className="cxv-stat-grid">
+          <div className="cxv-stat-grid cxv-stat-grid--five">
             <div className="cxv-stat"><span>Requests</span><strong>{summary.total}</strong><small>{generationRequests.length} chat · {summary.total - generationRequests.length} workbench</small></div>
             <div className="cxv-stat"><span>Errors</span><strong>{summary.errors}</strong><small>{summary.errorRate !== null ? `${Math.round(summary.errorRate * 100)}% of session requests` : '—'}</small></div>
             <div className="cxv-stat"><span>TTFT median</span><strong>{fmtMs(summary.medianTtftMs)}</strong><small>client-measured</small></div>
@@ -105,13 +106,12 @@ export default function TelemetryView() {
               <div className="tele-spark-row"><span className="tele-spark-label">TTFT</span><Sparkline values={requests.map((r) => r.ttftMs)} ariaLabel="TTFT trend" /></div>
               <div className="tele-spark-row"><span className="tele-spark-label">tok/s</span><Sparkline values={requests.map((r) => r.tokensPerSec)} ariaLabel="Tokens per second trend" /></div>
               <div className="tele-spark-row"><span className="tele-spark-label">duration</span><Sparkline values={requests.map((r) => r.durationMs)} ariaLabel="Request duration trend" /></div>
-              <p className="tele-note">operational telemetry — not compatibility evidence</p>
             </section>
 
             <section className="cxv-card cxv-panel">
               <div className="cxv-section__head"><h2>Per-model</h2><span className="cxv-section__count">{models.length} model id{models.length === 1 ? '' : 's'}</span></div>
               {models.length ? (
-                <table className="tele-table">
+                <table className="cxv-table">
                   <thead><tr><th>model id</th><th>req</th><th>err</th><th>TTFT med</th><th>tok/s med</th></tr></thead>
                   <tbody>
                     {models.map((row) => (
@@ -128,7 +128,6 @@ export default function TelemetryView() {
               ) : (
                 <p className="tele-note">No model-tagged requests yet.</p>
               )}
-              <p className="tele-note">grouping is by model id only — it implies nothing about support</p>
             </section>
           </div>
         </>
@@ -157,16 +156,16 @@ export default function TelemetryView() {
           <div className="tele-log-actions">
             <label className="tele-reveal">
               <input type="checkbox" checked={revealPrompts} onChange={(event) => setRevealPrompts(event.target.checked)} />
-              reveal prompt content (this session only)
+              Reveal prompt content (this session only)
             </label>
-            <button type="button" className="cxv-button" onClick={downloadExport} disabled={!requests.length}>
+            <Button variant="outline" size="sm" onClick={downloadExport} disabled={!requests.length}>
               Export JSON
-            </button>
+            </Button>
           </div>
         </div>
         <p className="cxv-sub">Local-only. Prompts stay redacted unless revealed for this session; exports exclude prompt content and file paths by construction.</p>
         {recentRequests.length ? (
-          <table className="tele-table tele-table--log">
+          <table className="cxv-table cxv-table--log">
             <thead><tr><th>time</th><th>endpoint</th><th>model</th><th>outcome</th><th>duration</th><th>tokens</th><th>prompt</th></tr></thead>
             <tbody>
               {recentRequests.map((record) => (

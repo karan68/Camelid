@@ -27,7 +27,7 @@ export const NodeCard = memo(function NodeCard({ node, selected, busyLabel, onSe
       role="button"
       tabIndex={0}
       aria-label={`${node.display_name}, ${statusLabel}`}
-      onKeyDown={(e) => { if (e.key === 'Enter') onSelect?.() }}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect?.() } }}
     >
       <span className={`cluster-node__ring is-${tone}`} aria-hidden="true" />
       <div className="cluster-node__head">

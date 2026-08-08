@@ -78,7 +78,6 @@ export function FlowBench({ reducedMotion = false, highlightId = null, onSimEven
       } else if (event.type === 'first_content') {
         ensureRequest(event)
         choreography.firstContent(event)
-        choreography.firstContent(event)
       } else if (event.type === 'progress') {
         ensureRequest(event)
         choreography.progress(event)

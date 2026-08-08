@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { IconClose, IconInfo } from '../ui/icons'
 import {
   DETENTS,
   gemma4ChatTokenFloorForModel,
@@ -106,30 +107,30 @@ export function ResponseLengthControl({ value, onChange, model = null, capabilit
 
       {verdict.level !== 'ok' && (
         <p className={`rlc__message rlc__message--${verdict.level}`} role="status">
-          <span className="rlc__message-icon" aria-hidden="true">{verdict.level === 'error' ? '✕' : '◷'}</span>
+          <span className="rlc__message-icon" aria-hidden="true">{verdict.level === 'error' ? <IconClose size={14} /> : <IconInfo size={14} />}</span>
           {verdict.message}
         </p>
       )}
       {gemma4Floor !== null && value < gemma4Floor && (
         <p className="rlc__message rlc__message--caution" role="status">
-          <span className="rlc__message-icon" aria-hidden="true">◷</span>
+          <span className="rlc__message-icon" aria-hidden="true"><IconInfo size={14} /></span>
           Gemma 4 chat will use at least {gemma4Floor} tokens so its hidden channel envelope cannot consume the entire visible reply.
         </p>
       )}
       {ghostMoeCap !== null && value > ghostMoeCap && (
         <p className="rlc__message rlc__message--caution" role="status">
-          <span className="rlc__message-icon" aria-hidden="true">◷</span>
-          The active Ghost-MoE WebUI lane will use at most {fmt(ghostMoeCap)} reply tokens, preserving room for normal prompts inside its default 4,096-position Metal common cache. Your saved limit remains available to other model lanes.
+          <span className="rlc__message-icon" aria-hidden="true"><IconInfo size={14} /></span>
+          The active model currently caps replies at {fmt(ghostMoeCap)} tokens to leave room for your prompt. Your saved limit still applies to other models.
         </p>
       )}
       {contextLength === null && (
-        <p className="rlc__absent">model context length unavailable — no loaded-model metadata to validate against</p>
+        <p className="rlc__absent">Context length unknown — load a model to see its limit.</p>
       )}
 
       {/* Memory estimate: ABSENT until the backend reports the inputs. When it
           does, the readout renders here labeled "estimated" with its formula in
           the popover; it never renders on invented numbers. */}
-      <p className="rlc__absent">memory estimate unavailable — backend does not yet report system memory or KV-cache cost per token (see BACKEND_ASKS.md #3)</p>
+      <p className="rlc__absent">Memory estimate not available — this engine version doesn’t report it yet.</p>
     </div>
   )
 }

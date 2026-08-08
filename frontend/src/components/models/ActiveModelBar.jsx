@@ -1,5 +1,7 @@
+import { Button } from '../ui/Button'
 import { StatusDot } from '../ui/StatusDot'
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { IconStop } from '../ui/icons'
 import { laneOf } from '../../lib/modelLanes'
 
 /* Zone 1 — what is loaded right now, with the one Unload action. The lane chip is
@@ -8,9 +10,9 @@ import { laneOf } from '../../lib/modelLanes'
 
 function activeLaneChip(lane) {
   if (lane === 'supported') return <EvidenceChip state="supported" asText size="sm">Supported</EvidenceChip>
-  if (lane === 'compatible') return <EvidenceChip state="runnable" asText size="sm">Runnable</EvidenceChip>
-  if (lane === 'eligible') return <EvidenceChip state="runnable" asText size="sm">Oracle-qualified</EvidenceChip>
-  return <EvidenceChip state="unsupported" asText size="sm">Experimental — unverified</EvidenceChip>
+  if (lane === 'compatible') return <EvidenceChip state="runnable" asText size="sm">Experimental</EvidenceChip>
+  if (lane === 'eligible') return <EvidenceChip state="runnable" asText size="sm">Ready to test</EvidenceChip>
+  return <EvidenceChip state="unsupported" asText size="sm">Experimental</EvidenceChip>
 }
 
 export function ActiveModelBar({
@@ -67,14 +69,21 @@ export function ActiveModelBar({
           <EvidenceChip state="error" asText size="sm">Not verified</EvidenceChip>
         ) : null}
         {loaded && verification?.eligible ? (
-          <button type="button" className="lane-row-action" onClick={onVerify} disabled={busy}>
-            {verificationBusy ? 'Verifying…' : verification?.report ? 'Verify again' : 'Verify'}
-          </button>
+          <Button variant="outline" size="sm" onClick={onVerify} loading={verificationBusy} disabled={busy}>
+            {verification?.report ? 'Verify again' : 'Verify'}
+          </Button>
         ) : null}
         {loaded ? (
-          <button type="button" className="lane-row-action" onClick={onUnload} disabled={busy}>
-            {unloading ? 'Unloading…' : 'Unload'}
-          </button>
+          <Button
+            variant="outline"
+            size="sm"
+            icon={<IconStop size={15} />}
+            onClick={onUnload}
+            loading={unloading}
+            disabled={busy}
+          >
+            Unload
+          </Button>
         ) : null}
       </div>
     </section>
