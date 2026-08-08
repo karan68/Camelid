@@ -109,10 +109,15 @@ pub fn error_message(body: &Value) -> Option<&str> {
 }
 
 /// Send one request to one node.
+///
+/// `bearer` is required by any node started with an API key: `/v1/health` is
+/// exempt from the server's auth but `/v1/chat/completions` is not, so without
+/// it this is the call that comes back 401.
 pub fn forward(
     spec: &NodeSpec,
     path: &str,
     body: &Value,
+    bearer: Option<&str>,
     timeout: Duration,
 ) -> Result<Forwarded, ForwardError> {
     reject_streaming(body)?;
@@ -129,6 +134,7 @@ pub fn forward(
         "POST",
         path,
         Some(&encoded),
+        bearer,
         timeout,
         MAX_RESPONSE_BYTES,
     )
@@ -190,6 +196,7 @@ mod tests {
             &spec("a", 1),
             "/v1/chat/completions",
             &body,
+            None,
             Duration::from_millis(200),
         )
         .expect_err("refused");
@@ -235,6 +242,7 @@ mod tests {
             &spec("windows", 1),
             "/v1/chat/completions",
             &chat_request("m", "hi", 4),
+            None,
             Duration::from_millis(400),
         )
         .expect_err("port 1 is closed");
