@@ -26,6 +26,7 @@ pub(crate) mod http;
 pub mod node;
 pub mod policy;
 pub mod probe;
+pub mod server;
 
 use std::time::Duration;
 

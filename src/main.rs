@@ -930,6 +930,46 @@ enum FabricAction {
         #[arg(long)]
         json: bool,
     },
+    /// Run a resident HTTP proxy in front of the fabric.
+    ///
+    /// Every request to `/v1/chat/completions` is placed and forwarded through
+    /// the same `Fabric::dispatch` path `fabric run` uses, so a client can point
+    /// at one address instead of the operator invoking the CLI per request.
+    /// Streaming is refused with 400, the same as the CLI path.
+    ///
+    /// The proxy has no authentication of its own, so it binds loopback by
+    /// default and refuses a routable address unless the exposure is
+    /// acknowledged explicitly.
+    Serve {
+        #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
+        nodes: Vec<String>,
+        #[arg(long, default_value = "127.0.0.1:8282")]
+        addr: SocketAddr,
+        /// Default placement mode; a client can still request affinity to a
+        /// specific node via the `x-camelid-fabric-sticky` request header.
+        #[arg(long, default_value = "throughput")]
+        mode: String,
+        /// Bearer token for nodes started with an API key. Falls back to
+        /// CAMELID_API_KEY. Without it, such a node observes as ready and then
+        /// answers every forwarded request with 401.
+        #[arg(long, value_name = "TOKEN")]
+        bearer: Option<String>,
+        /// Per-node health probe budget.
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+        /// Budget for the generation itself, which can legitimately take minutes.
+        #[arg(long, default_value_t = 300)]
+        forward_timeout_s: u64,
+        /// Explicitly permit an unauthenticated non-loopback listener. Without
+        /// this acknowledgement the proxy refuses the bind, because anything
+        /// that can reach it can drive every node in the fabric.
+        #[arg(
+            long,
+            env = "CAMELID_ALLOW_UNAUTHENTICATED_REMOTE",
+            default_value_t = false
+        )]
+        allow_unauthenticated_remote: bool,
+    },
 }
 
 #[cfg(test)]
@@ -988,6 +1028,8 @@ mod fabric_command_tests {
     fn every_fabric_subcommand_accepts_a_bearer() {
         // `run` is the one that 401s without it, but `status` and `route` must
         // take it too or they would keep predicting what `run` cannot do.
+        // `serve` is deliberately excluded: it forwards no credentials at all
+        // (see `FabricAction::Serve`'s doc comment), so it has no `--bearer`.
         on_cli_test_stack(|| {
             for argv in [
                 vec!["camelid", "fabric", "status"],
@@ -1002,6 +1044,9 @@ mod fabric_command_tests {
                         FabricAction::Status { bearer, .. }
                         | FabricAction::Route { bearer, .. }
                         | FabricAction::Run { bearer, .. } => bearer,
+                        FabricAction::Serve { .. } => {
+                            unreachable!("this loop never sends `fabric serve`")
+                        }
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
@@ -2533,12 +2578,12 @@ async fn main() -> anyhow::Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "label": decision.label,
-                            "reason": format!("{:?}", decision.reason),
+                            "reason": decision.reason.as_str(),
                             "affinity_lost": decision.affinity_lost,
                         }))?
                     );
                 } else {
-                    println!("route -> {} ({:?})", decision.label, decision.reason);
+                    println!("route -> {} ({})", decision.label, decision.reason.as_str());
                     if let Some(previous) = &decision.affinity_lost {
                         println!(
                             "note: affinity to `{previous}` could not be honoured; \
@@ -2604,7 +2649,7 @@ async fn main() -> anyhow::Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "node": answer.label,
-                            "reason": format!("{:?}", decision.reason),
+                            "reason": decision.reason.as_str(),
                             "affinity_lost": decision.affinity_lost,
                             "model": model_id,
                             "status": answer.status,
@@ -2614,9 +2659,9 @@ async fn main() -> anyhow::Result<()> {
                     );
                 } else {
                     println!(
-                        "[{} · {:?} · {} · {} ms]",
+                        "[{} · {} · {} · {} ms]",
                         answer.label,
-                        decision.reason,
+                        decision.reason.as_str(),
                         model_id,
                         answer.elapsed.as_millis()
                     );
@@ -2635,6 +2680,38 @@ async fn main() -> anyhow::Result<()> {
                         answer.status
                     );
                 }
+            }
+            FabricAction::Serve {
+                nodes,
+                addr,
+                mode,
+                bearer,
+                timeout_ms,
+                forward_timeout_s,
+                allow_unauthenticated_remote,
+            } => {
+                let mode = route_mode(&mode)?;
+                let bearer = fabric_bearer(bearer);
+                let specs = camelid::fabric::parse_fabric(&nodes)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let fabric = camelid::fabric::Fabric::new(specs)
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                    .with_bearer(bearer.as_deref());
+
+                // Bind before announcing, so a refused or already-taken address
+                // never prints a listening line it did not earn.
+                let listener =
+                    camelid::fabric::server::bind(addr, allow_unauthenticated_remote).await?;
+                println!("fabric serve listening on {}", listener.local_addr()?);
+                camelid::fabric::server::serve_on(
+                    listener,
+                    fabric,
+                    camelid::fabric::server::ServeConfig {
+                        mode,
+                        forward_timeout: std::time::Duration::from_secs(forward_timeout_s),
+                    },
+                )
+                .await?;
             }
         },
         Command::Inspect { path } => {

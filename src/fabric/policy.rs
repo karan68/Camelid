@@ -66,6 +66,22 @@ pub enum RouteReason {
     LeastLoaded,
 }
 
+impl RouteReason {
+    /// The name clients see, in `fabric … --json` and in the proxy's
+    /// `x-camelid-fabric-reason` header.
+    ///
+    /// Pinned here, and asserted in a test, because these strings used to come
+    /// from `#[derive(Debug)]` — which made renaming a variant a silent change
+    /// to two public surfaces.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Affinity => "Affinity",
+            Self::OnlyCandidate => "OnlyCandidate",
+            Self::LeastLoaded => "LeastLoaded",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDecision {
     pub label: String,
@@ -287,6 +303,15 @@ mod tests {
             route(&[], &RouteRequest::new(RouteMode::Throughput)),
             Err(RouteError::NoNodesConfigured)
         );
+    }
+
+    /// These strings reach clients over HTTP and in `--json` output, so they
+    /// are part of the contract and a variant rename must not move them.
+    #[test]
+    fn the_reason_names_clients_see_are_pinned() {
+        assert_eq!(RouteReason::Affinity.as_str(), "Affinity");
+        assert_eq!(RouteReason::OnlyCandidate.as_str(), "OnlyCandidate");
+        assert_eq!(RouteReason::LeastLoaded.as_str(), "LeastLoaded");
     }
 
     #[test]
