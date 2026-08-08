@@ -128,11 +128,11 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Qwen2.5 Coder 7B** | `Q8_0` | `qwen25` | 8.1 GB | `qwen25_coder` | `qwen2.5-coder-7b-instruct-q8_0.gguf` |
 | **Cohere Command R v01** | `Q8_0` | `command-r` | 37.2 GB | `command_r` | `c4ai-command-r-v01-Q8_0.gguf` |
 | **Ornith 1.0 9B** — hybrid DeltaNet, `tool_capable` | `Q8_0` | `qwen35` | 9.5 GB | `ornith` | `ornith-1.0-9b-Q8_0.gguf` |
-| **Bonsai 4B** | `Q1_0` | `qwen35` | 0.6 GB | `bonsai_4b_q1` | `Bonsai-4B-Q1_0.gguf` |
-| **Ternary Bonsai 4B** | `Q2_0` | `qwen35` | 1.1 GB | `bonsai_4b_q2` | `Ternary-Bonsai-4B-Q2_0.gguf` |
-| **Ternary Bonsai 4B** | `PQ2_0` | `qwen35` | 1.1 GB | `bonsai_4b_pq2` | `Ternary-Bonsai-4B-PQ2_0.gguf` |
-| **Bonsai 8B** | `Q1_0` | `qwen35` | 1.2 GB | `bonsai_8b_q1` | `Bonsai-8B-Q1_0.gguf` |
-| **Ternary Bonsai 8B** | `Q2_0` | `qwen35` | 2.2 GB | `bonsai_8b_q2` | `Ternary-Bonsai-8B-Q2_0.gguf` |
+| **Bonsai 4B** | `Q1_0` | `qwen3` | 0.6 GB | `bonsai_4b_q1` | `Bonsai-4B-Q1_0.gguf` |
+| **Ternary Bonsai 4B** | `Q2_0` | `qwen3` | 1.1 GB | `bonsai_4b_q2` | `Ternary-Bonsai-4B-Q2_0.gguf` |
+| **Ternary Bonsai 4B** | `PQ2_0` | `qwen3` | 1.1 GB | `bonsai_4b_pq2` | `Ternary-Bonsai-4B-PQ2_0.gguf` |
+| **Bonsai 8B** | `Q1_0` | `qwen3` | 1.2 GB | `bonsai_8b_q1` | `Bonsai-8B-Q1_0.gguf` |
+| **Ternary Bonsai 8B** | `Q2_0` | `qwen3` | 2.2 GB | `bonsai_8b_q2` | `Ternary-Bonsai-8B-Q2_0.gguf` |
 | **Bonsai 27B** | `Q1_0` | `qwen35` | 3.8 GB | `bonsai_27b_q1` | `Bonsai-27B-Q1_0.gguf` |
 | **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
@@ -161,6 +161,8 @@ Selected validation highlight:
 ### PrismML Bonsai and vision
 
 Seven hash-pinned PrismML Bonsai GGUFs are supported on Apple Silicon Metal and Windows x86_64 CUDA: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. Both 27B rows support PNG/JPEG input in browser chat and the API when paired with the Qwen3-VL projector.
+
+The **Arch** column reports what each GGUF declares in `general.architecture`, so it is not uniform across this family: the 4B and 8B files declare `qwen3` and only the 27B files declare `qwen35`. The two labels bind different engines, so the split is real rather than a typo.
 
 The desktop **Models** page downloads the projector automatically with either 27B model. For a CLI installation, place `Ternary-Bonsai-27B-mmproj-Q8_0.gguf` beside the model GGUF or set `CAMELID_MMPROJ`, then run `camelid serve` normally. See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact artifacts and validated scope.
 
