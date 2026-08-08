@@ -1026,15 +1026,15 @@ mod fabric_command_tests {
 
     #[test]
     fn every_fabric_subcommand_accepts_a_bearer() {
-        // `run` is the one that 401s without it, but `status` and `route` must
-        // take it too or they would keep predicting what `run` cannot do.
-        // `serve` is deliberately excluded: it forwards no credentials at all
-        // (see `FabricAction::Serve`'s doc comment), so it has no `--bearer`.
+        // `run` and `serve` are the ones that 401 without it, but `status` and
+        // `route` must take it too or they would keep predicting what the
+        // forwarding paths cannot do.
         on_cli_test_stack(|| {
             for argv in [
                 vec!["camelid", "fabric", "status"],
                 vec!["camelid", "fabric", "route"],
                 vec!["camelid", "fabric", "run", "--prompt", "hi"],
+                vec!["camelid", "fabric", "serve"],
             ] {
                 let mut argv = argv;
                 argv.extend(["--node", "a=127.0.0.1", "--bearer", "s3cret"]);
@@ -1043,10 +1043,8 @@ mod fabric_command_tests {
                     Some(Command::Fabric { action }) => match action {
                         FabricAction::Status { bearer, .. }
                         | FabricAction::Route { bearer, .. }
-                        | FabricAction::Run { bearer, .. } => bearer,
-                        FabricAction::Serve { .. } => {
-                            unreachable!("this loop never sends `fabric serve`")
-                        }
+                        | FabricAction::Run { bearer, .. }
+                        | FabricAction::Serve { bearer, .. } => bearer,
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
