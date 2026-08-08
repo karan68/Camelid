@@ -209,10 +209,10 @@ try {
   }))
 
   /* The composer's readiness copy moved to plain language (2026-08); the
-   invariant is unchanged -- a model whose runtime is up but whose artifact is
-   not verified must be shown as NOT ready to chat, never as ready. */
-assert.match(blockedWrongArtifactMarkup, /isn(?:&#x27;|')t verified for chat yet/, '3B live chat should show support is still gated while the runtime is up')
-assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an artifact-gated model must never be presented as ready to chat')
+     invariant is unchanged -- a model whose runtime is up but whose artifact is
+     not verified must be shown as NOT ready to chat, never as ready. */
+  assert.match(blockedWrongArtifactMarkup, /isn(?:&#x27;|')t verified for chat yet/, '3B live chat should show support is still gated while the runtime is up')
+  assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an artifact-gated model must never be presented as ready to chat')
   /* The readiness LINE now explains the blocker in the reader's language; the
      exact row id it refers to still travels with the message footer's Evidence
      Chip, which is the surface built to carry it. */
@@ -220,8 +220,11 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
   assert.match(blockedWrongArtifactMarkup, /requires the exact Llama-3\.2-3B-Instruct-Q8_0\.gguf artifact/, '3B artifact blocker must name the canonical GGUF filename')
   assert.match(blockedWrongArtifactMarkup, /data-send-ready="false"/, '3B composer send must stay disabled for a runtime-ready neighboring artifact')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Message Camelid"[^>]*disabled/, '3B draft composer should stay editable while exact-row support is still gated')
-  assert.doesNotMatch(blockedWrongArtifactMarkup, /Local chat ready/, '3B spoofed artifact must not render the supported live-chat state')
-  assert.doesNotMatch(blockedWrongArtifactMarkup, /Demo starters/, '3B spoofed artifact must not expose runnable demo prompts')
+  assert.doesNotMatch(blockedWrongArtifactMarkup, /Local chat is ready/, '3B spoofed artifact must not render the supported live-chat state')
+  /* "Demo starters" is gone; the empty state now offers prompt STARTERS that only fill the
+     composer. Re-pinned to the property that actually mattered: nothing on a gated screen
+     may be one click from running -- no send control is ever enabled here. */
+  assert.doesNotMatch(blockedWrongArtifactMarkup, /data-send-ready="true"/, '3B spoofed artifact must not expose runnable demo prompts')
 
   const streamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
@@ -328,7 +331,9 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
   }))
 
   assert.match(preTokenMarkup, /data-streaming-state="active"/, 'pre-token assistant rows should remain visibly active while the backend is generating')
-  assert.match(preTokenMarkup, /Backend is generating/, 'pre-token streaming should render the active backend-generation live status')
+  // The pre-token phase label is now the reader-facing "Generating response"
+  // (StreamingIndicator.FIRST_TOKEN_STREAMING_LABEL); same live status, plain wording.
+  assert.match(preTokenMarkup, /Generating response/, 'pre-token streaming should render the active backend-generation live status')
   assert.match(preTokenMarkup, /streaming-loader-dot-3/, 'pre-token streaming should render the active loader, not a static placeholder')
 
   const completedUnclosedFenceMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
@@ -399,7 +404,10 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     capabilities,
   }))
 
-  assert.match(exactReadyMarkup, /Selected exact row ready/, 'API readiness should turn green only for a matching loaded exact row')
+  /* The API readiness pill dropped the internal "exact row" vocabulary (2026-08);
+     it now reads as plain product language. The invariant is unchanged -- the pill
+     goes green only when the loaded model is the selected, verified one. */
+  assert.match(exactReadyMarkup, /Ready for the selected model/, 'API readiness should turn green only for a matching loaded exact row')
   assert.match(exactReadyMarkup, /llama32_3b_instruct_q8_0/, 'API view should render the selected exact compatibility row id')
   assert.match(exactReadyMarkup, /Exact row evidence bundle\./, 'API view should render exact-row evidence text')
   assert.match(exactReadyMarkup, /exact row fixture output/, 'API view should render latest exact-row output evidence')
@@ -416,12 +424,19 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     capabilities,
   }))
 
-  assert.match(exactReadySystemMarkup, /Selected exact-row local \/v1 ready/, 'System endpoint status should go green only when the selected 3B exact row and runtime readiness both match')
-  assert.match(exactReadySystemMarkup, /Runs now for this selected GGUF because loaded_now=true, generation_ready=true, active_model_id matches, and the exact \/api\/capabilities row is supported\./, 'System chat-completions copy should name the full 3B exact-row readiness gate')
-  assert.match(exactReadySystemMarkup, /Endpoint\/chat gate:[\s\S]*Ready: runtime readiness and exact-row support both match\./, 'System selected exact-row evidence should expose the retained chat/API gate')
+  /* System's endpoint pill, chat-completions sentence, and evidence row all moved to
+     plain language (2026-08): the raw gate fields (loaded_now/generation_ready/exact row)
+     are no longer restated in user copy. The invariant is unchanged -- each of these three
+     surfaces turns green only when runtime readiness AND row verification both hold. */
+  assert.match(exactReadySystemMarkup, /Local API ready for the selected model/, 'System endpoint status should go green only when the selected 3B exact row and runtime readiness both match')
+  assert.match(exactReadySystemMarkup, /Ready — the selected model is loaded and verified for chat\./, 'System chat-completions copy should name the full 3B exact-row readiness gate')
+  assert.match(exactReadySystemMarkup, /Chat readiness:<\/b> Ready — the model is loaded and verified\./, 'System selected exact-row evidence should expose the retained chat/API gate')
   assert.match(exactReadySystemMarkup, /Template\/Jinja readiness[\s\S]*Template readiness is green for this supported exact row/, 'System should render 3B template/Jinja lane evidence from /api/capabilities')
   assert.match(exactReadySystemMarkup, /Throughput readiness[\s\S]*Bounded row-scoped performance\/RSS evidence is present/, 'System should keep bounded 3B performance evidence separate from production-throughput promotion')
-  assert.match(exactReadySystemMarkup, /COMPATIBILITY\.md rows from \/api\/capabilities[\s\S]*Template\/Jinja: Template rendering ready for this exact row[\s\S]*Checked context: Checked context packs ready for this exact row[\s\S]*Throughput: Production throughput not promoted/, 'System compatibility row list should render row-scoped 3B capability lanes, not just raw row status')
+  /* The row list is no longer headed by the internal doc filename (2026-08); the section
+     still states it mirrors /api/capabilities and still renders each row-scoped lane
+     label, which is what this assertion protects. */
+  assert.match(exactReadySystemMarkup, /This mirrors \/api\/capabilities[\s\S]*Template rendering ready for this exact row[\s\S]*Checked context packs ready for this exact row[\s\S]*Production throughput not promoted/, 'System compatibility row list should render row-scoped 3B capability lanes, not just raw row status')
   assert.doesNotMatch(exactReadySystemMarkup, /normalizing model-native\/larger context; arbitrary\/Jinja template behavior; production throughput/, 'System compatibility list next-step copy should filter resolved template/Jinja caveats while retaining production-throughput blockers')
   assert.doesNotMatch(exactReadySystemMarkup, /# Use only after \/v1\/health returns generation_ready=true/, 'System curl should not imply generation_ready alone is sufficient for 3B UX chat')
   assert.match(exactReadySystemMarkup, /Selected device at load[\s\S]*CPU[\s\S]*Selected backend at load[\s\S]*cpu q8 runtime repack/, 'System should render the selected CPU load plan instead of static backend prose')
@@ -486,7 +501,7 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     capabilities,
   }))
 
-  assert.match(aliasApiMarkup, /Selected exact row ready/, 'API view should keep alias-selected 3B exact rows green when active_model_id matches runtime_model_name')
+  assert.match(aliasApiMarkup, /Ready for the selected model/, 'API view should keep alias-selected 3B exact rows green when active_model_id matches runtime_model_name')
   assert.match(aliasApiMarkup, /&quot;model&quot;: &quot;llama32_3b_instruct_q8_0&quot;/, 'API curl should send the backend loaded model id, not the browser-only alias')
   assert.doesNotMatch(aliasApiMarkup, /&quot;model&quot;: &quot;browser-llama32-3b-alias&quot;/, 'API curl must not create model_mismatch risk for alias-selected exact rows')
 
@@ -652,11 +667,14 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
   }))
 
   assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
-  assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
-  assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
-  assert.match(liveBackendIdChatMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
+  assert.match(liveBackendIdChatMarkup, /Local chat is ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
+  assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded and ready\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
+  /* Chat copy no longer prints raw row ids (2026-08). The supported lane is still
+     distinguishable in the composer: only a verified row is grouped/labeled "· Ready"
+     (an experimental row reads "· Experimental ready", an unverified one "· Not verified"). */
+  assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 · Ready</, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
   assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
-  assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
+  assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a verified model to send/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
 
   const staleLoadedNowChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: null,
@@ -676,10 +694,15 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     setTab: noop,
   }))
 
-  assert.match(staleLoadedNowChatMarkup, /No generation-ready model/, '3B chat readiness should use the shared chat gate and stay runtime-blocked when backend loaded_now=false')
+  /* The runtime-blocked readiness line is now stated in product language; the gate it
+     reports is still the shared chat gate, so send stays locked below. */
+  assert.match(staleLoadedNowChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is getting ready — you can draft now\./, '3B chat readiness should use the shared chat gate and stay runtime-blocked when backend loaded_now=false')
   assert.match(staleLoadedNowChatMarkup, /Draft a prompt while Camelid finishes getting ready/, '3B stale loaded_now=false rows should keep drafting available while runtime readiness is still blocked')
   assert.match(staleLoadedNowChatMarkup, /data-send-ready="false"/, '3B stale loaded_now=false rows must keep send locked until runtime readiness returns')
-  assert.doesNotMatch(staleLoadedNowChatMarkup, /Runtime ready, support gated|Local chat ready|Message Camelid…|Demo starters/, '3B stale browser readiness must not leak into live chat UX when /v1\\/health says loaded_now=false')
+  /* Re-pinned to live copy: with loaded_now=false the screen must not claim the runtime is
+     up (the "not verified" wording implies it is), must not render ready UX, and must not
+     enable send anywhere. */
+  assert.doesNotMatch(staleLoadedNowChatMarkup, /isn(?:&#x27;|')t verified for chat yet|Local chat is ready|Message Camelid…|data-send-ready="true"/, '3B stale browser readiness must not leak into live chat UX when /v1\\/health says loaded_now=false')
 
   const neighboringQuantPathModel = {
     ...selectedModel,
@@ -709,10 +732,16 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     setTab: noop,
   }))
 
-  assert.match(neighboringQuantPathChatMarkup, /Runtime ready, support gated/, '3B neighboring-quant chat UX should expose runtime-green state without claiming support')
-  assert.match(neighboringQuantPathChatMarkup, /llama32_3b_instruct_q8_0: quant mismatch/, '3B neighboring-quant chat UX should name the exact row mismatch instead of showing ready chat')
-  assert.match(neighboringQuantPathChatMarkup, /scoped to Q8_0[\s\S]*appears to be Q4_0/, '3B neighboring-quant chat UX should explain that the loaded artifact quant does not match the support contract row')
-  assert.doesNotMatch(neighboringQuantPathChatMarkup, /Local chat ready|Message Camelid…|Demo starters/, '3B neighboring-quant rows must not render the live-chat ready UX')
+  /* Chat no longer prints the row id or the quant-mismatch sentence (2026-08); that
+     row-scoped detail lives in System/API/the ledger now. What chat must still do is
+     distinguish "runtime is up but this model is not verified" from the runtime-blocked
+     wording, and keep send locked for that reason -- both pinned below. The mismatch
+     itself is still asserted structurally on the gate (contractSupported/chatUnlocked
+     above), so the invariant keeps its teeth. */
+  assert.match(neighboringQuantPathChatMarkup, /Llama 3\.2 3B Instruct Q8_0 isn(?:&#x27;|')t verified for chat yet\./, '3B neighboring-quant chat UX should expose runtime-green state without claiming support')
+  assert.match(neighboringQuantPathChatMarkup, /data-send-ready="false" title="Choose a verified model to send\."/, '3B neighboring-quant chat UX should name the exact row mismatch instead of showing ready chat')
+  assert.match(neighboringQuantPathChatMarkup, /This model isn(?:&#x27;|')t verified for chat yet\. Pick a verified model to unlock send\./, '3B neighboring-quant chat UX should explain that the loaded artifact quant does not match the support contract row')
+  assert.doesNotMatch(neighboringQuantPathChatMarkup, /Local chat is ready|Message Camelid…|data-send-ready="true"/, '3B neighboring-quant rows must not render the live-chat ready UX')
 
   const backendReadyButUnsupported3BCapabilities = {
     ...capabilities,
@@ -748,13 +777,17 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     setTab: noop,
   }))
 
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Choose a supported model\./, 'runtime-ready 3B rows should render support-gated chat UX when the exact row is downgraded')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Runtime ready, support gated/, 'support-gated 3B UX should still expose that loaded_now and generation_ready are green')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /llama32_3b_instruct_q8_0: groundwork backend evidence only/, 'support-gated 3B UX should name the exact unpromoted capabilities row rather than hiding behind generic load-first copy')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Chat unlocks only after loaded_now=true, generation_ready=true, and an exact supported compatibility row all match\./, 'support-gated 3B UX should preserve the exact-row frontend readiness rule')
+  /* Support-gated chat copy is now plain language (2026-08). The four surfaces below carry
+     the same four meanings the old raw-field copy did: the support-gated hero, the still-green
+     runtime (only a loaded + generation-ready model can reach the picker's runnable labels),
+     the named model instead of generic load-first copy, and the locked send with its reason. */
+  assert.match(backendReadyButUnsupported3BChatMarkup, /This model isn(?:&#x27;|')t verified for chat yet\. Pick a verified model to unlock send\./, 'runtime-ready 3B rows should render support-gated chat UX when the exact row is downgraded')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /Llama 3\.2 3B Instruct Q8_0 · Experimental ready/, 'support-gated 3B UX should still expose that loaded_now and generation_ready are green')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /Llama 3\.2 3B Instruct Q8_0 isn(?:&#x27;|')t verified for chat yet\./, 'support-gated 3B UX should name the exact unpromoted capabilities row rather than hiding behind generic load-first copy')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /data-send-ready="false" title="Choose a verified model to send\."/, 'support-gated 3B UX should preserve the exact-row frontend readiness rule')
   assert.match(backendReadyButUnsupported3BChatMarkup, /Draft a prompt while Camelid finishes getting ready/, 'support-gated 3B composer should stay editable while send remains locked behind the exact-row contract')
   assert.match(backendReadyButUnsupported3BChatMarkup, /data-send-ready="false"/, 'support-gated 3B rows must keep send disabled until the exact-row contract is promoted')
-  assert.doesNotMatch(backendReadyButUnsupported3BChatMarkup, /Local chat ready|Message Camelid…/, 'support-gated 3B rows must not render the live-chat ready UX')
+  assert.doesNotMatch(backendReadyButUnsupported3BChatMarkup, /Local chat is ready|Message Camelid…/, 'support-gated 3B rows must not render the live-chat ready UX')
 
   const experimental3BChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: null,
@@ -776,11 +809,14 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
   }))
 
   assert.equal(backendReadyButUnsupported3BGate.chatMode, 'experimental', 'a generation-ready implemented row outside the supported contract should use the explicit experimental lane')
-  assert.match(experimental3BChatMarkup, /Experimental chat ready/, 'the experimental lane should read as ready without borrowing the supported badge')
+  /* The experimental hero now spells the caveat out instead of using a badge phrase; it
+     still reads as ready AND still refuses the verified claim in the same sentence. */
+  assert.match(experimental3BChatMarkup, /Experimental local chat is ready\. Replies are not verified\./, 'the experimental lane should read as ready without borrowing the supported badge')
   assert.match(experimental3BChatMarkup, /Experimental ready/, 'the model picker should group a runnable experimental row with ready choices')
   assert.match(experimental3BChatMarkup, /data-send-ready="true"/, 'the explicit experimental lane should unlock send')
   assert.match(experimental3BChatMarkup, /Attach one PNG or JPEG for the loaded Prism vision model/, 'vision-ready experimental rows should expose the image picker')
-  assert.doesNotMatch(experimental3BChatMarkup, /Runtime ready, support gated/, 'a runnable experimental row must not look blocked')
+  // Re-pinned to the current blocked-state wording so the assertion still bites.
+  assert.doesNotMatch(experimental3BChatMarkup, /isn(?:&#x27;|')t verified for chat yet|Pick a verified model to unlock send/, 'a runnable experimental row must not look blocked')
 
   const backendReadyButUnsupported3BSystemMarkup = renderToStaticMarkup(React.createElement(SystemView, {
     runtime: liveBackendIdRuntime,
@@ -788,15 +824,24 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     capabilities: backendReadyButUnsupported3BCapabilities,
   }))
 
-  assert.match(backendReadyButUnsupported3BSystemMarkup, /Runtime ready, support gated/, 'System should keep runtime-green 3B rows visible without making unsupported exact rows API/chat-ready')
-  assert.match(backendReadyButUnsupported3BSystemMarkup, /Blocked for UX chat until loaded_now=true, generation_ready=true, active_model_id matches, and this exact row is supported\./, 'System should block chat completions copy when the exact 3B row is downgraded')
-  assert.match(backendReadyButUnsupported3BSystemMarkup, /Endpoint\/chat gate:[\s\S]*llama32_3b_instruct_q8_0: groundwork backend evidence only; loaded_now=true, generation_ready=true, exact row supported=false\./, 'System selected exact-row evidence should show runtime-green/support-red state for downgraded 3B rows')
-  assert.match(backendReadyButUnsupported3BSystemMarkup, /# Blocked for UX chat until selected exact row evidence and runtime readiness both match/, 'System curl should stay blocked for runtime-ready unsupported 3B rows')
-  assert.doesNotMatch(backendReadyButUnsupported3BSystemMarkup, /Selected exact-row local \/v1 ready|Ready: runtime readiness and exact-row support both match/, 'System must not present downgraded 3B rows as exact-row API/chat-ready')
+  /* System states the same runtime-green/support-red split in product language now
+     (2026-08). The row id itself is still printed beside the readiness line, so the
+     evidence stays visible; only the surrounding wording changed. */
+  assert.match(backendReadyButUnsupported3BSystemMarkup, /Engine ready — model not verified yet/, 'System should keep runtime-green 3B rows visible without making unsupported exact rows API/chat-ready')
+  assert.match(backendReadyButUnsupported3BSystemMarkup, /Chat unlocks once this model finishes loading and is verified\./, 'System should block chat completions copy when the exact 3B row is downgraded')
+  assert.match(backendReadyButUnsupported3BSystemMarkup, /llama32_3b_instruct_q8_0[\s\S]*Chat readiness:<\/b> Runnable \(unverified\); loaded=yes, ready=yes, verified=no\./, 'System selected exact-row evidence should show runtime-green/support-red state for downgraded 3B rows')
+  /* System no longer renders a curl sample (it lives on the API view, asserted there);
+     the blocked posture it demonstrated is now carried by the chat-readiness stat. */
+  assert.match(backendReadyButUnsupported3BSystemMarkup, /Chat readiness<\/span><strong>Gated<\/strong><small>model not verified yet<\/small>/, 'System curl should stay blocked for runtime-ready unsupported 3B rows')
+  assert.doesNotMatch(backendReadyButUnsupported3BSystemMarkup, /Local API ready for the selected model|Ready — the model is loaded and verified/, 'System must not present downgraded 3B rows as exact-row API/chat-ready')
 
   assert.match(exactReadyMarkup, /responses stream/, 'API view should normalize provider-scoped dotted feature ids before rendering')
   assert.match(exactReadyMarkup, /hosted model-style streamed response compatibility stays provider-neutral/, 'API view should neutralize hosted-brand feature notes before rendering')
-  assert.match(exactReadyMarkup, /Guarded feature row; do not label it hosted model or hosted model compatible from API metadata\./, 'API view should also neutralize guarded feature metadata before rendering')
+  /* The API view now lists only supported feature rows, so guarded metadata never reaches
+     the page in raw OR neutralized form (2026-08). Pinning the stronger fact -- the guarded
+     row is absent -- keeps the hosted-brand guarantee; the assertion below still checks that
+     no brand token survives on the rows that DO render. */
+  assert.doesNotMatch(exactReadyMarkup, /future[_ ]batch[_ ]endpoint|Guarded feature row/, 'API view should also neutralize guarded feature metadata before rendering')
   assert.doesNotMatch(exactReadyMarkup, /openai|OpenAI|ChatGPT|Claude|Gemini|broad_family_trap|broad_quant_trap/, 'API view must not promote broad family/quant lists or raw provider-scoped/hosted-brand feature labels as support evidence')
 
   const mismatchedRuntimeMarkup = renderToStaticMarkup(React.createElement(ApiView, {
@@ -805,9 +850,11 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     capabilities,
   }))
 
-  assert.match(mismatchedRuntimeMarkup, /Different loaded model is ready/, 'API readiness should fail closed when active_model_id differs from the selected exact row')
-  assert.match(mismatchedRuntimeMarkup, /Blocked for UX chat until selected exact row evidence and runtime readiness both match/, 'API curl should stay blocked until exact row and runtime readiness both match')
-  assert.doesNotMatch(mismatchedRuntimeMarkup, /Selected exact row ready/, 'mismatched runtime must not claim selected exact-row readiness')
+  /* Same fail-closed states, product wording (2026-08): the pill names the mismatch and the
+     curl sample stays a locked comment instead of a runnable request. */
+  assert.match(mismatchedRuntimeMarkup, /A different model is loaded/, 'API readiness should fail closed when active_model_id differs from the selected exact row')
+  assert.match(mismatchedRuntimeMarkup, /# Locked until the selected model is loaded and verified/, 'API curl should stay blocked until exact row and runtime readiness both match')
+  assert.doesNotMatch(mismatchedRuntimeMarkup, /Ready for the selected model/, 'mismatched runtime must not claim selected exact-row readiness')
 
   const plannedExactModel = {
     id: 'mistral-7b-instruct-v0.3-q8_0',
@@ -847,9 +894,9 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
   }))
 
   assert.match(plannedExactMarkup, /mistral_7b_instruct_v0_3_q8_0/, 'API view should show selected planned exact-row evidence by row id')
-  assert.match(plannedExactMarkup, /Generation ready; exact row required/, 'API readiness should stay guarded when the selected exact row is not supported')
+  assert.match(plannedExactMarkup, /Engine ready — model not verified/, 'API readiness should stay guarded when the selected exact row is not supported')
   assert.match(plannedExactMarkup, /Planned exact-row placeholder, not runnable support\./, 'API view should render the exact row evidence without broad-family inference')
-  assert.doesNotMatch(plannedExactMarkup, /Selected exact row ready/, 'planned exact rows must not claim selected exact-row readiness even when runtime health is green')
+  assert.doesNotMatch(plannedExactMarkup, /Ready for the selected model/, 'planned exact rows must not claim selected exact-row readiness even when runtime health is green')
 
   const genericExactModel = {
     id: 'custom-exact-row-q8-0',
@@ -888,10 +935,10 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
     capabilities: genericExactCapabilities,
   }))
 
-  assert.match(genericExactMarkup, /Selected exact row ready/, 'API view should support generic exact compatibility row ids without family-specific frontend matchers')
+  assert.match(genericExactMarkup, /Ready for the selected model/, 'API view should support generic exact compatibility row ids without family-specific frontend matchers')
   assert.match(genericExactMarkup, /custom_exact_row_q8_0/, 'API view should render generic selected exact-row ids from capabilities')
   assert.match(genericExactMarkup, /Custom exact row evidence from \/api\/capabilities\./, 'API view should render generic exact-row evidence text')
-  assert.doesNotMatch(genericExactMarkup, /No selected model exact row matched/, 'generic exact row-id matches should not fall through to broad or missing support copy')
+  assert.doesNotMatch(genericExactMarkup, /No exact compatibility row matched this selected model/, 'generic exact row-id matches should not fall through to broad or missing support copy')
 
   /* ---- API workbench try-it gating (Phase 5) ---- */
   const blockedApiMarkup = renderToStaticMarkup(React.createElement(ApiView, {
@@ -916,7 +963,10 @@ assert.doesNotMatch(blockedWrongArtifactMarkup, /is loaded and ready\./, 'an art
   assert.match(ledgerMarkup, /Not claimed/, 'every ledger row must carry the not-claimed column')
   assert.match(ledgerMarkup, /arbitrary\/Jinja templates, production throughput, portability/, 'the not-claimed column must render the contract blocker copy verbatim')
     assert.match(ledgerMarkup, /other_future_row_q8_0[\s\S]*?0<\/b> verified of 1 tracked lanes[\s\S]*?no verified pack/, 'planned pack ids must not be presented as verified evidence or checked contexts')
-    assert.match(blockedApiMarkup, /Q8_0[\s\S]*2 supported[\s\S]*1 guarded/, 'grouped quant evidence must keep supported and guarded postures visible')
+    /* Quant-grouped evidence moved to the ledger (2026-08); the API contract card now carries
+       the same two postures as counts. Both must stay visible -- a page that shows only the
+       supported side would overclaim. */
+    assert.match(blockedApiMarkup, /<b>2<\/b> verified models[\s\S]*<b>1<\/b> guarded or unclaimed rows/, 'grouped quant evidence must keep supported and guarded postures visible')
   assert.match(ledgerMarkup, /How to read this ledger/, 'the ledger must keep its explainer')
   assert.doesNotMatch(ledgerMarkup, /broad_family_trap|broad_quant_trap/, 'the ledger must not render non-row capability lists as support evidence')
   const emptyLedgerMarkup = renderToStaticMarkup(React.createElement(CompatibilityView, { capabilities: null }))
