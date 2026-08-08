@@ -107,11 +107,13 @@ target/release/camelid fabric serve \
 
 Two limits are deliberate and worth knowing before you deploy it:
 
-- The proxy has no key of its own. The acknowledgement flag is the only way to bind it to a routable
-  address, and it should only be used behind something that authenticates.
-- Forwarded requests carry no credentials. A node started with `--api-key` still answers the
-  auth-exempt `/v1/health` probe, so it looks routable, and then refuses every forwarded request
-  with 401. Run the nodes behind a fabric proxy anonymously on a trusted network.
+- The proxy has no key of its own, so it authenticates no client. The acknowledgement flag is the
+  only way to bind it to a routable address, and it should only be used behind something that does
+  authenticate.
+- `--bearer` (or `CAMELID_API_KEY`) is the token the proxy presents *to its nodes*, the same as
+  `fabric status|route|run`. A node started with `--api-key` needs it: `/v1/health` is exempt from
+  that node's auth, so without a token the node observes as ready and then answers every forwarded
+  request with 401.
 
 Request bodies are bounded at the same 16 MiB default the node itself uses, and streaming requests
 are refused with 400 rather than half-supported.

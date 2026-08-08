@@ -14,9 +14,8 @@
 //! * There is no authentication layer. Anything that can reach this address can
 //!   drive every node in the fabric, so [`bind`] refuses a non-loopback address
 //!   unless the risk is acknowledged explicitly.
-//! * Forwarded requests carry no credentials, so a node started with
-//!   `--api-key` answers the auth-exempt `/v1/health` probe and then refuses
-//!   every forwarded request with 401.
+//! * The token this proxy presents to its nodes is the one the fabric was built
+//!   with; it authenticates the proxy to the nodes, never a client to the proxy.
 //! * A dispatch runs on a blocking thread and blocking socket I/O is not
 //!   cancellable, so a client that hangs up leaves its dispatch running until
 //!   the node answers or `forward_timeout` expires.

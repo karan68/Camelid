@@ -937,9 +937,9 @@ enum FabricAction {
     /// at one address instead of the operator invoking the CLI per request.
     /// Streaming is refused with 400, the same as the CLI path.
     ///
-    /// The proxy has no authentication of its own and forwards no credentials,
-    /// so it binds loopback by default and refuses a routable address unless
-    /// the exposure is acknowledged explicitly.
+    /// The proxy has no authentication of its own, so it binds loopback by
+    /// default and refuses a routable address unless the exposure is
+    /// acknowledged explicitly.
     Serve {
         #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
         nodes: Vec<String>,
@@ -949,6 +949,11 @@ enum FabricAction {
         /// specific node via the `x-camelid-fabric-sticky` request header.
         #[arg(long, default_value = "throughput")]
         mode: String,
+        /// Bearer token for nodes started with an API key. Falls back to
+        /// CAMELID_API_KEY. Without it, such a node observes as ready and then
+        /// answers every forwarded request with 401.
+        #[arg(long, value_name = "TOKEN")]
+        bearer: Option<String>,
         /// Per-node health probe budget.
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
@@ -1023,6 +1028,8 @@ mod fabric_command_tests {
     fn every_fabric_subcommand_accepts_a_bearer() {
         // `run` is the one that 401s without it, but `status` and `route` must
         // take it too or they would keep predicting what `run` cannot do.
+        // `serve` is deliberately excluded: it forwards no credentials at all
+        // (see `FabricAction::Serve`'s doc comment), so it has no `--bearer`.
         on_cli_test_stack(|| {
             for argv in [
                 vec!["camelid", "fabric", "status"],
@@ -1037,6 +1044,9 @@ mod fabric_command_tests {
                         FabricAction::Status { bearer, .. }
                         | FabricAction::Route { bearer, .. }
                         | FabricAction::Run { bearer, .. } => bearer,
+                        FabricAction::Serve { .. } => {
+                            unreachable!("this loop never sends `fabric serve`")
+                        }
                     },
                     other => panic!("expected a fabric command, got {other:?}"),
                 };
@@ -2675,15 +2685,18 @@ async fn main() -> anyhow::Result<()> {
                 nodes,
                 addr,
                 mode,
+                bearer,
                 timeout_ms,
                 forward_timeout_s,
                 allow_unauthenticated_remote,
             } => {
                 let mode = route_mode(&mode)?;
+                let bearer = fabric_bearer(bearer);
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
-                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                    .with_bearer(bearer.as_deref());
 
                 // Bind before announcing, so a refused or already-taken address
                 // never prints a listening line it did not earn.
