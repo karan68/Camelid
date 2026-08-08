@@ -41,10 +41,23 @@ pub use policy::{route, RouteDecision, RouteError, RouteMode, RouteReason, Route
 pub use probe::{probe_fabric, probe_node, ProbeError, DEFAULT_PROBE_TIMEOUT};
 
 /// A configured set of nodes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Fabric {
     specs: Vec<NodeSpec>,
     timeout: Duration,
+    bearer: Option<String>,
+}
+
+/// Hand-written so a token can never reach a log through a derived `Debug`,
+/// the way `ServerPolicyOptions` redacts the key it holds.
+impl std::fmt::Debug for Fabric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fabric")
+            .field("specs", &self.specs)
+            .field("timeout", &self.timeout)
+            .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl Fabric {
@@ -52,11 +65,22 @@ impl Fabric {
         Self {
             specs,
             timeout: DEFAULT_PROBE_TIMEOUT,
+            bearer: None,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Authenticate to every node with this bearer token.
+    ///
+    /// Required against a node started with an API key: `/v1/health` is exempt
+    /// from the server's auth, so without a token such a node observes as ready
+    /// and places fine, then answers the request itself with 401.
+    pub fn with_bearer(mut self, bearer: Option<&str>) -> Self {
+        self.bearer = bearer.map(str::to_string);
         self
     }
 
@@ -70,7 +94,7 @@ impl Fabric {
 
     /// Observe every node once.
     pub fn observe(&self) -> Vec<NodeSnapshot> {
-        probe_fabric(&self.specs, self.timeout)
+        probe_fabric(&self.specs, self.bearer.as_deref(), self.timeout)
     }
 
     /// Observe every node once and choose one for a request.
@@ -105,7 +129,13 @@ impl Fabric {
         forward::reject_streaming(body)?;
 
         let (decision, chosen) = self.place(request)?;
-        let answer = forward::forward(&chosen.spec, path, body, forward_timeout)?;
+        let answer = forward::forward(
+            &chosen.spec,
+            path,
+            body,
+            self.bearer.as_deref(),
+            forward_timeout,
+        )?;
         Ok((decision, answer))
     }
 }
@@ -327,6 +357,19 @@ mod tests {
         let fabric = Fabric::new(Vec::new());
         assert!(fabric.is_empty());
         assert!(fabric.observe().is_empty());
+    }
+
+    #[test]
+    fn a_configured_token_is_never_exposed_by_debug() {
+        // A `Fabric` is the kind of thing that ends up in an error context or a
+        // trace line, so the derived `Debug` would have been a leak.
+        let authenticated = format!("{:?}", Fabric::new(Vec::new()).with_bearer(Some("s3cret")));
+        assert!(!authenticated.contains("s3cret"), "{authenticated}");
+        assert!(authenticated.contains("REDACTED"), "{authenticated}");
+
+        // Having no token reads as absent rather than as a redacted one.
+        let open = format!("{:?}", Fabric::new(Vec::new()));
+        assert!(open.contains("bearer: None"), "{open}");
     }
 
     #[test]

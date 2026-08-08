@@ -30,6 +30,17 @@ struct Received {
     method: String,
     path: String,
     body: String,
+    /// Header names lowercased; values verbatim.
+    headers: Vec<(String, String)>,
+}
+
+impl Received {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 #[derive(Clone)]
@@ -39,6 +50,10 @@ struct StubConfig {
     /// Body served from `/v1/chat/completions`.
     completion: String,
     completion_status: u16,
+    /// When set, every route but `/v1/health` answers 401 unless the request
+    /// carries exactly this bearer token — the arrangement a node started with
+    /// `CAMELID_API_KEY` actually presents to the fabric.
+    required_key: Option<String>,
 }
 
 impl StubConfig {
@@ -53,6 +68,7 @@ impl StubConfig {
                 r#"{{"choices":[{{"message":{{"role":"assistant","content":"served by {model}"}}}}]}}"#
             ),
             completion_status: 200,
+            required_key: None,
         }
     }
 
@@ -61,6 +77,7 @@ impl StubConfig {
             health: r#"{"ok":true,"generation_ready":false,"active_model_id":null}"#.to_string(),
             completion: "{}".to_string(),
             completion_status: 200,
+            required_key: None,
         }
     }
 
@@ -68,6 +85,14 @@ impl StubConfig {
         Self {
             completion: r#"{"error":{"message":"engine queue full"}}"#.to_string(),
             completion_status: 503,
+            ..Self::ready(model, 0)
+        }
+    }
+
+    /// A node with an API key set: health stays open, generation does not.
+    fn requiring_key(model: &str, key: &str) -> Self {
+        Self {
+            required_key: Some(key.to_string()),
             ..Self::ready(model, 0)
         }
     }
@@ -139,7 +164,22 @@ fn serve_once(stream: &mut TcpStream, config: &StubConfig, requests: &Mutex<Vec<
         return;
     };
 
+    // Mirrors `route_requires_auth` in the real server: `/v1/health` is exempt,
+    // everything else is gated.
+    let authorized = match &config.required_key {
+        Some(key) => {
+            received.path == "/v1/health"
+                || received.header("authorization") == Some(&format!("Bearer {key}"))
+        }
+        None => true,
+    };
+
     let (status, body) = match received.path.as_str() {
+        _ if !authorized => (
+            401,
+            r#"{"error":{"message":"provide Authorization: Bearer <key> or X-API-Key"}}"#
+                .to_string(),
+        ),
         "/v1/health" => (200_u16, config.health.clone()),
         "/v1/chat/completions" => (config.completion_status, config.completion.clone()),
         _ => (404, "{}".to_string()),
@@ -181,6 +221,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Received> {
                 method: parts.next()?.to_string(),
                 path: parts.next()?.to_string(),
                 body,
+                headers: parse_headers(&head),
             });
         }
     }
@@ -189,6 +230,15 @@ fn read_request(stream: &mut TcpStream) -> Option<Received> {
 
 fn find_header_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Every header line after the request line, names lowercased for lookup.
+fn parse_headers(head: &str) -> Vec<(String, String)> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect()
 }
 
 fn content_length(head: &str) -> Option<usize> {
@@ -329,7 +379,7 @@ fn forwarding_sends_a_well_formed_request_and_returns_the_answer() {
     let spec = alpha.spec("alpha");
 
     let body = forward::chat_request("model-alpha", "ping", 8);
-    let answer = forward::forward(&spec, "/v1/chat/completions", &body, FORWARD_TIMEOUT)
+    let answer = forward::forward(&spec, "/v1/chat/completions", &body, None, FORWARD_TIMEOUT)
         .expect("stub answers");
 
     assert!(answer.is_success());
@@ -363,6 +413,7 @@ fn an_engine_refusal_is_the_nodes_answer_not_a_transport_failure() {
         &spec,
         "/v1/chat/completions",
         &forward::chat_request("model-alpha", "ping", 8),
+        None,
         FORWARD_TIMEOUT,
     )
     .expect("a 503 is an answer, not an error");
@@ -422,6 +473,116 @@ fn dispatch_refuses_streaming_before_touching_the_network() {
     assert!(
         error.to_string().contains("streaming"),
         "unexpected: {error}"
+    );
+}
+
+#[test]
+fn a_fabric_carrying_the_key_is_served_by_an_authenticated_node() {
+    let alpha = StubNode::start(StubConfig::requiring_key("model-alpha", "s3cret"));
+    let fabric = fabric_of(vec![alpha.spec("alpha")]).with_bearer(Some("s3cret"));
+
+    let (decision, answer) = fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &forward::chat_request("model-alpha", "ping", 8),
+            &RouteRequest::new(RouteMode::Throughput),
+            FORWARD_TIMEOUT,
+        )
+        .expect("the node accepts our key");
+
+    assert_eq!(decision.label, "alpha");
+    assert_eq!(answer.status, 200);
+    assert_eq!(
+        forward::completion_text(&answer.body),
+        Some("served by model-alpha")
+    );
+
+    // Every request carried the token, the probe included. Health is exempt from
+    // the server's auth today, so sending it there buys nothing now — it means
+    // placement keeps working if that exemption is ever tightened.
+    let seen = alpha.received();
+    assert!(
+        seen.iter().any(|request| request.path == "/v1/health"),
+        "the node was probed as well as sent to"
+    );
+    for request in &seen {
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer s3cret"),
+            "`{}` went out unauthenticated",
+            request.path
+        );
+    }
+}
+
+#[test]
+fn a_missing_or_wrong_key_arrives_as_a_401_answer_not_a_transport_failure() {
+    // The defect this flag exists for. `/v1/health` is auth-exempt, so an
+    // authenticated node observes as ready and places fine; only the forward is
+    // refused. That refusal is the node answering, so it must reach the caller
+    // with its status rather than as a `Transport` error naming a dead node.
+    let alpha = StubNode::start(StubConfig::requiring_key("model-alpha", "s3cret"));
+
+    let unauthenticated = fabric_of(vec![alpha.spec("alpha")]);
+    let snapshots = unauthenticated.observe();
+    assert_eq!(
+        snapshots[0].active_model_id(),
+        Some("model-alpha"),
+        "health is exempt, so status still reads the node as ready"
+    );
+    assert_eq!(
+        route(&snapshots, &RouteRequest::new(RouteMode::Throughput))
+            .expect("placement succeeds even though the request will not")
+            .label,
+        "alpha"
+    );
+
+    // A wrong key is refused exactly as plainly as no key — and proves the stub
+    // compares the token rather than merely noticing one is present.
+    for fabric in [
+        unauthenticated,
+        fabric_of(vec![alpha.spec("alpha")]).with_bearer(Some("wrong-key")),
+    ] {
+        let (_, answer) = fabric
+            .dispatch(
+                "/v1/chat/completions",
+                &forward::chat_request("model-alpha", "ping", 8),
+                &RouteRequest::new(RouteMode::Throughput),
+                FORWARD_TIMEOUT,
+            )
+            .expect("a 401 is the node's answer, not a forwarding failure");
+
+        assert_eq!(answer.status, 401);
+        assert!(!answer.is_success());
+        assert!(
+            forward::error_message(&answer.body).is_some(),
+            "the refusal must carry a message an operator can act on"
+        );
+    }
+}
+
+#[test]
+fn an_unauthenticated_fabric_sends_no_authorization_header_at_all() {
+    // An open node must see exactly the request it saw before the fabric learned
+    // about tokens — not a header with an empty credential.
+    let alpha = StubNode::start(StubConfig::ready("model-alpha", 0));
+    let fabric = fabric_of(vec![alpha.spec("alpha")]);
+
+    fabric
+        .dispatch(
+            "/v1/chat/completions",
+            &forward::chat_request("model-alpha", "ping", 8),
+            &RouteRequest::new(RouteMode::Throughput),
+            FORWARD_TIMEOUT,
+        )
+        .expect("an open node answers");
+
+    let seen = alpha.received();
+    assert!(!seen.is_empty(), "the node was reached");
+    assert!(
+        seen.iter()
+            .all(|request| request.header("authorization").is_none()),
+        "an unconfigured fabric must not send an Authorization header"
     );
 }
 

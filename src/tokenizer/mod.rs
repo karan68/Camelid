@@ -502,6 +502,20 @@ fn resolve_gpt2_pre_tokenizer(
         // shared regex body, so no new splitter is required. Verified
         // character-for-character against `src/llama-vocab.cpp`.
         Some("stablelm2") => Ok(BpePreTokenizer::Qwen2),
+        // `lfm2` (LFM2 / LFM2.5) is an EXACT alias of `llama-bpe`: llama.cpp
+        // puts `lfm2` in the same switch arm as `llama3`/`llama-v3`/
+        // `llama-bpe`/`falcon3`/`pixtral`, resolving to
+        // LLAMA_VOCAB_PRE_TYPE_LLAMA3 with one shared regex body
+        // (`src/llama-vocab.cpp:2111-2123`), so no new splitter is required.
+        // That arm also sets `add_bos = true`; Camelid reaches the same place
+        // because LFM2 GGUFs omit `tokenizer.ggml.add_bos_token` and the
+        // default is `true`.
+        //
+        // This was a hard blocker, not a nicety: without it
+        // `Tokenizer::from_gguf` refuses every LFM2 row, which takes down the
+        // runnable smoke gate and the whole serve bridge even though the
+        // forward pass is parity-certified.
+        Some("lfm2") => Ok(BpePreTokenizer::Llama3),
         // `tekken` (Mistral Nemo / Ministral / Mistral Small 3.x). Ungated, unlike
         // `gpt-4o`: this dialect is validated by token-id agreement against the
         // pinned llama-tokenize oracle on a real Mistral Nemo GGUF, not by an
@@ -2865,6 +2879,16 @@ mod tests {
         assert!(matches!(
             resolve_gpt2_pre_tokenizer(Some("tekken"), &no_sig, false),
             Ok(BpePreTokenizer::Tekken)
+        ));
+
+        // `lfm2` is an EXACT alias of `llama-bpe` — llama.cpp resolves both to
+        // LLAMA_VOCAB_PRE_TYPE_LLAMA3 from one switch arm sharing a single
+        // regex body (`src/llama-vocab.cpp:2111-2123`). Without this arm every
+        // LFM2 row fails at tokenizer construction, which takes down the
+        // runnable smoke gate and the serve bridge.
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("lfm2"), &no_sig, false),
+            Ok(BpePreTokenizer::Llama3)
         ));
 
         // `command-r` is REFUSED, not mapped. BpePreTokenizer::CommandR models it

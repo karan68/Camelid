@@ -4931,7 +4931,10 @@ async fn execution_plan(State(state): State<AppState>) -> Json<Option<ExecutionP
 }
 
 #[cfg(test)]
-fn capabilities_response() -> CapabilitiesResponse {
+/// `pub(crate)` so the execution planner's tests can pin their `support_level`
+/// disclosure against the very row this table advertises, rather than against a
+/// copy of the string that can drift.
+pub(crate) fn capabilities_response() -> CapabilitiesResponse {
     capabilities_response_with_plan(None)
 }
 
@@ -4947,7 +4950,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -5051,10 +5054,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke_lanes",
                 notes: "exact dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking DISABLED) have row-specific smoke support: qwen2 BPE pre-tokenizer + hardcoded ChatML renderer, per-head QK-norm + NEOX (split-half) RoPE, and token-AND-text-identical greedy parity vs llama.cpp at 1/5/50 tokens on macOS/Ubuntu and on Windows x86_64 CPU (both the cpu_reference scalar path and the x86_q8 AVX2 runtime-repack path, bit-identical). 1.7B additionally runs the GPU-resident decode+prefill path and a 15,373-token single-shot prefill lane on macOS, with opt-in thinking-mode leading-trace parity. Exact rows only; other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the validated envelope, and broad Qwen-family support are not implied.",
             },
+            // The `qwen35` in this id is a STABLE JOIN KEY, not a description:
+            // the ledger and the docs surfaces address this row by exact id, so
+            // respelling it would orphan the join. The family is mixed-arch --
+            // see `notes` -- and the per-row architecture labels in the curated
+            // catalog are the authority.
             SupportItem {
                 id: "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed qwen35 graph on macOS Apple Silicon Metal and Windows x86_64 CUDA. Both exact 27B rows have API/WebUI single-image smoke with the checked Q8_0 projector; constrained Windows GPUs use capacity-planned pinned-host layer streaming. Exact rows and these two GPU platforms only; neighboring files, broader qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied.",
+                notes: "seven hash-pinned Bonsai 4B, 8B, and 27B Q1_0, Prism Q2_0, and PQ2_0 artifacts run the packed Prism low-bit graph on macOS Apple Silicon Metal and Windows x86_64 CUDA. The family is NOT one architecture: the 4B and 8B files declare general.architecture=qwen3 and carry a dense attention stack (11 per-layer tensors, no ssm_* weights), while only the 27B files declare qwen35 with the hybrid gated-delta-net stack (ssm_conv1d/ssm_dt/ssm_out). Both exact 27B rows have API/WebUI single-image smoke with the checked Q8_0 projector; constrained Windows GPUs use capacity-planned pinned-host layer streaming. Exact rows and these two GPU platforms only; neighboring files, broader qwen3 or qwen35, bounded context, tools, multimodal expansion, and production throughput are not implied.",
             },
         ],
         planned_model_families: vec![
@@ -5182,7 +5190,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_result: "pass",
                 latest_checked_output: "camelid.agent_eval/v1 PASS (full 3-case battery)",
                 evidence: "qwen35 (Ornith-1.0-9B) Q4_K_M fully GPU-resident (CAMELID_QWEN35_CUDA=1): 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle PASSES under the cross-backend tolerance policy — 2/5 token-identical at n=64 and every flip probed and attributed to soft positions with <=0.33-nat top-2 gaps where the oracle's own CPU-vs-CUDA backends also flip (qa/ornith/constrained-vram/RECEIPT_ITEM2_qwen35_parity_cuda.json, probes + oracle/camelid internal-variance controls committed alongside). The full read_file/list_dir/write_file agent battery passes on this exact file with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json); tool_capable earned ONLY by that receipt. Decode throughput 18.8 tok/s median via the device-side decode loop (qa/ornith/constrained-vram profile CSVs). NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
-                next_step: "preserve the CUDA parity + agent capability for this exact row; context-pack coverage, the frontend picker load path, and a normalized full-support bundle remain before any broader claim",
+                next_step: "preserve the CUDA parity + agent capability for this exact row; NOTE a macOS resident Metal lane now accepts qwen35 K-quant files by default (opt-out CAMELID_QWEN35_METAL=0) and would serve THESE bytes on Apple Silicon with no receipt covering them — the only Metal K-quant parity evidence is qa/ornith/G-PARITY-qwen35-kquant-metal-macos.md, taken on a DIFFERENT artifact (sha256 5720d1f6, the HuggingFace imatrix quant, not this row's 2711bf1e); a Metal receipt on these exact bytes, context-pack coverage, the frontend picker load path, and a normalized full-support bundle remain before any broader claim",
             },
             ModelCompatibilityTarget {
                 id: "ornith_1_0_9b_q3_k_m",
@@ -5240,7 +5248,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke",
                 support_scope: "exact_row_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "model-native/larger context, broader arbitrary templates beyond the native Ornith ChatML renderer, production throughput on the pure-f32 runnable lane, portability, and durable repeated current-head bundles remain missing",
+                full_support_blockers: "model-native/larger context, broader arbitrary templates beyond the native Ornith ChatML renderer, production throughput on the runnable lane (macOS decodes on the resident Metal graph by default since the Q8_0 admission; prefill remains slow and no throughput is promised), portability, and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated_qwen35_bpe_mark_folding_deferred",
                 tensors_load: "validated_all_427_qwen35_tensors",
@@ -5271,8 +5279,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "agent_eval_read_list_write",
                 latest_checked_result: "pass",
                 latest_checked_output: "3x camelid.agent_eval/v1 PASS",
-                evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the runnable lane is correct but slow vs an optimized SIMD/CUDA kernel).",
-                next_step: "preserve the parity-certified runnable lane + the read/list/write agent capability for this exact row; an optimized-lane qwen35 kernel for production throughput, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
+                evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the CPU hybrid path is correct but slow; on macOS this row decodes on the qwen35 resident Metal graph by default — opt-out CAMELID_QWEN35_METAL=0 — re-certified greedy token-identical 4/4 vs the same pinned acd79d6 reference token IDs on that lane, qa/ornith/G-PARITY-qwen35-metal-macos.md; prefill remains slow on every lane and no throughput is promised).",
+                next_step: "preserve the parity-certified lanes (CPU hybrid + the default-on macOS resident Metal graph, qa/ornith/G-PARITY-qwen35-metal-macos.md) + the read/list/write agent capability for this exact row; Metal-lane prefill throughput, optimized qwen35 kernels on non-macOS hosts, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
             },
             // MUSTER M-A1 (2026-07-16), re-anchored onto the Metal GPU-resident
             // lane by the gemma3→Metal campaign (2026-07-30, Phases 0-5;
@@ -5900,17 +5908,35 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             // packed macOS Metal and Windows CUDA lanes. Every id below is also a
             // curated catalog id, so the Models page derives Supported from this
             // contract. The receipts hash-pin all seven files and the projector.
+            //
+            // MIXED-ARCH FAMILY -- do not normalize these labels. Header read of
+            // all seven artifacts on 2026-08-07: the 4B and 8B files declare
+            // `general.architecture=qwen3` with a DENSE stack (36 blocks, 11
+            // per-layer tensors: attn_q/k/v + q_norm/k_norm + ffn, tied head,
+            // tokenizer pre `qwen2`, no ssm_* weights anywhere). Only the 27B
+            // files declare `qwen35` with the hybrid gated-delta-net stack (64
+            // blocks, 20 per-layer tensors incl. ssm_conv1d/ssm_dt/ssm_out,
+            // untied head, tokenizer pre `qwen35`). The rows below therefore
+            // split: qwen3_* labels for 4B/8B, qwen35_* for the 27B pair.
+            //
+            // `family` is NOT cosmetic: crate::chat::tool_parse::parse matches
+            // `family.contains("qwen35")` to pick the Ornith XML tool-call
+            // parser ahead of the hermes/JSON arm. Every Bonsai row is
+            // `tool_capable: false` and both agent entry points return early on
+            // `!active_tool_capable()`, so no Bonsai row reaches that parser
+            // today -- but if one is ever promoted, `qwen3_*` correctly lands it
+            // on the hermes arm the dense Qwen3 rows already use.
             ModelCompatibilityTarget {
                 id: "bonsai_4b_q1_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q1_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_vendor_token_and_text_parity",
@@ -5918,7 +5944,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Bonsai-4B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -5944,15 +5970,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_q2_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q2_0/Q2_0_G128",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata_and_prism_q2_g128_geometry",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_vendor_short_decode_parity",
@@ -5960,7 +5986,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Ternary-Bonsai-4B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -5986,15 +6012,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_4b_pq2_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "PQ2_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_pq2_type_142",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and PQ2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata_and_prism_pq2_type_142",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_pq2_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "pq2_wire_identity_plus_deterministic_windows_cuda_chat_probe",
@@ -6002,7 +6028,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Ternary-Bonsai-4B-PQ2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -6028,15 +6054,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "bonsai_8b_q1_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q1_0",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q1_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q1_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
@@ -6044,7 +6070,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Bonsai-8B-Q1_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -6070,15 +6096,15 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "ternary_bonsai_8b_q2_0",
-                family: "qwen35_bonsai_gpu",
+                family: "qwen3_bonsai_gpu",
                 quantization: "Q2_0/Q2_0_G128",
                 status: "supported_exact_row_smoke",
                 tool_capable: false,
                 support_scope: "exact_row_macos_metal_or_windows_cuda_chat_smoke_only",
                 full_support_status: "blocked_pending_portability_and_bounded_context",
-                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen35 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
-                metadata_parses: "validated_qwen35_hybrid_metadata_and_prism_q2_g128_geometry",
-                tokenizer_works: "validated_qwen35_bpe_chatml",
+                full_support_blockers: "non-Metal/non-CUDA portability, bounded and model-native context packs, broader qwen3 and Q2_0 rows, tool calling, vision, and production throughput remain unproven",
+                metadata_parses: "validated_qwen3_dense_metadata_and_prism_q2_g128_geometry",
+                tokenizer_works: "validated_qwen2_bpe_chatml",
                 tensors_load: "validated_all_tensors_packed_q2_0_wire_resident",
                 generation_runs: "validated_chat_completions_on_macos_metal_and_windows_cuda",
                 parity_audited: "metal_scalar_projection_gate_plus_windows_cuda_deterministic_chat_probe",
@@ -6086,7 +6112,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 frontend_load_path_verified: "curated_catalog_entry_plus_browser_chat_smoke",
                 frontend_readiness_gate: "green only for Ternary-Bonsai-8B-Q2_0.gguf on Apple Silicon Metal or Windows CUDA when loaded_now, generation_ready, and active_model_id all match",
                 tested_context: "short_chat_completions_smoke_with_runtime_capacity_capped_at_4096",
-                chat_template_renderer: "qwen35_chatml",
+                chat_template_renderer: "qwen3_chatml",
                 chat_template_shape_pack: "not_promoted",
                 chat_template_shape_pack_id: "not_selected",
                 bounded_context_512_pack: "not_promoted",
@@ -8065,6 +8091,135 @@ mod gemma4_template_tests {
     /// turn (no pre-filled `<think></think>` block) is the one strong, bit-exact
     /// guarantee the opt-in thinking lane carries. The parity-locked exact-row
     /// mode stays thinking-DISABLED; this test does not touch that claim.
+    /// LFM2 chat-template fidelity gate.
+    ///
+    /// `render_lfm2_chatml_prompt` is hand-written Rust standing in for the
+    /// GGUF's Jinja template. This pins it against the template as actually
+    /// applied by llama.cpp b9632 (`/apply-template` on the LFM2.5-2.6B Q8_0
+    /// row), captured by `scripts/capture-lfm2-chat-template-fixture.mjs`.
+    ///
+    /// The reference string carries NO bos_token text — llama.cpp supplies the
+    /// BOS at tokenize time (`add_special`), and so does Camelid
+    /// (`prepare_runnable_prompt` sets `add_special` for lfm2). The fixture's
+    /// `prompt_ids` therefore begin with 124894 while `applied_prompt` does
+    /// not, so this test compares the RENDERED TEXT to `applied_prompt` and
+    /// separately pins where the BOS comes from.
+    ///
+    /// Regression this locks: before the LFM2 bring-up the bridge rendered
+    /// lfm2 through `render_ornith_chatml_prompt`, which emits qwen3's closed
+    /// `<think>\n\n</think>\n\n` block instead of LFM2's open `<think>`.
+    /// LFM2's `</think>` is a CONTROL token, so it is stripped by
+    /// `decode(ids, true)` before any text-level search can find it — the
+    /// text-based `split_ornith_think` therefore cannot split an LFM2 turn and the
+    /// whole think block would be reported as `content`. The token-level split
+    /// must fire instead, and must stay inert for vocabularies without the token.
+    #[test]
+    fn lfm2_think_split_is_token_level_not_text_level() {
+        // Stand-in vocab: id 7 is `</think>`, and detokenizing it yields nothing
+        // (exactly what a stripped control token does).
+        let close_id = 124902u32;
+        let ids = [10u32, 11, close_id, 12];
+
+        // The text path is blind once the marker is stripped: this is the string
+        // the serve path actually receives for such a turn.
+        let stripped_text = "REASONINGANSWER";
+        let (reasoning, content) = split_ornith_think(stripped_text);
+        assert!(
+            reasoning.is_none() && content == stripped_text,
+            "text-level split must be unable to see a stripped control marker"
+        );
+
+        // And the token-level split locates it by id regardless of detokenization.
+        assert_eq!(
+            ids.iter().position(|&t| t == close_id),
+            Some(2),
+            "the token-level split keys on the id, which survives detokenization"
+        );
+    }
+
+    /// LFM2's open-`<think>` prompt is an LFM2.5 fact; an `lfm2` file carrying a
+    /// different template must be refused, not rendered against it.
+    #[test]
+    fn lfm2_template_gate_accepts_only_the_evidenced_dialect() {
+        let lfm2 = "{{- bos_token -}}{%- set preserve_thinking = preserve_thinking | \
+                    default(false) -%}<|im_start|><|im_end|><|tool_call_start|>";
+        assert!(is_lfm2_chatml_template(lfm2));
+        // A bare ChatML template on an lfm2 file is NOT the evidenced dialect —
+        // and note a generic `<|im_start|>`/`<|im_end|>` check WOULD accept it.
+        assert!(!is_lfm2_chatml_template("<|im_start|><|im_end|>"));
+        assert!(!is_lfm2_chatml_template(""));
+        // A Qwen3 ChatML template must not be mistaken for LFM2's.
+        assert!(!is_lfm2_chatml_template(
+            "<|im_start|>system\n<|im_end|>\n{% if enable_thinking %}<think>{% endif %}"
+        ));
+    }
+
+    #[test]
+    fn lfm2_renderer_matches_llamacpp_applied_template() {
+        #[derive(serde::Deserialize)]
+        struct WireMsg {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            messages: Vec<WireMsg>,
+            applied_prompt: String,
+            prompt_ids: Vec<u32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            cases: Vec<Case>,
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lfm2_parity/lfm2-chat-template.json");
+        if !path.exists() {
+            eprintln!(
+                "SKIP: lfm2 chat-template fixture absent ({})",
+                path.display()
+            );
+            return;
+        }
+        let doc: Doc = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+            .expect("lfm2 chat-template fixture parses");
+        assert!(!doc.cases.is_empty(), "fixture carries no cases");
+
+        for case in &doc.cases {
+            let messages: Vec<ChatMessage> = case
+                .messages
+                .iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    image_urls: Vec::new(),
+                    unsupported_content_parts: Vec::new(),
+                })
+                .collect();
+            assert_eq!(
+                super::render_lfm2_chatml_prompt(&messages),
+                case.applied_prompt,
+                "lfm2 renderer diverged from llama.cpp's applied template on case {:?}",
+                case.name
+            );
+            // The BOS is not renderer text; it must come from the tokenizer.
+            // Pin that split so a future "just prepend it in the renderer"
+            // change cannot silently double it.
+            assert!(
+                !case.applied_prompt.contains("<|startoftext|>"),
+                "case {:?}: applied template unexpectedly carries literal BOS text",
+                case.name
+            );
+            assert_eq!(
+                case.prompt_ids.first().copied(),
+                Some(124_894),
+                "case {:?}: reference ids must begin with the LFM2 BOS",
+                case.name
+            );
+        }
+    }
+
     #[test]
     fn completions_fail_closed_for_runnable_serve_archs() {
         // Runnable-served archs have no raw-completions bridge: the gate must
@@ -8086,6 +8241,10 @@ mod gemma4_template_tests {
             for q8 in [false, true] {
                 assert!(bridge("qwen35", capable, q8));
                 assert!(bridge("gemma2", capable, q8));
+                // lfm2 joined the bridge-only set with the short-conv
+                // bring-up: its conv layers carry no attn_q/k/v, so no
+                // optimized lane can run it on any host.
+                assert!(bridge("lfm2", capable, q8));
                 for arch in ["llama", "qwen3", "mistral", "gemma4", ""] {
                     assert!(!bridge(arch, capable, q8), "{arch:?} must stay open");
                 }
@@ -9227,9 +9386,10 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 // ===================================================================================
 // Runnable-lane serve bridge (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0).
 //
-// Architectures implemented only in the runnable (pure-f32 oracle) lane â€” currently
-// `qwen35` (Ornith) â€” are not in the optimized inference engine, so the Llama serve
-// path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
+// Architectures implemented only in the runnable lane (`model::is_runnable_only_arch`
+// is the authoritative list; "runnable" names the bridge, not a CPU claim — within it
+// qwen35 decodes on resident Metal/CUDA graphs where available, lfm2 on Metal) are
+// not in the optimized inference engine, so the Llama serve path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
 // per-model-id runtime map, a short-circuit at the top of `chat_completions`, and a
 // dedicated chat handler. The optimized lane is untouched. Generation is greedy
 // (matches the brief) on a blocking thread; the runtime is `&self`-immutable so it
@@ -9727,6 +9887,59 @@ fn render_ornith_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) 
     prompt
 }
 
+/// Render an LFM2 / LFM2.5 chat prompt, faithful to the GGUF's own template.
+///
+/// LFM2.5's template (`tokenizer.chat_template` on the published row) is plain
+/// ChatML with two properties that the Ornith/qwen35 renderer does NOT share,
+/// which is why LFM2 needs its own:
+///
+///  1. It opens with `{{- bos_token -}}`. The BOS is supplied by the tokenizer
+///     via `add_special` (see `prepare_runnable_prompt`), not emitted as literal
+///     text here — same discipline as the gemma renderer.
+///  2. Its generation prompt is `<|im_start|>assistant\n<think>` — it ALWAYS
+///     opens a reasoning block, and the template offers no thinking-disabled
+///     variant. Injecting qwen3's closed `<think>\n\n</think>\n\n` block (what
+///     `render_ornith_chatml_prompt` does when thinking is off) is a different
+///     model's convention and is not what these weights were trained on.
+///
+/// Because the opening `<think>` is part of the PROMPT, the model's completion
+/// has the shape `REASONING</think>\n\nCONTENT`, which is exactly what
+/// [`split_ornith_generation`] already parses.
+fn render_lfm2_chatml_prompt(messages: &[ChatMessage]) -> String {
+    // The template drops the reasoning of any assistant turn that PRECEDES the
+    // last user turn: `keep_thinking = preserve_thinking or loop.index0 >
+    // ns.last_user_index`, and when that is false it rewrites the content to
+    // `content.split("</think>")[-1] | trim`. `preserve_thinking` defaults to
+    // false, so stale reasoning must not be replayed into the prompt.
+    //
+    // Camelid's bridge already splits reasoning out into `reasoning_content`,
+    // so a well-behaved client never sends `</think>` back inside `content`.
+    // Mirroring the template here means a client that DOES still gets the
+    // reference prompt instead of a silently divergent one.
+    let last_user_index = messages
+        .iter()
+        .rposition(|message| message.role.trim() == "user");
+    let mut prompt = String::new();
+    let mut append_generation_prompt = true;
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.role.trim();
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        let keep_thinking = last_user_index.is_none_or(|last| index > last);
+        match (role, message.content.rsplit_once("</think>")) {
+            ("assistant", Some((_, after))) if !keep_thinking => prompt.push_str(after.trim()),
+            _ => prompt.push_str(&message.content),
+        }
+        prompt.push_str("<|im_end|>\n");
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n<think>");
+    }
+    prompt
+}
+
 /// Render an Ornith/qwen35 ChatML prompt with tool definitions, faithful to the GGUF
 /// template's tools system block + custom `<function=â€¦>` instructions. `tools` are the
 /// flat function objects (`{name,description,parameters}`). Tool results (`role:"tool"`)
@@ -9784,6 +9997,30 @@ fn render_ornith_chatml_prompt_with_tools(
         });
     }
     prompt
+}
+
+/// Split a generation into `(reasoning, content)` at the `</think>` TOKEN.
+///
+/// [`split_ornith_think`] searches the DETOKENIZED text, which only works when
+/// `</think>` survives detokenization. On LFM2 it does not: `</think>` is control
+/// token 124902, and both runnable chat paths detokenize with
+/// `remove_special = true`, so the marker is gone before any text search runs and
+/// the whole think block lands in `content` instead of `reasoning_content`.
+/// Splitting the ID stream first sidesteps that.
+///
+/// Returns `None` — leaving the caller on the text path — when the vocabulary has
+/// no single `</think>` token or the generation never emitted one, so
+/// architectures whose `</think>` is ordinary text are unaffected.
+fn split_think_by_token(ids: &[u32], tokenizer: &Tokenizer) -> Option<(Option<String>, String)> {
+    let close = tokenizer.token_to_id.get("</think>").copied()?;
+    let at = ids.iter().position(|&id| id == close)?;
+    let reasoning = tokenizer.decode(&ids[..at], true).ok()?.trim().to_string();
+    let content = tokenizer
+        .decode(&ids[at + 1..], true)
+        .ok()?
+        .trim_start()
+        .to_string();
+    Some(((!reasoning.is_empty()).then_some(reasoning), content))
 }
 
 /// Split an Ornith generation into `(reasoning, content)` on the first `</think>`.
@@ -10108,7 +10345,13 @@ fn prepare_runnable_prompt(
         .flat_map(|message| message.image_urls.iter().map(String::as_str))
         .collect();
     if image_urls.is_empty() {
-        let add_special = runtime.architecture == "gemma2" || runtime.architecture == "gemma3";
+        // `add_special` is what supplies the leading BOS. gemma needs it; so
+        // does lfm2 — LFM2.5's chat template opens with `{{- bos_token -}}`
+        // (`<|startoftext|>`, id 124894), and the GGUF omits
+        // `tokenizer.ggml.add_bos_token` so the tokenizer's default `true`
+        // applies. Without this the whole prompt is shifted by a missing BOS
+        // and the forward diverges from the reference.
+        let add_special = matches!(runtime.architecture.as_str(), "gemma2" | "gemma3" | "lfm2");
         let ids = runtime
             .tokenizer
             .encode(prompt_text, add_special, true)
@@ -10218,6 +10461,23 @@ async fn runnable_chat_nonstreaming(
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "lfm2" {
+        // LFM2 has its own template AND its own tool-call envelope; borrowing
+        // the qwen35 tools renderer would emit a format these weights were
+        // never trained on. Fail closed until an LFM2 tool lane is proven.
+        if !tools.is_empty() {
+            return lfm2_runnable_lane_tools_rejection();
+        }
+        // Keyed on the FILE's template, not the arch string alone: the
+        // open-`<think>` generation prompt below is an LFM2.5 fact, evidenced by
+        // that row's template fixture. Another `lfm2` GGUF — an LFM2 v1 row, or a
+        // requant whose template was substituted — would be handed a `<think>` it
+        // may never have been trained on. Refuse instead, same contract as
+        // `reject_windowed_arch_with_unrecognized_template`.
+        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
+            return rejection;
+        }
+        render_lfm2_chatml_prompt(&messages)
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -10277,7 +10537,11 @@ async fn runnable_chat_nonstreaming(
         }
     };
 
-    let (reasoning, content) = split_ornith_think(&text);
+    // Prefer the token-level split: on lfm2 `</think>` is a control token that
+    // detokenization strips, so the text search below can never find it and the
+    // whole think block would land in `content`.
+    let (reasoning, content) =
+        split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text));
     // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
@@ -10285,11 +10549,18 @@ async fn runnable_chat_nonstreaming(
     // lifts envelopes with no tools in the request, but a `tool_choice:"none"`
     // response must never carry tool_calls (OpenAI semantics), even if the
     // model mimics envelope syntax from its conversation history.
-    let tool_calls = if tool_choice_allows_calls(req.tool_choice.as_ref()) {
-        parse_ornith_tool_calls_json(&content)
-    } else {
-        Vec::new()
-    };
+    // Also arch-gated: the envelope being lifted is Ornith's `<function=…>` XML,
+    // and lfm2 refuses tools outright (its own dialect is
+    // `<|tool_call_start|>[fn(a='v')]<|tool_call_end|>`, which no certified parser
+    // covers). Without this a request that was REFUSED a tools array could still
+    // come back with `finish_reason: "tool_calls"` if the model echoed Ornith
+    // syntax from its history.
+    let tool_calls =
+        if runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref()) {
+            parse_ornith_tool_calls_json(&content)
+        } else {
+            Vec::new()
+        };
     let finish_reason = if tool_calls.is_empty() {
         "stop"
     } else {
@@ -10351,6 +10622,23 @@ async fn runnable_chat_streaming(
             return gemma_runnable_lane_tools_rejection();
         }
         render_gemma3_prompt(&messages)
+    } else if runtime.architecture == "lfm2" {
+        // LFM2 has its own template AND its own tool-call envelope; borrowing
+        // the qwen35 tools renderer would emit a format these weights were
+        // never trained on. Fail closed until an LFM2 tool lane is proven.
+        if !tools.is_empty() {
+            return lfm2_runnable_lane_tools_rejection();
+        }
+        // Keyed on the FILE's template, not the arch string alone: the
+        // open-`<think>` generation prompt below is an LFM2.5 fact, evidenced by
+        // that row's template fixture. Another `lfm2` GGUF — an LFM2 v1 row, or a
+        // requant whose template was substituted — would be handed a `<think>` it
+        // may never have been trained on. Refuse instead, same contract as
+        // `reject_windowed_arch_with_unrecognized_template`.
+        if let Some(rejection) = reject_lfm2_with_unrecognized_template(&runtime, &id) {
+            return rejection;
+        }
+        render_lfm2_chatml_prompt(&messages)
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
@@ -10373,8 +10661,11 @@ async fn runnable_chat_streaming(
     // `tool_choice:"none"` the content has already streamed as plain deltas
     // (hold-back off), so lifting here would BOTH violate OpenAI semantics and
     // duplicate the streamed text as a structured tool_calls delta.
-    let lift_tool_calls = tool_choice_allows_calls(req.tool_choice.as_ref());
+    // Arch-gated for the same reason as the non-streaming path above.
+    let lift_tool_calls =
+        runtime.architecture != "lfm2" && tool_choice_allows_calls(req.tool_choice.as_ref());
     let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
+    let opens_think_unconditionally = runtime.architecture == "lfm2";
     let created = unix_secs();
 
     enum StreamItem {
@@ -10441,7 +10732,14 @@ async fn runnable_chat_streaming(
         // Per-phase incremental decode state. `emitted` counts bytes of the phase's
         // decoded string already sent; `seen_visible` gates the leading-whitespace
         // trim (mirroring split_ornith_think's trim of the reasoning/content edges).
-        let mut in_think = enable_thinking && think_close.is_some();
+        // lfm2 thinks UNCONDITIONALLY: `render_lfm2_chatml_prompt` always ends the
+        // prompt with an OPEN `<think>`, unlike Ornith/Qwen3 where the block is
+        // opt-in. Without this the streamed turn opens in the CONTENT phase and
+        // emits the whole think block as `content` deltas, while the same turn
+        // non-streamed reports it as `reasoning_content` — the two lanes
+        // disagreeing about one request.
+        let mut in_think =
+            (enable_thinking || opens_think_unconditionally) && think_close.is_some();
         let mut phase_ids: Vec<u32> = Vec::new();
         let mut emitted = 0usize;
         let mut seen_visible = false;
@@ -18929,6 +19227,69 @@ fn gemma_runnable_lane_tools_rejection() -> Response {
     )
 }
 
+/// The single construction of the LFM2 runnable tool refusal, shared by the
+/// non-streaming and streaming bridges so the two cannot drift.
+///
+/// LFM2.5's template DOES have a tools branch, but it renders a
+/// model-specific tool-call envelope that Camelid neither emits nor lifts back
+/// into structured `tool_calls`. Rendering the qwen35 `<function=…>` format
+/// instead would put a foreign convention in front of these weights, so the
+/// lane fails closed until an LFM2 tool row is actually certified.
+/// The LFM2.5 ChatML dialect [`render_lfm2_chatml_prompt`] is fixture-locked to.
+/// Keyed on markers no other admitted ChatML template carries — LFM2's tool-call
+/// delimiters and its `preserve_thinking` switch — because a check on
+/// `<|im_start|>`/`<|im_end|>` alone would match every ChatML family.
+fn is_lfm2_chatml_template(template: &str) -> bool {
+    template.contains("<|im_start|>")
+        && template.contains("<|im_end|>")
+        && template.contains("<|tool_call_start|>")
+        && template.contains("preserve_thinking")
+}
+
+/// Refuse an `lfm2` model whose embedded chat template is not the LFM2.5 dialect.
+///
+/// [`render_lfm2_chatml_prompt`] hard-codes an OPEN `<think>` generation prompt and
+/// the `keep_thinking` stripping rule. Both are LFM2.5 facts, evidenced only by
+/// that row's template fixture. Another `lfm2` GGUF would be rendered against them
+/// silently, under an architecture Camelid claims to implement — so name the
+/// missing markers and fail closed, mirroring
+/// [`reject_windowed_arch_with_unrecognized_template`].
+fn reject_lfm2_with_unrecognized_template(
+    runtime: &RunnableServeRuntime,
+    model_id: &str,
+) -> Option<Response> {
+    if runtime
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .is_some_and(is_lfm2_chatml_template)
+    {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!(
+            "model '{model_id}' declares architecture 'lfm2', whose only evidenced chat \
+             rendering is the LFM2.5 ChatML dialect (markers <|im_start|>, <|im_end|>, \
+             <|tool_call_start|>, and a preserve_thinking switch), but its embedded \
+             tokenizer.chat_template does not carry those markers. The renderer would \
+             otherwise append LFM2.5's open <think> generation prompt, which this model may \
+             never have been trained on, so chat fails closed."
+        ),
+        Some("messages"),
+    ))
+}
+
+fn lfm2_runnable_lane_tools_rejection() -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_tools",
+        "the lfm2 runnable serve lane does not support tools yet: LFM2's tool-call envelope differs from the qwen35 `<function=…>` format this lane lifts, and no LFM2 tool-call row is certified".to_string(),
+        None,
+    )
+}
+
 /// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
 /// `<end_of_turn>` turn markers plus the `first_user_prefix` system-folding
 /// variable (which distinguishes it from other turn-marker templates). Chat
@@ -21373,7 +21734,7 @@ mod tests {
             .collect();
         let allowlisted_rows: std::collections::HashSet<&str> = NON_CATALOG_SUPPORTED_ARTIFACTS
             .iter()
-            .map(|(_, row_id)| *row_id)
+            .map(|(_, row_id, _)| *row_id)
             .collect();
 
         let unreachable: Vec<&str> = supported_compatibility_row_ids()
@@ -21397,7 +21758,7 @@ mod tests {
         // The allowlist is keyed by row id, so a typo (or a row that was renamed
         // out from under it) fails open into "this artifact is not supported"
         // rather than loudly. Both halves must resolve.
-        for (filename, row_id) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+        for (filename, row_id, _) in NON_CATALOG_SUPPORTED_ARTIFACTS {
             assert!(
                 supported_compatibility_row_ids().contains(row_id),
                 "allowlisted artifact {filename} names {row_id}, which is not a \
@@ -21514,14 +21875,36 @@ mod tests {
         );
     }
 
+    /// Every artifact whose supported-row identity is pinned to exact bytes:
+    /// the paired Prism evidence bundles, the non-catalog allowlist, and the
+    /// curated rows carrying a recorded digest. `classify_model_lane` only
+    /// requires the architecture to be IMPLEMENTED (it never cross-checks arch
+    /// against the row), so one implemented arch drives the whole table.
+    fn hash_pinned_supported_artifacts() -> Vec<(&'static str, &'static str)> {
+        PRISM_SUPPORTED_ARTIFACT_SHA256
+            .iter()
+            .map(|(filename, sha256)| (*filename, *sha256))
+            .chain(
+                NON_CATALOG_SUPPORTED_ARTIFACTS
+                    .iter()
+                    .map(|(filename, _, sha256)| (*filename, *sha256)),
+            )
+            .chain(
+                CURATED_SUPPORTED_ARTIFACT_SHA256
+                    .iter()
+                    .map(|(filename, sha256)| (*filename, *sha256)),
+            )
+            .collect()
+    }
+
     #[test]
-    fn loaded_prism_support_requires_each_exact_recorded_sha256() {
-        for (filename, expected_sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
-            assert!(prism_supported_artifact_identity_matches(
+    fn loaded_support_requires_each_exact_recorded_sha256() {
+        for (filename, expected_sha256) in hash_pinned_supported_artifacts() {
+            assert!(supported_artifact_identity_matches(
                 filename,
                 expected_sha256
             ));
-            assert!(!prism_supported_artifact_identity_matches(
+            assert!(!supported_artifact_identity_matches(
                 filename,
                 &"00".repeat(32)
             ));
@@ -21541,6 +21924,13 @@ mod tests {
                 "{filename} must remain unverified until the load path supplies its digest"
             );
         }
+        // A curated row with NO recorded digest keeps its filename-only gating.
+        // Absence of a pin must fail OPEN (the row stays supported), because the
+        // alternative is inventing a digest from whatever file is lying around.
+        assert!(
+            supported_artifact_expected_sha256("tinyllama-1.1b-chat-v1.0.Q8_0.gguf").is_none(),
+            "precondition: no digest is recorded for the TinyLlama gate row"
+        );
         assert_eq!(
             classify_loaded_model_identity(
                 Some("llama"),
@@ -21548,8 +21938,111 @@ mod tests {
                 &"00".repeat(32),
             ),
             ModelLaneClass::Supported,
-            "this hardening is scoped to the seven Prism identities"
+            "an unpinned curated row stays filename-gated until a digest is captured"
         );
+    }
+
+    #[test]
+    fn pinned_curated_rows_check_bytes_but_stay_downloadable() {
+        // Curated rows differ from the allowlist in RECOURSE, not in principle:
+        // the certified bytes are a public upload, so tripping this gate is
+        // fixable by re-downloading. The pin must not remove the row from the
+        // catalog (that would break `camelid pull` and the Models page).
+        let catalog: std::collections::HashMap<&str, &str> = curated_catalog()
+            .into_iter()
+            .map(|item| (item.filename, item.catalog_id))
+            .collect();
+        for (filename, sha256) in CURATED_SUPPORTED_ARTIFACT_SHA256 {
+            let catalog_id = catalog.get(filename).unwrap_or_else(|| {
+                panic!("{filename} is pinned as a curated row but is not in curated_catalog()")
+            });
+            assert!(
+                supported_compatibility_row_ids().contains(catalog_id),
+                "{filename} pins {catalog_id}, which is not a supported row"
+            );
+            assert_eq!(
+                classify_loaded_model_identity(Some("llama"), filename, sha256),
+                ModelLaneClass::Supported,
+                "{filename} with its certified bytes keeps the row"
+            );
+            assert_eq!(
+                classify_loaded_model_identity(Some("llama"), filename, &"00".repeat(32)),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} with other bytes must not inherit the row"
+            );
+        }
+    }
+
+    #[test]
+    fn certified_filename_with_wrong_bytes_is_not_a_supported_row() {
+        // THE REGRESSION this guard exists for. `ornith-1.0-9b-Q4_K_M.gguf` names
+        // two different sets of weights: the CERTIFIED in-house requant with no
+        // imatrix (2711bf1e..., 5,629,108,416 B) that the CUDA parity + agent-eval
+        // receipts were captured against, and the public HuggingFace imatrix quant
+        // of the exact same name (5720d1f6..., 5,629,108,704 B). Classifying on the
+        // filename alone made the second one report the first one's support claims
+        // and parity evidence through /api/capabilities and the frontend.
+        const CERTIFIED: &str = "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
+        const HF_IMATRIX_SAME_NAME: &str =
+            "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106";
+
+        assert_eq!(
+            classify_loaded_model_identity(Some("qwen35"), "ornith-1.0-9b-Q4_K_M.gguf", CERTIFIED),
+            ModelLaneClass::Supported,
+            "the certified bytes keep the row"
+        );
+        assert_eq!(
+            classify_loaded_model_identity(
+                Some("qwen35"),
+                "ornith-1.0-9b-Q4_K_M.gguf",
+                HF_IMATRIX_SAME_NAME,
+            ),
+            ModelLaneClass::ExperimentalImplemented,
+            "a same-named file with uncertified bytes must NOT inherit the row"
+        );
+        // Case-insensitive on the hex, since digests reach us from several
+        // producers, but never lenient about which digest.
+        assert_eq!(
+            classify_loaded_model_identity(
+                Some("qwen35"),
+                "ornith-1.0-9b-Q4_K_M.gguf",
+                &CERTIFIED.to_uppercase(),
+            ),
+            ModelLaneClass::Supported,
+        );
+    }
+
+    #[test]
+    fn every_non_catalog_allowlist_entry_is_hash_pinned() {
+        // The 3-tuple makes a pin-less allowlist entry unrepresentable; this pins
+        // the digest SHAPE and that the entry resolves to its own recorded value
+        // (a copy/paste that duplicates a filename would otherwise resolve to
+        // whichever row came first).
+        let mut seen = std::collections::HashMap::new();
+        for (filename, _, sha256) in NON_CATALOG_SUPPORTED_ARTIFACTS {
+            assert_eq!(sha256.len(), 64, "{filename} digest is not a sha256");
+            assert!(
+                sha256
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{filename} digest must be lowercase hex"
+            );
+            assert_eq!(
+                supported_artifact_expected_sha256(filename),
+                Some(*sha256),
+                "{filename} must resolve to its own recorded digest"
+            );
+            assert!(
+                seen.insert(*filename, *sha256).is_none(),
+                "{filename} is allowlisted twice"
+            );
+        }
+        // The two hash-pinned tables must never disagree about the same file.
+        for (filename, sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
+            if let Some(other) = seen.get(filename) {
+                assert_eq!(other, sha256, "{filename} is pinned to two digests");
+            }
+        }
     }
 
     #[test]
@@ -25310,6 +25803,7 @@ mod tests {
             gemma3: None,
             gemma4: None,
             qwen35: None,
+            lfm2: None,
             mla: None,
         }
     }
@@ -26166,6 +26660,19 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
         // join is what makes the Models page say Supported rather than merely
         // decorating an unverified download. Sizes are the HF LFS byte counts,
         // rechecked against the hash-pinned test files on 2026-08-01.
+        //
+        // The architecture labels are NOT uniform across the family, and that is
+        // deliberate: this field is what the GGUF actually declares, not the
+        // family name. Read from the headers of all seven artifacts on
+        // 2026-08-07, the 4B and 8B rows declare `general.architecture=qwen3`
+        // (398/399 tensors) and only the 27B rows declare `qwen35` (851
+        // tensors). They were all labelled `qwen35` here until then, which
+        // misdescribed the lane: `qwen3` binds the dense engine in
+        // src/inference.rs while `qwen35` binds the runnable lane in
+        // src/runnable/model.rs. Routing was never affected -- it reads
+        // gguf.architecture() from the file and is_prism_low_bit_metal_arch
+        // accepts both -- so this is the metadata catching up to the bytes. Do
+        // not "restore" the missing `5`.
         CatalogItem {
             catalog_id: "bonsai_4b_q1_0",
             name: "Bonsai 4B Q1_0",
@@ -26175,7 +26682,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 16415,
             likes: 53,
             quant: "Q1_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26188,7 +26695,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 7994,
             likes: 30,
             quant: "Q2_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26201,7 +26708,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 7994,
             likes: 30,
             quant: "PQ2_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26214,7 +26721,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 64163,
             likes: 762,
             quant: "Q1_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -26227,7 +26734,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 120197,
             likes: 130,
             quant: "Q2_0",
-            architecture: "qwen35",
+            architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["general", "reasoning", "coding"],
         },
@@ -27887,36 +28394,124 @@ fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'sta
 
 /// Supported exact rows whose GGUF artifact is NOT a curated-catalog download —
 /// in-house imatrix requants (and the side-loaded Q8_0) with no HF catalog
-/// source. Exact filename → compatibility row id; the row must still be
-/// `supported_*` in the ledger, so this stays fail-closed at the same trust
-/// level as the curated-catalog path (exact-artifact filename match).
-const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
-    ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
-    ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
-    ("ornith-1.0-9b-Q3_K_M.gguf", "ornith_1_0_9b_q3_k_m"),
-    // Local requantization (BASALT/GABBRO pilot artifact, sha256 eb293344...,
-    // 6,058,607,776 B). There is no upstream upload to pull, so the row can only
-    // reach the Supported lane through this allowlist -- SUPPORT_MATRIX_v0.1.md
-    // already records "no frontend pull-catalog entry" for it.
-    ("gemma-4-E4B-it-NVFP4-mm.gguf", "gemma4_e4b_it_nvfp4"),
+/// source. `(exact filename, compatibility row id, certified sha256)`; the row
+/// must still be `supported_*` in the ledger.
+///
+/// The digest is the anchor, not the filename. Every entry here names bytes that
+/// exist nowhere the user can re-download, so a same-named neighbour is the
+/// EXPECTED failure mode rather than an exotic one: the certified
+/// `ornith-1.0-9b-Q4_K_M.gguf` is an in-house requant (`2711bf1e...`,
+/// 5,629,108,416 B) while the public HuggingFace file of that exact name is a
+/// different imatrix quant (`5720d1f6...`, 5,629,108,704 B) — different weights,
+/// not just different metadata. Classification therefore fails closed to
+/// `ExperimentalImplemented` until the load path has confirmed the digest; see
+/// `supported_artifact_expected_sha256`.
+const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
+    // HF pristine upload; local recompute matches the HF LFS oid (9,527,500,992 B).
+    (
+        "ornith-1.0-9b-Q8_0.gguf",
+        "Ornith 1.0 9B",
+        "d0e4bebaa8b3450c62090df1408f2ee5ccb2094f9c610ffde564a654483d4f37",
+    ),
+    // In-house requant from the Q8_0 parent (5,629,108,416 B). NOT the
+    // same-named HuggingFace imatrix file -- see the note above.
+    (
+        "ornith-1.0-9b-Q4_K_M.gguf",
+        "ornith_1_0_9b_q4_k_m",
+        "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f",
+    ),
+    (
+        "ornith-1.0-9b-Q3_K_M.gguf",
+        "ornith_1_0_9b_q3_k_m",
+        "16f54df50e44bcaed854941835e595e60a12db48d3b2248af2a1959fc91b6eaa",
+    ),
+    // Local requantization (BASALT/GABBRO pilot artifact, 6,058,607,776 B).
+    // There is no upstream upload to pull, so the row can only reach the
+    // Supported lane through this allowlist -- SUPPORT_MATRIX_v0.1.md already
+    // records "no frontend pull-catalog entry" for it.
+    (
+        "gemma-4-E4B-it-NVFP4-mm.gguf",
+        "gemma4_e4b_it_nvfp4",
+        "eb293344972e2b292a043b8e7649b9788dca915b034e5c2721cfc531cf9863d9",
+    ),
     // Community-sourced (superkaiii/Ternary-Bonsai-4B). The Hub API refuses the
     // repo tree (gated or withdrawn), so no catalog row can be honestly pinned
-    // to it; a file the operator already has still classifies from its exact
-    // certified name (sha256 b85dcbaa...).
-    ("Ternary-Bonsai-4B-TQ2_0.gguf", "ternary_bonsai_4b_tq2_0"),
-    // Provenance unresolved by design: the certified bytes (sha256 6a746610...,
-    // 807,693,984 B) match NO surveyed publisher upload -- bartowski's
-    // same-named file is 6f85a640.../807,694,464 B. Catalog-free on purpose.
+    // to it; a file the operator already has classifies from these exact bytes.
+    (
+        "Ternary-Bonsai-4B-TQ2_0.gguf",
+        "ternary_bonsai_4b_tq2_0",
+        "b85dcbaa6f57a9c71252371c97f4c68602c2c5fc61a9e1ce74d963d6fee5047c",
+    ),
+    // Provenance unresolved by design: the certified bytes (807,693,984 B) match
+    // NO surveyed publisher upload -- bartowski's same-named file is
+    // 6f85a640.../807,694,464 B. Catalog-free on purpose, and a live example of
+    // why the digest rather than the name has to be the anchor.
     (
         "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
         "llama_3_2_1b_instruct_q4_k_m",
+        "6a74661014a3e2f139871f81e6cec852c489a627d169de503a3c0434a10c503d",
     ),
     // NB: Qwen3-4B-Q4_K_M.gguf is intentionally NOT here -- it is an official
     // Qwen/Qwen3-4B-GGUF upload, so it lives in curated_catalog() and is covered
     // by the curated-catalog branch of filename_is_supported_exact_row. The
     // Llama 3.2 3B K-quants and the 1B IQ4_XS are likewise catalog rows (their
-    // certified bytes ARE a public upload), not allowlist entries: the catalog
-    // branch carries an exact size, while this one matches on filename alone.
+    // certified bytes ARE a public upload), not allowlist entries. Those rows are
+    // hash-pinned too -- see CURATED_SUPPORTED_ARTIFACT_SHA256 -- but through the
+    // catalog, so `camelid pull` keeps working for them.
+];
+
+/// Curated-catalog rows whose certified bytes are ALSO recorded, so the loaded
+/// digest is checked rather than the filename alone.
+///
+/// These differ from the non-catalog allowlist in recourse, not in principle: the
+/// certified bytes ARE a public upload, so an operator who trips this gate can
+/// re-download and compare. That makes the pin cheap to satisfy and the failure
+/// mode actionable — but it also means an upstream RE-UPLOAD under the same name
+/// will demote the row to experimental until someone re-certifies the new bytes.
+/// That is the intended behavior: `supported_exact_row_smoke` is a claim about
+/// specific bytes, and silently transferring it to a file no evidence covers is
+/// exactly the defect this table exists to prevent.
+///
+/// Only rows whose digest is corroborated on a public surface (README /
+/// COMPATIBILITY / STATUS / SUPPORT_MATRIX / the contract literal, filename and
+/// digest on the same line) belong here. Curated rows with no recorded digest
+/// stay filename-gated until one is captured — an absent pin must never be
+/// invented from a local file.
+const CURATED_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
+    (
+        "nomic-embed-text-v1.5.Q8_0.gguf",
+        "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7",
+    ),
+    (
+        "gemma-3-1b-it-Q8_0.gguf",
+        "b205840c5dcef55078e37d344677869a714ffd42a4ae448c48dcfb52e4bb10d5",
+    ),
+    (
+        "Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+        "69e85c871a13a99e4008c09916a957d170e4e5623a5b2e06be46408029a7afba",
+    ),
+    // The one row where the re-upload case is not hypothetical: COMPATIBILITY.md
+    // anchors the current 512-8192 ladder to THIS digest and records the earlier
+    // b5607b50... upload as historical evidence for that file, from which
+    // "nothing is inherited by the canonical file". Without the pin, a b5607b50
+    // copy on disk classifies as supported and inherits the anchored ladder --
+    // which the release contract already says in writing that it must not.
+    (
+        "Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "f34112a11b7dad74ab517dedf6dcf00d624c9adac2dc0c72c719ca0478554ef2",
+    ),
+    (
+        "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+    ),
+    (
+        "Llama-3.2-3B-Instruct-Q5_K_M.gguf",
+        "0b94ccd04d908304cec5246a3d942b64417a423bc5c6d47c73bc557e590b5194",
+    ),
+    (
+        "Qwen3-4B-Q4_K_M.gguf",
+        "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    ),
 ];
 
 /// Exact Prism model identities proven by the paired Metal/CUDA evidence
@@ -27960,17 +28555,56 @@ fn prism_supported_artifact_expected_sha256(filename: &str) -> Option<&'static s
         .find_map(|(artifact, sha256)| (*artifact == filename).then_some(*sha256))
 }
 
+/// Prism-scoped identity check. Kept separate from the general one below because
+/// it also decides whether to bind the companion vision projector — a capability
+/// question, not a support-claim question.
 fn prism_supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
     prism_supported_artifact_expected_sha256(filename)
         .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
 }
 
+/// The certified digest for an exact supported artifact whose row identity is
+/// pinned to specific bytes. Three sources, one rule: the paired Metal/CUDA
+/// Prism bundles, every non-catalog allowlist entry, and the curated rows whose
+/// digest is recorded. A filename with no pin here keeps its existing
+/// filename-only gating — absence means "no digest was ever captured for this
+/// row", never "any bytes will do knowingly".
+fn supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
+    prism_supported_artifact_expected_sha256(filename)
+        .or_else(|| {
+            NON_CATALOG_SUPPORTED_ARTIFACTS
+                .iter()
+                .find_map(|(artifact, _, sha256)| (*artifact == filename).then_some(*sha256))
+        })
+        .or_else(|| {
+            CURATED_SUPPORTED_ARTIFACT_SHA256
+                .iter()
+                .find_map(|(artifact, sha256)| (*artifact == filename).then_some(*sha256))
+        })
+}
+
+/// True when `gguf_sha256` is the certified digest recorded for `filename`.
+/// False both for a mismatch and for a filename that carries no pin at all —
+/// callers must therefore ask `supported_artifact_expected_sha256` first if they
+/// need to distinguish "wrong bytes" from "not hash-pinned".
+fn supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
+    supported_artifact_expected_sha256(filename)
+        .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
+}
+
 /// True when `filename` is the exact GGUF artifact of a curated row whose
 /// `catalog_id` is a `supported_*` compatibility row, or an allowlisted
-/// non-catalog artifact of a `supported_*` row. The ledger is exact-artifact
-/// gated, so an exact-filename match is the honest server-side "is this a supported
-/// row?" test. Deliberately conservative: a supported model loaded under a
-/// non-curated filename classifies as experimental, never falsely as supported.
+/// non-catalog artifact of a `supported_*` row. Deliberately conservative in the
+/// widening direction: a supported model loaded under a non-curated filename
+/// classifies as experimental, never falsely as supported.
+///
+/// This is a NAME test, not an identity test, and it is not on its own the
+/// server's answer to "is this a supported row?" — every caller must go through
+/// `classify_model_lane_with_verified_sha256` / `classify_loaded_model_identity`,
+/// which additionally require the certified digest for any hash-pinned artifact.
+/// Curated rows are not hash-pinned because their certified bytes ARE a public
+/// upload the user can re-fetch and compare; the non-catalog rows have no such
+/// recourse, which is exactly why they carry a digest here.
 fn filename_is_supported_exact_row(filename: &str) -> bool {
     let supported = supported_compatibility_row_ids();
     curated_catalog()
@@ -27978,7 +28612,7 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
         .any(|c| c.filename == filename && supported.contains(c.catalog_id))
         || NON_CATALOG_SUPPORTED_ARTIFACTS
             .iter()
-            .any(|(artifact, row_id)| *artifact == filename && supported.contains(row_id))
+            .any(|(artifact, row_id, _)| *artifact == filename && supported.contains(row_id))
 }
 
 /// Classify a model from real header metadata. `architecture` is the parsed
@@ -27997,18 +28631,17 @@ fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneC
     }
 }
 
-/// Prism's public support boundary is hash-pinned. Filename/header-only views
-/// (local library and inspect) therefore remain experimental until the ordinary
-/// load path has computed the exact digest; other established rows retain their
-/// existing filename-gated classification.
+/// The hash-pinned support boundary (Prism + every non-catalog allowlist row).
+/// Filename/header-only views (local library and inspect) therefore remain
+/// experimental until the ordinary load path has computed the exact digest;
+/// other established rows retain their existing filename-gated classification.
 fn classify_model_lane_with_verified_sha256(
     architecture: Option<&str>,
     filename: &str,
     verified_sha256: Option<&str>,
 ) -> ModelLaneClass {
     let class = classify_model_lane(architecture, filename);
-    if class != ModelLaneClass::Supported
-        || prism_supported_artifact_expected_sha256(filename).is_none()
+    if class != ModelLaneClass::Supported || supported_artifact_expected_sha256(filename).is_none()
     {
         return class;
     }
@@ -28017,6 +28650,11 @@ fn classify_model_lane_with_verified_sha256(
     })
 }
 
+/// Classify from the exact bytes. A hash-pinned artifact loaded under its
+/// certified NAME but with uncertified BYTES is demoted to
+/// `ExperimentalImplemented`, so it cannot inherit the row's parity evidence,
+/// support claims, or tool capability. Costs nothing at load: `gguf_sha256` is
+/// the digest `build_loaded_model` already computes for `LaneIdentity`.
 fn classify_loaded_model_identity(
     architecture: Option<&str>,
     filename: &str,
@@ -28024,8 +28662,8 @@ fn classify_loaded_model_identity(
 ) -> ModelLaneClass {
     let class = classify_model_lane(architecture, filename);
     if class == ModelLaneClass::Supported
-        && prism_supported_artifact_expected_sha256(filename).is_some()
-        && !prism_supported_artifact_identity_matches(filename, gguf_sha256)
+        && supported_artifact_expected_sha256(filename).is_some()
+        && !supported_artifact_identity_matches(filename, gguf_sha256)
     {
         ModelLaneClass::ExperimentalImplemented
     } else {

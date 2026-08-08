@@ -2,10 +2,14 @@
 //!
 //! One configurable transformer (parameterized from GGUF KV via [`LlamaModelConfig`]):
 //! embeddings → N pre-norm blocks (RMSNorm → GQA attention with RoPE → RMSNorm →
-//! SwiGLU FFN) → final RMSNorm → logits. No Metal/CUDA, no fused quantized kernels —
-//! weights are dequantized to f32 ([`super::dequant`]) and run through naive f32 math.
-//! Speed is the supported lane's job; this path's job is to be obviously correct and
-//! deterministic so it can serve as the promotion oracle.
+//! SwiGLU FFN) → final RMSNorm → logits. The generic reference graph itself uses no
+//! Metal/CUDA and no fused quantized kernels — weights are dequantized to f32
+//! ([`super::dequant`]) and run through naive f32 math. Speed is the supported lane's
+//! job; this path's job is to be obviously correct and deterministic so it can serve
+//! as the promotion oracle. This module ALSO hosts the arch-specific routing that
+//! sends qwen35 to its resident Metal (macOS default) or CUDA graph and lfm2 to its
+//! Metal engine — those lanes consume packed quantized weights directly, and the f32
+//! reference below is their fallback and oracle.
 //!
 //! Memory: weights stay resident in their compact **quantized** form; each layer's
 //! matrices are dequantized to f32 once per forward pass and dropped, and the
@@ -39,7 +43,7 @@ enum RawMatBytes {
     /// their bytes instead of duplicating the largest matrix in the model.
     Owned(Arc<Vec<u8>>),
     /// Page-aligned packed backing. Metal wraps this allocation with
-    /// `newBufferWithBytesNoCopy`, so a Q1/Q2 projection has one resident copy.
+    /// `newBufferWithBytesNoCopy`, so a Q1/Q2 or Q8_0 projection has one resident copy.
     WirePages(Arc<crate::wire_mmap::WirePages>),
 }
 
@@ -66,6 +70,66 @@ impl RawMatBytes {
             Self::Owned(_) => None,
         }
     }
+}
+
+/// The resident Metal format a GGUF tensor type maps to, or `None` if the resident lane
+/// cannot consume it. Single source of truth *for the loader*: admitting a type here is
+/// what makes it page-backed at load (see [`wants_page_backing`]), so those two cannot
+/// drift apart.
+///
+/// Not macOS-gated, because `wants_page_backing` is not: the loader makes the same
+/// backing choice on every target.
+///
+/// **It is not the only gate on the way to the GPU, and the others do NOT fail loudly.**
+/// Admitting a type here has two silent knock-on effects, both of which must be decided
+/// deliberately:
+///
+/// 1. It routes the type into the *hybrid* Prism wire path from
+///    [`RawMat::par_matvec`]/[`RawMat::par_matmul`], which keeps its own separate list —
+///    `metal::ResidentWeightFormat::hybrid_prism_wire_supported`. `Q8_0` and the K-quants
+///    are admitted here and declined there on purpose, so they fall through to the CPU
+///    kernel instead of taking a second GPU path with none of the resident lane's parity
+///    evidence. That list is exhaustive over `ResidentWeightFormat`, so a brand-new
+///    *format variant* is a compile error there — but admitting an existing variant here
+///    is **not**, and `prism_wire_hybrid_admission_is_pinned_per_format` stays green.
+/// 2. It does NOT update `execution_plan.rs`. The plan picks its arm from tensor types
+///    and arch, so a newly-admitted quant will keep disclosing whatever arm it matched
+///    before — `/v1/health` naming a lane other than the one serving. That has now
+///    happened four times (Prism Q1/Q2, lfm2, qwen35 Q8_0, qwen35 K-quant); the last one
+///    was caught only because a live load was checked.
+fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWeightFormat> {
+    match tt {
+        GgufTensorType::Q1_0 => Some(crate::metal::ResidentWeightFormat::Q1_0),
+        GgufTensorType::Q2_0G64 => Some(crate::metal::ResidentWeightFormat::Q2_0G64),
+        GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+            Some(crate::metal::ResidentWeightFormat::Q2_0G128)
+        }
+        // Q8_0 wire blocks (34B: f16 scale + 32 i8) are already the layout the resident
+        // Metal Q8 GEMV consumes, so they need no repack.
+        GgufTensorType::Q8_0 => Some(crate::metal::ResidentWeightFormat::Q8_0),
+        // K-quant super-blocks (Q4_K 144B / Q6_K 210B per 256 values) are likewise the
+        // exact layout `encode_resident_kquant_matmul_f32` consumes. Admitted as a PAIR:
+        // an ornith Q4_K_M file carries Q6_K on `output.weight`, 12 `attn_qkv`, 4
+        // `attn_v` and 16 `ffn_down`, and `prism_metal_weight` hard-errors on an
+        // unmapped type, so admitting only Q4K yields no resident graph at all.
+        GgufTensorType::Q4K => Some(crate::metal::ResidentWeightFormat::Q4K),
+        GgufTensorType::Q6K => Some(crate::metal::ResidentWeightFormat::Q6K),
+        _ => None,
+    }
+}
+
+/// Tensor types read into `RawMatBytes::WirePages` rather than an owned `Vec`, so the
+/// allocation can be wrapped in place with `newBufferWithBytesNoCopy`.
+///
+/// Derived from [`resident_metal_format`] rather than listed again: `prism_metal_weight`
+/// needs a tensor to be *both* page-backed and format-mapped, and when those were two
+/// hand-maintained lists, adding a type to only one left it silently failing the
+/// page-backed check and falling back to CPU decode.
+///
+/// Page-backing is otherwise unobservable — `as_slice` is identical either way and
+/// `wire_pages` is macOS-only — at the cost of rounding each tensor up to a page.
+fn wants_page_backing(tt: GgufTensorType) -> bool {
+    resident_metal_format(tt).is_some()
 }
 
 #[cfg(target_os = "macos")]
@@ -123,29 +187,47 @@ impl RawMat {
     }
 
     #[cfg(target_os = "macos")]
-    fn prism_metal_format(&self) -> Option<crate::metal::ResidentWeightFormat> {
-        match self.tt {
-            GgufTensorType::Q1_0 => Some(crate::metal::ResidentWeightFormat::Q1_0),
-            GgufTensorType::Q2_0G64 => Some(crate::metal::ResidentWeightFormat::Q2_0G64),
-            GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
-                Some(crate::metal::ResidentWeightFormat::Q2_0G128)
-            }
-            _ => None,
-        }
-    }
-
-    #[cfg(target_os = "macos")]
     fn prism_metal_weight(&self) -> Result<crate::metal::ResidentWeightBytes<'_>> {
         let pages = self.bytes.wire_pages().ok_or_else(|| {
             BackendError::InvalidTensorData("Prism Metal weight is not page-backed".into())
         })?;
-        let format = self.prism_metal_format().ok_or_else(|| {
+        let format = resident_metal_format(self.tt).ok_or_else(|| {
             BackendError::InvalidTensorData(format!(
                 "unsupported Qwen3.5 Metal projection type {:?}",
                 self.tt
             ))
         })?;
         Ok(crate::metal::ResidentWeightBytes::WirePages { format, pages })
+    }
+
+    /// Q8_0 weight bytes for the LFM2 Metal engine.
+    ///
+    /// Since Q8_0 joined `resident_metal_format`, `prism_metal_weight` returns the
+    /// identical value for a page-backed Q8_0 tensor. This helper stays separate for
+    /// the two ways it behaves differently: it hard-requires Q8_0 (LFM2 ships every
+    /// projection as Q8_0, so any other type is a load error, not a fallback), and it
+    /// tolerates non-page-backed bytes — page-backed allocations are handed over in
+    /// place (one resident copy, no upload), while `Owned` bytes go through the
+    /// resident cache as ordinary wire bytes where `prism_metal_weight` fails closed.
+    /// `resolve_resident_weight` already accepts `Q8_0` on both arms.
+    #[cfg(target_os = "macos")]
+    fn q8_metal_weight(&self) -> Result<crate::metal::ResidentWeightBytes<'_>> {
+        if self.tt != GgufTensorType::Q8_0 {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "lfm2 Metal lane requires Q8_0 projections, got {:?}",
+                self.tt
+            )));
+        }
+        if let Some(pages) = self.bytes.wire_pages() {
+            return Ok(crate::metal::ResidentWeightBytes::WirePages {
+                format: crate::metal::ResidentWeightFormat::Q8_0,
+                pages,
+            });
+        }
+        Ok(crate::metal::ResidentWeightBytes::KQuantBytes {
+            format: crate::metal::ResidentWeightFormat::Q8_0,
+            bytes: self.bytes.as_slice(),
+        })
     }
 
     /// Dequantize the entire matrix to f32 (used per layer, dropped after the layer).
@@ -199,7 +281,7 @@ impl RawMat {
         debug_assert_eq!(x.len(), self.in_features);
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = self.prism_metal_format().and_then(|format| {
+            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matvec_f32(x, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -338,7 +420,7 @@ impl RawMat {
         let out_f = self.out_features;
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
-            if let Some(output) = self.prism_metal_format().and_then(|format| {
+            if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
                 crate::metal::try_prism_wire_matmul_f32(xs, pages, format, self.out_features)
             }) {
                 log_prism_metal_hybrid_once();
@@ -419,6 +501,11 @@ struct Layer {
 struct KvCache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
+    /// LFM2 short-conv rolling state, per layer: `(l_cache-1) * d_model`,
+    /// layout `[c*(l_cache-1) + t]` with `t=0` oldest. Empty for every layer
+    /// of every other architecture, and for LFM2's own attention layers —
+    /// sized by [`RunnableModel::new_cache`].
+    conv: Vec<Vec<f32>>,
 }
 
 impl KvCache {
@@ -426,6 +513,7 @@ impl KvCache {
         Self {
             k: vec![Vec::new(); n_layers],
             v: vec![Vec::new(); n_layers],
+            conv: vec![Vec::new(); n_layers],
         }
     }
 }
@@ -465,6 +553,12 @@ pub struct RunnableModel {
     /// layers have no K/V attention). When set, the forward path is routed to the
     /// dedicated `*_qwen35` methods and `layers` is empty. See [`Qwen35Runtime`].
     qwen35: Option<Qwen35Runtime>,
+    /// LFM2 / LFM2.5 hybrid short-convolution runtime. `Some` only for the
+    /// `lfm2` architecture, whose conv layers do not fit the generic `Layer`
+    /// (they carry `shortconv.*` and no K/V attention). When set, the forward
+    /// path is routed to the dedicated `*_lfm2` methods and `layers` is empty.
+    /// See [`Lfm2Runtime`].
+    lfm2: Option<Lfm2Runtime>,
     /// Exact artifact identity used to admit hash-pinned CUDA specializations.
     /// Geometry alone is not sufficient because unrelated qwen35 files can share it.
     #[cfg(feature = "cuda")]
@@ -479,6 +573,10 @@ pub struct RunnableModel {
     /// inspecting/loading a model does not allocate recurrent/KV state.
     #[cfg(target_os = "macos")]
     metal_qwen35: std::sync::Mutex<Option<crate::metal::Qwen35MetalDecode>>,
+    /// Resident LFM2 Metal graph, built on first use and reused. `Mutex` supplies the
+    /// `&mut` a per-token forward needs while `generate_*` take `&self`.
+    #[cfg(target_os = "macos")]
+    metal_lfm2: std::sync::Mutex<Option<crate::metal::Lfm2MetalDecode>>,
 }
 
 impl RunnableModel {
@@ -524,13 +622,7 @@ impl RunnableModel {
         let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
             let d = find_tensor(&gguf, name)?;
             let (inf, outf) = mat_dims(d, name)?;
-            let bytes = if matches!(
-                d.tensor_type,
-                GgufTensorType::Q1_0
-                    | GgufTensorType::Q2_0G64
-                    | GgufTensorType::Q2_0G128
-                    | GgufTensorType::Pq2_0
-            ) {
+            let bytes = if wants_page_backing(d.tensor_type) {
                 let byte_len = usize::try_from(d.n_bytes).map_err(|_| {
                     BackendError::InvalidTensorData(format!(
                         "tensor {name} packed byte length {} does not fit usize",
@@ -578,7 +670,15 @@ impl RunnableModel {
                 out_features: token_embd.out_features,
             }
         };
-        let output_norm = load_vec(&mut f, "output_norm.weight")?;
+        // LFM2 spells its final RMSNorm `token_embd_norm` rather than
+        // `output_norm` — llama.cpp maps LLM_TENSOR_OUTPUT_NORM_LFM2 to that
+        // name explicitly (`llama-arch.cpp:362`, commented there as a fix for
+        // the wrong tensor name). Every other covered arch keeps `output_norm`.
+        let output_norm = if arch == "lfm2" {
+            load_vec(&mut f, "token_embd_norm.weight")?
+        } else {
+            load_vec(&mut f, "output_norm.weight")?
+        };
 
         // Qwen3.5 (Ornith): hybrid gated-delta-net. Layers do not fit the generic
         // dense `Layer` (recurrent/SSM layers carry no K/V projections), so build a
@@ -742,12 +842,177 @@ impl RunnableModel {
                     value_dim,
                     conv_dim,
                 }),
+                lfm2: None,
                 #[cfg(feature = "cuda")]
                 resident_cuda_artifact,
                 #[cfg(feature = "cuda")]
                 cuda: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
                 metal_qwen35: std::sync::Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                metal_lfm2: std::sync::Mutex::new(None),
+            });
+        }
+
+        // LFM2 / LFM2.5: hybrid double-gated short convolution + GQA attention.
+        // Conv layers carry `shortconv.{conv,in_proj,out_proj}` and NO
+        // `attn_q/k/v`, so they cannot be expressed as the generic dense
+        // `Layer`; build a dedicated runtime and route the forward pass to the
+        // `*_lfm2` path. Graph ported from llama.cpp `src/models/lfm2.cpp`.
+        if arch == "lfm2" {
+            let meta = cfg.lfm2.as_ref().ok_or_else(|| {
+                BackendError::InvalidModelMetadata("lfm2 metadata missing from config".into())
+            })?;
+            let l_cache = meta.shortconv_l_cache as usize;
+            // llama.cpp asserts `n_shortconv_l_cache > 1` (`lfm2.cpp:167`): the
+            // rolling state is `l_cache - 1` wide, so a 0/1 cache has no state
+            // to carry and the file is malformed for this graph.
+            if l_cache < 2 {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "lfm2: shortconv.l_cache must be >= 2, got {l_cache}"
+                )));
+            }
+            if meta.layer_is_conv.len() != n_layers {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "lfm2: per-layer schedule covers {} layers, model has {n_layers}",
+                    meta.layer_is_conv.len()
+                )));
+            }
+            // Every attention layer must agree with the config scalar; a row
+            // with mixed non-zero KV widths would need per-layer KV sizing
+            // that this runtime does not carry, so refuse rather than
+            // mis-shape the cache.
+            for (l, &kv) in meta.kv_heads_per_layer.iter().enumerate() {
+                if kv != 0 && kv as usize != n_kv_heads {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "lfm2: layer {l} declares {kv} kv heads, expected {n_kv_heads} \
+                         (per-layer KV widths are not supported)"
+                    )));
+                }
+            }
+            // SLIDING WINDOW — fail closed. llama.cpp's LFM2 loader reads
+            // `attention.sliding_window` and, when present and non-zero, marks
+            // every ATTENTION layer SWA (`lfm2.cpp:23-28`). This forward is
+            // full-causal and carries no window mask, so a windowed row would
+            // decode fluent-looking garbage rather than erroring — the same
+            // hazard class as gemma3 on the CPU dense path (DECISIONS D20.2).
+            // LFM2.5-2.6B declares no window (`n_swa = 0`), so this refuses
+            // only rows this lane genuinely cannot run.
+            if let Some(window) = gguf.metadata_u32("lfm2.attention.sliding_window") {
+                if window > 0 {
+                    return Err(BackendError::UnsupportedGguf(format!(
+                        "lfm2: attention.sliding_window = {window}, but the runnable \
+                         lfm2 forward is full-causal and implements no window mask; \
+                         refusing rather than decoding with the wrong attention span"
+                    )));
+                }
+            }
+            // An all-conv schedule would leave zero attention layers, and the
+            // forward divides by `n_kv_heads` to derive the GQA group. Refuse
+            // instead of panicking on a divide-by-zero deep in decode.
+            if n_kv_heads == 0 || meta.layer_is_conv.iter().all(|c| *c) {
+                return Err(BackendError::UnsupportedGguf(
+                    "lfm2: no attention layers in the per-layer schedule (all conv); \
+                     this runtime requires at least one GQA layer"
+                        .into(),
+                ));
+            }
+
+            let mut lfm2_layers = Vec::with_capacity(n_layers);
+            for l in 0..n_layers {
+                let p = |t: &str| format!("blk.{l}.{t}.weight");
+                // `attn_norm` is LFM2's `operator_norm`: the pre-block RMSNorm
+                // on BOTH conv and attention layers (`lfm2.cpp:239`).
+                let attn_norm = load_vec(&mut f, &p("attn_norm"))?;
+                let ffn_norm = load_vec(&mut f, &p("ffn_norm"))?;
+                let ffn_gate = load_raw(&mut f, &p("ffn_gate"))?;
+                let ffn_up = load_raw(&mut f, &p("ffn_up"))?;
+                let ffn_down = load_raw(&mut f, &p("ffn_down"))?;
+                let kind = if meta.is_conv_layer(l) {
+                    // shortconv.conv is [l_cache, n_embd]; GGUF is row-major
+                    // over ne[0], so flat[c*l_cache + t] is channel `c`, tap
+                    // `t` — the same channel-major layout the qwen35 conv loop
+                    // consumes. Validate the element count HERE: the forward
+                    // indexes `conv[ch*l_cache + tap]` for every channel, so a
+                    // kernel that disagrees with (l_cache, d_model) would either
+                    // panic mid-decode or silently read a neighbouring
+                    // channel's taps.
+                    let conv = load_vec(&mut f, &p("shortconv.conv"))?;
+                    if conv.len() != l_cache * d_model {
+                        return Err(BackendError::InvalidTensorData(format!(
+                            "lfm2 layer {l}: shortconv.conv has {} elements, expected \
+                             l_cache*embedding = {}*{} = {}",
+                            conv.len(),
+                            l_cache,
+                            d_model,
+                            l_cache * d_model
+                        )));
+                    }
+                    Lfm2Kind::Conv {
+                        conv,
+                        in_proj: load_raw(&mut f, &p("shortconv.in_proj"))?,
+                        out_proj: load_raw(&mut f, &p("shortconv.out_proj"))?,
+                    }
+                } else {
+                    Lfm2Kind::Attn {
+                        wq: load_raw(&mut f, &p("attn_q"))?,
+                        wk: load_raw(&mut f, &p("attn_k"))?,
+                        wv: load_raw(&mut f, &p("attn_v"))?,
+                        wo: load_raw(&mut f, &p("attn_output"))?,
+                        q_norm: load_vec(&mut f, &p("attn_q_norm"))?,
+                        k_norm: load_vec(&mut f, &p("attn_k_norm"))?,
+                    }
+                };
+                lfm2_layers.push(Lfm2Layer {
+                    attn_norm,
+                    ffn_norm,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    kind,
+                });
+            }
+
+            return Ok(RunnableModel {
+                architecture: arch,
+                d_model,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rope_dim,
+                rope_base,
+                eps: cfg.rms_norm_epsilon,
+                vocab,
+                // llama.cpp classifies LLM_ARCH_LFM2 as LLAMA_ROPE_TYPE_NEOX
+                // (`llama-model.cpp:2477` → `:2492`); the converter leaves Q/K
+                // unpermuted, so split-half is what the weights expect.
+                rope_neox: true,
+                n_layers,
+                layer_rope_base: vec![rope_base; n_layers],
+                embed_scale: None,
+                ffn_gelu: false,
+                final_logit_softcap: None,
+                attn_logit_softcap: None,
+                logit_scale: None,
+                token_embd,
+                output,
+                output_norm,
+                layers: Vec::new(),
+                qwen35: None,
+                lfm2: Some(Lfm2Runtime {
+                    layers: lfm2_layers,
+                    l_cache,
+                }),
+                // No hash-pinned CUDA specialization exists for lfm2; the
+                // short-conv lane is CPU-only today.
+                #[cfg(feature = "cuda")]
+                resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact::Generic,
+                #[cfg(feature = "cuda")]
+                cuda: std::sync::Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                metal_qwen35: std::sync::Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                metal_lfm2: std::sync::Mutex::new(None),
             });
         }
 
@@ -856,12 +1121,15 @@ impl RunnableModel {
             output_norm,
             layers,
             qwen35: None,
+            lfm2: None,
             #[cfg(feature = "cuda")]
             resident_cuda_artifact: crate::cuda_resident::ResidentCudaArtifact::Generic,
             #[cfg(feature = "cuda")]
             cuda: std::sync::Mutex::new(None),
             #[cfg(target_os = "macos")]
             metal_qwen35: std::sync::Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            metal_lfm2: std::sync::Mutex::new(None),
         })
     }
 
@@ -891,6 +1159,21 @@ impl RunnableModel {
         }
         if self.qwen35.is_some() {
             return self.forward_logits_qwen35(tokens);
+        }
+        // LFM2's conv state is inherently sequential (a rolling ring per
+        // channel), so the whole-sequence forward is the incremental step run
+        // over every position — the same lane `generate` uses, which keeps the
+        // smoke gate and decode on one code path.
+        if let Some(rt) = &self.lfm2 {
+            let mut cache = self.new_cache();
+            let mut logits = Vec::new();
+            // This entry point returns the LAST position's logits, so only that
+            // position needs the tied 128k-row head.
+            let last = tokens.len().saturating_sub(1);
+            for (pos, &tok) in tokens.iter().enumerate() {
+                logits = self.forward_step_lfm2(rt, tok, pos, &mut cache, pos == last)?;
+            }
+            return Ok(logits);
         }
         let seq = tokens.len();
         let dm = self.d_model;
@@ -974,10 +1257,22 @@ impl RunnableModel {
         if self.qwen35.is_some() {
             return self.generate_qwen35(prompt, max_new, &[]);
         }
-        let mut cache = KvCache::new(self.n_layers);
+        // LFM2 resident Metal graph (opt-in via CAMELID_LFM2_METAL while it is
+        // being proven). No silent CPU fallback: the conv ring is order-dependent
+        // and a mid-stream replay would restart from the prompt, so a Metal failure
+        // surfaces as an error rather than a quietly different lane.
+        #[cfg(target_os = "macos")]
+        if self.lfm2.is_some() && lfm2_metal_enabled() {
+            return self.generate_lfm2_metal(prompt, max_new, &[], None, &mut |_| {});
+        }
+        let mut cache = self.new_cache();
         let mut last = Vec::new();
+        // Only the LAST prompt position's logits are consumed; the rest exist to
+        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
+        // those positions removes 9.7% of the bytes each prefill step reads.
+        let last_prompt = prompt.len().saturating_sub(1);
         for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step(tok, pos, &mut cache)?;
+            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
         }
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
@@ -1077,9 +1372,240 @@ impl RunnableModel {
         self.generate_vision_stopping_streaming(prefix, image, suffix, max_new, stop, &mut |_| {})
     }
 
+    /// A `KvCache` sized for this model, including LFM2's per-conv-layer
+    /// rolling short-conv state. Every incremental lane must allocate through
+    /// this rather than `KvCache::new`, or LFM2's conv layers would index an
+    /// empty ring.
+    fn new_cache(&self) -> KvCache {
+        let mut cache = KvCache::new(self.n_layers);
+        if let Some(rt) = &self.lfm2 {
+            for (li, layer) in rt.layers.iter().enumerate() {
+                if matches!(layer.kind, Lfm2Kind::Conv { .. }) {
+                    cache.conv[li] = vec![0.0f32; (rt.l_cache - 1) * self.d_model];
+                }
+            }
+        }
+        cache
+    }
+
+    /// Incremental forward of one LFM2 token at absolute `pos`. Conv layers
+    /// advance their rolling state; attention layers append K/V and attend over
+    /// all cached positions. Returns next-token logits.
+    ///
+    /// Ported from llama.cpp `src/models/lfm2.cpp` (graph at `:235-274`,
+    /// short-conv block at `:156-217`). Per layer:
+    ///
+    /// ```text
+    /// prev = h
+    /// h    = RMSNorm(h, attn_norm)          // LFM2 "operator_norm"
+    /// h    = conv_block(h) | attn_block(h)  // per-layer schedule
+    /// h    = prev + h
+    /// h    = h + SwiGLU_FFN(RMSNorm(h, ffn_norm))
+    /// ```
+    /// `need_logits = false` advances the cache and the conv ring but skips the
+    /// 128,000-row tied LM head. Every prompt-prefill position except the last
+    /// discards its logits, and that projection is 9.7% of the bytes a step
+    /// touches — the same economy `decode_token_qwen35` already takes.
+    fn forward_step_lfm2(
+        &self,
+        rt: &Lfm2Runtime,
+        token: u32,
+        pos: usize,
+        cache: &mut KvCache,
+        need_logits: bool,
+    ) -> Result<Vec<f32>> {
+        let dm = self.d_model;
+        let hd = self.head_dim;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = self.n_heads / self.n_kv_heads;
+        let q_dim = self.n_heads * hd;
+        let kv_dim = self.n_kv_heads * hd;
+        let cm1 = rt.l_cache - 1;
+
+        let t = token as usize;
+        if t >= self.vocab {
+            return Err(BackendError::InvalidTensorData(format!(
+                "token id {t} >= vocab {}",
+                self.vocab
+            )));
+        }
+        let mut hidden = self.token_embd.dequant_row(t, "token_embd")?;
+
+        for (li, layer) in rt.layers.iter().enumerate() {
+            let tn = |t: &str| format!("blk.{li}.{t}");
+            // LFM2 applies `operator_norm` before BOTH block kinds. `hidden` is
+            // the residual branch and is not touched again until the add below,
+            // so no separate `prev` copy is needed.
+            let xn = self.apply_norm(&hidden, &layer.attn_norm);
+
+            let mix = match &layer.kind {
+                Lfm2Kind::Conv {
+                    conv,
+                    in_proj,
+                    out_proj,
+                } => {
+                    // in_proj emits 3*d_model, chunked B | C | x (`lfm2.cpp:179-184`).
+                    //
+                    // Every projection here goes through `par_matvec`, the same
+                    // kernel the qwen35 runnable path uses. NOTE it is NOT an
+                    // f32-activation dot: for Q8_0 weights it quantizes the
+                    // activation once and reduces in int8×int8, which is what
+                    // llama.cpp's own q8×q8 path does — so it is numerically
+                    // CLOSER to the reference, not bit-identical to
+                    // `dequant_all().matvec()`. The parity claim it carries is
+                    // greedy-token (argmax) identity, which is exactly what
+                    // `tests/lfm2_parity.rs` certifies. It also avoids
+                    // materializing each weight matrix as f32, which at 2.6B
+                    // would allocate GBs per token.
+                    let bcx = in_proj.par_matvec(&xn, &tn("shortconv.in_proj"))?;
+                    if bcx.len() != 3 * dm {
+                        return Err(BackendError::InvalidTensorData(format!(
+                            "lfm2 layer {li}: shortconv.in_proj produced {} values, expected {}",
+                            bcx.len(),
+                            3 * dm
+                        )));
+                    }
+                    let (b, rest) = bcx.split_at(dm);
+                    let (c, x) = rest.split_at(dm);
+
+                    // Causal depthwise conv of width `l_cache` over `bx = b*x`.
+                    // The window for channel `ch` is
+                    // [state_0 (oldest) .. state_{l_cache-2}, bx_now]; the kernel
+                    // is channel-major (`conv[ch*l_cache + tap]`) because the GGUF
+                    // tensor is [l_cache, n_embd] and rows run along ne[0].
+                    // NOTE: `ggml_ssm_conv` applies NO activation — unlike the
+                    // qwen35 SSM conv, there is no SiLU here (`lfm2.cpp:207`).
+                    let state = &mut cache.conv[li];
+                    let mut y = vec![0.0f32; dm];
+                    for ch in 0..dm {
+                        let bx = b[ch] * x[ch];
+                        let mut acc = 0.0f32;
+                        for tap in 0..cm1 {
+                            acc += conv[ch * rt.l_cache + tap] * state[ch * cm1 + tap];
+                        }
+                        acc += conv[ch * rt.l_cache + cm1] * bx;
+                        // Second gate: elementwise multiply by C (`lfm2.cpp:210`).
+                        y[ch] = c[ch] * acc;
+                        // Roll the ring left and append this position's input.
+                        for tap in 0..cm1.saturating_sub(1) {
+                            state[ch * cm1 + tap] = state[ch * cm1 + tap + 1];
+                        }
+                        state[ch * cm1 + (cm1 - 1)] = bx;
+                    }
+                    out_proj.par_matvec(&y, &tn("shortconv.out_proj"))?
+                }
+                Lfm2Kind::Attn {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => {
+                    let mut qp = wq.par_matvec(&xn, &tn("attn_q"))?;
+                    let mut kp = wk.par_matvec(&xn, &tn("attn_k"))?;
+                    let vp = wv.par_matvec(&xn, &tn("attn_v"))?;
+                    // QK RMSNorm over head_dim, BEFORE RoPE (`lfm2.cpp:137-146`).
+                    self.apply_norm_heads(&mut qp, self.n_heads, hd, q_norm);
+                    self.apply_norm_heads(&mut kp, self.n_kv_heads, hd, k_norm);
+                    let rb = self.layer_rope_base[li];
+                    self.apply_rope(&mut qp, self.n_heads, pos, rb);
+                    self.apply_rope(&mut kp, self.n_kv_heads, pos, rb);
+
+                    cache.k[li].extend_from_slice(&kp);
+                    cache.v[li].extend_from_slice(&vp);
+                    let ck = &cache.k[li];
+                    let cv = &cache.v[li];
+                    // Attention layers are full-causal: LFM2.5-2.6B declares no
+                    // sliding window (`n_swa = 0`), so every cached position is
+                    // visible. Derived from the cache rather than `pos` because
+                    // conv layers do not advance the K/V cache, so an
+                    // attention layer's cache depth is the only truth here.
+                    let n_pos = ck.len() / kv_dim;
+
+                    let mut attn_out = vec![0.0f32; q_dim];
+                    for h in 0..self.n_heads {
+                        let kvh = h / group;
+                        let qh = &qp[h * hd..(h + 1) * hd];
+                        let mut scores = vec![0.0f32; n_pos];
+                        let mut mx = f32::NEG_INFINITY;
+                        for (j, sj) in scores.iter_mut().enumerate() {
+                            let kh = &ck[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                            let s = dot(qh, kh) * scale;
+                            *sj = s;
+                            if s > mx {
+                                mx = s;
+                            }
+                        }
+                        let mut sum = 0.0f32;
+                        for s in scores.iter_mut() {
+                            *s = (*s - mx).exp();
+                            sum += *s;
+                        }
+                        let oh = &mut attn_out[h * hd..(h + 1) * hd];
+                        for (j, s) in scores.iter().enumerate() {
+                            let w = *s / sum;
+                            let vh = &cv[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                            for d in 0..hd {
+                                oh[d] += w * vh[d];
+                            }
+                        }
+                    }
+                    wo.par_matvec(&attn_out, &tn("attn_output"))?
+                }
+            };
+
+            for (h, m) in hidden.iter_mut().zip(mix.iter()) {
+                *h += *m;
+            }
+
+            // SwiGLU FFN, identical on conv and attention layers.
+            let xn2 = self.apply_norm(&hidden, &layer.ffn_norm);
+            let g = layer.ffn_gate.par_matvec(&xn2, &tn("ffn_gate"))?;
+            let u = layer.ffn_up.par_matvec(&xn2, &tn("ffn_up"))?;
+            let act: Vec<f32> = g
+                .iter()
+                .zip(u.iter())
+                .map(|(&gv, &uv)| silu(gv) * uv)
+                .collect();
+            let d = layer.ffn_down.par_matvec(&act, &tn("ffn_down"))?;
+            for (h, dv) in hidden.iter_mut().zip(d.iter()) {
+                *h += *dv;
+            }
+        }
+
+        // Final norm is `token_embd_norm`; the logits matrix is tied to
+        // `token_embd` (LFM2.5 ships no `output.weight`). The 128k-row vocab
+        // projection dominates a decode step, so take the row-parallel form
+        // (same int8-activation caveat as the per-layer projections above).
+        if !need_logits {
+            return Ok(Vec::new());
+        }
+        let normed = self.apply_norm(&hidden, &self.output_norm);
+        self.output.par_matvec(&normed, "output")
+    }
+
     /// Incremental forward of a single token at absolute `pos`, appending its K/V to
     /// `cache` and attending over all cached positions. Returns next-token logits.
     fn forward_step(&self, token: u32, pos: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        self.forward_step_maybe_logits(token, pos, cache, true)
+    }
+
+    /// [`forward_step`] with the LM head made optional. Only the lfm2 path honors
+    /// the flag today; every other architecture ignores it and always projects,
+    /// so behaviour there is unchanged.
+    ///
+    /// [`forward_step`]: RunnableModel::forward_step
+    fn forward_step_maybe_logits(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut KvCache,
+        need_logits: bool,
+    ) -> Result<Vec<f32>> {
+        if let Some(rt) = &self.lfm2 {
+            return self.forward_step_lfm2(rt, token, pos, cache, need_logits);
+        }
         let hd = self.head_dim;
         let scale = 1.0 / (hd as f32).sqrt();
         let group = self.n_heads / self.n_kv_heads;
@@ -1382,7 +1908,10 @@ impl RunnableModel {
 // Qwen3.5 (Ornith) — hybrid gated-delta-net (linear attention) + full attention lane.
 //
 // Faithful re-implementation of llama.cpp's `qwen35` graph (arch string "qwen35",
-// `src/models/qwen35.cpp` + `delta-net-base.cpp`) in pure f32 for the runnable lane.
+// `src/models/qwen35.cpp` + `delta-net-base.cpp`) in pure f32 as the runnable lane's
+// CPU reference and fallback. On macOS, decode defaults to the full Metal resident
+// graph built from these same structs (`generate_qwen35_metal`; opt-out
+// `CAMELID_QWEN35_METAL=0`); the pure-f32 forward below remains the oracle.
 // The runnable lane decodes one token at a time, so the gated-delta-net AUTOREGRESSIVE
 // recurrence covers both prefill and decode (the batched "chunking" path is never
 // needed). Each layer is either:
@@ -1446,6 +1975,48 @@ struct Qwen35Runtime {
     key_dim: usize,     // d_state * num_k_heads (2048)
     value_dim: usize,   // head_v_dim * num_v_heads (= d_inner, 4096)
     conv_dim: usize,    // 2*key_dim + value_dim (8192)
+}
+
+/// One LFM2 block: either a double-gated short convolution or a GQA attention
+/// mix, followed in both cases by the same SwiGLU FFN.
+enum Lfm2Kind {
+    /// Short-conv layer. `conv` is the depthwise kernel flattened
+    /// `[c*l_cache + t]` (channel `c`, tap `t`); `in_proj` emits `3*n_embd`
+    /// split as `B | C | x`; `out_proj` maps back to `n_embd`.
+    Conv {
+        conv: Vec<f32>,
+        in_proj: RawMat,
+        out_proj: RawMat,
+    },
+    /// GQA attention layer with per-head-dim QK RMSNorm applied BEFORE RoPE
+    /// (`lfm2.cpp:137-146`).
+    Attn {
+        wq: RawMat,
+        wk: RawMat,
+        wv: RawMat,
+        wo: RawMat,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+    },
+}
+
+struct Lfm2Layer {
+    /// LFM2's `operator_norm`: pre-block RMSNorm on conv AND attention layers.
+    attn_norm: Vec<f32>,
+    /// Pre-FFN RMSNorm.
+    ffn_norm: Vec<f32>,
+    ffn_gate: RawMat,
+    ffn_up: RawMat,
+    ffn_down: RawMat,
+    kind: Lfm2Kind,
+}
+
+/// Parsed LFM2 runtime: per-layer weights + the short-conv kernel width.
+struct Lfm2Runtime {
+    layers: Vec<Lfm2Layer>,
+    /// Short-conv kernel width (`lfm2.shortconv.l_cache`, 3). The rolling conv
+    /// state is `l_cache - 1` wide.
+    l_cache: usize,
 }
 
 /// Per-layer incremental state for qwen35 decode. Full-attention layers grow a
@@ -1698,9 +2269,13 @@ impl RunnableModel {
     /// for the shared prefix (same per-token math, same accumulation order).
     ///
     /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
-    /// qwen35 greedy decode. Routes to the GPU resident lane when `CAMELID_QWEN35_CUDA=1`
-    /// (lazy-built, reused, recurrent state reset per call), and falls back to the CPU
-    /// runnable lane on any CUDA error. The CPU lane is the certified oracle and default.
+    /// qwen35 greedy decode. On macOS, routes to the full Metal resident graph by
+    /// default (opt-out `CAMELID_QWEN35_METAL=0` via [`qwen35_metal_enabled`]), falling
+    /// back to the CPU hybrid lane on any Metal error. With the `cuda` feature, routes
+    /// to the CUDA resident lane when `CAMELID_QWEN35_CUDA=1` (default-on for Prism
+    /// low-bit rows on Windows; lazy-built, reused, recurrent state reset per call),
+    /// falling back to the CPU runnable lane on any CUDA error. The CPU lane is the
+    /// certified oracle, and the default only where neither GPU lane applies.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
         self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {})
     }
@@ -1721,9 +2296,7 @@ impl RunnableModel {
         let _ = stream_tokens_observable;
 
         #[cfg(target_os = "macos")]
-        if !std::env::var("CAMELID_QWEN35_METAL")
-            .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
-        {
+        if qwen35_metal_enabled() {
             match self.generate_qwen35_metal(prompt, max_new, stop, sampling, on_token) {
                 Ok(tokens) => return Ok(tokens),
                 Err(err) => {
@@ -1733,7 +2306,7 @@ impl RunnableModel {
         }
         #[cfg(feature = "cuda")]
         {
-            let cuda_enabled = match std::env::var("CAMELID_QWEN35_CUDA") {
+            let cuda_requested = match std::env::var("CAMELID_QWEN35_CUDA") {
                 Ok(value) => matches!(
                     value.to_ascii_lowercase().as_str(),
                     "1" | "true" | "on" | "yes"
@@ -1744,6 +2317,15 @@ impl RunnableModel {
                 // still an explicit CPU fallback/debug override.
                 Err(_) => cfg!(windows) && self.output.is_prism_low_bit(),
             };
+            // `--gpu off` (and the UI's live toggle) is the AUTHORITATIVE master switch:
+            // it is documented as "Force the CPU reference path; never use the GPU even
+            // if one is present". Nothing in this lane consulted it, so on Windows --
+            // where the default above is ON for every Prism row -- `--gpu off` could not
+            // select the CPU lane at all for the qwen35 Bonsai rows; they kept building
+            // the resident CUDA graph. `CAMELID_QWEN35_CUDA=1` is an opt-IN to this lane,
+            // not an override of the master switch. `gpu_accel_enabled()` lazily seeds
+            // from platform capability, so the default (auto) path is unchanged.
+            let cuda_enabled = cuda_requested && crate::cuda::gpu_accel_enabled();
             if cuda_enabled {
                 return qwen35_cuda_with_cpu_fallback(
                     on_token,
@@ -1865,6 +2447,240 @@ impl RunnableModel {
             }
         }
         Ok(generated)
+    }
+
+    /// Build the resident LFM2 Metal graph. Every guard here is deliberately
+    /// independent of `LlamaModelConfig::from_gguf`'s upstream checks: this engine
+    /// bakes in LFM2.5's exact shape, so anything it cannot express must refuse
+    /// rather than decode with the wrong graph.
+    #[cfg(target_os = "macos")]
+    fn build_lfm2_metal(&self, max_positions: usize) -> Result<crate::metal::Lfm2MetalDecode> {
+        use crate::metal::{
+            Lfm2MetalConfig, Lfm2MetalDecode, Lfm2MetalLayerInput, Lfm2MetalLayerKindInput,
+        };
+        let runtime = self
+            .lfm2
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidTensorData("not an lfm2 model".to_string()))?;
+        let refuse = |why: &str| -> BackendError {
+            BackendError::UnsupportedGguf(format!("lfm2 Metal lane: {why}"))
+        };
+        // Structural facts the encoder assumes. LFM2.5 satisfies all of them; a row
+        // that does not gets a typed refusal and stays on the CPU lane.
+        if self.embed_scale.is_some() {
+            return Err(refuse("embedding scale is not modelled"));
+        }
+        if self.ffn_gelu {
+            return Err(refuse("GeGLU FFN is not modelled (SwiGLU only)"));
+        }
+        if self.final_logit_softcap.is_some() || self.attn_logit_softcap.is_some() {
+            return Err(refuse("logit soft-caps are not modelled"));
+        }
+        if self.logit_scale.is_some() {
+            return Err(refuse("logit scale is not modelled"));
+        }
+        if !self.rope_neox {
+            return Err(refuse("only NEOX rope pairing is encoded"));
+        }
+        if self.layer_rope_base.iter().any(|b| *b != self.rope_base) {
+            return Err(refuse("per-layer rope bases are not modelled"));
+        }
+        let ffn_dim = runtime
+            .layers
+            .first()
+            .map(|layer| layer.ffn_gate.out_features)
+            .ok_or_else(|| refuse("model has no layers"))?;
+
+        let mut layers = Vec::with_capacity(runtime.layers.len());
+        for layer in &runtime.layers {
+            if layer.ffn_gate.out_features != ffn_dim || layer.ffn_up.out_features != ffn_dim {
+                return Err(refuse("non-uniform FFN width"));
+            }
+            let kind = match &layer.kind {
+                Lfm2Kind::Attn {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => Lfm2MetalLayerKindInput::Attn {
+                    q: wq.q8_metal_weight()?,
+                    k: wk.q8_metal_weight()?,
+                    v: wv.q8_metal_weight()?,
+                    output: wo.q8_metal_weight()?,
+                    q_norm,
+                    k_norm,
+                },
+                Lfm2Kind::Conv {
+                    conv,
+                    in_proj,
+                    out_proj,
+                } => Lfm2MetalLayerKindInput::Conv {
+                    in_proj: in_proj.q8_metal_weight()?,
+                    out_proj: out_proj.q8_metal_weight()?,
+                    conv,
+                },
+            };
+            layers.push(Lfm2MetalLayerInput {
+                attn_norm: &layer.attn_norm,
+                ffn_norm: &layer.ffn_norm,
+                ffn_gate: layer.ffn_gate.q8_metal_weight()?,
+                ffn_up: layer.ffn_up.q8_metal_weight()?,
+                ffn_down: layer.ffn_down.q8_metal_weight()?,
+                kind,
+            });
+        }
+        let config = Lfm2MetalConfig {
+            hidden: self.d_model,
+            ffn_dim,
+            n_heads: self.n_heads,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            rope_dim: self.rope_dim,
+            l_cache: runtime.l_cache,
+            vocab: self.vocab,
+            eps: self.eps,
+        };
+        Lfm2MetalDecode::new(
+            config,
+            &layers,
+            &self.output_norm,
+            self.output.q8_metal_weight()?,
+            max_positions,
+        )
+        .ok_or_else(|| refuse("resident graph construction refused these dimensions"))
+    }
+
+    /// Greedy/sampled decode on the resident LFM2 Metal graph.
+    ///
+    /// Prefill is one `step_*` per prompt token here — the same shape the qwen35
+    /// Metal lane uses. Batched prefill is a separate, larger change.
+    #[cfg(target_os = "macos")]
+    fn generate_lfm2_metal(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        sampling: Option<&SamplingConfig>,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let max_positions = lfm2_metal_context_capacity();
+        if prompt.len() >= max_positions {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "lfm2 Metal lane: prompt of {} tokens exceeds the resident capacity of \
+                 {max_positions} (raise CAMELID_LFM2_METAL_MAXPOS)",
+                prompt.len()
+            )));
+        }
+        let mut guard = self
+            .metal_lfm2
+            .lock()
+            .map_err(|_| BackendError::InvalidTensorData("lfm2 Metal mutex poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(self.build_lfm2_metal(max_positions)?);
+            eprintln!(
+                "[lfm2] resident Metal graph active (Q8_0 weights, short-conv + GQA \
+                 attention, FFN, logits, GPU greedy)"
+            );
+        }
+        let engine = guard
+            .as_mut()
+            .ok_or_else(|| BackendError::InvalidTensorData("lfm2 Metal engine absent".into()))?;
+        // The conv ring is order-dependent, so every request starts from a clean state.
+        engine.reset();
+
+        let sampler = sampling.map(|config| LlamaSampler::Sampling(config.clone()));
+        let mut token_history = prompt.to_vec();
+        let mut out = Vec::with_capacity(max_new);
+
+        let embed =
+            |t: u32| -> Result<Vec<f32>> { self.token_embd.dequant_row(t as usize, "token_embd") };
+        let step = |engine: &mut crate::metal::Lfm2MetalDecode,
+                    tok: u32,
+                    pos: usize,
+                    want_logits: bool|
+         -> Result<(Option<u32>, Option<Vec<f32>>)> {
+            let h = self.token_embd.dequant_row(tok as usize, "token_embd")?;
+            let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+            if want_logits {
+                let logits = engine.step_logits(&h, &cos, &sin, pos).ok_or_else(|| {
+                    BackendError::InvalidTensorData("lfm2 Metal step (logits) failed".into())
+                })?;
+                Ok((None, Some(logits)))
+            } else {
+                let t = engine.step_greedy(&h, &cos, &sin, pos).ok_or_else(|| {
+                    BackendError::InvalidTensorData("lfm2 Metal step (greedy) failed".into())
+                })?;
+                Ok((Some(t), None))
+            }
+        };
+        let _ = &embed;
+
+        let want_logits = sampler.is_some();
+        let mut next: u32;
+        {
+            // Chunked prefill for everything but the LAST prompt token: each weight
+            // streams once per chunk instead of once per token, and the discarded
+            // logits never touch the 128k-row head. The final token goes through a
+            // normal step so it produces a selection.
+            let head = prompt.len() - 1;
+            if head > 0 {
+                let mut embeds = Vec::with_capacity(head * self.d_model);
+                let mut coss = Vec::with_capacity(head * (self.rope_dim / 2));
+                let mut sins = Vec::with_capacity(head * (self.rope_dim / 2));
+                for (pos, &tok) in prompt.iter().take(head).enumerate() {
+                    embeds.extend_from_slice(
+                        &self.token_embd.dequant_row(tok as usize, "token_embd")?,
+                    );
+                    let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+                    coss.extend_from_slice(&cos);
+                    sins.extend_from_slice(&sin);
+                }
+                engine
+                    .prefill_prompt(&embeds, &coss, &sins, head, lfm2_metal_prefill_chunk())
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData("lfm2 Metal prefill failed".into())
+                    })?;
+            }
+            let last = Some(step(engine, prompt[head], head, want_logits)?);
+            let (tok, logits) = last.ok_or_else(|| {
+                BackendError::InvalidTensorData("lfm2 Metal lane: empty prompt".into())
+            })?;
+            next = match (&sampler, tok, logits) {
+                (Some(s), _, Some(l)) => qwen35_sample_logits(l, s, &token_history)?,
+                (None, Some(t), _) => t,
+                _ => {
+                    return Err(BackendError::InvalidTensorData(
+                        "lfm2 Metal lane: selection/logits mismatch".into(),
+                    ))
+                }
+            };
+        }
+
+        let mut pos = prompt.len();
+        for i in 0..max_new {
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            token_history.push(next);
+            on_token(next);
+            if i + 1 < max_new {
+                let (tok, logits) = step(engine, next, pos, want_logits)?;
+                pos += 1;
+                next = match (&sampler, tok, logits) {
+                    (Some(s), _, Some(l)) => qwen35_sample_logits(l, s, &token_history)?,
+                    (None, Some(t), _) => t,
+                    _ => {
+                        return Err(BackendError::InvalidTensorData(
+                            "lfm2 Metal lane: selection/logits mismatch".into(),
+                        ))
+                    }
+                };
+            }
+        }
+        Ok(out)
     }
 
     #[cfg(target_os = "macos")]
@@ -2614,14 +3430,26 @@ impl RunnableModel {
         if self.qwen35.is_some() {
             return self.generate_qwen35_streaming(prompt, max_new, stop, None, true, on_token);
         }
+        // LFM2 resident Metal graph (opt-in via CAMELID_LFM2_METAL while it is
+        // being proven). No silent CPU fallback: the conv ring is order-dependent
+        // and a mid-stream replay would restart from the prompt, so a Metal failure
+        // surfaces as an error rather than a quietly different lane.
+        #[cfg(target_os = "macos")]
+        if self.lfm2.is_some() && lfm2_metal_enabled() {
+            return self.generate_lfm2_metal(prompt, max_new, stop, None, on_token);
+        }
         // Dense/generic path (MUSTER M-A1): the same incremental loop as `generate`
         // (byte-identical forward sequence when no stop token fires) plus stop-token
         // handling and true per-token streaming. A stop token ends the turn and is
         // NOT appended — matching the qwen35 lane and llama.cpp's served output.
-        let mut cache = KvCache::new(self.n_layers);
+        let mut cache = self.new_cache();
         let mut last = Vec::new();
+        // Only the LAST prompt position's logits are consumed; the rest exist to
+        // fill the cache and roll the conv ring. Skipping the tied 128k-row head on
+        // those positions removes 9.7% of the bytes each prefill step reads.
+        let last_prompt = prompt.len().saturating_sub(1);
         for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.forward_step(tok, pos, &mut cache)?;
+            last = self.forward_step_maybe_logits(tok, pos, &mut cache, pos == last_prompt)?;
         }
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
@@ -3168,6 +3996,73 @@ fn read_tensor_bytes(f: &mut File, d: &GgufTensorDescriptor, name: &str) -> Resu
 /// Physical token slots reserved by the resident Qwen3.5 Metal graph. The
 /// request's `max_tokens` is an upper bound, not a demand, so callers clamp the
 /// generation budget to the unused portion of this capacity.
+#[cfg(target_os = "macos")]
+/// Resident position capacity for the LFM2 Metal graph. KV is allocated for the 8
+/// attention layers only (the 22 conv layers carry a fixed 2-column ring), so 4096
+/// positions cost ~8 MiB of KV, not the dense figure.
+#[cfg(target_os = "macos")]
+fn lfm2_metal_context_capacity() -> usize {
+    std::env::var("CAMELID_LFM2_METAL_MAXPOS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096)
+}
+
+/// Positions per prefill command buffer. The batched Q8 GEMV tiles 8 columns per
+/// weight pass, so anything >= 8 amortises weight streaming; 64 keeps scratch small
+/// (~2.75 MB at this model's FFN width).
+/// Tiled simdgroup-matrix GEMM for LFM2 prefill projections. Default ON; opt out
+/// with `CAMELID_LFM2_PREFILL_MM=0` to force the bit-exact batched GEMV.
+#[cfg(target_os = "macos")]
+pub(crate) fn lfm2_prefill_mm_enabled() -> bool {
+    !std::env::var("CAMELID_LFM2_PREFILL_MM").is_ok_and(|v| {
+        let v = v.trim();
+        v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn lfm2_metal_prefill_chunk() -> usize {
+    std::env::var("CAMELID_LFM2_METAL_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
+/// Whether the LFM2 resident Metal lane may be used. DEFAULT-ON; opt out with
+/// `CAMELID_LFM2_METAL=0` (also `off`/`false`/`no`/`disabled`, the documented
+/// opt-out convention).
+///
+/// This predicate MUST stay in lockstep with the execution-plan gate in
+/// `execution_plan.rs`. They answer the same question, and when they disagree
+/// `/v1/health` describes a lane other than the one that ran.
+#[cfg(target_os = "macos")]
+pub(crate) fn lfm2_metal_enabled() -> bool {
+    // Reuses the planner's own opt-out predicate rather than restating the value
+    // list. Restating it is how the two drift: an independently written list here
+    // already differed from the planner's on `no` and `cpu`, which would have let
+    // routing and disclosure disagree for those two values.
+    !std::env::var("CAMELID_LFM2_METAL")
+        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
+}
+
+/// Whether qwen35 decode routes to the resident Metal graph (default on; `=0`
+/// opt-out convention).
+///
+/// This predicate MUST stay in lockstep with the execution-plan gate in
+/// `execution_plan.rs` — same rule as [`lfm2_metal_enabled`], and the same
+/// history: the inline `== "0" || == "false"` check this replaces already
+/// differed from the planner's vocabulary on `off`/`disabled`/`cpu`, which
+/// would have let those opt-out spellings flip the disclosed lane while
+/// routing kept serving Metal.
+#[cfg(target_os = "macos")]
+pub(crate) fn qwen35_metal_enabled() -> bool {
+    !std::env::var("CAMELID_QWEN35_METAL")
+        .is_ok_and(|v| crate::execution_plan::flag_value_disabled(&v))
+}
+
 #[cfg(target_os = "macos")]
 fn qwen35_metal_context_capacity() -> usize {
     std::env::var("CAMELID_QWEN35_METAL_MAXPOS")
@@ -3960,6 +4855,152 @@ impl RunnableModel {
             }
         }
         Ok(e)
+    }
+}
+
+/// The resident-format list and the page-backing it drives. Both are platform-
+/// independent — `load_raw` makes the same backing choice on every target — so these
+/// run everywhere, not only where the resident lane exists.
+#[cfg(test)]
+mod resident_format_admission_tests {
+    use super::*;
+    use crate::metal::ResidentWeightFormat;
+
+    #[test]
+    fn admitted_types_map_to_a_resident_format_and_page_back() {
+        // One table pins both halves, because page-backing is derived from the mapping.
+        // Dropping an entry returns that type to `Owned`, where the resident lane
+        // refuses it and the model falls back to CPU decode with no error.
+        for (tt, want) in [
+            (GgufTensorType::Q1_0, ResidentWeightFormat::Q1_0),
+            (GgufTensorType::Q2_0G64, ResidentWeightFormat::Q2_0G64),
+            (GgufTensorType::Q2_0G128, ResidentWeightFormat::Q2_0G128),
+            (GgufTensorType::Pq2_0, ResidentWeightFormat::Q2_0G128),
+            (GgufTensorType::Q8_0, ResidentWeightFormat::Q8_0),
+            // Admitted as a PAIR. An ornith Q4_K_M file is Q4_K 217 / Q6_K 33 / F32 177,
+            // so dropping either arm leaves `prism_metal_weight` erroring on the other
+            // and `build_qwen35_metal` yields no resident graph at all — not a partial
+            // one. Measured on that file: 11.3 tok/s decode, phys_footprint 6261 MB
+            // (vs 9917 MB for the Q8_0 row).
+            (GgufTensorType::Q4K, ResidentWeightFormat::Q4K),
+            (GgufTensorType::Q6K, ResidentWeightFormat::Q6K),
+        ] {
+            assert_eq!(resident_metal_format(tt), Some(want), "{tt:?} must map");
+            assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
+        }
+    }
+
+    #[test]
+    fn unadmitted_types_neither_map_nor_page_back() {
+        // Page-backing costs a page per tensor, so it stays opt-in. Note Q5_K is absent
+        // from the admitted table on purpose: there is no `q5k` Metal kernel, so an
+        // ornith Q3_K_M (which carries q5_K tensors) must keep failing closed to CPU.
+        for tt in [
+            GgufTensorType::F32,
+            GgufTensorType::F16,
+            GgufTensorType::Q4_0,
+            GgufTensorType::Q5K,
+        ] {
+            assert_eq!(resident_metal_format(tt), None, "{tt:?} must not admit");
+            assert!(!wants_page_backing(tt), "{tt:?} must stay Owned");
+        }
+    }
+}
+
+/// The macOS-only half of Q8_0 admission: `prism_metal_weight`'s page-backing
+/// requirement and the wire block geometry that makes admitting Q8_0 a no-repack
+/// change. The format mapping itself is platform-independent and covered above. Runs
+/// on any macOS host with no GGUF and no GPU.
+#[cfg(all(test, target_os = "macos"))]
+mod resident_metal_q8_admission_tests {
+    use super::*;
+    use crate::metal::{ResidentWeightBytes, ResidentWeightFormat};
+    use std::io::Write;
+
+    /// One GGUF `Q8_0` block is an f16 scale followed by 32 int8 quants. The resident
+    /// Metal Q8 GEMV consumes exactly this layout, which is why admitting Q8_0 needs no
+    /// repack. If either side ever diverges from 34/32, these tests are the tripwire.
+    const Q8_0_WIRE_BLOCK_BYTES: usize = 34;
+    const Q8_0_BLOCK_VALUES: usize = 32;
+
+    fn raw(
+        bytes: RawMatBytes,
+        tt: GgufTensorType,
+        in_features: usize,
+        out_features: usize,
+    ) -> RawMat {
+        RawMat {
+            bytes,
+            tt,
+            in_features,
+            out_features,
+        }
+    }
+
+    /// `out_features` rows of `in_features` values each, in Q8_0 wire form.
+    fn q8_0_wire_bytes(in_features: usize, out_features: usize) -> Vec<u8> {
+        let blocks_per_row = in_features / Q8_0_BLOCK_VALUES;
+        (0..out_features * blocks_per_row * Q8_0_WIRE_BLOCK_BYTES)
+            .map(|i| i as u8)
+            .collect()
+    }
+
+    #[test]
+    fn page_backed_q8_0_admits_as_a_resident_wire_weight() {
+        let (in_features, out_features) = (Q8_0_BLOCK_VALUES * 2, 3);
+        let wire = q8_0_wire_bytes(in_features, out_features);
+        assert_eq!(
+            wire.len(),
+            out_features * 2 * Q8_0_WIRE_BLOCK_BYTES,
+            "fixture must be an exact number of 34-byte Q8_0 wire blocks"
+        );
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&wire).expect("write wire bytes");
+        file.flush().expect("flush");
+        let pages = crate::wire_mmap::WirePages::read_from_file(file.as_file(), 0, wire.len())
+            .expect("Q8_0 tensors must be page-backable");
+        assert_eq!(
+            pages.bytes(),
+            &wire[..],
+            "page-backing must not alter bytes"
+        );
+
+        let m = raw(
+            RawMatBytes::WirePages(pages),
+            GgufTensorType::Q8_0,
+            in_features,
+            out_features,
+        );
+        match m.prism_metal_weight().expect("page-backed Q8_0 must admit") {
+            ResidentWeightBytes::WirePages { format, pages } => {
+                assert_eq!(format, ResidentWeightFormat::Q8_0);
+                assert_eq!(pages.bytes(), &wire[..]);
+            }
+            _ => panic!("expected page-backed WirePages backing for a Q8_0 projection"),
+        }
+    }
+
+    #[test]
+    fn owned_q8_0_is_refused_instead_of_silently_copied() {
+        // Variant check only: `Owned` is refused outright, so an ordinary heap tensor
+        // never reaches the resident lane. The page-alignment invariant itself is
+        // `WirePages`' contract, covered by
+        // `metal::tests::wire_mmap_nocopy_buffer_gpu_reads_file_bytes`.
+        let m = raw(
+            RawMatBytes::owned(q8_0_wire_bytes(Q8_0_BLOCK_VALUES, 1)),
+            GgufTensorType::Q8_0,
+            Q8_0_BLOCK_VALUES,
+            1,
+        );
+        let err = match m.prism_metal_weight() {
+            Ok(_) => panic!("owned Q8_0 must not reach the resident lane"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("not page-backed"),
+            "unexpected error: {err}"
+        );
     }
 }
 

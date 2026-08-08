@@ -1438,6 +1438,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let dense_vector = |name: &str| CpuTensor::from_f32(name, vec![32], vec![1.0; 32]).unwrap();
@@ -1553,6 +1554,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let dense_vector = |name: &str| CpuTensor::from_f32(name, vec![32], vec![1.0; 32]).unwrap();
@@ -2211,6 +2213,8 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_Q8_0_PACKED_4X8_DOT",
         "CAMELID_X86_KQUANT_MATMUL_OWNER",
         "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+        "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256",
+        "CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI",
         "CAMELID_X86_Q6K_AVX2",
         "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
         "CAMELID_Q8_0_FILE_CACHE_BYTES",
@@ -3827,11 +3831,23 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                 0,
                 "baseline leg dispatched the owner (n_rows={n_rows}) — vacuous comparison"
             );
-            // Cover BOTH owner inners: VNNI (default when the CPU has it) and
-            // the AVX2 fallback (VNNI sub-flag forced off).
-            for vnni in ["1", "0"] {
+            // Cover EVERY owner inner reachable on this host: the folded
+            // 512-bit inner (default), the legacy dpbusd 512-bit inner
+            // (opt-in), and the AVX2 fallback (wide-inner flag off). A leg the
+            // CPU cannot reach legitimately falls back, so the engaged-checks
+            // below state exactly which inner each leg is ALLOWED to have run —
+            // without them a leg silently measures a kernel its name disclaims.
+            for leg in ["a512fold", "a512vnni", "avx2"] {
                 std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
-                std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI", vnni);
+                std::env::set_var(
+                    "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+                    if leg == "avx2" { "0" } else { "1" },
+                );
+                if leg == "a512vnni" {
+                    std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI", "1");
+                } else {
+                    std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI");
+                }
                 reset_q8_schedule_telemetry();
                 let owner = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
                 // Engaged-check: if the dispatch silently stopped firing, the
@@ -3840,29 +3856,48 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                 let telemetry = snapshot_q8_schedule_telemetry();
                 assert!(
                     telemetry.kquant_owner_prefill_taken > 0,
-                    "owner leg did not dispatch (n_rows={n_rows}, vnni={vnni}) — vacuous comparison"
+                    "owner leg did not dispatch (n_rows={n_rows}, leg={leg}) — vacuous comparison"
                 );
-                // Per-inner engaged check: the vnni=1 leg must actually run
-                // the VNNI inner when the host has the features; on hosts
-                // without them the leg legitimately falls back to AVX2 (the
-                // AVX2 inner is still covered by the vnni=0 leg).
-                let vnni_expected = vnni == "1" && q8_owner_avx512vnni_available();
+                let host_vnni512 = q8_owner_avx512vnni_available();
+                let host_bw512 = q8_owner_avx512bw_available();
+                // The folded inner needs only avx512f+bw, so on an AVX-512 host
+                // WITHOUT vnni the a512vnni leg legitimately lands on it too.
+                let (want_vnni, want_fold) = match leg {
+                    "a512vnni" => (host_vnni512, !host_vnni512 && host_bw512),
+                    "a512fold" => (false, host_bw512),
+                    _ => (false, false),
+                };
                 assert_eq!(
-                    vnni_expected,
+                    want_vnni,
                     telemetry.kquant_owner_vnni_taken > 0,
-                    "VNNI inner engagement mismatch (n_rows={n_rows}, vnni={vnni}, \
-                     host_vnni={})",
-                    q8_owner_avx512vnni_available()
+                    "dpbusd 512-bit inner engagement mismatch (n_rows={n_rows}, leg={leg}, \
+                     host_vnni512={host_vnni512}, host_bw512={host_bw512})"
+                );
+                assert_eq!(
+                    want_fold,
+                    telemetry.kquant_owner_avx512fold_taken > 0,
+                    "folded 512-bit inner engagement mismatch (n_rows={n_rows}, leg={leg}, \
+                     host_vnni512={host_vnni512}, host_bw512={host_bw512})"
+                );
+                // The 256-bit inner sits strictly below both 512-bit paths AND
+                // is opt-in since #617. No leg here sets its flag, so it must
+                // never engage — without this a non-AVX-512 host's legs could
+                // silently be measuring that kernel instead of the AVX2 one.
+                assert_eq!(
+                    telemetry.kquant_owner_avxvnni_taken, 0,
+                    "the 256-bit inner engaged without its opt-in flag \
+                     (n_rows={n_rows}, leg={leg})"
                 );
                 std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
                 std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
+                std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI");
                 assert_eq!(owner.data.len(), base.data.len());
                 for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
                     assert_eq!(
                         a.to_bits(),
                         b.to_bits(),
                         "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, \
-                         out_dim={out_dim}, vnni={vnni})"
+                         out_dim={out_dim}, leg={leg})"
                     );
                 }
             }
@@ -4063,7 +4098,10 @@ fn q4_k_repack8_budget_zero_degrades_bit_identically() {
 fn q4_k_owner_avxvnni_inner_is_bit_identical() {
     #[cfg(target_arch = "x86_64")]
     {
-        if !std::arch::is_x86_feature_detected!("avxvnni") || q8_owner_avx512vnni_available() {
+        // The 256-bit inner sits below BOTH 512-bit paths, and the folded one
+        // needs only avx512f+bw — so `avx512bw` (not `avx512vnni`) is what
+        // makes this kernel unreachable and the assertion vacuous.
+        if !std::arch::is_x86_feature_detected!("avxvnni") || q8_owner_avx512bw_available() {
             return;
         }
         let _env_guard = env_lock();
@@ -4097,11 +4135,13 @@ fn q4_k_owner_avxvnni_inner_is_bit_identical() {
 
         std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
         std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI", "1");
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256", "1");
         reset_q8_schedule_telemetry();
         let owned = matmul_rhs_transposed_q4_k_block_dot(&input, &weight, "avxvnni").unwrap();
         let telemetry = snapshot_q8_schedule_telemetry();
         std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
         std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256");
 
         assert!(
             telemetry.kquant_owner_avxvnni_taken > 0,
@@ -4170,6 +4210,67 @@ fn q6_k_owner_prefill_bitwise_matches_block_dot_core() {
                     "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, out_dim={out_dim})"
                 );
             }
+        }
+    }
+}
+
+/// Natural-order reference for one superblock's `aux32`, written the way
+/// [`q6_k_wire_row_dot`] states it. Without an independent oracle the kernel
+/// and its twin could agree with each other and both be wrong.
+fn q6_k_reference_aux32(a: &[i8; 256], scales: &[u8; 16], q8: &[i8; 256]) -> [i32; 8] {
+    let mut aux32 = [0i32; 8];
+    for (j, &scale) in scales.iter().enumerate().take(16) {
+        let scale = scale as i8 as i32;
+        let off = j * 16;
+        for l in 0..8 {
+            aux32[l] += scale * (q8[off + l] as i32) * (a[off + l] as i32);
+            aux32[l] += scale * (q8[off + 8 + l] as i32) * (a[off + 8 + l] as i32);
+        }
+    }
+    aux32
+}
+
+/// Both owner `aux32` kernels against the natural-order reference loop.
+#[test]
+fn q6_k_owner_aux32_matches_the_reference_lane_loop() {
+    for salt in 0..8usize {
+        let a: [i8; 256] =
+            std::array::from_fn(|i| ((((i * 17 + salt * 5) % 64) as i16) - 32) as i8);
+        // Scale byte 0 is always 0x80 so the i8 extreme (-128) is exercised.
+        let scales: [u8; 16] = std::array::from_fn(|j| {
+            if j == 0 {
+                0x80
+            } else {
+                ((j * 37 + salt * 13) % 256) as u8
+            }
+        });
+        // salt 7 pins the extreme the zero-point form exists to survive: the
+        // faster sign-folded alternative (`maddubs(|a|, sign(a)·q8)`) is
+        // silently wrong at an activation of -128 because negating it wraps.
+        // `quantize_q8_k_blocks` cannot emit -128 today, and this kernel must
+        // not acquire a dependency on that which the per-cell path lacks.
+        let q8: [i8; 256] = std::array::from_fn(|i| {
+            if salt == 7 && i % 3 == 0 {
+                -128
+            } else {
+                (((i * 23 + salt * 11) % 255) as i16 - 127) as i8
+            }
+        });
+
+        let want = q6_k_reference_aux32(&a, &scales, &q8);
+        assert_eq!(
+            q6_k_owner_aux32_scalar(&a, &scales, &q8),
+            want,
+            "scalar aux32 diverged from the reference (salt={salt})"
+        );
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed present above.
+            let simd = unsafe { q6_k_owner_aux32_avx2(&a, &scales, &q8) };
+            assert_eq!(
+                simd, want,
+                "avx2 aux32 diverged from the reference (salt={salt})"
+            );
         }
     }
 }
@@ -8880,6 +8981,7 @@ fn applies_rope_to_each_attention_head() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
@@ -8926,6 +9028,7 @@ fn apply_rope_uses_configured_frequency_base() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -8982,6 +9085,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -9042,6 +9146,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -9109,6 +9214,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
@@ -9181,6 +9287,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 4], vec![1.0, 0.0, 0.0, 0.0]).unwrap();
@@ -9267,6 +9374,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 2], vec![1.0, 0.0]).unwrap();
@@ -9352,6 +9460,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let tensor = CpuTensor::from_f32("query", vec![1, 2], vec![1.0, 0.0]).unwrap();
@@ -10973,6 +11082,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
@@ -11268,6 +11378,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
@@ -11503,6 +11614,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let layer = LlamaLayerWeights {
@@ -11622,6 +11734,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let kv_cache = LlamaKvCache::new(
@@ -11778,6 +11891,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let weights = Arc::new(LlamaLoadedWeights {
@@ -12668,6 +12782,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         mla: None,
     };
     let n = 7;
@@ -13060,6 +13175,298 @@ fn iq4_xs_wire_dot_consistent_with_tensor_dequant() {
         (dot as f64 - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
         "iq4_xs dot {dot} vs tensor dequant reference {reference}"
     );
+}
+
+/// REGRESSION (K-quant on CPU): `CAMELID_X86_Q4K_DECODE=0` must not be able to strand
+/// a wire-only K-quant weight with no CPU consumer.
+///
+/// `load_kquant_wire_linear` retains wire bytes and leaves `data` EMPTY, and there is
+/// no f32 K-quant load path to fall back to, so the streaming block-dot is the ONLY
+/// consumer. With the flag able to turn it off, every K-quant model died on its first
+/// CPU forward with `storage=no-row-major-data, data_len=0` — reproduced on a real
+/// Qwen3-4B-Q4_K_M. The flag may pick between kernels; it may not remove the last one.
+#[test]
+fn kquant_block_dot_stays_selected_for_wire_only_weights() {
+    // Flag ON: selected regardless of whether f32 data exists.
+    assert!(super::kquant_block_dot_selected(true) || !super::q4_k_cpu_block_dot_enabled());
+    // The invariant that actually matters: a weight with NO f32 data always selects
+    // the block-dot, whatever the env flag says.
+    assert!(
+        super::kquant_block_dot_selected(false),
+        "a wire-only K-quant weight must always select the streaming block-dot"
+    );
+}
+
+/// The four Prism packed low-bit geometries, as (type, block_elements, block_bytes).
+const PRISM_GEOMETRIES: [(crate::gguf::GgufTensorType, usize, usize); 4] = [
+    (crate::gguf::GgufTensorType::Q1_0, 128, 18),
+    (crate::gguf::GgufTensorType::Q2_0G64, 64, 18),
+    (crate::gguf::GgufTensorType::Q2_0G128, 128, 34),
+    (crate::gguf::GgufTensorType::Pq2_0, 128, 34),
+];
+
+/// Deterministic Prism wire bytes: pseudo-random code nibbles with a varied f16
+/// scale per block. Block 0 of every row is given a ZERO scale on purpose — that is
+/// the one place Q1_0's `neg_d = -d` reconstruction is observable (`-0.0` vs `+0.0`),
+/// so the bit-exactness assertions below actually cover it.
+fn prism_wire_fixture(block_bytes: usize, blocks: usize) -> Vec<u8> {
+    let mut wire = vec![0u8; blocks * block_bytes];
+    for (i, b) in wire.iter_mut().enumerate() {
+        *b = ((i * 167 + 13) % 256) as u8;
+    }
+    for (b, blk) in wire.chunks_exact_mut(block_bytes).enumerate() {
+        let scale = if b % 7 == 0 {
+            0.0
+        } else {
+            0.015 + (b % 5) as f32 * 0.004
+        };
+        blk[0..2].copy_from_slice(&super::f32_to_f16_bits(scale).to_le_bytes());
+    }
+    wire
+}
+
+/// Dequantize a whole Prism weight tensor with the tensor-layer decoders — the
+/// independent oracle the block-dot must reproduce.
+fn prism_decode_reference(
+    tensor_type: crate::gguf::GgufTensorType,
+    wire: &[u8],
+    elements: usize,
+) -> Vec<f32> {
+    match tensor_type {
+        crate::gguf::GgufTensorType::Q1_0 => {
+            crate::tensor::decode_q1_0_tensor("prism_ref", wire, elements).expect("decode q1_0")
+        }
+        other => crate::tensor::decode_q2_0_tensor("prism_ref", wire, elements, other)
+            .expect("decode q2_0"),
+    }
+}
+
+/// Prism prefill linear: `prism_block_dot_core` must be BIT-IDENTICAL to
+/// dequantizing with `decode_q1_0_tensor` / `decode_q2_0_tensor` and dotting in
+/// element order. Bit-identity (not a tolerance) is the contract — the kernel
+/// deliberately keeps the per-element `(coef * d) * a` multiply instead of
+/// factoring `d` out of a block sum, precisely so this holds.
+#[test]
+fn prism_block_dot_core_is_bit_identical_to_decoded_dot() {
+    for (tensor_type, block_elements, block_bytes) in PRISM_GEOMETRIES {
+        let (out_dim, n_rows) = (5usize, 3usize);
+        let in_dim = block_elements * 4;
+        let blocks_per_row = in_dim / block_elements;
+        let wire = prism_wire_fixture(block_bytes, out_dim * blocks_per_row);
+
+        let input_data: Vec<f32> = (0..n_rows * in_dim)
+            .map(|i| ((i as f32) * 0.019).cos() * 2.5)
+            .collect();
+        let input =
+            super::CpuTensor::from_f32("in", vec![n_rows, in_dim], input_data.clone()).unwrap();
+
+        let out = super::prism_block_dot_core(&input, &wire, out_dim, in_dim, tensor_type, "prism")
+            .unwrap();
+        assert_eq!(out.shape.dims, vec![n_rows, out_dim]);
+
+        let f32w = prism_decode_reference(tensor_type, &wire, out_dim * in_dim);
+        for r in 0..n_rows {
+            let act = &input_data[r * in_dim..(r + 1) * in_dim];
+            for o in 0..out_dim {
+                let mut want = 0f32;
+                for k in 0..in_dim {
+                    want += f32w[o * in_dim + k] * act[k];
+                }
+                assert_eq!(
+                    out.data[r * out_dim + o].to_bits(),
+                    want.to_bits(),
+                    "{tensor_type:?} row {r} col {o}"
+                );
+            }
+        }
+    }
+}
+
+/// The Prism decode (single-row) path must equal row 0 of the prefill core exactly.
+#[test]
+fn prism_decode_row_matches_block_dot_core() {
+    for (tensor_type, block_elements, block_bytes) in PRISM_GEOMETRIES {
+        let out_dim = 6usize;
+        let in_dim = block_elements * 3;
+        let blocks_per_row = in_dim / block_elements;
+        let wire = prism_wire_fixture(block_bytes, out_dim * blocks_per_row);
+
+        let input_row: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let input = super::CpuTensor::from_f32("in", vec![1, in_dim], input_row.clone()).unwrap();
+
+        let prefill =
+            super::prism_block_dot_core(&input, &wire, out_dim, in_dim, tensor_type, "prism")
+                .unwrap();
+        let mut decode = vec![0f32; out_dim];
+        super::accumulate_transposed_linear_row_prism(&input_row, &wire, tensor_type, &mut decode);
+        for (o, &d) in decode.iter().enumerate() {
+            assert_eq!(
+                prefill.data[o].to_bits(),
+                d.to_bits(),
+                "{tensor_type:?} col {o}"
+            );
+        }
+    }
+}
+
+/// REGRESSION (Bonsai on CPU): a Prism linear loaded the way `load_prism_wire_linear`
+/// loads it — packed wire pages, `data` EMPTY — must have a CPU consumer in the real
+/// linear dispatch.
+///
+/// Before the fix this assertion failed on `require_row_major_f32_data`: the loader
+/// chose the packed-wire representation from a compile-time `cfg!` that is true for
+/// EVERY Windows build (`build.rs` turns the `cuda` feature on there), while the
+/// planner routed decode to the CPU whenever no usable NVIDIA device was present.
+/// Nothing in the CPU chain consumed Q1_0/Q2_0 wire, so every Bonsai row died on its
+/// first forward. The existing bonsai tests all asserted PLANNER DISCLOSURE STRINGS,
+/// which are identical whether or not the loader and the CPU agree — this test closes
+/// that blind spot by exercising the load representation against the real dispatch.
+#[test]
+fn prism_wire_only_linear_has_a_cpu_consumer() {
+    use std::io::Write;
+    for (tensor_type, block_elements, block_bytes) in PRISM_GEOMETRIES {
+        let (out_dim, n_rows) = (4usize, 2usize);
+        let in_dim = block_elements * 2;
+        let blocks_per_row = in_dim / block_elements;
+        let wire = prism_wire_fixture(block_bytes, out_dim * blocks_per_row);
+
+        // Build the tensor exactly as `load_prism_wire_linear` does: page-aligned wire
+        // pages read from a file, and NO f32 data.
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file.write_all(&wire).unwrap();
+        temp_file.flush().unwrap();
+        let file = std::fs::File::open(temp_file.path()).unwrap();
+        let pages =
+            crate::wire_mmap::WirePages::read_from_file(&file, 0, wire.len()).expect("wire pages");
+
+        let mut weight = super::CpuTensor::from_f32(
+            "prism_w",
+            vec![out_dim, in_dim],
+            vec![0.0; out_dim * in_dim],
+        )
+        .unwrap();
+        weight.source_type = Some(tensor_type);
+        weight.kquant_wire_pages = Some(pages);
+        weight.data = Vec::new();
+        assert!(
+            weight.low_bit_wire().is_some(),
+            "{tensor_type:?} fixture must expose packed wire"
+        );
+
+        let input_data: Vec<f32> = (0..n_rows * in_dim)
+            .map(|i| ((i as f32) * 0.023).sin() * 1.75)
+            .collect();
+        let input =
+            super::CpuTensor::from_f32("in", vec![n_rows, in_dim], input_data.clone()).unwrap();
+
+        // The real dispatch, not the kernel directly — that is the thing that was broken.
+        let out = super::matmul_rhs_transposed_with_precision(&input, &weight, "prism_dispatch")
+            .unwrap_or_else(|err| {
+                panic!("{tensor_type:?} wire-only linear has no CPU consumer: {err}")
+            });
+
+        let f32w = prism_decode_reference(tensor_type, &wire, out_dim * in_dim);
+        for r in 0..n_rows {
+            let act = &input_data[r * in_dim..(r + 1) * in_dim];
+            for o in 0..out_dim {
+                let mut want = 0f32;
+                for k in 0..in_dim {
+                    want += f32w[o * in_dim + k] * act[k];
+                }
+                assert_eq!(
+                    out.data[r * out_dim + o].to_bits(),
+                    want.to_bits(),
+                    "{tensor_type:?} row {r} col {o}"
+                );
+            }
+        }
+    }
+}
+
+/// Prism block-dot against REAL Bonsai weights: load every packed low-bit linear the
+/// way the engine loads it and check the streaming dot against the tensor-layer
+/// decoder. Skips unless `CAMELID_PRISM_GGUF` points at a Bonsai GGUF.
+#[test]
+fn prism_block_dot_matches_decode_on_real_model() {
+    let Some(path) = std::env::var_os("CAMELID_PRISM_GGUF") else {
+        eprintln!(
+            "skipping prism block-dot real-model parity: set CAMELID_PRISM_GGUF to a Bonsai gguf"
+        );
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let gguf = crate::gguf::read_metadata(&path).expect("read gguf metadata");
+    let store = crate::tensor::TensorStore::open(&path, &gguf);
+
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    };
+
+    let mut tested = 0usize;
+    for desc in &gguf.tensors {
+        if super::prism_block_geometry(desc.tensor_type).is_none() || desc.dimensions.len() != 2 {
+            continue;
+        }
+        let in_dim = desc.dimensions[0] as usize;
+        let out_dim = desc.dimensions[1] as usize;
+
+        // The REAL loader — this is the representation the CPU path actually receives.
+        let weight = store
+            .load_prism_wire_linear(&desc.name)
+            .expect("load prism wire linear");
+        assert!(weight.data.is_empty(), "{} should be wire-only", desc.name);
+        let wire = weight.low_bit_wire().expect("prism wire bytes");
+        let f32w = prism_decode_reference(desc.tensor_type, wire, in_dim * out_dim);
+
+        let n_rows = 2usize;
+        let input_data: Vec<f32> = (0..n_rows * in_dim).map(|_| next_f32()).collect();
+        let input = crate::tensor::CpuTensor::from_f32(
+            "prism_in",
+            vec![n_rows, in_dim],
+            input_data.clone(),
+        )
+        .expect("input tensor");
+
+        let out = super::matmul_rhs_transposed_prism_block_dot(&input, &weight, "prism_bd")
+            .expect("prism block dot");
+        // The kernel must recover the output width from the wire, not from dim(0) —
+        // the tied embed/lm_head is `[in, out]`, where those differ.
+        assert_eq!(
+            out.shape.dims,
+            vec![n_rows, out_dim],
+            "{} output width",
+            desc.name
+        );
+
+        // Verify a bounded prefix of the output: the head is ~151k wide and the
+        // reference dot is deliberately naive, so checking every column would cost
+        // ~10^9 scalar ops for no extra signal.
+        let checked = out_dim.min(16);
+        for r in 0..n_rows {
+            let act = &input_data[r * in_dim..(r + 1) * in_dim];
+            for o in 0..checked {
+                let mut want = 0f32;
+                for k in 0..in_dim {
+                    want += f32w[o * in_dim + k] * act[k];
+                }
+                assert_eq!(
+                    out.data[r * out_dim + o].to_bits(),
+                    want.to_bits(),
+                    "{} row {r} out {o}",
+                    desc.name
+                );
+            }
+        }
+        tested += 1;
+        if tested >= 3 {
+            break;
+        }
+    }
+    assert!(tested > 0, "no Prism low-bit 2-D linears found in {path:?}");
 }
 
 /// IQ4_XS prefill linear: `iq4_xs_block_dot_core` (multi-row, rayon over output) must equal

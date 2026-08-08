@@ -50,6 +50,9 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub matmul_owner_avxvnni_taken: u64,
     pub kquant_owner_prefill_taken: u64,
     pub kquant_owner_vnni_taken: u64,
+    /// Owner prefill matmuls that dispatched the folded 512-bit inner (scale in
+    /// `madd_epi16`, no `vpdpbusd` — so it also covers AVX-512 hosts with no VNNI).
+    pub kquant_owner_avx512fold_taken: u64,
     pub kquant_owner_avxvnni_taken: u64,
     pub kquant_owner_repack8_taken: u64,
     pub kquant_owner_repack8_built: u64,
@@ -151,6 +154,8 @@ pub(super) static Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN: AtomicU64 = AtomicU64::ne
 pub(super) static Q8_SCHED_MATMUL_OWNER_AVXVNNI_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN: AtomicU64 = AtomicU64::new(0);
+/// Folded 512-bit inner: the default on any avx512f+bw host, VNNI or not.
+pub(super) static Q8_SCHED_KQUANT_OWNER_AVX512FOLD_TAKEN: AtomicU64 = AtomicU64::new(0);
 /// 256-bit AVX-VNNI inner: reachable on Alder Lake and later consumer parts
 /// that carry `vpdpbusd` without any AVX-512.
 pub(super) static Q8_SCHED_KQUANT_OWNER_AVXVNNI_TAKEN: AtomicU64 = AtomicU64::new(0);
@@ -232,6 +237,7 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_MATMUL_OWNER_AVXVNNI_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_KQUANT_OWNER_AVX512FOLD_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_AVXVNNI_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_REPACK8_BUILT.store(0, Ordering::Relaxed);
@@ -344,6 +350,8 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
         matmul_owner_avxvnni_taken: Q8_SCHED_MATMUL_OWNER_AVXVNNI_TAKEN.load(Ordering::Relaxed),
         kquant_owner_prefill_taken: Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.load(Ordering::Relaxed),
         kquant_owner_vnni_taken: Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.load(Ordering::Relaxed),
+        kquant_owner_avx512fold_taken: Q8_SCHED_KQUANT_OWNER_AVX512FOLD_TAKEN
+            .load(Ordering::Relaxed),
         kquant_owner_avxvnni_taken: Q8_SCHED_KQUANT_OWNER_AVXVNNI_TAKEN.load(Ordering::Relaxed),
         kquant_owner_repack8_taken: Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN.load(Ordering::Relaxed),
         kquant_owner_repack8_built: Q8_SCHED_KQUANT_OWNER_REPACK8_BUILT.load(Ordering::Relaxed),

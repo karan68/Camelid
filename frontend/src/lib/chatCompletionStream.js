@@ -137,7 +137,16 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
       const choice = chunk?.choices?.[0]
       const role = choice?.delta?.role ?? null
       const delta = choice?.delta?.content ?? choice?.text ?? ''
-      if (role && !delta) onStreamEvent?.({ type: 'role', role, ...streamMetrics() })
+      // Reasoning deltas are GENERATED TOKENS even though they are not visible
+      // content. A thinking model can spend an entire reply in `reasoning_content`
+      // (LFM2's generation prompt opens a <think> block), so counting only
+      // `content` made the tok/s readout report a fraction of the real rate —
+      // or zero. Counted here, never appended to `content`.
+      const reasoningDelta = choice?.delta?.reasoning_content ?? ''
+      if (role && !delta && !reasoningDelta) onStreamEvent?.({ type: 'role', role, ...streamMetrics() })
+      if (reasoningDelta && !delta) {
+        completionTokens += 1
+      }
       if (delta) {
         completionTokens += 1
         if (firstContentMs === null) firstContentMs = performance.now() - streamStartedAt

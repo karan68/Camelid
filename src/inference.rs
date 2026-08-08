@@ -118,6 +118,8 @@ use crate::{
         with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
         Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block, Q8_0PackedRows4Interleave,
         Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape, TensorStore,
+        Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMENTS, Q2_0_G128_BLOCK_BYTES, Q2_0_G128_BLOCK_ELEMENTS,
+        Q2_0_G64_BLOCK_BYTES, Q2_0_G64_BLOCK_ELEMENTS,
     },
     BackendError, Result,
 };
@@ -694,9 +696,22 @@ impl LlamaLoadedWeights {
                     return store.load_iq4_xs_wire_linear(name);
                 }
                 // Prism Q1/Q2 linears stay in their native packed wire format on
-                // macOS Metal and Windows CUDA. Both resident lanes consume these
-                // bytes directly; there is no whole-model Q8/F32 expansion. Keep
-                // the pre-existing lossless Q1->Q8 bridge on other platforms.
+                // EVERY platform. The macOS Metal and Windows CUDA resident lanes
+                // consume these bytes directly, and `matmul_rhs_transposed_prism_
+                // block_dot` streams the SAME bytes on the CPU, so no platform
+                // pays a whole-model Q8/F32 expansion.
+                //
+                // This used to be gated on `cfg!(macos | windows+cuda)`, which was a
+                // COMPILE-time stand-in for a RUNTIME question. `build.rs` turns the
+                // `cuda` feature on for every Windows build, so a Windows box with no
+                // usable NVIDIA device still took the packed-wire branch while the
+                // planner (which reads the runtime `platform.cuda_resident_active`)
+                // routed decode to the CPU. The CPU had no Q1_0/Q2_0 consumer, so the
+                // wire-only tensor -- `data: Vec::new()` -- reached the f32 matmul and
+                // every Bonsai row died on `require_row_major_f32_data` at its first
+                // forward. A loader keyed on the target triple can never agree with a
+                // planner keyed on the device actually present; the fix is to give the
+                // CPU a consumer so the branch does not need to guess.
                 if matches!(
                     desc.tensor_type,
                     GgufTensorType::Q1_0
@@ -705,16 +720,7 @@ impl LlamaLoadedWeights {
                         | GgufTensorType::Pq2_0
                 ) && desc.dimensions.len() == 2
                 {
-                    if cfg!(any(
-                        target_os = "macos",
-                        all(target_os = "windows", feature = "cuda")
-                    )) {
-                        return store.load_prism_wire_linear(name);
-                    }
-                    if desc.tensor_type == GgufTensorType::Q1_0 {
-                        return store.load_q1_0_as_q8_0_blocks_linear(name);
-                    }
-                    return store.load_cpu_f32(name);
+                    return store.load_prism_wire_linear(name);
                 }
                 if matches!(
                     desc.tensor_type,
@@ -9421,7 +9427,15 @@ fn linear_with_diagnostic_layouts_with_plan(
     {
         return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name);
     }
-    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+    // Prism packed low-bit weights, for the same reason and with the same
+    // unconditional urgency as IQ4_XS above. Their blocks are 128/64 elements
+    // wide, so they are NOT gated on the 256-element K-quant modulus.
+    if prism_wire_of(weight).is_some() {
+        return matmul_rhs_transposed_prism_block_dot(input, weight, name);
+    }
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_width % Q6_K_VALUES_PER_BLOCK == 0
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q2_k_block_dot(input, weight, name);
         }
@@ -9558,6 +9572,9 @@ struct BorrowedLinearWeight<'a> {
     q8_0_file_backing: Option<&'a Q8_0FileBacking>,
     tq2_0_wire_bytes: Option<&'a [u8]>,
     iq4_xs_wire_bytes: Option<&'a [u8]>,
+    /// Packed wire for the Prism low-bit family only (never TQ2_0 — see
+    /// [`prism_wire_of`]), so `source_type` alone selects the right geometry.
+    prism_wire_bytes: Option<&'a [u8]>,
     q2_k_wire_bytes: Option<&'a [u8]>,
     q3_k_wire_bytes: Option<&'a [u8]>,
     q4_k_wire_bytes: Option<&'a [u8]>,
@@ -9585,6 +9602,7 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_file_backing: weight.q8_0_file_backing.as_ref(),
             tq2_0_wire_bytes: weight.tq2_0_wire_bytes.as_deref().map(|v| v.as_slice()),
             iq4_xs_wire_bytes: weight.iq4_xs_wire_bytes.as_deref().map(|v| v.as_slice()),
+            prism_wire_bytes: prism_wire_of(weight).map(|(wire, _)| wire),
             q2_k_wire_bytes: weight.q2_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q3_k_wire_bytes: weight.q3_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q4_k_wire_bytes: weight.q4_k_wire(),
@@ -9791,6 +9809,10 @@ fn output_projection_with_layout_with_plan(
             {
                 return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name.as_str());
             }
+            // Tied Prism Q1_0/Q2_0 embed/lm_head: stream the packed wire blocks.
+            if prism_wire_of(weight).is_some() {
+                return matmul_rhs_transposed_prism_block_dot(input, weight, name.as_str());
+            }
             if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
                 return matmul_rhs_transposed_q2_k_block_dot(input, weight, name.as_str());
             }
@@ -9887,10 +9909,19 @@ fn matmul_rhs_transposed_with_precision_with_plan(
     if weight.source_type == Some(GgufTensorType::IQ4XS) && weight.iq4_xs_wire_bytes.is_some() {
         return matmul_rhs_transposed_iq4_xs_block_dot(input, weight, name);
     }
+    // Prism Q1_0/Q2_0/PQ2_0 carry only wire bytes (empty f32 data), so like IQ4_XS
+    // they must always take the streaming block-dot — there is no f32 to fall back to.
+    if prism_wire_of(weight).is_some() {
+        return matmul_rhs_transposed_prism_block_dot(input, weight, name);
+    }
     // K-quant (Q4_K / Q6_K) 2-D linears retain wire bytes with no f32 data, so
     // without an in-place CPU dot they have no CPU consumer. Dispatch them to the
-    // bit-exact block-dot kernels (gated; a Q4_K_M model mixes both quants).
-    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+    // bit-exact block-dot kernels (a Q4_K_M model mixes both quants). The env flag
+    // may only express a kernel preference, never disable the sole consumer --
+    // see `kquant_block_dot_selected`.
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_width % Q6_K_VALUES_PER_BLOCK == 0
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) && weight.q2_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q2_k_block_dot(input, weight, name);
         }
@@ -9968,7 +9999,14 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
             return iq4_xs_block_dot_core(input, wire, output_width, input_width, name);
         }
     }
-    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+    // Prism packed low-bit: wire-only, and on 128/64-element blocks rather than
+    // the 256-element K-quant modulus, so it is not gated on that check.
+    if let (Some(wire), Some(tensor_type)) = (weight.prism_wire_bytes, weight.source_type) {
+        return prism_block_dot_core(input, wire, output_width, input_width, tensor_type, name);
+    }
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_width % Q6_K_VALUES_PER_BLOCK == 0
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) {
             if let Some(wire) = weight.q2_k_wire_bytes {
                 return q2_k_block_dot_core(input, wire, output_width, input_width, name);
@@ -16828,6 +16866,26 @@ fn q8_owner_avx512vnni_available() -> bool {
     false
 }
 
+/// Whether the *folded* 512-bit K-quant inner can run on this CPU. It reaches
+/// for `vpmaddubsw`/`vpmaddwd` instead of `vpdpbusd`, so it needs no VNNI —
+/// which brings in the AVX-512 parts that have none (Skylake-SP/X and Cannon
+/// Lake; Cascade Lake onwards do carry VNNI). Those fall all the way back to
+/// the AVX2 inner today.
+#[cfg(target_arch = "x86_64")]
+fn q8_owner_avx512bw_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx2")
+}
+// Unlike its two neighbours, every non-test caller of this one is arch-gated
+// (the `use_a512fold` binding), so off x86_64 the stub is live only for the
+// parity test — which is NOT arch-gated and needs it to state its expectations.
+#[cfg(not(target_arch = "x86_64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn q8_owner_avx512bw_available() -> bool {
+    false
+}
+
 /// Whether the 256-bit AVX-VNNI owner microkernel can run on this CPU. `vpdpbusd`
 /// without AVX-512 is the whole consumer Intel line from Alder Lake onwards.
 #[cfg(target_arch = "x86_64")]
@@ -19789,6 +19847,210 @@ fn accumulate_transposed_linear_row_tq2_0(input_row: &[f32], wire: &[u8], output
     });
 }
 
+/// `(elements_per_block, bytes_per_block)` for the Prism packed low-bit family.
+///
+/// `Pq2_0` (GGUF type id 142) is wire-identical to the legacy g128 layout — it
+/// exists only so Prism's packed Q2 can coexist with upstream's type-42 g64 —
+/// so it shares g128's geometry here and everywhere downstream.
+fn prism_block_geometry(tensor_type: GgufTensorType) -> Option<(usize, usize)> {
+    match tensor_type {
+        GgufTensorType::Q1_0 => Some((Q1_0_BLOCK_ELEMENTS, Q1_0_BLOCK_BYTES)),
+        GgufTensorType::Q2_0G64 => Some((Q2_0_G64_BLOCK_ELEMENTS, Q2_0_G64_BLOCK_BYTES)),
+        GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+            Some((Q2_0_G128_BLOCK_ELEMENTS, Q2_0_G128_BLOCK_BYTES))
+        }
+        _ => None,
+    }
+}
+
+/// The packed wire bytes for a weight, if it is one of the Prism low-bit types.
+///
+/// Deliberately NARROWER than [`CpuTensor::low_bit_wire`], which also answers for
+/// TQ2_0: that type has its own 256-element / 66-byte kernel and completely
+/// different block math, so it must never be routed here by a shared accessor.
+fn prism_wire_of(weight: &CpuTensor) -> Option<(&[u8], GgufTensorType)> {
+    let tensor_type = weight.source_type?;
+    prism_block_geometry(tensor_type)?;
+    Some((weight.low_bit_wire()?, tensor_type))
+}
+
+/// Dot ONE packed Prism weight row against one f32 activation row.
+///
+/// The weight values are reconstructed exactly as `decode_q1_0_tensor` and
+/// `decode_q2_0_tensor` reconstruct them, and multiplied into the activation in
+/// element order:
+///
+/// * Q1_0 decodes to `{-d, +d}` per sign bit. The negative branch uses a
+///   precomputed `neg_d = -d` rather than `-1.0 * d` so a ZERO scale keeps the
+///   sign of zero the pin specifies (`+0.0` set, `-0.0` clear).
+/// * Q2_0 / PQ2_0 decode to `(q - 1) * d` over `q in {0,1,2,3}`, giving
+///   `{-d, 0, +d, +2d}`.
+///
+/// The per-element multiply is deliberate: factoring `d` out of a block sum
+/// (`d * sum(a)`) would be faster but is NOT the same float, and it would break
+/// the invariant the unit tests pin — that this kernel is bit-identical to
+/// `decode_*_tensor` followed by a scalar dot. The `(coef * d) * a` grouping
+/// matters for the same reason and must not be reassociated.
+fn prism_row_dot(w_row: &[u8], act: &[f32], tensor_type: GgufTensorType) -> f32 {
+    let mut acc = 0f32;
+    match tensor_type {
+        GgufTensorType::Q1_0 => {
+            for (block, chunk) in w_row
+                .chunks_exact(Q1_0_BLOCK_BYTES)
+                .zip(act.chunks(Q1_0_BLOCK_ELEMENTS))
+            {
+                let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let neg_d = -d;
+                let qs = &block[2..Q1_0_BLOCK_BYTES];
+                for (j, &a) in chunk.iter().enumerate() {
+                    let bit = (qs[j / 8] >> (j % 8)) & 1;
+                    acc += (if bit == 1 { d } else { neg_d }) * a;
+                }
+            }
+        }
+        GgufTensorType::Q2_0G64 | GgufTensorType::Q2_0G128 | GgufTensorType::Pq2_0 => {
+            let (block_elements, block_bytes) = match prism_block_geometry(tensor_type) {
+                Some(geometry) => geometry,
+                None => return 0.0,
+            };
+            for (block, chunk) in w_row
+                .chunks_exact(block_bytes)
+                .zip(act.chunks(block_elements))
+            {
+                let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let qs = &block[2..];
+                for (j, &a) in chunk.iter().enumerate() {
+                    let q = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+                    acc += ((i32::from(q) - 1) as f32 * d) * a;
+                }
+            }
+        }
+        _ => {}
+    }
+    acc
+}
+
+/// Shared core for the streaming Prism linear: every output row dots its own
+/// packed wire row against the activations, rayon-parallel over the output
+/// dimension. Takes the contraction width from the input and the output width
+/// from the caller, so a GGUF `[in, out]` weight (GQA k/v projections) works
+/// unchanged — the same layout-agnostic contract the K-quant cores use.
+fn prism_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    tensor_type: GgufTensorType,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    let (block_elements, block_bytes) = prism_block_geometry(tensor_type).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!(
+            "Prism block-dot received non-Prism tensor type {tensor_type:?}"
+        ))
+    })?;
+    if !in_dim.is_multiple_of(block_elements) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "{tensor_type:?} block-dot requires in_dim multiple of {block_elements}, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / block_elements) * block_bytes;
+    if wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{tensor_type:?} weight wire length {} != out_dim {out_dim} * {row_bytes}",
+            wire.len()
+        )));
+    }
+    let n_rows = input.dim(0)?;
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            (0..n_rows)
+                .map(|r| {
+                    prism_row_dot(
+                        w_row,
+                        &input.data[r * in_dim..(r + 1) * in_dim],
+                        tensor_type,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+/// Streaming CPU linear for the Prism packed low-bit family (Q1_0, Q2_0 g64/g128,
+/// PQ2_0). These tensors are loaded wire-only with EMPTY f32 data, so without this
+/// kernel they have no CPU consumer at all — the exact gap that made every Bonsai
+/// row fail its first forward whenever the resident GPU lane was not driving decode.
+/// Mirrors [`matmul_rhs_transposed_tq2_0_block_dot`].
+fn matmul_rhs_transposed_prism_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let (wire, tensor_type) = prism_wire_of(weight).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Prism weight missing wire bytes".to_string())
+    })?;
+    let (block_elements, block_bytes) = prism_block_geometry(tensor_type).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!(
+            "Prism block-dot received non-Prism tensor type {tensor_type:?}"
+        ))
+    })?;
+    let in_dim = input.dim(1)?;
+    if !in_dim.is_multiple_of(block_elements) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "{tensor_type:?} block-dot requires in_dim multiple of {block_elements}, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / block_elements) * block_bytes;
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{tensor_type:?} weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    // Output width comes from the WIRE LENGTH, never from `weight.dim(0)`: Bonsai's
+    // tied embed/lm_head is a GGUF `[in, out]` tensor ([2560, 151669]), so dim(0) is
+    // the contraction width, not the output width. Same layout-agnostic contract the
+    // K-quant and IQ4_XS cores use — reading dim(0) here made the real 4B rows fail
+    // their first forward with a wire-length mismatch.
+    let out_dim = wire.len() / row_bytes;
+    prism_block_dot_core(input, wire, out_dim, in_dim, tensor_type, name)
+}
+
+/// Single-row (decode) variant of the streaming Prism linear. Mirrors
+/// [`accumulate_transposed_linear_row_tq2_0`].
+fn accumulate_transposed_linear_row_prism(
+    input_row: &[f32],
+    wire: &[u8],
+    tensor_type: GgufTensorType,
+    output: &mut [f32],
+) {
+    use rayon::prelude::*;
+    let Some((block_elements, block_bytes)) = prism_block_geometry(tensor_type) else {
+        return;
+    };
+    if !input_row.len().is_multiple_of(block_elements) {
+        return;
+    }
+    let row_bytes = (input_row.len() / block_elements) * block_bytes;
+    if wire.len() < output.len() * row_bytes {
+        return;
+    }
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = prism_row_dot(w_row, input_row, tensor_type);
+    });
+}
+
 /// Per-input-row Q4_K accumulate: quantise the row to Q8_K, dot against each
 /// output row's Q4_K wire super-blocks via the bit-exact kernel (rayon over the
 /// output dimension). Mirrors [`accumulate_transposed_linear_row_tq2_0`].
@@ -19895,6 +20157,23 @@ fn matmul_rhs_transposed_q6_k_block_dot(
 /// `q6_k_wire_row_dot`). Windows greedy parity is proven vs llama.cpp acd79d6
 /// (K-quant conductor Phase 2); Linux/macOS f32-near-tie parity confirmation is a
 /// documented follow-up.
+/// Whether the K-quant streaming block-dot must run for this weight.
+///
+/// `CAMELID_X86_Q4K_DECODE=0` expresses a PREFERENCE between CPU kernels. It cannot
+/// mean "materialize f32 instead", because for a 2-D K-quant linear nothing ever
+/// materializes it: `load_kquant_wire_linear` retains wire bytes and leaves `data`
+/// EMPTY (an 8B model decoded to f32 is ~32 GB). So when the weight carries no f32
+/// data the block-dot is the only consumer and the flag must not be able to turn it
+/// off -- exactly the rule the IQ4_XS dispatch above already states for itself.
+///
+/// Before this guard, `CAMELID_X86_Q4K_DECODE=0` made EVERY K-quant model fail its
+/// first forward on CPU with `matmul rhs-transposed rhs cannot read tensor ... as
+/// row-major f32: storage=no-row-major-data, data_len=0` -- the same defect as the
+/// Prism lane's, reachable through an env var instead of a target triple.
+fn kquant_block_dot_selected(weight_has_f32_data: bool) -> bool {
+    q4_k_cpu_block_dot_enabled() || !weight_has_f32_data
+}
+
 pub(crate) fn q4_k_cpu_block_dot_enabled() -> bool {
     // Read once per process (non-test): this predicate runs per projection
     // call on the decode hot loop, and env reads allocate on Windows.
@@ -20178,6 +20457,35 @@ fn q4_k_repack8_for_weight(
         .clone()
 }
 
+/// The legacy `dpbusd` AVX-512 inner, default OFF: the folded inner
+/// ([`q4_k_owner_weight_row_block_avx512fold`]) carries the group scale inside
+/// its widening `madd_epi16` and measured faster at both shapes tried —
+/// 1.297x at in_dim 2048 and 1.173x at 8192 in isolation, on an i7-11800H
+/// (7/7 paired rounds at both shapes, worst round 1.155x). Retained behind
+/// `CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI=1` because that comparison has
+/// only been made on one microarchitecture — Sapphire Rapids (two FMA ports)
+/// and Zen 4/5 (double-pumped 512-bit) can rebalance `dpbusd` against
+/// `maddubs`. Dispatch is bit-identical either way. Resolved once like its
+/// siblings, with the same bypass so an A/B sweep is not pinned to whichever
+/// arm ran first.
+#[cfg(target_arch = "x86_64")]
+fn x86_kquant_matmul_owner_avx512vnni_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI")
+    }
+    #[cfg(not(test))]
+    {
+        if q8_runtime::bench_uncached_runtime_plan() {
+            return q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI");
+        }
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI")
+        })
+    }
+}
+
 /// AVX-512 VNNI inner for the K-quant owner: default ON whenever the owner is
 /// on (the GEMM4 split-flag-trap lesson) and the CPU has the features; runtime
 /// dispatch stays bit-identical either way (exact integers, associative).
@@ -20198,6 +20506,32 @@ fn x86_kquant_matmul_owner_vnni_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI")
+        })
+    }
+}
+
+/// The 256-bit `vpdpbusd` inner, default OFF: the AVX2 inner carries the group
+/// scale inside its widening `madd_epi16`, and measured faster than
+/// `vpdpbusd` + `mullo_epi32` at both shapes tried — 1.19x at in_dim 2048 and
+/// 1.17x at 8192 in isolation, 1.09x on 1B Q4_K_M prefill, on an i9-14900HX.
+/// Retained behind `CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256=1` because that
+/// comparison has only been made on one microarchitecture; dispatch is
+/// bit-identical either way. Resolved once like its siblings, with the same
+/// bypass so an A/B sweep is not pinned to whichever arm ran first.
+#[cfg(target_arch = "x86_64")]
+fn x86_kquant_matmul_owner_avxvnni256_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256")
+    }
+    #[cfg(not(test))]
+    {
+        if q8_runtime::bench_uncached_runtime_plan() {
+            return q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256");
+        }
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256")
         })
     }
 }
@@ -20441,14 +20775,115 @@ unsafe fn q4_k_owner_weight_row_block_avx512vnni(
     }
 }
 
+/// v7 inner: [`q4_k_owner_weight_row_block_avx512vnni`] with the group scale
+/// carried inside a widening `madd_epi16` instead of a separate `mullo_epi32`,
+/// and the mins side vectorised. Default over the `dpbusd` sibling; roll back
+/// with `CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI=1`.
+///
+/// Why it wins: `vpdpbusd` hands back i32, so scaling its result costs a 2-uop
+/// `vpmulld`, giving `dpbusd` + `mullo` + `add` = 4 uops per chunk. The folded
+/// form reduces AND scales in one 1-uop instruction — `vpmaddubsw` +
+/// `vpmaddwd` + `vpaddd` = 3. This is an identity, not an associativity
+/// argument: `madd(p, ones) * s` and `madd(p, s)` are both `s·p[2k] +
+/// s·p[2k+1]` in every lane, so no VNNI instruction is needed at all — hence
+/// the `avx512f,avx512bw` gate, which also reaches the AVX-512 parts that have
+/// no VNNI.
+///
+/// Lane correspondence (why the i16 scale vector lands where `svec` did):
+/// `wvec[j]` bytes `0..32` are the low nibbles (scale `sc[2j]`) and `32..64`
+/// the high nibbles (`sc[2j+1]`). `maddubs` maps bytes `0..32` to i16 lanes
+/// `0..16` and `32..64` to `16..32`; `madd` then maps i16 `0..16` to i32 lanes
+/// `0..8` and i16 `16..32` to i32 `8..16` — exactly the halves the existing
+/// `inserti64x4` split scaled, so the same split with i16 broadcasts is
+/// correct.
+///
+/// Bit-identity: every intermediate is exact integer. q8 lanes are in
+/// [-127, 127] (`quantize_q8_k_blocks` clamps, so -128 is unreachable) ⇒
+/// |maddubs pair| ≤ 2·15·127 = 3810, no i16 saturation (the raw instruction
+/// bound would be 3840 at q8 = -128); × the post-kmask 6-bit scale cap of 63
+/// and summed in pairs ⇒ |madd lane| ≤ 480,060 — the same per-lane value the
+/// `dpbusd` sibling's `mullo` produced; `vacc` over 4 adds ≤ 1.93M; the 16-lane
+/// reduce ≤ 30.8M ≈ 1.4% of `i32::MAX`. The mins side is smaller still: a group
+/// sum is ≤ 32·127 = 4064 and the total ≤ 2.05M, so the `i64` it used was never
+/// needed, and 2.05M < 2^24 keeps the `as f32` exact. The load-bearing f32
+/// chain is untouched, verbatim `q4_k_dot_arm` order.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q4_k_owner_weight_row_block_avx512fold(
+    w_row: &[u8],
+    superblocks: usize,
+    wd: &[f32],
+    wdmin: &[f32],
+    wscales: &[[u8; 8]],
+    wmins: &[[u8; 8]],
+    preps: &[(Vec<Q8KBlock>, Vec<[i32; 8]>)],
+    sumf_block: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let low_mask = _mm256_set1_epi8(0x0f);
+    for i in 0..superblocks {
+        let qs = &w_row[i * Q4_K_WIRE_BYTES_PER_BLOCK + 16..i * Q4_K_WIRE_BYTES_PER_BLOCK + 144];
+        // Hoist per row block: [low_j | high_j] zmm per chunk plus the matching
+        // [scale_2j x16 | scale_2j+1 x16] i16 lanes.
+        let mut wvec = [_mm512_setzero_si512(); 4];
+        let mut svec = [_mm512_setzero_si512(); 4];
+        let sc = &wscales[i];
+        for j in 0..4 {
+            let q4 = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+            let low = _mm256_and_si256(q4, low_mask);
+            let high = _mm256_and_si256(_mm256_srli_epi16(q4, 4), low_mask);
+            wvec[j] = _mm512_inserti64x4(_mm512_castsi256_si512(low), high, 1);
+            svec[j] = _mm512_inserti64x4(
+                _mm512_castsi256_si512(_mm256_set1_epi16(sc[2 * j] as i16)),
+                _mm256_set1_epi16(sc[2 * j + 1] as i16),
+                1,
+            );
+        }
+        // Mins are per (weight row, superblock), so the widen is hoisted too.
+        let minv = _mm256_cvtepu8_epi32(_mm_loadl_epi64(wmins[i].as_ptr() as *const __m128i));
+        for ((blocks, sums), sumf) in preps.iter().zip(sumf_block.iter_mut()) {
+            let y = &blocks[i];
+            let d = y.d * wd[i];
+            let dmin = y.d * wdmin[i];
+            // |group sum| ≤ 32·127 = 4064 and the min ≤ 63, so a lane is
+            // ≤ 256,032 and the total ≤ 2.05M — exact in i32 and in f32.
+            let sumv = _mm256_loadu_si256(sums[i].as_ptr() as *const __m256i);
+            let prod =
+                crate::diffusion_gemma::refmath::hsum_i32_8(_mm256_mullo_epi32(sumv, minv)) as i64;
+            *sumf = (-dmin).mul_add(prod as f32, *sumf);
+            let q8p = y.qs.as_ptr();
+            let mut vacc = _mm512_setzero_si512();
+            for j in 0..4 {
+                // One contiguous 64-byte activation load: [q8lo_j | q8hi_j].
+                let q = _mm512_loadu_si512(q8p.add(j * 64).cast());
+                let p = _mm512_madd_epi16(_mm512_maddubs_epi16(wvec[j], q), svec[j]);
+                vacc = _mm512_add_epi32(vacc, p);
+            }
+            // Exact-integer 16-lane reduce via the proven 8-lane hsum.
+            let lo = _mm512_castsi512_si256(vacc);
+            let hi = _mm512_extracti64x4_epi64(vacc, 1);
+            let main = crate::diffusion_gemma::refmath::hsum_i32_8(lo) as i64
+                + crate::diffusion_gemma::refmath::hsum_i32_8(hi) as i64;
+            *sumf = d.mul_add(main as f32, *sumf);
+        }
+    }
+}
+
 /// v6 inner: 256-bit AVX-VNNI sibling of
 /// [`q4_k_owner_weight_row_block_avx512vnni`], for the Alder-Lake-and-later
-/// consumer parts that carry `vpdpbusd` but have AVX-512 fused off — the whole
-/// 12th-gen-onwards Intel client line, which today falls all the way back to
-/// the AVX2 inner. Same algebra as the AVX-512 sibling with the zmm pair split
-/// into two ymm halves: the low nibbles pair with `y.qs[64j..64j+32]` and the
-/// high nibbles with `y.qs[64j+32..64j+64]`, exactly the halves the 64-byte
-/// zmm load covers, so the operand pairing is unchanged.
+/// consumer parts that carry `vpdpbusd` but have AVX-512 fused off. Same
+/// algebra as the AVX-512 sibling with the zmm pair split into two ymm halves:
+/// the low nibbles pair with `y.qs[64j..64j+32]` and the high nibbles with
+/// `y.qs[64j+32..64j+64]`, exactly the halves the 64-byte zmm load covers, so
+/// the operand pairing is unchanged.
+///
+/// Opt-in via `CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256=1`: `vpdpbusd`
+/// returns i32, so the group scale needs a 2-uop `mullo_epi32`, whereas the
+/// AVX2 inner folds the same scale into a widening `madd_epi16` for free and
+/// measured faster here. Kept because that was measured on one
+/// microarchitecture only.
 ///
 /// Bit-identity: every intermediate is exact integer. A `dpbusd` lane is a quad
 /// sum ≤ 4·15·127 = 7620; ×63 scale ≤ 480,060; `vacc` takes 8 adds (4 chunks ×
@@ -20520,12 +20955,19 @@ unsafe fn q4_k_owner_weight_row_block_avxvnni(
 /// q8 lanes are in [-127, 127] (`quantize_q8_k_blocks` uses iscale = -127/max
 /// plus a .min(127) clamp, so -128 is unreachable) ⇒ |maddubs pair| ≤ 2·15·127
 /// = 3810, no i16 saturation (the raw instruction bound would be 3840 at
-/// q8 = -128); madd lane ≤ 7620; × the post-kmask 6-bit scale cap of 63 ⇒
-/// ≤ 480,060; vacc lane over 8 adds ≤ 3.85M; hsum ≤ 30.8M ≈ 1.4% of i32::MAX.
-/// Integer addition is associative, so the per-cell total equals the
-/// per-chunk-hsum path bit for bit. The f32 chain per cell is verbatim
+/// q8 = -128); × the post-kmask 6-bit scale cap of 63 and summed in pairs ⇒
+/// |madd lane| ≤ 480,060; vacc lane over 8 adds ≤ 3.85M; hsum ≤ 30.8M ≈ 1.4%
+/// of i32::MAX. Integer addition is associative, so the per-cell total equals
+/// the per-chunk-hsum path bit for bit. The f32 chain per cell is verbatim
 /// `q4_k_dot_arm` order: per superblock mins-side `(-dmin).mul_add` then
 /// main-side `d.mul_add`, ascending superblocks (i outer, row inner).
+///
+/// The group scale rides in the widening `madd_epi16` instead of a separate
+/// `mullo_epi32`, which is what makes this inner beat `vpdpbusd`: that
+/// instruction hands back i32, so scaling it costs a 2-uop `mullo_epi32`,
+/// while `madd_epi16` reduces AND scales in one 1-uop instruction. This is an
+/// identity, not an associativity argument — `madd(p, ones) * s` and
+/// `madd(p, s)` are both `s·p[2k] + s·p[2k+1]` in every lane.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
@@ -20541,42 +20983,40 @@ unsafe fn q4_k_owner_weight_row_block_avx2(
 ) {
     use std::arch::x86_64::*;
     let low_mask = _mm256_set1_epi8(0x0f);
-    let ones16 = _mm256_set1_epi16(1);
     for i in 0..superblocks {
         let qs = &w_row[i * Q4_K_WIRE_BYTES_PER_BLOCK + 16..i * Q4_K_WIRE_BYTES_PER_BLOCK + 144];
         let mut low = [_mm256_setzero_si256(); 4];
         let mut high = [_mm256_setzero_si256(); 4];
+        let mut slo = [_mm256_setzero_si256(); 4];
+        let mut shi = [_mm256_setzero_si256(); 4];
+        let sc = &wscales[i];
         for j in 0..4 {
             let q4 = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
             low[j] = _mm256_and_si256(q4, low_mask);
             high[j] = _mm256_and_si256(_mm256_srli_epi16(q4, 4), low_mask);
+            slo[j] = _mm256_set1_epi16(sc[2 * j] as i16);
+            shi[j] = _mm256_set1_epi16(sc[2 * j + 1] as i16);
         }
-        let sc = &wscales[i];
-        let mins = &wmins[i];
+        // Mins are per (weight row, superblock), so the widen is hoisted too.
+        let minv = _mm256_cvtepu8_epi32(_mm_loadl_epi64(wmins[i].as_ptr() as *const __m128i));
         for ((blocks, sums), sumf) in preps.iter().zip(sumf_block.iter_mut()) {
             let y = &blocks[i];
             let d = y.d * wd[i];
             let dmin = y.d * wdmin[i];
-            let mut prod: i64 = 0;
-            for g in 0..8 {
-                prod += sums[i][g] as i64 * mins[g] as i64;
-            }
+            // |group sum| ≤ 32·127 = 4064 and the scale ≤ 63, so a lane is
+            // ≤ 256,032 and the total ≤ 2.05M — exact in i32 and in f32.
+            let sumv = _mm256_loadu_si256(sums[i].as_ptr() as *const __m256i);
+            let prod =
+                crate::diffusion_gemma::refmath::hsum_i32_8(_mm256_mullo_epi32(sumv, minv)) as i64;
             *sumf = (-dmin).mul_add(prod as f32, *sumf);
             let q8p = y.qs.as_ptr();
             let mut vacc = _mm256_setzero_si256();
             for j in 0..4 {
                 let q8lo = _mm256_loadu_si256(q8p.add(j * 64) as *const __m256i);
                 let q8hi = _mm256_loadu_si256(q8p.add(j * 64 + 32) as *const __m256i);
-                let slo = _mm256_madd_epi16(_mm256_maddubs_epi16(low[j], q8lo), ones16);
-                let shi = _mm256_madd_epi16(_mm256_maddubs_epi16(high[j], q8hi), ones16);
-                vacc = _mm256_add_epi32(
-                    vacc,
-                    _mm256_mullo_epi32(slo, _mm256_set1_epi32(sc[2 * j] as i32)),
-                );
-                vacc = _mm256_add_epi32(
-                    vacc,
-                    _mm256_mullo_epi32(shi, _mm256_set1_epi32(sc[2 * j + 1] as i32)),
-                );
+                let plo = _mm256_madd_epi16(_mm256_maddubs_epi16(low[j], q8lo), slo[j]);
+                let phi = _mm256_madd_epi16(_mm256_maddubs_epi16(high[j], q8hi), shi[j]);
+                vacc = _mm256_add_epi32(vacc, _mm256_add_epi32(plo, phi));
             }
             let main = crate::diffusion_gemma::refmath::hsum_i32_8(vacc) as i64;
             *sumf = d.mul_add(main as f32, *sumf);
@@ -20616,15 +21056,34 @@ fn q4_k_owner_prefill_tiled(
     let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
+    // "The 512-bit VNNI kernels are usable on this host." The 8-row repack
+    // group kernel keys off THIS, not off which single-row inner is selected —
+    // it is a different kernel with its own algebra (its `mullo` is already
+    // amortized across four accumulating `dpbusd`s and its mins side is already
+    // vectorised), so the fold below neither applies to it nor gates it.
+    // (x86_64 only: every reader of it is behind the same cfg.)
     #[cfg(target_arch = "x86_64")]
-    let use_vnni = x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512vnni_available();
+    let avx512vnni_host = x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512vnni_available();
+    // The legacy `dpbusd` single-row inner, now opt-in — see the flag's doc comment.
+    #[cfg(target_arch = "x86_64")]
+    let use_vnni = avx512vnni_host && x86_kquant_matmul_owner_avx512vnni_enabled();
     #[cfg(not(target_arch = "x86_64"))]
     let use_vnni = false;
-    // 256-bit vpdpbusd: same instruction, no AVX-512. Only consulted when the
-    // 512-bit path is unavailable, so an AVX-512 host is completely unaffected.
+    // Folded 512-bit inner: the default whenever the host has avx512f+bw, which
+    // is a strictly wider set than the `dpbusd` sibling's (no VNNI required).
+    #[cfg(target_arch = "x86_64")]
+    let use_a512fold =
+        !use_vnni && x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512bw_available();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_a512fold = false;
+    // 256-bit vpdpbusd: same instruction, no AVX-512. Only consulted when both
+    // 512-bit paths are unavailable — so an AVX-512 host never reaches it — and
+    // itself opt-in since #617; see that flag's doc comment.
     #[cfg(target_arch = "x86_64")]
     let use_avxvnni = !use_vnni
+        && !use_a512fold
         && x86_kquant_matmul_owner_vnni_enabled()
+        && x86_kquant_matmul_owner_avxvnni256_enabled()
         && std::arch::is_x86_feature_detected!("avxvnni")
         && std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
@@ -20633,6 +21092,9 @@ fn q4_k_owner_prefill_tiled(
     // silently measures the AVX2 inner (vacuous comparison).
     if use_vnni {
         Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if use_a512fold {
+        Q8_SCHED_KQUANT_OWNER_AVX512FOLD_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if use_avxvnni {
         Q8_SCHED_KQUANT_OWNER_AVXVNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -20672,7 +21134,7 @@ fn q4_k_owner_prefill_tiled(
     // below — bit-identical either way.
     #[cfg(target_arch = "x86_64")]
     if let Some(pack) = repack8 {
-        if use_vnni && pack.superblocks_per_row == superblocks && pack.rows <= out_dim {
+        if avx512vnni_host && pack.superblocks_per_row == superblocks && pack.rows <= out_dim {
             Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let groups = pack.rows / 8;
             const GROUPS_PER_TASK: usize = 4; // 32 output rows per task, as below
@@ -20798,6 +21260,21 @@ fn q4_k_owner_prefill_tiled(
                             &mut sumf_block[..block_rows],
                         );
                     }
+                } else if use_a512fold {
+                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: avx512f/bw + avx2 confirmed present at dispatch.
+                    unsafe {
+                        q4_k_owner_weight_row_block_avx512fold(
+                            w_row,
+                            superblocks,
+                            &wd,
+                            &wdmin,
+                            &wscales,
+                            &wmins,
+                            &preps[row_start..row_end],
+                            &mut sumf_block[..block_rows],
+                        );
+                    }
                 } else if use_avxvnni {
                     #[cfg(target_arch = "x86_64")]
                     // SAFETY: avx2 + avxvnni confirmed present at dispatch.
@@ -20891,9 +21368,47 @@ fn q6_k_owner_rebuild_superblock(block: &[u8], a: &mut [i8; Q6_K_VALUES_PER_BLOC
     }
 }
 
+/// `shuffle_epi8` control that reorders one 16-value scale group so the two
+/// values sharing an `aux32` lane become adjacent: `dst[2m] = src[m]`,
+/// `dst[2m + 1] = src[m + 8]`. A scale group is exactly one 128-bit lane, so
+/// broadcasting these 16 bytes covers both halves of a 32-byte load.
+#[cfg(target_arch = "x86_64")]
+const Q6_K_OWNER_PAIR_PERM: [i8; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+
+/// Q6_K's reference unpack shifts each 6-bit code by `-32`. `maddubs` needs an
+/// unsigned operand, so the kernel adds that shift back and then removes it
+/// again from the activation pair sums.
+#[cfg(target_arch = "x86_64")]
+const Q6_K_OWNER_ZERO_POINT: i8 = 32;
+#[cfg(target_arch = "x86_64")]
+const Q6_K_OWNER_ZERO_POINT_SHIFT: i32 = 5;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(Q6_K_OWNER_ZERO_POINT as i32 == 1 << Q6_K_OWNER_ZERO_POINT_SHIFT);
+
 /// Q6_K integer lane dot over a pre-rebuilt superblock: the exact integers of
-/// [`q6_k_wire_row_dot`]'s `aux32` loop (associative — lane/order free), AVX2
-/// body lifted from the in-tree bit-identical `q6_k_wire_row_dot_avx2`.
+/// [`q6_k_wire_row_dot`]'s `aux32` loop (associative — lane/order free), so
+/// this is bit-identical to [`q6_k_owner_aux32_scalar`] and to the per-cell
+/// path by construction.
+///
+/// Two 16-value scale groups per iteration through one `maddubs`, against the
+/// previous kernel's one group per 128-bit load widened to i16. Both operands
+/// are shuffled into pair order in-register, so a `maddubs` pair sum IS one
+/// `aux32` lane's contribution for that group. The stored weight layout is
+/// deliberately left alone: pre-permuting it would save the shuffle here but
+/// turns the scalar twin's contiguous reads into strided ones, which measured
+/// 3.5x slower — and the scalar twin is the only path on non-x86 targets.
+///
+/// The zero point is added back rather than folded with `sign_epi8`. The sign
+/// form is marginally faster and is silently wrong at an activation byte of
+/// `-128`, because negating `-128` wraps; `quantize_q8_k_blocks` cannot emit
+/// that today, but the per-cell path this must match does not depend on it and
+/// neither should this.
+///
+/// Exact-integer envelope, all well inside i16 before the widen: `a + 32` is
+/// `0..=63` and `|q8| ≤ 128`, so a `maddubs` pair is ≤ 16,128 in absolute
+/// value; the zero-point term `32·(q8_lo + q8_hi)` is ≤ 8,192; their difference
+/// is ≤ 24,320 < `i16::MAX`. After the widen a lane value is `|a·q8| ≤ 4064`
+/// per pair member, × `|scale| ≤ 128` over 16 groups ⇒ ≤ 16.6M ≪ `i32::MAX`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn q6_k_owner_aux32_avx2(
@@ -20902,24 +21417,43 @@ unsafe fn q6_k_owner_aux32_avx2(
     q8: &[i8; Q6_K_VALUES_PER_BLOCK],
 ) -> [i32; 8] {
     use std::arch::x86_64::*;
+    let perm = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+        Q6_K_OWNER_PAIR_PERM.as_ptr() as *const __m128i
+    ));
+    let ones = _mm256_set1_epi8(1);
+    let zero_point = _mm256_set1_epi8(Q6_K_OWNER_ZERO_POINT);
     let mut acc = _mm256_setzero_si256();
-    let aptr = a.as_ptr();
-    let qptr = q8.as_ptr();
-    for (j, &scale) in scales.iter().enumerate().take(16) {
-        let off = j * 16;
-        let a16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(aptr.add(off) as *const __m128i));
-        let q16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(qptr.add(off) as *const __m128i));
-        // 16 i16 products (exact, fit i16); low 128 = products[0..8], high = [8..16]
-        let prod = _mm256_mullo_epi16(a16, q16);
-        let pair = _mm_add_epi16(
-            _mm256_castsi256_si128(prod),
-            _mm256_extracti128_si256(prod, 1),
-        ); // 8 i16 = prod[l] + prod[l+8]
-        let scaled = _mm256_mullo_epi32(
-            _mm256_cvtepi16_epi32(pair),
-            _mm256_set1_epi32(scale as i8 as i32),
+    for group_pair in 0..8 {
+        let off = group_pair * 32;
+        let q = _mm256_shuffle_epi8(
+            _mm256_loadu_si256(q8.as_ptr().add(off) as *const __m256i),
+            perm,
         );
-        acc = _mm256_add_epi32(acc, scaled);
+        // The rebuild leaves `a` in [-32, 31], so this lands in [0, 63].
+        let au = _mm256_add_epi8(
+            _mm256_shuffle_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(off) as *const __m256i),
+                perm,
+            ),
+            zero_point,
+        );
+        let lanes = _mm256_sub_epi16(
+            _mm256_maddubs_epi16(au, q),
+            _mm256_slli_epi16(_mm256_maddubs_epi16(ones, q), Q6_K_OWNER_ZERO_POINT_SHIFT),
+        );
+        let lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(lanes));
+        let hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(lanes, 1));
+        acc = _mm256_add_epi32(
+            acc,
+            _mm256_mullo_epi32(lo, _mm256_set1_epi32(scales[2 * group_pair] as i8 as i32)),
+        );
+        acc = _mm256_add_epi32(
+            acc,
+            _mm256_mullo_epi32(
+                hi,
+                _mm256_set1_epi32(scales[2 * group_pair + 1] as i8 as i32),
+            ),
+        );
     }
     let mut aux32 = [0i32; 8];
     _mm256_storeu_si256(aux32.as_mut_ptr() as *mut __m256i, acc);
@@ -23743,10 +24277,17 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
             return;
         }
     }
+    // Prism packed low-bit: wire-only, so this is the decode-path consumer.
+    if let (Some(wire), Some(tensor_type)) = (weight.prism_wire_bytes, weight.source_type) {
+        accumulate_transposed_linear_row_prism(input_row, wire, tensor_type, output);
+        return;
+    }
     // K-quant (Q4_K / Q6_K) wire weights: no f32 data to accumulate, so dot the
     // retained wire blocks in place. This is the universal funnel for the
     // accumulate-based (descriptor/borrowed) matmul layouts.
-    if q4_k_cpu_block_dot_enabled() && input_row.len().is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
+    if kquant_block_dot_selected(!weight.data.is_empty())
+        && input_row.len().is_multiple_of(Q6_K_VALUES_PER_BLOCK)
+    {
         if weight.source_type == Some(GgufTensorType::Q2K) {
             if let Some(wire) = weight.q2_k_wire_bytes {
                 accumulate_transposed_linear_row_q2_k(input_row, wire, output);

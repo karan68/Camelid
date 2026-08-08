@@ -257,19 +257,23 @@ assert.equal(isExactCompatibilityHint(genericExactRowHint), true, 'generic row-i
 assert.equal(isCompatibilitySupportedForModel(genericExactRowFixture, { id: 'custom-exact-row-q8-0', quant: 'Q8_0' }), true, 'supported generic exact rows should unlock only through the exact row id and quant evidence')
 assert.equal(isCompatibilitySupportedForModel(genericExactRowFixture, { id: 'custom-exact-row-q4-0', quant: 'Q4_0' }), false, 'generic exact rows should not unlock neighboring quantized filenames')
 
+// The family column mirrors the real contract, which is NOT uniform: the 4B/8B
+// GGUFs declare `general.architecture=qwen3` and only the 27B pair declares
+// `qwen35`. The Supported lane is derived from id/filename/quant, so family is
+// incidental here — it is kept accurate so the fixture cannot teach the wrong shape.
 const prismCatalogRows = [
-  ['bonsai_4b_q1_0', 'Bonsai-4B-Q1_0.gguf', 'Q1_0'],
-  ['ternary_bonsai_4b_q2_0', 'Ternary-Bonsai-4B-Q2_0.gguf', 'Q2_0'],
-  ['ternary_bonsai_4b_pq2_0', 'Ternary-Bonsai-4B-PQ2_0.gguf', 'PQ2_0'],
-  ['bonsai_8b_q1_0', 'Bonsai-8B-Q1_0.gguf', 'Q1_0'],
-  ['ternary_bonsai_8b_q2_0', 'Ternary-Bonsai-8B-Q2_0.gguf', 'Q2_0'],
-  ['bonsai_27b_q1_0', 'Bonsai-27B-Q1_0.gguf', 'Q1_0'],
-  ['ternary_bonsai_27b_q2_0', 'Ternary-Bonsai-27B-Q2_0.gguf', 'Q2_0'],
+  ['bonsai_4b_q1_0', 'Bonsai-4B-Q1_0.gguf', 'Q1_0', 'qwen3_bonsai_gpu'],
+  ['ternary_bonsai_4b_q2_0', 'Ternary-Bonsai-4B-Q2_0.gguf', 'Q2_0', 'qwen3_bonsai_gpu'],
+  ['ternary_bonsai_4b_pq2_0', 'Ternary-Bonsai-4B-PQ2_0.gguf', 'PQ2_0', 'qwen3_bonsai_gpu'],
+  ['bonsai_8b_q1_0', 'Bonsai-8B-Q1_0.gguf', 'Q1_0', 'qwen3_bonsai_gpu'],
+  ['ternary_bonsai_8b_q2_0', 'Ternary-Bonsai-8B-Q2_0.gguf', 'Q2_0', 'qwen3_bonsai_gpu'],
+  ['bonsai_27b_q1_0', 'Bonsai-27B-Q1_0.gguf', 'Q1_0', 'qwen35_bonsai_gpu_vision'],
+  ['ternary_bonsai_27b_q2_0', 'Ternary-Bonsai-27B-Q2_0.gguf', 'Q2_0', 'qwen35_bonsai_gpu_vision'],
 ]
 const prismCapabilityFixture = {
-  model_compatibility: prismCatalogRows.map(([id, filename, quantization]) => ({
+  model_compatibility: prismCatalogRows.map(([id, filename, quantization, family]) => ({
     id,
-    family: 'qwen35_bonsai_gpu',
+    family,
     quantization,
     status: 'supported_exact_row_smoke',
     frontend_readiness_gate: `green only for ${filename} on a checked Metal or Windows CUDA lane`,

@@ -823,6 +823,28 @@ fn route_mode(raw: &str) -> anyhow::Result<camelid::fabric::RouteMode> {
     }
 }
 
+/// Resolve the token the fabric authenticates to its nodes with.
+///
+/// Deliberately not `#[arg(env = "CAMELID_API_KEY")]`: clap prints an env var's
+/// current value in `--help`, which would put the token on the terminal.
+fn fabric_bearer(flag: Option<String>) -> Option<String> {
+    resolve_bearer(flag, std::env::var("CAMELID_API_KEY").ok())
+}
+
+/// Choose between an explicit flag and the environment. Pure, so the precedence
+/// is tested without a process-wide variable.
+///
+/// The flag wins; otherwise `CAMELID_API_KEY`, the same variable the server
+/// reads its own key from, so a shell configured for one node needs no second
+/// setting. Trimmed and emptiness-checked the way the server treats its own key,
+/// so a value that arrived with a trailing newline still matches, and an empty
+/// one reads as "no token" rather than becoming a bare `Bearer `.
+fn resolve_bearer(flag: Option<String>, from_env: Option<String>) -> Option<String> {
+    flag.or(from_env)
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 /// Actions over a fabric of independent Camelid nodes.
 ///
 /// A fabric places whole requests on nodes that each own a complete model and
@@ -836,6 +858,11 @@ enum FabricAction {
         /// A node, as `LABEL=HOST[:PORT]`. Repeat for each node.
         #[arg(long = "node", required = true, value_name = "LABEL=HOST[:PORT]")]
         nodes: Vec<String>,
+        /// Bearer token for nodes started with an API key. Falls back to
+        /// CAMELID_API_KEY. Prefer the variable on a shared machine, so the
+        /// secret is not in the process command line.
+        #[arg(long, value_name = "TOKEN")]
+        bearer: Option<String>,
         /// Per-node probe budget. Nodes are probed concurrently, so this bounds
         /// the whole command, not each node in turn.
         #[arg(long, default_value_t = 2000)]
@@ -860,6 +887,10 @@ enum FabricAction {
         /// Label of the node that served this session previously.
         #[arg(long)]
         sticky: Option<String>,
+        /// Bearer token for nodes started with an API key. Falls back to
+        /// CAMELID_API_KEY.
+        #[arg(long, value_name = "TOKEN")]
+        bearer: Option<String>,
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
         #[arg(long)]
@@ -883,6 +914,11 @@ enum FabricAction {
         model: Option<String>,
         #[arg(long)]
         sticky: Option<String>,
+        /// Bearer token for nodes started with an API key. Falls back to
+        /// CAMELID_API_KEY. Without it, a node that requires a key observes as
+        /// ready and then answers this request with 401.
+        #[arg(long, value_name = "TOKEN")]
+        bearer: Option<String>,
         #[arg(long, default_value_t = 64)]
         max_tokens: u32,
         /// Per-node health probe budget.
@@ -929,6 +965,85 @@ enum FabricAction {
         )]
         allow_unauthenticated_remote: bool,
     },
+}
+
+#[cfg(test)]
+mod fabric_command_tests {
+    use super::*;
+
+    /// The parsed `Cli` is large enough to want more than a test thread's
+    /// default stack, the same reason `workspace_command_tests` does this.
+    fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("fabric-cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn fabric CLI parse test")
+            .join()
+            .expect("fabric CLI parse test panicked");
+    }
+
+    #[test]
+    fn an_explicit_flag_beats_the_environment() {
+        assert_eq!(
+            resolve_bearer(Some("from-flag".into()), Some("from-env".into())),
+            Some("from-flag".to_string())
+        );
+    }
+
+    #[test]
+    fn the_environment_is_the_fallback_not_the_only_source() {
+        assert_eq!(
+            resolve_bearer(None, Some("from-env".into())),
+            Some("from-env".to_string())
+        );
+        assert_eq!(resolve_bearer(None, None), None);
+    }
+
+    #[test]
+    fn a_token_is_trimmed_the_way_the_server_trims_its_own_key() {
+        // A key exported from a file commonly arrives with a trailing newline;
+        // sending that verbatim would never match the server's trimmed key.
+        assert_eq!(
+            resolve_bearer(None, Some("  s3cret\n".into())),
+            Some("s3cret".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_or_blank_token_reads_as_no_token() {
+        // `CAMELID_API_KEY=` is set-but-empty; treating it as a token would send
+        // a bare `Bearer ` that the server rejects for a confusing reason.
+        assert_eq!(resolve_bearer(None, Some(String::new())), None);
+        assert_eq!(resolve_bearer(None, Some("   ".into())), None);
+        assert_eq!(resolve_bearer(Some("  ".into()), None), None);
+    }
+
+    #[test]
+    fn every_fabric_subcommand_accepts_a_bearer() {
+        // `run` is the one that 401s without it, but `status` and `route` must
+        // take it too or they would keep predicting what `run` cannot do.
+        on_cli_test_stack(|| {
+            for argv in [
+                vec!["camelid", "fabric", "status"],
+                vec!["camelid", "fabric", "route"],
+                vec!["camelid", "fabric", "run", "--prompt", "hi"],
+            ] {
+                let mut argv = argv;
+                argv.extend(["--node", "a=127.0.0.1", "--bearer", "s3cret"]);
+                let cli = Cli::try_parse_from(&argv).expect("parses");
+                let bearer = match cli.command {
+                    Some(Command::Fabric { action }) => match action {
+                        FabricAction::Status { bearer, .. }
+                        | FabricAction::Route { bearer, .. }
+                        | FabricAction::Run { bearer, .. } => bearer,
+                    },
+                    other => panic!("expected a fabric command, got {other:?}"),
+                };
+                assert_eq!(bearer.as_deref(), Some("s3cret"), "{argv:?}");
+            }
+        });
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2405,13 +2520,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Fabric { action } => match action {
             FabricAction::Status {
                 nodes,
+                bearer,
                 timeout_ms,
                 json,
             } => {
+                let bearer = fabric_bearer(bearer);
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
-                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                    .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
                 if json {
                     println!("{}", serde_json::to_string_pretty(&snapshots)?);
@@ -2424,14 +2542,17 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 model,
                 sticky,
+                bearer,
                 timeout_ms,
                 json,
             } => {
+                let bearer = fabric_bearer(bearer);
                 let mode = route_mode(&mode)?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
-                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                    .with_bearer(bearer.as_deref());
                 let snapshots = fabric.observe();
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
@@ -2467,16 +2588,19 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 model,
                 sticky,
+                bearer,
                 max_tokens,
                 timeout_ms,
                 forward_timeout_s,
                 json,
             } => {
+                let bearer = fabric_bearer(bearer);
                 let mode = route_mode(&mode)?;
                 let specs = camelid::fabric::parse_fabric(&nodes)
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
                 let fabric = camelid::fabric::Fabric::new(specs)
-                    .with_timeout(std::time::Duration::from_millis(timeout_ms));
+                    .with_timeout(std::time::Duration::from_millis(timeout_ms))
+                    .with_bearer(bearer.as_deref());
 
                 let request = camelid::fabric::RouteRequest::new(mode)
                     .with_model(model.as_deref())
@@ -2505,6 +2629,7 @@ async fn main() -> anyhow::Result<()> {
                     &chosen.spec,
                     "/v1/chat/completions",
                     &body,
+                    bearer.as_deref(),
                     std::time::Duration::from_secs(forward_timeout_s),
                 )
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -5216,6 +5341,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         gemma3: None,
         gemma4: None,
         qwen35: None,
+        lfm2: None,
         logit_scale: None,
         mla: None,
     })
@@ -5289,6 +5415,8 @@ fn run_bench_owner_sweep(
         Lane::KQuant => &[
             "CAMELID_X86_KQUANT_MATMUL_OWNER",
             "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+            "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256",
+            "CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI",
             "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8",
         ],
     };
@@ -5306,6 +5434,13 @@ fn run_bench_owner_sweep(
     let avx_vnni = std::arch::is_x86_feature_detected!("avxvnni");
     #[cfg(not(target_arch = "x86_64"))]
     let avx_vnni = false;
+    // The folded 512-bit K-quant inner needs no VNNI, so it is reachable on a
+    // strictly wider set than `avx512_vnni` — measure it wherever it can run.
+    #[cfg(target_arch = "x86_64")]
+    let avx512_bw = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw");
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx512_bw = false;
 
     // Lane A (Q8).
     let vnni4x4: SweepConfig = (
@@ -5356,27 +5491,53 @@ fn run_bench_owner_sweep(
         q8_configs.push(avxvnni256);
     }
 
-    // Lane B. The 512-bit inner and the 8-row repack need AVX-512; the 256-bit
-    // inner needs only `vpdpbusd`. Both answer the same env flag, so which one
-    // runs is a property of the host — hence the label is picked from the
-    // host's capabilities, and kernels this CPU cannot reach are not measured.
+    // Lane B. The folded 512-bit inner needs avx512f+bw; the legacy dpbusd
+    // inner and the 8-row repack additionally need avx512vnni; the 256-bit
+    // inner needs only `vpdpbusd`. Every arm pins its own sub-flag, so which
+    // kernel runs is a property of the arm rather than of whichever ran first —
+    // the label is still picked from the host's capabilities, and kernels this
+    // CPU cannot reach are not measured.
     const KQ_OWNER: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER";
     const KQ_VNNI: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI";
+    const KQ_AVXVNNI256: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_AVXVNNI256";
+    const KQ_A512VNNI: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_AVX512VNNI";
     const KQ_REPACK8: &str = "CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8";
     let kq_off: SweepConfig = ("off", false, &[(KQ_OWNER, "0")]);
     let kq_avx2: SweepConfig = ("owner_avx2", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "0")]);
-    let kq_vnni512: SweepConfig = ("owner_vnni512", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
-    let kq_avxvnni: SweepConfig = ("owner_avxvnni256", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
+    let kq_a512fold: SweepConfig = ("owner_avx512fold", true, &[(KQ_OWNER, "1"), (KQ_VNNI, "1")]);
+    let kq_vnni512: SweepConfig = (
+        "owner_vnni512",
+        true,
+        &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_A512VNNI, "1")],
+    );
+    let kq_avxvnni: SweepConfig = (
+        "owner_avxvnni256",
+        true,
+        &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_AVXVNNI256, "1")],
+    );
+    // Pins the dpbusd single-row inner too: repack8 only covers
+    // floor(out_dim/8)*8 rows, so the ragged tail and any non-repacked tensor
+    // fall to the single-row path. Without this the arm would be a mix of
+    // repack8 and the folded inner, and would not be comparable with the
+    // pre-fold repack8 receipts its label refers to.
     let kq_repack8: SweepConfig = (
         "owner_vnni512_repack8",
         true,
-        &[(KQ_OWNER, "1"), (KQ_VNNI, "1"), (KQ_REPACK8, "1")],
+        &[
+            (KQ_OWNER, "1"),
+            (KQ_VNNI, "1"),
+            (KQ_A512VNNI, "1"),
+            (KQ_REPACK8, "1"),
+        ],
     );
     let mut kquant_configs: Vec<SweepConfig> = vec![kq_off, kq_avx2];
+    if avx512_bw {
+        kquant_configs.push(kq_a512fold);
+    }
     if avx512_vnni {
         kquant_configs.push(kq_vnni512);
         kquant_configs.push(kq_repack8);
-    } else if avx_vnni {
+    } else if avx_vnni && !avx512_bw {
         kquant_configs.push(kq_avxvnni);
     }
     let configs: Vec<SweepConfig> = match lane {
@@ -5405,10 +5566,17 @@ fn run_bench_owner_sweep(
         configs.len()
     );
     // Both lanes are capability-aware now, so this applies to either one.
+    // Capability disclosure. The folded 512-bit inner exists only in Lane B, so
+    // say so only when Lane B is what is being measured — otherwise a Q8 run
+    // reports a kernel it never touches.
     if !avx512_vnni {
-        if avx_vnni {
+        if avx512_bw && matches!(lane, Lane::KQuant) {
             eprintln!(
-                "[bench-owner-sweep] no avx512f/bw/vnni: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
+                "[bench-owner-sweep] avx512f/bw without vnni: measuring the folded 512-bit inner; the dpbusd and repack8 arms are unreachable here"
+            );
+        } else if avx_vnni {
+            eprintln!(
+                "[bench-owner-sweep] no AVX-512 at all: measuring the 256-bit AVX-VNNI inner in place of the 512-bit arms"
             );
         } else {
             eprintln!("[bench-owner-sweep] no vpdpbusd at all: only the AVX2 inner is measured");
@@ -5470,6 +5638,7 @@ fn run_bench_owner_sweep(
                 "owner_prefill_taken": owner_taken,
                 "q8_avxvnni256_taken": telemetry_snapshot.matmul_owner_avxvnni_taken,
                 "kquant_vnni512_taken": telemetry_snapshot.kquant_owner_vnni_taken,
+                "kquant_avx512fold_taken": telemetry_snapshot.kquant_owner_avx512fold_taken,
                 "kquant_avxvnni256_taken": telemetry_snapshot.kquant_owner_avxvnni_taken,
             });
             println!("{}", serde_json::to_string(&rec)?);

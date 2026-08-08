@@ -90,13 +90,18 @@ fn classify(payload: &HealthPayload) -> NodeStatus {
     })
 }
 
-fn read_health(spec: &NodeSpec, timeout: Duration) -> Result<HealthPayload, ProbeError> {
+fn read_health(
+    spec: &NodeSpec,
+    bearer: Option<&str>,
+    timeout: Duration,
+) -> Result<HealthPayload, ProbeError> {
     let response = http::request(
         &spec.host,
         spec.port,
         "GET",
         "/v1/health",
         None,
+        bearer,
         timeout,
         MAX_HEALTH_BYTES,
     )?;
@@ -107,11 +112,27 @@ fn read_health(spec: &NodeSpec, timeout: Duration) -> Result<HealthPayload, Prob
         .map_err(|error| ProbeError::Json(error.to_string()))
 }
 
+/// Why a probe left a node unroutable. Pure.
+///
+/// `/v1/health` is exempt from the server's auth today, so a rejected
+/// credential cannot reach here yet. If that exemption is ever tightened, the
+/// bare status would render as "offline" and send an operator hunting a network
+/// fault instead of a missing key, so 401 and 403 say what they mean.
+fn unreachable_reason(error: &ProbeError) -> String {
+    match error {
+        ProbeError::Status(code @ (401 | 403)) => format!(
+            "node rejected the fabric's credentials (HTTP {code}); \
+             pass --bearer or set CAMELID_API_KEY"
+        ),
+        other => other.to_string(),
+    }
+}
+
 /// Probe one node. Never fails: an unreachable node is a routing fact, not an
 /// error the caller has to handle separately.
-pub fn probe_node(spec: &NodeSpec, timeout: Duration) -> NodeSnapshot {
+pub fn probe_node(spec: &NodeSpec, bearer: Option<&str>, timeout: Duration) -> NodeSnapshot {
     let started = Instant::now();
-    match read_health(spec, timeout) {
+    match read_health(spec, bearer, timeout) {
         Ok(payload) => NodeSnapshot {
             spec: spec.clone(),
             status: classify(&payload),
@@ -120,7 +141,7 @@ pub fn probe_node(spec: &NodeSpec, timeout: Duration) -> NodeSnapshot {
         Err(error) => NodeSnapshot {
             spec: spec.clone(),
             status: NodeStatus::Unreachable {
-                reason: error.to_string(),
+                reason: unreachable_reason(&error),
             },
             latency: None,
         },
@@ -131,14 +152,18 @@ pub fn probe_node(spec: &NodeSpec, timeout: Duration) -> NodeSnapshot {
 ///
 /// Sequential probing would make a fabric's status cost the sum of its timeouts,
 /// so a single dead node would stall the view of every live one.
-pub fn probe_fabric(specs: &[NodeSpec], timeout: Duration) -> Vec<NodeSnapshot> {
+pub fn probe_fabric(
+    specs: &[NodeSpec],
+    bearer: Option<&str>,
+    timeout: Duration,
+) -> Vec<NodeSnapshot> {
     if specs.is_empty() {
         return Vec::new();
     }
     std::thread::scope(|scope| {
         let handles: Vec<_> = specs
             .iter()
-            .map(|spec| scope.spawn(move || probe_node(spec, timeout)))
+            .map(|spec| scope.spawn(move || probe_node(spec, bearer, timeout)))
             .collect();
         handles
             .into_iter()
@@ -232,7 +257,7 @@ mod tests {
 
     #[test]
     fn probing_an_empty_fabric_does_no_work() {
-        assert!(probe_fabric(&[], DEFAULT_PROBE_TIMEOUT).is_empty());
+        assert!(probe_fabric(&[], None, DEFAULT_PROBE_TIMEOUT).is_empty());
     }
 
     #[test]
@@ -243,8 +268,30 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 1,
         };
-        let snapshot = probe_node(&spec, Duration::from_millis(500));
+        let snapshot = probe_node(&spec, None, Duration::from_millis(500));
         assert!(matches!(snapshot.status, NodeStatus::Unreachable { .. }));
         assert_eq!(snapshot.label(), "dead");
+    }
+
+    #[test]
+    fn a_rejected_credential_names_the_key_rather_than_reading_as_offline() {
+        for code in [401, 403] {
+            let reason = unreachable_reason(&ProbeError::Status(code));
+            assert!(reason.contains("credentials"), "{reason}");
+            assert!(reason.contains("--bearer"), "{reason}");
+            assert!(reason.contains(&code.to_string()), "{reason}");
+        }
+    }
+
+    #[test]
+    fn every_other_probe_failure_keeps_its_own_wording() {
+        assert_eq!(
+            unreachable_reason(&ProbeError::Status(503)),
+            "health endpoint answered HTTP 503"
+        );
+        assert_eq!(
+            unreachable_reason(&ProbeError::Transport("cannot connect".to_string())),
+            "cannot connect"
+        );
     }
 }

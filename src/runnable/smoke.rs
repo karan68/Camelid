@@ -39,6 +39,15 @@ const MIN_DISTINCT: usize = 6;
 /// (HF-anchored), plus phi3 which is implemented + coherence-validated with HF parity
 /// pending a larger-RAM machine (allowed per the runnable-lane memory policy). Smoke
 /// runs ONLY on these — everything else is "combo not yet anchored".
+/// NOTE on the anchor: the first four combos are anchored against **HF
+/// transformers** (`tests/runnable_parity.rs`). `lfm2` is anchored against
+/// **llama.cpp** instead (`tests/lfm2_parity.rs`, receipt
+/// `qa/runnable/lfm2-parity.json`) — its short-conv graph is ported from
+/// llama.cpp `src/models/lfm2.cpp`, and no HF fixture generator exists on this
+/// host. That is the same anchor the qwen35/Ornith rows use. It is a weaker
+/// anchor than HF in principle (llama.cpp is an implementation, not the
+/// reference definition), and any claim built on the lfm2 row must say which
+/// oracle it rests on.
 fn is_oracle_qualified(arch: &str, tok: TokenizerFamily, quant: &str) -> bool {
     matches!(
         (arch, tok, quant),
@@ -46,6 +55,7 @@ fn is_oracle_qualified(arch: &str, tok: TokenizerFamily, quant: &str) -> bool {
             | ("qwen3", TokenizerFamily::Bpe, "Q8_0")
             | ("gemma3", TokenizerFamily::Spm, "Q8_0")
             | ("phi3", TokenizerFamily::Spm, "Q8_0")
+            | ("lfm2", TokenizerFamily::Bpe, "Q8_0")
     )
 }
 
@@ -60,7 +70,7 @@ fn oracle_qualification_gate(arch: &str, tok: TokenizerFamily, quant: &str) -> R
     Err(BackendError::UnsupportedGguf(format!(
         "combo not yet anchored: {arch}/{quant}/{tok:?}; smoke-admission runs only on \
          oracle-qualified combos (llama/Q8_0/SPM, qwen3/Q8_0/BPE, gemma3/Q8_0/SPM, \
-         phi3/Q8_0/SPM)"
+         phi3/Q8_0/SPM, lfm2/Q8_0/BPE)"
     )))
 }
 
@@ -75,6 +85,7 @@ pub fn oracle_qualified(architecture: &str, quant: &str) -> bool {
             | ("gemma3", "Q8_0")
             | ("phi3", "Q8_0")
             | ("nomic-bert", "Q8_0")
+            | ("lfm2", "Q8_0")
     )
 }
 
