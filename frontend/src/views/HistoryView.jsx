@@ -1,4 +1,4 @@
-import { clampText, formatCompactNumber, formatHistoryDate, formatPreview } from '../lib/formatters'
+import { clampText, formatCompactNumber, formatHistoryDate, formatModelLabel, formatPreview } from '../lib/formatters'
 import { Button } from '../components/ui/Button'
 import { downloadConversation } from '../lib/conversationExport'
 import { EmptyState } from '../components/ui/EmptyState'
@@ -57,7 +57,7 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
                 <header className="cxv-card__head">
                   <div className="cxv-card__titles">
                     <strong title={conversation.title || 'Untitled chat'}>{clampText(conversation.title || 'Untitled chat', 70) || 'Untitled chat'}</strong>
-                    <span className="cxv-card__sub" title={conversation.model_id || 'No model recorded'}>{conversation.model_id || 'No model recorded'}</span>
+                    <span className="cxv-card__sub" title={conversation.model_id || 'No model recorded'}>{formatModelLabel(conversation.model_id)}</span>
                   </div>
                   <span className="cxv-tag">{formatCompactNumber(messageCount)} messages</span>
                 </header>

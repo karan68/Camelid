@@ -55,11 +55,89 @@ export function formatCompactNumber(value) {
   return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(Number(value))
 }
 
+/* Card previews are plain text, so markdown syntax the model emitted (fences,
+   emphasis, link brackets) must not leak through as literal characters. Only
+   the markers are removed — the words and code inside are kept. */
+function stripMarkdown(value) {
+  return String(value)
+    .replace(/```[\w+-]*\n?/g, ' ')            // fence openers (with language) and closers
+    .replace(/~~~[\w+-]*\n?/g, ' ')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')  // images -> alt text
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')   // links -> link text
+    .replace(/`([^`]+)`/g, '$1')               // inline code
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')        // headings
+    .replace(/^\s{0,3}>\s?/gm, '')             // blockquotes
+    .replace(/^\s{0,3}(?:[-*+]|\d+\.)\s+/gm, '') // list markers
+    .replace(/^\s{0,3}(?:[-*_]\s*){3,}$/gm, ' ') // horizontal rules
+    .replace(/(\*\*|__)(.*?)\1/g, '$2')        // bold
+    .replace(/(^|\W)[*_]([^*_\n]+)[*_](?=\W|$)/g, '$1$2') // italic
+    .replace(/~~(.*?)~~/g, '$1')               // strikethrough
+}
+
 export function formatPreview(value, maxLength = 120) {
   if (!value) return 'No messages yet'
-  const normalized = String(value).replace(/\s+/g, ' ').trim()
+  const normalized = stripMarkdown(value).replace(/\s+/g, ' ').trim()
+  if (!normalized) return 'No messages yet'
   if (normalized.length <= maxLength) return normalized
-  return `${normalized.slice(0, maxLength - 1)}…`
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`
+}
+
+/* Conversations record whichever model name was in play at the time: some hold
+   a display name ("Llama 3.2 1B Instruct"), older ones a raw catalog id
+   ("tinyllama_tinyllama-1.1b-chat-v1.0-q8_0"). Render both the same way. */
+const MODEL_FAMILY_NAMES = new Map([
+  ['tinyllama', 'TinyLlama'], ['llama', 'Llama'], ['llama3', 'Llama 3'], ['qwen', 'Qwen'], ['qwen2', 'Qwen2'],
+  ['qwen3', 'Qwen3'], ['gemma', 'Gemma'], ['gemma3', 'Gemma 3'], ['gemma4', 'Gemma 4'],
+  ['phi3', 'Phi-3'], ['mistral', 'Mistral'], ['deepseek', 'DeepSeek'], ['bonsai', 'Bonsai'],
+  ['nomic', 'Nomic'], ['ornith', 'Ornith'], ['cohere', 'Cohere'],
+])
+
+export function formatModelLabel(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return 'No model recorded'
+  // Already a display name (or a HF repo path) — leave it alone.
+  if (/\s/.test(raw)) return raw
+  const tail = raw.split('/').pop().replace(/\.gguf$/i, '')
+  const tokens = tail.split(/[_-]+/).filter(Boolean)
+  const merged = []
+  for (const token of tokens) {
+    const previous = merged[merged.length - 1]
+    // Drop a duplicated family prefix ("tinyllama_tinyllama-...").
+    if (previous && previous.toLowerCase() === token.toLowerCase()) continue
+    // Rejoin split quant labels, repeatedly: ["q4","k","m"] -> "Q4_K_M".
+    if (previous && /^i?q\d+(?:_[a-z0-9]+)*$/i.test(previous) && /^(?:\d+|[a-z]{1,2})$/i.test(token)) {
+      merged[merged.length - 1] = `${previous.toUpperCase()}_${token.toUpperCase()}`
+      continue
+    }
+    // Rejoin split versions: ["v0","3"] -> "v0.3".
+    if (previous && /^v\d+$/i.test(previous) && /^\d+$/.test(token)) {
+      merged[merged.length - 1] = `${previous.toLowerCase()}.${token}`
+      continue
+    }
+    // Rejoin split parameter counts: ["0","6b"] -> "0.6B".
+    if (previous && /^\d+$/.test(previous) && /^\d+[bm]$/i.test(token)) {
+      merged[merged.length - 1] = `${previous}.${token.toUpperCase()}`
+      continue
+    }
+    merged.push(token)
+  }
+  return merged
+    .map((token) => {
+      const lower = token.toLowerCase()
+      if (MODEL_FAMILY_NAMES.has(lower)) return MODEL_FAMILY_NAMES.get(lower)
+      // Catalog ids fuse family and version: "llama32" -> "Llama 3.2".
+      const versioned = lower.match(/^([a-z]+)(\d)(\d)$/)
+      if (versioned && MODEL_FAMILY_NAMES.has(versioned[1])) {
+        return `${MODEL_FAMILY_NAMES.get(versioned[1])} ${versioned[2]}.${versioned[3]}`
+      }
+      if (/_/.test(token)) return token                       // already-normalized quant
+      if (/^i?q\d/i.test(token)) return token.toUpperCase()   // q8, iq4xs
+      if (/^\d+(?:\.\d+)?[bm]$/i.test(token)) return token.toUpperCase() // 1.1b -> 1.1B
+      if (/^a\d+b$/i.test(token)) return token.toUpperCase()  // a4b (active params) -> A4B
+      if (/^v\d/i.test(token)) return token.toLowerCase()     // v1.0
+      return token.charAt(0).toUpperCase() + token.slice(1)
+    })
+    .join(' ')
 }
 
 export function clampText(value, maxLength = 72) {

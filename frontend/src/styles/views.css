@@ -396,11 +396,18 @@
 .cxv-card__titles strong { font-size: var(--text-md); font-weight: 650; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cxv-card__sub { font-size: var(--text-xs); color: var(--color-text-muted); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cxv-card__preview { flex: 1; color: var(--color-text-muted); font-size: var(--text-sm); line-height: var(--leading-snug); display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.cxv-card__foot { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--color-border-soft); }
+/* Foot wraps: the action row drops to its own line rather than squeezing the
+   meta column until "6 replies" / "Jul 20" break mid-phrase and the last
+   action overflows the card. Meta items never break internally. */
+.cxv-card__foot { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--color-border-soft); flex-wrap: wrap; }
 .cxv-card__meta { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); color: var(--color-text-muted); min-width: 0; flex-wrap: wrap; }
+.cxv-card__meta > span { white-space: nowrap; }
 .cxv-card__meta strong { color: var(--color-text); font-weight: 700; }
 .cxv-dot { opacity: 0.5; }
-.cxv-card__actions { display: flex; align-items: center; gap: var(--space-2); flex: none; }
+.cxv-card__actions { display: flex; align-items: center; gap: var(--space-1); flex: 1 1 auto; min-width: 0; justify-content: flex-end; flex-wrap: wrap; }
+/* Once the actions wrap to their own rows, right-alignment reads as ragged —
+   line them up with the meta text instead. */
+@media (max-width: 560px) { .cxv-card__actions { justify-content: flex-start; } }
 
 /* Tag chip */
 .sys-row__claims { display: inline-flex; align-items: center; gap: var(--space-2); min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
@@ -492,6 +499,7 @@
 .downloaded-model .cxv-card__actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 160px));
+  gap: var(--space-2);
   width: 100%;
   min-width: 0;
   justify-content: flex-end;
