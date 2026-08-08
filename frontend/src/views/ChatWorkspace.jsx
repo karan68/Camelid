@@ -305,17 +305,39 @@ export default function ChatWorkspace({
     if (!generationActive) return undefined
     autoFollowGenerationRef.current = true
     setUserScrolledAway(false)
-    const updateAutoFollow = () => {
-      const el = document.querySelector('.cxchat__scroll')
-      if (!el) return
-      const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight)
-      const follow = distanceFromBottom < 260
+    /* Auto-follow is released by the user's GESTURE, not by how far they got.
+       Keying it to a distance threshold meant a small trackpad scroll left the
+       viewport inside the band, so the next token re-anchored to the bottom and
+       the page appeared to fight the scroll. Any upward wheel/touch/key intent
+       releases it immediately; it re-engages only once they return to the
+       bottom, so a released stream never silently yanks back. */
+    const setFollow = (follow) => {
       if (follow !== autoFollowGenerationRef.current) setUserScrolledAway(!follow)
       autoFollowGenerationRef.current = follow
     }
+    const releaseOnUpwardIntent = (event) => {
+      if (event.type === 'wheel' && event.deltaY >= 0) return
+      if (event.type === 'keydown' && !['ArrowUp', 'PageUp', 'Home'].includes(event.key)) return
+      setFollow(false)
+    }
+    const updateAutoFollow = () => {
+      const el = document.querySelector('.cxchat__scroll')
+      if (!el) return
+      // Re-engage only at the very bottom; never re-engage mid-scroll.
+      const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight)
+      if (distanceFromBottom <= 24) setFollow(true)
+    }
     const el = document.querySelector('.cxchat__scroll')
     el?.addEventListener('scroll', updateAutoFollow, { passive: true })
-    return () => el?.removeEventListener('scroll', updateAutoFollow)
+    el?.addEventListener('wheel', releaseOnUpwardIntent, { passive: true })
+    el?.addEventListener('touchmove', releaseOnUpwardIntent, { passive: true })
+    el?.addEventListener('keydown', releaseOnUpwardIntent)
+    return () => {
+      el?.removeEventListener('scroll', updateAutoFollow)
+      el?.removeEventListener('wheel', releaseOnUpwardIntent)
+      el?.removeEventListener('touchmove', releaseOnUpwardIntent)
+      el?.removeEventListener('keydown', releaseOnUpwardIntent)
+    }
   }, [generationActive, selectedConversation?.id])
 
   useLayoutEffect(() => {

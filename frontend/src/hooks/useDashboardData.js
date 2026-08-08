@@ -946,6 +946,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
     let activeConversationId = null
     let assistantId = null
     let chatLifecycleId = null
+    /* Hoisted so the finally below can always halt the display-pacing loop,
+       including on abort and error paths. */
+    let stopPacing = () => {}
     let pendingAssistantPatch = null
     let pendingAssistantFrame = null
 
@@ -1023,6 +1026,27 @@ export function useDashboardData({ showNotice, clearNotice }) {
       let firstContentEmitted = false
       let lastProgressAt = 0
       const pacer = createPacerState()
+      /* The pacer is driven by its own animation frame loop rather than by token
+         arrival, so the text keeps flowing smoothly between bursty SSE chunks
+         and advances once per display refresh (120Hz where the panel supports
+         it). Arrival still records the real stream for the lag bound; only the
+         DISPLAY is paced, and metrics never read from it. */
+      let latestReceivedContent = ''
+      let pacingFrame = null
+      stopPacing = () => {
+        if (pacingFrame !== null && typeof window !== 'undefined') window.cancelAnimationFrame(pacingFrame)
+        pacingFrame = null
+      }
+      const pacingTick = () => {
+        pacingFrame = null
+        const fullContent = latestReceivedContent
+        const paced = paceStep(pacer, fullContent, performance.now())
+        if (paced) markAssistantStreamState({ content: paced })
+        startPacing()
+      }
+      const startPacing = () => {
+        if (pacingFrame === null && typeof window !== 'undefined') pacingFrame = window.requestAnimationFrame(pacingTick)
+      }
       assistantId = makeId('message')
       /* Snapshot of the support claim that was active when this send left the
          composer: row id + status only (never paths) so the message footer can
@@ -1177,9 +1201,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
           lastProgressAt = performance.now()
           emitProgress(lifecycleId, { tokens: realTokens, tokensPerSec: liveTps })
         }
+        /* Record what truly arrived; the pacing loop above owns the display. */
+        latestReceivedContent = fullContent
+        startPacing()
         markAssistantStreamState({
-          /* paced display (lag-bounded ≤150ms, drains on end; metrics use the
-             real stream — see lib/streamPacing.js) */
           content: paceStep(pacer, fullContent, performance.now()) || '…',
           streaming_phase: 'streaming',
           tokens_in_per_sec: null,
@@ -1209,6 +1234,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           }
         },
       })
+      stopPacing()
       flushAssistantStreamPatch()
       const elapsedMs = performance.now() - requestStartedAt
       const assistantMessage = {
@@ -1305,6 +1331,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         showNotice(errorMessage, 'error')
       }
     } finally {
+      stopPacing()
       activeChatRequestRef.current = null
       setStoppingGeneration(false)
       setSending(false)

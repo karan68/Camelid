@@ -136,6 +136,7 @@ const executionPlanSource = read('../src/lib/executionPlan.js')
 const loadedModelDisplaySource = read('../src/lib/loadedModelDisplay.js')
 const apiViewSource = read('../src/views/ApiView.jsx')
 const supportContractSummarySource = read('../src/components/api/SupportContractSummary.jsx')
+const streamPacingSource = read('../src/lib/streamPacing.js')
 const systemViewSource = read('../src/views/SystemView.jsx')
 const modelsViewSource = read('../src/views/ModelsView.jsx')
 const topBarSource = read('../src/components/TopBar.jsx')
@@ -502,6 +503,20 @@ const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../s
 }
 assert.match(dashboardHookSource, /paceStep\(pacer, fullContent/, 'streaming display must go through the bounded pacer')
 assert.match(dashboardHookSource, /paceDrain\(pacer, streamed\.content/, 'final content must drain byte-identical from the real stream')
+
+/* ---- Streaming feel: paced by elapsed time, and scroll is never stolen ---- */
+// The pacer must advance on its own animation frame loop, not only when a
+// token arrives, or bursty SSE chunks render as bursty text.
+assert.match(dashboardHookSource, /requestAnimationFrame\(pacingTick\)/, 'display pacing must be driven by an animation frame loop, not token arrival alone')
+assert.match(dashboardHookSource, /stopPacing\(\)/, 'the pacing loop must be halted on completion, abort, and error')
+// Frame-rate independence: the advance comes from elapsed time, so 120Hz gets
+// smaller, more frequent steps rather than running twice as fast.
+assert.match(streamPacingSource, /Math\.exp\(-elapsed \/ CATCH_UP_TAU_MS\)/, 'the pacer must advance from elapsed time so motion is frame-rate independent')
+// Auto-follow must release on the user's gesture. Keying it to a distance
+// threshold is what made the view fight a small trackpad scroll.
+assert.match(chatWorkspaceSource, /releaseOnUpwardIntent/, 'auto-follow must release on upward scroll intent, not on a distance threshold')
+assert.match(chatWorkspaceSource, /addEventListener\('wheel', releaseOnUpwardIntent/, 'a trackpad wheel gesture must release auto-follow immediately')
+assert.doesNotMatch(chatWorkspaceSource, /distanceFromBottom < 260/, 'the 260px auto-follow band must not come back; it re-anchored mid-scroll')
 
 /* ---- Camelid mark (Phase 8): original glyph, derivative sparkle retired ---- */
 const camelidMarkSource = read('../src/components/ui/CamelidMark.jsx')
