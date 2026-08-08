@@ -6,8 +6,9 @@
 //! [`super::Fabric::dispatch`], so the routing and forwarding guarantees are
 //! identical to the CLI path.
 //!
-//! Streaming is refused here for the same reason [`super::forward`] refuses it:
-//! an SSE body is a different response shape than the JSON this proxy returns.
+//! Streaming is relayed rather than interpreted: when a client asks for
+//! `stream: true` the node's server-sent events are forwarded byte for byte, so
+//! an event field this proxy has never heard of reaches the client unaltered.
 //!
 //! # Limits an operator has to know about
 //!
@@ -16,24 +17,27 @@
 //!   unless the risk is acknowledged explicitly.
 //! * The token this proxy presents to its nodes is the one the fabric was built
 //!   with; it authenticates the proxy to the nodes, never a client to the proxy.
-//! * A dispatch runs on a blocking thread and blocking socket I/O is not
-//!   cancellable, so a client that hangs up leaves its dispatch running until
-//!   the node answers or `forward_timeout` expires.
+//! * A non-streaming dispatch runs on a blocking thread and blocking socket I/O
+//!   is not cancellable, so a client that hangs up leaves its dispatch running
+//!   until the node answers or `forward_timeout` expires. A streaming dispatch
+//!   does notice: its next send fails and the node's socket is dropped with it.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::Value;
 
-use super::policy::{RouteError, RouteMode, RouteRequest};
-use super::{DispatchError, Fabric, ForwardError};
+use super::policy::{RouteDecision, RouteError, RouteMode, RouteRequest};
+use super::{self as fabric, DispatchError, Fabric, ForwardError, StreamOutcome};
 use crate::api::DEFAULT_MAX_REQUEST_BODY_BYTES;
 
 /// Optional header a client sends to request affinity to a specific node.
@@ -46,6 +50,11 @@ pub struct ServeConfig {
     /// specific node via [`STICKY_HEADER`] regardless of this default.
     pub mode: RouteMode,
     /// Budget for the generation itself, which can legitimately take minutes.
+    ///
+    /// On a streaming request it bounds two waits that mean the same thing —
+    /// the wait for the node's response head, and any later gap in which the
+    /// node sends nothing. A healthy stream resets the second with every token,
+    /// so a long generation is never cut short by it.
     pub forward_timeout: Duration,
 }
 
@@ -134,7 +143,30 @@ async fn chat_completions(
         .get(STICKY_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let request = OwnedRequest { model, sticky };
 
+    if fabric::wants_streaming(&body) {
+        return stream_completion(state, body, request).await;
+    }
+    buffered_completion(state, body, request).await
+}
+
+/// The parts of a [`RouteRequest`] that outlive the borrow of the request body,
+/// so placement can run on another thread.
+struct OwnedRequest {
+    model: Option<String>,
+    sticky: Option<String>,
+}
+
+impl OwnedRequest {
+    fn as_route(&self, mode: RouteMode) -> RouteRequest<'_> {
+        RouteRequest::new(mode)
+            .with_model(self.model.as_deref())
+            .with_sticky(self.sticky.as_deref())
+    }
+}
+
+async fn buffered_completion(state: ServerState, body: Value, request: OwnedRequest) -> Response {
     // Fabric::dispatch is synchronous socket I/O (probes every node, then
     // forwards) and can legitimately run for the whole forward_timeout — up to
     // minutes for a real generation. Running it directly on an async worker
@@ -142,13 +174,10 @@ async fn chat_completions(
     // dispatches reach the runtime's worker count; spawn_blocking moves it onto
     // tokio's much larger blocking pool instead.
     let outcome = tokio::task::spawn_blocking(move || {
-        let request = RouteRequest::new(state.config.mode)
-            .with_model(model.as_deref())
-            .with_sticky(sticky.as_deref());
         state.fabric.dispatch(
             "/v1/chat/completions",
             &body,
-            &request,
+            &request.as_route(state.config.mode),
             state.config.forward_timeout,
         )
     })
@@ -158,12 +187,7 @@ async fn chat_completions(
         Ok(Ok((decision, answer))) => {
             let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = (status, Json(answer.body)).into_response();
-            let out = response.headers_mut();
-            insert(out, "x-camelid-fabric-node", &decision.label);
-            insert(out, "x-camelid-fabric-reason", decision.reason.as_str());
-            if let Some(previous) = &decision.affinity_lost {
-                insert(out, "x-camelid-fabric-affinity-lost", previous);
-            }
+            tag(response.headers_mut(), &decision);
             response
         }
         Ok(Err(DispatchError::Route(error))) => route_error(error),
@@ -175,7 +199,150 @@ async fn chat_completions(
     }
 }
 
-fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) {
+/// What the blocking side reports once it has the node's response head.
+///
+/// Sent before any body byte, so the response status and the placement headers
+/// are settled before the client is committed to reading a stream.
+enum StreamStart {
+    Streaming {
+        decision: RouteDecision,
+        status: u16,
+        content_type: Option<String>,
+    },
+    /// The node answered outright instead of streaming.
+    Buffered {
+        decision: RouteDecision,
+        answer: fabric::Forwarded,
+    },
+    Failed(DispatchError),
+}
+
+/// How many body pieces may sit between the node and a slow client.
+///
+/// Bounded on purpose: once it fills, the blocking reader stops reading its
+/// socket, which is what pushes back on the node rather than buffering a
+/// generation in memory.
+const STREAM_CHANNEL_DEPTH: usize = 32;
+
+async fn stream_completion(state: ServerState, body: Value, request: OwnedRequest) -> Response {
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<StreamStart>();
+    let (chunk_tx, mut chunk_rx) =
+        tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(STREAM_CHANNEL_DEPTH);
+
+    // Same reasoning as the buffered path: this is blocking socket I/O for the
+    // whole life of the generation, so it belongs on the blocking pool. It also
+    // owns cancellation — every send below reports whether the client is still
+    // there, and the socket to the node is dropped as soon as it is not.
+    tokio::task::spawn_blocking(move || {
+        let outcome = state.fabric.dispatch_streaming(
+            "/v1/chat/completions",
+            &body,
+            &request.as_route(state.config.mode),
+            state.config.forward_timeout,
+            state.config.forward_timeout,
+        );
+
+        let mut streaming = match outcome {
+            Err(error) => {
+                let _ = start_tx.send(StreamStart::Failed(error));
+                return;
+            }
+            Ok((decision, StreamOutcome::Buffered(answer))) => {
+                let _ = start_tx.send(StreamStart::Buffered { decision, answer });
+                return;
+            }
+            Ok((decision, StreamOutcome::Streaming(streaming))) => {
+                let start = StreamStart::Streaming {
+                    decision,
+                    status: streaming.status,
+                    content_type: streaming.content_type.clone(),
+                };
+                if start_tx.send(start).is_err() {
+                    return;
+                }
+                streaming
+            }
+        };
+
+        loop {
+            match streaming.next_chunk() {
+                Ok(None) => return,
+                Ok(Some(chunk)) => {
+                    // A closed channel means the client hung up. Returning drops
+                    // the node's socket with it, so the generation is not left
+                    // running for nobody.
+                    if chunk_tx.blocking_send(Ok(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = chunk_tx.blocking_send(Err(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+
+    let start = match start_rx.await {
+        Ok(start) => start,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "dispatch task did not complete",
+            )
+        }
+    };
+
+    let (decision, status, content_type) = match start {
+        StreamStart::Failed(DispatchError::Route(error)) => return route_error(error),
+        StreamStart::Failed(DispatchError::Forward(error)) => return forward_error(error),
+        StreamStart::Buffered { decision, answer } => {
+            let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, Json(answer.body)).into_response();
+            tag(response.headers_mut(), &decision);
+            return response;
+        }
+        StreamStart::Streaming {
+            decision,
+            status,
+            content_type,
+        } => (decision, status, content_type),
+    };
+
+    let stream = async_stream::stream! {
+        while let Some(chunk) = chunk_rx.recv().await {
+            yield chunk;
+        }
+    };
+
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    let out = response.headers_mut();
+    // Only the node headers that describe the payload are relayed. Everything
+    // else — Content-Length and the hop-by-hop set — describes the node's own
+    // connection, and this response is framed independently of it.
+    if let Some(content_type) = &content_type {
+        insert(out, CONTENT_TYPE, content_type);
+    }
+    insert(out, CACHE_CONTROL, "no-cache");
+    tag(out, &decision);
+    response
+}
+
+/// Record which node served a request and why, on any answer shape.
+fn tag(headers: &mut HeaderMap, decision: &RouteDecision) {
+    insert(headers, "x-camelid-fabric-node", &decision.label);
+    insert(headers, "x-camelid-fabric-reason", decision.reason.as_str());
+    if let Some(previous) = &decision.affinity_lost {
+        insert(headers, "x-camelid-fabric-affinity-lost", previous);
+    }
+}
+
+fn insert<K>(headers: &mut HeaderMap, name: K, value: &str)
+where
+    K: axum::http::header::IntoHeaderName,
+{
     // A label or reason string can never contain characters invalid in a
     // header value in practice, but a malformed one must not crash the
     // response — dropping the header is strictly better than losing the body.
@@ -267,9 +434,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_streaming_request_is_refused_with_400_before_any_probe() {
-        // The node is unreachable on purpose: a 400 here proves the refusal
-        // happened before dispatch ever tried to route the request.
+    async fn a_streaming_request_is_routed_rather_than_refused() {
+        // The node is unreachable on purpose. A 503 — a placement failure —
+        // proves the proxy tried to route the stream; the 400 this used to
+        // answer would mean it had refused before looking at the fabric.
         let fabric = Fabric::new(vec![NodeSpec {
             label: "dead".to_string(),
             host: "127.0.0.1".to_string(),
@@ -287,7 +455,7 @@ mod tests {
             .await
             .expect("router answers");
         let (status, body) = read_json(response).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["type"], "fabric_error");
     }
 

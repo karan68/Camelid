@@ -32,7 +32,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-pub use forward::{ForwardError, Forwarded, DEFAULT_FORWARD_TIMEOUT};
+pub use forward::{
+    wants_streaming, ForwardError, Forwarded, StreamOutcome, Streaming, DEFAULT_FORWARD_TIMEOUT,
+};
 pub use node::{
     parse_fabric, parse_node_spec, NodeReady, NodeSnapshot, NodeSpec, NodeSpecParseError,
     NodeStatus, DEFAULT_NODE_PORT,
@@ -137,6 +139,32 @@ impl Fabric {
             forward_timeout,
         )?;
         Ok((decision, answer))
+    }
+
+    /// Observe, place, and start a streaming request.
+    ///
+    /// The same placement as [`Fabric::dispatch`] — both go through
+    /// [`Fabric::place`] — but the answer is read as it arrives instead of all
+    /// at once. Returns once the node's response head is in, so a caller knows
+    /// the status and which node it came from before relaying a single byte.
+    pub fn dispatch_streaming(
+        &self,
+        path: &str,
+        body: &Value,
+        request: &RouteRequest<'_>,
+        head_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Result<(RouteDecision, StreamOutcome), DispatchError> {
+        let (decision, chosen) = self.place(request)?;
+        let outcome = forward::forward_streaming(
+            &chosen.spec,
+            path,
+            body,
+            self.bearer.as_deref(),
+            head_timeout,
+            idle_timeout,
+        )?;
+        Ok((decision, outcome))
     }
 }
 
