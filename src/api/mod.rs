@@ -21918,10 +21918,14 @@ mod tests {
                 ModelLaneClass::ExperimentalImplemented,
                 "{filename} with replaced bytes must not inherit support by name"
             );
+            // With no digest in hand, a pin says nothing: the row keeps its
+            // ordinary filename/header class. Asserting ExperimentalImplemented
+            // here for every pinned artifact is what locked the v0.6.0 library
+            // regression in behind a green test.
             assert_eq!(
                 classify_model_lane_with_verified_sha256(Some("qwen35"), filename, None),
-                ModelLaneClass::ExperimentalImplemented,
-                "{filename} must remain unverified until the load path supplies its digest"
+                ModelLaneClass::Supported,
+                "{filename} must not be demoted before anyone has hashed it"
             );
         }
         // A curated row with NO recorded digest keeps its filename-only gating.
@@ -21940,6 +21944,92 @@ mod tests {
             ModelLaneClass::Supported,
             "an unpinned curated row stays filename-gated until a digest is captured"
         );
+    }
+
+    /// THE v0.6.0 REGRESSION, reported against the shipped Windows build:
+    /// "llama-3.2-3b instruct is listed as experimental" and Bonsai likewise.
+    ///
+    /// v0.6.0 widened the pre-load gate from `prism_supported_artifact_expected_sha256`
+    /// to `supported_artifact_expected_sha256`, so every row that gained a pin was
+    /// relabelled Experimental in the models library — which calls the classifier
+    /// with `None`, because drawing a badge must never cost a multi-GB rehash.
+    /// Adding a pin is supposed to tighten what happens when the BYTES are wrong,
+    /// never to change how a file the user has not loaded is described.
+    #[test]
+    fn pinning_an_artifact_never_demotes_it_before_its_digest_is_known() {
+        for filename in [
+            "Llama-3.2-3B-Instruct-Q8_0.gguf",
+            "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            "Llama-3.2-3B-Instruct-Q5_K_M.gguf",
+            "Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+            "gemma-3-1b-it-Q8_0.gguf",
+            "Qwen3-4B-Q4_K_M.gguf",
+            "ornith-1.0-9b-Q8_0.gguf",
+            "ornith-1.0-9b-Q4_K_M.gguf",
+            "ornith-1.0-9b-Q3_K_M.gguf",
+            "gemma-4-E4B-it-NVFP4-mm.gguf",
+            "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+            // The Bonsai rows the owner reported. TQ2_0 flipped in v0.6.0; the
+            // Prism-pinned ones read Experimental for longer than that.
+            "Ternary-Bonsai-4B-TQ2_0.gguf",
+            "Bonsai-4B-Q1_0.gguf",
+            "Bonsai-8B-Q1_0.gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            "Ternary-Bonsai-4B-Q2_0.gguf",
+            "Ternary-Bonsai-4B-PQ2_0.gguf",
+            "Ternary-Bonsai-8B-Q2_0.gguf",
+        ] {
+            assert!(
+                supported_artifact_expected_sha256(filename).is_some(),
+                "precondition: {filename} is hash-pinned"
+            );
+            assert_eq!(
+                classify_model_lane_with_verified_sha256(Some("llama"), filename, None),
+                ModelLaneClass::Supported,
+                "{filename} must read Supported in the models library, not Experimental"
+            );
+            // The pin still does its real job: certified NAME + uncertified BYTES
+            // loses the row's evidence at load, which is where it always mattered.
+            assert_eq!(
+                classify_loaded_model_identity(Some("llama"), filename, &"00".repeat(32)),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} with replaced bytes must still be demoted at load time"
+            );
+        }
+    }
+
+    /// The Prism rows (the curated Bonsai artifacts) read "Experimental" in the
+    /// models library from before v0.6.0 through v0.6.0 itself, because they were
+    /// the original hash-pinned set. They now follow the same rule as every other
+    /// row: described by filename/header until someone actually hashes them, and
+    /// fail-closed the moment the bytes are known to be wrong.
+    #[test]
+    fn prism_rows_are_described_by_filename_until_their_bytes_are_known() {
+        for (filename, expected_sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
+            assert_eq!(
+                classify_model_lane_with_verified_sha256(Some("qwen35"), filename, None),
+                ModelLaneClass::Supported,
+                "{filename} must read Supported in the library, not Experimental"
+            );
+            assert_eq!(
+                classify_model_lane_with_verified_sha256(
+                    Some("qwen35"),
+                    filename,
+                    Some(expected_sha256)
+                ),
+                ModelLaneClass::Supported,
+                "{filename} with its certified digest is supported"
+            );
+            assert_eq!(
+                classify_model_lane_with_verified_sha256(
+                    Some("qwen35"),
+                    filename,
+                    Some(&"00".repeat(32))
+                ),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} with uncertified bytes must still fail closed at load"
+            );
+        }
     }
 
     #[test]
@@ -28404,8 +28494,12 @@ fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'sta
 /// 5,629,108,416 B) while the public HuggingFace file of that exact name is a
 /// different imatrix quant (`5720d1f6...`, 5,629,108,704 B) — different weights,
 /// not just different metadata. Classification therefore fails closed to
-/// `ExperimentalImplemented` until the load path has confirmed the digest; see
-/// `supported_artifact_expected_sha256`.
+/// `ExperimentalImplemented` the moment the load path confirms the digest does
+/// not match — see `classify_loaded_model_identity`, which consults the full pin
+/// set. It does NOT pre-emptively demote the row in the filename-only library
+/// view: that view has no digest, and demoting on the mere existence of a pin is
+/// what made every pinned row read "Experimental" in v0.6.0. See
+/// `classify_model_lane_with_verified_sha256` for that boundary.
 const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     // HF pristine upload; local recompute matches the HF LFS oid (9,527,500,992 B).
     (
@@ -28631,23 +28725,37 @@ fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneC
     }
 }
 
-/// The hash-pinned support boundary (Prism + every non-catalog allowlist row).
-/// Filename/header-only views (local library and inspect) therefore remain
-/// experimental until the ordinary load path has computed the exact digest;
-/// other established rows retain their existing filename-gated classification.
+/// Classify an artifact for a view that may or may not have its digest.
+///
+/// A hash pin decides what happens when the BYTES are known and WRONG. It is not
+/// evidence about a file nobody has hashed yet, so it must not change how that
+/// file is described. With a digest in hand this defers to
+/// `classify_loaded_model_identity` (certified NAME + uncertified BYTES loses the
+/// row's evidence); without one it falls back to the ordinary filename/header
+/// classification, exactly as an unpinned curated row already does.
+///
+/// The alternative — withholding support until a digest exists — is what shipped
+/// in v0.6.0, and it reads as a support REGRESSION to anyone looking at the
+/// models library, which calls this with `verified_sha256: None` because drawing
+/// a badge must never cost a multi-GB rehash. Every pinned row was relabelled
+/// "Experimental" on sight: Llama-3.2-3B Q8_0/Q4_K_M/Q5_K_M, Llama-3.2-1B
+/// IQ4_XS/Q4_K_M, gemma-3-1b-it, nomic-embed, Qwen3-4B-Q4_K_M, the NVFP4 row, all
+/// three Ornith rows, and Ternary-Bonsai-4B-TQ2_0. The Prism rows had read
+/// "Experimental" this way since before v0.6.0; that is now gone too.
+///
+/// Fail-closed still holds where it does the work — at load, where the digest is
+/// free (`build_loaded_model` already computes it for `LaneIdentity`) and where a
+/// wrong-bytes file would otherwise inherit parity claims, support claims, and
+/// tool capability. No generation ever runs under an unearned supported label.
 fn classify_model_lane_with_verified_sha256(
     architecture: Option<&str>,
     filename: &str,
     verified_sha256: Option<&str>,
 ) -> ModelLaneClass {
-    let class = classify_model_lane(architecture, filename);
-    if class != ModelLaneClass::Supported || supported_artifact_expected_sha256(filename).is_none()
-    {
-        return class;
+    match verified_sha256 {
+        Some(sha256) => classify_loaded_model_identity(architecture, filename, sha256),
+        None => classify_model_lane(architecture, filename),
     }
-    verified_sha256.map_or(ModelLaneClass::ExperimentalImplemented, |sha256| {
-        classify_loaded_model_identity(architecture, filename, sha256)
-    })
 }
 
 /// Classify from the exact bytes. A hash-pinned artifact loaded under its
