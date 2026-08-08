@@ -208,7 +208,9 @@ const missingCapabilitiesGate = getChatGateState(null, exactThreeBModel, runtime
 assert.equal(missingCapabilitiesGate.runtimeReady, true, '3B runtime readiness must remain visible when /api/capabilities is unavailable')
 assert.equal(missingCapabilitiesGate.contractSupported, false, '3B support must fail closed when /api/capabilities is unavailable')
 assert.equal(missingCapabilitiesGate.chatUnlocked, false, '3B WebUI chat must not unlock from runtime health alone without the exact capabilities row')
-assert.equal(missingCapabilitiesGate.label, 'No matching COMPATIBILITY.md row', '3B support-gated copy should name the missing exact row when capabilities are absent')
+// `label` is the plain-language layer the UI renders; the unmatched row id and
+// its evidence remain on `hint` for the technical views.
+assert.equal(missingCapabilitiesGate.label, 'Runnable (unverified)', '3B support-gated copy should say the model is unverified when capabilities are absent')
 
 for (const [label, model, runtimeOverride] of [
   ['loaded_now=false', exactThreeBModel, { ...runtime, loaded_now: false }],
@@ -295,20 +297,39 @@ assert.match(hookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge
 assert.match(chatSource, /modelCanChat\s*=\s*\(model\) => \['supported', 'experimental'\]\.includes\(getChatGateState\(capabilities, model, runtime\)\.chatMode\)/, 'chat model picker must derive supported and experimental lanes from the shared exact-row gate')
 assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(modelCanChat\)/, 'chat model picker must filter through the shared supported-or-experimental lane predicate')
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && canChat && !generationActive/, 'composer send button must be blocked unless the chat gate (supported exact row or experimental lane) unlocked')
-assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')
-assert.match(chatSource, /supportStatusCopy[\s\S]*COMPATIBILITY\.md and \/api\/capabilities agree/, 'chat readiness copy must name the support-contract requirement')
+/* Redesign (2026-08): the readiness fine print collapsed from a stack of lines
+   into one composer status line plus a details tooltip, and its wording moved to
+   plain product language (raw flag names like generation_ready=true and the
+   COMPATIBILITY.md filename no longer appear in user-facing chat copy — they
+   remain on `hint` and in the System/API views). The honesty invariant is
+   unchanged and still pinned here: the line must distinguish "runtime is not
+   ready yet" from "this model is not verified", so a warming-up model is never
+   presented as verified and vice versa. */
+assert.match(chatSource, /statusLine\s*=[\s\S]*warming up — send unlocks shortly/, 'chat readiness copy must still name the runtime readiness requirement')
+assert.match(chatSource, /statusLine\s*=[\s\S]*isn't verified for chat yet/, 'chat readiness copy must still name the support requirement separately from runtime readiness')
 assert.match(chatSource, /selectedRuntimeReady\s*=\s*selectedChatGate\.runtimeReady/, 'live 3B chat readiness must use the shared exact-row gate instead of stale browser runtime fields')
 assert.match(chatSource, /selectedModelCapabilitySupported\s*=\s*selectedChatGate\.contractSupported/, 'live 3B support readiness must use the shared exact-row gate contract state')
 assert.doesNotMatch(chatSource, /selectedChatGate\.runtimeReady\s*\|\|\s*isRunnableInCurrentRuntime/, 'live 3B chat must not bypass runtime loaded_now through the older runnable helper')
 assert.doesNotMatch(chatSource, /isCompatibilitySupportedForModel\(capabilities, selectedModel\)/, 'live 3B support readiness must not re-check support outside the shared chat gate')
-assert.match(chatSource, /supportStatusLabel\s*=\s*selectedModelCapabilitySupported[\s\S]*\?\s*selectedCompatibilityLabel/, 'supported live chat readiness must name the exact /api/capabilities row instead of a generic green label')
-assert.match(chatSource, /supportStatusCopy\s*=\s*selectedModelCapabilitySupported[\s\S]*`\$\{selectedCompatibilityLabel\}\. COMPATIBILITY\.md and \/api\/capabilities agree/, 'supported live chat readiness copy must preserve the exact row id after the gate turns green')
+/* Row-id placement change (2026-08), called out for review: the composer used to
+   print the exact capabilities row id as its green-state label. That id is
+   maintainer vocabulary in the middle of a chat surface, so the composer now
+   names the model in plain language and the exact row id moved to the surfaces
+   built to carry evidence — the Evidence Chip, the System and API views, and
+   `hint` on the gate. What must not regress is the support claim's SOURCE, so
+   that is what is pinned: it may only come from the shared gate, never from
+   runtime health or a name match. */
+assert.match(chatSource, /selectedModelCapabilitySupported\s*=\s*selectedChatGate\.contractSupported/, 'the composer support claim must derive only from the shared exact-row gate')
+assert.match(chatSource, /<EvidenceChip/, 'the experimental lane must still declare itself through the Evidence Chip rather than plain text')
 // Redesign (2026-06): the six overlapping readiness surfaces were consolidated into one
 // status line in the docked composer. Runtime + exact-row support readiness still render
 // together (honesty preserved); row-scoped capability-lane copy now lives in the System/API
 // views (still asserted there). Behavioral intent — never show ready when gated — is unchanged.
-assert.match(chatSource, /cxcomposer__status[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel/, 'redesigned chat must keep runtime + exact-row support readiness in the consolidated status surface')
-assert.match(chatSource, /selectedCompatibilityLabel/, 'redesigned chat must surface the exact-row compatibility label, not a generic green badge')
+assert.match(chatSource, /cxcomposer__status[\s\S]*cxcomposer__status-text">\{statusLine\}/, 'redesigned chat must keep runtime + support readiness in the consolidated status surface')
+/* The exact row id moved off the chat surface (maintainer vocabulary in a chat
+   window) to the views built to carry evidence. What is pinned now is that chat
+   never prints internal doc names, and its claim still comes from the gate. */
+assert.doesNotMatch(chatSource, /COMPATIBILITY\.md/, 'chat copy must not name internal doc files')
 assert.match(chatSource, /StreamingLoader/, 'live 3B chat must keep an accessible pre-token loader')
 assert.equal((chatSource.match(/aria-label="Message Camelid"/g) || []).length, 1, 'redesigned chat docks a single shared composer textarea')
 // Redesign (2026-07, D14): the Models page was rebuilt as five derived zones. The 3B
@@ -331,7 +352,7 @@ assert.doesNotMatch(modelsSource, /api\/models\/load/, 'ModelsView must not hand
 assert.doesNotMatch(modelsSource, /runtimeReady\s*=\s*isRunnableModel\(model\)/, 'ModelsView must not label runtime readiness from stale model-only readiness')
 assert.match(catalogSource, /isCompatibilitySupportedForModel\(capabilities, null, item\)/, 'catalog rows must resolve their landing lane through the shared capability matcher')
 assert.match(catalogSource, /if \(item\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')
-assert.match(apiSource, /Selected exact-row evidence/, 'API view must surface selected 3B exact-row evidence')
+assert.match(apiSource, /Selected model evidence/, 'API view must surface evidence for the selected model')
 assert.match(apiSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API view must use the shared exact-row chat gate for 3B endpoint readiness')
 assert.match(apiSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API view must not reimplement 3B endpoint readiness separately from Chat/System')
 assert.match(apiSource, /selectedExactRowReady/, 'API view endpoint readiness must use selected exact-row readiness, not broad family evidence')
@@ -339,9 +360,10 @@ assert.match(apiSource, /selectedCompatibilityTarget\.frontend_readiness_gate/, 
 assert.match(systemSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'System view must use the shared exact-row chat gate for 3B readiness surfaces')
 assert.match(systemSource, /selectedCompatibilityHint\s*=\s*selectedChatGate\.hint \|\| findCompatibilityHint\(capabilities, selectedModel\)/, 'System selected exact-row evidence must stay anchored to the shared chat gate compatibility hint')
 assert.match(systemSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'System view must not promote /v1 chat readiness from generation_ready alone')
-assert.match(systemSource, /Blocked for UX chat until selected exact row evidence and runtime readiness both match/, 'System curl copy must stay blocked until 3B exact-row support and runtime readiness both match')
-assert.match(systemSource, /Endpoint\/chat gate:/, 'System selected 3B evidence must show the retained endpoint/chat readiness gate')
-assert.match(systemSource, /rowSupportNextStepCopy\(target, apiFeatures\)/, 'System compatibility rows must render filtered exact-row next-step copy instead of raw blocker text')
+/* The readiness-gated curl now lives only on the API view. */
+assert.match(apiSource, /Locked until the selected model is loaded and verified/, 'curl copy must stay locked until support and runtime readiness both match')
+assert.match(systemSource, /Chat readiness:/, 'System must still show the retained chat readiness gate')
+assert.match(systemSource, /<SupportContractSummary/, 'System must render the contract through the shared summary that owns its copy')
 // Redesign (2026-06): the TopBar support-contract strip was removed; the slim TopBar now shows
 // the conversation title + a compact model status chip. It must still derive that chip from the
 // shared exact-row chat gate and resolve the active model through runtime_model_name aliases

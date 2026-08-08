@@ -135,6 +135,7 @@ const dashboardHookSource = read('../src/hooks/useDashboardData.js')
 const executionPlanSource = read('../src/lib/executionPlan.js')
 const loadedModelDisplaySource = read('../src/lib/loadedModelDisplay.js')
 const apiViewSource = read('../src/views/ApiView.jsx')
+const supportContractSummarySource = read('../src/components/api/SupportContractSummary.jsx')
 const systemViewSource = read('../src/views/SystemView.jsx')
 const modelsViewSource = read('../src/views/ModelsView.jsx')
 const topBarSource = read('../src/components/TopBar.jsx')
@@ -176,7 +177,11 @@ assert.match(chatWorkspaceSource, /lastVisibleMessageIsUser[\s\S]*awaitingAssist
 assert.match(chatWorkspaceSource, /hasStreamingAssistant[\s\S]*generationActive/, 'a persisted streaming row should keep the UI active even if the send call state changes')
 assert.match(chatWorkspaceSource, /cxcomposer__status/, 'the composer should keep the consolidated runtime/support status line')
 assert.match(chatWorkspaceSource, /<EvidenceChip/, 'the composer support claim should render through the Evidence Chip, not an ad-hoc badge')
-assert.match(chatWorkspaceSource, /selectedChatGate\.contractSupported \? 'supported'/, 'the composer Evidence Chip must take its supported state only from the shared chat gate')
+/* The composer's status EvidenceChip became a one-line status + details tooltip
+   (2026-08 redesign); the chip itself now marks the experimental lane. The
+   invariant this pins is unchanged: the support claim may only come from the
+   shared chat gate, never from runtime health or a name match. */
+assert.match(chatWorkspaceSource, /selectedModelCapabilitySupported\s*=\s*selectedChatGate\.contractSupported/, 'the composer support claim must take its supported state only from the shared chat gate')
 /* Ported (Phase 9): the original blunt regex predates the composer's send-time
    budget VALIDATION (which legitimately references the configured cap). The
    intent stands: chat must not render a max-token PICKER — the control lives
@@ -253,14 +258,20 @@ assert.match(streamParserSource, /replace\(/, 'stream parser should normalize li
 assert.match(streamParserSource, /split\('\\n\\n'\)/, 'stream parser should split normalized SSE events on blank lines for partial rendering')
 
 /* ---- API view ---- */
-assert.match(apiViewSource, /Selected exact-row evidence/, 'API support view should show selected exact-row evidence instead of a broad validated-target claim')
-assert.match(apiViewSource, /<CanonicalStatement text=\{supportContractCurrentGate\}/, 'API should render the complete gate through the shared structured canonical statement')
+assert.match(apiViewSource, /Selected model evidence/, 'API support view should show evidence for the selected model instead of a broad validated-target claim')
+/* 2026-08 UI polish: System and API no longer each render their own copy of
+   the support-contract block; both defer to the shared SupportContractSummary,
+   and row-level quant/family evidence lives only in the Compatibility ledger.
+   Pinned below: the shared card is used, and neither view re-duplicates rows. */
+assert.match(apiViewSource, /<SupportContractSummary/, 'API should render the gate through the shared support-contract summary')
+assert.match(supportContractSummarySource, /<CanonicalStatement text=\{currentGate\} \/>/, 'the shared summary must render the complete gate through the structured canonical statement')
+assert.match(supportContractSummarySource, /View full row-level evidence in Compatibility/, 'the shared summary must deep-link to the ledger that owns row-level evidence')
 assert.match(apiViewSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API endpoint readiness should use the shared exact-row chat gate')
 assert.match(apiViewSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API endpoint readiness should stay aligned with Chat/System exact-row chat unlocks')
 assert.match(apiViewSource, /selectedRuntimeMatches/, 'API endpoint readiness should require active_model_id to match the selected model')
 assert.match(apiViewSource, /readinessPillCopy/, 'API endpoint status copy should come from the exact-row readiness gate, not generation_ready alone')
 assert.match(apiViewSource, /chatCompletionsCopy/, 'API chat-completions copy should stay gated unless selected exact-row evidence and runtime readiness both match')
-assert.match(apiViewSource, /Blocked for UX chat until selected exact row evidence and runtime readiness both match/, 'API curl example should fail closed until exact-row evidence and runtime readiness match')
+assert.match(apiViewSource, /Locked until the selected model is loaded and verified/, 'API curl example must still fail closed until the model is loaded and verified')
 assert.match(apiViewSource, /selectedCompatibilityTarget\.frontend_readiness_gate/, 'API support view should surface the selected row readiness gate verbatim from /api/capabilities')
 assert.match(apiViewSource, /selectedCompatibilityTarget\.support_scope/, 'API support view should surface exact-row support scope instead of inferring a broader claim')
 assert.match(apiViewSource, /selectedCompatibilityTarget\.latest_checked_bucket/, 'API support view should surface exact-row latest checked bucket evidence')
@@ -268,16 +279,16 @@ assert.match(apiViewSource, /selectedCompatibilityTarget\.latest_checked_output/
 assert.match(apiViewSource, /selectedCompatibilityTarget\.full_support_status/, 'API support view should show the exact row full-support status boundary')
 assert.match(apiViewSource, /exactRowSupportLanes\(selectedCompatibilityTarget, apiFeatures\)/, 'API support view should show template/Jinja, checked-context, and throughput readiness lanes for the selected exact row')
 assert.match(apiViewSource, /rowSupportBoundaryCopy\(selectedCompatibilityTarget, apiFeatures\)/, 'API support view should filter resolved template/Jinja and throughput blockers out of the remaining support boundary')
-assert.match(apiViewSource, /rowSupportNextStepCopy\(target, apiFeatures\)/, 'API support view should filter resolved template/Jinja and throughput blockers out of row next-step copy')
+assert.match(apiViewSource, /Selected model evidence/, 'API must still show evidence scoped to the selected model')
 assert.match(capabilitiesSource, /function frontendSupportContractCopy/, 'frontend support contract copy should filter resolved template/Jinja and throughput caveats for current supported rows')
 assert.match(capabilitiesSource, /Production-throughput readiness is green/, 'capability helpers should describe production-throughput as a green exact-row readiness lane when perf evidence is supported')
 assert.match(exactRowEvidenceSummarySource, /function groupExactRows[\s\S]*target\?\.id && target\?\.\[field\]/, 'exact-row evidence summaries should group only concrete compatibility rows with the requested field')
-assert.match(apiViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="quantization"/, 'API support view should summarize quant evidence with the shared exact-row renderer')
-assert.match(apiViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="family"/, 'API support view should summarize family evidence with the shared exact-row renderer')
-assert.match(apiViewSource, /Exact-row quant evidence/, 'API support view should label quant evidence as exact-row scoped')
-assert.match(apiViewSource, /Exact-row family evidence/, 'API support view should label family evidence as exact-row scoped')
-assert.match(apiViewSource, /broad quant lists do not unlock chat/, 'API support view should not promote broad quant lists into chat readiness')
-assert.match(apiViewSource, /row-scoped family\/quant evidence/, 'API endpoint summary should describe family and quant evidence as row-scoped')
+assert.doesNotMatch(apiViewSource, /ExactRowEvidenceSummary/, 'API must not re-duplicate row-level evidence; the Compatibility ledger owns it')
+assert.doesNotMatch(systemViewSource, /ExactRowEvidenceSummary/, 'System must not re-duplicate row-level evidence; the Compatibility ledger owns it')
+assert.match(apiViewSource, /Selected model contract/, 'API must still show the contract scoped to the selected model')
+assert.doesNotMatch(apiViewSource, /COMPATIBILITY\.md/, 'API user-facing copy must not name internal doc files')
+assert.match(apiViewSource, /selectedCompatibilitySupported/, 'API chat readiness must stay scoped to the selected model, not broad quant lists')
+assert.match(apiViewSource, /reports what has been verified/, 'API endpoint summary must describe capabilities as verified evidence, not a broad claim')
 assert.doesNotMatch(apiViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|summarizeCapabilityItems/, 'API support view should not render non-row capability lists as support evidence')
 assert.match(apiViewSource, /No exact compatibility row matched this selected model/, 'API selected model contract should fail closed instead of displaying family or saved-path guesses')
 assert.match(apiViewSource, /displayCapabilityCopy\(selectedCompatibilityTarget\.evidence\)/, 'API support view should sanitize and display exact-row evidence copy')
@@ -288,15 +299,16 @@ assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '
 assert.match(apiViewSource, /<EvidenceChip/, 'API contract rows should render their status claims through the Evidence Chip')
 
 /* ---- System view ---- */
-assert.match(systemViewSource, /Selected exact-row evidence/, 'System support view should show selected exact-row evidence instead of broad quant or family capability lists')
-assert.match(systemViewSource, /<CanonicalStatement text=\{supportContractCurrentGate\}/, 'System should render the complete gate through the shared structured canonical statement')
-assert.match(systemViewSource, /Exact-row quant evidence/, 'System support view should scope quant evidence to compatibility rows')
-assert.match(systemViewSource, /Exact-row family evidence/, 'System support view should scope family evidence to compatibility rows')
-assert.match(systemViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="quantization"/, 'System support view should summarize quant evidence with the shared exact-row renderer')
-assert.match(systemViewSource, /<ExactRowEvidenceSummary targets=\{compatibilityTargets\} field="family"/, 'System support view should summarize family evidence with the shared exact-row renderer')
+assert.match(systemViewSource, /Selected model verification/, 'System must show verification scoped to the selected model, not broad capability lists')
+assert.match(systemViewSource, /<SupportContractSummary/, 'System should render the gate through the shared support-contract summary')
+assert.match(systemViewSource, /selectedChatGate\.contractSupported/, 'System support state must come from the shared gate')
+assert.doesNotMatch(systemViewSource, /COMPATIBILITY\.md/, 'System user-facing copy must not name internal doc files')
+assert.match(supportContractSummarySource, /verified models/, 'the shared summary must still surface how many models are verified')
+assert.match(systemViewSource, /Chat readiness:/, 'System must still spell out the chat readiness gate')
 assert.doesNotMatch(systemViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|summarizeCapabilityItems/, 'System support view should not render non-row capability lists as support evidence')
 assert.match(systemViewSource, /displayCapabilityId\(feature\.id\)/, 'System view should not render raw provider-scoped API feature ids')
-assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
+/* The readiness-gated curl now has a single home on the API view. */
+assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'the curl example must use the loaded backend model id for alias-selected rows')
 assert.match(systemViewSource, /<EvidenceChip/, 'System contract rows should render their status claims through the Evidence Chip')
 assert.match(dashboardHookSource, /\.\.\.executionRuntimeFields\(health\)/, 'dashboard runtime state should use the tested health execution-field mapper')
 assert.match(systemViewSource, /describeExecutionPlan\(runtime\)/, 'System execution copy should come only from the health-derived runtime snapshot')
@@ -383,7 +395,7 @@ assert.match(firstRunCardSource, /firstRunCancelOutcome\(\{ confirmed, \.\.\.obs
 assert.doesNotMatch(firstRunCardSource, /finally \{[\s\S]{0,200}fail\('Download canceled/, 'cancellation must never be reported unconditionally from a finally block')
 assert.match(modelsViewSource, /loadInFlightRef\.current[\s\S]*(already loading|finish loading, then retry)/, 'model loading must be single-flight across catalog completions')
 assert.match(modelsViewSource, /deleteLocalModel\(entry\)/, 'local deletion must submit the scanned entry identity rather than filename alone')
-assert.match(modelsViewSource, /Delete model from disk\?/, 'local model deletion must require destructive confirmation')
+assert.match(modelsViewSource, /This cannot be undone[\s\S]*confirmLabel="Delete model"/, 'local model deletion must require destructive confirmation naming the file')
 assert.match(laneRowsSource, /entry\.delete_token/, 'delete controls must require the scan-issued opaque identity token')
 assert.match(laneRowsSource, /model-delete-guard/, 'disabled delete controls must reference visible guard copy')
 assert.match(downloadsPanelSource, /catalog\/downloads|bytes_downloaded/, 'download progress must come only from the backend downloads poll')
@@ -391,7 +403,9 @@ assert.match(downloadedModelsViewSource, /loadLocalModelForChat\(/, 'each downlo
 assert.match(downloadedModelsViewSource, /unloadLocalModel\(\{ apiBase: spine\.base, modelId \}\)/, 'each downloaded-model Unload action must target that exact resident model')
 assert.match(downloadedModelsViewSource, /isActive \? spine\.current\?\.id : entry\.filename/, 'an auto-loaded active card must unload by its registry id even when GGUF metadata named it differently')
 assert.match(downloadedModelsViewSource, /spine\.loadedModelIds\.has\(entry\.filename\)/, 'card actions must use the full resident registry, including non-active sidecars')
-assert.match(downloadedModelsViewSource, />\s*Load\s*<\/Button>[\s\S]*>\s*Unload\s*<\/Button>/, 'every downloaded model card must expose both Load and Unload controls')
+/* Load and Unload became one mutually exclusive control keyed on isLoaded; a row
+   of permanently disabled Unload buttons was the defect this replaced. */
+assert.match(downloadedModelsViewSource, /isLoaded \?[\s\S]*Unload\s*<\/Button>[\s\S]*Load\s*<\/Button>/, 'every downloaded model card must expose the load control appropriate to its state')
 assert.match(viewsCss, /\.downloaded-model \.cxv-card__foot\s*\{[^}]*flex-direction:\s*column/, 'downloaded-model metadata and actions must occupy separate footer rows')
 assert.match(viewsCss, /\.downloaded-model \.cxv-card__actions\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*160px\)\)[^}]*width:\s*100%[^}]*min-width:\s*0/, 'downloaded-model actions must use a bounded two-column grid instead of overflowing into adjacent cards')
 assert.match(viewsCss, /\.downloaded-model \.cxv-card__actions \.cxv-danger\s*\{\s*grid-column:\s*2/, 'downloaded-model Delete actions must stay aligned to the lower-right grid cell')
@@ -458,7 +472,7 @@ const {
   assert.ok(Math.abs(tokensToSlider(sliderToTokens(0.5)) - 0.5) < 0.03, 'log slider mapping round-trips')
 }
 assert.match(rlcSource, /from model metadata, not a support claim/, 'the context marker must disclaim support (I2)')
-assert.match(rlcSource, /memory estimate unavailable — backend does not yet report/, 'missing memory data renders an honest absent line, never a fake gauge')
+assert.match(rlcSource, /Memory estimate not available/, 'missing memory data renders an honest absent line, never a fake gauge')
 assert.match(rlcSource, /estimated/, 'the future readout contract keeps the estimated label in source')
 assert.doesNotMatch(rlcSource, /navigator\.deviceMemory|performance\.memory/, 'no client-side memory guessing')
 assert.match(chatWorkspaceSource, /validateSendBudget/, 'the composer must validate prompt+max_tokens against the real context rule at send time')
@@ -507,7 +521,7 @@ assert.doesNotMatch(faviconSource, /9b51e0|4285f4|fa9085/, 'favicon must not car
 const flowBenchSource = read('../src/components/observatory/FlowBench.jsx')
 const flowBenchEngineSource = read('../src/lib/observatory/flowBench.js')
 const observatoryViewSource = read('../src/views/InferenceObservatoryView.jsx')
-assert.match(observatoryViewSource, /operational telemetry — not compatibility evidence/, 'the Flow Bench view must carry the telemetry-not-evidence affordance')
+assert.match(observatoryViewSource, /live session stats/, 'the Observatory must still declare its numbers as session stats, not support evidence')
 assert.match(observatoryViewSource, /flowbench-rail__tiles/, 'the instrument rail tiles must be present')
 assert.match(flowBenchSource, /aria-hidden="true"/, 'the sim canvases must be aria-hidden; the rail and log carry the information')
 assert.match(flowBenchSource, /reducedMotion/, 'reduced motion must render a static field instead of animation')
@@ -528,10 +542,10 @@ assert.match(paletteSource, /camelid:open-ledger/, 'palette ledger jumps must us
 assert.match(frontendReadmeSource, /readiness-gate semantics are \*\*unchanged\*\*/, 'frontend README must state gate semantics are unchanged after the overhaul')
 
 /* ---- Session telemetry (Phase 6) ---- */
-assert.match(telemetryViewSource, /operational telemetry — not compatibility evidence/, 'every telemetry surface must carry the not-evidence affordance')
+assert.match(telemetryViewSource, /Live session stats — measured in this browser, nothing persisted/, 'every telemetry surface must declare its numbers as session stats, not support evidence')
 assert.match(telemetryViewSource, /useState\(false\)/, 'prompt reveal must default to redacted')
 assert.match(telemetryViewSource, /•••• redacted/, 'redacted prompts must render visibly redacted')
-assert.match(telemetryViewSource, /It never seeds or invents data/, 'the empty state must promise no synthetic data')
+assert.match(telemetryViewSource, /Nothing is seeded, stored, or shared/, 'the page must promise no synthetic data')
 assert.doesNotMatch(telemetryViewSource, /EvidenceChip[\s\S]{0,300}(ttftMs|tokensPerSec|durationMs|medianT)/, 'perf numbers must never render inside Evidence Chips')
 assert.doesNotMatch(telemetryLogSource, /Math\.random|seedData|sampleData|fakeData|demoData/, 'the telemetry store must have no synthetic data path')
 assert.match(dashboardHookSource, /recordChatGeneration\(/, 'chat sends must feed the session telemetry store')
@@ -551,7 +565,7 @@ assert.match(apiViewSource, /<ApiWorkbench/, 'the API view must mount the workbe
 assert.match(apiViewSource, /chatUnlocked=\{selectedExactRowReady\}/, 'workbench generation gating must come from the shared exact-row chat gate')
 assert.match(apiWorkbenchSource, /Requires a loaded supported model/, 'gated generation try-its must say they require a loaded supported model')
 assert.match(apiWorkbenchSource, /gated exactly like chat/, 'the guarded copy must tie the workbench gate to the chat gate')
-assert.match(apiWorkbenchSource, /operational telemetry — not compatibility evidence/, 'the request inspector must carry the telemetry-not-evidence banner')
+assert.match(apiWorkbenchSource, /Live request stats — measured in this browser, nothing persisted/, 'the request inspector must declare its numbers as request stats, not support evidence')
 assert.match(apiWorkbenchSource, /fail_closed/, 'fail-closed routes must render their typed guarded state')
 assert.doesNotMatch(apiWorkbenchSource, /dangerouslySetInnerHTML/, 'inspector output must render as text')
 /* lib/apiExamples.js is deliberately NOT in the brand sweep: code samples may
@@ -579,10 +593,12 @@ assert.match(runtimeMemoryPanelSource, /Purge KV cache/, 'Analytics runtime card
 
 /* ---- TopBar (re-baselined to the Evidence Chip gate) ---- */
 assert.match(topBarSource, /getChatGateState\(capabilities, selectedModel, runtime\)/, 'TopBar must derive its support claim from the shared chat gate')
-assert.match(topBarSource, /<EvidenceChip/, 'TopBar support gate must render through the Evidence Chip')
+/* The permanent top-bar contract chip printed raw row ids on every screen and was
+   removed; the model chip keeps the claim, still sourced from the shared gate. */
+assert.doesNotMatch(topBarSource, /COMPATIBILITY\.md|CONTRACT ROW/i, 'TopBar must not print raw contract vocabulary')
 assert.match(topBarSource, /className="topbar__gate"/, 'TopBar gate block must render on every tab, not only chat')
 assert.doesNotMatch(topBarSource, /tab === 'chat' && !demoMode &&[\s\S]*topbar__gate/, 'TopBar gate visibility must not be restricted to the chat tab')
-assert.match(topBarSource, /state=\{gate\.contractSupported \? 'supported'/, 'TopBar Evidence Chip supported state must come only from the shared gate contract flag')
+assert.match(topBarSource, /gate\.contractSupported/, 'TopBar support state must come only from the shared gate contract flag')
 
 /* ---- Evidence Chip system (Phase 1 contract) ---- */
 assert.doesNotMatch(evidenceChipSource, /fetch\(|getChatGateState|isCompatibilitySupportedForModel|findCompatibilityHint/, 'EvidenceChip must stay purely presentational — it renders gate state, never computes or fetches it')
@@ -601,7 +617,7 @@ assert.ok(runnableChipRule, 'evidence.css must define the runnable chip state')
 assert.doesNotMatch(runnableChipRule[0], /var\(--color-verified\)/, 'the runnable chip must never spend the reserved copper token')
 assert.match(runnableChipRule[0], /var\(--color-evidence\)/, 'the runnable chip must use the amber evidence token (the 🟡 legend state)')
 assert.match(parityReceiptSource, /execution_lane === 'runnable'/, 'the receipt card must detect the runnable lane from the receipt schema')
-assert.match(parityReceiptSource, /Runnable lane/, 'a runnable receipt must be labelled distinctly from a supported parity receipt')
+assert.match(parityReceiptSource, /Not yet verified — run the command below to check/, 'an unverified receipt must be labelled distinctly from a verified one')
 const runnableCardRule = chatCss.match(/\.parity-receipt-lane-badge\s*\{[^}]*\}/s)
 assert.ok(runnableCardRule, 'chat.css must style the runnable lane badge')
 assert.doesNotMatch(runnableCardRule[0], /var\(--color-verified\)/, 'the runnable lane badge must never be copper')

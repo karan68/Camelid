@@ -117,13 +117,16 @@ try {
   check('view: honest no-traffic state renders with no requests', () => {
     const html = renderToStaticMarkup(React.createElement(InferenceObservatoryView, { apiBase: 'http://127.0.0.1:1' }))
     assert.ok(html.includes('No session traffic yet'), 'honest empty copy missing')
-    assert.ok(html.includes('The Flow Bench'), 'title missing')
+    assert.ok(html.includes('Observatory'), 'title missing')
     assert.ok(html.includes('flowbench'), 'bench stage missing')
-    assert.ok(html.includes('operational telemetry'), 'not-evidence affordance missing')
+    assert.ok(html.includes('live session stats'), 'not-evidence affordance missing')
   })
   check('view: never-fake-motion promise exists in source', () => {
     const source = readFileSync(resolve(frontendRoot, 'src/views/InferenceObservatoryView.jsx'), 'utf8')
-    assert.ok(source.includes('never fake motion'))
+    // The promise moved from the long metaphor intro into one plain sentence;
+    // the guarantee it makes (idle means nothing is running, never fake motion)
+    // is unchanged and still stated to the user.
+    assert.ok(source.includes('When nothing is running, the view stays still'))
     assert.ok(source.includes('the bench stays still until a real request runs'))
   })
 

@@ -57,7 +57,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
         <div className="cxv-head__copy">
           <p className="cxv-kicker"><IconApi size={14} /> API</p>
           <h1>API</h1>
-          <p className="cxv-sub">The local OpenAI-compatible API: <code>/api/capabilities</code> reports what has been verified on this machine, and <code>/v1/health</code> reports what is loaded right now.</p>
+          <p className="cxv-sub">The local <code>/v1</code>-compatible API: <code>/api/capabilities</code> reports what has been verified on this machine, and <code>/v1/health</code> reports what is loaded right now.</p>
         </div>
         <div className="cxv-head__actions">
           <StatusDot tone={runtimeStatus.tone} pulse={generationReady} label={headerStatus} />
