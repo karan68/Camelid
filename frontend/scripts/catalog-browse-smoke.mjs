@@ -249,8 +249,13 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
     { catalog_id: 'd', fit: 'unknown' },
   ]
   const { runnable, blocked } = partitionCuratedByFit(curated)
-  assert.deepEqual(runnable.map((i) => i.catalog_id), ['a', 'd'], 'unprobed hosts keep their catalog')
-  assert.deepEqual(blocked.map((i) => i.catalog_id), ['b', 'c'])
+  /* Only a PERMANENT refusal folds away. 'c' is insufficient_free_memory: the
+     machine is big enough and the memory is merely busy, which the user can
+     change, so the row stays visible carrying its own amber chip and Re-check
+     button. Folding it away turned a busy machine into a seemingly empty
+     catalog. 'b' is wont_fit, which freeing memory cannot change. */
+  assert.deepEqual(runnable.map((i) => i.catalog_id), ['a', 'c', 'd'], 'a busy machine keeps its catalog visible')
+  assert.deepEqual(blocked.map((i) => i.catalog_id), ['b'], 'only models too big for the machine fold away')
 
   const ghostAlternative = {
     catalog_id: 'ghost',
@@ -268,7 +273,7 @@ function hfFile({ repo = 'unsloth/Phi-4-mini-instruct-GGUF', quant, size, fit = 
   )
   assert.deepEqual(
     partitionCuratedByFit([...curated, ghostAlternative]).runnable.map((i) => i.catalog_id),
-    ['a', 'd', 'ghost'],
+    ['a', 'c', 'd', 'ghost'],
     'a verified Ghost resident set keeps an otherwise-too-large curated model visible as runnable',
   )
   assert.equal(

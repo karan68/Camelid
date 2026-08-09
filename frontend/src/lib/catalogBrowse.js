@@ -256,11 +256,23 @@ export function partitionByArchSupport(groups) {
 
 /* Split curated rows into what this machine can run and what it cannot, for the
    no-search landing state. Rows with an `unknown` verdict count as runnable: an
-   unprobed host must not have its whole catalog folded away. */
+   unprobed host must not have its whole catalog folded away.
+
+   Only a PERMANENT refusal is folded away. `insufficient_free_memory` means the
+   machine is big enough and the memory is merely in use right now, which changes
+   the moment another app closes — folding those rows away made a busy machine
+   look like a small one. On a host with little free memory that was most of the
+   catalog: measured here, 31 of 33 curated rows collapsed behind a disclosure and
+   the page read as broken. Those rows stay in the list, where they already render
+   an amber chip, the reason, and the Re-check button that re-probes memory live.
+   `wont_fit` is the one refusal freeing memory cannot change, so it still folds. */
 export function partitionCuratedByFit(items) {
+  const permanentlyRefused = (item) => isRefusingFit(item.fit)
+    && !fitIsRecheckable(item.fit)
+    && !ghostMoeFits(item)
   return {
-    runnable: items.filter((item) => !isRefusingFit(item.fit) || ghostMoeFits(item)),
-    blocked: items.filter((item) => isRefusingFit(item.fit) && !ghostMoeFits(item)),
+    runnable: items.filter((item) => !permanentlyRefused(item)),
+    blocked: items.filter(permanentlyRefused),
   }
 }
 
