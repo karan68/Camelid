@@ -1441,7 +1441,13 @@ enum Command {
     /// Download a supported model (a known-good Q8_0 GGUF) into ./models.
     ///
     /// Run with no argument to list the catalog. Accepts a catalog id or a
-    /// fragment of the name, e.g. `camelid pull llama32_3b`.
+    /// fragment of the name, e.g. `camelid pull 3b_instruct_q8`.
+    //
+    // The id here is a plain literal because clap reads doc attributes
+    // textually and silently drops anything that is not already a string
+    // literal, so it cannot be spliced in from a constant. It is kept honest by
+    // `catalog::tests::every_pull_example_in_the_source_resolves`, which scans
+    // for this pattern and requires every id it finds to resolve.
     Pull {
         /// Catalog id or name fragment to download. Omit to list all models.
         model: Option<String>,

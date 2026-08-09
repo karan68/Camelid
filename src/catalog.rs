@@ -10,6 +10,25 @@ use std::path::{Path, PathBuf};
 
 use crate::api::{curated_catalog, CatalogItem};
 
+/// The id shown to users as the worked example of `camelid pull`.
+///
+/// This is a constant, and covered by a test, because the previous example was
+/// a bare `llama32_3b` that stopped resolving the moment the Q4_K_M and Q5_K_M
+/// rows joined the catalog: the fragment then named three different multi-GB
+/// downloads and `resolve` correctly refused to guess. The catalog listing and
+/// `--help` both kept printing it, so the CLI spent several releases telling
+/// people to run a command that could only ever error. Nothing failed, because
+/// nothing checked that the advice the CLI gives is advice the CLI accepts.
+///
+/// Quant-qualified so it stays unique as more quantizations of the same model
+/// are certified.
+///
+/// `every_pull_example_in_the_source_resolves` is the real guard: it scans the
+/// crate for `camelid pull <id>` in any string or comment and requires each id
+/// to resolve. That covers `--help`, whose text clap reads textually from doc
+/// attributes and so cannot be built from this constant.
+pub const PULL_EXAMPLE: &str = "3b_instruct_q8";
+
 /// Entry point for the `Pull` subcommand. With no `query`, prints the catalog;
 /// otherwise resolves `query` to exactly one row and downloads it into
 /// `models_dir`.
@@ -18,7 +37,7 @@ pub fn run_pull(query: Option<&str>, models_dir: &Path) -> anyhow::Result<()> {
 
     let Some(query) = query else {
         print_catalog(&entries);
-        eprintln!("\nDownload one with:  camelid pull <id>   (e.g. camelid pull llama32_3b)");
+        eprintln!("\nDownload one with:  camelid pull <id>   (e.g. camelid pull {PULL_EXAMPLE})");
         return Ok(());
     };
 
@@ -292,6 +311,103 @@ mod tests {
         let entries = curated_catalog();
         let item = resolve(&entries, "3b-instruct-q8").unwrap();
         assert_eq!(item.catalog_id, "llama32_3b_instruct_q8_0");
+    }
+
+    /// The CLI must not advertise a command that the CLI rejects.
+    ///
+    /// `a_family_fragment_spanning_several_quants_refuses_to_guess` below
+    /// asserts that `llama32_3b` is ambiguous -- and for several releases that
+    /// was exactly the id the catalog footer and `--help` told people to run.
+    /// Both tests passed the whole time, because nothing tied the printed
+    /// example to the resolver. This is that tie.
+    #[test]
+    fn example_id_actually_resolves() {
+        let entries = curated_catalog();
+        let item = resolve(&entries, PULL_EXAMPLE).unwrap_or_else(|err| {
+            panic!("PULL_EXAMPLE ({PULL_EXAMPLE}) must resolve, but `camelid pull {PULL_EXAMPLE}` would fail: {err}")
+        });
+        assert_eq!(item.catalog_id, "llama32_3b_instruct_q8_0");
+    }
+
+    /// Every `camelid pull <id>` written anywhere in the crate must resolve.
+    ///
+    /// The constant above only guards the catalog footer. `--help` cannot use
+    /// it -- clap reads doc attributes textually and drops anything that is not
+    /// already a string literal -- so its example is a hand-written literal and
+    /// would drift again on the next catalog change. Scanning the source catches
+    /// that copy, and every other one: comments, strings, help text alike.
+    #[test]
+    fn every_pull_example_in_the_source_resolves() {
+        let entries = curated_catalog();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir)
+                .expect("readable source dir")
+                .flatten()
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "found no .rs files under {}",
+            root.display()
+        );
+
+        let mut checked = 0usize;
+        let mut broken = Vec::new();
+
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("readable source file");
+            for (lineno, line) in text.lines().enumerate() {
+                let mut rest = line;
+                while let Some(at) = rest.find("camelid pull ") {
+                    let tail = &rest[at + "camelid pull ".len()..];
+                    // Stop at the first character that cannot be part of an id.
+                    let id: String = tail
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                        .collect();
+                    rest = &tail[id.len().min(tail.len())..];
+
+                    // `camelid pull <id>` and `camelid pull` alone are usage
+                    // syntax, not examples.
+                    if id.is_empty() {
+                        continue;
+                    }
+                    checked += 1;
+                    if resolve(&entries, &id).is_err() {
+                        broken.push(format!(
+                            "{}:{} -> `camelid pull {}`",
+                            file.file_name().unwrap_or_default().to_string_lossy(),
+                            lineno + 1,
+                            id
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked > 0,
+            "scanned {} files but found no examples",
+            files.len()
+        );
+        assert!(
+            broken.is_empty(),
+            "these `camelid pull` examples name ids that do not resolve, so the \
+             command as printed would fail:\n  {}",
+            broken.join("\n  ")
+        );
     }
 
     #[test]
