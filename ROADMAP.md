@@ -1,12 +1,12 @@
 # Camelid Roadmap
 
-Last updated: 2026-05-31
+Last updated: 2026-08-09
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.
 
 [`COMPATIBILITY.md`](COMPATIBILITY.md) defines what Camelid can honestly support today. [`STATUS.md`](STATUS.md) records the artifacts, evidence boundaries, and blocker state behind that posture. Detailed completed-phase history lives in `ROADMAP_ARCHIVE.md` and `STATUS.md`. Read this file as operating sequence, not aspiration.
 
-Executive summary: Camelid has one full verified gate, three bounded Llama exact-row lanes, and one promoted Mistral exact-row smoke lane. TinyLlama 1.1B Chat Q8_0 remains the trusted gate. Llama 3.2 1B Instruct Q8_0 is verified through checked 512/1024/2048/4096/8192 context packs. Llama 3.2 3B Instruct Q8_0 is supported as exact-row smoke through the anchored checked 512/1024/2048/4096/8192 raw-decode context ladder on its current canonical GGUF, with the canonical Ubuntu API/WebUI evidence retained as historical evidence for the prior upload. Llama 3 8B Instruct Q8_0 is verified within checked 512/1024/2048 packs. Mistral 7B Instruct v0.3 Q8_0 is supported as exact-row smoke with checked bounded 512/1024/2048/4096/8192 context packs, GPU-vs-CPU greedy parity, and the support-promotion API/WebUI smoke bundle at `qa/evidence-bundles/mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json`. Mixtral remains partial backend runtime evidence only and is blocked by later-generation divergence plus a continuation HTTP hang. Ubuntu x86 Q8 acceleration is active default-off performance work, not a support, portability, or throughput claim.
+Executive summary: Camelid has one full verified gate and, at v0.6.1, more than two dozen supported exact rows in the [`COMPATIBILITY.md`](COMPATIBILITY.md) at-a-glance contract. TinyLlama 1.1B Chat Q8_0 remains the trusted gate. Llama 3.2 1B Instruct Q8_0 is verified through checked 512/1024/2048/4096/8192 context packs; Llama 3 8B Instruct Q8_0 within checked 512/1024/2048; Llama 3.2 3B Instruct Q8_0 as exact-row smoke on its anchored raw-decode ladder. Mistral 7B Instruct v0.3 Q8_0 is supported exact-row smoke. Since the four-row era the ledger has widened by exact rows, never by family: five dense Qwen3 rows, three Ornith `qwen35` rows (the `tool_capable` vehicle for agent mode), Gemma 3 1B and Gemma 4 E2B/E4B, seven PrismML Bonsai artifacts including two vision-capable 27B rows, four certified non-Q8_0 Llama requants, and the DiffusionGemma experimental lane. Windows x86_64 and Linux x86_64 are tracked platforms with CUDA lanes carrying their own per-GPU parity bundles. Agent mode is Supported (experimental) on receipted `tool_capable` rows. Mixtral remains partial backend runtime evidence only, blocked by later-generation divergence plus a continuation HTTP hang. LFM2.5 and the two distributed Gemma 4 rows are active validation, not support. Performance work stays evidence-gated and largely default-off: it is not a support, portability, or throughput claim.
 
 Practical reading rule: if a task does not protect the current gate, remove the next exact blocker, or prepare aligned support-language updates, it is secondary to this roadmap.
 
@@ -50,8 +50,17 @@ Recent work moved the release ledger only where the evidence, API, frontend, and
 - Mistral 7B Instruct v0.3 Q8_0 is promoted to supported exact-row smoke with tokenizer/template, 1-token generation, broader five-prompt/50-token parity, checked bounded 512/1024/2048/4096/8192 context, GPU-vs-CPU greedy parity, and a support-promotion API/WebUI smoke bundle aligned on `supported_exact_row_smoke`.
 - Mixtral 8x7B Instruct v0.1 Q8_0 remains blocked partial runtime evidence only: bounded one-token MoE evidence exists, but Gate 9A later-generation divergence and a continuation backend HTTP hang block API/WebUI/frontend readiness and support promotion.
 - Ubuntu x86 Q8 performance work has produced default-off route/control-plane/kernel slices and retained/rejected evidence, but the current roadmap treats it as evidence-gated performance work, not a support or throughput milestone.
+- Five dense Qwen3 rows (0.6B/1.7B/4B/8B `Q8_0` plus 4B `Q4_K_M`) are supported exact-row smoke for ChatML with thinking DISABLED. Thinking mode is available opt-in as a leading-trace lane; thinking-disabled remains the parity-locked mode.
+- Three Ornith `qwen35` hybrid rows (`Q8_0`, and the in-house `Q4_K_M`/`Q3_K_M` requants) are supported exact-row smoke. The `Q8_0` row is the `tool_capable` promotion vehicle that made agent mode Supported (experimental).
+- Gemma 3 1B-It `Q8_0` is supported exact-row smoke, defaulting to the Metal GPU-resident serve lane on a Metal host. Gemma 4 E2B-It and E4B-It `Q8_0` are supported exact-row smoke on CPU AND Metal GPU-resident.
+- Seven hash-pinned PrismML Bonsai artifacts are supported exact-row smoke on macOS Metal and Windows x86_64 CUDA; the two 27B rows add single-image vision through the pinned Qwen3-VL projector.
+- Four non-Q8_0 Llama requants are GPU-resident parity-certified exact-row smoke on raw greedy decode: Llama 3.2 1B `IQ4_XS` and `Q4_K_M`, Llama 3.2 3B `Q4_K_M` and `Q5_K_M`. Each stands on its own bundle and inherits no chat/context envelope from its parent row.
+- Windows x86_64 became a tracked platform (CPU/MSVC and experimental CUDA), and the CUDA backend now compiles into the default build on Windows and x86_64 Linux. CUDA parity evidence is scoped to the recorded GPU, driver, and CUDA version — compiling the path in is a build-wiring fact, not a support claim.
+- The API surface widened within the same evidence discipline: the stateless Responses API subset, embeddings and reranking on the exact Nomic v1.5 `Q8_0` row, structured output via LLGuidance, multi-choice and logprobs, and a privacy-safe Prometheus `/metrics` surface.
+- `Phi-3-mini-4k-instruct-Q8_0` entered the curated catalog under a formal HOLD (`qa/muster/HOLD-phi3-mini-4k-instruct-q8_0.json`): prompt-token parity passes, but an SPM rstrip seam on chat specials and temperature-0 non-determinism on this row block certification. It is downloadable and NOT advertised as supported.
+- LFM2.5-2.6B `Q8_0` opened the first `lfm2` lane as active validation, GPU-resident on Metal by default on Apple Silicon.
 
-Near-term objective: preserve the supported TinyLlama gate, exact Llama 3.2 1B/3B and Llama 3 8B bounded lanes, preserve the Mistral 7B Instruct v0.3 Q8_0 supported exact-row smoke lane without broadening it, fix Mixtral blockers before any support wording, and keep performance claims default-off until same-host evidence moves the whole-model result.
+Near-term objective: preserve every supported exact row across all support surfaces without broadening any of them, close the active-validation lanes (Mixtral, LFM2.5, the two distributed Gemma 4 rows) or keep them visibly unpromoted, clear the Phi-3 HOLD blockers before any Phi wording, and keep performance and GPU claims scoped to the exact row, host, and device they were measured on.
 
 ## Delivery sequence: now, next, later
 
@@ -59,40 +68,40 @@ This is the highest-level execution order. **Now** protects the current gate and
 
 ### Now
 
-Protect the supported lanes and clear the next blocker before widening claims.
+Protect every supported lane and clear the next blocker before widening claims.
 
 - Protect the validated TinyLlama Q8_0 gate.
-- Protect the exact Llama 3.2 1B bounded 512/1024/2048/4096/8192 row.
-- Protect the exact Llama 3.2 3B anchored 512/1024/2048/4096/8192 ladder row and the exact Llama 3 8B bounded 512/1024/2048 row.
-- Preserve the Llama 3.2 1B/3B broader prompt-pack plus bounded context-pack wins while expanding only after model-native/larger-context, stronger performance/portability, and broader chat-template evidence land.
-- Preserve the Llama 3 8B exact-row promotion through the checked 512/1024/2048-context packs on current `main`; older 1024/2048 bundles remain historical source-head evidence only.
-- Protect the Mistral 7B Instruct v0.3 Q8_0 supported exact-row smoke lane across all support surfaces.
+- Protect the exact Llama 3.2 1B bounded 512/1024/2048/4096/8192 row, the Llama 3.2 3B anchored raw-decode ladder row, and the exact Llama 3 8B bounded 512/1024/2048 row.
+- Protect the Mistral 7B Instruct v0.3 Q8_0, five dense Qwen3, three Ornith `qwen35`, Gemma 3 1B, Gemma 4 E2B/E4B, seven PrismML Bonsai, and four certified Llama requant rows across docs, `/api/capabilities`, and frontend readiness.
+- Keep the parity-locked mode for Qwen3 rows thinking-DISABLED; keep opt-in thinking mode described as a leading-trace lane only.
 - Keep Mixtral fail-closed until later-generation divergence and the continuation hang are fixed and rerun through API/WebUI/RSS/frontend evidence.
-- Keep Ubuntu x86 Q8 acceleration default-off while the team proves route hit, parity, repeated same-host timing, and whole-model impact.
-- Keep README, `COMPATIBILITY.md`, `ROADMAP.md`, `STATUS.md`, `/api/capabilities`, and frontend readiness copy aligned.
+- Keep LFM2.5 and the two distributed Gemma 4 rows visibly active-validation, not supported.
+- Keep the Phi-3 row downloadable but unadvertised until the SPM rstrip seam and temperature-0 non-determinism are resolved.
+- Keep every CUDA claim scoped to its recorded GPU, driver, and CUDA version, and keep Ubuntu x86 Q8 acceleration default-off until route hit, parity, repeated same-host timing, and whole-model impact are proven.
+- Keep README, `COMPATIBILITY.md`, `ROADMAP.md`, `STATUS.md`, `/api/capabilities`, the wiki, and frontend readiness copy aligned in the same change window.
 
 ### Next
 
 Promote only what can be defended row by row.
 
-- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mistral 7B Instruct v0.3 Q8_0** is already promoted as exact-row smoke only; **Mixtral 8x7B Instruct v0.1 Q8_0** remains blocked until later-generation divergence and continuation hang are fixed and rerun.
-- Widen Llama 3.2 3B Q8_0 beyond exact-row smoke only if broader prompt/chat-template, memory/performance, API, and WebUI evidence all land.
-- Retain an Ubuntu x86 Q8 performance slice only when it is default-off, parity-preserving, measured on the canonical same-host lane, and improves the whole-model result or narrows the proven bottleneck.
-- Broaden quantization support beyond Q8_0 with tests, docs, and exact-row evidence.
-- Expand tokenizer and chat-template coverage for additional supported rows.
-- Extend correctness checks into longer prompt and context buckets.
+- Close the active-validation set as exact-row lanes, never as family-wide claims: Mixtral 8x7B Instruct v0.1 Q8_0, LFM2.5-2.6B Q8_0, and the two distributed Gemma 4 rows.
+- Move the bounded Llama rows toward full support: model-native/larger context beyond the checked packs, broader arbitrary/Jinja template coverage, production throughput, and portability. For Llama 3.2 3B specifically, re-anchor the May-era API/WebUI, template-shape, and perf/RSS evidence families to the canonical GGUF.
+- Extend Windows coverage to the gaps its bundles name: WebUI/frontend smoke, longer/model-native context, thinking mode, and Windows parity bundles for the Llama 3.2 1B/3B rows.
+- Take agent mode past macOS: Windows and Linux live-lane transcripts, so the host claim matches the CI-validated builds.
+- Broaden quantization support only with per-quant tests, docs, and at least one row-specific real-model parity artifact. Metadata parsing alone never promotes a quant.
+- Bring the next candidate families in as single exact rows — Qwen2.5-7B-Instruct Q8_0 and gemma-2-9b-it Q8_0 — with tokenizer/template fixtures and prompt-token parity before any runtime-support wording.
+- Require separate evidence rows for any encoder, quant, GPU path, or classifier-head reranker beyond the exact Nomic embedding lane.
 
 ### Later
 
 Broaden the product surface only after correctness and release discipline are stable.
 
-- Richer OpenAI API completeness beyond the current supported subset.
+- Richer OpenAI API completeness beyond the current supported subset: stateful Responses features, `/v1/messages`, and `/infill` stay fail-closed until their contracts exist.
 - Measured performance optimization after correctness gates are stable.
 - Packaging and portability work across non-primary platforms.
-- Broader model-family expansion beyond current LLaMA-family priorities.
-- First-class multi-model concurrency so Camelid can keep multiple local models loaded at once and serve agent/OpenClaw workloads that need different models simultaneously.
-- For Qwen specifically, start with one exact GGUF target and do not schedule runtime-promotion work until tokenizer/chat-template fixtures, llama.cpp token-reference checks, and bounded load plus prompt-token parity are in place for that row.
-- Treat Rust-coder and other specialized rows as validation candidates only until acquisition, tokenizer/runtime mapping, parity, API/WebUI, RSS, and throughput evidence exist for the exact row.
+- Broader model-family expansion, still row by row.
+- First-class multi-model concurrency so Camelid can keep multiple local models loaded at once and serve agent workloads that need different models simultaneously.
+- Treat specialized rows as validation candidates only until acquisition, tokenizer/runtime mapping, parity, API/WebUI, RSS, and throughput evidence exist for the exact row.
 
 ## Milestone table
 
