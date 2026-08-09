@@ -1045,19 +1045,23 @@ export function CatalogLaneBrowse({
         </CatalogGroup>
       ) : (
         <>
+          {/* The list holds everything this machine can run, including rows whose
+              memory is merely occupied right now — each carries its own amber chip
+              and Re-check button, so the state is visible per row instead of
+              hiding the model. Only models too big for the machine fold away. */}
           <CatalogGroup
-            title="Curated — runs on this machine"
+            title="Curated picks"
             marker={null}
             count={curatedRunnable.length}
-            emptyText="No curated model fits the memory free right now. Close some applications, then use Re-check on one of the rows below."
+            emptyText="No curated model matches."
           >
             {curatedRunnable.map((item) => renderRow(item))}
           </CatalogGroup>
           {curatedBlocked.length ? (
             <details className="catalog-collapsed">
               <summary>
-                {curatedBlocked.length} more curated model{curatedBlocked.length === 1 ? '' : 's'} this
-                machine cannot load right now
+                {curatedBlocked.length} model{curatedBlocked.length === 1 ? '' : 's'} too big for this
+                machine
               </summary>
               <div className="catalog-list">{curatedBlocked.map((item) => renderRow(item))}</div>
             </details>
