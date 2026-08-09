@@ -38,13 +38,23 @@ export function formatHistoryDate(value) {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' })
 }
 
+/* Decimal units, matching the labels. This divided by 1024 while printing KB/MB/GB,
+   so every size in the UI was a binary magnitude wearing an SI name -- and the CLI,
+   which uses `/1e9`, disagreed with the UI about the same file:
+
+     Llama-3.2-3B-Instruct-Q8_0.gguf   CLI "3.4 GB"   UI "3.2 GB"
+
+   Two numbers for one file is worse than either convention being wrong, and the
+   catalog literals, the Hub's own listing and `camelid pull` are all decimal, so
+   the UI was the outlier. Dividing by 1000 makes the labels honest and the two
+   surfaces agree. Sizes shown in the UI go up slightly; nothing downloads more. */
 export function formatBytes(value) {
   if (value === null || value === undefined) return '—'
   const units = ['B', 'KB', 'MB', 'GB']
   let size = Number(value)
   let unit = 0
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024
+  while (size >= 1000 && unit < units.length - 1) {
+    size /= 1000
     unit += 1
   }
   return `${size.toFixed(size >= 100 || unit === 0 ? 0 : 1)} ${units[unit]}`
