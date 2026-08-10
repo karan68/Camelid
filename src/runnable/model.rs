@@ -2,20 +2,19 @@
 //!
 //! One configurable transformer (parameterized from GGUF KV via [`LlamaModelConfig`]):
 //! embeddings → N pre-norm blocks (RMSNorm → GQA attention with RoPE → RMSNorm →
-//! SwiGLU FFN) → final RMSNorm → logits. The generic reference graph itself uses no
-//! Metal/CUDA and no fused quantized kernels — weights are dequantized to f32
-//! ([`super::dequant`]) and run through naive f32 math. Speed is the supported lane's
-//! job; this path's job is to be obviously correct and deterministic so it can serve
-//! as the promotion oracle. This module ALSO hosts the arch-specific routing that
+//! SwiGLU FFN) → final RMSNorm → logits. Most weights are dequantized to f32
+//! ([`super::dequant`]) and run through naive f32 math. BitNet I2_S projections are
+//! the deliberate exception: cleanroom CPU and opportunistic Metal/CUDA kernels
+//! consume the canonical packed bytes directly. This module ALSO hosts the
+//! arch-specific routing that
 //! sends qwen35 to its resident Metal (macOS default) or CUDA graph and lfm2 to its
 //! Metal engine — those lanes consume packed quantized weights directly, and the f32
 //! reference below is their fallback and oracle.
 //!
-//! Memory: weights stay resident in their compact **quantized** form; each layer's
-//! matrices are dequantized to f32 once per forward pass and dropped, and the
-//! embedding/output projections are done row-by-row. Peak ≈ raw weights + one layer
-//! of f32, rather than the whole model as f32 — deliberate, so a small model fits a
-//! tight RAM budget without thrashing (`RUNNABLE_LANE_SPEC.md` working-env guard).
+//! Memory: weights stay resident in their compact **quantized** form. The generic
+//! reference graph dequantizes one projection at a time, embedding/output projections
+//! are handled row-by-row, and BitNet projections remain packed throughout. This
+//! avoids expanding a full model to f32.
 //!
 //! Phase 4 brings this up on **llama** (adjacent-pair RoPE, RMSNorm, SwiGLU, GQA).
 //! Architecture-specific switches (qwen3 QK-norm / split-half RoPE, gemma norms +
@@ -129,7 +128,7 @@ fn resident_metal_format(tt: GgufTensorType) -> Option<crate::metal::ResidentWei
 /// Page-backing is otherwise unobservable — `as_slice` is identical either way and
 /// `wire_pages` is macOS-only — at the cost of rounding each tensor up to a page.
 fn wants_page_backing(tt: GgufTensorType) -> bool {
-    resident_metal_format(tt).is_some()
+    tt == GgufTensorType::I2S || resident_metal_format(tt).is_some()
 }
 
 #[cfg(target_os = "macos")]
@@ -158,15 +157,16 @@ struct Mat {
 }
 
 impl Mat {
-    /// y[r] = Σ_i data[r*in + i] * x[i].
     fn matvec(&self, x: &[f32]) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.in_features);
-        let mut y = vec![0.0f32; self.out_features];
-        for (r, yr) in y.iter_mut().enumerate() {
-            let row = &self.data[r * self.in_features..(r + 1) * self.in_features];
-            *yr = dot(row, x);
+        let mut output = vec![0.0_f32; self.out_features];
+        for (row, value) in output.iter_mut().enumerate() {
+            *value = dot(
+                &self.data[row * self.in_features..(row + 1) * self.in_features],
+                x,
+            );
         }
-        y
+        output
     }
 }
 
@@ -230,24 +230,46 @@ impl RawMat {
         })
     }
 
-    /// Dequantize the entire matrix to f32 (used per layer, dropped after the layer).
     fn dequant_all(&self, name: &str) -> Result<Mat> {
-        let data = super::dequant::dequantize(
-            self.tt,
-            self.bytes.as_slice(),
-            self.in_features * self.out_features,
-            name,
-        )?;
         Ok(Mat {
-            data,
+            data: super::dequant::dequantize(
+                self.tt,
+                self.bytes.as_slice(),
+                self.in_features * self.out_features,
+                name,
+            )?,
             in_features: self.in_features,
             out_features: self.out_features,
         })
     }
 
+    /// Preserve the generic graph's f32 reference arithmetic while allowing
+    /// canonical I2_S projections to stay packed and use their cleanroom lane.
+    fn projection_matvec(&self, input: &[f32], name: &str) -> Result<Vec<f32>> {
+        if self.tt == GgufTensorType::I2S {
+            self.par_matvec(input, name)
+        } else {
+            Ok(self.dequant_all(name)?.matvec(input))
+        }
+    }
+
+    fn projection_matmul(&self, inputs: &[Vec<f32>], name: &str) -> Result<Vec<Vec<f32>>> {
+        if self.tt == GgufTensorType::I2S {
+            self.par_matmul(inputs)
+        } else {
+            let matrix = self.dequant_all(name)?;
+            Ok(inputs.iter().map(|input| matrix.matvec(input)).collect())
+        }
+    }
+
     /// Dequantize a single row `r` (length `in_features`) — for embedding lookup and
     /// the output projection, which touch the huge vocab matrix one row at a time.
     fn dequant_row(&self, r: usize, name: &str) -> Result<Vec<f32>> {
+        if self.tt == GgufTensorType::I2S {
+            return Err(BackendError::InvalidTensorData(format!(
+                "I2_S tensor {name} has a tensor-wide scale trailer and cannot be decoded row-wise"
+            )));
+        }
         let rb = self.row_bytes();
         let slice = &self.bytes.as_slice()[r * rb..(r + 1) * rb];
         super::dequant::dequantize(self.tt, slice, self.in_features, name)
@@ -279,6 +301,43 @@ impl RawMat {
     /// corresponding slice of a whole-matrix dequant.
     fn par_matvec(&self, x: &[f32], name: &str) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), self.in_features);
+        if self.tt == GgufTensorType::I2S {
+            let mode = crate::bitnet_kernels::BitNetKernelMode::from_env();
+            let mut output = vec![0.0_f32; self.out_features];
+            if crate::bitnet_kernels::gpu_allowed()
+                && crate::cuda::gpu_accel_enabled()
+                && crate::cuda::try_bitnet_i2_s_linear_rows(
+                    x,
+                    self.bytes.as_slice(),
+                    1,
+                    self.out_features,
+                    self.in_features,
+                    mode.gpu_code(),
+                    &mut output,
+                )
+            {
+                return Ok(output);
+            }
+            #[cfg(target_os = "macos")]
+            if crate::bitnet_kernels::gpu_allowed() && crate::cuda::gpu_accel_enabled() {
+                if let Some(pages) = self.bytes.wire_pages() {
+                    if let Some(output) = crate::metal::try_bitnet_i2_s_matvec_f32(
+                        x,
+                        pages,
+                        self.out_features,
+                        mode.gpu_code(),
+                    ) {
+                        return Ok(output);
+                    }
+                }
+            }
+            return crate::bitnet_kernels::i2_s_matvec(
+                self.bytes.as_slice(),
+                x,
+                self.out_features,
+                mode,
+            );
+        }
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
             if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
@@ -418,6 +477,52 @@ impl RawMat {
     fn par_matmul(&self, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
         let m = xs.len();
         let out_f = self.out_features;
+        if self.tt == GgufTensorType::I2S {
+            let mode = crate::bitnet_kernels::BitNetKernelMode::from_env();
+            let input_width = xs.first().map(Vec::len).ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "I2_S matmul requires at least one input row".into(),
+                )
+            })?;
+            if input_width != self.in_features || xs.iter().any(|input| input.len() != input_width)
+            {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "I2_S matmul expected input rows of width {}, got {:?}",
+                    self.in_features,
+                    xs.iter().map(Vec::len).collect::<Vec<_>>()
+                )));
+            }
+            let flat_input = xs.iter().flatten().copied().collect::<Vec<_>>();
+            let mut flat_output = vec![0.0_f32; m * out_f];
+            if crate::bitnet_kernels::gpu_allowed()
+                && crate::cuda::gpu_accel_enabled()
+                && crate::cuda::try_bitnet_i2_s_linear_rows(
+                    &flat_input,
+                    self.bytes.as_slice(),
+                    m,
+                    out_f,
+                    input_width,
+                    mode.gpu_code(),
+                    &mut flat_output,
+                )
+            {
+                return Ok(flat_output
+                    .chunks_exact(out_f)
+                    .map(<[f32]>::to_vec)
+                    .collect());
+            }
+            #[cfg(target_os = "macos")]
+            if crate::bitnet_kernels::gpu_allowed() && crate::cuda::gpu_accel_enabled() {
+                if let Some(pages) = self.bytes.wire_pages() {
+                    if let Some(output) =
+                        crate::metal::try_bitnet_i2_s_matmul_f32(xs, pages, out_f, mode.gpu_code())
+                    {
+                        return Ok(output);
+                    }
+                }
+            }
+            return crate::bitnet_kernels::i2_s_matmul(self.bytes.as_slice(), xs, out_f, mode);
+        }
         #[cfg(target_os = "macos")]
         if let Some(pages) = self.bytes.wire_pages() {
             if let Some(output) = resident_metal_format(self.tt).and_then(|format| {
@@ -489,6 +594,20 @@ struct Layer {
     /// vector, applied to Q/K after projection and before RoPE. `None` for llama-family.
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
+    /// BitNet embedding checkpoints normalize each projection input separately.
+    /// These seven tensors are an all-or-nothing graph contract for the official
+    /// qwen3/gemma3 embedding GGUFs.
+    q_norm_in: Option<Vec<f32>>,
+    k_norm_in: Option<Vec<f32>>,
+    v_norm_in: Option<Vec<f32>>,
+    output_norm_in: Option<Vec<f32>>,
+    gate_norm_in: Option<Vec<f32>>,
+    up_norm_in: Option<Vec<f32>>,
+    down_norm_in: Option<Vec<f32>>,
+    /// BitNet-b1.58 applies SubLN to the attention value mix and gated FFN
+    /// activation before their output projections.
+    attn_sub_norm: Option<Vec<f32>>,
+    ffn_sub_norm: Option<Vec<f32>>,
     /// gemma 4-norm structure: an extra RMSNorm applied to the attention output and to
     /// the FFN output BEFORE each residual add. `None` for the llama 2-norm structure.
     post_attn_norm: Option<Vec<f32>>,
@@ -589,6 +708,7 @@ impl RunnableModel {
             .architecture()
             .ok_or_else(|| BackendError::InvalidModelMetadata("missing architecture".into()))?
             .to_string();
+        let bitnet_embedding = crate::model::is_bitnet_embedding_model(&gguf);
 
         let d_model = cfg.embedding_length as usize;
         let n_heads = cfg.attention_head_count as usize;
@@ -1050,7 +1170,7 @@ impl RunnableModel {
                 (gu.split_rows(0, ffn), gu.split_rows(ffn, ffn))
             };
 
-            layers.push(Layer {
+            let layer = Layer {
                 attn_norm: load_vec(&mut f, &p("attn_norm"))?,
                 ffn_norm: load_vec(&mut f, &p("ffn_norm"))?,
                 wq,
@@ -1062,9 +1182,20 @@ impl RunnableModel {
                 down: load_raw(&mut f, &p("ffn_down"))?,
                 q_norm: load_vec_opt(&mut f, &p("attn_q_norm"))?,
                 k_norm: load_vec_opt(&mut f, &p("attn_k_norm"))?,
+                q_norm_in: load_vec_opt(&mut f, &p("attn_q_norm_in"))?,
+                k_norm_in: load_vec_opt(&mut f, &p("attn_k_norm_in"))?,
+                v_norm_in: load_vec_opt(&mut f, &p("attn_v_norm_in"))?,
+                output_norm_in: load_vec_opt(&mut f, &p("attn_output_norm_in"))?,
+                gate_norm_in: load_vec_opt(&mut f, &p("ffn_gate_norm_in"))?,
+                up_norm_in: load_vec_opt(&mut f, &p("ffn_up_norm_in"))?,
+                down_norm_in: load_vec_opt(&mut f, &p("ffn_down_norm_in"))?,
+                attn_sub_norm: load_vec_opt(&mut f, &p("attn_sub_norm"))?,
+                ffn_sub_norm: load_vec_opt(&mut f, &p("ffn_sub_norm"))?,
                 post_attn_norm: load_vec_opt(&mut f, &p("post_attention_norm"))?,
                 post_ffn_norm: load_vec_opt(&mut f, &p("post_ffw_norm"))?,
-            });
+            };
+            validate_extra_norms(&layer, l, &arch, bitnet_embedding, d_model, q_dim, ffn)?;
+            layers.push(layer);
         }
 
         let is_gemma = arch.starts_with("gemma");
@@ -1141,6 +1272,13 @@ impl RunnableModel {
         }
     }
 
+    fn apply_optional_norm(&self, x: &[f32], weight: Option<&Vec<f32>>) -> Vec<f32> {
+        match weight {
+            Some(weight) => self.apply_norm(x, weight),
+            None => x.to_vec(),
+        }
+    }
+
     fn apply_norm_heads(&self, vec: &mut [f32], n_heads: usize, head_dim: usize, weight: &[f32]) {
         if self.architecture == "command-r" {
             layer_norm_heads(vec, n_heads, head_dim, weight, self.eps)
@@ -1175,59 +1313,12 @@ impl RunnableModel {
             }
             return Ok(logits);
         }
-        let seq = tokens.len();
-        let dm = self.d_model;
-
-        // Embedding lookup (one dequantized row per token).
-        let mut hidden = vec![0.0f32; seq * dm];
-        for (pos, &tok) in tokens.iter().enumerate() {
-            let t = tok as usize;
-            if t >= self.vocab {
-                return Err(BackendError::InvalidTensorData(format!(
-                    "token id {t} >= vocab {}",
-                    self.vocab
-                )));
-            }
-            let mut row = self.token_embd.dequant_row(t, "token_embd")?;
-            // gemma scales embeddings by sqrt(d_model).
-            if let Some(scale) = self.embed_scale {
-                for v in row.iter_mut() {
-                    *v *= scale;
-                }
-            }
-            hidden[pos * dm..(pos + 1) * dm].copy_from_slice(&row);
-        }
-
-        // gemma3→CUDA campaign, localization instrument. `CAMELID_LAYER_DUMP=<path>`
-        // appends this lane's LAST-position hidden state after every layer, so the
-        // resident GPU lanes can be diffed against this oracle layer by layer and
-        // the first divergent layer names the defect. Off unless the var is set;
-        // no effect on the forward itself.
-        let dump_path = std::env::var("CAMELID_LAYER_DUMP").ok();
-        let mut dump = String::new();
-        for (li, layer) in self.layers.iter().enumerate() {
-            self.attention_block(layer, li, &mut hidden, seq)?;
-            self.ffn_block(layer, li, &mut hidden, seq)?;
-            if dump_path.is_some() {
-                let last = &hidden[(seq - 1) * dm..seq * dm];
-                let l2 = last.iter().map(|v| v * v).sum::<f32>().sqrt();
-                dump.push_str(&format!(
-                    "{li}\t{l2:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
-                    last[0], last[1], last[2], last[3]
-                ));
-            }
-        }
-        if let Some(p) = dump_path {
-            let _ = std::fs::write(p, &dump);
-        }
-
-        // Final norm on the last position, then logits (one dequantized row per vocab).
-        let last = &hidden[(seq - 1) * dm..seq * dm];
-        let normed = self.apply_norm(last, &self.output_norm);
+        let hidden = self.forward_hidden_states(tokens)?;
+        let normed = &hidden[hidden.len() - self.d_model..];
         let mut logits = vec![0.0f32; self.vocab];
         for (t, lt) in logits.iter_mut().enumerate() {
             let row = self.output.dequant_row(t, "output")?;
-            *lt = dot(&row, &normed);
+            *lt = dot(&row, normed);
         }
         // gemma2 final logit soft-cap (gemma3: None).
         if let Some(cap) = self.final_logit_softcap {
@@ -1241,6 +1332,65 @@ impl RunnableModel {
             }
         }
         Ok(logits)
+    }
+
+    /// Run the generic causal stack and return final-normalized hidden states for
+    /// every input position. This is also the encoder surface used by the official
+    /// decoder-only BitNet embedding checkpoints before their declared pooling.
+    pub(crate) fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(BackendError::InvalidTensorData(
+                "empty token sequence".into(),
+            ));
+        }
+        if self.qwen35.is_some() || self.lfm2.is_some() {
+            return Err(BackendError::UnsupportedGguf(format!(
+                "{} does not expose full-sequence hidden states",
+                self.architecture
+            )));
+        }
+        let seq = tokens.len();
+        let dm = self.d_model;
+        let mut hidden = vec![0.0f32; seq * dm];
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let t = tok as usize;
+            if t >= self.vocab {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "token id {t} >= vocab {}",
+                    self.vocab
+                )));
+            }
+            let mut row = self.token_embd.dequant_row(t, "token_embd")?;
+            if let Some(scale) = self.embed_scale {
+                for value in &mut row {
+                    *value *= scale;
+                }
+            }
+            hidden[pos * dm..(pos + 1) * dm].copy_from_slice(&row);
+        }
+
+        let dump_path = std::env::var("CAMELID_LAYER_DUMP").ok();
+        let mut dump = String::new();
+        for (li, layer) in self.layers.iter().enumerate() {
+            self.attention_block(layer, li, &mut hidden, seq)?;
+            self.ffn_block(layer, li, &mut hidden, seq)?;
+            if dump_path.is_some() {
+                let last = &hidden[(seq - 1) * dm..seq * dm];
+                let l2 = last.iter().map(|value| value * value).sum::<f32>().sqrt();
+                dump.push_str(&format!(
+                    "{li}\t{l2:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\n",
+                    last[0], last[1], last[2], last[3]
+                ));
+            }
+        }
+        if let Some(path) = dump_path {
+            let _ = std::fs::write(path, &dump);
+        }
+        for row in hidden.chunks_exact_mut(dm) {
+            let normed = self.apply_norm(row, &self.output_norm);
+            row.copy_from_slice(&normed);
+        }
+        Ok(hidden)
     }
 
     /// Greedy-decode up to `max_new` tokens. Uses an incremental KV cache: the prompt
@@ -1629,13 +1779,12 @@ impl RunnableModel {
         for (li, layer) in self.layers.iter().enumerate() {
             // --- attention (single query position over cached K/V) ---
             let xn = self.apply_norm(&hidden, &layer.attn_norm);
-            let wq = layer.wq.dequant_all(&name(li, "attn_q"))?;
-            let wk = layer.wk.dequant_all(&name(li, "attn_k"))?;
-            let wv = layer.wv.dequant_all(&name(li, "attn_v"))?;
-            let wo = layer.wo.dequant_all(&name(li, "attn_output"))?;
-            let mut qp = wq.matvec(&xn);
-            let mut kp = wk.matvec(&xn);
-            let vp = wv.matvec(&xn);
+            let q_input = self.apply_optional_norm(&xn, layer.q_norm_in.as_ref());
+            let k_input = self.apply_optional_norm(&xn, layer.k_norm_in.as_ref());
+            let v_input = self.apply_optional_norm(&xn, layer.v_norm_in.as_ref());
+            let mut qp = layer.wq.projection_matvec(&q_input, &name(li, "attn_q"))?;
+            let mut kp = layer.wk.projection_matvec(&k_input, &name(li, "attn_k"))?;
+            let vp = layer.wv.projection_matvec(&v_input, &name(li, "attn_v"))?;
             if let Some(qn) = &layer.q_norm {
                 self.apply_norm_heads(&mut qp, self.n_heads, hd, qn);
             }
@@ -1682,7 +1831,13 @@ impl RunnableModel {
                     }
                 }
             }
-            let mut proj = wo.matvec(&attn_out);
+            if let Some(norm) = &layer.attn_sub_norm {
+                attn_out = self.apply_norm(&attn_out, norm);
+            }
+            let output_input = self.apply_optional_norm(&attn_out, layer.output_norm_in.as_ref());
+            let mut proj = layer
+                .wo
+                .projection_matvec(&output_input, &name(li, "attn_output"))?;
             if let Some(pn) = &layer.post_attn_norm {
                 proj = self.apply_norm(&proj, pn);
             }
@@ -1692,11 +1847,12 @@ impl RunnableModel {
 
             // --- FFN ---
             let xn2 = self.apply_norm(&hidden, &layer.ffn_norm);
-            let gate = layer.gate.dequant_all(&name(li, "ffn_gate"))?;
-            let up = layer.up.dequant_all(&name(li, "ffn_up"))?;
-            let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
-            let g = gate.matvec(&xn2);
-            let u = up.matvec(&xn2);
+            let gate_input = self.apply_optional_norm(&xn2, layer.gate_norm_in.as_ref());
+            let up_input = self.apply_optional_norm(&xn2, layer.up_norm_in.as_ref());
+            let g = layer
+                .gate
+                .projection_matvec(&gate_input, &name(li, "ffn_gate"))?;
+            let u = layer.up.projection_matvec(&up_input, &name(li, "ffn_up"))?;
             let mut act = vec![0.0f32; g.len()];
             for i in 0..g.len() {
                 let gated = if self.ffn_gelu {
@@ -1706,7 +1862,13 @@ impl RunnableModel {
                 };
                 act[i] = gated * u[i];
             }
-            let mut d = down.matvec(&act);
+            if let Some(norm) = &layer.ffn_sub_norm {
+                act = self.apply_norm(&act, norm);
+            }
+            let down_input = self.apply_optional_norm(&act, layer.down_norm_in.as_ref());
+            let mut d = layer
+                .down
+                .projection_matvec(&down_input, &name(li, "ffn_down"))?;
             if let Some(pn) = &layer.post_ffn_norm {
                 d = self.apply_norm(&d, pn);
             }
@@ -1769,21 +1931,26 @@ impl RunnableModel {
         let q_dim = self.n_heads * hd;
         let kv_dim = self.n_kv_heads * hd;
 
-        // Dequantize this layer's projection weights once (dropped at block end).
-        let wq = layer.wq.dequant_all(&name(li, "attn_q"))?;
-        let wk = layer.wk.dequant_all(&name(li, "attn_k"))?;
-        let wv = layer.wv.dequant_all(&name(li, "attn_v"))?;
-        let wo = layer.wo.dequant_all(&name(li, "attn_output"))?;
-
         let mut q = vec![0.0f32; seq * q_dim];
         let mut k = vec![0.0f32; seq * kv_dim];
         let mut v = vec![0.0f32; seq * kv_dim];
+        let mut q_inputs = Vec::with_capacity(seq);
+        let mut k_inputs = Vec::with_capacity(seq);
+        let mut v_inputs = Vec::with_capacity(seq);
         for pos in 0..seq {
             let x = &hidden[pos * dm..(pos + 1) * dm];
             let xn = self.apply_norm(x, &layer.attn_norm);
-            let mut qp = wq.matvec(&xn);
-            let mut kp = wk.matvec(&xn);
-            let vp = wv.matvec(&xn);
+            q_inputs.push(self.apply_optional_norm(&xn, layer.q_norm_in.as_ref()));
+            k_inputs.push(self.apply_optional_norm(&xn, layer.k_norm_in.as_ref()));
+            v_inputs.push(self.apply_optional_norm(&xn, layer.v_norm_in.as_ref()));
+        }
+        let q_rows = layer.wq.projection_matmul(&q_inputs, &name(li, "attn_q"))?;
+        let k_rows = layer.wk.projection_matmul(&k_inputs, &name(li, "attn_k"))?;
+        let v_rows = layer.wv.projection_matmul(&v_inputs, &name(li, "attn_v"))?;
+        for pos in 0..seq {
+            let mut qp = q_rows[pos].clone();
+            let mut kp = k_rows[pos].clone();
+            let vp = &v_rows[pos];
             // QK-norm (qwen3, gemma3): per-head RMSNorm before RoPE.
             if let Some(qn) = &layer.q_norm {
                 self.apply_norm_heads(&mut qp, self.n_heads, hd, qn);
@@ -1796,9 +1963,10 @@ impl RunnableModel {
             self.apply_rope(&mut kp, self.n_kv_heads, pos, rope_base);
             q[pos * q_dim..(pos + 1) * q_dim].copy_from_slice(&qp);
             k[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&kp);
-            v[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&vp);
+            v[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(vp);
         }
 
+        let mut output_inputs = Vec::with_capacity(seq);
         for pos in 0..seq {
             let mut attn_out = vec![0.0f32; q_dim];
             for h in 0..self.n_heads {
@@ -1832,7 +2000,16 @@ impl RunnableModel {
                     }
                 }
             }
-            let mut proj = wo.matvec(&attn_out);
+            if let Some(norm) = &layer.attn_sub_norm {
+                attn_out = self.apply_norm(&attn_out, norm);
+            }
+            output_inputs.push(self.apply_optional_norm(&attn_out, layer.output_norm_in.as_ref()));
+        }
+        let projections = layer
+            .wo
+            .projection_matmul(&output_inputs, &name(li, "attn_output"))?;
+        for (pos, projection) in projections.iter().enumerate() {
+            let mut proj = projection.clone();
             // gemma: post-attention RMSNorm before the residual add.
             if let Some(pn) = &layer.post_attn_norm {
                 proj = self.apply_norm(&proj, pn);
@@ -1847,14 +2024,24 @@ impl RunnableModel {
 
     fn ffn_block(&self, layer: &Layer, li: usize, hidden: &mut [f32], seq: usize) -> Result<()> {
         let dm = self.d_model;
-        let gate = layer.gate.dequant_all(&name(li, "ffn_gate"))?;
-        let up = layer.up.dequant_all(&name(li, "ffn_up"))?;
-        let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
+        let mut gate_inputs = Vec::with_capacity(seq);
+        let mut up_inputs = Vec::with_capacity(seq);
         for pos in 0..seq {
             let x = &hidden[pos * dm..(pos + 1) * dm];
             let xn = self.apply_norm(x, &layer.ffn_norm);
-            let g = gate.matvec(&xn);
-            let u = up.matvec(&xn);
+            gate_inputs.push(self.apply_optional_norm(&xn, layer.gate_norm_in.as_ref()));
+            up_inputs.push(self.apply_optional_norm(&xn, layer.up_norm_in.as_ref()));
+        }
+        let gate_rows = layer
+            .gate
+            .projection_matmul(&gate_inputs, &name(li, "ffn_gate"))?;
+        let up_rows = layer
+            .up
+            .projection_matmul(&up_inputs, &name(li, "ffn_up"))?;
+        let mut down_inputs = Vec::with_capacity(seq);
+        for pos in 0..seq {
+            let g = &gate_rows[pos];
+            let u = &up_rows[pos];
             // Gated FFN: gemma uses GeGLU (gelu-tanh), llama uses SwiGLU (silu).
             let mut act = vec![0.0f32; g.len()];
             for i in 0..g.len() {
@@ -1865,7 +2052,16 @@ impl RunnableModel {
                 };
                 act[i] = gated * u[i];
             }
-            let mut d = down.matvec(&act);
+            if let Some(norm) = &layer.ffn_sub_norm {
+                act = self.apply_norm(&act, norm);
+            }
+            down_inputs.push(self.apply_optional_norm(&act, layer.down_norm_in.as_ref()));
+        }
+        let down_rows = layer
+            .down
+            .projection_matmul(&down_inputs, &name(li, "ffn_down"))?;
+        for (pos, down_row) in down_rows.iter().enumerate() {
+            let mut d = down_row.clone();
             // gemma: post-FFN RMSNorm before the residual add.
             if let Some(pn) = &layer.post_ffn_norm {
                 d = self.apply_norm(&d, pn);
@@ -3957,6 +4153,74 @@ mod prism_vision_cuda_tests {
     }
 }
 
+fn validate_extra_norms(
+    layer: &Layer,
+    layer_index: usize,
+    architecture: &str,
+    require_projection_norms: bool,
+    d_model: usize,
+    q_dim: usize,
+    ffn_dim: usize,
+) -> Result<()> {
+    let projection_norms = [
+        ("attn_q_norm_in", layer.q_norm_in.as_ref(), d_model),
+        ("attn_k_norm_in", layer.k_norm_in.as_ref(), d_model),
+        ("attn_v_norm_in", layer.v_norm_in.as_ref(), d_model),
+        ("attn_output_norm_in", layer.output_norm_in.as_ref(), q_dim),
+        ("ffn_gate_norm_in", layer.gate_norm_in.as_ref(), d_model),
+        ("ffn_up_norm_in", layer.up_norm_in.as_ref(), d_model),
+        ("ffn_down_norm_in", layer.down_norm_in.as_ref(), ffn_dim),
+    ];
+    let projection_norm_count = projection_norms
+        .iter()
+        .filter(|(_, value, _)| value.is_some())
+        .count();
+    if (require_projection_norms && projection_norm_count != projection_norms.len())
+        || (!require_projection_norms
+            && projection_norm_count != 0
+            && projection_norm_count != projection_norms.len())
+    {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "layer {layer_index}: BitNet projection-input norm set is incomplete ({projection_norm_count}/{} tensors)",
+            projection_norms.len()
+        )));
+    }
+    for (name, value, expected) in projection_norms {
+        if let Some(value) = value {
+            if value.len() != expected {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "layer {layer_index} {name} has {} elements, expected {expected}",
+                    value.len()
+                )));
+            }
+        }
+    }
+
+    match (&layer.attn_sub_norm, &layer.ffn_sub_norm) {
+        (Some(attn), Some(ffn)) => {
+            if attn.len() != q_dim || ffn.len() != ffn_dim {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "layer {layer_index}: BitNet SubLN widths are attention={} and ffn={}, expected {q_dim} and {ffn_dim}",
+                    attn.len(),
+                    ffn.len()
+                )));
+            }
+        }
+        (None, None) if architecture != "bitnet-b1.58" => {}
+        (None, None) => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "layer {layer_index}: bitnet-b1.58 requires attn_sub_norm and ffn_sub_norm"
+            )));
+        }
+        _ => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "layer {layer_index}: BitNet SubLN requires both attn_sub_norm and ffn_sub_norm"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn name(layer: usize, tensor: &str) -> String {
     format!("blk.{layer}.{tensor}")
 }
@@ -4888,6 +5152,11 @@ mod resident_format_admission_tests {
             assert_eq!(resident_metal_format(tt), Some(want), "{tt:?} must map");
             assert!(wants_page_backing(tt), "{tt:?} must load into WirePages");
         }
+
+        // I2_S has its own cleanroom Metal kernel and canonical tensor-wide
+        // trailer, so it is page-backed without pretending to be a Prism format.
+        assert_eq!(resident_metal_format(GgufTensorType::I2S), None);
+        assert!(wants_page_backing(GgufTensorType::I2S));
     }
 
     #[test]

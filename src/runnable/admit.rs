@@ -53,7 +53,15 @@ use crate::gguf::{GgufFile, GgufTensorType};
 
 /// v1 covered architectures (`general.architecture`).
 pub const COVERED_ARCHITECTURES: &[&str] = &[
-    "llama", "qwen2", "qwen3", "qwen35", "gemma2", "gemma3", "phi3", "lfm2",
+    "llama",
+    "qwen2",
+    "qwen3",
+    "qwen35",
+    "gemma2",
+    "gemma3",
+    "phi3",
+    "lfm2",
+    "bitnet-b1.58",
 ];
 
 /// v1 covered tokenizer models (`tokenizer.ggml.model`), grouped by family below.
@@ -284,6 +292,7 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::IQ4NL
             | GgufTensorType::Tq1_0
             | GgufTensorType::Tq2_0
+            | GgufTensorType::I2S
             | GgufTensorType::Q1_0
             | GgufTensorType::Q2_0G64
             | GgufTensorType::Q2_0G128
@@ -325,7 +334,7 @@ fn check_quants(
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
                      F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, \
-                     Q5_K, Q6_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, Q1_0, \
+                     Q5_K, Q6_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, I2_S, Q1_0, \
                      Q2_0_G64, Q2_0_G128, PQ2_0",
                     tensor.tensor_type, tensor.name
                 ),
@@ -874,7 +883,7 @@ mod tests {
         assert!(
             reject
                 .message
-                .ends_with("TQ1_0, TQ2_0, Q1_0, Q2_0_G64, Q2_0_G128, PQ2_0"),
+                .ends_with("TQ1_0, TQ2_0, I2_S, Q1_0, Q2_0_G64, Q2_0_G128, PQ2_0"),
             "generic covered-set message must name its complete supported tail: {}",
             reject.message
         );

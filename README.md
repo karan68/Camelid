@@ -103,6 +103,9 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 
 | Model | Quant | Arch | Size | Pull ID | GGUF file |
 |---|---|---|---:|---|---|
+| **Microsoft BitNet b1.58 2B 4T** *(experimental)* | `I2_S` | `bitnet-b1.58` | 1.2 GB | `bitnet_b1_58_2b_4t_i2_s` | `ggml-model-i2_s.gguf` |
+| **Microsoft BitNet Embedding 0.6B** *(experimental)* | `I2_S` | `qwen3` | 0.4 GB | `bitnet_embedding_0_6b_i2_s` | `bitnet-embeddings-0.6b-bf16-i2_s.gguf` |
+| **Microsoft BitNet Embedding 270M** *(experimental)* | `I2_S` | `gemma3` | 0.4 GB | `bitnet_embedding_270m_i2_s` | `bitnet-embeddings-270m-bf16-i2_s.gguf` |
 | **TinyLlama 1.1B Chat** | `Q8_0` | `llama` | 1.2 GB | `tinyllama` | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` |
 | **Llama 3.2 1B Instruct** | `Q8_0` | `llama` | 1.3 GB | `1b_instruct_q8` | `Llama-3.2-1B-Instruct-Q8_0.gguf` |
 | **Llama 3.2 1B Instruct** | `IQ4_XS` | `llama` | 0.7 GB | `iq4_xs` | `Llama-3.2-1B-Instruct-IQ4_XS.gguf` |
@@ -137,6 +140,14 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
 The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Command R requires a workstation-class host.
+
+The three BitNet rows are bring-up targets, not promoted support rows yet. Camelid
+can parse and execute their official canonical `I2_S` GGUF graphs through cleanroom
+CPU, Metal, and CUDA projection kernels. Runtime-selectable `i2_s`, `tl1`, and `tl2`
+strategies operate on the same published bytes; they do not claim compatibility with
+BitNet.cpp's separately permuted TL files. Reference parity and bounded-context /
+embedding-vector receipts remain outstanding. See
+[the BitNet runtime notes](docs/architecture/BITNET.md).
 
 Experimental exception: the Gemma 4 26B MoE row can also run on a single 16 GB
 Apple-silicon Mac through the opt-in Ghost-MoE Metal lane, which repacks the routed experts into a

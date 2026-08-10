@@ -14,6 +14,36 @@ gated-SiLU feed-forward block, post-residual LayerNorm, GGUF pooling metadata,
 L2 normalization, and Matryoshka truncation. Q8_0 matrices remain quantized and
 execute through Camelid's block-backed Q8 linear path.
 
+## Experimental Microsoft BitNet embeddings
+
+Two additional exact official artifacts are admitted as experimental rows with
+cleanroom CPU, Metal, and CUDA `I2_S` projection kernels:
+
+- `microsoft/BitNet-embedding-0.6B/bitnet-embeddings-0.6b-bf16-i2_s.gguf`
+  (427,935,008 bytes; SHA-256
+  `c89c64f05a2d3f83565250a6762640197fc624df866d4a1bd5853f811219af17`)
+- `microsoft/BitNet-embedding-270M/bitnet-embeddings-270m-bf16-i2_s.gguf`
+  (367,487,040 bytes; SHA-256
+  `8ee5ae971b103cd55758934be54e5c9f7cc2b58b15890615acce8e649988c751`)
+
+They reuse the `qwen3` and `gemma3` architecture identifiers but add seven
+per-projection RMSNorm inputs to every layer. Camelid requires the complete norm
+set, `I2_S` for every dense projection, the pinned official geometry, and no
+language-model output tensor. The files run through `/v1/embeddings`,
+`/v1/rerank`, and the bounded Workspace semantic retriever; generative endpoints
+fail closed.
+
+The projection runtime keeps the official canonical `I2_S` bytes and exposes
+direct `i2_s`, 9-entry `tl1`, and 27-entry `tl2` lookup strategies via
+`CAMELID_BITNET_KERNEL`. `CAMELID_BITNET_GPU=0` forces the CPU oracle. See
+[BITNET.md](BITNET.md) for the wire-format boundary and hardware tests.
+
+The published model cards describe last-token pooling, while both current GGUF
+artifacts declare `pooling_type=1` (mean). Camelid follows the executable GGUF
+metadata and L2-normalizes the result. This discrepancy and reference-vector
+parity are explicit promotion blockers, so neither BitNet embedding row is a
+supported row yet.
+
 Batch execution uses at most eight encoder workers by default so large
 Workspace indexes cannot fan out without bound. Set
 `CAMELID_EMBEDDING_BATCH_WORKERS` to an integer from 1 through 16 to tune that
@@ -118,4 +148,5 @@ measurements, not a portable SLA.
 
 No support is implied for another filename, hash, Nomic version, encoder
 architecture, quantization, classifier head, GPU backend, or persistent vector
-database.
+database. The experimental BitNet rows above likewise remain outside the
+supported envelope until their own reference-vector receipts are committed.

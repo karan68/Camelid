@@ -9246,11 +9246,11 @@ mod windowed_arch_cli_lane_tests {
         );
     }
 
-    /// qwen35 / gemma2 stay refused on every lane class — the flip did not
+    /// qwen35 / gemma2 / bitnet-b1.58 stay refused on every lane class — the flip did not
     /// touch them, and this is the causality control for the lane split.
     #[test]
     fn runnable_only_archs_stay_refused_on_both_lane_classes() {
-        for arch in ["qwen35", "gemma2"] {
+        for arch in ["qwen35", "gemma2", "bitnet-b1.58"] {
             for lane in [
                 DenseLaneWindowedForward::CpuDenseOnly,
                 DenseLaneWindowedForward::ViaSessionDecode,

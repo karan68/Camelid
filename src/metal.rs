@@ -94,6 +94,7 @@ struct MetalLinearKernel {
     multiply_pipeline: ComputePipelineState,
     dense_f16_linear_pipeline: ComputePipelineState,
     dense_f32_linear_pipeline: ComputePipelineState,
+    bitnet_i2_s_linear_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
     gelu_mul_pipeline: ComputePipelineState,
     qwen35_l2_norm_pipeline: ComputePipelineState,
@@ -7009,6 +7010,78 @@ kernel void vision_diagnostics_f32(
     metrics[slot * 3 + 1] = maximum;
     metrics[slot * 3 + 2] = sqrt(squared);
 }
+
+inline int bitnet_i2_s_ternary(device const uchar* packed, ulong logical_index) {
+    const ulong tile = logical_index / 128;
+    const uint within = uint(logical_index % 128);
+    const uchar byte = packed[tile * 32 + (within % 32)];
+    const uint code = (byte >> (6 - 2 * (within / 32))) & 3;
+    return code == 0 ? -1 : (code == 2 ? 1 : 0);
+}
+
+// Cleanroom BitNet projection over canonical I2_S bytes. Mode 0 decodes each
+// ternary weight directly; modes 1 and 2 use 9-entry and 27-entry lookup tables.
+kernel void bitnet_i2_s_linear_rows(
+    device const float* input [[buffer(0)]],
+    device const uchar* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& input_width [[buffer(3)]],
+    constant uint& weight_rows [[buffer(4)]],
+    constant uint& input_rows [[buffer(5)]],
+    constant uint& mode [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const ulong total = ulong(input_rows) * weight_rows;
+    if (gid >= total) return;
+    const uint input_row = gid / weight_rows;
+    const uint weight_row = gid % weight_rows;
+    device const float* x = input + ulong(input_row) * input_width;
+    const ulong base = ulong(weight_row) * input_width;
+    float sum = 0.0f;
+
+    if (mode == 1) {
+        uint column = 0;
+        for (; column + 1 < input_width; column += 2) {
+            const float a = x[column];
+            const float b = x[column + 1];
+            const float table[9] = {-a-b, -a, -a+b, -b, 0.0f, b, a-b, a, a+b};
+            const int left = bitnet_i2_s_ternary(weights, base + column) + 1;
+            const int right = bitnet_i2_s_ternary(weights, base + column + 1) + 1;
+            sum += table[left * 3 + right];
+        }
+        for (; column < input_width; ++column) {
+            sum += float(bitnet_i2_s_ternary(weights, base + column)) * x[column];
+        }
+    } else if (mode == 2) {
+        uint column = 0;
+        for (; column + 2 < input_width; column += 3) {
+            float table[27];
+            for (uint a = 0; a < 3; ++a) {
+                for (uint b = 0; b < 3; ++b) {
+                    for (uint c = 0; c < 3; ++c) {
+                        table[a * 9 + b * 3 + c] = float(int(a) - 1) * x[column]
+                            + float(int(b) - 1) * x[column + 1]
+                            + float(int(c) - 1) * x[column + 2];
+                    }
+                }
+            }
+            const int d0 = bitnet_i2_s_ternary(weights, base + column) + 1;
+            const int d1 = bitnet_i2_s_ternary(weights, base + column + 1) + 1;
+            const int d2 = bitnet_i2_s_ternary(weights, base + column + 2) + 1;
+            sum += table[d0 * 9 + d1 * 3 + d2];
+        }
+        for (; column < input_width; ++column) {
+            sum += float(bitnet_i2_s_ternary(weights, base + column)) * x[column];
+        }
+    } else {
+        for (uint column = 0; column < input_width; ++column) {
+            sum += float(bitnet_i2_s_ternary(weights, base + column)) * x[column];
+        }
+    }
+    const ulong packed_len = ulong(weight_rows) * input_width / 4;
+    const float scale = *reinterpret_cast<device const float*>(weights + packed_len);
+    output[gid] = sum * scale;
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -7068,6 +7141,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .ok()?;
             let dense_f32_linear_pipeline = device
                 .new_compute_pipeline_state_with_function(&dense_f32_linear_function)
+                .ok()?;
+            let bitnet_i2_s_linear_function = elementwise_library
+                .get_function("bitnet_i2_s_linear_rows", None)
+                .ok()?;
+            let bitnet_i2_s_linear_pipeline = device
+                .new_compute_pipeline_state_with_function(&bitnet_i2_s_linear_function)
                 .ok()?;
             let silu_mul_function = elementwise_library
                 .get_function("silu_mul_f32", None)
@@ -7760,6 +7839,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 multiply_pipeline,
                 dense_f16_linear_pipeline,
                 dense_f32_linear_pipeline,
+                bitnet_i2_s_linear_pipeline,
                 silu_mul_pipeline,
                 gelu_mul_pipeline,
                 qwen35_l2_norm_pipeline,
@@ -12333,6 +12413,154 @@ fn encode_resident_matmul_f32(
             );
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+static BITNET_METAL_RUN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of canonical I2_S projections completed by the cleanroom Metal kernel.
+#[cfg(target_os = "macos")]
+pub fn metal_bitnet_run_count() -> u64 {
+    BITNET_METAL_RUN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn metal_bitnet_run_count() -> u64 {
+    0
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn try_bitnet_i2_s_matvec_f32(
+    input: &[f32],
+    pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+    output_rows: usize,
+    mode: u32,
+) -> Option<Vec<f32>> {
+    try_bitnet_i2_s_matmul_flat(input, input.len(), 1, pages, output_rows, mode)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn try_bitnet_i2_s_matmul_f32(
+    inputs: &[Vec<f32>],
+    pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+    output_rows: usize,
+    mode: u32,
+) -> Option<Vec<Vec<f32>>> {
+    let input_width = inputs.first()?.len();
+    if input_width == 0 || inputs.iter().any(|input| input.len() != input_width) {
+        return None;
+    }
+    let flat = inputs.iter().flatten().copied().collect::<Vec<_>>();
+    let output =
+        try_bitnet_i2_s_matmul_flat(&flat, input_width, inputs.len(), pages, output_rows, mode)?;
+    Some(
+        output
+            .chunks_exact(output_rows)
+            .map(<[f32]>::to_vec)
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn try_bitnet_i2_s_matmul_flat(
+    input: &[f32],
+    input_width: usize,
+    input_rows: usize,
+    pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+    output_rows: usize,
+    mode: u32,
+) -> Option<Vec<f32>> {
+    let elements = input_width.checked_mul(output_rows)?;
+    let output_elements = input_rows.checked_mul(output_rows)?;
+    if input_width == 0
+        || input_rows == 0
+        || output_rows == 0
+        || !elements.is_multiple_of(128)
+        || input.len() != input_width.checked_mul(input_rows)?
+        || output_elements > u32::MAX as usize
+        || pages.byte_len() != elements / 4 + 32
+        || mode > 2
+    {
+        return None;
+    }
+    let packed_len = elements / 4;
+    let scale = f32::from_le_bytes(pages.bytes()[packed_len..packed_len + 4].try_into().ok()?);
+    if !scale.is_finite() {
+        return None;
+    }
+
+    let kernel = metal_linear_kernel()?;
+    let input_buffer = kernel.device.new_buffer(
+        std::mem::size_of_val(input) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let output_buffer = kernel.device.new_buffer(
+        (output_elements * std::mem::size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let scalar_buffer = kernel
+        .device
+        .new_buffer(16, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&input_buffer, input);
+    unsafe {
+        let scalars = scalar_buffer.contents().cast::<u32>();
+        *scalars = input_width as u32;
+        *scalars.add(1) = output_rows as u32;
+        *scalars.add(2) = input_rows as u32;
+        *scalars.add(3) = mode;
+    }
+    let weights = {
+        let mut cache = METAL_LINEAR_CACHE
+            .get_or_init(|| Mutex::new(MetalLinearCache::new()))
+            .lock()
+            .ok()?;
+        cache.q8_wire_nocopy_buffer(&kernel.device, pages)
+    };
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.bitnet_i2_s_linear_pipeline);
+    encoder.set_buffer(0, Some(&input_buffer), 0);
+    encoder.set_buffer(1, Some(&weights), 0);
+    encoder.set_buffer(2, Some(&output_buffer), 0);
+    encoder.set_buffer(3, Some(&scalar_buffer), 0);
+    encoder.set_buffer(4, Some(&scalar_buffer), 4);
+    encoder.set_buffer(5, Some(&scalar_buffer), 8);
+    encoder.set_buffer(6, Some(&scalar_buffer), 12);
+    let width = kernel
+        .bitnet_i2_s_linear_pipeline
+        .thread_execution_width()
+        .max(1);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (output_elements as u64).div_ceil(width),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let mut output = vec![0.0_f32; output_elements];
+    read_buffer_f32(&output_buffer, &mut output);
+    BITNET_METAL_RUN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        eprintln!(
+            "[bitnet] Metal I2_S cleanroom kernel active (mode={})",
+            match mode {
+                1 => "tl1",
+                2 => "tl2",
+                _ => "i2_s",
+            }
+        );
+    });
+    Some(output)
 }
 
 /// Run one packed Prism projection against a page-backed Q1/Q2 matrix.
@@ -26446,6 +26674,75 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bitnet_i2_s_cleanroom_modes_execute_on_metal() {
+        use std::io::Write;
+
+        if !super::detect_metal_device().available {
+            return;
+        }
+        let rows = 3;
+        let width = 128;
+        let values = (0..rows * width)
+            .map(|index| match index % 3 {
+                0 => -1_i8,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+        let mut wire = vec![0_u8; values.len() / 4];
+        for (index, value) in values.iter().copied().enumerate() {
+            let tile = index / 128;
+            let within = index % 128;
+            let code: u8 = match value {
+                -1 => 0,
+                0 => 1,
+                1 => 2,
+                _ => unreachable!(),
+            };
+            wire[tile * 32 + within % 32] |= code << (6 - 2 * (within / 32));
+        }
+        wire.extend_from_slice(&0.25_f32.to_le_bytes());
+        wire.extend_from_slice(&[0; 28]);
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&wire).expect("write I2_S wire bytes");
+        file.flush().expect("flush I2_S wire bytes");
+        let pages = crate::wire_mmap::WirePages::read_from_file(file.as_file(), 0, wire.len())
+            .expect("page-backed I2_S fixture");
+        let input = (0..width)
+            .map(|index| (index as i32 % 7 - 3) as f32)
+            .collect::<Vec<_>>();
+
+        for (mode, cpu_mode) in [
+            (0, crate::bitnet_kernels::BitNetKernelMode::I2S),
+            (1, crate::bitnet_kernels::BitNetKernelMode::Tl1),
+            (2, crate::bitnet_kernels::BitNetKernelMode::Tl2),
+        ] {
+            let expected = crate::bitnet_kernels::i2_s_matvec(&wire, &input, rows, cpu_mode)
+                .expect("CPU oracle");
+            let before = super::metal_bitnet_run_count();
+            let actual = super::try_bitnet_i2_s_matvec_f32(&input, &pages, rows, mode)
+                .expect("Metal I2_S dispatch");
+            assert!(super::metal_bitnet_run_count() > before);
+            for (got, want) in actual.iter().zip(&expected) {
+                assert!((got - want).abs() <= 1.0e-5 * want.abs().max(1.0));
+            }
+            let batch = super::try_bitnet_i2_s_matmul_f32(
+                &[input.clone(), input.clone()],
+                &pages,
+                rows,
+                mode,
+            )
+            .expect("Metal batched I2_S dispatch");
+            assert_eq!(batch.len(), 2);
+            for output in batch {
+                for (got, want) in output.iter().zip(&expected) {
+                    assert!((got - want).abs() <= 1.0e-5 * want.abs().max(1.0));
+                }
+            }
+        }
+    }
 
     /// The F16-primary resident KV cache is qualified for the K-quant lane, so
     /// it must follow the LOADED MODEL, never the process-wide

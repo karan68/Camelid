@@ -43,7 +43,7 @@ pub use server::ServeOptions;
 pub(crate) use server::DEFAULT_MAX_REQUEST_BODY_BYTES;
 
 use crate::{
-    embedding::{cosine_similarity, EncoderConfig, NomicBertRuntime},
+    embedding::{cosine_similarity, EmbeddingRuntime, EncoderConfig},
     execution_plan::{plan_for_model_with_env, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
@@ -139,7 +139,7 @@ pub struct AppState {
     dg_runtimes: Arc<RwLock<HashMap<String, Arc<DgServeRuntime>>>>,
     /// Bidirectional encoder runtimes, loaded lazily on the first embeddings or
     /// reranking request and released with the owning model.
-    embedding_runtimes: Arc<RwLock<HashMap<String, Arc<NomicBertRuntime>>>>,
+    embedding_runtimes: Arc<RwLock<HashMap<String, Arc<EmbeddingRuntime>>>>,
     /// Prevent concurrent first-use requests from loading the same encoder
     /// weights more than once and temporarily doubling resident memory.
     embedding_runtime_load: Arc<tokio::sync::Mutex<()>>,
@@ -4474,7 +4474,7 @@ struct RerankResponse<'a> {
 async fn resolve_embedding_runtime(
     state: &AppState,
     requested_model: Option<&str>,
-) -> std::result::Result<(String, Arc<NomicBertRuntime>), Response> {
+) -> std::result::Result<(String, Arc<EmbeddingRuntime>), Response> {
     let model_id = match requested_model
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -4486,13 +4486,13 @@ async fn resolve_embedding_runtime(
             let active_embedding = active.filter(|id| {
                 loaded
                     .get(id)
-                    .is_some_and(|model| model.gguf.architecture() == Some("nomic-bert"))
+                    .is_some_and(|model| is_embedding_model(&model.gguf))
             });
             active_embedding
                 .or_else(|| {
                     let mut candidates = loaded
                         .values()
-                        .filter(|model| model.gguf.architecture() == Some("nomic-bert"))
+                        .filter(|model| is_embedding_model(&model.gguf))
                         .map(|model| model.id.clone())
                         .collect::<Vec<_>>();
                     candidates.sort();
@@ -4542,13 +4542,14 @@ async fn resolve_embedding_runtime(
                 Some("model"),
             )
         })?;
-    if model.gguf.architecture() != Some("nomic-bert") {
+    if !is_embedding_model(&model.gguf) {
         return Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "model_not_embedding_capable",
             format!(
-                "model {model_id:?} uses architecture {:?}; the current embedding runtime requires \"nomic-bert\"",
-                model.gguf.architecture().unwrap_or("unknown")
+                "model {model_id:?} uses architecture {:?} and name {:?}; it is not an admitted embedding artifact",
+                model.gguf.architecture().unwrap_or("unknown"),
+                model.gguf.model_name().unwrap_or("unknown")
             ),
             Some("model"),
         ));
@@ -4556,7 +4557,7 @@ async fn resolve_embedding_runtime(
 
     let path = model.path.clone();
     let _reader = state.model_file_lifecycle.read().await;
-    let loaded = tokio::task::spawn_blocking(move || NomicBertRuntime::load(path)).await;
+    let loaded = tokio::task::spawn_blocking(move || EmbeddingRuntime::load(path)).await;
     let runtime = match loaded {
         Ok(Ok(runtime)) => Arc::new(runtime),
         Ok(Err(error)) => {
@@ -4678,19 +4679,6 @@ async fn embeddings(
         .into_response()
 }
 
-fn with_embedding_prefix(text: &str, prefix: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.starts_with("search_query:")
-        || trimmed.starts_with("search_document:")
-        || trimmed.starts_with("clustering:")
-        || trimmed.starts_with("classification:")
-    {
-        trimmed.to_string()
-    } else {
-        format!("{prefix}{trimmed}")
-    }
-}
-
 async fn rerank(
     State(state): State<AppState>,
     payload: std::result::Result<Json<RerankRequest>, JsonRejection>,
@@ -4734,12 +4722,12 @@ async fn rerank(
         };
 
     let mut inputs = Vec::with_capacity(request.documents.len() + 1);
-    inputs.push(with_embedding_prefix(&request.query, "search_query: "));
+    inputs.push(runtime.prepare_retrieval_query(&request.query));
     inputs.extend(
         request
             .documents
             .iter()
-            .map(|document| with_embedding_prefix(document.text(), "search_document: ")),
+            .map(|document| runtime.prepare_retrieval_document(document.text())),
     );
     let result = tokio::task::spawn_blocking(move || {
         let embeddings = runtime.embed_batch(&inputs, None)?;
@@ -7790,16 +7778,22 @@ fn gemma4_cuda_fit_check(model_path: &std::path::Path) -> std::result::Result<()
 
 /// Model family from the GGUF `general.architecture`.
 fn model_family(gguf: &GgufFile) -> &'static str {
+    if is_embedding_model(gguf) {
+        return "embedding";
+    }
     match gguf.architecture() {
         Some("gemma4") => "gemma4",
-        Some("nomic-bert") => "embedding",
         Some(
             "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "smollm3" | "gemma3" | "phi3"
-            | "lfm2",
+            | "lfm2" | "bitnet-b1.58",
         ) => "llama-family",
         Some(_) => "other",
         None => "unknown",
     }
+}
+
+fn is_embedding_model(gguf: &GgufFile) -> bool {
+    gguf.architecture() == Some("nomic-bert") || crate::model::is_bitnet_embedding_model(gguf)
 }
 
 /// Gemma 4 chat template constants + renderer. Turns are
@@ -8245,6 +8239,7 @@ mod gemma4_template_tests {
                 // bring-up: its conv layers carry no attn_q/k/v, so no
                 // optimized lane can run it on any host.
                 assert!(bridge("lfm2", capable, q8));
+                assert!(bridge("bitnet-b1.58", capable, q8));
                 for arch in ["llama", "qwen3", "mistral", "gemma4", ""] {
                     assert!(!bridge(arch, capable, q8), "{arch:?} must stay open");
                 }
@@ -9388,7 +9383,8 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 //
 // Architectures implemented only in the runnable lane (`model::is_runnable_only_arch`
 // is the authoritative list; "runnable" names the bridge, not a CPU claim — within it
-// qwen35 decodes on resident Metal/CUDA graphs where available, lfm2 on Metal) are
+// qwen35 decodes on resident Metal/CUDA graphs where available, lfm2 on Metal, and
+// bitnet-b1.58 through cleanroom CPU/Metal/CUDA I2_S projections) are
 // not in the optimized inference engine, so the Llama serve path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
 // per-model-id runtime map, a short-circuit at the top of `chat_completions`, and a
 // dedicated chat handler. The optimized lane is untouched. Generation is greedy
@@ -9443,7 +9439,7 @@ fn runnable_serve_flag(value: Option<&str>) -> bool {
 /// single source of truth shared with the CLI direct-session guard — so the
 /// serve router and the direct lanes can never disagree about routing.
 fn is_runnable_serve_file(gguf: &GgufFile) -> bool {
-    crate::model::file_requires_runnable_bridge(gguf)
+    !is_embedding_model(gguf) && crate::model::file_requires_runnable_bridge(gguf)
 }
 
 /// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
@@ -11595,6 +11591,7 @@ fn build_loaded_model(
     id: String,
     mut gguf: GgufFile,
 ) -> Result<LoadedModel, BackendError> {
+    let embedding_only = crate::model::is_bitnet_embedding_model(&gguf);
     let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
     // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
     // the split tensors the binder + forward path expect (no-op for already-split rows),
@@ -11607,18 +11604,31 @@ fn build_loaded_model(
     // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
     // WHY it fails closed (architecture not implemented, missing/invalid metadata,
     // DiffusionGemma redirect, â€¦) instead of silently sitting non-generative.
-    let unsupported_runtime = match &llama_config_result {
-        Err(
-            err @ (BackendError::UnsupportedModelArchitecture(_)
-            | BackendError::InvalidModelMetadata(_)
-            | BackendError::UnsupportedGguf(_)),
-        ) => Some(UnsupportedRuntimeSummary {
-            code: backend_error_code(err),
-            message: err.to_string(),
-        }),
-        _ => None,
+    let unsupported_runtime = if embedding_only {
+        Some(UnsupportedRuntimeSummary {
+            code: "model_not_generation_capable",
+            message:
+                "this Microsoft BitNet artifact is embedding-only; use /v1/embeddings or /v1/rerank"
+                    .to_string(),
+        })
+    } else {
+        match &llama_config_result {
+            Err(
+                err @ (BackendError::UnsupportedModelArchitecture(_)
+                | BackendError::InvalidModelMetadata(_)
+                | BackendError::UnsupportedGguf(_)),
+            ) => Some(UnsupportedRuntimeSummary {
+                code: backend_error_code(err),
+                message: err.to_string(),
+            }),
+            _ => None,
+        }
     };
-    let llama_config = llama_config_result.ok();
+    let llama_config = if embedding_only {
+        None
+    } else {
+        llama_config_result.ok()
+    };
     let llama_tensors = llama_config
         .as_ref()
         .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
@@ -21719,6 +21729,43 @@ mod tests {
     }
 
     #[test]
+    fn catalog_exposes_bitnet_rows_as_experimental_bring_up_targets() {
+        let catalog = curated_catalog();
+        for (id, filename, size, architecture) in [
+            (
+                "bitnet_b1_58_2b_4t_i2_s",
+                "ggml-model-i2_s.gguf",
+                1_187_801_280,
+                "bitnet-b1.58",
+            ),
+            (
+                "bitnet_embedding_0_6b_i2_s",
+                "bitnet-embeddings-0.6b-bf16-i2_s.gguf",
+                427_935_008,
+                "qwen3",
+            ),
+            (
+                "bitnet_embedding_270m_i2_s",
+                "bitnet-embeddings-270m-bf16-i2_s.gguf",
+                367_487_040,
+                "gemma3",
+            ),
+        ] {
+            let item = catalog
+                .iter()
+                .find(|item| item.catalog_id == id)
+                .unwrap_or_else(|| panic!("missing BitNet catalog row {id}"));
+            assert_eq!(item.filename, filename);
+            assert_eq!(item.size_bytes, size);
+            assert_eq!(item.quant, "I2_S");
+            assert_eq!(
+                classify_model_lane(Some(architecture), filename),
+                ModelLaneClass::ExperimentalImplemented
+            );
+        }
+    }
+
+    #[test]
     fn every_supported_row_is_reachable_on_the_models_page() {
         // REGRESSION: a row can be promoted to `supported_*` in the contract and
         // still be invisible to every user. The Models page has exactly two ways
@@ -26351,6 +26398,45 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "nomic-bert",
             license: "apache-2.0",
+            task_tags: &["embeddings", "retrieval"],
+        },
+        CatalogItem {
+            catalog_id: "bitnet_b1_58_2b_4t_i2_s",
+            name: "Microsoft BitNet b1.58 2B 4T I2_S",
+            repo_id: "microsoft/BitNet-b1.58-2B-4T-gguf",
+            filename: "ggml-model-i2_s.gguf",
+            size_bytes: 1_187_801_280,
+            downloads: 0,
+            likes: 0,
+            quant: "I2_S",
+            architecture: "bitnet-b1.58",
+            license: "mit",
+            task_tags: &["general"],
+        },
+        CatalogItem {
+            catalog_id: "bitnet_embedding_0_6b_i2_s",
+            name: "Microsoft BitNet Embedding 0.6B I2_S",
+            repo_id: "microsoft/BitNet-embedding-0.6B",
+            filename: "bitnet-embeddings-0.6b-bf16-i2_s.gguf",
+            size_bytes: 427_935_008,
+            downloads: 0,
+            likes: 0,
+            quant: "I2_S",
+            architecture: "qwen3",
+            license: "mit",
+            task_tags: &["embeddings", "retrieval"],
+        },
+        CatalogItem {
+            catalog_id: "bitnet_embedding_270m_i2_s",
+            name: "Microsoft BitNet Embedding 270M I2_S",
+            repo_id: "microsoft/BitNet-embedding-270M",
+            filename: "bitnet-embeddings-270m-bf16-i2_s.gguf",
+            size_bytes: 367_487_040,
+            downloads: 0,
+            likes: 0,
+            quant: "I2_S",
+            architecture: "gemma3",
+            license: "mit",
             task_tags: &["embeddings", "retrieval"],
         },
         CatalogItem {

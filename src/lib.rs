@@ -1,6 +1,7 @@
 #[cfg(feature = "alloc-gate")]
 pub mod alloc_gate;
 pub mod api;
+pub(crate) mod bitnet_kernels;
 pub mod capability;
 pub mod catalog;
 pub mod chat;

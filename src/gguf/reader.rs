@@ -52,6 +52,9 @@ pub enum GgufTensorType {
     IQ4XS,
     Tq1_0,
     Tq2_0,
+    /// BitNet I2_S: four ternary values per byte plus one tensor-wide
+    /// 32-byte trailer whose first four bytes store the f32 scale.
+    I2S,
     I8,
     I16,
     I32,
@@ -106,6 +109,7 @@ impl GgufTensorType {
             23 => Self::IQ4XS,
             34 => Self::Tq1_0,
             35 => Self::Tq2_0,
+            36 => Self::I2S,
             24 => Self::I8,
             25 => Self::I16,
             26 => Self::I32,
@@ -154,6 +158,8 @@ impl GgufTensorType {
             Self::Tq1_0 => Some((256, 54)),
             // block_tq2_0 = qs[QK_K/4]=64 + f16 d(2) = 66 (2.06 bpw)
             Self::Tq2_0 => Some((256, 66)),
+            // I2_S has a tensor-wide scale trailer, not a fixed block layout.
+            Self::I2S => None,
             // block_nvfp4 = d[4] UE4M3 sub-block scales + qs[32] packed E2M1 nibbles = 36
             // bytes per QK_NVFP4=64 elements (4.5 bpw; pin ggml-common.h:211-217).
             Self::NVFP4 => Some((64, 36)),
@@ -688,6 +694,23 @@ fn read_value_of_type(cursor: &mut Cursor, ty: i32) -> Result<GgufMetadataValue>
 }
 
 fn tensor_nbytes(name: &str, dimensions: &[u64], tensor_type: GgufTensorType) -> Result<u64> {
+    if tensor_type == GgufTensorType::I2S {
+        let mut elements = 1u64;
+        for dim in dimensions {
+            elements = elements.checked_mul(*dim).ok_or_else(|| {
+                BackendError::InvalidGguf(format!("tensor {name} element count overflow"))
+            })?;
+        }
+        if !elements.is_multiple_of(4) {
+            return Err(BackendError::InvalidGguf(format!(
+                "tensor {name} I2_S element count {elements} is not divisible by four packed values per byte"
+            )));
+        }
+        return elements
+            .checked_div(4)
+            .and_then(|packed| packed.checked_add(32))
+            .ok_or_else(|| BackendError::InvalidGguf(format!("tensor {name} byte size overflow")));
+    }
     let (block_size, type_size) = tensor_type.layout().ok_or_else(|| {
         BackendError::UnsupportedGguf(format!(
             "tensor {name} has unknown or removed GGML type {tensor_type:?}"
@@ -863,6 +886,17 @@ mod nvfp4_wire_facts {
         assert_eq!(GgufTensorType::Q2_0G128.layout(), Some((128, 34)));
         assert_eq!(GgufTensorType::from_id(142), GgufTensorType::Pq2_0);
         assert_eq!(GgufTensorType::Pq2_0.layout(), Some((128, 34)));
+    }
+
+    #[test]
+    fn i2_s_id_and_tensor_wide_layout_are_pinned() {
+        assert_eq!(GgufTensorType::from_id(36), GgufTensorType::I2S);
+        assert_eq!(GgufTensorType::I2S.layout(), None);
+        assert_eq!(
+            super::tensor_nbytes("w", &[128, 2], GgufTensorType::I2S).unwrap(),
+            96
+        );
+        assert!(super::tensor_nbytes("bad", &[3], GgufTensorType::I2S).is_err());
     }
 
     /// Pin EVERY quantized block layout against the reference struct definitions

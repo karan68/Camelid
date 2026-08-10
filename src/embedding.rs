@@ -13,6 +13,8 @@ use rayon::prelude::*;
 
 use crate::gguf::{read_metadata, GgufFile, GgufTensorType};
 use crate::inference::linear_for_role_runtime;
+use crate::model::{is_bitnet_embedding_model, LlamaModelConfig};
+use crate::runnable::RunnableModel;
 use crate::tensor::{CpuTensor, TensorStore};
 use crate::tokenizer::Tokenizer;
 use crate::{BackendError, Result};
@@ -173,6 +175,305 @@ pub struct NomicBertRuntime {
     embedding_norm_weight: Vec<f32>,
     embedding_norm_bias: Vec<f32>,
     layers: Vec<EncoderLayer>,
+}
+
+/// API-facing embedding runtime. The enum keeps the established Nomic encoder
+/// intact while admitting Microsoft's two exact decoder-only BitNet embedding
+/// artifacts through the generic runnable graph.
+pub enum EmbeddingRuntime {
+    Nomic(NomicBertRuntime),
+    BitNet(BitNetEmbeddingRuntime),
+}
+
+impl std::fmt::Debug for EmbeddingRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nomic(runtime) => runtime.fmt(formatter),
+            Self::BitNet(runtime) => runtime.fmt(formatter),
+        }
+    }
+}
+
+impl EmbeddingRuntime {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let gguf = read_metadata(path)?;
+        if gguf.architecture() == Some(NOMIC_BERT_ARCH) {
+            return NomicBertRuntime::load(path).map(Self::Nomic);
+        }
+        if is_bitnet_embedding_model(&gguf) {
+            return BitNetEmbeddingRuntime::load(path).map(Self::BitNet);
+        }
+        Err(BackendError::UnsupportedModelArchitecture(format!(
+            "embedding runtime supports {NOMIC_BERT_ARCH:?} and the exact Microsoft BitNet embedding GGUFs; got architecture {:?}, model {:?}",
+            gguf.architecture().unwrap_or("unknown"),
+            gguf.model_name().unwrap_or("unknown")
+        )))
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        match self {
+            Self::Nomic(runtime) => runtime.tokenizer(),
+            Self::BitNet(runtime) => runtime.tokenizer(),
+        }
+    }
+
+    pub fn embed_batch(
+        &self,
+        inputs: &[String],
+        dimensions: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Nomic(runtime) => runtime.embed_batch(inputs, dimensions),
+            Self::BitNet(runtime) => runtime.embed_batch(inputs, dimensions),
+        }
+    }
+
+    pub fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<Vec<f32>> {
+        match self {
+            Self::Nomic(runtime) => runtime.embed(text, dimensions),
+            Self::BitNet(runtime) => runtime.embed(text, dimensions),
+        }
+    }
+
+    /// Prepare the query side of a retrieval or reranking request using the
+    /// instruction convention for the loaded model family.
+    pub fn prepare_retrieval_query(&self, text: &str) -> String {
+        match self {
+            Self::Nomic(_) => with_nomic_task_prefix(text, "search_query: "),
+            Self::BitNet(_) => with_bitnet_query_instruction(text),
+        }
+    }
+
+    /// Prepare the document side of a retrieval or reranking request. BitNet
+    /// embeddings are trained without a document-side instruction.
+    pub fn prepare_retrieval_document(&self, text: &str) -> String {
+        match self {
+            Self::Nomic(_) => with_nomic_task_prefix(text, "search_document: "),
+            Self::BitNet(_) => text.trim().to_string(),
+        }
+    }
+}
+
+fn with_nomic_task_prefix(text: &str, prefix: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with("search_query:")
+        || trimmed.starts_with("search_document:")
+        || trimmed.starts_with("clustering:")
+        || trimmed.starts_with("classification:")
+    {
+        trimmed.to_string()
+    } else {
+        format!("{prefix}{trimmed}")
+    }
+}
+
+fn with_bitnet_query_instruction(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with("query:") {
+        trimmed.to_string()
+    } else {
+        format!("query: {trimmed}")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BitNetEmbeddingConfig {
+    context_length: usize,
+    embedding_length: usize,
+    pooling: PoolingType,
+}
+
+/// Runtime for Microsoft's exact BitNet embedding GGUFs. Projection weights
+/// remain in canonical I2_S wire form for the cleanroom CPU/Metal/CUDA kernels.
+pub struct BitNetEmbeddingRuntime {
+    path: PathBuf,
+    config: BitNetEmbeddingConfig,
+    tokenizer: Arc<Tokenizer>,
+    model: RunnableModel,
+}
+
+impl std::fmt::Debug for BitNetEmbeddingRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BitNetEmbeddingRuntime")
+            .field("path", &self.path)
+            .field("config", &self.config)
+            .field("tokenizer", &self.tokenizer.model.as_summary_model())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BitNetEmbeddingRuntime {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let gguf = read_metadata(&path)?;
+        if !is_bitnet_embedding_model(&gguf) {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "not an exact Microsoft BitNet embedding GGUF: architecture {:?}, model {:?}",
+                gguf.architecture().unwrap_or("unknown"),
+                gguf.model_name().unwrap_or("unknown")
+            )));
+        }
+        let llama = LlamaModelConfig::from_gguf(&gguf)?;
+        let expected = match gguf.model_name() {
+            Some("bitnet-embeddings-0.6b") => ("qwen3", 32_768, 1_024, 3_072, 28, 16, 8, 128),
+            Some("bitnet-embeddings-270m") => ("gemma3", 32_768, 640, 2_048, 18, 4, 1, 256),
+            _ => unreachable!("exact BitNet embedding model checked above"),
+        };
+        let actual = (
+            llama.architecture.as_str(),
+            llama.context_length as usize,
+            llama.embedding_length as usize,
+            llama.feed_forward_length as usize,
+            llama.block_count as usize,
+            llama.attention_head_count as usize,
+            llama.attention_head_count_kv as usize,
+            llama.attention_key_length.unwrap_or(0) as usize,
+        );
+        if actual != expected {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "BitNet embedding geometry {actual:?} does not match the pinned official artifact {expected:?}"
+            )));
+        }
+        if gguf.metadata_u32("general.file_type") != Some(40) {
+            return Err(BackendError::InvalidModelMetadata(
+                "BitNet embedding GGUF must declare general.file_type=40 (I2_S)".into(),
+            ));
+        }
+        if gguf
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name == "output.weight")
+        {
+            return Err(BackendError::InvalidModelMetadata(
+                "BitNet embedding artifact unexpectedly contains output.weight".into(),
+            ));
+        }
+        let projection_suffixes = [
+            ".attn_q.weight",
+            ".attn_k.weight",
+            ".attn_v.weight",
+            ".attn_output.weight",
+            ".ffn_gate.weight",
+            ".ffn_up.weight",
+            ".ffn_down.weight",
+        ];
+        let projection_count = gguf
+            .tensors
+            .iter()
+            .filter(|tensor| {
+                tensor.name.starts_with("blk.")
+                    && projection_suffixes
+                        .iter()
+                        .any(|suffix| tensor.name.ends_with(suffix))
+            })
+            .map(|tensor| {
+                if tensor.tensor_type != GgufTensorType::I2S {
+                    Err(BackendError::UnsupportedTensorType(format!(
+                        "BitNet embedding projection {} must be I2_S, got {:?}",
+                        tensor.name, tensor.tensor_type
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+            .len();
+        let expected_projections = llama.block_count as usize * projection_suffixes.len();
+        if projection_count != expected_projections {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "BitNet embedding artifact has {projection_count} dense projections, expected {expected_projections}"
+            )));
+        }
+
+        let architecture = llama.architecture.as_str();
+        let pooling = PoolingType::from_gguf(
+            gguf.metadata_u32(&format!("{architecture}.pooling_type"))
+                .ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(format!(
+                        "required metadata {architecture}.pooling_type is missing"
+                    ))
+                })?,
+        )?;
+        let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf)?);
+        let model_path = path.to_str().ok_or_else(|| {
+            BackendError::InvalidModelMetadata("BitNet model path is not valid UTF-8".into())
+        })?;
+        let model = RunnableModel::load(model_path)?;
+        Ok(Self {
+            path,
+            config: BitNetEmbeddingConfig {
+                context_length: expected.1,
+                embedding_length: expected.2,
+                pooling,
+            },
+            tokenizer,
+            model,
+        })
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    pub fn embed(&self, text: &str, dimensions: Option<usize>) -> Result<Vec<f32>> {
+        let token_ids = self.tokenizer.encode(text, true, false)?;
+        if token_ids.is_empty() {
+            return Err(BackendError::InvalidTokenizerMetadata(
+                "BitNet embedding tokenizer produced no tokens".into(),
+            ));
+        }
+        if token_ids.len() > self.config.context_length {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "embedding input is {} tokens, above this model's {}-token context",
+                token_ids.len(),
+                self.config.context_length
+            )));
+        }
+        let output = EncoderOutput {
+            token_count: token_ids.len(),
+            token_embeddings: self.model.forward_hidden_states(&token_ids)?,
+            token_ids,
+            embedding_length: self.config.embedding_length,
+        };
+        let mut embedding = output.pool(self.config.pooling)?;
+        if let Some(dimensions) = dimensions {
+            if dimensions == 0 || dimensions > embedding.len() {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "embedding dimensions must be between 1 and {}, got {dimensions}",
+                    embedding.len()
+                )));
+            }
+            embedding.truncate(dimensions);
+            l2_normalize(&mut embedding)?;
+        }
+        Ok(embedding)
+    }
+
+    pub fn embed_batch(
+        &self,
+        inputs: &[String],
+        dimensions: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Err(BackendError::InvalidModelMetadata(
+                "embedding input must contain at least one string".into(),
+            ));
+        }
+        if inputs.len() > MAX_BATCH_INPUTS {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "embedding input contains {} strings; maximum batch size is {MAX_BATCH_INPUTS}",
+                inputs.len()
+            )));
+        }
+        embedding_batch_pool().install(|| {
+            inputs
+                .par_iter()
+                .map(|input| self.embed(input, dimensions))
+                .collect()
+        })
+    }
 }
 
 impl std::fmt::Debug for NomicBertRuntime {
@@ -895,5 +1196,25 @@ mod tests {
         assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]).unwrap() - 1.0).abs() < 1e-6);
         assert_eq!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).unwrap(), 0.0);
         assert!(cosine_similarity(&[1.0], &[1.0, 2.0]).is_err());
+    }
+
+    #[test]
+    fn retrieval_instructions_match_each_embedding_family() {
+        assert_eq!(
+            with_nomic_task_prefix("  camelids  ", "search_query: "),
+            "search_query: camelids"
+        );
+        assert_eq!(
+            with_nomic_task_prefix("search_document: alpaca", "search_query: "),
+            "search_document: alpaca"
+        );
+        assert_eq!(
+            with_bitnet_query_instruction("  What is BitNet?  "),
+            "query: What is BitNet?"
+        );
+        assert_eq!(
+            with_bitnet_query_instruction("query: What is BitNet?"),
+            "query: What is BitNet?"
+        );
     }
 }

@@ -189,7 +189,10 @@ fn headline_quant(gguf: &GgufFile) -> String {
     counts
         .into_iter()
         .max_by_key(|(_, c)| *c)
-        .map(|(tt, _)| format!("{tt:?}"))
+        .map(|(tt, _)| match tt {
+            GgufTensorType::I2S => "I2_S".to_string(),
+            _ => format!("{tt:?}"),
+        })
         .unwrap_or_else(|| "F32".to_string())
 }
 

@@ -242,14 +242,14 @@ pub fn selected_device_ordinal() -> usize {
 
 #[cfg(feature = "cuda")]
 pub use backend::{
-    detect_cuda_device, probe_capability, release_async_pool, try_q8_0_block_linear_row,
-    try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
+    detect_cuda_device, probe_capability, release_async_pool, try_bitnet_i2_s_linear_rows,
+    try_q8_0_block_linear_row, try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
 pub use stub::{
-    detect_cuda_device, probe_capability, release_async_pool, try_q8_0_block_linear_row,
-    try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
+    detect_cuda_device, probe_capability, release_async_pool, try_bitnet_i2_s_linear_rows,
+    try_q8_0_block_linear_row, try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -315,6 +315,19 @@ mod stub {
     ) -> bool {
         false
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_bitnet_i2_s_linear_rows(
+        _input: &[f32],
+        _weight_bytes: &[u8],
+        _input_rows: usize,
+        _weight_rows: usize,
+        _input_width: usize,
+        _mode: u32,
+        _output: &mut [f32],
+    ) -> bool {
+        false
+    }
 }
 
 /// Number of Q8_0 matmuls the CUDA backend has completed on the GPU this
@@ -327,6 +340,17 @@ pub fn cuda_q8_run_count() -> u64 {
 
 #[cfg(not(feature = "cuda"))]
 pub fn cuda_q8_run_count() -> u64 {
+    0
+}
+
+/// Number of cleanroom BitNet I2_S projections completed by CUDA.
+#[cfg(feature = "cuda")]
+pub fn cuda_bitnet_run_count() -> u64 {
+    backend::bitnet_run_count()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_bitnet_run_count() -> u64 {
     0
 }
 
@@ -345,11 +369,17 @@ mod backend {
     use super::CudaDeviceInfo;
 
     static RUN_COUNT: AtomicU64 = AtomicU64::new(0);
+    static BITNET_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
     static LOGGED: AtomicBool = AtomicBool::new(false);
+    static BITNET_LOGGED: AtomicBool = AtomicBool::new(false);
     static ENTRY_LOGGED: AtomicBool = AtomicBool::new(false);
 
     pub(super) fn run_count() -> u64 {
         RUN_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn bitnet_run_count() -> u64 {
+        BITNET_RUN_COUNT.load(Ordering::Relaxed)
     }
 
     /// CUDA C source for the Q8_0 encoded linear kernel. One thread computes one
@@ -434,6 +464,85 @@ extern "C" __global__ void q8_0_block_linear_row(
     }
     if (lane == 0) output[row] = partial;
 }
+
+// Cleanroom BitNet kernel over the public canonical I2_S contract: four
+// ternary values per byte, interleaved in 128-value tiles, plus a tensor-wide
+// f32 scale at packed_bytes[weight_rows * input_width / 4]. `mode` selects
+// direct decode (0), two-weight/9-entry lookup (1), or three-weight/27-entry
+// lookup (2). One thread computes one output element in deterministic K order.
+__device__ __forceinline__ int i2_s_ternary(
+    const unsigned char* packed,
+    const long logical_index
+) {
+    const long tile = logical_index / 128;
+    const int within = (int)(logical_index % 128);
+    const unsigned char byte = packed[tile * 32 + (within % 32)];
+    const int code = (byte >> (6 - 2 * (within / 32))) & 3;
+    return code == 0 ? -1 : (code == 2 ? 1 : 0);
+}
+
+extern "C" __global__ void bitnet_i2_s_linear_rows(
+    const float* __restrict__ input,
+    const unsigned char* __restrict__ weights,
+    const int input_rows,
+    const int weight_rows,
+    const int input_width,
+    const int mode,
+    float* __restrict__ output
+) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)input_rows * weight_rows;
+    if (idx >= total) return;
+    const int input_row = (int)(idx / weight_rows);
+    const int weight_row = (int)(idx % weight_rows);
+    const float* x = input + (long)input_row * input_width;
+    const long base = (long)weight_row * input_width;
+    float sum = 0.0f;
+
+    if (mode == 1) {
+        int column = 0;
+        for (; column + 1 < input_width; column += 2) {
+            const float a = x[column];
+            const float b = x[column + 1];
+            const float table[9] = {-a-b, -a, -a+b, -b, 0.0f, b, a-b, a, a+b};
+            const int left = i2_s_ternary(weights, base + column) + 1;
+            const int right = i2_s_ternary(weights, base + column + 1) + 1;
+            sum += table[left * 3 + right];
+        }
+        for (; column < input_width; ++column) {
+            sum += (float)i2_s_ternary(weights, base + column) * x[column];
+        }
+    } else if (mode == 2) {
+        int column = 0;
+        for (; column + 2 < input_width; column += 3) {
+            float table[27];
+            for (int a = 0; a < 3; ++a) {
+                for (int b = 0; b < 3; ++b) {
+                    for (int c = 0; c < 3; ++c) {
+                        table[a * 9 + b * 3 + c] = (float)(a - 1) * x[column]
+                            + (float)(b - 1) * x[column + 1]
+                            + (float)(c - 1) * x[column + 2];
+                    }
+                }
+            }
+            const int d0 = i2_s_ternary(weights, base + column) + 1;
+            const int d1 = i2_s_ternary(weights, base + column + 1) + 1;
+            const int d2 = i2_s_ternary(weights, base + column + 2) + 1;
+            sum += table[d0 * 9 + d1 * 3 + d2];
+        }
+        for (; column < input_width; ++column) {
+            sum += (float)i2_s_ternary(weights, base + column) * x[column];
+        }
+    } else {
+        for (int column = 0; column < input_width; ++column) {
+            sum += (float)i2_s_ternary(weights, base + column) * x[column];
+        }
+    }
+
+    const long packed_len = (long)weight_rows * input_width / 4;
+    const float scale = *reinterpret_cast<const float*>(weights + packed_len);
+    output[idx] = sum * scale;
+}
 "#;
 
     struct CudaBackend {
@@ -441,6 +550,7 @@ extern "C" __global__ void q8_0_block_linear_row(
         stream: Arc<CudaStream>,
         kernel: CudaFunction,
         kernel_block: CudaFunction,
+        kernel_bitnet: CudaFunction,
         device_name: String,
         /// GPU-resident weight cache: each Q8_0 weight is uploaded to the GPU
         /// once (keyed by its stable host pointer + length) and reused across
@@ -537,11 +647,15 @@ extern "C" __global__ void q8_0_block_linear_row(
         let kernel_block = module
             .load_function("q8_0_block_linear_row")
             .map_err(|e| format!("load_function (block) failed: {e}"))?;
+        let kernel_bitnet = module
+            .load_function("bitnet_i2_s_linear_rows")
+            .map_err(|e| format!("load_function (BitNet I2_S) failed: {e}"))?;
         Ok(CudaBackend {
             ctx,
             stream,
             kernel,
             kernel_block,
+            kernel_bitnet,
             device_name,
             weight_cache: HashMap::new(),
         })
@@ -960,6 +1074,119 @@ extern "C" __global__ void q8_0_block_linear_row(
         )
     }
 
+    /// Execute canonical I2_S projections on CUDA. Shape or runtime failures
+    /// return `false` so the caller can run the cleanroom CPU oracle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_bitnet_i2_s_linear_rows(
+        input: &[f32],
+        weight_bytes: &[u8],
+        input_rows: usize,
+        weight_rows: usize,
+        input_width: usize,
+        mode: u32,
+        output: &mut [f32],
+    ) -> bool {
+        let Some(elements) = input_width.checked_mul(weight_rows) else {
+            return false;
+        };
+        let Some(input_elements) = input_width.checked_mul(input_rows) else {
+            return false;
+        };
+        let Some(output_elements) = weight_rows.checked_mul(input_rows) else {
+            return false;
+        };
+        if input_rows == 0
+            || weight_rows == 0
+            || input_width == 0
+            || !elements.is_multiple_of(128)
+            || input.len() != input_elements
+            || weight_bytes.len() != elements / 4 + 32
+            || output.len() != output_elements
+            || output_elements > u32::MAX as usize
+            || mode > 2
+        {
+            return false;
+        }
+        let Some(b) = backend() else {
+            return false;
+        };
+        let mut guard = b.lock().expect("cuda backend mutex poisoned");
+        match run_bitnet_inner(
+            &mut guard,
+            input,
+            weight_bytes,
+            input_rows,
+            weight_rows,
+            input_width,
+            mode,
+            output,
+        ) {
+            Ok(()) => {
+                BITNET_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+                if !BITNET_LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[bitnet] CUDA I2_S cleanroom kernel active on {} (mode={})",
+                        guard.device_name,
+                        match mode {
+                            1 => "tl1",
+                            2 => "tl2",
+                            _ => "i2_s",
+                        }
+                    );
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_bitnet_inner(
+        b: &mut CudaBackend,
+        input: &[f32],
+        weight_bytes: &[u8],
+        input_rows: usize,
+        weight_rows: usize,
+        input_width: usize,
+        mode: u32,
+        output: &mut [f32],
+    ) -> Result<(), cudarc::driver::DriverError> {
+        let key = (weight_bytes.as_ptr() as usize, weight_bytes.len());
+        if !b.weight_cache.contains_key(&key) {
+            let resident = b.stream.clone_htod(weight_bytes)?;
+            b.weight_cache.insert(key, resident);
+        }
+        let d_weights = b.weight_cache.get(&key).expect("weight just inserted");
+        let d_input = b.stream.clone_htod(input)?;
+        let mut d_output = b.stream.alloc_zeros::<f32>(output.len())?;
+        let total = output.len() as u32;
+        let block_dim = 256_u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(block_dim), 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let input_rows = input_rows as i32;
+        let weight_rows = weight_rows as i32;
+        let input_width = input_width as i32;
+        let mode = mode as i32;
+        let mut builder = b.stream.launch_builder(&b.kernel_bitnet);
+        builder
+            .arg(&d_input)
+            .arg(d_weights)
+            .arg(&input_rows)
+            .arg(&weight_rows)
+            .arg(&input_width)
+            .arg(&mode)
+            .arg(&mut d_output);
+        // SAFETY: every buffer and scalar is shape-checked above; the grid is
+        // bounded by output.len(), and the kernel guards its final partial block.
+        unsafe { builder.launch(cfg)? };
+        b.stream.memcpy_dtoh(&d_output, output)?;
+        b.ctx.synchronize()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1004,6 +1231,79 @@ extern "C" __global__ void q8_0_block_linear_row(
             fn next_scale(&mut self) -> f32 {
                 // Small positive f16-ish scales, like real Q8_0 block scales.
                 ((self.next_u32() % 1000) as f32 + 1.0) / 4096.0
+            }
+        }
+
+        #[test]
+        #[ignore = "requires a CUDA device"]
+        fn cuda_bitnet_i2_s_cleanroom_modes_match_cpu_oracle() {
+            if !detect_cuda_device().available {
+                if std::env::var("CAMELID_REQUIRE_CUDA_TESTS").as_deref() == Ok("1") {
+                    panic!(
+                        "CAMELID_REQUIRE_CUDA_TESTS=1 but the CUDA backend (including NVRTC \
+                         compilation of bitnet_i2_s_linear_rows) is unavailable"
+                    );
+                }
+                eprintln!("skipping: no CUDA device available");
+                return;
+            }
+            let input_rows = 2;
+            let weight_rows = 3;
+            let input_width = 128;
+            let values = (0..weight_rows * input_width)
+                .map(|index| match index % 3 {
+                    0 => -1_i8,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>();
+            let mut wire = vec![0_u8; values.len() / 4];
+            for (index, value) in values.iter().copied().enumerate() {
+                let tile = index / 128;
+                let within = index % 128;
+                let code: u8 = match value {
+                    -1 => 0,
+                    0 => 1,
+                    1 => 2,
+                    _ => unreachable!(),
+                };
+                wire[tile * 32 + within % 32] |= code << (6 - 2 * (within / 32));
+            }
+            wire.extend_from_slice(&0.25_f32.to_le_bytes());
+            wire.extend_from_slice(&[0; 28]);
+            let one_input = (0..input_width)
+                .map(|index| (index as i32 % 7 - 3) as f32)
+                .collect::<Vec<_>>();
+            let input = [one_input.clone(), one_input.clone()].concat();
+
+            for (mode, cpu_mode) in [
+                (0, crate::bitnet_kernels::BitNetKernelMode::I2S),
+                (1, crate::bitnet_kernels::BitNetKernelMode::Tl1),
+                (2, crate::bitnet_kernels::BitNetKernelMode::Tl2),
+            ] {
+                let expected = crate::bitnet_kernels::i2_s_matmul(
+                    &wire,
+                    &[one_input.clone(), one_input.clone()],
+                    weight_rows,
+                    cpu_mode,
+                )
+                .expect("CPU oracle")
+                .concat();
+                let mut actual = vec![0.0_f32; input_rows * weight_rows];
+                let before = bitnet_run_count();
+                assert!(try_bitnet_i2_s_linear_rows(
+                    &input,
+                    &wire,
+                    input_rows,
+                    weight_rows,
+                    input_width,
+                    mode,
+                    &mut actual,
+                ));
+                assert!(bitnet_run_count() > before);
+                for (got, want) in actual.iter().zip(&expected) {
+                    assert!((got - want).abs() <= 1.0e-5 * want.abs().max(1.0));
+                }
             }
         }
 

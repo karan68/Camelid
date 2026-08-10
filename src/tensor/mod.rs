@@ -4738,6 +4738,7 @@ impl TensorStore {
             GgufTensorType::IQ4XS => decode_iq4_xs_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq1_0 => decode_tq1_0_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Tq2_0 => decode_tq2_0_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::I2S => decode_i2_s_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q1_0 => decode_q1_0_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q2_0G64
             | GgufTensorType::Q2_0G128
@@ -4746,7 +4747,7 @@ impl TensorStore {
             }
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, Q1_0, Q2_0G64, Q2_0G128, PQ2_0"
+                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, I2_S, Q1_0, Q2_0G64, Q2_0G128, PQ2_0"
                 )))
             }
         };
@@ -5947,6 +5948,58 @@ pub(crate) fn decode_q4_0_tensor(
         let scale = block.scale_f32();
         for val in block.unpack_values() {
             out.push(val as f32 * scale);
+        }
+    }
+    Ok(out)
+}
+
+/// Decode BitNet's tensor-wide I2_S representation.
+///
+/// Packed bytes are grouped in 128-value tiles. Byte `gp` in each 32-byte tile
+/// stores values `gp`, `32 + gp`, `64 + gp`, and `96 + gp` from most- to
+/// least-significant two-bit field. Codes 0/1/2 map to -1/0/+1; code 3 is the
+/// second zero spelling used by the reference decoder. One f32 scale follows
+/// all packed bytes at the start of a 32-byte tensor trailer.
+pub(crate) fn decode_i2_s_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
+    if !expected_elements.is_multiple_of(128) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: I2_S element count {expected_elements} is not aligned to 128-value packing groups"
+        )));
+    }
+    let packed_len = expected_elements / 4;
+    let expected_bytes = packed_len.checked_add(32).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!("{name}: I2_S byte length overflow"))
+    })?;
+    if bytes.len() != expected_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: I2_S byte length {} does not match packed payload {packed_len} + 32-byte trailer",
+            bytes.len()
+        )));
+    }
+    let scale = f32::from_le_bytes(
+        bytes[packed_len..packed_len + 4]
+            .try_into()
+            .expect("four-byte I2_S scale"),
+    );
+    if !scale.is_finite() {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: I2_S tensor scale must be finite, got {scale}"
+        )));
+    }
+
+    const CODE: [f32; 4] = [-1.0, 0.0, 1.0, 0.0];
+    let mut out = vec![0.0_f32; expected_elements];
+    for (tile, packed) in bytes[..packed_len].chunks_exact(32).enumerate() {
+        let base = tile * 128;
+        for (gp, byte) in packed.iter().copied().enumerate() {
+            out[base + gp] = CODE[((byte >> 6) & 3) as usize] * scale;
+            out[base + 32 + gp] = CODE[((byte >> 4) & 3) as usize] * scale;
+            out[base + 64 + gp] = CODE[((byte >> 2) & 3) as usize] * scale;
+            out[base + 96 + gp] = CODE[(byte & 3) as usize] * scale;
         }
     }
     Ok(out)

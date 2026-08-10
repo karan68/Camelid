@@ -279,6 +279,10 @@ pub struct PlanPlatform {
     pub cpu_features: Vec<String>,
     /// A usable Metal compute device exists on this host (always false off macOS).
     pub metal_available: bool,
+    /// A usable CUDA compute device exists, independent of the resident-Q8 gate.
+    pub cuda_available: bool,
+    /// State of the platform-neutral user GPU switch.
+    pub gpu_accel_enabled: bool,
     /// The CUDA resident decode engine will drive decode for this process (a usable
     /// CUDA device is present, GPU acceleration is on, and neither deterministic mode
     /// nor `CAMELID_CUDA_RESIDENT_DECODE=0` forces the CPU reference). When true, the
@@ -296,6 +300,8 @@ impl PlanPlatform {
         let cpu_model = cpu_model();
         let platform_label = platform_label(&operating_system, &architecture, &cpu_model);
         let metal_available = crate::metal::detect_metal_device().available;
+        let cuda_available = crate::cuda::is_available();
+        let gpu_accel_enabled = crate::cuda::gpu_accel_enabled();
         let cuda_resident_active = cuda_resident_decode_will_run();
         Self {
             operating_system,
@@ -304,6 +310,8 @@ impl PlanPlatform {
             cpu_model,
             cpu_features,
             metal_available,
+            cuda_available,
+            gpu_accel_enabled,
             cuda_resident_active,
         }
     }
@@ -426,6 +434,7 @@ pub fn plan_for_model_with_platform_and_env(
     // tensor present, "Q4_K_M" meant K-quant tensors with no Q8_0.
     let has_tensor = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0_tensors = has_tensor(GgufTensorType::Q8_0);
+    let has_i2_s_tensors = has_tensor(GgufTensorType::I2S);
     let has_kquant_tensors = has_tensor(GgufTensorType::Q4K) || has_tensor(GgufTensorType::Q6K);
     let has_prism_low_bit_tensors = has_tensor(GgufTensorType::Q1_0)
         || has_tensor(GgufTensorType::Q2_0G64)
@@ -493,6 +502,23 @@ pub fn plan_for_model_with_platform_and_env(
     };
     reasons.push(format!("support_level={support_level}"));
 
+    let bitnet_gpu_allowed =
+        platform.gpu_accel_enabled && !planner_env.flag_disabled("CAMELID_BITNET_GPU");
+    let bitnet_backend = if bitnet_gpu_allowed && platform.cuda_available {
+        "cuda"
+    } else if bitnet_gpu_allowed && platform.metal_available {
+        "metal"
+    } else {
+        "cpu"
+    };
+    let bitnet_kernel_path =
+        match crate::bitnet_kernels::BitNetKernelMode::from_env().effective_cpu() {
+            crate::bitnet_kernels::BitNetKernelMode::I2S => "i2_s_canonical_direct",
+            crate::bitnet_kernels::BitNetKernelMode::Tl1 => "i2_s_canonical_tl1_lookup",
+            crate::bitnet_kernels::BitNetKernelMode::Tl2 => "i2_s_canonical_tl2_lookup",
+            crate::bitnet_kernels::BitNetKernelMode::Auto => unreachable!("auto resolved"),
+        };
+
     let (
         selected_backend,
         selected_q8_path,
@@ -500,7 +526,55 @@ pub fn plan_for_model_with_platform_and_env(
         prefill_runtime_policy,
         decode_path,
         fallback_path,
-    ) = if gguf.architecture() == Some("gemma4") {
+    ) = if crate::model::is_bitnet_embedding_model(gguf) && has_i2_s_tensors {
+        reasons.push(format!(
+            "exact Microsoft BitNet embedding GGUF: decoder-only qwen3/gemma3 graph with \
+             canonical I2_S projections executes through the experimental {bitnet_backend} \
+             cleanroom kernel; GPU dispatch falls back to the CPU oracle and generative \
+             endpoints fail closed"
+        ));
+        (
+            match bitnet_backend {
+                "cuda" => "bitnet_embedding_cuda_runtime",
+                "metal" => "bitnet_embedding_metal_runtime",
+                _ => "bitnet_embedding_cpu_runtime",
+            },
+            bitnet_kernel_path,
+            match bitnet_backend {
+                "cuda" => "bitnet_embedding_cuda_full_sequence",
+                "metal" => "bitnet_embedding_metal_full_sequence",
+                _ => "bitnet_embedding_cpu_full_sequence",
+            },
+            "experimental_exact_artifact_geometry",
+            "mean_pool_l2_normalize",
+            "no_generation_fallback",
+        )
+    } else if gguf.architecture() == Some("bitnet-b1.58") && has_i2_s_tensors {
+        reasons.push(format!(
+            "BitNet-b1.58 canonical I2_S row: causal SubLN graph executes through the \
+             experimental {bitnet_backend} cleanroom kernel with CPU fallback"
+        ));
+        (
+            match bitnet_backend {
+                "cuda" => "bitnet_runnable_cuda_runtime",
+                "metal" => "bitnet_runnable_metal_runtime",
+                _ => "bitnet_runnable_cpu_runtime",
+            },
+            bitnet_kernel_path,
+            match bitnet_backend {
+                "cuda" => "bitnet_runnable_cuda_prefill",
+                "metal" => "bitnet_runnable_metal_prefill",
+                _ => "bitnet_runnable_cpu_prefill",
+            },
+            "experimental_cleanroom_graph",
+            match bitnet_backend {
+                "cuda" => "bitnet_runnable_cuda_decode",
+                "metal" => "bitnet_runnable_metal_decode",
+                _ => "bitnet_runnable_cpu_decode",
+            },
+            "bitnet_cleanroom_cpu_fallback",
+        )
+    } else if gguf.architecture() == Some("gemma4") {
         // gemma4 rows are served by their OWN runtime (`Gemma4ServeRuntime`), not
         // by the generic dense engine, so the generic Q8/K-quant arms below would
         // describe a lane this row never takes. Phase 0 of the gemma3→CUDA
@@ -1946,7 +2020,8 @@ fn recognized_row_level(row: &str) -> &'static str {
 /// for a row that is certified on a lane this engine does not own.
 ///
 /// Runnable-only archs are excluded FIRST, before the table is consulted at all.
-/// `crate::model::is_runnable_only_arch` (qwen35, gemma2, lfm2) marks the archs
+/// `crate::model::is_runnable_only_arch` (qwen35, gemma2, lfm2, bitnet-b1.58)
+/// marks the archs
 /// whose only correct forward pass lives in `crate::runnable` on EVERY host. The
 /// arm this predicate gates dispatches to `select_macos_q8_plan` and
 /// `select_x86_q8_plan`, which would describe an engine that cannot run them and
@@ -2008,6 +2083,11 @@ fn model_family(row: &str, gguf: &GgufFile) -> String {
 fn quant_type(gguf: &GgufFile) -> String {
     let has = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
     let has_q8_0 = has(GgufTensorType::Q8_0);
+    // BitNet and Prism both use general.file_type=40 in their respective forks.
+    // GGML tensor type 36 is definitive for BitNet's I2_S payload.
+    if has(GgufTensorType::I2S) {
+        return "I2_S".into();
+    }
     // File type 41 identifies Prism Q2_0 but cannot identify its deployed
     // block geometry. The directory resolver can, so it outranks metadata.
     if has(GgufTensorType::Q2_0G64) {
@@ -2271,6 +2351,8 @@ mod tests {
             cpu_model: "fixture cpu".into(),
             cpu_features: features.iter().map(|feature| (*feature).into()).collect(),
             metal_available: false,
+            cuda_available: false,
+            gpu_accel_enabled: false,
             cuda_resident_active: false,
         }
     }
@@ -2278,12 +2360,15 @@ mod tests {
     fn metal_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
             metal_available: true,
+            gpu_accel_enabled: true,
             ..platform(os, arch, features)
         }
     }
 
     fn cuda_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
+            cuda_available: true,
+            gpu_accel_enabled: true,
             cuda_resident_active: true,
             ..platform(os, arch, features)
         }
@@ -3785,7 +3870,7 @@ mod tests {
         // the level list — so it still holds if a runnable-only arch ever ships
         // under a row name the optimized engine does recognize, and it keeps
         // holding if `supported_exact_row_smoke` is later added to that list.
-        for arch in ["qwen35", "gemma2", "lfm2"] {
+        for arch in ["qwen35", "gemma2", "lfm2", "bitnet-b1.58"] {
             assert!(
                 crate::model::is_runnable_only_arch(arch),
                 "{arch} must stay in the runnable-only set for this guard to mean anything"
@@ -3800,6 +3885,100 @@ mod tests {
                 "{arch} is runnable-only and must be refused before the row table is read"
             );
         }
+    }
+
+    #[test]
+    fn bitnet_i2_s_plans_disclose_the_runtime_that_serves_them() {
+        let _guard = env_lock();
+        env::remove_var("CAMELID_BITNET_GPU");
+        env::remove_var("CAMELID_BITNET_KERNEL");
+        let mut causal = quant_fixture(
+            "bitnet2b",
+            Some(40),
+            &[GgufTensorType::I2S, GgufTensorType::F16],
+        );
+        causal.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("bitnet-b1.58".into()),
+        );
+        let causal_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/ggml-model-i2_s.gguf"),
+            &causal,
+            Some(8),
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(causal_plan.plan.quant_type, "I2_S");
+        assert_eq!(
+            causal_plan.plan.selected_backend,
+            "bitnet_runnable_cpu_runtime"
+        );
+        let metal_causal_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/ggml-model-i2_s.gguf"),
+            &causal,
+            Some(8),
+            metal_platform("macos", "aarch64", &["neon"]),
+        );
+        assert_eq!(
+            metal_causal_plan.plan.selected_backend,
+            "bitnet_runnable_metal_runtime"
+        );
+        env::set_var("CAMELID_BITNET_GPU", "0");
+        env::set_var("CAMELID_BITNET_KERNEL", "tl1");
+        let forced_cpu_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/ggml-model-i2_s.gguf"),
+            &causal,
+            Some(8),
+            metal_platform("macos", "aarch64", &["neon"]),
+        );
+        assert_eq!(
+            forced_cpu_plan.plan.selected_backend,
+            "bitnet_runnable_cpu_runtime"
+        );
+        assert_eq!(
+            forced_cpu_plan.plan.selected_q8_path,
+            "i2_s_canonical_tl1_lookup"
+        );
+        env::remove_var("CAMELID_BITNET_GPU");
+        env::remove_var("CAMELID_BITNET_KERNEL");
+
+        let mut embedding = quant_fixture(
+            "bitnet-embeddings-270m",
+            Some(40),
+            &[GgufTensorType::I2S, GgufTensorType::F16],
+        );
+        embedding.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("gemma3".into()),
+        );
+        embedding.metadata.insert(
+            "general.name".into(),
+            GgufMetadataValue::String("bitnet-embeddings-270m".into()),
+        );
+        let embedding_plan = plan_for_model_with_platform(
+            &PathBuf::from("/models/bitnet-embeddings-270m-bf16-i2_s.gguf"),
+            &embedding,
+            Some(8),
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(
+            embedding_plan.plan.selected_backend,
+            "bitnet_embedding_cpu_runtime"
+        );
+        assert_eq!(embedding_plan.plan.decode_path, "mean_pool_l2_normalize");
+        let cuda_embedding_plan = plan_for_model_with_platform(
+            &PathBuf::from("C:/models/bitnet-embeddings-270m-bf16-i2_s.gguf"),
+            &embedding,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(
+            cuda_embedding_plan.plan.selected_backend,
+            "bitnet_embedding_cuda_runtime"
+        );
+        assert_eq!(
+            cuda_embedding_plan.plan.prefill_path,
+            "bitnet_embedding_cuda_full_sequence"
+        );
     }
 
     #[test]

@@ -148,6 +148,18 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
             | "gemma4"
             | "phi3"
             | "lfm2"
+            | "bitnet-b1.58"
+    )
+}
+
+/// Exact official Microsoft BitNet embedding GGUFs. They intentionally reuse
+/// qwen3/gemma3 architecture identifiers while carrying an embedding-only
+/// projection-norm graph and no language-model output tensor.
+pub fn is_bitnet_embedding_model(gguf: &GgufFile) -> bool {
+    matches!(
+        (gguf.architecture(), gguf.model_name()),
+        (Some("qwen3"), Some("bitnet-embeddings-0.6b"))
+            | (Some("gemma3"), Some("bitnet-embeddings-270m"))
     )
 }
 
@@ -161,6 +173,8 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 /// binding cannot bind them (BACKEND_ASKS RA-6b). Every lane that would
 /// construct a direct dense session for these archs must fail closed instead
 /// of decoding fluent-looking garbage.
+/// bitnet-b1.58: its I2_S projections and attention/FFN SubLN tensors exist
+/// only in the runnable graph; the optimized binder would drop both SubLNs.
 ///
 /// gemma3 LEFT this set in Phase 3b of the Metal campaign: the Metal-resident
 /// forward carries its full structure (QK + sandwich norms, GeGLU, dual-theta
@@ -171,7 +185,7 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 /// lanes now key on. The CPU dense forward remains WRONG for gemma3 (no
 /// window mask; hazard H4) and fails closed at forward dispatch.
 pub fn is_runnable_only_arch(architecture: &str) -> bool {
-    matches!(architecture, "qwen35" | "gemma2" | "lfm2")
+    matches!(architecture, "qwen35" | "gemma2" | "lfm2" | "bitnet-b1.58")
 }
 
 /// Capability-aware serve/direct-session routing predicate (gemma3→Metal
@@ -324,7 +338,8 @@ impl LlamaModelConfig {
         let architecture = match gguf.architecture() {
             Some(
                 architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "qwen3moe" | "qwen35"
-                | "smollm3" | "gemma3" | "gemma4" | "phi3" | "lfm2"),
+                | "smollm3" | "gemma3" | "gemma4" | "phi3" | "lfm2"
+                | "bitnet-b1.58"),
             ) => architecture,
             // Gemma 4 MTP/assistant drafter heads ship as a distinct architecture.
             // The tensor map parses (q-only attention layers, per-layer
@@ -1031,6 +1046,12 @@ impl Gemma3Metadata {
         if architecture != "gemma3" {
             return Ok(None);
         }
+        // Microsoft's 270M BitNet embedding checkpoint uses the Gemma 3 dense
+        // graph but deliberately omits sliding-window metadata. The pinned
+        // BitNet llama.cpp loader treats that omission as full attention.
+        if is_bitnet_embedding_model(gguf) {
+            return Ok(None);
+        }
         let key = |suffix: &str| architecture_key(architecture, suffix);
         let block_count = required_u32(gguf, &key("block_count"))?;
         let embedding_length = required_u32(gguf, &key("embedding_length"))?;
@@ -1396,7 +1417,7 @@ fn lfm2_reject_unrunnable_shapes(
 }
 
 /// NEOX split-half RoPE pairing per architecture: qwen2/qwen3/qwen3moe/qwen35,
-/// phi3 and lfm2 (unpermuted weights;
+/// phi3, lfm2, and bitnet-b1.58 (unpermuted weights;
 /// proven during MUSTER M-A2 — adjacent even/odd degenerates long generation,
 /// split-half restores coherence; the runnable lane independently asserts NEOX
 /// for phi3). Everything else keeps adjacent even/odd (LLaMA-style permuted
@@ -1409,7 +1430,7 @@ fn lfm2_reject_unrunnable_shapes(
 fn arch_uses_neox_rope_pairing(architecture: &str) -> bool {
     matches!(
         architecture,
-        "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "phi3" | "lfm2"
+        "qwen2" | "qwen3" | "qwen3moe" | "qwen35" | "phi3" | "lfm2" | "bitnet-b1.58"
     )
 }
 
@@ -2800,6 +2821,48 @@ mod tests {
         gguf
     }
 
+    #[test]
+    fn exact_bitnet_embedding_rows_are_detected_and_gemma_uses_full_attention() {
+        let qwen = meta_only_gguf(vec![
+            (
+                "general.architecture",
+                GgufMetadataValue::String("qwen3".into()),
+            ),
+            (
+                "general.name",
+                GgufMetadataValue::String("bitnet-embeddings-0.6b".into()),
+            ),
+        ]);
+        assert!(super::is_bitnet_embedding_model(&qwen));
+
+        let gemma = meta_only_gguf(vec![
+            (
+                "general.architecture",
+                GgufMetadataValue::String("gemma3".into()),
+            ),
+            (
+                "general.name",
+                GgufMetadataValue::String("bitnet-embeddings-270m".into()),
+            ),
+            ("gemma3.context_length", GgufMetadataValue::U32(32_768)),
+            ("gemma3.embedding_length", GgufMetadataValue::U32(640)),
+            ("gemma3.block_count", GgufMetadataValue::U32(18)),
+            ("gemma3.feed_forward_length", GgufMetadataValue::U32(2_048)),
+            ("gemma3.attention.head_count", GgufMetadataValue::U32(4)),
+            ("gemma3.attention.head_count_kv", GgufMetadataValue::U32(1)),
+            ("gemma3.attention.key_length", GgufMetadataValue::U32(256)),
+            ("gemma3.vocab_size", GgufMetadataValue::U32(262_144)),
+            ("gemma3.rope.freq_base", GgufMetadataValue::F32(1_000_000.0)),
+        ]);
+        assert!(super::is_bitnet_embedding_model(&gemma));
+        let config = super::LlamaModelConfig::from_gguf(&gemma).expect("BitNet Gemma config");
+        assert!(
+            config.gemma3.is_none(),
+            "missing SWA metadata means full attention"
+        );
+        assert_eq!(config.attention_key_length, Some(256));
+    }
+
     /// The real LFM2.5-2.6B row: 30 layers, `head_count_kv` an **i32 array**
     /// whose zeros mark the 22 short-conv layers and whose 8s mark the 8 GQA
     /// layers (verbatim from the published GGUF).
@@ -2984,6 +3047,7 @@ mod tests {
         // (`llama-model.cpp:2477` → `:2492`) and its converter leaves Q/K
         // unpermuted, so split-half is what the on-disk weights expect.
         assert!(super::arch_uses_neox_rope_pairing("lfm2"));
+        assert!(super::arch_uses_neox_rope_pairing("bitnet-b1.58"));
         assert!(!super::arch_uses_neox_rope_pairing("llama"));
         assert!(!super::arch_uses_neox_rope_pairing("mistral"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma3"));
@@ -3004,8 +3068,17 @@ mod tests {
         // mistral3.cpp:137,143. gemma3/gemma4/qwen35 carry per-layer rope BASES
         // or schedules — not skips — and those live in their own metadata.
         for arch in [
-            "llama", "mistral", "qwen2", "qwen3", "qwen3moe", "qwen35", "gemma3", "gemma4", "phi3",
+            "llama",
+            "mistral",
+            "qwen2",
+            "qwen3",
+            "qwen3moe",
+            "qwen35",
+            "gemma3",
+            "gemma4",
+            "phi3",
             "lfm2",
+            "bitnet-b1.58",
         ] {
             assert!(
                 super::arch_no_rope_layer_step(arch).is_none(),
@@ -3023,7 +3096,7 @@ mod tests {
         // fluent-looking garbage. gemma3 left this set in Phase 3b of the Metal
         // campaign (its routing is capability-aware — pinned by the split test
         // below).
-        for arch in ["qwen35", "gemma2", "lfm2"] {
+        for arch in ["qwen35", "gemma2", "lfm2", "bitnet-b1.58"] {
             assert!(
                 super::is_runnable_only_arch(arch),
                 "{arch} must be classified runnable-lane-only"
@@ -3050,7 +3123,7 @@ mod tests {
         // bridge-only regardless of capability; dense archs never bridge.
         for capable in [false, true] {
             for q8 in [false, true] {
-                for arch in ["qwen35", "gemma2"] {
+                for arch in ["qwen35", "gemma2", "bitnet-b1.58"] {
                     assert!(
                         super::arch_requires_runnable_bridge_given(arch, capable, q8),
                         "{arch} must require the runnable bridge on every host"
@@ -3167,8 +3240,17 @@ mod tests {
         // This list must stay byte-for-byte in sync with the match arm in
         // LlamaModelConfig::from_gguf. If you change one, change both.
         for arch in [
-            "llama", "mistral", "qwen2", "qwen3", "qwen3moe", "smollm3", "gemma3", "gemma4",
-            "phi3", "lfm2",
+            "llama",
+            "mistral",
+            "qwen2",
+            "qwen3",
+            "qwen3moe",
+            "smollm3",
+            "gemma3",
+            "gemma4",
+            "phi3",
+            "lfm2",
+            "bitnet-b1.58",
         ] {
             assert!(
                 super::is_implemented_architecture(arch),
