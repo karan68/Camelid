@@ -2487,6 +2487,7 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))
+        .route("/api/dial", get(dial))
         .route(
             "/api/models/default",
             get(default_model).post(set_default_model),
@@ -20136,6 +20137,291 @@ mod tests {
         }
     }
 
+    /// An empty models directory must still answer, and answer honestly: the dial
+    /// is a report, so "nothing installed" is a 200 with every tier unavailable,
+    /// never a 404 or a 500.
+    #[tokio::test]
+    async fn dial_answers_on_a_model_less_host_with_every_tier_unavailable() {
+        let _env_guard = crate::test_support::env_lock();
+        let body = dial_body(&dial_state().1, "/api/dial", StatusCode::OK).await;
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["surface"], "chat");
+        let tiers = body["tiers"].as_array().expect("tiers array");
+        assert_eq!(tiers.len(), 4);
+        for tier in tiers {
+            assert_eq!(tier["available"], false, "{tier}");
+            assert_eq!(tier["availability"], "unavailable", "{tier}");
+            assert_eq!(tier["unavailable_code"], "no_models", "{tier}");
+            assert!(tier["primary_model_id"].is_null(), "{tier}");
+        }
+        assert_eq!(body["dual_model_oracle"]["hardware_permits"], false);
+    }
+
+    #[tokio::test]
+    async fn dial_kill_switch_reports_the_feature_off() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(DIAL_ENABLED_ENV, "0");
+        let body = dial_body(&dial_state().1, "/api/dial", StatusCode::OK).await;
+        std::env::remove_var(DIAL_ENABLED_ENV);
+
+        assert_eq!(body["enabled"], false);
+        for tier in body["tiers"].as_array().expect("tiers array") {
+            assert_eq!(tier["unavailable_code"], "feature_disabled", "{tier}");
+        }
+        assert_eq!(body["dual_model_oracle"]["effective"], false);
+    }
+
+    /// The workspace needs a tool-capable model; chat does not. With a GGUF that
+    /// belongs to no supported row, the two surfaces must disagree — and the
+    /// difference must come from the surface, not from capacity.
+    #[tokio::test]
+    async fn dial_workspace_and_chat_disagree_without_a_tool_capable_model() {
+        let _env_guard = crate::test_support::env_lock();
+        let (_tmp, state) = dial_state_with_model("unproven-model.gguf");
+
+        let chat = dial_body(&state, "/api/dial?surface=chat", StatusCode::OK).await;
+        assert_eq!(chat["tiers"][0]["primary_model_id"], "unproven-model.gguf");
+        assert_ne!(
+            chat["tiers"][0]["unavailable_code"],
+            "no_tool_capable_model"
+        );
+
+        let workspace = dial_body(&state, "/api/dial?surface=workspace", StatusCode::OK).await;
+        assert_eq!(workspace["surface"], "workspace");
+        for tier in workspace["tiers"].as_array().expect("tiers array") {
+            assert_eq!(tier["unavailable_code"], "no_tool_capable_model", "{tier}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_rejects_an_unknown_surface_instead_of_defaulting() {
+        let _env_guard = crate::test_support::env_lock();
+        let body = dial_body(
+            &dial_state().1,
+            "/api/dial?surface=turbo",
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(body["error"]["code"], "invalid_dial_surface");
+        assert_eq!(body["error"]["param"], "surface");
+    }
+
+    /// The field names are the contract a UI binds to; pin them so a rename is a
+    /// deliberate act rather than a silent break.
+    #[tokio::test]
+    async fn dial_response_shape_is_pinned() {
+        let _env_guard = crate::test_support::env_lock();
+        let (_tmp, state) = dial_state_with_model("unproven-model.gguf");
+        let body = dial_body(&state, "/api/dial", StatusCode::OK).await;
+
+        let top: std::collections::BTreeSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            top,
+            ["dual_model_oracle", "enabled", "surface", "tiers"]
+                .into_iter()
+                .collect()
+        );
+        let oracle: std::collections::BTreeSet<&str> = body["dual_model_oracle"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            oracle,
+            ["effective", "hardware_permits", "setting_enabled"]
+                .into_iter()
+                .collect()
+        );
+        let tier = &body["tiers"][0];
+        for field in [
+            "tier",
+            "available",
+            "availability",
+            "capacity_verified",
+            "primary_model_id",
+            "primary_model_name",
+            "review_mode",
+            "reason",
+            "estimated_relative_cost",
+        ] {
+            assert!(tier.get(field).is_some(), "tier is missing {field}: {tier}");
+        }
+        assert_eq!(body["tiers"][0]["tier"], "low");
+        assert_eq!(body["tiers"][3]["tier"], "ultra");
+        assert_eq!(body["tiers"][2]["review_mode"], "self_critique");
+        assert_eq!(body["tiers"][0]["estimated_relative_cost"], 1.0);
+        assert_eq!(body["tiers"][2]["estimated_relative_cost"], 2.0);
+    }
+
+    /// A GET that reports must not also *do* something. Polling it must never
+    /// load a model or register a download.
+    #[tokio::test]
+    async fn dial_polling_has_no_side_effects() {
+        let _env_guard = crate::test_support::env_lock();
+        let (_tmp, state) = dial_state_with_model("unproven-model.gguf");
+        // The download registry is process-global, so other tests may hold rows in
+        // it. Compare before/after rather than asserting empty.
+        let downloads_before = active_downloads_map().lock().unwrap().len();
+        for _ in 0..50 {
+            let _ = dial_body(&state, "/api/dial", StatusCode::OK).await;
+        }
+        assert!(state.loaded_models.read().await.is_empty());
+        assert!(state.active_model_id.read().await.is_none());
+        assert!(state.cached_weights.read().await.is_empty());
+        assert!(state.execution_plans.read().await.is_empty());
+        assert!(state.model_last_used.read().await.is_empty());
+        assert_eq!(
+            active_downloads_map().lock().unwrap().len(),
+            downloads_before,
+            "polling the dial must not register a download"
+        );
+    }
+
+    /// The dial reads no server registry, so it must answer even while a load or
+    /// unload is holding every lock a model transition takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dial_answers_while_a_model_transition_holds_the_locks() {
+        use tower::ServiceExt;
+
+        let _env_guard = crate::test_support::env_lock();
+        let (_tmp, state) = dial_state_with_model("unproven-model.gguf");
+        let app = router_with_state(state.clone());
+
+        let _transition = state.model_transition.lock().await;
+        let _loaded = state.loaded_models.write().await;
+        let _active = state.active_model_id.write().await;
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    app.oneshot(
+                        axum::http::Request::builder()
+                            .uri("/api/dial")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    ),
+                )
+                .await
+                .expect("dial must not block on a model transition")
+                .unwrap()
+                .status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+    }
+
+    /// `serve --model <path>` can run a model that lives outside the models
+    /// directory. Reporting "no models installed" while the engine is serving one
+    /// is the failure a live run actually produced, so pin it.
+    #[test]
+    fn dial_candidates_include_a_model_loaded_from_outside_the_models_dir() {
+        let hw = crate::capability::HardwareProfile::cached();
+        let dir = tempfile::tempdir().expect("models dir");
+        let elsewhere = tempfile::tempdir().expect("other dir");
+        std::fs::write(dir.path().join("in-dir.gguf"), b"GGUF-not-a-real-model").unwrap();
+        let outside = elsewhere.path().join("outside.gguf");
+        std::fs::write(&outside, b"GGUF-not-a-real-model").unwrap();
+
+        assert_eq!(dial_candidates(dir.path(), &[], hw).len(), 1);
+
+        let both = dial_candidates(dir.path(), std::slice::from_ref(&outside), hw);
+        let ids: Vec<&str> = both.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["in-dir.gguf", "outside.gguf"]);
+
+        // The same file named twice is one candidate, not two.
+        let deduped = dial_candidates(dir.path(), &[dir.path().join("in-dir.gguf")], hw);
+        assert_eq!(deduped.len(), 1);
+    }
+
+    /// A live Workspace run refused `Llama-3.2-3B-Instruct-Q8_0.gguf` with 422
+    /// `model_not_tool_capable` while the dial was advertising three Workspace tiers
+    /// on it: the local copy is a different publisher's build, and `tool_capable` is
+    /// earned per exact row by an agent-eval receipt against specific bytes.
+    ///
+    /// The dial must therefore answer tool-capability the way the gate does — bytes
+    /// included — or it promises a tier the session refuses.
+    #[test]
+    fn a_hash_pinned_artifact_with_the_wrong_bytes_is_not_tool_capable() {
+        let dir = tempfile::tempdir().expect("models dir");
+
+        // Every tool-capable row that is hash-pinned: wrong bytes must be refused.
+        let mut checked = 0usize;
+        for (filename, _) in CURATED_SUPPORTED_ARTIFACT_SHA256.iter() {
+            if workspace::tool_capable_row_for_filename(filename).is_none() {
+                continue;
+            }
+            let path = dir.path().join(filename);
+            std::fs::write(&path, b"GGUF-these-are-not-the-certified-bytes").unwrap();
+            assert!(
+                !dial_tool_capable_artifact(&path, filename),
+                "{filename} is hash-pinned, so a same-named file with different bytes \
+                 must not be advertised as tool-capable"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no hash-pinned tool-capable row found; this test would pin nothing"
+        );
+    }
+
+    /// The complement: a filename that no tool-capable row claims is never
+    /// tool-capable, whatever its bytes are.
+    #[test]
+    fn a_filename_no_tool_capable_row_claims_is_never_tool_capable() {
+        let dir = tempfile::tempdir().expect("models dir");
+        let path = dir.path().join("not-a-known-artifact.gguf");
+        std::fs::write(&path, b"GGUF-not-a-real-model").unwrap();
+        assert!(!dial_tool_capable_artifact(
+            &path,
+            "not-a-known-artifact.gguf"
+        ));
+    }
+
+    fn dial_state() -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let state = AppState::default().with_models_dir(Some(tmp.path().to_path_buf()));
+        (tmp, state)
+    }
+
+    /// A models directory holding one GGUF whose bytes are not a real model. The
+    /// header is unparseable on purpose, exercising the load guard's own
+    /// advisory-pad fallback rather than requiring a multi-gigabyte fixture.
+    fn dial_state_with_model(filename: &str) -> (tempfile::TempDir, AppState) {
+        let (tmp, state) = dial_state();
+        std::fs::write(tmp.path().join(filename), b"GGUF-not-a-real-model").expect("write gguf");
+        (tmp, state)
+    }
+
+    async fn dial_body(state: &AppState, uri: &str, expect: StatusCode) -> serde_json::Value {
+        use tower::ServiceExt;
+        let response = router_with_state(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expect, "{uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     /// `/health` names the build that is answering. The WebUI's System view reads these
     /// two fields directly, so an operator looking at a running engine can tell which
     /// version it is without inspecting the binary — and they must survive a busy
@@ -28123,6 +28409,352 @@ fn runnable_smoke_receipt_path(filename: &str) -> PathBuf {
 /// `GET /api/models/local` â€” enumerate `<models_dir>/*.gguf` with per-model lane
 /// facts. Membership is derived downstream from these facts; nothing here is
 /// hand-authored.
+/// Kill switch for the whole Dial feature (AD-10). Default ON; only an explicit
+/// `0`/`false`/`off`/`no`/`disabled` turns it off, so a typo cannot silently
+/// disable a shipped feature.
+const DIAL_ENABLED_ENV: &str = "CAMELID_DIAL";
+/// Opt-in for a second resident model reviewing the top tier. Default OFF: it is
+/// the only dial behaviour that costs additional memory.
+const DIAL_DUAL_MODEL_ENV: &str = "CAMELID_DIAL_DUAL_MODEL";
+
+#[derive(Debug, serde::Deserialize)]
+struct DialQuery {
+    surface: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DialTierView {
+    pub tier: &'static str,
+    /// True exactly when the tier can be used now, i.e. when the load guard
+    /// would not refuse its model.
+    pub available: bool,
+    /// `ready` | `needs_free_memory` | `unavailable`.
+    pub availability: &'static str,
+    /// Only meaningful while `ready`: false when the advisor abstained, so the
+    /// tier is offerable but carries no capacity promise.
+    pub capacity_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shortfall_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_model_name: Option<String>,
+    /// `none` | `self_critique` | `second_model`.
+    pub review_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_model_id: Option<String>,
+    pub reason: String,
+    /// Model passes relative to a single-pass turn. A structural count (1 or 2),
+    /// NOT a measured latency multiplier — a warm second pass is cheaper than the
+    /// first, and no throughput claim is made here.
+    pub estimated_relative_cost: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DialOracleView {
+    /// The operator opted in via `CAMELID_DIAL_DUAL_MODEL`.
+    pub setting_enabled: bool,
+    /// `fit::assess_pair` admits the top tier's two largest candidates together.
+    pub hardware_permits: bool,
+    /// Both of the above. Anything less degrades to same-model review.
+    pub effective: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DialResponse {
+    pub enabled: bool,
+    pub surface: &'static str,
+    pub tiers: Vec<DialTierView>,
+    pub dual_model_oracle: DialOracleView,
+}
+
+/// The compatibility row id for an exact artifact filename, from the same two
+/// sources `filename_is_supported_exact_row` consults.
+fn dial_row_id_for_filename(filename: &str) -> Option<&'static str> {
+    curated_catalog()
+        .iter()
+        .find(|c| c.filename == filename)
+        .map(|c| c.catalog_id)
+        .or_else(|| {
+            NON_CATALOG_SUPPORTED_ARTIFACTS
+                .iter()
+                .find_map(|(artifact, row_id, _)| (*artifact == filename).then_some(*row_id))
+        })
+}
+
+/// Tool capability for an on-disk candidate, answered the way the Workspace session
+/// gate answers it: the row must be tool-capable AND, when the artifact is hash-pinned,
+/// the bytes must be the certified ones.
+///
+/// `tool_capable` is earned per exact row by a committed agent-eval receipt against
+/// specific bytes, so a same-named replacement has not earned it. Matching on filename
+/// alone made the dial advertise Workspace tiers that the gate then refused with 422
+/// `model_not_tool_capable`.
+fn dial_tool_capable_artifact(path: &std::path::Path, filename: &str) -> bool {
+    if workspace::tool_capable_row_for_filename(filename).is_none() {
+        return false;
+    }
+    let Some(expected) = supported_artifact_expected_sha256(filename) else {
+        return true;
+    };
+    // Only hash-pinned artifacts pay for a digest, and this is the loader's own cache,
+    // so the warm path is a stat rather than a re-read of the whole GGUF.
+    receipt::sha256_file_hex_cached(path).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+/// Describe one on-disk GGUF the way the dial needs it, or `None` when the path
+/// is not a usable model file.
+///
+/// The footprint is built the way `fit_preload_guard` builds it — exact
+/// dimensions when the header parses, [`crate::fit::advisory_footprint`]
+/// otherwise — so the dial cannot offer a tier the loader would then refuse.
+fn dial_candidate_from_path(
+    path: &std::path::Path,
+    hw: &crate::capability::HardwareProfile,
+) -> Option<crate::dial::CandidateModel> {
+    let filename = path.file_name()?.to_string_lossy().to_string();
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return None;
+    }
+    let size = metadata.len();
+    let footprint = crate::fit_dims::dims_from_gguf_file(path)
+        .map(|dims| exact_preload_footprint(size, dims, hw, false, crate::fit::KvDtype::F16))
+        .unwrap_or_else(|| crate::fit::advisory_footprint(size));
+    let row_id = dial_row_id_for_filename(&filename);
+    let task_tags = curated_catalog()
+        .iter()
+        .find(|c| c.filename == filename)
+        .map(|c| c.task_tags.iter().map(|t| t.to_string()).collect())
+        .unwrap_or_default();
+    Some(crate::dial::CandidateModel {
+        id: filename.clone(),
+        tool_capable: dial_tool_capable_artifact(path, &filename),
+        filename,
+        footprint,
+        supported_row: row_id.is_some_and(|id| supported_compatibility_row_ids().contains(id)),
+        task_tags,
+    })
+}
+
+/// Build the dial's candidate set: every GGUF in the models directory, plus
+/// `also` — paths that are already loaded but may live elsewhere.
+///
+/// `also` exists because `serve --model <path>` can run a model from outside the
+/// models directory; without it the dial would report "no models installed" while
+/// the engine is serving one. Deduplicated by filename, directory entries first.
+///
+/// Read-only: it stats and parses GGUF headers (the same cheap header-only path
+/// `/api/models/inspect` uses) and mutates no server state.
+fn dial_candidates(
+    models_dir: &std::path::Path,
+    also: &[PathBuf],
+    hw: &crate::capability::HardwareProfile,
+) -> Vec<crate::dial::CandidateModel> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(models_dir)
+        .map(|entries| {
+            let mut found: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+                })
+                .collect();
+            found.sort();
+            found
+        })
+        .unwrap_or_default();
+    paths.extend(also.iter().cloned());
+
+    let mut candidates: Vec<crate::dial::CandidateModel> = Vec::new();
+    for path in paths {
+        let Some(candidate) = dial_candidate_from_path(&path, hw) else {
+            continue;
+        };
+        if candidates.iter().any(|c| c.id == candidate.id) {
+            continue;
+        }
+        candidates.push(candidate);
+    }
+    candidates
+}
+
+/// Whether this host could hold the two largest candidates at once.
+fn dial_hardware_permits_pair(
+    candidates: &[crate::dial::CandidateModel],
+    hw: &crate::capability::HardwareProfile,
+) -> bool {
+    let mut by_size: Vec<&crate::dial::CandidateModel> = candidates.iter().collect();
+    by_size.sort_by(|a, b| {
+        a.footprint
+            .weight_bytes
+            .cmp(&b.footprint.weight_bytes)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let (Some(primary), Some(oracle)) = (by_size.pop(), by_size.pop()) else {
+        return false;
+    };
+    let budget = cpu_weight_materialization_limit_bytes().unwrap_or(u64::MAX);
+    crate::fit::assess_pair(
+        hw,
+        &primary.footprint,
+        &oracle.footprint,
+        crate::fit::ACTIVATION_SCRATCH_BYTES,
+        budget,
+    )
+    .admits_pair()
+}
+
+fn dial_tier_view(
+    plan: &crate::dial::TierPlan,
+    candidates: &[crate::dial::CandidateModel],
+) -> DialTierView {
+    let (availability, capacity_verified, shortfall_bytes, unavailable_code) =
+        match plan.availability {
+            crate::dial::Availability::Ready { capacity_verified } => {
+                ("ready", capacity_verified, None, None)
+            }
+            crate::dial::Availability::NeedsFreeMemory { shortfall_bytes } => {
+                ("needs_free_memory", false, Some(shortfall_bytes), None)
+            }
+            crate::dial::Availability::Unavailable { code } => {
+                ("unavailable", false, None, Some(code.as_str()))
+            }
+        };
+    let (review_mode, review_model_id) = match &plan.review {
+        crate::dial::ReviewMode::None => ("none", None),
+        crate::dial::ReviewMode::SelfCritique => ("self_critique", None),
+        crate::dial::ReviewMode::SecondModel(id) => ("second_model", Some(id.clone())),
+    };
+    let primary_model_name = plan.primary_model_id.as_ref().and_then(|id| {
+        candidates
+            .iter()
+            .find(|c| &c.id == id)
+            .map(|c| c.filename.clone())
+    });
+    DialTierView {
+        tier: plan.tier.as_str(),
+        available: plan.availability.is_ready(),
+        availability,
+        capacity_verified,
+        shortfall_bytes,
+        unavailable_code,
+        primary_model_id: plan.primary_model_id.clone(),
+        primary_model_name,
+        review_mode,
+        review_model_id,
+        reason: plan.reason.clone(),
+        estimated_relative_cost: if matches!(plan.review, crate::dial::ReviewMode::None) {
+            1.0
+        } else {
+            2.0
+        },
+    }
+}
+
+fn dial_disabled_response(surface: crate::dial::DialSurface) -> DialResponse {
+    DialResponse {
+        enabled: false,
+        surface: dial_surface_str(surface),
+        tiers: crate::dial::DialTier::ALL
+            .iter()
+            .map(|tier| DialTierView {
+                tier: tier.as_str(),
+                available: false,
+                availability: "unavailable",
+                capacity_verified: false,
+                shortfall_bytes: None,
+                unavailable_code: Some("feature_disabled"),
+                primary_model_id: None,
+                primary_model_name: None,
+                review_mode: "none",
+                review_model_id: None,
+                reason: format!("The dial is turned off ({DIAL_ENABLED_ENV}=0)."),
+                estimated_relative_cost: 1.0,
+            })
+            .collect(),
+        dual_model_oracle: DialOracleView {
+            setting_enabled: false,
+            hardware_permits: false,
+            effective: false,
+        },
+    }
+}
+
+fn dial_surface_str(surface: crate::dial::DialSurface) -> &'static str {
+    match surface {
+        crate::dial::DialSurface::Chat => "chat",
+        crate::dial::DialSurface::Workspace => "workspace",
+    }
+}
+
+/// Report what each dial position would do on this host, and why.
+///
+/// Strictly read-only: no model is loaded, no download is registered, no
+/// background dimension fetch is scheduled, and no server lock is taken. It uses
+/// the cached hardware snapshot rather than a live probe because this endpoint is
+/// pollable and `HardwareProfile::detect()` re-initializes a CUDA context; the
+/// load guard keeps its live probe and stays authoritative, exactly as the
+/// catalog badge already relates to it.
+async fn dial(State(state): State<AppState>, Query(query): Query<DialQuery>) -> Response {
+    let surface = match query.surface.as_deref() {
+        None | Some("chat") => crate::dial::DialSurface::Chat,
+        Some("workspace") => crate::dial::DialSurface::Workspace,
+        Some(other) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_dial_surface",
+                format!("unknown surface {other:?}; expected \"chat\" or \"workspace\""),
+                Some("surface"),
+            );
+        }
+    };
+
+    if !crate::runtime_config::env_flag_default_on(DIAL_ENABLED_ENV) {
+        return Json(dial_disabled_response(surface)).into_response();
+    }
+
+    let hw = crate::capability::HardwareProfile::cached();
+    // Best-effort: include anything already loaded from outside the models
+    // directory. `try_read` rather than `read` keeps this endpoint non-blocking —
+    // if a model transition holds the registry, the directory scan still answers.
+    let loaded_paths: Vec<PathBuf> = state
+        .loaded_models
+        .try_read()
+        .map(|loaded| loaded.values().map(|model| model.path.clone()).collect())
+        .unwrap_or_default();
+    let candidates = dial_candidates(&state.models_dir, &loaded_paths, hw);
+    let setting_enabled = crate::runtime_config::env_flag_default_off(DIAL_DUAL_MODEL_ENV);
+    let hardware_permits = dial_hardware_permits_pair(&candidates, hw);
+    let effective = setting_enabled && hardware_permits;
+    // A second model is only ever offered once Phase 2's pair gate agrees; the
+    // resolver's own byte budget stays 0 otherwise.
+    let pair_budget = if effective {
+        cpu_weight_materialization_limit_bytes().unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+
+    let plans = crate::dial::resolve_all(surface, &candidates, hw, pair_budget);
+    Json(DialResponse {
+        enabled: true,
+        surface: dial_surface_str(surface),
+        tiers: plans
+            .iter()
+            .map(|plan| dial_tier_view(plan, &candidates))
+            .collect(),
+        dual_model_oracle: DialOracleView {
+            setting_enabled,
+            hardware_permits,
+            effective,
+        },
+    })
+    .into_response()
+}
+
 async fn local_models(
     State(state): State<AppState>,
     _headers: HeaderMap,

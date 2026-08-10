@@ -1,0 +1,13 @@
+﻿rep,task_id,draft_ms,medium_correct,review_ms,worked_correct,worked_changed,verdict_found,draft,worked_final
+1,1,3971,1,32336,1,False,True,"Python Java C++","Python Java C++"
+1,2,4071,1,28797,1,False,True,"blue, green, red, yellow","blue, green, red, yellow"
+1,3,4065,0,40056,0,False,True,"The sea whispers secrets to the shore at dawn.","The sea whispers secrets to the shore at dawn."
+1,4,2172,1,12153,1,False,True,"BANANA","BANANA"
+1,5,5024,1,39450,1,False,True,"Cheetah Cobra Crab","Cheetah Cobra Crab"
+1,6,2140,1,42708,1,False,True,"42","42"
+1,7,11589,1,57238,1,False,True,"Rain falls from the sky, cleansing the earth and bringing life to the land. It is a natural phenomenon that shapes weather patterns and infl","Rain falls from the sky, cleansing the earth and bringing life to the land. It is a natural phenomenon that shapes weather patterns and infl"
+1,8,5075,1,37242,1,False,True,"2,4,6,8,10","2,4,6,8,10"
+1,9,2608,0,50295,0,False,True,"Golden Flame.","Golden Flame."
+1,10,2309,1,28351,1,False,True,"yes!","yes!"
+1,11,3941,1,28210,1,False,True,"Apple Banana Cherry","Apple Banana Cherry"
+1,12,4730,0,187309,0,True,True,"Brew a cup of coffee and savor its rich aroma.","----- CORRECTED ANSWER ----- Brew a cup of coffee and savor its rich aroma. (Note: The original answer contains the letter 'e', so it is not"

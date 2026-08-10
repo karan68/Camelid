@@ -14,18 +14,26 @@ use serde::{Deserialize, Serialize};
 
 use super::agent::{
     run_loop, AgentConfig, AgentMsg, Approver, ContextBudgetUsage, Decision, LiveDriver, LoopEnd,
-    ModelStepMetrics, Policy, Reporter,
+    ModelDriver, ModelStep, ModelStepMetrics, Policy, Reporter,
 };
 use super::audit::NoopSink;
 use super::client::Client;
 use super::shell_sandbox::ShellSandbox;
 use super::tools::{Action, Sandbox, ToolOutcome, ToolProfile};
 use super::workspace_memory::MemoryContext;
+use crate::dial::{self, DialTier, ReviewOutcome};
 
 const APPROVAL_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
 const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
+/// Wall-clock budget a whole turn must still fit inside for a review pass to be
+/// worth starting. A turn that has already run this long is one the caller has
+/// waited on long enough; the draft is returned instead of doubling the wait.
+const WORKSPACE_REVIEW_TURN_BUDGET: Duration = Duration::from_secs(10 * 60);
+/// Minimum slice of [`WORKSPACE_REVIEW_TURN_BUDGET`] that must remain before a
+/// review is started, so a review is never begun only to be abandoned.
+const WORKSPACE_REVIEW_TIME_FLOOR: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -65,6 +73,17 @@ pub(crate) enum WorkspaceEvent {
     },
     #[serde(rename = "model.answer")]
     ModelAnswer { content: String },
+    /// The answer that was just streamed is a draft that the dial is about to review.
+    #[serde(rename = "dial.draft_ready")]
+    DialDraftReady { tier: String },
+    #[serde(rename = "dial.review_started")]
+    DialReviewStarted,
+    /// `changed` is false when the reviewer declined, so the draft above stands as the answer.
+    #[serde(rename = "dial.review_finished")]
+    DialReviewFinished { changed: bool },
+    /// A guard declined to spend a second pass; the draft above stands as the answer.
+    #[serde(rename = "dial.review_skipped")]
+    DialReviewSkipped { reason: String },
     #[serde(rename = "tool.call")]
     ToolCall { detail: String },
     #[serde(rename = "approval.required")]
@@ -133,6 +152,9 @@ pub(crate) struct WorkspaceRunConfig {
     /// Optional session-scoped semantic index. When present, each turn gets a
     /// bounded set of relevant workspace excerpts before the model runs.
     pub semantic_retriever: Option<Arc<super::semantic_search::WorkspaceSemanticRetriever>>,
+    /// Effort tier for this turn. `None` means the caller did not ask for a
+    /// tier, which behaves exactly as the tiers that do not review.
+    pub dial_tier: Option<DialTier>,
 }
 
 impl WorkspaceBridgeClient {
@@ -403,6 +425,17 @@ pub(crate) fn run_live(
     config: WorkspaceRunConfig,
     mut worker: WorkspaceBridgeWorker,
 ) -> Result<LoopEnd, String> {
+    let turn_started = Instant::now();
+    let review_tier = config.dial_tier.filter(|tier| tier.wants_review());
+    let review_params = review_tier.map(|tier| ReviewParams {
+        addr: config.addr,
+        model_id: config.model_id.clone(),
+        family: config.family.clone(),
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        tier,
+    });
+    let review_goal = review_params.is_some().then(|| config.goal.clone());
     let sandbox = match Sandbox::new(&config.workspace, false, Duration::from_secs(30)) {
         Ok(sandbox) => sandbox.with_shell_mode(ShellSandbox::Disabled),
         Err(error) => {
@@ -488,6 +521,38 @@ pub(crate) fn run_live(
         &mut Policy::default(),
         &mut history,
     );
+    // A review only ever runs over an answer that exists, and only ever adds a
+    // second answer on top of it. Nothing below can turn a good turn into a bad
+    // one: every path that is not a strictly better answer keeps the draft.
+    if matches!(end, LoopEnd::Answered) {
+        if let (Some(params), Some(goal)) = (review_params, review_goal) {
+            if let Some(draft) = last_assistant_text(&history) {
+                let tier = params.tier;
+                let max_tokens = params.max_tokens;
+                let mut review_driver = LiveDriver::with(
+                    Client::new(params.addr),
+                    params.model_id,
+                    params.family,
+                    params.max_tokens,
+                    params.temperature,
+                );
+                review_driver.set_context_budget(Some(WORKSPACE_CONTEXT_BUDGET_TOKENS));
+                review_driver
+                    .set_stream_control(Arc::clone(&worker.cancel), WORKSPACE_MODEL_STEP_TIMEOUT);
+                if let Some(revised) = run_review_pass(
+                    &mut worker,
+                    &mut review_driver,
+                    tier,
+                    max_tokens,
+                    &goal,
+                    &draft,
+                    turn_started.elapsed(),
+                ) {
+                    worker.reporter.model_text(&revised);
+                }
+            }
+        }
+    }
     let outcome = match end {
         LoopEnd::Answered => "answered",
         LoopEnd::Aborted => "aborted",
@@ -497,6 +562,108 @@ pub(crate) fn run_live(
     };
     worker.reporter.send(WorkspaceEvent::Finished { outcome });
     Ok(end)
+}
+
+/// Everything a review pass needs from a [`WorkspaceRunConfig`] whose other
+/// fields the agent loop has already consumed.
+struct ReviewParams {
+    addr: SocketAddr,
+    model_id: String,
+    family: String,
+    max_tokens: u32,
+    temperature: f32,
+    tier: DialTier,
+}
+
+fn last_assistant_text(history: &[AgentMsg]) -> Option<String> {
+    history.iter().rev().find_map(|message| match message {
+        AgentMsg::Assistant(text) => Some(text.clone()),
+        _ => None,
+    })
+}
+
+/// Reviews `draft` with a second pass over `driver` and returns a revision only
+/// when the reviewer supplied one.
+///
+/// Every guard, every transport failure and every reply this module cannot read
+/// keeps the draft, so the worst outcome of a review is the answer the caller
+/// would have received without one. Exactly one of `dial.review_finished` or
+/// `dial.review_skipped` follows every `dial.draft_ready`.
+fn run_review_pass(
+    worker: &mut WorkspaceBridgeWorker,
+    driver: &mut dyn ModelDriver,
+    tier: DialTier,
+    max_tokens: u32,
+    goal: &str,
+    draft: &str,
+    elapsed: Duration,
+) -> Option<String> {
+    worker.reporter.send(WorkspaceEvent::DialDraftReady {
+        tier: tier.as_str().to_string(),
+    });
+    let skip = |worker: &mut WorkspaceBridgeWorker, reason: &str| -> Option<String> {
+        worker.reporter.send(WorkspaceEvent::DialReviewSkipped {
+            reason: reason.to_string(),
+        });
+        None
+    };
+
+    if !dial::review_is_worth_attempting(draft) {
+        return skip(worker, "empty_draft");
+    }
+    if !dial::review_fits_time_budget(
+        elapsed,
+        WORKSPACE_REVIEW_TURN_BUDGET,
+        WORKSPACE_REVIEW_TIME_FLOOR,
+    ) {
+        return skip(worker, "time_budget");
+    }
+    if worker.cancel.load(Ordering::Relaxed) {
+        return skip(worker, "cancelled");
+    }
+
+    let review_history = vec![
+        AgentMsg::System(dial::review_instruction().to_string()),
+        AgentMsg::User(dial::review_request(goal, draft)),
+    ];
+
+    // The driver's own accounting decides whether a second pass fits; this
+    // module never re-derives it. A count the driver cannot produce proceeds,
+    // because an overflowing prompt is refused by the server on its own and
+    // that refusal lands on the same keep-the-draft path.
+    if let Ok(Some(projected)) = driver.prompt_tokens(&review_history, &[]) {
+        if !dial::review_fits_context_budget(projected, WORKSPACE_CONTEXT_BUDGET_TOKENS, max_tokens)
+        {
+            return skip(worker, "context_budget");
+        }
+    }
+
+    worker.reporter.send(WorkspaceEvent::DialReviewStarted);
+    let finished = |worker: &mut WorkspaceBridgeWorker, changed: bool| {
+        worker
+            .reporter
+            .send(WorkspaceEvent::DialReviewFinished { changed });
+    };
+
+    // No tools are offered to the reviewer, so a review can never re-run the
+    // work the draft already did.
+    let reply = match driver.step(&review_history, &[]) {
+        Ok(ModelStep::Text(text)) => text,
+        Ok(ModelStep::Calls(_)) | Err(_) => {
+            finished(worker, false);
+            return None;
+        }
+    };
+    match dial::interpret_review(draft, &reply) {
+        ReviewOutcome::Unchanged => {
+            finished(worker, false);
+            None
+        }
+        ReviewOutcome::Revised(revised) => {
+            finished(worker, true);
+            Some(revised)
+        }
+    }
 }
 
 fn render_relevant_memory(relevant: &[super::workspace_memory::StoredTurn]) -> Option<String> {
@@ -789,5 +956,317 @@ mod tests {
         let _approval_id = next_approval(&client);
         assert_eq!(join.join().unwrap(), LoopEnd::Aborted);
         assert!(!root.path().join("result.txt").exists());
+    }
+
+    /// A reviewer whose reply is fixed, and which records exactly what it was
+    /// asked. Recording the tool list is the point: a reviewer that is offered
+    /// tools could re-run the work the draft already did.
+    struct RecordingReviewer {
+        reply: Result<ModelStep, String>,
+        projected_tokens: Result<Option<u32>, String>,
+        seen_histories: Vec<Vec<AgentMsg>>,
+        seen_tool_counts: Vec<usize>,
+    }
+
+    impl RecordingReviewer {
+        fn answering(text: &str) -> Self {
+            Self {
+                reply: Ok(ModelStep::Text(text.to_string())),
+                projected_tokens: Ok(None),
+                seen_histories: Vec::new(),
+                seen_tool_counts: Vec::new(),
+            }
+        }
+
+        fn failing(error: &str) -> Self {
+            Self {
+                reply: Err(error.to_string()),
+                projected_tokens: Ok(None),
+                seen_histories: Vec::new(),
+                seen_tool_counts: Vec::new(),
+            }
+        }
+
+        fn projecting(text: &str, tokens: u32) -> Self {
+            let mut reviewer = Self::answering(text);
+            reviewer.projected_tokens = Ok(Some(tokens));
+            reviewer
+        }
+
+        fn steps(&self) -> usize {
+            self.seen_tool_counts.len()
+        }
+    }
+
+    impl ModelDriver for RecordingReviewer {
+        fn step(&mut self, history: &[AgentMsg], tools: &[ToolSpec]) -> Result<ModelStep, String> {
+            self.seen_histories.push(history.to_vec());
+            self.seen_tool_counts.push(tools.len());
+            match &self.reply {
+                Ok(ModelStep::Text(text)) => Ok(ModelStep::Text(text.clone())),
+                Ok(ModelStep::Calls(calls)) => Ok(ModelStep::Calls(calls.clone())),
+                Err(error) => Err(error.clone()),
+            }
+        }
+
+        fn prompt_tokens(
+            &mut self,
+            _history: &[AgentMsg],
+            _tools: &[ToolSpec],
+        ) -> Result<Option<u32>, String> {
+            self.projected_tokens.clone()
+        }
+    }
+
+    /// Drains the events a review produced. The draft itself was already
+    /// reported by the agent loop, so only the dial events are of interest.
+    fn dial_events(client: &WorkspaceBridgeClient) -> Vec<WorkspaceEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = client.events.recv_timeout(Duration::from_millis(50)) {
+            events.push(event);
+        }
+        events
+    }
+
+    fn review(
+        reviewer: &mut RecordingReviewer,
+        draft: &str,
+        elapsed: Duration,
+    ) -> (Option<String>, Vec<WorkspaceEvent>) {
+        let (mut worker, client) = bridge(16);
+        let revised = run_review_pass(
+            &mut worker,
+            reviewer,
+            DialTier::High,
+            64,
+            "explain the retry policy",
+            draft,
+            elapsed,
+        );
+        (revised, dial_events(&client))
+    }
+
+    /// Test 7: a reviewer that declines leaves the draft standing, and says so.
+    #[test]
+    fn a_declined_review_keeps_the_draft() {
+        let mut reviewer = RecordingReviewer::answering(dial::REVIEW_DECLINE_MARKER);
+        let (revised, events) = review(&mut reviewer, "the draft answer", Duration::ZERO);
+
+        assert_eq!(revised, None);
+        assert_eq!(
+            events,
+            vec![
+                WorkspaceEvent::DialDraftReady {
+                    tier: "high".to_string()
+                },
+                WorkspaceEvent::DialReviewStarted,
+                WorkspaceEvent::DialReviewFinished { changed: false },
+            ]
+        );
+    }
+
+    /// Test 8: a substantive reply replaces the draft and is reported as a
+    /// change, so a caller can always tell which answer it is looking at.
+    #[test]
+    fn a_substantive_review_revises_the_draft() {
+        let mut reviewer = RecordingReviewer::answering("retries stop after three attempts");
+        let (revised, events) = review(&mut reviewer, "retries never stop", Duration::ZERO);
+
+        assert_eq!(
+            revised.as_deref(),
+            Some("retries stop after three attempts")
+        );
+        assert_eq!(
+            events.last(),
+            Some(&WorkspaceEvent::DialReviewFinished { changed: true })
+        );
+    }
+
+    /// Test 9: the reviewer is asked exactly once, and both the task and the
+    /// draft reach it. A review that lost the draft would be reviewing nothing.
+    #[test]
+    fn the_reviewer_is_asked_once_with_the_task_and_the_draft() {
+        let mut reviewer = RecordingReviewer::answering(dial::REVIEW_DECLINE_MARKER);
+        let (_, _) = review(&mut reviewer, "retries never stop", Duration::ZERO);
+
+        assert_eq!(reviewer.steps(), 1);
+        let history = &reviewer.seen_histories[0];
+        assert!(matches!(history[0], AgentMsg::System(_)));
+        let AgentMsg::User(request) = &history[1] else {
+            panic!("the review request must be the user turn: {history:?}");
+        };
+        assert!(request.contains("explain the retry policy"), "{request}");
+        assert!(request.contains("retries never stop"), "{request}");
+    }
+
+    /// Test 14: the reviewer is offered no tools, so a review can never re-run
+    /// the work the draft already did.
+    #[test]
+    fn the_reviewer_is_offered_no_tools() {
+        let mut reviewer = RecordingReviewer::answering(dial::REVIEW_DECLINE_MARKER);
+        let (_, _) = review(&mut reviewer, "the draft answer", Duration::ZERO);
+
+        assert_eq!(reviewer.seen_tool_counts, vec![0]);
+    }
+
+    /// Test 12: a reviewer that fails or times out keeps the draft. The step
+    /// timeout surfaces as an error from the driver, so this is the same path.
+    #[test]
+    fn a_failed_review_keeps_the_draft() {
+        let mut reviewer = RecordingReviewer::failing("model step timed out after 90s");
+        let (revised, events) = review(&mut reviewer, "the draft answer", Duration::ZERO);
+
+        assert_eq!(revised, None);
+        assert_eq!(
+            events.last(),
+            Some(&WorkspaceEvent::DialReviewFinished { changed: false })
+        );
+    }
+
+    /// A reviewer that answers with tool calls is not answering; the draft
+    /// stands rather than the turn losing its answer.
+    #[test]
+    fn a_reviewer_that_calls_tools_keeps_the_draft() {
+        let mut reviewer = RecordingReviewer {
+            reply: Ok(ModelStep::Calls(vec![call("read_file", json!({}))])),
+            projected_tokens: Ok(None),
+            seen_histories: Vec::new(),
+            seen_tool_counts: Vec::new(),
+        };
+        let (revised, events) = review(&mut reviewer, "the draft answer", Duration::ZERO);
+
+        assert_eq!(revised, None);
+        assert_eq!(
+            events.last(),
+            Some(&WorkspaceEvent::DialReviewFinished { changed: false })
+        );
+    }
+
+    /// Test 10: a review that would not fit the context budget is never asked
+    /// for, and the reason is reported rather than left to be guessed.
+    #[test]
+    fn a_review_over_the_context_budget_is_skipped_before_the_model_runs() {
+        let mut reviewer = RecordingReviewer::projecting(
+            "a revision that must never be produced",
+            WORKSPACE_CONTEXT_BUDGET_TOKENS - 63,
+        );
+        let (revised, events) = review(&mut reviewer, "the draft answer", Duration::ZERO);
+
+        assert_eq!(revised, None);
+        assert_eq!(reviewer.steps(), 0);
+        assert_eq!(
+            events,
+            vec![
+                WorkspaceEvent::DialDraftReady {
+                    tier: "high".to_string()
+                },
+                WorkspaceEvent::DialReviewSkipped {
+                    reason: "context_budget".to_string()
+                },
+            ]
+        );
+    }
+
+    /// The same projection one token smaller does fit, so the guard above is
+    /// the budget boundary and not a review that never runs.
+    #[test]
+    fn a_review_that_exactly_fits_the_context_budget_still_runs() {
+        let mut reviewer = RecordingReviewer::projecting(
+            dial::REVIEW_DECLINE_MARKER,
+            WORKSPACE_CONTEXT_BUDGET_TOKENS - 64,
+        );
+        let (_, events) = review(&mut reviewer, "the draft answer", Duration::ZERO);
+
+        assert_eq!(reviewer.steps(), 1);
+        assert_eq!(
+            events.last(),
+            Some(&WorkspaceEvent::DialReviewFinished { changed: false })
+        );
+    }
+
+    /// Test 11: a turn that has already spent its budget returns the draft
+    /// rather than doubling the wait the caller has already borne.
+    #[test]
+    fn a_review_is_skipped_when_the_turn_budget_is_spent() {
+        let mut reviewer = RecordingReviewer::answering("a revision that must never be produced");
+        let (revised, events) = review(
+            &mut reviewer,
+            "the draft answer",
+            WORKSPACE_REVIEW_TURN_BUDGET,
+        );
+
+        assert_eq!(revised, None);
+        assert_eq!(reviewer.steps(), 0);
+        assert_eq!(
+            events.last(),
+            Some(&WorkspaceEvent::DialReviewSkipped {
+                reason: "time_budget".to_string()
+            })
+        );
+    }
+
+    /// Test 13: a turn cancelled before the review starts spends nothing more.
+    #[test]
+    fn a_cancelled_turn_never_starts_a_review() {
+        let mut reviewer = RecordingReviewer::answering("a revision that must never be produced");
+        let (mut worker, client) = bridge(16);
+        worker.cancel.store(true, Ordering::Relaxed);
+        let revised = run_review_pass(
+            &mut worker,
+            &mut reviewer,
+            DialTier::High,
+            64,
+            "explain the retry policy",
+            "the draft answer",
+            Duration::ZERO,
+        );
+
+        assert_eq!(revised, None);
+        assert_eq!(reviewer.steps(), 0);
+        assert_eq!(
+            dial_events(&client).last(),
+            Some(&WorkspaceEvent::DialReviewSkipped {
+                reason: "cancelled".to_string()
+            })
+        );
+    }
+
+    /// An empty draft is nothing to review, and asking anyway would invite the
+    /// reviewer to answer the task itself with no tools and no context.
+    #[test]
+    fn an_empty_draft_is_never_reviewed() {
+        let mut reviewer = RecordingReviewer::answering("a revision that must never be produced");
+        let (revised, events) = review(&mut reviewer, "   \n  ", Duration::ZERO);
+
+        assert_eq!(revised, None);
+        assert_eq!(reviewer.steps(), 0);
+        assert_eq!(
+            events.last(),
+            Some(&WorkspaceEvent::DialReviewSkipped {
+                reason: "empty_draft".to_string()
+            })
+        );
+    }
+
+    /// Test 6: a review is never itself reviewed. One pass per turn is the
+    /// whole cost bound, so the reviewer is asked exactly once no matter what
+    /// it replies.
+    #[test]
+    fn a_revision_is_never_reviewed_again() {
+        let mut reviewer = RecordingReviewer::answering("a revised answer");
+        let (revised, _) = review(&mut reviewer, "the draft answer", Duration::ZERO);
+
+        assert_eq!(revised.as_deref(), Some("a revised answer"));
+        assert_eq!(reviewer.steps(), 1);
+    }
+
+    /// The tiers that do not review must not pay for a driver, a prompt or a
+    /// decision. Only the reviewing tiers reach [`run_review_pass`] at all.
+    #[test]
+    fn only_the_reviewing_tiers_ask_for_a_review() {
+        assert!(!DialTier::Low.wants_review());
+        assert!(!DialTier::Medium.wants_review());
+        assert!(DialTier::High.wants_review());
+        assert!(DialTier::Ultra.wants_review());
     }
 }

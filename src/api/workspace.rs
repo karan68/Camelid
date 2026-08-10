@@ -78,6 +78,7 @@ struct ActiveWorkspaceSession {
     max_tokens: u32,
     temperature: f32,
     allow_writes: bool,
+    dial_tier: Option<crate::dial::DialTier>,
     semantic_retriever: Option<Arc<crate::chat::semantic_search::WorkspaceSemanticRetriever>>,
     memory: WorkspaceMemoryStore,
     state: StdMutex<WorkspaceSessionState>,
@@ -353,6 +354,10 @@ pub(super) struct CreateWorkspaceSessionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     allow_writes: Option<bool>,
+    /// Effort tier for every turn in this session. Absent means the caller did
+    /// not ask for one, which behaves exactly as the tiers that do not review.
+    #[serde(default)]
+    dial: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -981,6 +986,32 @@ fn simplify_path(path: &std::path::Path) -> String {
     text
 }
 
+/// Resolves the effort tier every turn in a session runs at.
+///
+/// `Ok(None)` means no review pass: either the caller asked for no tier, or the
+/// feature is switched off. Those are the same thing to everything downstream,
+/// and this is the only place either can be decided, so no caller can reach the
+/// bridge with a tier the kill switch was supposed to have removed.
+fn resolve_dial_tier(requested: Option<&str>) -> Result<Option<crate::dial::DialTier>, String> {
+    let Some(raw) = requested else {
+        return Ok(None);
+    };
+    let Some(tier) = crate::dial::DialTier::parse(raw) else {
+        return Err(format!(
+            "dial must be one of {}",
+            crate::dial::DialTier::ALL
+                .iter()
+                .map(|tier| tier.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    if !crate::runtime_config::env_flag_default_on(super::DIAL_ENABLED_ENV) {
+        return Ok(None);
+    }
+    Ok(Some(tier))
+}
+
 pub(super) async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1035,6 +1066,18 @@ pub(super) async fn create_session(
         );
     }
     let allow_writes = false;
+
+    let dial_tier = match resolve_dial_tier(request.dial.as_deref()) {
+        Ok(tier) => tier,
+        Err(message) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_dial_tier",
+                message,
+                Some("dial"),
+            );
+        }
+    };
 
     let requested_workspace = request.workspace;
     let workspace =
@@ -1165,6 +1208,7 @@ pub(super) async fn create_session(
         max_tokens,
         temperature,
         semantic_retriever: semantic_retriever.clone(),
+        dial_tier,
     };
     let session = Arc::new(ActiveWorkspaceSession {
         id: id.clone(),
@@ -1174,6 +1218,7 @@ pub(super) async fn create_session(
         max_tokens,
         temperature,
         allow_writes,
+        dial_tier,
         semantic_retriever,
         memory,
         state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
@@ -1649,6 +1694,7 @@ pub(super) async fn send_message(
         max_tokens: session.max_tokens,
         temperature: session.temperature,
         semantic_retriever: session.semantic_retriever.clone(),
+        dial_tier: session.dial_tier,
     };
     match session.install_turn(events, worker, run_config, control) {
         Ok(InstallTurn::Installed) => {}
@@ -1926,7 +1972,9 @@ async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, Str
 /// Name-only resolution, for listing which rows COULD serve Workspace (nothing
 /// is loaded, so there are no bytes to check). Never use this to authorize a
 /// loaded model — see `tool_capable_row_for_loaded_artifact`.
-fn tool_capable_row_for_filename(filename: &str) -> Option<(&'static str, &'static str)> {
+pub(super) fn tool_capable_row_for_filename(
+    filename: &str,
+) -> Option<(&'static str, &'static str)> {
     let row_id = curated_catalog()
         .iter()
         .find(|item| item.filename == filename)
@@ -2185,6 +2233,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: true,
+                dial_tier: None,
                 semantic_retriever: None,
                 memory: WorkspaceMemoryStore::open(std::env::temp_dir().join(format!(
                     "camelid-workspace-state-test-{}.sqlite3",
@@ -2233,6 +2282,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: true,
+            dial_tier: None,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Idle),
@@ -2255,6 +2305,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             semantic_retriever: None,
+            dial_tier: None,
         };
         let (worker, client) = bridge(1);
         let (events, control) = client.into_parts();
@@ -2298,6 +2349,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            dial_tier: None,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelled),
@@ -2327,6 +2379,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            dial_tier: None,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelling),
@@ -2349,6 +2402,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             semantic_retriever: None,
+            dial_tier: None,
         };
 
         assert!(session
@@ -2385,6 +2439,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: false,
+                dial_tier: None,
                 semantic_retriever: None,
                 memory,
                 state: StdMutex::new(terminal_state),
@@ -2407,6 +2462,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 semantic_retriever: None,
+                dial_tier: None,
             };
             let (worker, client) = bridge(1);
             let (events, control) = client.into_parts();
@@ -2439,6 +2495,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            dial_tier: None,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
@@ -2457,6 +2514,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 semantic_retriever: None,
+                dial_tier: None,
             })),
             control: StdMutex::new(Some(control)),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),
@@ -2505,6 +2563,71 @@ mod tests {
         assert_eq!(
             tool_capable_row_for_filename("neighboring-model.gguf"),
             None
+        );
+    }
+
+    /// A session that asks for no tier gets none, and every tier name the dial
+    /// publishes is accepted by the surface that has to honour it.
+    #[test]
+    fn every_published_tier_is_accepted_and_none_is_the_default() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(super::super::DIAL_ENABLED_ENV);
+
+        assert_eq!(resolve_dial_tier(None), Ok(None));
+        for tier in crate::dial::DialTier::ALL {
+            assert_eq!(
+                resolve_dial_tier(Some(tier.as_str())),
+                Ok(Some(tier)),
+                "{tier:?} is published by /api/dial but refused by the workspace"
+            );
+        }
+    }
+
+    /// An unknown tier is refused rather than silently treated as no tier, so a
+    /// caller never believes it bought effort it did not get. Case and padding
+    /// are tolerated, because those are transport noise rather than a different
+    /// request.
+    #[test]
+    fn an_unknown_tier_is_refused_rather_than_ignored() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(super::super::DIAL_ENABLED_ENV);
+
+        for unknown in ["", "  ", "highest", "hi gh", "turbo", "0", "none"] {
+            assert!(
+                resolve_dial_tier(Some(unknown)).is_err(),
+                "{unknown:?} was accepted as a tier"
+            );
+        }
+        for tolerated in ["HIGH ", " high", "High"] {
+            assert_eq!(
+                resolve_dial_tier(Some(tolerated)),
+                Ok(Some(crate::dial::DialTier::High)),
+                "{tolerated:?} is the high tier with transport noise around it"
+            );
+        }
+    }
+
+    /// Test 15 (negative control): with the feature switched off, the tier that
+    /// reviews resolves to exactly what the tiers that do not review resolve
+    /// to, so nothing downstream can spend a second pass.
+    #[test]
+    fn the_kill_switch_makes_a_reviewing_tier_resolve_like_a_plain_one() {
+        let _env_guard = crate::test_support::env_lock();
+
+        std::env::remove_var(super::super::DIAL_ENABLED_ENV);
+        let reviewing = resolve_dial_tier(Some("high"));
+        assert_eq!(reviewing, Ok(Some(crate::dial::DialTier::High)));
+        assert!(crate::dial::DialTier::High.wants_review());
+
+        std::env::set_var(super::super::DIAL_ENABLED_ENV, "0");
+        let switched_off = resolve_dial_tier(Some("high"));
+        std::env::remove_var(super::super::DIAL_ENABLED_ENV);
+
+        assert_eq!(switched_off, Ok(None));
+        assert_eq!(
+            switched_off.unwrap().map(|tier| tier.wants_review()),
+            None,
+            "the kill switch left a tier that still reviews"
         );
     }
 }

@@ -512,6 +512,136 @@ pub(crate) fn exact_footprint_with_scratch(
     }
 }
 
+/// Why a second resident model was refused. Machine-readable so callers branch on
+/// the variant instead of parsing prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRefusal {
+    /// The primary's weights alone exceed the CPU-weight materialization budget,
+    /// so no second model could ever join it.
+    PrimaryOverWeightBudget,
+    /// Each model's weights fit that budget, but the two together do not.
+    CombinedOverWeightBudget,
+    /// The two footprints together exceed the usable host-RAM budget.
+    HostMemory,
+}
+
+/// Whether two models can be held at once on this host.
+///
+/// Deliberately **not** a [`FitVerdict`]: that enum is serialized onto the catalog
+/// API and its variants are pinned to the WebUI by
+/// `scripts/check-fit-verdict-vocabulary.mjs`. Widening it to describe pairs would
+/// drag an unrelated UI contract along. For the same reason this type has no
+/// `as_str`/`is_positive_fit`/`refuses_load` method: that checker locates those
+/// functions by name and would parse the wrong body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairVerdict {
+    /// Both fit VRAM together, respecting headroom.
+    BothResident,
+    /// Both fit the host-RAM budget together. This is the meaningful answer on a
+    /// host whose engine places weights in host RAM, which is the common case.
+    BothCpuOk,
+    /// Only one model is admissible; the pair is not.
+    OnlyPrimary(PairRefusal),
+    /// Host memory could not be probed, so no honest pair claim can be made.
+    Unknown,
+}
+
+impl PairVerdict {
+    /// Whether a second resident model may be admitted.
+    pub fn admits_pair(self) -> bool {
+        matches!(self, PairVerdict::BothResident | PairVerdict::BothCpuOk)
+    }
+}
+
+/// Combined footprint of two models held at once, counting activation scratch
+/// **once**.
+///
+/// Scratch is shared because the engine decodes one job at a time
+/// (`src/api/engine.rs` owns a single compute thread), so a second resident model
+/// costs its weights and its KV cache, not a second scratch arena.
+/// [`FitInputs`] folds scratch into `kv_bytes_at_ctx`, so the caller passes the
+/// value it used and one copy is removed here.
+fn combined_footprint_bytes(
+    primary: &FitInputs,
+    oracle: &FitInputs,
+    shared_scratch_bytes: u64,
+) -> u64 {
+    let weights = primary.weight_bytes.saturating_add(oracle.weight_bytes);
+    let overhead = primary
+        .kv_bytes_at_ctx
+        .saturating_add(oracle.kv_bytes_at_ctx)
+        .saturating_sub(shared_scratch_bytes);
+    weights.saturating_add(overhead)
+}
+
+/// Pure pair decision with an explicit VRAM headroom, mirroring
+/// [`assess_with_headroom`] so the arithmetic is testable without process env.
+///
+/// Order is **host-RAM first**, and that ordering is load-bearing rather than
+/// stylistic: measurement on a CUDA-by-default Windows build showed every model
+/// executing on a CPU backend with zero VRAM in use, so VRAM is an upgrade to
+/// report, never the budget that decides. A GPU-first rule would admit pairs the
+/// machine cannot actually stage.
+fn assess_pair_with_headroom(
+    hw: &HardwareProfile,
+    primary: &FitInputs,
+    oracle: &FitInputs,
+    shared_scratch_bytes: u64,
+    cpu_weight_budget_bytes: u64,
+    vram_headroom_mib: u64,
+) -> PairVerdict {
+    let Some(usable_ram) = usable_host_ram_bytes(hw) else {
+        return PairVerdict::Unknown;
+    };
+
+    // The materialization budget is what `load_weights_lru` enforces by evicting,
+    // so a pair that breaches it would thrash rather than coexist. Both bounds are
+    // inclusive: spending the budget exactly is not an overrun.
+    if primary.weight_bytes > cpu_weight_budget_bytes {
+        return PairVerdict::OnlyPrimary(PairRefusal::PrimaryOverWeightBudget);
+    }
+    let combined_weights = primary.weight_bytes.saturating_add(oracle.weight_bytes);
+    if combined_weights > cpu_weight_budget_bytes {
+        return PairVerdict::OnlyPrimary(PairRefusal::CombinedOverWeightBudget);
+    }
+
+    let combined = combined_footprint_bytes(primary, oracle, shared_scratch_bytes);
+    if combined > usable_ram {
+        return PairVerdict::OnlyPrimary(PairRefusal::HostMemory);
+    }
+
+    if has_usable_gpu(hw)
+        && crate::cuda_vram::evaluate(hw.cuda_vram_free_bytes, combined, vram_headroom_mib).is_ok()
+    {
+        return PairVerdict::BothResident;
+    }
+    PairVerdict::BothCpuOk
+}
+
+/// Assess whether `primary` and `oracle` can be resident together on `hw`.
+///
+/// `shared_scratch_bytes` is the activation-scratch allowance already folded into
+/// both footprints (see [`combined_footprint_bytes`]); pass 0 when the footprints
+/// carry none. `cpu_weight_budget_bytes` is the caller's CPU-weight
+/// materialization limit — pass `u64::MAX` to disable that bound, which leaves the
+/// host-RAM and VRAM budgets still deciding.
+pub fn assess_pair(
+    hw: &HardwareProfile,
+    primary: &FitInputs,
+    oracle: &FitInputs,
+    shared_scratch_bytes: u64,
+    cpu_weight_budget_bytes: u64,
+) -> PairVerdict {
+    assess_pair_with_headroom(
+        hw,
+        primary,
+        oracle,
+        shared_scratch_bytes,
+        cpu_weight_budget_bytes,
+        crate::cuda_vram::min_headroom_mib(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1094,170 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         let back: ModelDims = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
+    }
+
+    // ---- assess_pair -------------------------------------------------------
+
+    /// Footprint carrying no scratch, so pair arithmetic is exact in tests.
+    fn plain(weight_bytes: u64, kv_bytes_at_ctx: u64) -> FitInputs {
+        FitInputs {
+            weight_bytes,
+            kv_bytes_at_ctx,
+        }
+    }
+
+    fn pair(
+        hw: &HardwareProfile,
+        primary: &FitInputs,
+        oracle: &FitInputs,
+        budget: u64,
+    ) -> PairVerdict {
+        assess_pair_with_headroom(hw, primary, oracle, 0, budget, 512)
+    }
+
+    #[test]
+    fn two_small_models_under_budget_are_admitted() {
+        let hw = profile(false, 0, 64 * GIB, 64 * GIB);
+        let a = plain(GIB, 256 * MIB);
+        let b = plain(2 * GIB, 256 * MIB);
+        let verdict = pair(&hw, &a, &b, 6 * GIB);
+        assert_eq!(verdict, PairVerdict::BothCpuOk);
+        assert!(verdict.admits_pair());
+    }
+
+    #[test]
+    fn combined_weights_one_byte_over_budget_are_refused() {
+        let hw = profile(false, 0, 64 * GIB, 64 * GIB);
+        let a = plain(3 * GIB, 0);
+        let b = plain(3 * GIB + 1, 0);
+        assert_eq!(
+            pair(&hw, &a, &b, 6 * GIB),
+            PairVerdict::OnlyPrimary(PairRefusal::CombinedOverWeightBudget)
+        );
+    }
+
+    #[test]
+    fn combined_weights_exactly_at_budget_are_admitted() {
+        // The bound is inclusive: spending the budget exactly is not an overrun.
+        let hw = profile(false, 0, 64 * GIB, 64 * GIB);
+        let a = plain(3 * GIB, 0);
+        let b = plain(3 * GIB, 0);
+        assert_eq!(pair(&hw, &a, &b, 6 * GIB), PairVerdict::BothCpuOk);
+    }
+
+    #[test]
+    fn a_primary_over_budget_alone_is_named_distinctly() {
+        let hw = profile(false, 0, 64 * GIB, 64 * GIB);
+        let a = plain(7 * GIB, 0);
+        let b = plain(GIB, 0);
+        assert_eq!(
+            pair(&hw, &a, &b, 6 * GIB),
+            PairVerdict::OnlyPrimary(PairRefusal::PrimaryOverWeightBudget)
+        );
+    }
+
+    #[test]
+    fn unprobed_host_memory_abstains() {
+        let hw = profile(false, 0, 0, 0);
+        let a = plain(GIB, 0);
+        assert_eq!(pair(&hw, &a, &a, 6 * GIB), PairVerdict::Unknown);
+    }
+
+    #[test]
+    fn an_unbounded_weight_budget_still_defers_to_host_memory() {
+        // Disabling the materialization bound must not become "always yes".
+        let hw = profile(false, 0, 32 * GIB, 4 * GIB);
+        let a = plain(8 * GIB, 0);
+        let b = plain(8 * GIB, 0);
+        assert_eq!(
+            pair(&hw, &a, &b, u64::MAX),
+            PairVerdict::OnlyPrimary(PairRefusal::HostMemory)
+        );
+        // ...and it does admit a pair the host can genuinely hold.
+        let small = plain(GIB, 0);
+        assert_eq!(pair(&hw, &small, &small, u64::MAX), PairVerdict::BothCpuOk);
+    }
+
+    #[test]
+    fn saturating_arithmetic_survives_absurd_inputs() {
+        let hw = profile(false, 0, 64 * GIB, 64 * GIB);
+        let huge = plain(u64::MAX, u64::MAX);
+        assert_eq!(
+            pair(&hw, &huge, &huge, u64::MAX),
+            PairVerdict::OnlyPrimary(PairRefusal::HostMemory)
+        );
+        // Subtracting more shared scratch than exists must not wrap around.
+        assert_eq!(
+            combined_footprint_bytes(&plain(0, 10), &plain(0, 10), 999),
+            0
+        );
+        assert_eq!(
+            combined_footprint_bytes(&huge, &huge, 0),
+            u64::MAX,
+            "saturating add, not wraparound"
+        );
+    }
+
+    #[test]
+    fn shared_scratch_is_counted_once_not_twice() {
+        let scratch = ACTIVATION_SCRATCH_BYTES;
+        let a = plain(GIB, scratch);
+        let b = plain(GIB, scratch);
+        // Two weights + two KV terms (here zero) + exactly one scratch arena.
+        assert_eq!(
+            combined_footprint_bytes(&a, &b, scratch),
+            2 * GIB + scratch,
+            "the second resident model must not buy a second scratch arena"
+        );
+    }
+
+    #[test]
+    fn a_gpu_that_holds_only_one_model_never_reports_both_resident() {
+        // VRAM fits one 3 GiB model but not two; host RAM is ample.
+        let hw = profile(true, 4 * GIB, 64 * GIB, 64 * GIB);
+        let a = plain(3 * GIB, 0);
+        let verdict = pair(&hw, &a, &a, 16 * GIB);
+        assert_ne!(verdict, PairVerdict::BothResident);
+        assert_eq!(verdict, PairVerdict::BothCpuOk);
+
+        // Widening VRAM to hold both flips it, proving the branch is reachable.
+        let roomy_gpu = profile(true, 32 * GIB, 64 * GIB, 64 * GIB);
+        assert_eq!(
+            pair(&roomy_gpu, &a, &a, 16 * GIB),
+            PairVerdict::BothResident
+        );
+    }
+
+    #[test]
+    fn admitting_a_pair_never_contradicts_the_single_model_verdict() {
+        // If both can be held together, neither may be individually unrunnable.
+        let hosts = [
+            profile(false, 0, 64 * GIB, 64 * GIB),
+            profile(false, 0, 32 * GIB, 8 * GIB),
+            profile(true, 32 * GIB, 64 * GIB, 64 * GIB),
+            profile(true, 4 * GIB, 32 * GIB, 16 * GIB),
+        ];
+        let sizes = [MIB, 512 * MIB, 2 * GIB, 6 * GIB, 20 * GIB];
+        let mut admitted = 0;
+        for hw in &hosts {
+            for p in sizes {
+                for o in sizes {
+                    let primary = plain(p, 128 * MIB);
+                    let oracle = plain(o, 128 * MIB);
+                    if !pair(hw, &primary, &oracle, u64::MAX).admits_pair() {
+                        continue;
+                    }
+                    admitted += 1;
+                    for one in [&primary, &oracle] {
+                        assert_ne!(
+                            assess_with_headroom(hw, one, 512),
+                            FitVerdict::WontFit,
+                            "pair admitted but {one:?} alone is WontFit on {hw:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(admitted > 0, "the sweep never admitted a pair");
     }
 }
