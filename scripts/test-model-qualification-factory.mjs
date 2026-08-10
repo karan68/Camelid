@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -246,6 +247,7 @@ const headerReceiptFor = (row, overrides = {}) => ({
 const tokenizerReceiptPaths = new Map([
   [gemma.id, 'qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json'],
   [smol.id, 'qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json'],
+  [qwenMoe.id, 'qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json'],
 ])
 const durableTokenizerReceipts = new Map(await Promise.all(
   [...tokenizerReceiptPaths].map(async ([rowId, path]) => [
@@ -270,6 +272,15 @@ const tokenizerReceiptFor = (row) => {
   receipt.camelid.binary_sha256 = 'a'.repeat(64)
   return receipt
 }
+const durableQwenTokenizerBytes = await readFile(resolve(
+  root,
+  tokenizerReceiptPaths.get(qwenMoe.id),
+))
+assert.equal(
+  createHash('sha256').update(durableQwenTokenizerBytes).digest('hex'),
+  '021dbe0b4f6a94f7140daa8e02969106dab941e205d184ee60f683d58f13ea37',
+  'factory evidence must remain byte-bound to the clean-head Qwen3 tokenizer receipt',
+)
 
 for (const [rowId, receiptPath] of [
   ['qwen3_30b_a3b_q8_0', 'qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json'],
@@ -306,7 +317,10 @@ for (const [rowId, receiptPath] of [
       types: { Q8_0: 338, F32: 241 },
     })
     assert.equal(durableReceipt.support_claim, false)
-    assert.notEqual(durableRow.gates.tokenizer.status, 'pass')
+    assert.equal(durableRow.gates.tokenizer.status, 'pass')
+    assert(durableRow.gates.tokenizer.evidence.includes(
+      'qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json',
+    ))
     assert.notEqual(durableRow.gates.template.status, 'pass')
   }
 }
@@ -456,6 +470,26 @@ assert.equal(passingTokenizerStage.scope.context, 'not_run')
 assert.equal(passingTokenizerStage.scope.support_claim, false)
 assert.equal(Object.hasOwn(passingTokenizerStage, 'cases'), false, 'full token arrays must stay out of factory reports')
 assert.equal(Object.hasOwn(passingTokenizerStage, 'does_not_prove'), false, 'arbitrary receipt prose must stay out of factory reports')
+
+const passingQwenMoeTokenizerStage = tokenizerStageFromReceipt(
+  qwenMoe,
+  tokenizerReceiptFor(qwenMoe),
+  roster.defaults,
+  { expectedSourceHead: currentSourceHead },
+)
+assert.equal(passingQwenMoeTokenizerStage.status, 'pass')
+assert.equal(passingQwenMoeTokenizerStage.result.case_count, 13)
+assert.equal(passingQwenMoeTokenizerStage.result.exact_match_count, 13)
+assert.equal(passingQwenMoeTokenizerStage.result.all_token_ids_match, true)
+assert.equal(passingQwenMoeTokenizerStage.observed.token_count, 151_936)
+assert.equal(passingQwenMoeTokenizerStage.observed.declared_add_bos_token, false)
+assert.equal(passingQwenMoeTokenizerStage.scope.template_rendering, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.load, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.generation, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.api_webui, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.context, 'not_run')
+assert.equal(passingQwenMoeTokenizerStage.scope.support_claim, false)
+assert.equal(Object.hasOwn(passingQwenMoeTokenizerStage, 'cases'), false)
 
 const staleTokenizerStage = tokenizerStageFromReceipt(
   smol,

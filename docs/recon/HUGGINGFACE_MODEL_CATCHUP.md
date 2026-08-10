@@ -44,9 +44,10 @@ page progressively harder to scan.
    passes, including the dialect-specific absent-BOS default. Legacy `smollm`
    remains a distinct two-pass dialect and must not be used as a shortcut; the
    real row's dynamic chat renderer remains the next gate.
-6. **Qwen3 MoE** now has an authoritative official 32.48 GB artifact anchor and
-   clean-head bounded metadata evidence. It still needs exact-row tokenizer and
-   template qualification plus a routing-semantics audit before a large download.
+6. **Qwen3 MoE** now has an authoritative official 32.48 GB artifact anchor,
+   clean-head bounded metadata evidence, and a 13-case exact-row `qwen2`
+   tokenizer receipt against pinned llama.cpp b9632. Its embedded Qwen3 template
+   and MoE routing semantics still need qualification before a large download.
    Synthetic browse fixtures are not candidates.
 
 The work order reflects implementation closeness. The full LFM2 artifact has
@@ -67,7 +68,7 @@ promotion; the other five families remain active dispositions:
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity, clean-head bounded exact-row metadata, seven-case tokenizer parity, and the exact IT template route pass; substituted templates and invalid shapes fail closed. | Full-artifact identity/load and greedy parity, then API/WebUI/context. |
 | SmolLM3 | Source, clean-head bounded exact-row metadata, and the 10-case `smaug-bpe` tokenizer pack pass. Its absent BOS metadata resolves exactly like pinned llama.cpp, while the dynamic chat template remains under an executable HOLD. | Build a deterministic renderer for its date/reasoning/system/tool contract; load, generation, API/WebUI, and context remain blocked behind that template/runtime work. |
-| Qwen3 MoE | Source identity and clean-head bounded metadata pass for the official 32.48 GB row; the exact 32 MiB prefix confirms `qwen3moe` / `gpt2` / `qwen2`, the Q8_0/F32 inventory, and all 579 descriptors. | Qualify the exact-row tokenizer and embedded Qwen3 template, then full-artifact identity/load and MoE parity; remote metadata alone is not a support promotion. |
+| Qwen3 MoE | Source identity, clean-head bounded metadata, and 13-case exact-row tokenizer parity pass for the official 32.48 GB row. The pack pins absent automatic BOS insertion, exact Qwen2 regex splits, CONTROL ChatML markers, USER_DEFINED tool/reasoning tags, and UNUSED padding behavior. | Qualify the embedded 4,100-byte Qwen3 template, then full-artifact identity/load and MoE parity; tokenizer evidence is not a load, generation, API, context, or support promotion. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
 LFM2's completed exact row does not promote those families or any adjacent
@@ -166,6 +167,10 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   exact-row tokenizer pack only after metadata passes. A passing tokenizer
   receipt advances only the report's tokenizer stage; artifact, template,
   load, generation, API/WebUI, and context gates remain unchanged.
+  `--inspect-template` is a separate, mutually exclusive SmolLM3 preparation
+  lane. It binds the same immutable 32 MiB prefix to the 5,493-byte template and
+  a pinned analyzer/shape pack, but keeps the runtime template stage blocked;
+  nested preparation success is not a renderer or support claim.
 - `scripts/check-model-qualification-report.mjs` validates the committed report
   contract, fail-closed overall status, and privacy boundary before evidence is
   accepted.
@@ -177,11 +182,14 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   and compact tensor-inventory hash. It aborts if a server ignores `Range`, so
   inspecting a 30+ GiB candidate cannot silently become a full download.
 - `scripts/hf-qualification-tokenizer.mjs` provides bounded exact-row tokenizer
-  lanes for Gemma 2 and SmolLM3. It compares Camelid against pinned llama.cpp
+  lanes for Gemma 2, SmolLM3, and Qwen3 MoE. It compares Camelid against pinned llama.cpp
   using unchanged tokenizer metadata from an immutable 32 MiB prefix. The
   SmolLM3 pack includes empty/default-special handling, exact `Hello` IDs,
   Unicode/contraction/digit splits, ChatML controls, and USER_DEFINED tool tags;
-  both lanes explicitly decline weight-load, generation, template-rendering,
+  the Qwen3 MoE pack additionally pins all 13 exact ID arrays, explicit
+  `add_bos_token=false`, CONTROL versus USER_DEFINED behavior, UNUSED padding,
+  the committed header receipt, and the deterministic vocabulary-only derivative.
+  All lanes explicitly decline weight-load, generation, template-rendering,
   API, and support claims. The factory calls the same lane with its already
   validated source lock. Camelid and pinned llama.cpp identities are checked
   before the tokenizer range request, and source HEAD plus tracked-clean state

@@ -1045,6 +1045,34 @@ assert(
 )
 
 const qwen3Row = roster.rows.find((row) => row.id === 'qwen3_30b_a3b_q8_0')
+const durableQwen3ReceiptBytes = readFileSync(
+  new URL('../qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json', import.meta.url),
+)
+assert.equal(
+  sha256(durableQwen3ReceiptBytes),
+  '021dbe0b4f6a94f7140daa8e02969106dab941e205d184ee60f683d58f13ea37',
+  'durable Qwen3 MoE tokenizer evidence must remain byte-identical to the clean-head receipt',
+)
+const durableQwen3Receipt = JSON.parse(durableQwen3ReceiptBytes.toString('utf8'))
+assert.deepEqual(
+  validateQwen3MoeTokenizerReceipt(durableQwen3Receipt, qwen3Row, roster.defaults),
+  [],
+  'durable Qwen3 MoE tokenizer evidence must remain bound to the exact row and oracle pack',
+)
+assert.equal(durableQwen3Receipt.provenance.source_head, 'ded8e95b95fadbe2e7ab6a03d48e4d1e9a2c32d6')
+assert.equal(durableQwen3Receipt.provenance.clean_current_head, true)
+assert.equal(durableQwen3Receipt.result.case_count, QWEN3_MOE_CASES.length)
+assert.equal(durableQwen3Receipt.result.exact_match_count, QWEN3_MOE_CASES.length)
+assert.equal(durableQwen3Receipt.result.all_token_ids_match, true)
+assert.equal(durableQwen3Receipt.result.support_decision, 'qwen3_moe_exact_row_tokenizer_gate_only')
+assert(durableQwen3Receipt.cases.every((testCase) => testCase.exact_match))
+assert.equal(qwen3Row.gates.tokenizer.status, 'pass')
+for (const downstream of ['template', 'load_smoke', 'parity', 'api_webui', 'context']) {
+  assert.notEqual(qwen3Row.gates[downstream].status, 'pass', `${downstream} must not ride tokenizer evidence`)
+}
+assert.equal(Object.hasOwn(durableQwen3Receipt, 'support_claim'), false)
+assert(!/[A-Za-z]:[\\/]/.test(JSON.stringify(durableQwen3Receipt)))
+
 const syntheticQwen3Cases = QWEN3_MOE_CASES.map((testCase) => ({
   id: testCase.id,
   text_utf8_bytes: Buffer.byteLength(testCase.text),

@@ -597,8 +597,11 @@
         },
         "tokenizer": {
           "required": true,
-          "status": "pending",
-          "evidence": []
+          "status": "pass",
+          "evidence": [
+            "src/tokenizer/mod.rs",
+            "qa/model-qualification/qwen3-30b-a3b-q8-header-tokenizer-parity.json"
+          ]
         },
         "template": {
           "required": true,

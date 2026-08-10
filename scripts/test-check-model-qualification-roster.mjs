@@ -81,7 +81,7 @@ assert.match(qwenVerifyLog, /PASS reference-rerun: generated tokens \(8\) and te
 assert.match(qwenVerifyLog, /RECEIPT VERIFIED \(self-digest, lane identity, Camelid replay, and llama\.cpp reference re-run all passed/)
 assert.equal(summarizeRoster(roster)[3].next_gate, 'load_smoke', 'Gemma2 advances through exact-row metadata, tokenizer, and template evidence')
 assert.equal(summarizeRoster(roster)[4].next_gate, 'template', 'SmolLM3 advances through exact-row tokenizer evidence while preserving its dynamic-template HOLD')
-assert.equal(summarizeRoster(roster)[5].next_gate, 'tokenizer', 'Qwen3 MoE advances through clean-head bounded metadata while preserving every downstream HOLD')
+assert.equal(summarizeRoster(roster)[5].next_gate, 'template', 'Qwen3 MoE advances through exact-row tokenizer evidence while preserving every downstream HOLD')
 
 assert.ok(
   errorsAfter((candidate) => { candidate.defaults.models_dir_env = 'CAMELID_MODEL_DIR' }).some((error) => error.includes('plural CAMELID_MODELS_DIR')),
