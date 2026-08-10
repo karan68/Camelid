@@ -1,7 +1,12 @@
 #!/usr/bin/env node
+import { createHash, randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { arch, platform, release } from 'node:os'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
+import { validateQualificationReport } from './check-model-qualification-report.mjs'
 import { validateRoster } from './check-model-qualification-roster.mjs'
 import {
   DEFAULT_PREFIX_BYTES,
@@ -10,6 +15,7 @@ import {
   inspectBinaryIdentity,
   inspectRemoteHeader,
   normalizePrefixBytes,
+  validateImmutableLock,
 } from './hf-qualification-header.mjs'
 import {
   DEFAULT_TOKENIZER_PREFIX_BYTES,
@@ -30,17 +36,306 @@ import {
 import { resolveHfSource, validateLockAgainstSelection } from './hf-qualification-source.mjs'
 import { deriveOverall, qualify, redactLocalPaths } from './model-qualification-runner.mjs'
 
+const execFileAsync = promisify(execFile)
+const CANDIDATE_QUALIFICATION_MODE = 'unrostered_hf_selector'
+const CANDIDATE_ID_PREFIX = 'hf_selector_'
+const CANDIDATE_ID_HEX_LENGTH = 24
+const CANDIDATE_RUN_ID_PREFIX = 'hf_candidate_run_'
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const CANDIDATE_REPO_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/
+const CANDIDATE_FILE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._+() -]{0,255}$/
+const CANDIDATE_LICENSE_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,127}$/
+const REVISION_RE = /^[0-9a-f]{40}$/
+const SHA256_RE = /^[0-9a-f]{64}$/
+const CLI_VALUE_OPTIONS = new Set([
+  'roster',
+  'rows',
+  'repo',
+  'file',
+  'revision',
+  'models-dir',
+  'artifact',
+  'camelid',
+  'out-dir',
+  'prefix-bytes',
+  'llama-tokenize',
+  'llama-template-analysis',
+  'prompt-limit',
+])
+const CLI_BOOLEAN_OPTIONS = new Set([
+  'help',
+  'resolve-source',
+  'inspect-header',
+  'inspect-tokenizer',
+  'inspect-template',
+  'run-smoke',
+  'run-generation',
+])
+
+function parseCanonicalPositiveInteger(value, option) {
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(`--${option} must be a canonical positive integer`)
+  }
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`--${option} must be a canonical positive integer`)
+  }
+  return parsed
+}
+
 function parseArgs(argv) {
   const args = new Map()
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
-    if (!arg.startsWith('--')) continue
-    const [key, inline] = arg.slice(2).split('=', 2)
+    if (typeof arg !== 'string' || !arg.startsWith('--') || arg === '--') {
+      throw new Error(`unexpected positional argument ${JSON.stringify(arg)}`)
+    }
+    const equals = arg.indexOf('=')
+    const key = arg.slice(2, equals === -1 ? undefined : equals)
+    const inline = equals === -1 ? null : arg.slice(equals + 1)
+    if (!CLI_VALUE_OPTIONS.has(key) && !CLI_BOOLEAN_OPTIONS.has(key)) {
+      throw new Error(`unknown option --${key}`)
+    }
+    if (args.has(key)) throw new Error(`duplicate option --${key}`)
+    if (CLI_BOOLEAN_OPTIONS.has(key)) {
+      if (inline !== null) throw new Error(`--${key} does not accept a value`)
+      args.set(key, true)
+      continue
+    }
+    if (inline !== null) {
+      if (inline.trim().length === 0) throw new Error(`--${key} requires a non-empty value`)
+      args.set(key, inline)
+      continue
+    }
     const next = argv[index + 1]
-    const value = inline ?? (next && !next.startsWith('--') ? argv[++index] : 'true')
-    args.set(key, value)
+    if (typeof next !== 'string' || next.trim().length === 0 || next.startsWith('--')) {
+      throw new Error(`--${key} requires exactly one non-empty value`)
+    }
+    args.set(key, next)
+    index += 1
+  }
+  if (args.has('prompt-limit')) {
+    parseCanonicalPositiveInteger(args.get('prompt-limit'), 'prompt-limit')
   }
   return args
+}
+
+function normalizeCandidateSelection(selection) {
+  if (!selection || typeof selection !== 'object' || Array.isArray(selection)) {
+    throw new Error('candidate selector must be an object with repo and file')
+  }
+  const repo = typeof selection.repo === 'string' ? selection.repo.trim() : ''
+  const file = typeof selection.file === 'string' ? selection.file.trim() : ''
+  const revision = selection.revision === null || selection.revision === undefined || selection.revision === ''
+    ? null
+    : String(selection.revision).trim()
+  if (!CANDIDATE_REPO_RE.test(repo)) {
+    throw new Error('--repo must be a canonical Hugging Face model id such as org/model')
+  }
+  const segments = file.split('/')
+  if (!file || file.length > 1024
+    || file.startsWith('/')
+    || file.endsWith('/')
+    || file.includes('\\')
+    || !file.toLowerCase().endsWith('.gguf')
+    || segments.some((segment) => !CANDIDATE_FILE_SEGMENT_RE.test(segment))) {
+    throw new Error('--file must be a relative, traversal-free Hugging Face .gguf path')
+  }
+  if (revision !== null && !REVISION_RE.test(revision)) {
+    throw new Error('--revision must be a lowercase immutable 40-character revision')
+  }
+  return { repo, file, revision }
+}
+
+function candidateSelectorDigest(selection) {
+  const normalized = normalizeCandidateSelection(selection)
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
+}
+
+function candidateIdForSelection(selection) {
+  return `${CANDIDATE_ID_PREFIX}${candidateSelectorDigest(selection).slice(0, CANDIDATE_ID_HEX_LENGTH)}`
+}
+
+function publicCandidateIdentity(selection) {
+  const selectorSha256 = candidateSelectorDigest(selection)
+  const rowId = `${CANDIDATE_ID_PREFIX}${selectorSha256.slice(0, CANDIDATE_ID_HEX_LENGTH)}`
+  return {
+    row_id: rowId,
+    candidate: {
+      identity_mode: 'public_selector_digest',
+      selector_id: rowId,
+      selector_sha256: selectorSha256,
+      selector_redacted: true,
+      requested_revision_pinned: selection.revision !== null,
+      roster_membership: 'absent_from_phase1_roster',
+    },
+  }
+}
+
+function opaqueCandidateIdentity(runIdentity = randomUUID()) {
+  const runId = typeof runIdentity === 'function' ? runIdentity() : runIdentity
+  if (typeof runId !== 'string' || !UUID_RE.test(runId)) {
+    throw new Error('candidate opaque run identity must be a lowercase RFC 4122 version-4 UUID')
+  }
+  const rowId = `${CANDIDATE_RUN_ID_PREFIX}${runId.replaceAll('-', '')}`
+  return {
+    row_id: rowId,
+    candidate: {
+      identity_mode: 'opaque_run',
+      run_id: runId,
+      selector_redacted: true,
+      roster_membership: 'absent_from_phase1_roster',
+    },
+  }
+}
+
+function canonicalCandidateDownloadUrl(lock) {
+  const repoPath = lock.repo.split('/').map(encodeURIComponent).join('/')
+  const filePath = lock.file.split('/').map(encodeURIComponent).join('/')
+  return `https://huggingface.co/${repoPath}/resolve/${lock.revision}/${filePath}?download=true`
+}
+
+function candidateLockError(lock, selected) {
+  if (!lock || typeof lock !== 'object' || Array.isArray(lock)) return 'missing_lock'
+  if (lock.schema !== 'camelid.hf-source-lock/v1') return 'schema'
+  if (lock.repo !== selected.repo) return 'repo'
+  if (lock.file !== selected.file) return 'file'
+  if (!REVISION_RE.test(lock.revision || '')) return 'revision'
+  if (selected.revision !== null && lock.revision !== selected.revision) return 'revision'
+  if (!Number.isSafeInteger(lock.size_bytes) || lock.size_bytes <= 0) return 'size_bytes'
+  if (!SHA256_RE.test(lock.sha256 || '')) return 'sha256'
+  if (typeof lock.license !== 'string' || !CANDIDATE_LICENSE_RE.test(lock.license)) return 'license'
+  if (!lock.access || typeof lock.access !== 'object' || Array.isArray(lock.access)
+    || Object.keys(lock.access).sort().join(',') !== 'disabled,gated,private'
+    || !['gated', 'private', 'disabled'].every((field) => typeof lock.access[field] === 'boolean')) {
+    return 'access'
+  }
+  try { validateImmutableLock(lock) } catch { return 'download_url' }
+  if (lock.download_url !== canonicalCandidateDownloadUrl(lock)) return 'download_url'
+  return null
+}
+
+async function resolveCandidateSourcePreflight(selection, {
+  resolver = resolveHfSource,
+  token = process.env.HF_TOKEN || null,
+} = {}) {
+  const selected = normalizeCandidateSelection(selection)
+  let lock
+  try {
+    lock = await resolver({ ...selected, token })
+  } catch (error) {
+    const errorCode = sourceLookupErrorCode(error)
+    return {
+      lock: null,
+      stage: {
+        status: 'blocked',
+        resolution: 'live_huggingface',
+        error_code: errorCode,
+        reason: `live Hugging Face source resolution could not complete (${errorCode})`,
+      },
+    }
+  }
+  const invalidField = candidateLockError(lock, selected)
+  if (invalidField) {
+    return {
+      lock: null,
+      stage: {
+        status: invalidField === 'license' ? 'blocked' : 'fail',
+        resolution: 'live_huggingface',
+        error_code: invalidField === 'license'
+          ? 'source_license_unavailable'
+          : 'source_identity_invalid',
+        reason: invalidField === 'license'
+          ? 'the resolved Hugging Face source has no safe, explicit license identity'
+          : 'the resolved Hugging Face source lock is invalid or does not match the requested selector',
+      },
+    }
+  }
+  const access = { ...lock.access }
+  if (access.private) {
+    return {
+      lock: null,
+      stage: {
+        status: 'blocked',
+        resolution: 'live_huggingface',
+        error_code: 'private_source_not_persisted',
+        reason: 'private Hugging Face source identities are not persisted by selector qualification',
+        access,
+        selector_redacted: true,
+      },
+    }
+  }
+  if (access.disabled) {
+    return {
+      lock: null,
+      stage: {
+        status: 'blocked',
+        resolution: 'live_huggingface',
+        error_code: 'source_disabled',
+        reason: 'the resolved Hugging Face source is disabled',
+        access,
+        selector_redacted: true,
+      },
+    }
+  }
+  return {
+    lock,
+    stage: {
+      status: 'pass',
+      resolution: 'live_huggingface',
+      repo: lock.repo,
+      file: lock.file,
+      requested_revision: selected.revision,
+      revision: lock.revision,
+      size_bytes: lock.size_bytes,
+      sha256: lock.sha256,
+      license: lock.license,
+      access,
+    },
+  }
+}
+
+async function captureCandidateWorkspaceProvenance(root, {
+  gitImpl = execFileAsync,
+} = {}) {
+  try {
+    const [headResult, statusResult, trackedStatusResult] = await Promise.all([
+      gitImpl('git', ['rev-parse', 'HEAD'], {
+        cwd: root,
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true,
+      }),
+      gitImpl('git', ['status', '--porcelain'], {
+        cwd: root,
+        timeout: 10_000,
+        maxBuffer: 8 * 1024 * 1024,
+        windowsHide: true,
+      }),
+      gitImpl('git', ['status', '--porcelain', '--untracked-files=no'], {
+        cwd: root,
+        timeout: 10_000,
+        maxBuffer: 8 * 1024 * 1024,
+        windowsHide: true,
+      }),
+    ])
+    const sourceHead = String(headResult.stdout || '').trim()
+    if (!REVISION_RE.test(sourceHead)) throw new Error('invalid source HEAD')
+    const sourceTrackedDirty = String(trackedStatusResult.stdout || '').trim().length > 0
+    return {
+      source_head: sourceHead,
+      source_dirty: sourceTrackedDirty || String(statusResult.stdout || '').trim().length > 0,
+      source_tracked_dirty: sourceTrackedDirty,
+      source_inspection: 'observed',
+    }
+  } catch {
+    return {
+      source_head: null,
+      source_dirty: null,
+      source_tracked_dirty: null,
+      source_inspection: 'unknown',
+    }
+  }
 }
 
 function selectRows(roster, requested) {
@@ -279,7 +574,10 @@ function deriveInspectorProvenance(inspector) {
   return derived
 }
 
-function metadataStageFromHeader(row, receipt, { expectedSourceHead = null } = {}) {
+function headerStageFromReceiptIdentity(identity, receipt, {
+  expectedSourceHead = null,
+  identityLabel = 'selected source identity',
+} = {}) {
   const host = receipt?.host
   const inspector = receipt?.inspector
   const inspectorProvenance = deriveInspectorProvenance(inspector)
@@ -294,10 +592,10 @@ function metadataStageFromHeader(row, receipt, { expectedSourceHead = null } = {
     'inspect-prefix',
     '<remote-gguf-prefix>',
     '--declared-len',
-    String(row.identity.size_bytes),
+    String(identity.size_bytes),
   ]
   const receiptShapeValid = receipt?.schema === 'camelid.remote-gguf-header-inspection/v1'
-    && receipt.row_id === row.id
+    && receipt.row_id === identity.row_id
     && validReceiptTimestamp(receipt.generated_at)
     && host && typeof host === 'object' && !Array.isArray(host)
     && host.hostname_redacted === true
@@ -358,21 +656,21 @@ function metadataStageFromHeader(row, receipt, { expectedSourceHead = null } = {
 
   const sourceMismatches = []
   for (const [field, expected] of [
-    ['repo', row.source.repo],
-    ['file', row.source.file],
-    ['revision', row.source.revision],
-    ['size_bytes', row.identity.size_bytes],
-    ['sha256', row.identity.sha256],
+    ['repo', identity.repo],
+    ['file', identity.file],
+    ['revision', identity.revision],
+    ['size_bytes', identity.size_bytes],
+    ['sha256', identity.sha256],
   ]) {
     if (source[field] !== expected) sourceMismatches.push(field)
   }
-  if (contentRange.total !== row.identity.size_bytes) sourceMismatches.push('content_range.total')
+  if (contentRange.total !== identity.size_bytes) sourceMismatches.push('content_range.total')
   if (sourceMismatches.length) {
     return {
       status: 'fail',
       mode: 'remote_immutable_prefix',
       error_code: 'header_source_identity_mismatch',
-      reason: `remote header receipt does not match the roster identity: ${sourceMismatches.join(', ')}`,
+      reason: `remote header receipt does not match the ${identityLabel}: ${sourceMismatches.join(', ')}`,
     }
   }
 
@@ -389,20 +687,6 @@ function metadataStageFromHeader(row, receipt, { expectedSourceHead = null } = {
     tensor_payload_n_bytes: inventory.total_n_bytes,
     tensor_inventory_sha256: inventory.sha256,
   }
-  const mismatches = []
-  if (compactObserved.architecture !== row.identity.architecture) {
-    mismatches.push(`architecture ${JSON.stringify(compactObserved.architecture)} != ${JSON.stringify(row.identity.architecture)}`)
-  }
-  if (compactObserved.tokenizer_model !== row.expected.tokenizer_model) {
-    mismatches.push(`tokenizer model ${JSON.stringify(compactObserved.tokenizer_model)} != ${JSON.stringify(row.expected.tokenizer_model)}`)
-  }
-  if (row.expected.tokenizer_pre !== null && compactObserved.tokenizer_pre !== row.expected.tokenizer_pre) {
-    mismatches.push(`tokenizer pre ${JSON.stringify(compactObserved.tokenizer_pre)} != ${JSON.stringify(row.expected.tokenizer_pre)}`)
-  }
-  if (compactObserved.headline_quant !== row.identity.quantization) {
-    mismatches.push(`headline quant ${JSON.stringify(compactObserved.headline_quant)} != ${JSON.stringify(row.identity.quantization)}`)
-  }
-
   const details = {
     mode: 'remote_immutable_prefix',
     inspection_generated_at: receipt.generated_at,
@@ -424,11 +708,11 @@ function metadataStageFromHeader(row, receipt, { expectedSourceHead = null } = {
       command: expectedCommand,
     },
     source: {
-      repo: row.source.repo,
-      file: row.source.file,
-      revision: row.source.revision,
-      size_bytes: row.identity.size_bytes,
-      sha256: row.identity.sha256,
+      repo: identity.repo,
+      file: identity.file,
+      revision: identity.revision,
+      size_bytes: identity.size_bytes,
+      sha256: identity.sha256,
     },
     range: {
       requested_bytes: range.requested_bytes,
@@ -452,9 +736,132 @@ function metadataStageFromHeader(row, receipt, { expectedSourceHead = null } = {
       support_claim: false,
     },
   }
+  return { status: 'pass', ...details }
+}
+
+function metadataStageFromHeader(row, receipt, options = {}) {
+  const stage = headerStageFromReceiptIdentity({
+    row_id: row.id,
+    repo: row.source.repo,
+    file: row.source.file,
+    revision: row.source.revision,
+    size_bytes: row.identity.size_bytes,
+    sha256: row.identity.sha256,
+  }, receipt, { ...options, identityLabel: 'roster identity' })
+  if (stage.status !== 'pass') return stage
+
+  const mismatches = []
+  if (stage.observed.architecture !== row.identity.architecture) {
+    mismatches.push(`architecture ${JSON.stringify(stage.observed.architecture)} != ${JSON.stringify(row.identity.architecture)}`)
+  }
+  if (stage.observed.tokenizer_model !== row.expected.tokenizer_model) {
+    mismatches.push(`tokenizer model ${JSON.stringify(stage.observed.tokenizer_model)} != ${JSON.stringify(row.expected.tokenizer_model)}`)
+  }
+  if (row.expected.tokenizer_pre !== null && stage.observed.tokenizer_pre !== row.expected.tokenizer_pre) {
+    mismatches.push(`tokenizer pre ${JSON.stringify(stage.observed.tokenizer_pre)} != ${JSON.stringify(row.expected.tokenizer_pre)}`)
+  }
+  if (stage.observed.headline_quant !== row.identity.quantization) {
+    mismatches.push(`headline quant ${JSON.stringify(stage.observed.headline_quant)} != ${JSON.stringify(row.identity.quantization)}`)
+  }
   return mismatches.length
-    ? { status: 'fail', ...details, reason: mismatches.join('; ') }
-    : { status: 'pass', ...details }
+    ? { ...stage, status: 'fail', reason: mismatches.join('; ') }
+    : stage
+}
+
+function isPowerOfTwo(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) return false
+  let candidate = BigInt(value)
+  return (candidate & (candidate - 1n)) === 0n
+}
+
+function compactTensorTypeCounts(receipt) {
+  const types = receipt?.inspection?.tensor_inventory?.types
+  if (!types || typeof types !== 'object' || Array.isArray(types)) {
+    return { counts: null, valid: false }
+  }
+  const entries = Object.entries(types).sort(([left], [right]) => left.localeCompare(right))
+  let total = 0
+  const counts = {}
+  for (const [name, count] of entries) {
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(name)
+      || !Number.isSafeInteger(count) || count <= 0) {
+      return { counts: null, valid: false }
+    }
+    total += count
+    if (!Number.isSafeInteger(total)) return { counts: null, valid: false }
+    counts[name] = count
+  }
+  return {
+    counts,
+    valid: total === receipt.inspection.tensor_count,
+  }
+}
+
+function candidateMetadataStageFromHeader(candidateId, lock, receipt, {
+  expectedSourceHead,
+} = {}) {
+  const stage = headerStageFromReceiptIdentity({
+    row_id: candidateId,
+    repo: lock.repo,
+    file: lock.file,
+    revision: lock.revision,
+    size_bytes: lock.size_bytes,
+    sha256: lock.sha256,
+  }, receipt, {
+    expectedSourceHead,
+    identityLabel: 'candidate source identity',
+  })
+  if (stage.status !== 'pass') return stage
+  const dataStart = stage.observed.data_start_offset
+  const payloadBytes = stage.observed.tensor_payload_n_bytes
+  const payloadEnd = dataStart + payloadBytes
+  const expectedOpaqueBytes = Math.max(0, stage.range.received_bytes - dataStart)
+  const tensorTypes = compactTensorTypeCounts(receipt)
+  if (!isPowerOfTwo(stage.observed.alignment)
+    || dataStart < 24
+    || dataStart % stage.observed.alignment !== 0
+    || dataStart >= lock.size_bytes
+    || dataStart >= stage.range.received_bytes
+    || !Number.isSafeInteger(payloadEnd)
+    || payloadEnd !== lock.size_bytes
+    || stage.scope.prefix_sha256 !== 'all_received_prefix_bytes'
+    || stage.scope.tensor_payload !== 'partially_range_fetched_opaque'
+    || expectedOpaqueBytes <= 0
+    || stage.scope.opaque_tensor_payload_prefix_bytes !== expectedOpaqueBytes
+    || stage.scope.full_artifact_sha256 !== 'not_run'
+    || stage.scope.tensor_payload_interpretation !== 'not_run'
+    || stage.scope.load !== 'not_run'
+    || stage.scope.generation !== 'not_run'
+    || stage.scope.support_claim !== false
+    || !tensorTypes.valid) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix',
+      error_code: 'header_descriptor_invariants_invalid',
+      reason: 'candidate header descriptors or compact scope invariants are invalid',
+    }
+  }
+  if (stage.range.received_bytes >= lock.size_bytes
+    || stage.range.content_range.end >= lock.size_bytes - 1) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix',
+      error_code: 'header_full_artifact_forbidden',
+      reason: 'candidate header qualification must fetch strictly fewer bytes than the full artifact',
+    }
+  }
+  return {
+    ...stage,
+    observed: {
+      ...stage.observed,
+      tensor_type_counts: tensorTypes.counts,
+    },
+    assessment: 'bounded_header_descriptor_inspection_only',
+    scope: {
+      ...stage.scope,
+      runtime_compatibility: 'not_run',
+    },
+  }
 }
 
 function metadataStageFromHeaderError(error) {
@@ -818,7 +1225,246 @@ function summarizeReports(reports, gateOrder, { sourcePreflight = false } = {}) 
   return { counts, rows }
 }
 
+function candidateBlockedStages() {
+  return {
+    source: {
+      status: 'blocked',
+      reason: 'live Hugging Face source resolution has not completed',
+    },
+    artifact: {
+      status: 'blocked',
+      error_code: 'full_artifact_not_downloaded',
+      reason: 'selector qualification never downloads or verifies the full artifact',
+    },
+    metadata: {
+      status: 'blocked',
+      reason: 'bounded header inspection is downstream of a passing immutable source lock',
+    },
+    tokenizer: {
+      status: 'blocked',
+      error_code: 'candidate_tokenizer_pack_unavailable',
+      reason: 'an unrostered selector has no exact-row tokenizer pack',
+    },
+    template: {
+      status: 'blocked',
+      error_code: 'candidate_template_pack_unavailable',
+      reason: 'an unrostered selector has no exact-row template pack',
+    },
+    load_smoke: {
+      status: 'blocked',
+      error_code: 'candidate_full_artifact_unavailable',
+      reason: 'load smoke requires a separately acquired and identity-verified full artifact',
+    },
+    parity: {
+      status: 'blocked',
+      error_code: 'candidate_oracle_pack_unavailable',
+      reason: 'generation parity requires a separately pinned exact-row oracle pack',
+    },
+    api_webui: {
+      status: 'blocked',
+      error_code: 'candidate_runtime_unqualified',
+      reason: 'API and WebUI qualification are downstream of exact-row runtime evidence',
+    },
+    context: {
+      status: 'blocked',
+      error_code: 'candidate_context_unqualified',
+      reason: 'no exact-row context receipt exists for an unrostered selector',
+    },
+  }
+}
+
+function candidateHeaderFailure(status, errorCode, reason) {
+  return {
+    status,
+    mode: 'remote_immutable_prefix',
+    error_code: errorCode,
+    reason,
+  }
+}
+
+function candidateReportSkeleton(identity, provenance, { now = () => new Date() } = {}) {
+  return {
+    schema: 'camelid.model-qualification-report/v1',
+    generated_at: now().toISOString(),
+    phase: 2,
+    qualification_mode: CANDIDATE_QUALIFICATION_MODE,
+    row_id: identity.row_id,
+    candidate: identity.candidate,
+    source_head: provenance.source_head,
+    source_dirty: provenance.source_dirty,
+    source_tracked_dirty: provenance.source_tracked_dirty,
+    source_inspection: provenance.source_inspection,
+    host: {
+      hostname_redacted: true,
+      platform: safeObservedToken(platform()) || 'redacted',
+      release: safeObservedToken(release()) || 'redacted',
+      arch: safeObservedToken(arch()) || 'redacted',
+    },
+    backend: {
+      serve: 'not_run',
+      env: {},
+    },
+    artifact: {
+      local_path_redacted: true,
+      full_artifact_download: 'not_run',
+      full_artifact_sha256: 'not_run',
+    },
+    stages: candidateBlockedStages(),
+    overall_status: 'blocked',
+    support_decision: 'hold_unrostered_header_candidate',
+    support_claim: false,
+    scope: {
+      source_resolution: 'live_huggingface',
+      header_inspection: 'bounded_partial_range',
+      full_artifact_download: 'not_run',
+      full_artifact_sha256: 'not_run',
+      tensor_payload_interpretation: 'not_run',
+      tokenizer: 'not_run',
+      template: 'not_run',
+      load: 'not_run',
+      generation: 'not_run',
+      api_webui: 'not_run',
+      context: 'not_run',
+      support_claim: false,
+    },
+  }
+}
+
+function assertCandidateModeOptions(options) {
+  if (options.inspectHeader !== true) {
+    throw new Error('an arbitrary --repo/--file selector requires --inspect-header')
+  }
+  const conflicts = [
+    ['--rows', Object.hasOwn(options, 'rows')],
+    ['--roster', Object.hasOwn(options, 'roster')],
+    ['--models-dir', Object.hasOwn(options, 'modelsDir')],
+    ['--artifact', Object.hasOwn(options, 'artifact')],
+    ['--inspect-tokenizer', Object.hasOwn(options, 'inspectTokenizer')],
+    ['--inspect-template', Object.hasOwn(options, 'inspectTemplate')],
+    ['--run-smoke', Object.hasOwn(options, 'runSmoke')],
+    ['--run-generation', Object.hasOwn(options, 'runGeneration')],
+    ['--prompt-limit', Object.hasOwn(options, 'promptLimit')],
+    ['--llama-tokenize', Object.hasOwn(options, 'llamaTokenize')],
+    ['--llama-template-analysis', Object.hasOwn(options, 'llamaTemplateAnalysis')],
+  ].filter(([, enabled]) => enabled).map(([name]) => name)
+  if (conflicts.length) {
+    throw new Error(`arbitrary selector mode cannot be combined with ${conflicts.join(', ')}`)
+  }
+}
+
+async function assertCandidateNotRostered(root, selection) {
+  const rosterPath = resolve(root, 'qa/model-qualification/phase1-roster.json')
+  const roster = JSON.parse(await readFile(rosterPath, 'utf8'))
+  const errors = validateRoster(roster, rosterPath)
+  if (errors.length) throw new Error(`roster is invalid:\n${errors.join('\n')}`)
+  const existing = roster.rows.find((row) => (
+    row.source?.repo === selection.repo && row.source?.file === selection.file
+  ))
+  if (existing) {
+    throw new Error(`selector is already present in the Phase 1 roster as ${existing.id}; use --rows`)
+  }
+}
+
+async function runCandidateFactory(options) {
+  assertCandidateModeOptions(options)
+  const root = resolve(options.root || '.')
+  const selection = normalizeCandidateSelection(options.candidate)
+  const prefixBytes = normalizePrefixBytes(options.prefixBytes ?? DEFAULT_PREFIX_BYTES)
+  await assertCandidateNotRostered(root, selection)
+  const sourcePreflight = await resolveCandidateSourcePreflight(selection, {
+    resolver: options.sourceResolver || resolveHfSource,
+    token: options.hfToken ?? process.env.HF_TOKEN ?? null,
+  })
+  const identity = sourcePreflight.stage.status === 'pass' && sourcePreflight.lock
+    ? publicCandidateIdentity(selection)
+    : opaqueCandidateIdentity(options.candidateRunIdentity)
+  const provenance = await (
+    options.candidateWorkspaceInspector || captureCandidateWorkspaceProvenance
+  )(root)
+  const safeProvenance = provenance
+    && REVISION_RE.test(provenance.source_head || '')
+    && typeof provenance.source_dirty === 'boolean'
+    && typeof provenance.source_tracked_dirty === 'boolean'
+    && (!provenance.source_tracked_dirty || provenance.source_dirty)
+    && provenance.source_inspection === 'observed'
+    ? provenance
+    : {
+      source_head: null,
+      source_dirty: null,
+      source_tracked_dirty: null,
+      source_inspection: 'unknown',
+    }
+  let report = candidateReportSkeleton(identity, safeProvenance, { now: options.now })
+  report.stages.source = sourcePreflight.stage
+
+  if (sourcePreflight.stage.status !== 'pass' || !sourcePreflight.lock) {
+    report.stages.metadata = candidateHeaderFailure(
+      'blocked',
+      'header_source_preflight_blocked',
+      'bounded header inspection is downstream of a passing public immutable source lock',
+    )
+  } else if (!REVISION_RE.test(report.source_head || '')) {
+    report.stages.metadata = candidateHeaderFailure(
+      'blocked',
+      'header_source_head_unavailable',
+      'bounded candidate header inspection requires an observed factory source HEAD',
+    )
+  } else if (report.source_tracked_dirty !== false) {
+    report.stages.metadata = candidateHeaderFailure(
+      'blocked',
+      'header_source_tracked_dirty',
+      'bounded candidate header inspection requires a tracked-clean factory checkout',
+    )
+  } else if (sourcePreflight.lock.size_bytes <= 1) {
+    report.stages.metadata = candidateHeaderFailure(
+      'blocked',
+      'header_partial_range_unavailable',
+      'candidate header qualification requires a range strictly smaller than the artifact',
+    )
+  } else {
+    const partialPrefixBytes = Math.min(prefixBytes, sourcePreflight.lock.size_bytes - 1)
+    try {
+      const receipt = await (options.headerInspector || inspectRemoteHeader)(
+        sourcePreflight.lock,
+        {
+          binary: resolve(root, options.camelid || defaultCamelidBinary()),
+          rowId: report.row_id,
+          sourceRoot: root,
+          prefixBytes: partialPrefixBytes,
+          token: options.hfToken ?? process.env.HF_TOKEN ?? null,
+        },
+      )
+      report.stages.metadata = candidateMetadataStageFromHeader(
+        report.row_id,
+        sourcePreflight.lock,
+        receipt,
+        { expectedSourceHead: report.source_head },
+      )
+    } catch (error) {
+      report.stages.metadata = metadataStageFromHeaderError(error)
+    }
+  }
+
+  report.overall_status = deriveOverall(report.stages)
+  report = redactLocalPaths(report, [
+    [resolve(root, options.camelid || defaultCamelidBinary()), '<camelid>'],
+    [root, '<repo>'],
+  ])
+  const validationErrors = validateQualificationReport(report, 'candidate')
+  if (validationErrors.length) {
+    throw new Error(`candidate report is invalid:\n${validationErrors.join('\n')}`)
+  }
+  const outDir = resolve(root, options.outDir || 'target/model-qualification/factory')
+  await mkdir(outDir, { recursive: true })
+  await writeFile(
+    resolve(outDir, `${report.row_id}-report.json`),
+    `${JSON.stringify(report, null, 2)}\n`,
+  )
+  return report
+}
+
 async function runFactory(options) {
+  if (options.candidate) return runCandidateFactory(options)
   const root = resolve(options.root || '.')
   const rosterPath = resolve(root, options.roster || 'qa/model-qualification/phase1-roster.json')
   const roster = JSON.parse(await readFile(rosterPath, 'utf8'))
@@ -1125,11 +1771,16 @@ async function runFactory(options) {
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.has('help')) {
-    console.log(`Usage: node scripts/model-qualification-factory.mjs [options]
+    console.log(`Usage:
+  node scripts/model-qualification-factory.mjs [roster options]
+  node scripts/model-qualification-factory.mjs --repo <org/model> --file <path.gguf> --inspect-header [candidate options]
 
 Options:
   --roster <path>          Qualification roster (default: Phase 1)
   --rows <id,id>           Run only these rows, preserving roster priority
+  --repo <org/model>       Unrostered single-candidate Hugging Face repository
+  --file <path.gguf>       Unrostered candidate GGUF file selector
+  --revision <sha>         Optional immutable candidate revision; omitted resolves HEAD once
   --models-dir <path>      Artifact directory (default: roster env variable)
   --artifact <path>        Exact artifact override; requires one selected row
   --camelid <path>         Camelid binary (default: target/release/camelid)
@@ -1149,54 +1800,75 @@ Options:
 `)
     return
   }
-  const requestedRows = args.get('rows')
+  const requestedRows = args.has('rows')
     ? args.get('rows').split(',').map((id) => id.trim()).filter(Boolean)
-    : []
-  const promptLimitRaw = args.get('prompt-limit')
-  const promptLimit = promptLimitRaw ? Number.parseInt(promptLimitRaw, 10) : undefined
-  if (promptLimitRaw && (!Number.isInteger(promptLimit) || promptLimit < 1)) {
-    throw new Error('--prompt-limit must be a positive integer')
+    : null
+  if (args.has('rows') && requestedRows.length === 0) {
+    throw new Error('--rows requires at least one non-empty row id')
   }
+  const promptLimit = args.has('prompt-limit')
+    ? parseCanonicalPositiveInteger(args.get('prompt-limit'), 'prompt-limit')
+    : undefined
   const inspectTokenizer = args.has('inspect-tokenizer')
   const inspectHeader = args.has('inspect-header') || inspectTokenizer
   const inspectTemplate = args.has('inspect-template')
+  const candidateRequested = args.has('repo') || args.has('file') || args.has('revision')
   const prefixBytes = args.has('prefix-bytes')
     ? normalizePrefixBytes(args.get('prefix-bytes'))
     : DEFAULT_PREFIX_BYTES
-  const index = await runFactory({
+  const factoryOptions = {
     root: '.',
-    roster: args.get('roster'),
-    rows: requestedRows,
-    modelsDir: args.get('models-dir'),
-    artifact: args.get('artifact'),
-    camelid: args.get('camelid'),
-    llamaTokenize: args.get('llama-tokenize'),
-    llamaTemplateAnalysis: args.get('llama-template-analysis'),
-    outDir: args.get('out-dir'),
-    resolveSource: args.has('resolve-source') || inspectHeader,
-    inspectHeader,
-    inspectTokenizer,
-    inspectTemplate,
     prefixBytes,
-    runSmoke: args.has('run-smoke'),
-    runGeneration: args.has('run-generation'),
-    promptLimit,
-  })
-  process.stdout.write(`${JSON.stringify(index, null, 2)}\n`)
+  }
+  if (candidateRequested) {
+    factoryOptions.candidate = {
+      repo: args.get('repo'),
+      file: args.get('file'),
+      revision: args.get('revision'),
+    }
+  }
+  for (const [arg, option] of [
+    ['roster', 'roster'],
+    ['models-dir', 'modelsDir'],
+    ['artifact', 'artifact'],
+    ['camelid', 'camelid'],
+    ['llama-tokenize', 'llamaTokenize'],
+    ['llama-template-analysis', 'llamaTemplateAnalysis'],
+    ['out-dir', 'outDir'],
+  ]) {
+    if (args.has(arg)) factoryOptions[option] = args.get(arg)
+  }
+  if (args.has('rows')) factoryOptions.rows = requestedRows
+  if (args.has('resolve-source') || inspectHeader) factoryOptions.resolveSource = true
+  if (args.has('inspect-header') || inspectTokenizer) factoryOptions.inspectHeader = true
+  if (args.has('inspect-tokenizer')) factoryOptions.inspectTokenizer = true
+  if (args.has('inspect-template')) factoryOptions.inspectTemplate = true
+  if (args.has('run-smoke')) factoryOptions.runSmoke = true
+  if (args.has('run-generation')) factoryOptions.runGeneration = true
+  if (args.has('prompt-limit')) factoryOptions.promptLimit = promptLimit
+  const result = await runFactory(factoryOptions)
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
 }
 
 export {
   artifactForRow,
+  candidateIdForSelection,
+  candidateMetadataStageFromHeader,
+  candidateSelectorDigest,
+  captureCandidateWorkspaceProvenance,
   defaultCamelidBinary,
   defaultLlamaTemplateAnalyzerBinary,
   defaultLlamaTokenizerBinary,
   firstUnresolvedStage,
   metadataStageFromHeader,
   metadataStageFromHeaderError,
+  parseArgs,
   publicRosterLabel,
+  resolveCandidateSourcePreflight,
   resolveSourcePreflight,
   resolveSourceStage,
   runFactory,
+  runCandidateFactory,
   selectRows,
   sourceLookupErrorCode,
   sourceSelectionForRow,
