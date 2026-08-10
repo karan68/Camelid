@@ -395,18 +395,20 @@
           "required": true,
           "status": "blocked",
           "evidence": [
+            "qa/model-qualification/gemma2-9b-it-q8-header-inspection.json",
             "src/model.rs"
           ],
-          "reason": "Synthetic header coverage exists; no real exact-row inspect receipt exists."
+          "reason": "A bounded immutable-prefix draft parsed the exact-row metadata and all descriptors, but its durable summary lacks clean-current-head inspector version, binary SHA-256, and generated-at provenance. Regenerate it after the shared header helper lands before this gate can pass."
         },
         "tokenizer": {
           "required": true,
           "status": "blocked",
           "evidence": [
             "src/tokenizer/mod.rs",
-            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json"
+            "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json",
+            "qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json"
           ],
-          "reason": "The Gemma/Llama SPM construction path exists and the pinned metadata contract is known, but no exact-row token-id comparison against the pinned llama.cpp oracle has run."
+          "reason": "A bounded seven-case exact-row header-prefix comparison matched pinned llama-tokenize token IDs, including BOS, Unicode/whitespace, and parsed/unparsed chat controls. The receipt was produced by a dirty pre-integration Camelid binary and the oracle consumed a disposable tensor-count-zero vocabulary derivative rather than the original full artifact; a clean-current-head rerun is required before this gate can pass."
         },
         "template": {
           "required": true,
@@ -491,10 +493,11 @@
           "required": true,
           "status": "blocked",
           "evidence": [
+            "qa/model-qualification/smollm3-3b-q8-header-inspection.json",
             "src/model.rs",
             "tests/inference_session.rs"
           ],
-          "reason": "Synthetic config and NoPE schedule tests are preparatory evidence only; no anchored exact-row camelid inspect receipt exists."
+          "reason": "A bounded immutable-prefix draft parsed the exact-row metadata and all descriptors, but its durable summary lacks clean-current-head inspector version, binary SHA-256, and generated-at provenance. Regenerate it after the shared header helper lands before this gate can pass."
         },
         "tokenizer": {
           "required": true,

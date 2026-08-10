@@ -1,0 +1,54 @@
+{
+  "schema": "camelid.remote-gguf-header-inspection/v1",
+  "provenance": {
+    "status": "draft_requires_clean_head_regeneration",
+    "clean_head_inspector_receipt": false,
+    "required_before_metadata_gate_pass": [
+      "generated_at",
+      "inspector_version",
+      "inspector_binary_sha256"
+    ]
+  },
+  "source": {
+    "repo": "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF",
+    "file": "gemma-2-9b-it-q8_0.gguf",
+    "revision": "eb4741d7b2aece6d8519db62dc31d89029a40af8",
+    "size_bytes": 9827149312,
+    "sha256": "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e"
+  },
+  "range": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
+    "content_range": {
+      "start": 0,
+      "end": 33554431,
+      "total": 9827149312
+    },
+    "prefix_sha256": "b2bcc601c188ffc7c306f0011944a7a5492bfde490c34ddc390b69424c09a5e5"
+  },
+  "inspection": {
+    "version": 3,
+    "tensor_count": 464,
+    "metadata_count": 26,
+    "alignment": 32,
+    "data_start_offset": 6057472,
+    "observed": {
+      "architecture": "gemma2",
+      "general_file_type": 7,
+      "tokenizer_model": "llama",
+      "tokenizer_pre": "default",
+      "headline_quant": "Q8_0"
+    },
+    "tensor_inventory": {
+      "sha256": "77b57fadc9e71d39829d221e66b5e6284ad2170af64f195c17b0aabfa0926464",
+      "total_n_bytes": 9821091840,
+      "types": {
+        "Q8_0": 295,
+        "F32": 169
+      }
+    }
+  },
+  "support_claim": false,
+  "note": "Remote header inspection validates metadata and tensor descriptors against the pinned full length. The 32 MiB prefix SHA-256 also covers opaque initial payload bytes after data_start_offset; it is not a full payload or full artifact hash, and no payload bytes were interpreted or loaded. This does not prove generation.",
+  "row_id": "gemma2_9b_it_q8_0"
+}

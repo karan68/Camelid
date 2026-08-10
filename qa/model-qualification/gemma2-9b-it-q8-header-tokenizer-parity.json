@@ -1,0 +1,317 @@
+{
+  "schema": "camelid.header-tokenizer-parity/v1",
+  "generated_at": "2026-08-10T15:55:11.921Z",
+  "provenance": {
+    "status": "preparatory_requires_clean_current_head_rerun",
+    "gate_requires_clean_current_head": true,
+    "source_head": "96db34867b0402f7775670d4a767fae73b6b19d9",
+    "source_tracked_dirty": true,
+    "binary_commit_abbrev": "96db3486",
+    "binary_reports_dirty": true,
+    "binary_matches_source_head": true,
+    "clean_current_head": false
+  },
+  "row_id": "gemma2_9b_it_q8_0",
+  "host": {
+    "platform": "win32-x64",
+    "hostname_redacted": true
+  },
+  "source": {
+    "repo": "BenevolenceMessiah/gemma-2-9b-it-Q8_0-GGUF",
+    "file": "gemma-2-9b-it-q8_0.gguf",
+    "revision": "eb4741d7b2aece6d8519db62dc31d89029a40af8",
+    "size_bytes": 9827149312,
+    "sha256": "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e"
+  },
+  "bounded_fetch": {
+    "requested_bytes": 33554432,
+    "received_bytes": 33554432,
+    "content_range": {
+      "start": 0,
+      "end": 33554431,
+      "total": 9827149312
+    },
+    "prefix_sha256": "b2bcc601c188ffc7c306f0011944a7a5492bfde490c34ddc390b69424c09a5e5",
+    "temporary_paths_redacted": true,
+    "temporary_files_deleted": true,
+    "scope_note": "the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash"
+  },
+  "tokenizer_metadata": {
+    "token_count": 256000,
+    "score_count": 256000,
+    "token_type_count": 256000,
+    "chat_template_utf8_bytes": 591,
+    "chat_template_sha256": "ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6"
+  },
+  "camelid": {
+    "version": "camelid v0.6.1-24-g96db3486-dirty",
+    "binary_sha256": "2955fa83b879918e28a22df635acfdf1e465285ddee4924d654683ae86034baf",
+    "prefix_mode": "tokenize --declared-len"
+  },
+  "oracle": {
+    "project": "ggml-org/llama.cpp",
+    "revision": "acd79d603",
+    "executable": "llama-tokenize.exe",
+    "binary_sha256": "a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2c3d481af857c5e331b8c7a",
+    "input": "disposable vocabulary-only derivative of the same immutable GGUF prefix; tensor_count is zeroed so llama-tokenize consumes unchanged tokenizer metadata and ignores the original descriptor region plus opaque partial payload bytes; this is not the original full artifact",
+    "derivative": {
+      "original_tensor_count": 464,
+      "metadata_count": 26,
+      "patch": "set fixed-header tensor_count at byte offset 8 to zero; all tokenizer metadata bytes remain unchanged",
+      "patch_offset": 8,
+      "sha256": "1e7626e2e2e798ff7c6924e7b225498a2a79f528abfbca6e41c1cf82a9f63293",
+      "persisted": false
+    }
+  },
+  "cases": [
+    {
+      "id": "plain_ascii_with_bos",
+      "text_utf8_bytes": 5,
+      "text_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        2,
+        4521
+      ],
+      "llama_cpp_ids": [
+        2,
+        4521
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "e9bfe22fc1bced68d3e7ffa4440b18fe625124aff6ccda26622f30f7138e3130"
+    },
+    {
+      "id": "unicode_and_leading_spaces_with_bos",
+      "text_utf8_bytes": 25,
+      "text_sha256": "43b6628093e71cf8434858475eda4cbdcb63279592216ffba52db667cf6dde0a",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        2,
+        139,
+        556,
+        236370,
+        524,
+        18688,
+        102546,
+        235248,
+        235274,
+        235284,
+        235304
+      ],
+      "llama_cpp_ids": [
+        2,
+        139,
+        556,
+        236370,
+        524,
+        18688,
+        102546,
+        235248,
+        235274,
+        235284,
+        235304
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "5330ae7e99b9d7f338fb4788d1190de2f3730ea3404f43ed4f88e5323f7b39c5"
+    },
+    {
+      "id": "punctuation_and_newline_with_bos",
+      "text_utf8_bytes": 20,
+      "text_sha256": "d327c3a8b064c7a18f533f6184f6ead37cb996521703c77957a98fe30a0c3fb5",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        2,
+        4056,
+        974,
+        235265,
+        108,
+        4056,
+        1378,
+        29675
+      ],
+      "llama_cpp_ids": [
+        2,
+        4056,
+        974,
+        235265,
+        108,
+        4056,
+        1378,
+        29675
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "bc2b3f53ad1af6e32d422cc4372659d238b1346d18f0528fd708bfc96f82dc28"
+    },
+    {
+      "id": "plain_ascii_without_bos",
+      "text_utf8_bytes": 5,
+      "text_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+      "add_special": false,
+      "parse_special": false,
+      "camelid_ids": [
+        4521
+      ],
+      "llama_cpp_ids": [
+        4521
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
+    },
+    {
+      "id": "single_user_chat_controls",
+      "text_utf8_bytes": 60,
+      "text_sha256": "2b508c223c1185da4ef0f767b3d6d4d44550b6918009be112d67736a47fd3efa",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        2,
+        106,
+        1645,
+        108,
+        4521,
+        107,
+        108,
+        106,
+        2516,
+        108
+      ],
+      "llama_cpp_ids": [
+        2,
+        106,
+        1645,
+        108,
+        4521,
+        107,
+        108,
+        106,
+        2516,
+        108
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "bf12b6d99b589347dd2e5ff83ac48cd1671af27c9aa23b84cc634179b6d0f233"
+    },
+    {
+      "id": "multi_turn_chat_controls",
+      "text_utf8_bytes": 138,
+      "text_sha256": "f6c0f3ff812f4ca03d604f48269065ae8793830f8d8bbafdb389be2beca13fac",
+      "add_special": true,
+      "parse_special": true,
+      "camelid_ids": [
+        2,
+        106,
+        1645,
+        108,
+        5546,
+        107,
+        108,
+        106,
+        2516,
+        108,
+        4038,
+        107,
+        108,
+        106,
+        1645,
+        108,
+        11918,
+        107,
+        108,
+        106,
+        2516,
+        108
+      ],
+      "llama_cpp_ids": [
+        2,
+        106,
+        1645,
+        108,
+        5546,
+        107,
+        108,
+        106,
+        2516,
+        108,
+        4038,
+        107,
+        108,
+        106,
+        1645,
+        108,
+        11918,
+        107,
+        108,
+        106,
+        2516,
+        108
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "4931aa46eefc28542fc37674eeb2c77a510aa047f2ec2e6d0c5349d12f7e407c"
+    },
+    {
+      "id": "chat_markers_as_ordinary_text",
+      "text_utf8_bytes": 39,
+      "text_sha256": "d8be372100a56f62f96812ad479be7b979a2ab54378d41802d310f2071ac3251",
+      "add_special": true,
+      "parse_special": false,
+      "camelid_ids": [
+        2,
+        235322,
+        2997,
+        235298,
+        559,
+        235298,
+        15508,
+        235313,
+        1645,
+        108,
+        4521,
+        235322,
+        615,
+        235298,
+        559,
+        235298,
+        15508,
+        235313,
+        108
+      ],
+      "llama_cpp_ids": [
+        2,
+        235322,
+        2997,
+        235298,
+        559,
+        235298,
+        15508,
+        235313,
+        1645,
+        108,
+        4521,
+        235322,
+        615,
+        235298,
+        559,
+        235298,
+        15508,
+        235313,
+        108
+      ],
+      "exact_match": true,
+      "camelid_decoded_sha256": "33abc302bb9a39c061724a9b5f71cf30ea14671f1ec14e678aa815e1897dff03"
+    }
+  ],
+  "result": {
+    "case_count": 7,
+    "exact_match_count": 7,
+    "all_token_ids_match": true,
+    "support_decision": "no_change_header_tokenizer_evidence_only"
+  },
+  "does_not_prove": [
+    "full artifact integrity or presence on this host",
+    "weight load, logits, generation, or greedy-token parity",
+    "API, SSE, Models page, WebUI, or context readiness",
+    "sampling, tools, GPU execution, performance, neighboring rows, or broad Gemma support"
+  ]
+}
