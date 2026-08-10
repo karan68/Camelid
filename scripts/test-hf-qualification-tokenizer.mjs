@@ -1,20 +1,27 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import {
   GEMMA2_CASES,
+  SMOLLM3_CASES,
   assertGemma2TokenizerMetadata,
+  assertSmolLM3TokenizerMetadata,
   buildCamelidArgs,
   buildLlamaArgs,
   classifyCamelidProvenance,
   makeVocabOnlyGguf,
+  normalizeTokenizerPrefixBytes,
   parseLlamaIds,
   parseLlamaVersionOutput,
   sourceSelectionForRow,
   validateGemma2TokenizerReceipt,
+  validateSmolLM3TokenizerReceipt,
 } from './hf-qualification-tokenizer.mjs'
 import { validateLockAgainstSelection } from './hf-qualification-source.mjs'
+
+const sha256 = (value) => createHash('sha256').update(Buffer.from(value)).digest('hex')
 
 const prefix = Buffer.alloc(64)
 prefix.write('GGUF', 0, 'ascii')
@@ -69,6 +76,13 @@ assert.equal(classifyCamelidProvenance({
   sourceHead: '96db34867b0402f7775670d4a767fae73b6b19d9',
   sourceTrackedDirty: false,
 }).binary_matches_source_head, false)
+
+assert.equal(normalizeTokenizerPrefixBytes('gemma2_9b_it_q8_0', 32 * 1024 * 1024), 32 * 1024 * 1024)
+assert.equal(normalizeTokenizerPrefixBytes('smollm3_3b_q8_0', '33554432'), 32 * 1024 * 1024)
+assert.throws(
+  () => normalizeTokenizerPrefixBytes('smollm3_3b_q8_0', 16 * 1024 * 1024),
+  /requires exactly 33554432 prefix bytes/,
+)
 
 const camelidArgs = buildCamelidArgs({
   prefixPath: 'header.gguf',
@@ -139,10 +153,81 @@ assert.throws(
   /tokenizer.ggml.pre mismatch/,
 )
 
+const smolTokens = Array(128_256).fill('x')
+const smolTypes = Array(128_256).fill(1)
+for (let id = 128_000; id < 128_256; id += 1) smolTypes[id] = 3
+for (const id of [128_002, 128_003, 128_013, 128_014, 128_015, 128_016, 128_017, 128_018]) {
+  smolTypes[id] = 4
+}
+for (const [id, text] of [
+  [128_000, '<|begin_of_text|>'],
+  [128_001, '<|end_of_text|>'],
+  [128_002, '<think>'],
+  [128_003, '</think>'],
+  [128_006, '<|start_header_id|>'],
+  [128_007, '<|end_header_id|>'],
+  [128_008, '<|eom_id|>'],
+  [128_009, '<|eot_id|>'],
+  [128_010, '<|python_tag|>'],
+  [128_011, '<|im_start|>'],
+  [128_012, '<|im_end|>'],
+  [128_013, '<tool_response>'],
+  [128_014, '</tool_response>'],
+  [128_015, '<tool_call>'],
+  [128_016, '</tool_call>'],
+  [128_017, '<code>'],
+  [128_018, '</code>'],
+]) smolTokens[id] = text
+const smolMetadata = {
+  'general.architecture': 'smollm3',
+  'general.license': 'apache-2.0',
+  'smollm3.vocab_size': 128_256,
+  'tokenizer.ggml.model': 'gpt2',
+  'tokenizer.ggml.pre': 'smaug-bpe',
+  'tokenizer.ggml.bos_token_id': 128_000,
+  'tokenizer.ggml.eos_token_id': 128_012,
+  'tokenizer.ggml.padding_token_id': 128_012,
+  'tokenizer.ggml.tokens': smolTokens,
+  'tokenizer.ggml.merges': Array(280_147).fill('a b'),
+  'tokenizer.ggml.token_type': smolTypes,
+  'tokenizer.chat_template': 'intentionally not the pinned 5493-byte template',
+}
+assert.throws(
+  () => assertSmolLM3TokenizerMetadata({ metadata: smolMetadata }),
+  /chat template does not match/,
+  'all grounded SmolLM3 metadata must reach the final exact template check',
+)
+for (const key of [
+  'tokenizer.ggml.add_bos_token',
+  'tokenizer.ggml.add_eos_token',
+  'tokenizer.ggml.add_space_prefix',
+]) {
+  assert.throws(
+    () => assertSmolLM3TokenizerMetadata({ metadata: { ...smolMetadata, [key]: false } }),
+    new RegExp(`unexpectedly declares ${key.replaceAll('.', '\\.')}`),
+    `the exact row pins ${key} absence, not an invented explicit false value`,
+  )
+}
+const driftedSmolTypes = [...smolTypes]
+driftedSmolTypes[128_255] = 1
+assert.throws(
+  () => assertSmolLM3TokenizerMetadata({
+    metadata: { ...smolMetadata, 'tokenizer.ggml.token_type': driftedSmolTypes },
+  }),
+  /special-token type counts mismatch/,
+)
+
 assert.equal(GEMMA2_CASES.length, 7)
 assert(GEMMA2_CASES.some((testCase) => testCase.parse_special))
 assert(GEMMA2_CASES.some((testCase) => !testCase.parse_special))
 assert(GEMMA2_CASES.some((testCase) => !testCase.add_special))
+assert.equal(SMOLLM3_CASES.length, 10)
+assert(SMOLLM3_CASES.some((testCase) => testCase.id === 'empty_with_add_special'))
+assert(SMOLLM3_CASES.some((testCase) => testCase.id === 'plain_ascii_with_add_special'))
+assert(SMOLLM3_CASES.some((testCase) => /unicode/.test(testCase.id)))
+assert(SMOLLM3_CASES.some((testCase) => /contractions/.test(testCase.id)))
+assert(SMOLLM3_CASES.some((testCase) => testCase.parse_special))
+assert(SMOLLM3_CASES.some((testCase) => !testCase.parse_special))
 
 const selected = sourceSelectionForRow({
   id: 'gemma2_9b_it_q8_0',
@@ -219,6 +304,194 @@ assert(
   validateGemma2TokenizerReceipt(driftedOracle, receiptRow, roster.defaults)
     .some((error) => error.includes('llama.cpp revision mismatch')),
   'receipt oracle identity must remain bound to the roster pin',
+)
+
+const smolRow = roster.rows.find((row) => row.id === 'smollm3_3b_q8_0')
+const syntheticSmolCases = SMOLLM3_CASES.map((testCase) => {
+  let ids = [42]
+  if (testCase.id === 'empty_with_add_special') ids = []
+  if (testCase.id === 'plain_ascii_with_add_special'
+    || testCase.id === 'plain_ascii_without_add_special') ids = [9_906]
+  if (testCase.id === 'single_user_chat_controls'
+    || testCase.id === 'multi_turn_chat_controls') ids = [128_011, 882, 128_012]
+  if (testCase.id === 'chat_controls_as_ordinary_text') ids = [27, 91, 318]
+  if (testCase.id === 'user_defined_tool_tags_with_parse_special'
+    || testCase.id === 'user_defined_tool_tags_without_parse_special') ids = [128_015, 5018, 128_016]
+  return {
+    id: testCase.id,
+    text_utf8_bytes: Buffer.byteLength(testCase.text),
+    text_sha256: sha256(testCase.text),
+    add_special: testCase.add_special,
+    parse_special: testCase.parse_special,
+    camelid_ids: ids,
+    llama_cpp_ids: [...ids],
+    exact_match: true,
+    camelid_decoded_sha256: 'd'.repeat(64),
+  }
+})
+const syntheticSmolReceipt = {
+  schema: 'camelid.header-tokenizer-parity/v1',
+  generated_at: '2026-08-10T18:00:00.000Z',
+  provenance: structuredClone(receipt.provenance),
+  row_id: smolRow.id,
+  host: { platform: 'win32-x64', hostname_redacted: true },
+  source: {
+    repo: smolRow.source.repo,
+    file: smolRow.source.file,
+    revision: smolRow.source.revision,
+    size_bytes: smolRow.identity.size_bytes,
+    sha256: smolRow.identity.sha256,
+    license: smolRow.source.license,
+  },
+  bounded_fetch: {
+    requested_bytes: 32 * 1024 * 1024,
+    received_bytes: 32 * 1024 * 1024,
+    content_range: { start: 0, end: 32 * 1024 * 1024 - 1, total: smolRow.identity.size_bytes },
+    prefix_sha256: '2d043b2114b89100c7ba464e57375a6f32c06c04729542d54ed684b5e8c5016e',
+    temporary_paths_redacted: true,
+    temporary_files_deleted: true,
+  },
+  grounding: {
+    header_receipt: 'qa/model-qualification/smollm3-3b-q8-header-inspection.json',
+    tokenizer_pre_fixture: 'qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json',
+  },
+  tokenizer_metadata: {
+    token_count: 128_256,
+    merge_count: 280_147,
+    token_type_count: 128_256,
+    normal_token_count: 128_000,
+    special_token_count: 256,
+    control_token_count: 248,
+    user_defined_token_count: 8,
+    bos_token_id: 128_000,
+    eos_token_id: 128_012,
+    padding_token_id: 128_012,
+    declared_add_bos_token: 'absent',
+    declared_add_eos_token: 'absent',
+    declared_add_space_prefix: 'absent',
+    oracle_resolved_add_bos_token: false,
+    oracle_resolved_add_eos_token: false,
+    chat_control_token_ids: { im_start: 128_011, im_end: 128_012 },
+    chat_template_utf8_bytes: 5_493,
+    chat_template_sha256: 'b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e',
+  },
+  camelid: structuredClone(receipt.camelid),
+  oracle: {
+    ...structuredClone(receipt.oracle),
+    derivative: {
+      ...structuredClone(receipt.oracle.derivative),
+      original_tensor_count: 326,
+      metadata_count: 26,
+      patch_offset: 8,
+      sha256: 'e'.repeat(64),
+      persisted: false,
+    },
+  },
+  cases: syntheticSmolCases,
+  result: {
+    case_count: syntheticSmolCases.length,
+    exact_match_count: syntheticSmolCases.length,
+    all_token_ids_match: true,
+    support_decision: 'smollm3_exact_row_tokenizer_gate_only',
+  },
+}
+assert.deepEqual(
+  validateSmolLM3TokenizerReceipt(syntheticSmolReceipt, smolRow, roster.defaults),
+  [],
+  'SmolLM3 durable receipt validator accepts only the grounded exact-row pack',
+)
+
+const smolPrefixDrift = structuredClone(syntheticSmolReceipt)
+smolPrefixDrift.bounded_fetch.prefix_sha256 = '0'.repeat(64)
+assert(
+  validateSmolLM3TokenizerReceipt(smolPrefixDrift, smolRow, roster.defaults)
+    .some((error) => error.includes('grounded exact-row prefix')),
+)
+const smolLicenseDrift = structuredClone(syntheticSmolReceipt)
+smolLicenseDrift.source.license = 'other'
+assert(
+  validateSmolLM3TokenizerReceipt(smolLicenseDrift, smolRow, roster.defaults)
+    .some((error) => error.includes('source.license mismatch')),
+)
+const smolFalseBos = structuredClone(syntheticSmolReceipt)
+smolFalseBos.cases[0].camelid_ids = [128_000]
+smolFalseBos.cases[0].llama_cpp_ids = [128_000]
+assert(
+  validateSmolLM3TokenizerReceipt(smolFalseBos, smolRow, roster.defaults)
+    .some((error) => error.includes('did not resolve false for empty input')),
+)
+const smolControlLeak = structuredClone(syntheticSmolReceipt)
+const ordinaryControl = smolControlLeak.cases.find((testCase) => testCase.id === 'chat_controls_as_ordinary_text')
+ordinaryControl.camelid_ids = [128_011, 128_012]
+ordinaryControl.llama_cpp_ids = [128_011, 128_012]
+assert(
+  validateSmolLM3TokenizerReceipt(smolControlLeak, smolRow, roster.defaults)
+    .some((error) => error.includes('parsed despite parse_special=false')),
+)
+const smolUserDefinedDrift = structuredClone(syntheticSmolReceipt)
+for (const testCase of smolUserDefinedDrift.cases.filter((candidate) => candidate.id.startsWith('user_defined_tool_tags_'))) {
+  testCase.camelid_ids = [77]
+  testCase.llama_cpp_ids = [77]
+}
+assert(
+  validateSmolLM3TokenizerReceipt(smolUserDefinedDrift, smolRow, roster.defaults)
+    .some((error) => error.includes('lost exact boundary IDs')),
+)
+
+const smolOutOfRangeIds = structuredClone(syntheticSmolReceipt)
+for (const testCase of smolOutOfRangeIds.cases.filter((candidate) => candidate.id.startsWith('plain_ascii_'))) {
+  testCase.camelid_ids = [999_999]
+  testCase.llama_cpp_ids = [999_999]
+}
+assert(
+  validateSmolLM3TokenizerReceipt(smolOutOfRangeIds, smolRow, roster.defaults)
+    .some((error) => error.includes('has invalid token IDs')),
+  'paired token IDs outside the pinned vocabulary must fail closed',
+)
+const smolEmptyHelloIds = structuredClone(syntheticSmolReceipt)
+for (const testCase of smolEmptyHelloIds.cases.filter((candidate) => candidate.id.startsWith('plain_ascii_'))) {
+  testCase.camelid_ids = []
+  testCase.llama_cpp_ids = []
+}
+assert(
+  validateSmolLM3TokenizerReceipt(smolEmptyHelloIds, smolRow, roster.defaults)
+    .some((error) => error.includes('did not preserve exact Hello token IDs')),
+  'paired empty Hello outputs must not masquerade as absent-BOS parity',
+)
+
+const smolMissingEmptyIds = structuredClone(syntheticSmolReceipt)
+delete smolMissingEmptyIds.cases.find(
+  (testCase) => testCase.id === 'empty_with_add_special',
+).camelid_ids
+assert(
+  validateSmolLM3TokenizerReceipt(smolMissingEmptyIds, smolRow, roster.defaults)
+    .some((error) => error.includes('did not resolve false for empty input')),
+  'missing empty-input IDs must fail closed without throwing',
+)
+const smolScalarParsedIds = structuredClone(syntheticSmolReceipt)
+smolScalarParsedIds.cases.find(
+  (testCase) => testCase.id === 'single_user_chat_controls',
+).camelid_ids = 128_011
+assert(
+  validateSmolLM3TokenizerReceipt(smolScalarParsedIds, smolRow, roster.defaults)
+    .some((error) => error.includes('were not parsed to their exact IDs')),
+  'scalar parsed-control IDs must fail closed without throwing',
+)
+const smolMissingOrdinaryIds = structuredClone(syntheticSmolReceipt)
+delete smolMissingOrdinaryIds.cases.find(
+  (testCase) => testCase.id === 'chat_controls_as_ordinary_text',
+).llama_cpp_ids
+assert(
+  validateSmolLM3TokenizerReceipt(smolMissingOrdinaryIds, smolRow, roster.defaults)
+    .some((error) => error.includes('parsed despite parse_special=false')),
+  'missing ordinary-control IDs must fail closed without throwing',
+)
+const smolNullCase = structuredClone(syntheticSmolReceipt)
+smolNullCase.cases[4] = null
+assert(
+  validateSmolLM3TokenizerReceipt(smolNullCase, smolRow, roster.defaults)
+    .some((error) => error.includes('id/order mismatch')),
+  'null case entries must fail closed without throwing',
 )
 
 console.log('test-hf-qualification-tokenizer: all checks passed')

@@ -538,6 +538,24 @@ fn resolve_gpt2_pre_tokenizer(
     }
 }
 
+fn resolve_add_bos(
+    model_name: &str,
+    tokenizer_pre: Option<&str>,
+    explicit_add_bos: Option<bool>,
+) -> bool {
+    // Gemma's force-on behavior is an existing llama.cpp compatibility rule;
+    // keep it ahead of the ordinary metadata/default path.
+    if model_name.starts_with("gemma") {
+        return true;
+    }
+
+    // The pinned SmolLM3 row omits tokenizer.ggml.add_bos_token. llama.cpp's
+    // SMAUG vocabulary defaults that omission to false, while Camelid's broad
+    // BPE fallback historically defaulted it to true. Scope the correction to
+    // the exact `smaug-bpe` spelling and never override an explicit GGUF value.
+    explicit_add_bos.unwrap_or(tokenizer_pre != Some("smaug-bpe"))
+}
+
 /// SHA-256 of the pinned artifact's GGUF *header region* — bytes
 /// `[0, data_start_offset)`: magic, version, counts, the whole KV metadata
 /// block, and every tensor descriptor. Tensor payload bytes are deliberately
@@ -789,12 +807,11 @@ impl Tokenizer {
                 // (without this, the BOS is dropped and the whole forward
                 // diverges). E-series/12B already ship true, so this is a no-op
                 // for them.
-                add_bos: if model_name.starts_with("gemma") {
-                    true
-                } else {
-                    file.metadata_bool("tokenizer.ggml.add_bos_token")
-                        .unwrap_or(true)
-                },
+                add_bos: resolve_add_bos(
+                    model_name,
+                    file.metadata_string("tokenizer.ggml.pre"),
+                    file.metadata_bool("tokenizer.ggml.add_bos_token"),
+                ),
                 add_eos: file
                     .metadata_bool("tokenizer.ggml.add_eos_token")
                     .unwrap_or(false),
@@ -2481,8 +2498,8 @@ mod tests {
     use super::{
         bpe_byte_to_char, bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_smollm,
         bpe_pretokenize_with, is_chat_control_marker, is_exact_phi4_mini_q4km, is_mark,
-        BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig,
-        TokenizerModel, SPM_SPACE,
+        resolve_add_bos, BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer,
+        TokenizerConfig, TokenizerModel, SPM_SPACE,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::sync::OnceLock;
@@ -3328,6 +3345,36 @@ mod tests {
                 "token mismatch for {s:?}:\n  missing-pre: {ea:?}\n  reference:   {eb:?}"
             );
         }
+    }
+
+    #[test]
+    fn smaug_bpe_missing_add_bos_defaults_false_without_widening() {
+        // The pinned SmolLM3 row omits tokenizer.ggml.add_bos_token and the
+        // b9632 oracle does not prepend BOS. Both explicit values still win.
+        assert!(!resolve_add_bos("gpt2", Some("smaug-bpe"), None));
+        assert!(resolve_add_bos("gpt2", Some("smaug-bpe"), Some(true)));
+        assert!(!resolve_add_bos("gpt2", Some("smaug-bpe"), Some(false)));
+
+        // No other BPE spelling inherits the SmolLM3-specific omission rule.
+        for tokenizer_pre in [
+            "llama-bpe",
+            "lfm2",
+            "qwen2",
+            "qwen35",
+            "stablelm2",
+            "command-r",
+            "smollm",
+            "tekken",
+        ] {
+            assert!(
+                resolve_add_bos("gpt2", Some(tokenizer_pre), None),
+                "{tokenizer_pre} default changed"
+            );
+        }
+        assert!(resolve_add_bos("gpt2", None, None));
+
+        // Preserve the pre-existing Gemma force-on workaround.
+        assert!(resolve_add_bos("gemma4", None, Some(false)));
     }
 
     #[test]

@@ -16,11 +16,11 @@ import {
 
 const execFileAsync = promisify(execFile)
 const DEFAULT_PREFIX_BYTES = 32 * 1024 * 1024
-const MAX_PREFIX_BYTES = 64 * 1024 * 1024
 const PINNED_LLAMA_REVISION = 'acd79d603'
 const PINNED_LLAMA_TOKENIZE_SHA256 = 'a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2c3d481af857c5e331b8c7a'
 const PINNED_LLAMA_CLI_SHA256 = '2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731'
 const GEMMA2_TEMPLATE_SHA256 = 'ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6'
+const SMOLLM3_TEMPLATE_SHA256 = 'b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e'
 
 const GEMMA2_CASES = [
   {
@@ -62,6 +62,69 @@ const GEMMA2_CASES = [
   {
     id: 'chat_markers_as_ordinary_text',
     text: '<start_of_turn>user\nHello<end_of_turn>\n',
+    add_special: true,
+    parse_special: false,
+  },
+]
+
+const SMOLLM3_CASES = [
+  {
+    id: 'empty_with_add_special',
+    text: '',
+    add_special: true,
+    parse_special: false,
+  },
+  {
+    id: 'plain_ascii_with_add_special',
+    text: 'Hello',
+    add_special: true,
+    parse_special: false,
+  },
+  {
+    id: 'plain_ascii_without_add_special',
+    text: 'Hello',
+    add_special: false,
+    parse_special: false,
+  },
+  {
+    id: 'smaug_unicode_spacing_and_contractions',
+    text: "  na\u00efve caf\u00e9 \u4e2d\u6587\uff11\uff12\uff13 can't I'M we'd",
+    add_special: true,
+    parse_special: false,
+  },
+  {
+    id: 'smaug_digits_punctuation_newlines_and_case',
+    text: "x  y 1234 a/b\nCAN'T we're!!!",
+    add_special: true,
+    parse_special: false,
+  },
+  {
+    id: 'single_user_chat_controls',
+    text: '<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n',
+    add_special: true,
+    parse_special: true,
+  },
+  {
+    id: 'multi_turn_chat_controls',
+    text: '<|im_start|>user\nFirst<|im_end|>\n<|im_start|>assistant\nOne<|im_end|>\n<|im_start|>user\nSecond<|im_end|>\n<|im_start|>assistant\n',
+    add_special: true,
+    parse_special: true,
+  },
+  {
+    id: 'chat_controls_as_ordinary_text',
+    text: '<|im_start|>user\nHello<|im_end|>\n',
+    add_special: true,
+    parse_special: false,
+  },
+  {
+    id: 'user_defined_tool_tags_with_parse_special',
+    text: '<tool_call>{"name":"weather"}</tool_call>',
+    add_special: true,
+    parse_special: true,
+  },
+  {
+    id: 'user_defined_tool_tags_without_parse_special',
+    text: '<tool_call>{"name":"weather"}</tool_call>',
     add_special: true,
     parse_special: false,
   },
@@ -278,6 +341,198 @@ function assertGemma2TokenizerMetadata(inspection) {
   }
 }
 
+function assertSmolLM3TokenizerMetadata(inspection) {
+  const metadata = inspection?.metadata
+  if (!metadata || typeof metadata !== 'object') {
+    throw new Error('prefix inspection did not return metadata')
+  }
+  const exact = [
+    ['general.architecture', 'smollm3'],
+    ['general.license', 'apache-2.0'],
+    ['smollm3.vocab_size', 128_256],
+    ['tokenizer.ggml.model', 'gpt2'],
+    ['tokenizer.ggml.pre', 'smaug-bpe'],
+    ['tokenizer.ggml.bos_token_id', 128_000],
+    ['tokenizer.ggml.eos_token_id', 128_012],
+    ['tokenizer.ggml.padding_token_id', 128_012],
+  ]
+  for (const [key, expected] of exact) {
+    if (metadata[key] !== expected) {
+      throw new Error(`SmolLM3 tokenizer metadata ${key} mismatch`)
+    }
+  }
+  for (const key of [
+    'tokenizer.ggml.add_bos_token',
+    'tokenizer.ggml.add_eos_token',
+    'tokenizer.ggml.add_space_prefix',
+  ]) {
+    if (Object.hasOwn(metadata, key)) {
+      throw new Error(`SmolLM3 exact row unexpectedly declares ${key}`)
+    }
+  }
+
+  const tokens = metadata['tokenizer.ggml.tokens']
+  const merges = metadata['tokenizer.ggml.merges']
+  const types = metadata['tokenizer.ggml.token_type']
+  if (!Array.isArray(tokens) || tokens.length !== 128_256) {
+    throw new Error('SmolLM3 tokenizer token array is missing or not 128256 entries')
+  }
+  if (!Array.isArray(merges) || merges.length !== 280_147) {
+    throw new Error('SmolLM3 tokenizer merge array is missing or not 280147 entries')
+  }
+  if (!Array.isArray(types) || types.length !== tokens.length) {
+    throw new Error('SmolLM3 tokenizer type array is missing or length-mismatched')
+  }
+  if (!types.every((type) => Number.isSafeInteger(type))) {
+    throw new Error('SmolLM3 tokenizer type array contains a non-integer entry')
+  }
+
+  const tokenTypeCounts = Object.create(null)
+  for (const type of types) tokenTypeCounts[type] = (tokenTypeCounts[type] || 0) + 1
+  const normalTokenCount = tokenTypeCounts[1] || 0
+  const controlTokenCount = tokenTypeCounts[3] || 0
+  const userDefinedTokenCount = tokenTypeCounts[4] || 0
+  const specialTokenCount = tokens.length - normalTokenCount
+  if (normalTokenCount !== 128_000
+    || controlTokenCount !== 248
+    || userDefinedTokenCount !== 8
+    || specialTokenCount !== 256
+    || Object.keys(tokenTypeCounts).some((type) => !['1', '3', '4'].includes(type))) {
+    throw new Error('SmolLM3 tokenizer special-token type counts mismatch')
+  }
+
+  for (const [id, expected, expectedType] of [
+    [128_000, '<|begin_of_text|>', 3],
+    [128_001, '<|end_of_text|>', 3],
+    [128_002, '<think>', 4],
+    [128_003, '</think>', 4],
+    [128_006, '<|start_header_id|>', 3],
+    [128_007, '<|end_header_id|>', 3],
+    [128_008, '<|eom_id|>', 3],
+    [128_009, '<|eot_id|>', 3],
+    [128_010, '<|python_tag|>', 3],
+    [128_011, '<|im_start|>', 3],
+    [128_012, '<|im_end|>', 3],
+    [128_013, '<tool_response>', 4],
+    [128_014, '</tool_response>', 4],
+    [128_015, '<tool_call>', 4],
+    [128_016, '</tool_call>', 4],
+    [128_017, '<code>', 4],
+    [128_018, '</code>', 4],
+  ]) {
+    if (tokens[id] !== expected || types[id] !== expectedType) {
+      throw new Error(`SmolLM3 tokenizer special token ${id} mismatch`)
+    }
+  }
+
+  const template = metadata['tokenizer.chat_template']
+  if (typeof template !== 'string'
+    || Buffer.byteLength(template) !== 5_493
+    || sha256(Buffer.from(template)) !== SMOLLM3_TEMPLATE_SHA256) {
+    throw new Error('SmolLM3 tokenizer chat template does not match the pinned exact-row hash')
+  }
+  return {
+    token_count: tokens.length,
+    merge_count: merges.length,
+    token_type_count: types.length,
+    normal_token_count: normalTokenCount,
+    special_token_count: specialTokenCount,
+    control_token_count: controlTokenCount,
+    user_defined_token_count: userDefinedTokenCount,
+    bos_token_id: 128_000,
+    eos_token_id: 128_012,
+    padding_token_id: 128_012,
+    declared_add_bos_token: 'absent',
+    declared_add_eos_token: 'absent',
+    declared_add_space_prefix: 'absent',
+    oracle_resolved_add_bos_token: false,
+    oracle_resolved_add_eos_token: false,
+    chat_control_token_ids: {
+      im_start: 128_011,
+      im_end: 128_012,
+    },
+    chat_template_utf8_bytes: Buffer.byteLength(template),
+    chat_template_sha256: sha256(Buffer.from(template)),
+  }
+}
+
+const TOKENIZER_PACKS = Object.freeze({
+  gemma2_9b_it_q8_0: Object.freeze({
+    family: 'Gemma',
+    cases: GEMMA2_CASES,
+    assertMetadata: assertGemma2TokenizerMetadata,
+    tensorCount: 464,
+    metadataCount: 26,
+    prefixBytes: DEFAULT_PREFIX_BYTES,
+    prefixSha256: 'b2bcc601c188ffc7c306f0011944a7a5492bfde490c34ddc390b69424c09a5e5',
+    supportDecision: 'no_change_header_tokenizer_evidence_only',
+    requireReceiptLicense: false,
+    grounding: null,
+    metadataSummary: Object.freeze({
+      token_count: 256_000,
+      score_count: 256_000,
+      token_type_count: 256_000,
+      chat_template_utf8_bytes: 591,
+      chat_template_sha256: GEMMA2_TEMPLATE_SHA256,
+    }),
+  }),
+  smollm3_3b_q8_0: Object.freeze({
+    family: 'SmolLM3',
+    cases: SMOLLM3_CASES,
+    assertMetadata: assertSmolLM3TokenizerMetadata,
+    tensorCount: 326,
+    metadataCount: 26,
+    prefixBytes: DEFAULT_PREFIX_BYTES,
+    prefixSha256: '2d043b2114b89100c7ba464e57375a6f32c06c04729542d54ed684b5e8c5016e',
+    supportDecision: 'smollm3_exact_row_tokenizer_gate_only',
+    requireReceiptLicense: true,
+    grounding: Object.freeze({
+      header_receipt: 'qa/model-qualification/smollm3-3b-q8-header-inspection.json',
+      tokenizer_pre_fixture: 'qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json',
+    }),
+    metadataSummary: Object.freeze({
+      token_count: 128_256,
+      merge_count: 280_147,
+      token_type_count: 128_256,
+      normal_token_count: 128_000,
+      special_token_count: 256,
+      control_token_count: 248,
+      user_defined_token_count: 8,
+      bos_token_id: 128_000,
+      eos_token_id: 128_012,
+      padding_token_id: 128_012,
+      declared_add_bos_token: 'absent',
+      declared_add_eos_token: 'absent',
+      declared_add_space_prefix: 'absent',
+      oracle_resolved_add_bos_token: false,
+      oracle_resolved_add_eos_token: false,
+      chat_control_token_ids: Object.freeze({
+        im_start: 128_011,
+        im_end: 128_012,
+      }),
+      chat_template_utf8_bytes: 5_493,
+      chat_template_sha256: SMOLLM3_TEMPLATE_SHA256,
+    }),
+  }),
+})
+
+function tokenizerPackForRow(rowId) {
+  const pack = TOKENIZER_PACKS[rowId]
+  if (!pack) {
+    throw new Error(`bounded tokenizer pack is not defined for row ${JSON.stringify(rowId)}`)
+  }
+  return pack
+}
+
+function normalizeTokenizerPrefixBytes(rowId, value = DEFAULT_PREFIX_BYTES) {
+  const pack = tokenizerPackForRow(rowId)
+  const prefixBytes = typeof value === 'number' ? value : Number(value)
+  if (!Number.isSafeInteger(prefixBytes) || prefixBytes !== pack.prefixBytes) {
+    throw new Error(`${rowId} tokenizer evidence requires exactly ${pack.prefixBytes} prefix bytes`)
+  }
+  return prefixBytes
+}
+
 async function selectRow(root, rosterPath, rowId) {
   const absolute = resolve(root, rosterPath)
   const roster = JSON.parse(await readFile(absolute, 'utf8'))
@@ -285,9 +540,7 @@ async function selectRow(root, rosterPath, rowId) {
   if (errors.length) throw new Error(`roster is invalid:\n${errors.join('\n')}`)
   const row = roster.rows.find((candidate) => candidate.id === rowId)
   if (!row) throw new Error(`unknown --row ${JSON.stringify(rowId)}`)
-  if (row.id !== 'gemma2_9b_it_q8_0') {
-    throw new Error('this bounded tokenizer pack is pinned only to gemma2_9b_it_q8_0')
-  }
+  tokenizerPackForRow(row.id)
   return row
 }
 
@@ -305,17 +558,25 @@ function sourceSelectionForRow(row) {
   }
 }
 
-function validIdArray(value) {
+function validIdArray(value, tokenCount) {
   return Array.isArray(value)
-    && value.every((id) => Number.isSafeInteger(id) && id >= 0)
+    && Number.isSafeInteger(tokenCount)
+    && tokenCount > 0
+    && value.every((id) => Number.isSafeInteger(id) && id >= 0 && id < tokenCount)
 }
 
-function validateGemma2TokenizerReceipt(receipt, row, defaults) {
+function validateTokenizerReceipt(receipt, row, defaults, pack) {
   const errors = []
   const check = (condition, message) => { if (!condition) errors.push(message) }
   const shaRe = /^[0-9a-f]{64}$/
+  check(row?.id && TOKENIZER_PACKS[row.id] === pack, 'row is not bound to this tokenizer pack')
   check(receipt?.schema === 'camelid.header-tokenizer-parity/v1', 'schema mismatch')
   check(receipt?.row_id === row.id, 'row_id mismatch')
+  check(typeof receipt?.generated_at === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(receipt.generated_at)
+    && !Number.isNaN(Date.parse(receipt.generated_at)), 'generated_at is invalid')
+  check(receipt?.host?.hostname_redacted === true, 'hostname is not redacted')
+  check(!Object.hasOwn(receipt?.host || {}, 'hostname'), 'raw hostname is present')
 
   for (const [field, expected] of [
     ['repo', row.source.repo],
@@ -325,6 +586,11 @@ function validateGemma2TokenizerReceipt(receipt, row, defaults) {
     ['sha256', row.identity.sha256],
   ]) {
     check(receipt?.source?.[field] === expected, `source.${field} mismatch`)
+  }
+  if (pack.requireReceiptLicense) {
+    check(receipt?.source?.license === row.source.license, 'source.license mismatch')
+  } else if (Object.hasOwn(receipt?.source || {}, 'license')) {
+    check(receipt.source.license === row.source.license, 'source.license mismatch')
   }
 
   const provenance = receipt?.provenance || {}
@@ -347,39 +613,49 @@ function validateGemma2TokenizerReceipt(receipt, row, defaults) {
 
   const bounded = receipt?.bounded_fetch || {}
   const contentRange = bounded.content_range || {}
-  check(Number.isSafeInteger(bounded.requested_bytes) && bounded.requested_bytes > 0 && bounded.requested_bytes <= MAX_PREFIX_BYTES, 'bounded request size is invalid')
+  check(bounded.requested_bytes === pack.prefixBytes, 'bounded request size does not match the exact pack')
   check(bounded.received_bytes === bounded.requested_bytes, 'bounded received byte count mismatch')
   check(contentRange.start === 0, 'Content-Range must start at zero')
   check(contentRange.end + 1 === bounded.received_bytes, 'Content-Range end does not match received bytes')
   check(contentRange.total === row.identity.size_bytes, 'Content-Range total does not match row size')
-  check(shaRe.test(bounded.prefix_sha256 || ''), 'prefix SHA-256 is invalid')
+  check(bounded.prefix_sha256 === pack.prefixSha256, 'prefix SHA-256 does not match the grounded exact-row prefix')
   check(bounded.temporary_paths_redacted === true, 'temporary paths are not redacted')
   check(bounded.temporary_files_deleted === true, 'temporary files were not confirmed deleted')
+  if (pack.grounding) {
+    check(receipt?.grounding?.header_receipt === pack.grounding.header_receipt, 'grounding header receipt mismatch')
+    check(receipt?.grounding?.tokenizer_pre_fixture === pack.grounding.tokenizer_pre_fixture, 'grounding tokenizer fixture mismatch')
+  }
 
   const metadata = receipt?.tokenizer_metadata || {}
-  check(metadata.token_count === 256_000, 'token count mismatch')
-  check(metadata.score_count === metadata.token_count, 'score count mismatch')
-  check(metadata.token_type_count === metadata.token_count, 'token type count mismatch')
-  check(metadata.chat_template_sha256 === GEMMA2_TEMPLATE_SHA256, 'chat template SHA-256 mismatch')
+  for (const [field, expected] of Object.entries(pack.metadataSummary)) {
+    const observed = metadata[field]
+    const equal = expected && typeof expected === 'object'
+      ? JSON.stringify(observed) === JSON.stringify(expected)
+      : observed === expected
+    check(equal, `tokenizer metadata ${field} mismatch`)
+  }
 
   const expectedBuild = Number(String(defaults?.llama_cpp?.build || '').replace(/^b/, ''))
+  check(receipt?.oracle?.project === 'ggml-org/llama.cpp', 'llama.cpp project mismatch')
   check(receipt?.oracle?.revision === defaults?.llama_cpp?.revision, 'llama.cpp revision mismatch')
   check(receipt?.oracle?.build === expectedBuild, 'llama.cpp build mismatch')
   check(receipt?.oracle?.binary_sha256 === PINNED_LLAMA_TOKENIZE_SHA256, 'llama-tokenize SHA-256 mismatch')
   check(receipt?.oracle?.companion_binary_sha256 === PINNED_LLAMA_CLI_SHA256, 'llama.cpp companion SHA-256 mismatch')
   check(receipt?.oracle?.derivative?.persisted === false, 'vocabulary-only derivative was persisted')
-  check(receipt?.oracle?.derivative?.original_tensor_count === 464, 'derivative tensor count mismatch')
-  check(receipt?.oracle?.derivative?.metadata_count === 26, 'derivative metadata count mismatch')
+  check(receipt?.oracle?.derivative?.original_tensor_count === pack.tensorCount, 'derivative tensor count mismatch')
+  check(receipt?.oracle?.derivative?.metadata_count === pack.metadataCount, 'derivative metadata count mismatch')
   check(receipt?.oracle?.derivative?.patch_offset === 8, 'derivative patch offset mismatch')
   check(shaRe.test(receipt?.oracle?.derivative?.sha256 || ''), 'derivative SHA-256 is invalid')
 
+  const tokenCount = pack.metadataSummary.token_count
   const cases = Array.isArray(receipt?.cases) ? receipt.cases : []
-  check(cases.length === GEMMA2_CASES.length, 'case count mismatch')
+  check(cases.length === pack.cases.length, 'case count mismatch')
   let exactMatches = 0
-  for (let index = 0; index < GEMMA2_CASES.length; index += 1) {
-    const expected = GEMMA2_CASES[index]
+  for (let index = 0; index < pack.cases.length; index += 1) {
+    const expected = pack.cases[index]
     const observed = cases[index] || {}
-    const idsValid = validIdArray(observed.camelid_ids) && validIdArray(observed.llama_cpp_ids)
+    const idsValid = validIdArray(observed.camelid_ids, tokenCount)
+      && validIdArray(observed.llama_cpp_ids, tokenCount)
     const idsMatch = idsValid
       && JSON.stringify(observed.camelid_ids) === JSON.stringify(observed.llama_cpp_ids)
     if (idsMatch) exactMatches += 1
@@ -395,9 +671,82 @@ function validateGemma2TokenizerReceipt(receipt, row, defaults) {
   }
   check(receipt?.result?.case_count === cases.length, 'result case_count mismatch')
   check(receipt?.result?.exact_match_count === exactMatches, 'result exact_match_count mismatch')
-  check(receipt?.result?.all_token_ids_match === (exactMatches === GEMMA2_CASES.length), 'result all_token_ids_match mismatch')
-  check(receipt?.result?.support_decision === 'no_change_header_tokenizer_evidence_only', 'support decision widened unexpectedly')
+  check(receipt?.result?.all_token_ids_match === (exactMatches === pack.cases.length), 'result all_token_ids_match mismatch')
+  check(receipt?.result?.support_decision === pack.supportDecision, 'support decision widened unexpectedly')
+
+  if (row.id === 'smollm3_3b_q8_0') {
+    const emptyWithSpecial = cases.find((testCase) => testCase?.id === 'empty_with_add_special')
+    const helloWithSpecial = cases.find((testCase) => testCase?.id === 'plain_ascii_with_add_special')
+    const helloWithoutSpecial = cases.find((testCase) => testCase?.id === 'plain_ascii_without_add_special')
+    check(Boolean(emptyWithSpecial)
+      && validIdArray(emptyWithSpecial.camelid_ids, tokenCount)
+      && validIdArray(emptyWithSpecial.llama_cpp_ids, tokenCount)
+      && emptyWithSpecial.camelid_ids.length === 0
+      && emptyWithSpecial.llama_cpp_ids.length === 0,
+    'SmolLM3 absent add_bos metadata did not resolve false for empty input')
+    check(Boolean(helloWithSpecial && helloWithoutSpecial)
+      && validIdArray(helloWithSpecial.camelid_ids, tokenCount)
+      && validIdArray(helloWithSpecial.llama_cpp_ids, tokenCount)
+      && validIdArray(helloWithoutSpecial.camelid_ids, tokenCount)
+      && validIdArray(helloWithoutSpecial.llama_cpp_ids, tokenCount)
+      && JSON.stringify(helloWithSpecial.camelid_ids) === '[9906]'
+      && JSON.stringify(helloWithSpecial.llama_cpp_ids) === '[9906]'
+      && JSON.stringify(helloWithoutSpecial.camelid_ids) === '[9906]'
+      && JSON.stringify(helloWithoutSpecial.llama_cpp_ids) === '[9906]',
+    'SmolLM3 absent add_bos/add_eos metadata did not preserve exact Hello token IDs')
+
+    const parsedChat = cases.find((testCase) => testCase?.id === 'single_user_chat_controls')
+    const ordinaryChat = cases.find((testCase) => testCase?.id === 'chat_controls_as_ordinary_text')
+    check(Boolean(parsedChat)
+      && validIdArray(parsedChat.camelid_ids, tokenCount)
+      && validIdArray(parsedChat.llama_cpp_ids, tokenCount)
+      && parsedChat.camelid_ids.includes(128_011)
+      && parsedChat.camelid_ids.includes(128_012)
+      && parsedChat.llama_cpp_ids.includes(128_011)
+      && parsedChat.llama_cpp_ids.includes(128_012),
+    'SmolLM3 CONTROL chat markers were not parsed to their exact IDs')
+    check(Boolean(ordinaryChat)
+      && validIdArray(ordinaryChat.camelid_ids, tokenCount)
+      && validIdArray(ordinaryChat.llama_cpp_ids, tokenCount)
+      && !ordinaryChat.camelid_ids.includes(128_011)
+      && !ordinaryChat.camelid_ids.includes(128_012)
+      && !ordinaryChat.llama_cpp_ids.includes(128_011)
+      && !ordinaryChat.llama_cpp_ids.includes(128_012),
+    'SmolLM3 CONTROL chat markers parsed despite parse_special=false')
+
+    const withParse = cases.find((testCase) => testCase?.id === 'user_defined_tool_tags_with_parse_special')
+    const withoutParse = cases.find((testCase) => testCase?.id === 'user_defined_tool_tags_without_parse_special')
+    check(Boolean(withParse && withoutParse)
+      && validIdArray(withParse.camelid_ids, tokenCount)
+      && validIdArray(withParse.llama_cpp_ids, tokenCount)
+      && validIdArray(withoutParse.camelid_ids, tokenCount)
+      && validIdArray(withoutParse.llama_cpp_ids, tokenCount)
+      && JSON.stringify(withParse.camelid_ids) === JSON.stringify(withoutParse.camelid_ids)
+      && JSON.stringify(withParse.llama_cpp_ids) === JSON.stringify(withoutParse.llama_cpp_ids)
+      && withParse.camelid_ids[0] === 128_015
+      && withParse.camelid_ids.at(-1) === 128_016
+      && withParse.llama_cpp_ids[0] === 128_015
+      && withParse.llama_cpp_ids.at(-1) === 128_016
+      && withoutParse.camelid_ids[0] === 128_015
+      && withoutParse.camelid_ids.at(-1) === 128_016
+      && withoutParse.llama_cpp_ids[0] === 128_015
+      && withoutParse.llama_cpp_ids.at(-1) === 128_016,
+    'SmolLM3 USER_DEFINED tool tags changed with parse_special or lost exact boundary IDs')
+  }
+
+  const serialized = JSON.stringify(receipt)
+  check(!/[A-Za-z]:[\\/]/.test(serialized), 'receipt exposes an absolute Windows path')
+  check(!/(?:\/Users\/|\/home\/|\/tmp\/)/i.test(serialized), 'receipt exposes an absolute local path')
+  check(!/(?:Bearer\s+|hf_[A-Za-z0-9]{8,})/i.test(serialized), 'receipt exposes an access token')
   return errors
+}
+
+function validateGemma2TokenizerReceipt(receipt, row, defaults) {
+  return validateTokenizerReceipt(receipt, row, defaults, TOKENIZER_PACKS.gemma2_9b_it_q8_0)
+}
+
+function validateSmolLM3TokenizerReceipt(receipt, row, defaults) {
+  return validateTokenizerReceipt(receipt, row, defaults, TOKENIZER_PACKS.smollm3_3b_q8_0)
 }
 
 async function inspectPrefix(binary, prefixPath, declaredLength) {
@@ -440,13 +789,13 @@ async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.has('help') || !args.get('row')) {
     console.log(`Usage:
-  node scripts/hf-qualification-tokenizer.mjs --row gemma2_9b_it_q8_0 [options]
+  node scripts/hf-qualification-tokenizer.mjs --row <gemma2_9b_it_q8_0|smollm3_3b_q8_0> [options]
 
 Options:
   --roster <path>          Roster path (default: Phase 1)
   --camelid <path>         Camelid binary (default: target/debug/camelid)
   --llama-tokenize <path>  Pinned llama-tokenize binary
-  --prefix-bytes <n>       Range budget, max 64 MiB (default: 32 MiB)
+  --prefix-bytes <n>       Exact range budget; only 32 MiB is accepted
   --out <path>             Write the scrubbed parity receipt
   HF_TOKEN                 Optional token for gated/private rows
 `)
@@ -459,6 +808,7 @@ Options:
     args.get('roster') || 'qa/model-qualification/phase1-roster.json',
     args.get('row'),
   )
+  const pack = tokenizerPackForRow(row.id)
   const lock = await resolveHfSource({
     repo: row.source.repo,
     file: row.source.file,
@@ -469,14 +819,17 @@ Options:
   // also agree with the roster's exact revision, size, SHA-256, and license.
   // Otherwise a row-labelled receipt could silently qualify a different file.
   validateLockAgainstSelection(lock, sourceSelectionForRow(row))
-  const prefixBytes = Number(args.get('prefix-bytes') || DEFAULT_PREFIX_BYTES)
-  if (!Number.isSafeInteger(prefixBytes) || prefixBytes <= 0 || prefixBytes > MAX_PREFIX_BYTES) {
-    throw new Error(`prefix byte budget must be between 1 and ${MAX_PREFIX_BYTES}`)
-  }
+  const prefixBytes = normalizeTokenizerPrefixBytes(
+    row.id,
+    args.get('prefix-bytes') || DEFAULT_PREFIX_BYTES,
+  )
   const ranged = await fetchHeaderPrefix(lock, {
     prefixBytes,
     token: process.env.HF_TOKEN || null,
   })
+  if (ranged.prefix_sha256 !== pack.prefixSha256) {
+    throw new Error(`${row.id} prefix SHA-256 does not match the grounded exact-row header receipt`)
+  }
   const defaultCamelid = process.platform === 'win32'
     ? 'target/debug/camelid.exe'
     : 'target/debug/camelid'
@@ -495,7 +848,7 @@ Options:
     const vocabOnlyPath = join(temporary, 'vocab-only.gguf')
     await writeFile(prefixPath, ranged.bytes)
     const inspection = await inspectPrefix(camelid, prefixPath, lock.size_bytes)
-    const tokenizerMetadata = assertGemma2TokenizerMetadata(inspection)
+    const tokenizerMetadata = pack.assertMetadata(inspection)
     const derived = makeVocabOnlyGguf(ranged.bytes)
     if (derived.original_tensor_count !== inspection.tensor_count) {
       throw new Error('vocab-only derivative tensor count does not match prefix inspection')
@@ -503,7 +856,7 @@ Options:
     await writeFile(vocabOnlyPath, derived.bytes)
 
     const cases = []
-    for (const testCase of GEMMA2_CASES) {
+    for (const testCase of pack.cases) {
       const camelidResult = await runCamelidCase(
         camelid,
         prefixPath,
@@ -551,6 +904,7 @@ Options:
         revision: lock.revision,
         size_bytes: lock.size_bytes,
         sha256: lock.sha256,
+        license: lock.license,
       },
       bounded_fetch: {
         requested_bytes: ranged.requested_bytes,
@@ -561,6 +915,7 @@ Options:
         temporary_files_deleted: true,
         scope_note: 'the prefix hash includes opaque initial tensor payload bytes after data_start_offset; it is not a full payload or full artifact hash',
       },
+      ...(pack.grounding ? { grounding: pack.grounding } : {}),
       tokenizer_metadata: tokenizerMetadata,
       camelid: {
         version: camelidVersion,
@@ -591,13 +946,13 @@ Options:
         case_count: cases.length,
         exact_match_count: cases.filter((testCase) => testCase.exact_match).length,
         all_token_ids_match: allMatch,
-        support_decision: 'no_change_header_tokenizer_evidence_only',
+        support_decision: pack.supportDecision,
       },
       does_not_prove: [
         'full artifact integrity or presence on this host',
         'weight load, logits, generation, or greedy-token parity',
         'API, SSE, Models page, WebUI, or context readiness',
-        'sampling, tools, GPU execution, performance, neighboring rows, or broad Gemma support',
+        `sampling, tools, GPU execution, performance, neighboring rows, or broad ${pack.family} support`,
       ],
     }
   } finally {
@@ -619,15 +974,19 @@ Options:
 
 export {
   GEMMA2_CASES,
+  SMOLLM3_CASES,
   assertGemma2TokenizerMetadata,
+  assertSmolLM3TokenizerMetadata,
   buildCamelidArgs,
   buildLlamaArgs,
   classifyCamelidProvenance,
   makeVocabOnlyGguf,
+  normalizeTokenizerPrefixBytes,
   parseLlamaIds,
   parseLlamaVersionOutput,
   sourceSelectionForRow,
   validateGemma2TokenizerReceipt,
+  validateSmolLM3TokenizerReceipt,
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
