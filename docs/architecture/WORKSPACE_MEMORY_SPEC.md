@@ -67,7 +67,7 @@ Do not describe this candidate as production-ready until those gates have receip
 Every claim below is tagged:
 
 - **[VERIFIED]** — read directly from the codebase during design and believed accurate as of this branch. Still re‑confirm before coding; the tree is dirty/uncommitted in places.
-- **[DOCUMENTED]** — taken from repo docs/notes (`COMPATIBILITY.md`, `STATUS.md`, memory notes), not independently re‑measured here.
+- **[DOCUMENTED]** — taken from repo docs/notes (`COMPATIBILITY.md`, `docs/reference/STATUS.md`, memory notes), not independently re‑measured here.
 - **[ASSUMED]** — a reasonable inference **not** verified. Must be confirmed by reading code before relying on it.
 - **[PROPOSED]** — new design in this spec. Does not exist yet.
 - **[TO‑VERIFY]** — an explicit open question the implementer must resolve first.

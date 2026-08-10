@@ -14,7 +14,8 @@
 //!
 //! The covered-set here is **authoritative for the runnable lane** and is taken
 //! verbatim from the spec — it intentionally differs from `model.rs`'s
-//! optimized-lane architecture allowlist (see `BACKEND_ASKS.md` RA-4). In
+//! optimized-lane architecture allowlist (see
+//! `docs/archive/campaigns/BACKEND_ASKS.md` RA-4). In
 //! particular the runnable set includes `gemma2`/`command-r` and excludes
 //! `mistral`/`smollm3`/`gemma4`. Command R admission is only a coverage-axis
 //! statement: the loader pins execution to the immutable Aya Expanse 8B Q4_K_M

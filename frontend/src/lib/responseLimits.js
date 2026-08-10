@@ -2,7 +2,8 @@
    real source: model context from /v1/models meta.n_ctx_train (descriptive
    metadata, not a support claim — I2), the verified bound from validated
    bounded-context packs on the exact /api/capabilities row. Memory and
-   KV-cost inputs do not exist on the backend yet (BACKEND_ASKS.md #3) — the
+   KV-cost inputs do not exist on the backend yet
+   (frontend/design-evidence/BACKEND_ASKS.md #3) — the
    UI renders those indicators ABSENT, never estimated client-side. */
 
 import { findCompatibilityHint, isExactCompatibilityHint } from './capabilities.js'

@@ -5401,7 +5401,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "direct_chat_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "Certainly! Here",
-                evidence: "five-prompt TinyLlama Q8_0 parity gate plus current template-shape, bounded 512-context, API/WebUI, and RSS/perf artifacts recorded in STATUS.md",
+                evidence: "five-prompt TinyLlama Q8_0 parity gate plus current template-shape, bounded 512-context, API/WebUI, and RSS/perf artifacts recorded in docs/reference/STATUS.md",
                 next_step: "extend to larger contexts and additional LLaMA-family/quant targets before broadening support claims",
             },
             ModelCompatibilityTarget {
@@ -30685,7 +30685,7 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ),
     // Local requantization (BASALT/GABBRO pilot artifact, 6,058,607,776 B).
     // There is no upstream upload to pull, so the row can only reach the
-    // Supported lane through this allowlist -- SUPPORT_MATRIX_v0.1.md already
+    // Supported lane through this allowlist -- docs/reference/SUPPORT_MATRIX_v0.1.md already
     // records "no frontend pull-catalog entry" for it.
     (
         "gemma-4-E4B-it-NVFP4-mm.gguf",

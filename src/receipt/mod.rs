@@ -6,7 +6,7 @@
 //!
 //! 1. A receipt proves one request matched the reference — it is NOT a support
 //!    promotion. A green receipt does not move any row in the release ledger
-//!    (`README.md` / `COMPATIBILITY.md` / `STATUS.md`), and no copy, field
+//!    (`README.md` / `COMPATIBILITY.md` / `docs/reference/STATUS.md`), and no copy, field
 //!    name, or log line may imply otherwise.
 //! 2. Receipts are only meaningful for deterministic runs. A receipt for a
 //!    sampled (non-greedy) run must be stamped `reproducible: false` and is

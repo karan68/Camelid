@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "d31e5cb0",
+    "source_head": "442a5e95",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs and API_CONFORMANCE_CASES in src/api/contract.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -571,7 +571,7 @@
         "latest_checked_bucket": "direct_chat_smoke",
         "latest_checked_result": "pass",
         "latest_checked_output": "Certainly! Here",
-        "evidence": "five-prompt TinyLlama Q8_0 parity gate plus current template-shape, bounded 512-context, API/WebUI, and RSS/perf artifacts recorded in STATUS.md",
+        "evidence": "five-prompt TinyLlama Q8_0 parity gate plus current template-shape, bounded 512-context, API/WebUI, and RSS/perf artifacts recorded in docs/reference/STATUS.md",
         "next_step": "extend to larger contexts and additional LLaMA-family/quant targets before broadening support claims"
       }
     },
