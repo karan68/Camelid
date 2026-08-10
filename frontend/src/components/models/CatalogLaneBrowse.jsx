@@ -784,19 +784,21 @@ export function CatalogLaneBrowse({
   onStartModel,
   onModelStarted,
   onOperationBusy,
-  seedQuery = '',
+  externalQuery,
+  onCuratedMatchCount,
 }) {
   const base = (apiBase || '').replace(/\/$/, '')
   const [items, setItems] = useState(null)
   const [query, setQuery] = useState('')
-  /* The page header's model search hands its term down here when it finds
-     nothing installed, so one keystroke sequence carries from "do I have this?"
-     to "can I get it?". Seeding only follows a NEW term; it never fights typing
-     that is already underway in this box. */
+  /* The Models page owns one search for the whole page, so when it drives this
+     component the box here would be a second, competing input — it is hidden and
+     this query simply follows the page's. Empty is synced too: clearing up there
+     must clear the catalog, not strand an old term down here. */
+  const pageControlled = externalQuery !== undefined
   useEffect(() => {
-    const seed = String(seedQuery || '').trim()
-    if (seed) setQuery(seed)
-  }, [seedQuery])
+    if (!pageControlled) return
+    setQuery(String(externalQuery || ''))
+  }, [pageControlled, externalQuery])
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [nextCursor, setNextCursor] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -996,6 +998,15 @@ export function CatalogLaneBrowse({
   )
   const searching = debouncedQuery.length >= 2
 
+  /* The page's result line needs to know whether scrolling down is worth it, so
+     report how many curated rows the current term matches. Curated only: live
+     Hugging Face results arrive asynchronously, and a count that changed after
+     the fact would be worse than no count. */
+  useEffect(() => {
+    if (!onCuratedMatchCount) return
+    onCuratedMatchCount(searching ? curated.length : null)
+  }, [onCuratedMatchCount, searching, curated.length])
+
   const hfGroups = useMemo(() => groupHfFilesByRepo(experimental), [experimental])
   const { loadable, unimplemented } = useMemo(() => partitionByArchSupport(hfGroups), [hfGroups])
   // Landing state only: with no query, lead with what this machine can actually
@@ -1026,13 +1037,15 @@ export function CatalogLaneBrowse({
         for confirmation first; progress appears in Downloads above, and finished downloads join
         the sections above.
       </p>
-      <input
-        className="catalog-search"
-        aria-label="Search model catalog"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        placeholder="Search curated picks and live Hugging Face GGUFs (name, repo, filename)"
-      />
+      {!pageControlled && (
+        <input
+          className="catalog-search"
+          aria-label="Search model catalog"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search curated picks and live Hugging Face GGUFs (name, repo, filename)"
+        />
+      )}
       <UndeterminedFitNotice items={visibleItems} />
       {error ? (
         <Notice

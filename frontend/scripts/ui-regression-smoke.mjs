@@ -350,11 +350,16 @@ assert.match(modelsViewSource, /experimentalRows\s*=\s*allExperimentalRows\.filt
 // A GGUF's filename is often the only place the quantization appears, so a
 // search for "q4" has to reach it.
 assert.match(modelsViewSource, /model\?\.name \|\| ''\} \$\{model\?\.filename \|\| ''/, 'the model search must match filename as well as display name')
-// Finding nothing installed is exactly when someone is looking for a model they
-// do not have yet, so the term is handed to the catalog instead of dead-ending.
-assert.match(modelsViewSource, /setCatalogSeedQuery\(modelQuery\.trim\(\)\)/, 'an empty local result must hand its term to the catalog search')
-assert.match(modelsViewSource, /seedQuery=\{catalogSeedQuery\}/, 'the seeded term must reach CatalogLaneBrowse')
-assert.match(catalogLaneBrowseSource, /if \(seed\) setQuery\(seed\)/, 'the catalog must adopt a seeded term without clobbering typing already underway')
+// One search drives the whole page. Scoping it to installed models only meant
+// searching "qwen" on a machine without one reported failure while seven
+// downloadable Qwen builds sat further down the same page.
+assert.match(modelsViewSource, /externalQuery=\{modelQuery\}/, 'the page search must drive the catalog, not just the installed sections')
+assert.match(catalogLaneBrowseSource, /setQuery\(String\(externalQuery \|\| ''\)\)/, 'the catalog must follow the page query, including when it is cleared')
+// Two search boxes on one page is the thing this replaced, so the catalog's own
+// input must not render while the page is driving it.
+assert.match(catalogLaneBrowseSource, /\{!pageControlled && \(/, "the catalog's own search box must be hidden when the page drives the query")
+// The result line has to say whether scrolling down is worth it.
+assert.match(modelsViewSource, /to download in Get models/, 'the result line must report how many catalog rows match')
 // Empty states must not keep claiming the machine has nothing while a filter is
 // simply hiding it.
 assert.match(modelsViewSource, /filteringModels \? 'No verified model matches this search\.'/, 'the Supported empty state must say when a filter is what emptied it')

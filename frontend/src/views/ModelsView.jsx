@@ -68,8 +68,9 @@ export default function ModelsView({
   const [deleteNotice, setDeleteNotice] = useState('')
   const [catalogOperations, setCatalogOperations] = useState(new Set())
   const [modelQuery, setModelQuery] = useState('')
-  /* Seeds the catalog's own search when a local search comes up empty. */
-  const [catalogSeedQuery, setCatalogSeedQuery] = useState('')
+  /* How many curated catalog rows the current term matches, reported up by
+     CatalogLaneBrowse so the result line can say whether scrolling is worth it. */
+  const [catalogMatchCount, setCatalogMatchCount] = useState(null)
   const loadInFlightRef = useRef('')
 
   const laneBuckets = useMemo(
@@ -388,26 +389,23 @@ export default function ModelsView({
           reporting failure. */}
       {filteringModels && (
         <div className="models-filter-summary" role="status">
-          {localMatchCount > 0 ? (
-            <span>
-              {localMatchCount} model{localMatchCount === 1 ? '' : 's'} on this machine match{localMatchCount === 1 ? 'es' : ''}{' '}
-              <strong>{modelQuery.trim()}</strong>
-            </span>
-          ) : (
-            <span>No model on this machine matches <strong>{modelQuery.trim()}</strong>.</span>
-          )}
+          <span>
+            {localMatchCount > 0
+              ? <>{localMatchCount} on this machine {localMatchCount === 1 ? 'matches' : 'match'} <strong>{modelQuery.trim()}</strong></>
+              : <>Nothing installed matches <strong>{modelQuery.trim()}</strong></>}
+            {catalogMatchCount !== null && catalogMatchCount > 0 && (
+              <> · {catalogMatchCount} to download in Get models</>
+            )}
+          </span>
           <div className="models-filter-summary__actions">
-            {localMatchCount === 0 && (
+            {catalogMatchCount !== null && catalogMatchCount > 0 && (
               <Button
                 variant="tonal"
                 size="sm"
                 icon={<IconSearch size={15} />}
-                onClick={() => {
-                  setCatalogSeedQuery(modelQuery.trim())
-                  document.querySelector('.catalog-lane-browse')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                }}
+                onClick={() => document.querySelector('.catalog-lane-browse')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
               >
-                Look for it in Get models
+                Jump to Get models
               </Button>
             )}
             <Button variant="ghost" size="sm" onClick={() => setModelQuery('')}>Clear</Button>
@@ -536,7 +534,8 @@ export default function ModelsView({
 
       {/* Zone 5 — get models: curated picks + live Hugging Face search */}
       <CatalogLaneBrowse
-        seedQuery={catalogSeedQuery}
+        externalQuery={modelQuery}
+        onCuratedMatchCount={setCatalogMatchCount}
         apiBase={catalogApiBase || apiBase}
         capabilities={capabilities}
         localFilenames={spine.localFilenames}
