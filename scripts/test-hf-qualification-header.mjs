@@ -49,9 +49,15 @@ const inspection = {
     { name: 'b', dimensions: [1], tensor_type: 'F32', relative_offset: 32, absolute_offset: 128, n_bytes: 4 },
   ],
 }
+const sourceHead = `12345678${'9'.repeat(32)}`
 const inspectorIdentity = {
-  version: 'camelid 0.1.0',
+  version: 'camelid v0.6.1-27-g12345678',
   binary_sha256: 'e'.repeat(64),
+  source_head: sourceHead,
+  binary_commit_abbrev: '12345678',
+  binary_reports_dirty: false,
+  binary_matches_source_head: true,
+  clean_current_head: true,
 }
 
 assert.deepEqual(parseContentRange('bytes 0-15/100'), { start: 0, end: 15, total: 100 })
@@ -253,14 +259,39 @@ const inspectedIdentity = await inspectBinaryIdentity('<camelid>', {
   execImpl: async (binary, args) => {
     assert.equal(binary, '<camelid>')
     assert.deepEqual(args, ['--version'])
-    return { stdout: 'camelid 0.1.0\n' }
+    return { stdout: 'camelid v0.6.1-27-g12345678\n' }
   },
   hashImpl: async (binary) => {
     assert.equal(binary, '<camelid>')
     return 'e'.repeat(64)
   },
+  gitImpl: async (binary, args, options) => {
+    assert.equal(binary, 'git')
+    assert.deepEqual(args, ['rev-parse', 'HEAD'])
+    assert.equal(options.cwd, '<source-root>')
+    return { stdout: `${sourceHead}\n` }
+  },
+  sourceRoot: '<source-root>',
 })
 assert.deepEqual(inspectedIdentity, inspectorIdentity)
+
+const dirtyInspectedIdentity = await inspectBinaryIdentity('<camelid>', {
+  execImpl: async () => ({ stdout: 'camelid v0.6.1-27-g12345678-dirty\n' }),
+  hashImpl: async () => 'e'.repeat(64),
+  gitImpl: async () => ({ stdout: `${sourceHead}\n` }),
+})
+assert.equal(dirtyInspectedIdentity.binary_reports_dirty, true)
+assert.equal(dirtyInspectedIdentity.binary_matches_source_head, true)
+assert.equal(dirtyInspectedIdentity.clean_current_head, false)
+
+const staleInspectedIdentity = await inspectBinaryIdentity('<camelid>', {
+  execImpl: async () => ({ stdout: 'camelid v0.6.1-27-gabcdef12\n' }),
+  hashImpl: async () => 'e'.repeat(64),
+  gitImpl: async () => ({ stdout: `${sourceHead}\n` }),
+})
+assert.equal(staleInspectedIdentity.binary_reports_dirty, false)
+assert.equal(staleInspectedIdentity.binary_matches_source_head, false)
+assert.equal(staleInspectedIdentity.clean_current_head, false)
 await assert.rejects(
   inspectPrefix(undefined, '<prefix>', 100, {
     execImpl: async () => { throw new Error('must not execute') },
@@ -285,7 +316,12 @@ const remoteReceipt = await inspectRemoteHeader(lock, {
   rowId: 'fixture_row',
   prefixBytes: 16,
   token: 'test-secret-token',
-  identityImpl: async () => inspectorIdentity,
+  sourceRoot: '<source-root>',
+  identityImpl: async (binary, options) => {
+    assert.equal(binary, '<camelid>')
+    assert.equal(options.sourceRoot, '<source-root>')
+    return inspectorIdentity
+  },
   now: () => new Date('2026-08-10T12:34:56.000Z'),
   fetchImpl: async () => new Response(Buffer.alloc(16, 11), {
     status: 206,
@@ -338,6 +374,59 @@ await assert.rejects(
     && error.status === 'blocked',
 )
 assert.equal(missingBinaryFetched, false, 'a missing inspector binary must block before any range request')
+
+for (const identity of [
+  {
+    ...inspectorIdentity,
+    version: 'camelid v0.6.1-27-g12345678-dirty',
+    binary_reports_dirty: true,
+    clean_current_head: false,
+  },
+  {
+    ...inspectorIdentity,
+    version: 'camelid v0.6.1-27-gabcdef12',
+    binary_commit_abbrev: 'abcdef12',
+    binary_matches_source_head: false,
+    clean_current_head: false,
+  },
+]) {
+  let uncleanIdentityFetched = false
+  await assert.rejects(
+    inspectRemoteHeader(lock, {
+      binary: '<camelid>',
+      prefixBytes: 16,
+      identityImpl: async () => identity,
+      fetchImpl: async () => {
+        uncleanIdentityFetched = true
+        throw new Error('must not fetch')
+      },
+    }),
+    (error) => error instanceof HeaderInspectionError
+      && error.code === 'header_inspector_not_clean_current_head'
+      && error.status === 'blocked',
+  )
+  assert.equal(uncleanIdentityFetched, false, 'dirty or stale inspector identity must block before range fetch')
+}
+
+let forgedIdentityFetched = false
+await assert.rejects(
+  inspectRemoteHeader(lock, {
+    binary: '<camelid>',
+    prefixBytes: 16,
+    identityImpl: async () => ({
+      ...inspectorIdentity,
+      binary_commit_abbrev: 'forged',
+    }),
+    fetchImpl: async () => {
+      forgedIdentityFetched = true
+      throw new Error('must not fetch')
+    },
+  }),
+  (error) => error instanceof HeaderInspectionError
+    && error.code === 'header_inspector_identity_invalid'
+    && error.status === 'fail',
+)
+assert.equal(forgedIdentityFetched, false, 'inconsistent inspector fields must fail before range fetch')
 
 let failedTemporaryPrefix
 let inspectionFailure

@@ -2,7 +2,8 @@
 
 Status: active, Phase 1 started 2026-08-09. The first exact row, LFM2.5 2.6B
 Q8_0, completed all eight gates and was promoted on 2026-08-10; Phase 1
-continues for the remaining families.
+continues for the remaining families while the Phase 2 qualification factory is
+being built from the same fail-closed gates.
 
 ## Goal
 
@@ -58,10 +59,10 @@ promotion; the other five families remain active dispositions:
 | Family | Current result | Next honest gate |
 |---|---|---|
 | LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane. | Apple-Silicon resident-Metal parity, context above 512 tokens, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
-| Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. | Layer trace under one fully pinned oracle launch recipe; do not waive the token mismatch. |
+| Qwen2.5 | Source, metadata, tokenizer, template, and the exact 512-token context bucket pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. | Layer trace under one fully pinned oracle launch recipe and complete API/WebUI/SSE smoke; do not waive the token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
-| Gemma 2 | Source identity and exact IT template route pass; substituted templates and invalid shapes fail closed. | Exact-row metadata and token-ID oracle, then load/parity. |
-| SmolLM3 | Source is pinned and the real `smaug-bpe` construction gap is closed; its dynamic chat template has an executable HOLD. | Exact-row token IDs, then a deterministic renderer for its date/reasoning/system/tool contract. |
+| Gemma 2 | Source identity, seven-case tokenizer parity, and the exact IT template route pass; the bounded header capture awaits regeneration under the clean-head provenance contract. | Clean-head metadata receipt, then full-artifact identity/load and greedy parity. |
+| SmolLM3 | Source is pinned and the real `smaug-bpe` construction gap is closed; its bounded header capture awaits clean-head regeneration and its dynamic chat template has an executable HOLD. | Clean-head metadata receipt and exact-row token IDs, then a deterministic renderer for its date/reasoning/system/tool contract. |
 | Qwen3 MoE | Official 32.48 GB row is pinned; a bounded 32 MiB prefix confirms all 579 descriptors. | Full-artifact identity/load and MoE parity; remote metadata alone is not a promotion. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
@@ -132,11 +133,15 @@ continuations, and the exact one-turn ChatML rendering. Passing that fixture is
 still only raw graph/tokenizer evidence; chat-template/API/context gates remain
 separate.
 
-Current bootstrap result: source, metadata, tokenizer, and template gates pass.
+Current bootstrap result: source, metadata, tokenizer, template, and the exact
+512-token context gate pass. The context receipt used a clean current-head
+binary, replayed Camelid deterministically, and matched all eight generated
+tokens and text against pinned llama.cpp. This does not waive the independent
+short-prompt result below.
 Raw greedy parity matches 3 of 4 prompts; the remaining prompt reverses two
 near-tied candidates, so it is recorded as a hard parity failure rather than
-waived. Load/smoke, complete API/WebUI, and context gates remain blocked, and
-the row stays experimental/unverified.
+waived. Load/smoke and complete API/WebUI gates remain blocked, and the row
+stays experimental/unverified.
 
 ## Phase 2 factory foundation
 
@@ -150,14 +155,23 @@ Phase 2 has started without weakening the Phase 1 evidence boundary:
   resolves filenames under `CAMELID_MODELS_DIR`, and writes one scrubbed report
   per row plus an index. Missing directories, artifacts, fixtures, binaries, or
   source identities become `blocked`; they never disappear as skipped tests.
+  `--resolve-source` performs the immutable Hub preflight, while
+  `--inspect-header` additionally runs the bounded remote-header lane and keeps
+  per-row failures from aborting the rest of the batch.
 - `scripts/check-model-qualification-report.mjs` validates the committed report
   contract, fail-closed overall status, and privacy boundary before evidence is
   accepted.
 - `scripts/hf-qualification-header.mjs` range-fetches at most 64 MiB and invokes
   `camelid inspect-prefix` with the pinned full byte length. The command validates
   metadata and every tensor descriptor against the real artifact bounds while
-  redacting the temporary prefix path. It aborts if a server ignores `Range`, so
+  redacting the temporary prefix path. Receipts pin the inspector version and
+  binary SHA-256, immutable source identity, exact `Content-Range`, prefix hash,
+  and compact tensor-inventory hash. It aborts if a server ignores `Range`, so
   inspecting a 30+ GiB candidate cannot silently become a full download.
+- `scripts/hf-qualification-tokenizer.mjs` provides the first bounded
+  exact-row tokenizer lane for Gemma 2. It compares Camelid against pinned
+  llama.cpp using unchanged tokenizer metadata from the immutable prefix, while
+  explicitly declining any weight-load or generation claim.
 
 The factory does not download multi-gigabyte artifacts implicitly and does not
 run smoke or generation unless those probes are explicitly requested. This

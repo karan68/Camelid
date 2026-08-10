@@ -233,9 +233,27 @@ function validHostToken(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_.:+-]{1,128}$/.test(value)
 }
 
-function metadataStageFromHeader(row, receipt) {
+function deriveInspectorProvenance(inspector) {
+  if (!inspector || typeof inspector !== 'object' || Array.isArray(inspector)
+    || typeof inspector.version !== 'string'
+    || !/^[A-Za-z0-9 ._+()-]{1,128}$/.test(inspector.version)
+    || !/^[0-9a-f]{40}$/.test(inspector.source_head || '')) return null
+  const versionMatch = /^camelid [A-Za-z0-9._+()-]+-g([0-9a-f]{7,40})(-dirty)?$/.exec(inspector.version)
+  if (!versionMatch) return null
+  const derived = {
+    source_head: inspector.source_head,
+    binary_commit_abbrev: versionMatch[1],
+    binary_reports_dirty: Boolean(versionMatch[2]),
+    binary_matches_source_head: inspector.source_head.startsWith(versionMatch[1]),
+  }
+  derived.clean_current_head = derived.binary_matches_source_head && !derived.binary_reports_dirty
+  return derived
+}
+
+function metadataStageFromHeader(row, receipt, { expectedSourceHead = null } = {}) {
   const host = receipt?.host
   const inspector = receipt?.inspector
+  const inspectorProvenance = deriveInspectorProvenance(inspector)
   const source = receipt?.source
   const range = receipt?.range
   const inspection = receipt?.inspection
@@ -259,9 +277,16 @@ function metadataStageFromHeader(row, receipt) {
     && validHostToken(host.release)
     && validHostToken(host.arch)
     && inspector && typeof inspector === 'object' && !Array.isArray(inspector)
-    && typeof inspector.version === 'string'
-    && /^[A-Za-z0-9 ._+()-]{1,128}$/.test(inspector.version)
+    && inspectorProvenance
     && /^[0-9a-f]{64}$/.test(inspector.binary_sha256 || '')
+    && inspector.source_head === inspectorProvenance.source_head
+    && inspector.binary_commit_abbrev === inspectorProvenance.binary_commit_abbrev
+    && inspector.binary_reports_dirty === inspectorProvenance.binary_reports_dirty
+    && inspector.binary_matches_source_head === inspectorProvenance.binary_matches_source_head
+    && inspector.clean_current_head === inspectorProvenance.clean_current_head
+    && inspector.clean_current_head === true
+    && (expectedSourceHead === null
+      || (/^[0-9a-f]{40}$/.test(expectedSourceHead) && inspector.source_head === expectedSourceHead))
     && inspector.binary_path_redacted === true
     && JSON.stringify(inspector.command) === JSON.stringify(expectedCommand)
     && source && typeof source === 'object'
@@ -361,6 +386,11 @@ function metadataStageFromHeader(row, receipt) {
     inspector: {
       version: inspector.version,
       binary_sha256: inspector.binary_sha256,
+      source_head: inspectorProvenance.source_head,
+      binary_commit_abbrev: inspectorProvenance.binary_commit_abbrev,
+      binary_reports_dirty: inspectorProvenance.binary_reports_dirty,
+      binary_matches_source_head: inspectorProvenance.binary_matches_source_head,
+      clean_current_head: inspectorProvenance.clean_current_head,
       binary_path_redacted: true,
       command: expectedCommand,
     },
@@ -529,10 +559,13 @@ async function runFactory(options) {
           const receipt = await (options.headerInspector || inspectRemoteHeader)(sourcePreflight.lock, {
             binary: resolve(root, options.camelid || defaultCamelidBinary()),
             rowId: row.id,
+            sourceRoot: root,
             prefixBytes,
             token: hfToken,
           })
-          headerOutcome = metadataStageFromHeader(row, receipt)
+          headerOutcome = metadataStageFromHeader(row, receipt, {
+            expectedSourceHead: report.source_head,
+          })
         } catch (error) {
           headerOutcome = metadataStageFromHeaderError(error)
         }

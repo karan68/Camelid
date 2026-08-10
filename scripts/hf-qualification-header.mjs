@@ -17,6 +17,7 @@ const REVISION_RE = /^[0-9a-f]{40}$/
 const SHA256_RE = /^[0-9a-f]{64}$/
 const HEADER_ERROR_CONTRACTS = Object.freeze({
   header_inspector_identity_invalid: ['fail', 'camelid inspector identity is absent or invalid'],
+  header_inspector_not_clean_current_head: ['blocked', 'camelid inspector is not a clean build of current source HEAD'],
   header_inspector_unavailable: ['blocked', 'camelid inspector is unavailable'],
   source_lock_invalid: ['blocked', 'immutable source lock is absent or invalid'],
   header_fetch_unavailable: ['blocked', 'remote header fetch is blocked'],
@@ -95,21 +96,52 @@ function safeHostToken(value) {
     : 'redacted'
 }
 
+function parseBinaryVersionProvenance(version) {
+  if (typeof version !== 'string' || !/^[A-Za-z0-9 ._+()-]{1,128}$/.test(version)) return null
+  const match = /^camelid [A-Za-z0-9._+()-]+-g([0-9a-f]{7,40})(-dirty)?$/.exec(version)
+  if (!match) return null
+  return {
+    binary_commit_abbrev: match[1],
+    binary_reports_dirty: Boolean(match[2]),
+  }
+}
+
 function normalizeInspectorIdentity(identity) {
+  const parsedVersion = parseBinaryVersionProvenance(identity?.version)
   if (!identity || typeof identity !== 'object' || Array.isArray(identity)
-    || typeof identity.version !== 'string'
-    || !/^[A-Za-z0-9 ._+()-]{1,128}$/.test(identity.version)
-    || !SHA256_RE.test(identity.binary_sha256 || '')) {
+    || !parsedVersion
+    || !SHA256_RE.test(identity.binary_sha256 || '')
+    || !REVISION_RE.test(identity.source_head || '')) {
     throw headerError(
       'header_inspector_identity_invalid',
       'fail',
       'camelid inspector identity is absent or invalid',
     )
   }
-  return {
+  const derived = {
     version: identity.version,
     binary_sha256: identity.binary_sha256,
+    source_head: identity.source_head,
+    binary_commit_abbrev: parsedVersion.binary_commit_abbrev,
+    binary_reports_dirty: parsedVersion.binary_reports_dirty,
+    binary_matches_source_head: identity.source_head.startsWith(parsedVersion.binary_commit_abbrev),
   }
+  derived.clean_current_head = derived.binary_matches_source_head && !derived.binary_reports_dirty
+  for (const field of [
+    'binary_commit_abbrev',
+    'binary_reports_dirty',
+    'binary_matches_source_head',
+    'clean_current_head',
+  ]) {
+    if (Object.hasOwn(identity, field) && identity[field] !== derived[field]) {
+      throw headerError(
+        'header_inspector_identity_invalid',
+        'fail',
+        'camelid inspector identity contains inconsistent provenance fields',
+      )
+    }
+  }
+  return derived
 }
 
 async function sha256File(path) {
@@ -126,6 +158,8 @@ async function sha256File(path) {
 async function inspectBinaryIdentity(binary, {
   execImpl = execFileAsync,
   hashImpl = sha256File,
+  gitImpl = execFileAsync,
+  sourceRoot = resolve('.'),
 } = {}) {
   if (typeof binary !== 'string' || !binary.trim()) {
     throw headerError('header_inspector_unavailable', 'blocked', 'camelid inspect-prefix binary is not configured')
@@ -145,9 +179,22 @@ async function inspectBinaryIdentity(binary, {
   catch {
     throw headerError('header_inspector_unavailable', 'blocked', 'camelid inspector binary could not be hashed')
   }
+  let sourceHead
+  try {
+    const result = await gitImpl('git', ['rev-parse', 'HEAD'], {
+      cwd: sourceRoot,
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+      windowsHide: true,
+    })
+    sourceHead = String(result.stdout || '').trim()
+  } catch {
+    throw headerError('header_inspector_unavailable', 'blocked', 'current source HEAD could not be read')
+  }
   return normalizeInspectorIdentity({
     version: String(stdout || '').trim(),
     binary_sha256: binarySha256,
+    source_head: sourceHead,
   })
 }
 
@@ -435,6 +482,7 @@ async function inspectRemoteHeader(lock, {
   fetchImpl = fetch,
   inspectImpl = inspectPrefix,
   identityImpl = inspectBinaryIdentity,
+  sourceRoot = resolve('.'),
   now = () => new Date(),
 } = {}) {
   validateImmutableLock(lock)
@@ -445,10 +493,17 @@ async function inspectRemoteHeader(lock, {
     throw headerError('header_row_id_invalid', 'fail', 'remote header inspection row id is invalid')
   }
   let inspector
-  try { inspector = normalizeInspectorIdentity(await identityImpl(binary)) }
+  try { inspector = normalizeInspectorIdentity(await identityImpl(binary, { sourceRoot })) }
   catch (error) {
     if (error instanceof HeaderInspectionError) throw error
     throw headerError('header_inspector_unavailable', 'blocked', 'camelid inspector identity could not be read')
+  }
+  if (!inspector.clean_current_head) {
+    throw headerError(
+      'header_inspector_not_clean_current_head',
+      'blocked',
+      'camelid inspector is not a clean build of current source HEAD',
+    )
   }
   const ranged = await fetchHeaderPrefix(lock, { prefixBytes, token, fetchImpl })
   const temporary = await mkdtemp(join(tmpdir(), 'camelid-hf-header-'))
@@ -561,6 +616,7 @@ Options:
   const report = await inspectRemoteHeader(lock, {
     binary: resolve(args.get('camelid') || process.env.CAMELID_BIN || defaultBinary),
     rowId: row.id,
+    sourceRoot: root,
     prefixBytes: normalizePrefixBytes(args.get('prefix-bytes') || DEFAULT_PREFIX_BYTES),
     token: process.env.HF_TOKEN || null,
   })

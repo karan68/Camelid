@@ -1,0 +1,47 @@
+{
+  "schema": "camelid.evidence_bundle_manifest/v1",
+  "bundle": "qwen2.5-0.5b-q8-context-512-20260810",
+  "generated_utc": "2026-08-10T16:36:06Z",
+  "qualification_harness_head": "8a99bd9ec34f1677597bd96a0d9fe0488a128745",
+  "runtime_head": "8a99bd9ec34f1677597bd96a0d9fe0488a128745",
+  "runtime_binary_sha256": "a21ac6df71fab0b35a226f5ed26fdb22a19a9ac70cbf4188c1fb6fcfe3d9275e",
+  "host": {
+    "platform": "windows-x64",
+    "backend": "cpu_reference",
+    "hostname_redacted": true
+  },
+  "model": {
+    "row_id": "qwen2_5_0_5b_instruct_q8_0",
+    "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "filename": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "size_bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "license": "apache-2.0"
+  },
+  "oracle": {
+    "tool": "llama.cpp llama-server",
+    "build": 9632,
+    "revision": "acd79d603",
+    "binary_sha256": "6c787bf07ac1d7e1bbaa1ee176c3ef0df58ea86494c8c1b1d2d9f4a9176b19ae",
+    "package_archive_sha256": "b835d5c5155dd2a5ed748a0351debf2ede0dc9f808757e0429f8700a11832dcd",
+    "gpu_layers": 0,
+    "cache_type_k": "f32",
+    "cache_type_v": "f32",
+    "flash_attention": "off",
+    "repack": "off"
+  },
+  "gates": {
+    "context_512": "pass: exact 512 prompt IDs, Camelid deterministic self-replay, execution-trace replay, and 8/8 generated IDs/text match pinned llama.cpp",
+    "short_greedy": "fail: separate four-prompt gate remains 3/4 and is not waived",
+    "load_smoke": "blocked: runnable-smoke tuple is not oracle-qualified",
+    "api_webui": "blocked: SSE and Models-page/WebUI promotion smoke remain unrun"
+  },
+  "support_decision": "context_gate_pass_only",
+  "artifacts": [
+    "context-summary.json",
+    "parity-receipt.json",
+    "verify.log",
+    "SHA256SUMS"
+  ]
+}

@@ -12,6 +12,7 @@ import {
   parseLlamaIds,
   parseLlamaVersionOutput,
   sourceSelectionForRow,
+  validateGemma2TokenizerReceipt,
 } from './hf-qualification-tokenizer.mjs'
 import { validateLockAgainstSelection } from './hf-qualification-source.mjs'
 
@@ -172,18 +173,52 @@ const receipt = JSON.parse(readFileSync(
   new URL('../qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json', import.meta.url),
   'utf8',
 ))
+const roster = JSON.parse(readFileSync(
+  new URL('../qa/model-qualification/phase1-roster.json', import.meta.url),
+  'utf8',
+))
+const receiptRow = roster.rows.find((row) => row.id === 'gemma2_9b_it_q8_0')
+assert.deepEqual(
+  validateGemma2TokenizerReceipt(receipt, receiptRow, roster.defaults),
+  [],
+  'durable Gemma2 tokenizer evidence must be derived from exact identities and token arrays',
+)
 assert.equal(receipt.schema, 'camelid.header-tokenizer-parity/v1')
 assert.equal(receipt.result.case_count, GEMMA2_CASES.length)
 assert.equal(receipt.result.exact_match_count, GEMMA2_CASES.length)
 assert.equal(receipt.result.all_token_ids_match, true)
-assert.equal(receipt.provenance.status, 'preparatory_requires_clean_current_head_rerun')
+assert.equal(receipt.provenance.status, 'clean_current_head_receipt')
 assert.equal(receipt.provenance.gate_requires_clean_current_head, true)
 assert.equal(receipt.provenance.binary_matches_source_head, true)
-assert.equal(receipt.provenance.clean_current_head, false)
-assert.equal(receipt.provenance.binary_reports_dirty, true)
+assert.equal(receipt.provenance.clean_current_head, true)
+assert.equal(receipt.provenance.source_tracked_dirty, false)
+assert.equal(receipt.provenance.binary_reports_dirty, false)
 assert(receipt.cases.every((testCase) => testCase.exact_match))
 assert.match(receipt.oracle.input, /tensor_count is zeroed/)
 assert.match(receipt.bounded_fetch.scope_note, /opaque initial tensor payload bytes/)
 assert(!/[A-Za-z]:[\\/]/.test(JSON.stringify(receipt)), 'receipt must not expose an absolute Windows path')
+
+const forgedIds = structuredClone(receipt)
+forgedIds.cases[0].llama_cpp_ids = [999]
+forgedIds.cases[0].exact_match = true
+assert(
+  validateGemma2TokenizerReceipt(forgedIds, receiptRow, roster.defaults)
+    .some((error) => error.includes('token IDs diverge')),
+  'receipt-authored exact_match must not hide divergent IDs',
+)
+const driftedSource = structuredClone(receipt)
+driftedSource.source.sha256 = '0'.repeat(64)
+assert(
+  validateGemma2TokenizerReceipt(driftedSource, receiptRow, roster.defaults)
+    .some((error) => error.includes('source.sha256 mismatch')),
+  'receipt source identity must remain bound to the roster row',
+)
+const driftedOracle = structuredClone(receipt)
+driftedOracle.oracle.revision = 'deadbeef0'
+assert(
+  validateGemma2TokenizerReceipt(driftedOracle, receiptRow, roster.defaults)
+    .some((error) => error.includes('llama.cpp revision mismatch')),
+  'receipt oracle identity must remain bound to the roster pin',
+)
 
 console.log('test-hf-qualification-tokenizer: all checks passed')

@@ -3,10 +3,32 @@
   "provenance": {
     "status": "draft_requires_clean_head_regeneration",
     "clean_head_inspector_receipt": false,
-    "required_before_metadata_gate_pass": [
-      "generated_at",
-      "inspector_version",
-      "inspector_binary_sha256"
+    "missing_fields": [
+      "inspector.source_head",
+      "inspector.binary_commit_abbrev",
+      "inspector.binary_reports_dirty",
+      "inspector.binary_matches_source_head",
+      "inspector.clean_current_head"
+    ]
+  },
+  "row_id": "smollm3_3b_q8_0",
+  "generated_at": "2026-08-10T16:33:26.763Z",
+  "host": {
+    "hostname_redacted": true,
+    "platform": "win32",
+    "release": "10.0.26220",
+    "arch": "x64"
+  },
+  "inspector": {
+    "version": "camelid v0.6.1-27-g8a99bd9e",
+    "binary_sha256": "a21ac6df71fab0b35a226f5ed26fdb22a19a9ac70cbf4188c1fb6fcfe3d9275e",
+    "binary_path_redacted": true,
+    "command": [
+      "<camelid>",
+      "inspect-prefix",
+      "<remote-gguf-prefix>",
+      "--declared-len",
+      "3275574624"
     ]
   },
   "source": {
@@ -48,7 +70,14 @@
       }
     }
   },
+  "scope": {
+    "prefix_sha256": "all_received_prefix_bytes",
+    "tensor_payload": "partially_range_fetched_opaque",
+    "full_artifact_sha256": "not_run",
+    "tensor_payload_interpretation": "not_run",
+    "load": "not_run",
+    "generation": "not_run"
+  },
   "support_claim": false,
-  "note": "Remote header inspection validates metadata and tensor descriptors against the pinned full length. The 32 MiB prefix SHA-256 also covers opaque initial payload bytes after data_start_offset; it is not a full payload or full artifact hash, and no payload bytes were interpreted or loaded. This does not prove generation.",
-  "row_id": "smollm3_3b_q8_0"
+  "note": "Remote header inspection validates metadata and tensor descriptors against the pinned full length. The prefix SHA-256 covers every received byte, including any opaque initial tensor payload after data_start_offset; the remaining payload is not fetched, and no tensor payload is interpreted, loaded as model weights, or used for inference or generation."
 }

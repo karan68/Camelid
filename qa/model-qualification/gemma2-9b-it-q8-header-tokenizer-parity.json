@@ -1,15 +1,15 @@
 {
   "schema": "camelid.header-tokenizer-parity/v1",
-  "generated_at": "2026-08-10T15:55:11.921Z",
+  "generated_at": "2026-08-10T16:33:05.480Z",
   "provenance": {
-    "status": "preparatory_requires_clean_current_head_rerun",
+    "status": "clean_current_head_receipt",
     "gate_requires_clean_current_head": true,
-    "source_head": "96db34867b0402f7775670d4a767fae73b6b19d9",
-    "source_tracked_dirty": true,
-    "binary_commit_abbrev": "96db3486",
-    "binary_reports_dirty": true,
+    "source_head": "8a99bd9ec34f1677597bd96a0d9fe0488a128745",
+    "source_tracked_dirty": false,
+    "binary_commit_abbrev": "8a99bd9e",
+    "binary_reports_dirty": false,
     "binary_matches_source_head": true,
-    "clean_current_head": false
+    "clean_current_head": true
   },
   "row_id": "gemma2_9b_it_q8_0",
   "host": {
@@ -44,16 +44,20 @@
     "chat_template_sha256": "ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6"
   },
   "camelid": {
-    "version": "camelid v0.6.1-24-g96db3486-dirty",
-    "binary_sha256": "2955fa83b879918e28a22df635acfdf1e465285ddee4924d654683ae86034baf",
+    "version": "camelid v0.6.1-27-g8a99bd9e",
+    "binary_sha256": "a21ac6df71fab0b35a226f5ed26fdb22a19a9ac70cbf4188c1fb6fcfe3d9275e",
     "prefix_mode": "tokenize --declared-len"
   },
   "oracle": {
     "project": "ggml-org/llama.cpp",
     "revision": "acd79d603",
+    "build": 9632,
+    "revision_verification": "parsed from the sibling llama-cli --version output in the same binary package",
+    "companion_executable": "llama-cli.exe",
+    "companion_binary_sha256": "2ec09da0b81d0201ce5b21810caefb4e77fd108f383b30c15ca493c5a70f7731",
     "executable": "llama-tokenize.exe",
     "binary_sha256": "a44a4d7e1445d22a4cffb0d38f6efa8f1d81e84ae2c3d481af857c5e331b8c7a",
-    "input": "disposable vocabulary-only derivative of the same immutable GGUF prefix; tensor_count is zeroed so llama-tokenize consumes unchanged tokenizer metadata and ignores the original descriptor region plus opaque partial payload bytes; this is not the original full artifact",
+    "input": "disposable vocabulary-only derivative of the same immutable GGUF prefix; tensor_count is zeroed so llama-tokenize consumes unchanged tokenizer metadata and ignores the original descriptor region plus opaque partial payload bytes",
     "derivative": {
       "original_tensor_count": 464,
       "metadata_count": 26,

@@ -27,8 +27,12 @@ import {
 } from './model-qualification-factory.mjs'
 
 const execFileAsync = promisify(execFile)
-
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const currentSourceHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], {
+  cwd: root,
+  windowsHide: true,
+})).stdout.trim()
+const currentCommitAbbrev = currentSourceHead.slice(0, 8)
 assert.equal(
   defaultCamelidBinary(),
   process.platform === 'win32' ? 'target/release/camelid.exe' : 'target/release/camelid',
@@ -101,8 +105,13 @@ const headerReceiptFor = (row, overrides = {}) => ({
     arch: 'x64',
   },
   inspector: {
-    version: 'camelid 0.1.0',
+    version: `camelid v0.6.1-27-g${currentCommitAbbrev}`,
     binary_sha256: 'e'.repeat(64),
+    source_head: currentSourceHead,
+    binary_commit_abbrev: currentCommitAbbrev,
+    binary_reports_dirty: false,
+    binary_matches_source_head: true,
+    clean_current_head: true,
     binary_path_redacted: true,
     command: [
       '<camelid>',
@@ -161,15 +170,6 @@ for (const [rowId, receiptPath] of [
   ['gemma2_9b_it_q8_0', 'qa/model-qualification/gemma2-9b-it-q8-header-inspection.json'],
   ['smollm3_3b_q8_0', 'qa/model-qualification/smollm3-3b-q8-header-inspection.json'],
 ]) {
-  let tracked = false
-  try {
-    await execFileAsync('git', ['ls-files', '--error-unmatch', '--', receiptPath], {
-      cwd: root,
-      windowsHide: true,
-    })
-    tracked = true
-  } catch {}
-  if (!tracked) continue
   const durableRow = roster.rows.find((row) => row.id === rowId)
   assert.ok(durableRow, `committed header receipt row ${rowId} must remain in the roster`)
   const durableReceipt = JSON.parse(await readFile(resolve(root, receiptPath), 'utf8'))
@@ -177,7 +177,7 @@ for (const [rowId, receiptPath] of [
   assert.equal(
     durableStage.status,
     'fail',
-    `${receiptPath} remains a draft until clean inspector provenance is regenerated`,
+    `${receiptPath} remains a draft until clean-head inspector provenance is regenerated`,
   )
   assert.equal(durableStage.error_code, 'header_receipt_invalid')
 }
@@ -213,8 +213,13 @@ assert.equal(passingHeaderStage.observed.tensor_inventory_sha256, 'd'.repeat(64)
 assert.equal(passingHeaderStage.inspection_generated_at, '2026-08-10T12:34:56.000Z')
 assert.equal(passingHeaderStage.host.hostname_redacted, true)
 assert.equal(Object.hasOwn(passingHeaderStage.host, 'hostname'), false)
-assert.equal(passingHeaderStage.inspector.version, 'camelid 0.1.0')
+assert.equal(passingHeaderStage.inspector.version, `camelid v0.6.1-27-g${currentCommitAbbrev}`)
 assert.equal(passingHeaderStage.inspector.binary_sha256, 'e'.repeat(64))
+assert.equal(passingHeaderStage.inspector.source_head, currentSourceHead)
+assert.equal(passingHeaderStage.inspector.binary_commit_abbrev, currentCommitAbbrev)
+assert.equal(passingHeaderStage.inspector.binary_reports_dirty, false)
+assert.equal(passingHeaderStage.inspector.binary_matches_source_head, true)
+assert.equal(passingHeaderStage.inspector.clean_current_head, true)
 assert.equal(passingHeaderStage.scope.prefix_sha256, 'all_received_prefix_bytes')
 assert.equal(passingHeaderStage.scope.full_artifact_sha256, 'not_run')
 assert.equal(passingHeaderStage.scope.tensor_payload, 'partially_range_fetched_opaque')
@@ -250,6 +255,37 @@ const maliciousInspectorStage = metadataStageFromHeader(qwen, maliciousInspector
 assert.equal(maliciousInspectorStage.status, 'fail')
 assert.equal(JSON.stringify(maliciousInspectorStage).includes('test-secret-token'), false)
 assert.equal(JSON.stringify(maliciousInspectorStage).includes('private'), false)
+
+const dirtyInspectorReceipt = headerReceiptFor(qwen)
+dirtyInspectorReceipt.inspector.version += '-dirty'
+dirtyInspectorReceipt.inspector.binary_reports_dirty = true
+dirtyInspectorReceipt.inspector.clean_current_head = false
+const dirtyInspectorStage = metadataStageFromHeader(qwen, dirtyInspectorReceipt)
+assert.equal(dirtyInspectorStage.status, 'fail')
+assert.equal(dirtyInspectorStage.error_code, 'header_receipt_invalid')
+
+const staleInspectorReceipt = headerReceiptFor(qwen)
+staleInspectorReceipt.inspector.version = 'camelid v0.6.1-27-gabcdef12'
+staleInspectorReceipt.inspector.binary_commit_abbrev = 'abcdef12'
+staleInspectorReceipt.inspector.binary_matches_source_head = false
+staleInspectorReceipt.inspector.clean_current_head = false
+const staleInspectorStage = metadataStageFromHeader(qwen, staleInspectorReceipt)
+assert.equal(staleInspectorStage.status, 'fail')
+assert.equal(staleInspectorStage.error_code, 'header_receipt_invalid')
+
+const forgedInspectorReceipt = headerReceiptFor(qwen)
+forgedInspectorReceipt.inspector.binary_reports_dirty = true
+const forgedInspectorStage = metadataStageFromHeader(qwen, forgedInspectorReceipt)
+assert.equal(forgedInspectorStage.status, 'fail')
+assert.equal(forgedInspectorStage.error_code, 'header_receipt_invalid')
+
+const forgedSourceHeadReceipt = headerReceiptFor(qwen)
+forgedSourceHeadReceipt.inspector.source_head = `${currentCommitAbbrev}${'f'.repeat(32)}`
+const forgedSourceHeadStage = metadataStageFromHeader(qwen, forgedSourceHeadReceipt, {
+  expectedSourceHead: currentSourceHead,
+})
+assert.equal(forgedSourceHeadStage.status, 'fail')
+assert.equal(forgedSourceHeadStage.error_code, 'header_receipt_invalid')
 
 const typedHeaderFailure = metadataStageFromHeaderError(new HeaderInspectionError(
   'header_body_budget_exceeded',
@@ -455,6 +491,7 @@ try {
       headerCalls += 1
       assert.equal(options.prefixBytes, 16)
       assert.equal(options.token, 'test-secret-token')
+      assert.equal(options.sourceRoot, root)
       assert.equal(options.rowId, sourceLock.repo === qwen.source.repo ? qwen.id : qwenMoe.id)
       assert.match(
         options.binary,
@@ -498,8 +535,16 @@ try {
   assert.equal(headerPassedReport.stages.metadata.status, 'pass')
   assert.equal(headerPassedReport.stages.metadata.mode, 'remote_immutable_prefix')
   assert.equal(headerPassedReport.stages.metadata.inspection_generated_at, '2026-08-10T12:34:56.000Z')
-  assert.equal(headerPassedReport.stages.metadata.inspector.version, 'camelid 0.1.0')
+  assert.equal(
+    headerPassedReport.stages.metadata.inspector.version,
+    `camelid v0.6.1-27-g${currentCommitAbbrev}`,
+  )
   assert.equal(headerPassedReport.stages.metadata.inspector.binary_sha256, 'e'.repeat(64))
+  assert.equal(headerPassedReport.stages.metadata.inspector.source_head, currentSourceHead)
+  assert.equal(headerPassedReport.stages.metadata.inspector.binary_commit_abbrev, currentCommitAbbrev)
+  assert.equal(headerPassedReport.stages.metadata.inspector.binary_reports_dirty, false)
+  assert.equal(headerPassedReport.stages.metadata.inspector.binary_matches_source_head, true)
+  assert.equal(headerPassedReport.stages.metadata.inspector.clean_current_head, true)
   assert.equal(headerPassedReport.stages.metadata.range.prefix_sha256, 'c'.repeat(64))
   assert.equal(headerPassedReport.stages.metadata.scope.prefix_sha256, 'all_received_prefix_bytes')
   assert.equal(headerPassedReport.stages.metadata.scope.full_artifact_sha256, 'not_run')

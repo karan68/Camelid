@@ -241,9 +241,12 @@
         },
         "context": {
           "required": true,
-          "status": "blocked",
-          "evidence": [],
-          "reason": "No preflighted 512-token parity receipt exists for this exact row."
+          "status": "pass",
+          "evidence": [
+            "qa/evidence-bundles/qwen2.5-0.5b-q8-context-512-20260810/manifest.json",
+            "qa/evidence-bundles/qwen2.5-0.5b-q8-context-512-20260810/context-summary.json",
+            "qa/evidence-bundles/qwen2.5-0.5b-q8-context-512-20260810/parity-receipt.json"
+          ]
         }
       }
     },
@@ -398,17 +401,16 @@
             "qa/model-qualification/gemma2-9b-it-q8-header-inspection.json",
             "src/model.rs"
           ],
-          "reason": "A bounded immutable-prefix draft parsed the exact-row metadata and all descriptors, but its durable summary lacks clean-current-head inspector version, binary SHA-256, and generated-at provenance. Regenerate it after the shared header helper lands before this gate can pass."
+          "reason": "The exact-row immutable prefix parsed all metadata and descriptors, but the receipt predates the clean-current-head inspector provenance contract. Regenerate it after the hardened header helper lands before this gate can pass."
         },
         "tokenizer": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
             "src/tokenizer/mod.rs",
             "qa/model-qualification/fixtures/gemma2-it-chat-template-v1.json",
             "qa/model-qualification/gemma2-9b-it-q8-header-tokenizer-parity.json"
-          ],
-          "reason": "A bounded seven-case exact-row header-prefix comparison matched pinned llama-tokenize token IDs, including BOS, Unicode/whitespace, and parsed/unparsed chat controls. The receipt was produced by a dirty pre-integration Camelid binary and the oracle consumed a disposable tensor-count-zero vocabulary derivative rather than the original full artifact; a clean-current-head rerun is required before this gate can pass."
+          ]
         },
         "template": {
           "required": true,
@@ -497,7 +499,7 @@
             "src/model.rs",
             "tests/inference_session.rs"
           ],
-          "reason": "A bounded immutable-prefix draft parsed the exact-row metadata and all descriptors, but its durable summary lacks clean-current-head inspector version, binary SHA-256, and generated-at provenance. Regenerate it after the shared header helper lands before this gate can pass."
+          "reason": "The exact-row immutable prefix parsed all metadata and descriptors, but the receipt predates the clean-current-head inspector provenance contract. Regenerate it after the hardened header helper lands before this gate can pass."
         },
         "tokenizer": {
           "required": true,

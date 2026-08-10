@@ -1,0 +1,95 @@
+{
+  "schema": "camelid.context-qualification-summary/v1",
+  "generated_at": "2026-08-10T16:36:06Z",
+  "phase": 1,
+  "row_id": "qwen2_5_0_5b_instruct_q8_0",
+  "provenance": {
+    "source_head": "8a99bd9ec34f1677597bd96a0d9fe0488a128745",
+    "camelid_version": "v0.6.1-27-g8a99bd9e",
+    "camelid_binary_sha256": "a21ac6df71fab0b35a226f5ed26fdb22a19a9ac70cbf4188c1fb6fcfe3d9275e",
+    "binary_built_from_clean_head": true,
+    "host": "windows-x64",
+    "hostname_redacted": true
+  },
+  "artifact": {
+    "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "size_bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "architecture": "qwen2",
+    "quantization": "Q8_0"
+  },
+  "request": {
+    "mode": "raw",
+    "endpoint": "/v1/completions",
+    "target_token_heuristic": 739,
+    "prompt_suffix": ".",
+    "expected_prompt_tokens": 512,
+    "actual_prompt_tokens": 512,
+    "actual_prompt_token_gate_pass": true,
+    "max_generated_tokens": 8,
+    "temperature": 0
+  },
+  "resource_preflight": {
+    "kv_bytes_per_token": 24576,
+    "projected_kv_bytes": 12582912,
+    "safe_kv_budget_bytes": 3758096384,
+    "llama_context": 640
+  },
+  "oracle": {
+    "engine": "llama.cpp",
+    "build": 9632,
+    "revision": "acd79d603",
+    "binary": "llama-server.exe",
+    "binary_sha256": "6c787bf07ac1d7e1bbaa1ee176c3ef0df58ea86494c8c1b1d2d9f4a9176b19ae",
+    "package_archive": "llama-b9632-bin-win-cpu-x64.zip",
+    "package_archive_sha256": "b835d5c5155dd2a5ed748a0351debf2ede0dc9f808757e0429f8700a11832dcd",
+    "gpu_layers": 0,
+    "cache_type_k": "f32",
+    "cache_type_v": "f32",
+    "flash_attention": "off",
+    "repack": "off",
+    "engines_never_co_resident": true
+  },
+  "receipt": {
+    "schema": "camelid.parity-receipt/v1",
+    "receipt_id": "35bbb6af7c286ab2e2db2884ab2547c21cbf33dc788243f41b5e55728270ad51",
+    "file": "parity-receipt.json",
+    "file_sha256": "ac6b20eb9d4ccf7ecd7cb789d3b5443f3244eff381d9322085c0e5e6c17e4144",
+    "verify_log_file": "verify.log",
+    "verify_log_sha256": "cc08826d7faf0826ca015f5c91af6ab78c81bee8a36041cb4e328bef00d15a2f",
+    "execution_trace": {
+      "algorithm": "sha256-rollup-v1",
+      "lane": "deterministic-cpu",
+      "host_isa": "x86_64",
+      "digest": "49631d2f1c2f1c9646811922482ef2172b0959972d0712029c0ec4f827e1cce1",
+      "fold_count": 200
+    }
+  },
+  "result": {
+    "self_digest_pass": true,
+    "lane_identity_pass": true,
+    "camelid_self_replay_pass": true,
+    "execution_trace_pass": true,
+    "llama_cpp_reference_replay_pass": true,
+    "generated_token_ids": [
+      576,
+      14796,
+      26555,
+      3267,
+      279,
+      2310,
+      9798,
+      2544
+    ],
+    "generated_text": " The river wound past the old stone mill",
+    "first_divergent_token_index": -1,
+    "strict_token_and_text_parity": true
+  },
+  "support_decision": "context_gate_pass_only",
+  "does_not_prove": [
+    "the separate four-prompt short-context parity gate, which remains failed at one prompt",
+    "load-smoke admission or API/WebUI/SSE promotion readiness",
+    "sampling, tools, GPU execution, performance, neighboring rows, or broad Qwen support",
+    "context lengths above the exact 512-token bucket"
+  ]
+}
