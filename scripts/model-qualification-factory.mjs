@@ -3,6 +3,13 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { validateRoster } from './check-model-qualification-roster.mjs'
+import {
+  DEFAULT_PREFIX_BYTES,
+  MAX_PREFIX_BYTES,
+  classifyHeaderInspectionError,
+  inspectRemoteHeader,
+  normalizePrefixBytes,
+} from './hf-qualification-header.mjs'
 import { resolveHfSource, validateLockAgainstSelection } from './hf-qualification-source.mjs'
 import { deriveOverall, qualify, redactLocalPaths } from './model-qualification-runner.mjs'
 
@@ -34,6 +41,12 @@ function artifactForRow(row, modelsDir, explicitArtifact = null) {
   const filename = row.identity.gguf_filename || row.source.file
   if (!modelsDir || !filename) return null
   return resolve(modelsDir, basename(filename))
+}
+
+function defaultCamelidBinary() {
+  return process.platform === 'win32'
+    ? 'target/release/camelid.exe'
+    : 'target/release/camelid'
 }
 
 function firstUnresolvedStage(report, gateOrder) {
@@ -81,7 +94,23 @@ function sourceLookupErrorCode(error) {
   return 'source_lookup_error'
 }
 
-async function resolveSourceStage(row, {
+function sourceLockMismatchFields(lock, selected) {
+  const mismatches = []
+  for (const field of ['repo', 'file', 'revision']) {
+    if (lock?.[field] !== selected[field]) mismatches.push(field)
+  }
+  for (const field of ['size_bytes', 'sha256']) {
+    if (lock?.[field] !== selected.expected?.[field]) mismatches.push(field)
+  }
+  const expectedLicense = selected.expected?.license
+  if (expectedLicense
+    && String(expectedLicense).trim().toLowerCase() !== String(lock?.license || '').trim().toLowerCase()) {
+    mismatches.push('license')
+  }
+  return mismatches
+}
+
+async function resolveSourcePreflight(row, {
   resolver = resolveHfSource,
   token = process.env.HF_TOKEN || null,
 } = {}) {
@@ -97,9 +126,12 @@ async function resolveSourceStage(row, {
     .map(([field]) => field)
   if (missing.length) {
     return {
-      status: 'blocked',
-      resolution: 'live_huggingface',
-      reason: `roster source selector is not fully pinned: ${missing.join(', ')}`,
+      lock: null,
+      stage: {
+        status: 'blocked',
+        resolution: 'live_huggingface',
+        reason: `roster source selector is not fully pinned: ${missing.join(', ')}`,
+      },
     }
   }
 
@@ -114,17 +146,23 @@ async function resolveSourceStage(row, {
   } catch (error) {
     const errorCode = sourceLookupErrorCode(error)
     return {
-      status: 'blocked',
-      resolution: 'live_huggingface',
-      error_code: errorCode,
-      reason: `live Hugging Face source resolution could not complete (${errorCode})`,
+      lock: null,
+      stage: {
+        status: 'blocked',
+        resolution: 'live_huggingface',
+        error_code: errorCode,
+        reason: `live Hugging Face source resolution could not complete (${errorCode})`,
+      },
     }
   }
   if (!lock || typeof lock !== 'object' || Array.isArray(lock)) {
     return {
-      status: 'blocked',
-      resolution: 'live_huggingface',
-      reason: 'live Hugging Face source resolution returned no source-lock object',
+      lock: null,
+      stage: {
+        status: 'blocked',
+        resolution: 'live_huggingface',
+        reason: 'live Hugging Face source resolution returned no source-lock object',
+      },
     }
   }
 
@@ -136,34 +174,256 @@ async function resolveSourceStage(row, {
 
   try {
     validateLockAgainstSelection(lock, selected)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+  } catch {
+    const mismatchFields = sourceLockMismatchFields(lock, selected)
     return {
-      status: 'fail',
-      resolution: 'live_huggingface',
-      reason: message,
-      resolved: {
-        repo: lock.repo,
-        file: lock.file,
-        revision: lock.revision,
-        size_bytes: lock.size_bytes,
-        sha256: lock.sha256,
-        license: lock.license,
-        access,
+      lock: null,
+      stage: {
+        status: 'fail',
+        resolution: 'live_huggingface',
+        reason: `resolved source does not match roster row ${row.id}: ${mismatchFields.join(', ') || 'unknown identity field'}`,
+        expected: {
+          repo: selected.repo,
+          file: selected.file,
+          revision: selected.revision,
+          size_bytes: selected.expected.size_bytes,
+          sha256: selected.expected.sha256,
+          license: selected.expected.license,
+          access,
+        },
       },
     }
   }
 
   return {
-    status: 'pass',
-    resolution: 'live_huggingface',
-    repo: lock.repo,
-    file: lock.file,
-    revision: lock.revision,
-    size_bytes: lock.size_bytes,
-    sha256: lock.sha256,
-    license: lock.license,
-    access,
+    lock,
+    stage: {
+      status: 'pass',
+      resolution: 'live_huggingface',
+      repo: lock.repo,
+      file: lock.file,
+      revision: lock.revision,
+      size_bytes: lock.size_bytes,
+      sha256: lock.sha256,
+      license: lock.license,
+      access,
+    },
+  }
+}
+
+async function resolveSourceStage(row, options = {}) {
+  return (await resolveSourcePreflight(row, options)).stage
+}
+
+function safeObservedToken(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_.:+-]{1,128}$/.test(value)
+    ? value
+    : value === null || value === undefined
+      ? null
+      : '<invalid>'
+}
+
+function validReceiptTimestamp(value) {
+  return typeof value === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)
+    && !Number.isNaN(Date.parse(value))
+}
+
+function validHostToken(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_.:+-]{1,128}$/.test(value)
+}
+
+function metadataStageFromHeader(row, receipt) {
+  const host = receipt?.host
+  const inspector = receipt?.inspector
+  const source = receipt?.source
+  const range = receipt?.range
+  const inspection = receipt?.inspection
+  const observed = inspection?.observed
+  const inventory = inspection?.tensor_inventory
+  const contentRange = range?.content_range
+  const expectedCommand = [
+    '<camelid>',
+    'inspect-prefix',
+    '<remote-gguf-prefix>',
+    '--declared-len',
+    String(row.identity.size_bytes),
+  ]
+  const receiptShapeValid = receipt?.schema === 'camelid.remote-gguf-header-inspection/v1'
+    && receipt.row_id === row.id
+    && validReceiptTimestamp(receipt.generated_at)
+    && host && typeof host === 'object' && !Array.isArray(host)
+    && host.hostname_redacted === true
+    && !Object.hasOwn(host, 'hostname')
+    && validHostToken(host.platform)
+    && validHostToken(host.release)
+    && validHostToken(host.arch)
+    && inspector && typeof inspector === 'object' && !Array.isArray(inspector)
+    && typeof inspector.version === 'string'
+    && /^[A-Za-z0-9 ._+()-]{1,128}$/.test(inspector.version)
+    && /^[0-9a-f]{64}$/.test(inspector.binary_sha256 || '')
+    && inspector.binary_path_redacted === true
+    && JSON.stringify(inspector.command) === JSON.stringify(expectedCommand)
+    && source && typeof source === 'object'
+    && range && typeof range === 'object'
+    && inspection && typeof inspection === 'object'
+    && observed && typeof observed === 'object'
+    && inventory && typeof inventory === 'object'
+    && contentRange && typeof contentRange === 'object'
+    && Number.isSafeInteger(range.requested_bytes) && range.requested_bytes > 0
+    && range.requested_bytes <= MAX_PREFIX_BYTES
+    && Number.isSafeInteger(range.received_bytes) && range.received_bytes > 0
+    && range.received_bytes === range.requested_bytes
+    && Number.isSafeInteger(contentRange.start) && contentRange.start === 0
+    && Number.isSafeInteger(contentRange.end) && contentRange.end >= 0
+    && Number.isSafeInteger(contentRange.total) && contentRange.total > contentRange.end
+    && contentRange.end + 1 === range.received_bytes
+    && /^[0-9a-f]{64}$/.test(range.prefix_sha256 || '')
+    && [2, 3].includes(inspection.version)
+    && Number.isSafeInteger(inspection.tensor_count) && inspection.tensor_count >= 0
+    && Number.isSafeInteger(inspection.metadata_count) && inspection.metadata_count >= 0
+    && Number.isSafeInteger(inspection.alignment) && inspection.alignment > 0
+    && Number.isSafeInteger(inspection.data_start_offset) && inspection.data_start_offset >= 0
+    && Number.isSafeInteger(inventory.total_n_bytes) && inventory.total_n_bytes >= 0
+    && /^[0-9a-f]{64}$/.test(inventory.sha256 || '')
+    && receipt.scope?.prefix_sha256 === 'all_received_prefix_bytes'
+    && receipt.scope?.tensor_payload === 'partially_range_fetched_opaque'
+    && receipt.scope?.full_artifact_sha256 === 'not_run'
+    && receipt.scope?.tensor_payload_interpretation === 'not_run'
+    && receipt.scope?.load === 'not_run'
+    && receipt.scope?.generation === 'not_run'
+    && receipt.support_claim === false
+  if (!receiptShapeValid) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix',
+      error_code: 'header_receipt_invalid',
+      reason: 'remote header inspector returned an invalid compact receipt',
+    }
+  }
+
+  const sourceMismatches = []
+  for (const [field, expected] of [
+    ['repo', row.source.repo],
+    ['file', row.source.file],
+    ['revision', row.source.revision],
+    ['size_bytes', row.identity.size_bytes],
+    ['sha256', row.identity.sha256],
+  ]) {
+    if (source[field] !== expected) sourceMismatches.push(field)
+  }
+  if (contentRange.total !== row.identity.size_bytes) sourceMismatches.push('content_range.total')
+  if (sourceMismatches.length) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix',
+      error_code: 'header_source_identity_mismatch',
+      reason: `remote header receipt does not match the roster identity: ${sourceMismatches.join(', ')}`,
+    }
+  }
+
+  const compactObserved = {
+    gguf_version: inspection.version,
+    architecture: safeObservedToken(observed.architecture),
+    tokenizer_model: safeObservedToken(observed.tokenizer_model),
+    tokenizer_pre: safeObservedToken(observed.tokenizer_pre),
+    headline_quant: safeObservedToken(observed.headline_quant),
+    tensor_count: inspection.tensor_count,
+    metadata_count: inspection.metadata_count,
+    alignment: inspection.alignment,
+    data_start_offset: inspection.data_start_offset,
+    tensor_payload_n_bytes: inventory.total_n_bytes,
+    tensor_inventory_sha256: inventory.sha256,
+  }
+  const mismatches = []
+  if (compactObserved.architecture !== row.identity.architecture) {
+    mismatches.push(`architecture ${JSON.stringify(compactObserved.architecture)} != ${JSON.stringify(row.identity.architecture)}`)
+  }
+  if (compactObserved.tokenizer_model !== row.expected.tokenizer_model) {
+    mismatches.push(`tokenizer model ${JSON.stringify(compactObserved.tokenizer_model)} != ${JSON.stringify(row.expected.tokenizer_model)}`)
+  }
+  if (row.expected.tokenizer_pre !== null && compactObserved.tokenizer_pre !== row.expected.tokenizer_pre) {
+    mismatches.push(`tokenizer pre ${JSON.stringify(compactObserved.tokenizer_pre)} != ${JSON.stringify(row.expected.tokenizer_pre)}`)
+  }
+  if (compactObserved.headline_quant !== row.identity.quantization) {
+    mismatches.push(`headline quant ${JSON.stringify(compactObserved.headline_quant)} != ${JSON.stringify(row.identity.quantization)}`)
+  }
+
+  const details = {
+    mode: 'remote_immutable_prefix',
+    inspection_generated_at: receipt.generated_at,
+    host: {
+      hostname_redacted: true,
+      platform: host.platform,
+      release: host.release,
+      arch: host.arch,
+    },
+    inspector: {
+      version: inspector.version,
+      binary_sha256: inspector.binary_sha256,
+      binary_path_redacted: true,
+      command: expectedCommand,
+    },
+    source: {
+      repo: row.source.repo,
+      file: row.source.file,
+      revision: row.source.revision,
+      size_bytes: row.identity.size_bytes,
+      sha256: row.identity.sha256,
+    },
+    range: {
+      requested_bytes: range.requested_bytes,
+      received_bytes: range.received_bytes,
+      content_range: {
+        start: contentRange.start,
+        end: contentRange.end,
+        total: contentRange.total,
+      },
+      prefix_sha256: range.prefix_sha256,
+    },
+    observed: compactObserved,
+    scope: {
+      prefix_sha256: 'all_received_prefix_bytes',
+      tensor_payload: 'partially_range_fetched_opaque',
+      opaque_tensor_payload_prefix_bytes: Math.max(0, range.received_bytes - inspection.data_start_offset),
+      full_artifact_sha256: 'not_run',
+      tensor_payload_interpretation: 'not_run',
+      load: 'not_run',
+      generation: 'not_run',
+      support_claim: false,
+    },
+  }
+  return mismatches.length
+    ? { status: 'fail', ...details, reason: mismatches.join('; ') }
+    : { status: 'pass', ...details }
+}
+
+function metadataStageFromHeaderError(error) {
+  const failure = classifyHeaderInspectionError(error)
+  return {
+    status: failure.status,
+    mode: 'remote_immutable_prefix',
+    error_code: failure.error_code,
+    reason: failure.reason,
+  }
+}
+
+function summarizeHeaderInspections(reports, prefixBytes) {
+  const counts = { pass: 0, fail: 0, blocked: 0, not_run: 0 }
+  let requestedBytes = 0
+  let receivedBytes = 0
+  for (const { headerOutcome } of reports) {
+    const status = headerOutcome?.status || 'not_run'
+    counts[status] = (counts[status] || 0) + 1
+    requestedBytes += headerOutcome?.range?.requested_bytes || 0
+    receivedBytes += headerOutcome?.range?.received_bytes || 0
+  }
+  return {
+    mode: 'remote_immutable_prefix',
+    per_row_byte_budget: prefixBytes,
+    verified_receipt_requested_bytes: requestedBytes,
+    verified_receipt_received_bytes: receivedBytes,
+    counts,
   }
 }
 
@@ -205,6 +465,12 @@ async function runFactory(options) {
   if (options.artifact && rows.length !== 1) {
     throw new Error('--artifact is only valid when exactly one row is selected')
   }
+  const inspectHeader = Boolean(options.inspectHeader)
+  const sourcePreflightEnabled = Boolean(options.resolveSource || inspectHeader)
+  const prefixBytes = inspectHeader
+    ? normalizePrefixBytes(options.prefixBytes ?? DEFAULT_PREFIX_BYTES)
+    : DEFAULT_PREFIX_BYTES
+  const hfToken = options.hfToken ?? process.env.HF_TOKEN ?? null
 
   const configuredModelsDir = options.modelsDir
     || process.env[roster.defaults.models_dir_env]
@@ -216,9 +482,13 @@ async function runFactory(options) {
   const reports = []
   for (const row of rows) {
     const artifact = artifactForRow(row, modelsDir, options.artifact)
-    const resolvedSource = options.resolveSource
-      ? await resolveSourceStage(row, { resolver: options.sourceResolver || resolveHfSource })
+    const sourcePreflight = sourcePreflightEnabled
+      ? await resolveSourcePreflight(row, {
+        resolver: options.sourceResolver || resolveHfSource,
+        token: hfToken,
+      })
       : null
+    const resolvedSource = sourcePreflight?.stage || null
     const sourcePassed = !resolvedSource || resolvedSource.status === 'pass'
     let report = await qualify({
       root,
@@ -230,6 +500,7 @@ async function runFactory(options) {
       runGeneration: sourcePassed && options.runGeneration,
       promptLimit: options.promptLimit,
     })
+    let headerOutcome = null
     if (resolvedSource) {
       report.stages.source = resolvedSource
       if (!sourcePassed && artifact) {
@@ -238,19 +509,48 @@ async function runFactory(options) {
           reason: 'live source preflight did not pass; the local artifact was not inspected',
         }
       }
-      report.overall_status = deriveOverall(report.stages)
-      report = redactLocalPaths(report, [
-        [artifact, '<artifact>'],
-        [root, '<repo>'],
-      ])
     }
+    if (inspectHeader) {
+      if (!sourcePassed || !sourcePreflight?.lock) {
+        headerOutcome = {
+          status: 'blocked',
+          mode: 'remote_immutable_prefix',
+          error_code: 'header_source_preflight_blocked',
+          reason: 'remote header inspection is downstream of a passing live source preflight',
+        }
+        report.stages.metadata = headerOutcome
+      } else if (report.stages.artifact?.status === 'pass') {
+        headerOutcome = {
+          status: 'not_run',
+          reason: 'an exact local artifact passed identity and remains the authoritative metadata lane',
+        }
+      } else {
+        try {
+          const receipt = await (options.headerInspector || inspectRemoteHeader)(sourcePreflight.lock, {
+            binary: resolve(root, options.camelid || defaultCamelidBinary()),
+            rowId: row.id,
+            prefixBytes,
+            token: hfToken,
+          })
+          headerOutcome = metadataStageFromHeader(row, receipt)
+        } catch (error) {
+          headerOutcome = metadataStageFromHeaderError(error)
+        }
+        report.stages.metadata = headerOutcome
+      }
+    }
+    report.overall_status = deriveOverall(report.stages)
+    report = redactLocalPaths(report, [
+      [artifact, '<artifact>'],
+      [root, '<repo>'],
+    ])
     const reportFile = `${row.id}.json`
     await writeFile(resolve(outDir, reportFile), `${JSON.stringify(report, null, 2)}\n`)
-    reports.push({ row, report, reportFile })
+    reports.push({ row, report, reportFile, headerOutcome })
   }
 
   const summary = summarizeReports(reports, roster.gate_order, {
-    sourcePreflight: Boolean(options.resolveSource),
+    sourcePreflight: sourcePreflightEnabled,
   })
   const sourceDirtyValues = reports.map(({ report }) => report.source_dirty)
   const index = {
@@ -264,8 +564,11 @@ async function runFactory(options) {
     source_dirty: sourceDirtyValues.some((value) => value === null)
       ? null
       : sourceDirtyValues.some(Boolean),
-    ...(options.resolveSource
+    ...(sourcePreflightEnabled
       ? { source_resolution: summarizeSourceResolution(reports) }
+      : {}),
+    ...(inspectHeader
+      ? { header_inspection: summarizeHeaderInspections(reports, prefixBytes) }
       : {}),
     ...summary,
   }
@@ -286,6 +589,8 @@ Options:
   --camelid <path>         Camelid binary (default: target/release/camelid)
   --out-dir <path>         Scrubbed reports/index output directory
   --resolve-source         Live-resolve each pinned HF selector before local probes
+  --inspect-header         Bounded immutable-prefix inspection; implies --resolve-source
+  --prefix-bytes <n>       Per-row header range budget, max 64 MiB (default: 32 MiB)
   --run-smoke              Execute configured smoke probes
   --run-generation         Execute pinned greedy parity probes
   --prompt-limit <n>       Deliberately partial parity run (remains blocked)
@@ -300,6 +605,10 @@ Options:
   if (promptLimitRaw && (!Number.isInteger(promptLimit) || promptLimit < 1)) {
     throw new Error('--prompt-limit must be a positive integer')
   }
+  const inspectHeader = args.has('inspect-header')
+  const prefixBytes = args.has('prefix-bytes')
+    ? normalizePrefixBytes(args.get('prefix-bytes'))
+    : DEFAULT_PREFIX_BYTES
   const index = await runFactory({
     root: '.',
     roster: args.get('roster'),
@@ -308,7 +617,9 @@ Options:
     artifact: args.get('artifact'),
     camelid: args.get('camelid'),
     outDir: args.get('out-dir'),
-    resolveSource: args.has('resolve-source'),
+    resolveSource: args.has('resolve-source') || inspectHeader,
+    inspectHeader,
+    prefixBytes,
     runSmoke: args.has('run-smoke'),
     runGeneration: args.has('run-generation'),
     promptLimit,
@@ -318,13 +629,18 @@ Options:
 
 export {
   artifactForRow,
+  defaultCamelidBinary,
   firstUnresolvedStage,
+  metadataStageFromHeader,
+  metadataStageFromHeaderError,
   publicRosterLabel,
+  resolveSourcePreflight,
   resolveSourceStage,
   runFactory,
   selectRows,
   sourceLookupErrorCode,
   sourceSelectionForRow,
+  summarizeHeaderInspections,
   summarizeSourceResolution,
   summarizeReports,
 }
