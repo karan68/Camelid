@@ -143,6 +143,14 @@ function normalizePrefixBytes(value = PREFIX_BYTES) {
   return parsed
 }
 
+function smollm3TemplatePackAvailable(rowId) {
+  return rowId === ROW_ID
+}
+
+function smollm3TemplatePrefixBytesForRow(rowId) {
+  return smollm3TemplatePackAvailable(rowId) ? PREFIX_BYTES : null
+}
+
 function assertExactTemplate(template) {
   if (typeof template !== 'string'
     || Buffer.byteLength(template) !== TEMPLATE_UTF8_BYTES
@@ -959,11 +967,26 @@ function stableLockIdentity(lock) {
     sha256: lock?.sha256,
     license: lock?.license,
     download_url: lock?.download_url,
-    access: lock?.access,
+    access: lock?.access && typeof lock.access === 'object'
+      ? {
+        gated: lock.access.gated,
+        private: lock.access.private,
+        disabled: lock.access.disabled,
+      }
+      : lock?.access,
   }
 }
 
-async function qualifySmolLM3Template({ root = resolve('.'), rosterPath = 'qa/model-qualification/phase1-roster.json', binary, analyzer, prefixBytes = PREFIX_BYTES, token = null }, deps = {}) {
+async function qualifySmolLM3Template({
+  root = resolve('.'),
+  rosterPath = 'qa/model-qualification/phase1-roster.json',
+  binary,
+  analyzer,
+  prefixBytes = PREFIX_BYTES,
+  token = null,
+  initialLock = null,
+  sourceResolver = resolveHfSource,
+}, deps = {}) {
   normalizePrefixBytes(prefixBytes)
   const sha256Impl = deps.sha256Impl || sha256
   const readFileImpl = deps.readFileImpl || readFile
@@ -987,7 +1010,7 @@ async function qualifySmolLM3Template({ root = resolve('.'), rosterPath = 'qa/mo
     try {
       candidate = deps.resolveSource
         ? await deps.resolveSource(selection)
-        : await resolveHfSource({
+        : await sourceResolver({
           repo: selection.repo,
           file: selection.file,
           revision: selection.revision,
@@ -1009,7 +1032,15 @@ async function qualifySmolLM3Template({ root = resolve('.'), rosterPath = 'qa/mo
   const oracleBefore = deps.inspectOracle
     ? await deps.inspectOracle(analyzer)
     : await inspectOracle(analyzer, { execImpl, readFileImpl })
-  const lock = await resolveSelectedSource()
+  let lock
+  if (initialLock === null) {
+    lock = await resolveSelectedSource()
+  } else {
+    try { validateLockAgainstSelection(initialLock, selection) }
+    catch { throw templateError('smollm3_template_source_identity_mismatch') }
+    lock = initialLock
+  }
+  const lockIdentityBefore = stableLockIdentity(lock)
   const range = deps.fetchPrefix
     ? await deps.fetchPrefix(lock, { prefixBytes: PREFIX_BYTES, token })
     : await fetchHeaderPrefix(lock, { prefixBytes: PREFIX_BYTES, token })
@@ -1076,7 +1107,7 @@ async function qualifySmolLM3Template({ root = resolve('.'), rosterPath = 'qa/mo
     ])
     if (!sameJson(inspectorAfter, inspectorBefore)) throw templateError('smollm3_template_inspector_changed')
     if (!sameJson(oracleAfter, oracleBefore)) throw templateError('smollm3_template_oracle_changed')
-    if (!sameJson(stableLockIdentity(lockAfter), stableLockIdentity(lock))) {
+    if (!sameJson(stableLockIdentity(lockAfter), lockIdentityBefore)) {
       throw templateError('smollm3_template_source_changed')
     }
     if (!Buffer.isBuffer(prefixAfter)
@@ -1157,6 +1188,8 @@ export {
   parseAnalyzerDefaultPrompt,
   qualifySmolLM3Template,
   runTemplateAnalyzer,
+  smollm3TemplatePackAvailable,
+  smollm3TemplatePrefixBytesForRow,
   validateShapePack,
 }
 

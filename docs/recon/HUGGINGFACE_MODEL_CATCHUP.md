@@ -49,8 +49,11 @@ page progressively harder to scan.
    remains a distinct two-pass dialect and must not be used as a shortcut. A
    preparation-only renderer now locks two default no-tool prompt shapes; the
    production route and the remaining dynamic branches remain the next gate.
-6. **Qwen3 MoE** needs an authoritative artifact anchor and a routing-semantics
-   audit before a large download. Synthetic browse fixtures are not candidates.
+6. **Qwen3 MoE** has an authoritative official 32.48 GB artifact anchor and a
+   bounded prefix that confirms its metadata and 579 tensor descriptors. That
+   receipt predates the tracked-worktree provenance requirement, so metadata
+   remains blocked pending a clean-current-HEAD rerun. Synthetic browse fixtures
+   are not candidates.
 
 The work order reflects implementation closeness. The full LFM2 artifact has
 now been identity-checked and exercised at its pinned SHA-256; its promotion no
@@ -66,12 +69,11 @@ promotion; the other five families remain active dispositions:
 | Family | Current result | Next honest gate |
 |---|---|---|
 | LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane, and the exact-row handoff independently passes on the resident-Metal lane on one Apple M4 / macOS 26.5 / arm64 host. | Context above 512 tokens, CUDA, other Apple hardware, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
-| LFM2 | **Complete / promoted exact-row smoke.** All eight Phase 1 gates pass for `LFM2.5-2.6B-Q8_0.gguf` on the Windows CPU runnable lane, and the exact-row handoff independently passes on the resident-Metal lane on one Apple M4 / macOS 26.5 / arm64 host. | Context above 512 tokens, CUDA, other Apple hardware, and separately evidenced neighboring sizes/quants or broader sampling/tool boundaries. |
 | Qwen2.5 | Source, metadata, tokenizer, and template pass; strict greedy parity remains failed on one stable cross-engine numeric frontier. A prepared 512-token capture is not accepted because its required verifier transcript is absent from Git. | Recover or rerun the complete 512-token bundle, then complete the layer trace and API/WebUI/SSE smoke; do not waive the short-token mismatch. |
 | Phi-3 | Generic head-dim-96 CPU cache reads are bit-identical; the unproven partial Metal PV tile now falls back. | Repeat the exact-row Metal prefill/decode receipt before changing the HOLD. |
 | Gemma 2 | Source identity, clean-head bounded exact-row metadata, seven-case tokenizer parity, and the exact IT template route pass; substituted templates and invalid shapes fail closed. | Full-artifact identity/load and greedy parity, then API/WebUI/context. |
 | SmolLM3 | Source, clean-head bounded exact-row metadata, and the 10-case `smaug-bpe` tokenizer pack pass. Its absent BOS metadata resolves exactly like pinned llama.cpp. Two default no-tool prompt shapes are preparation-qualified, while the production dynamic template remains under an executable HOLD. | Wire only after runtime token-ID parity and control-marker safety are locked, then qualify system/custom/tool/no-think branches; load, generation, API/WebUI, and context remain blocked. |
-| Qwen3 MoE | Official 32.48 GB row is pinned; a bounded 32 MiB prefix confirms all 579 descriptors. | Full-artifact identity/load and MoE parity; remote metadata alone is not a promotion. |
+| Qwen3 MoE | The official 32.48 GB row is pinned, and a bounded 32 MiB prefix confirms `qwen3moe` / `gpt2` / `qwen2`, the Q8_0/F32 inventory, and all 579 descriptors. The receipt is preparatory because it predates tracked-worktree provenance. | Rerun metadata qualification from a tracked-clean current HEAD, then qualify the exact-row tokenizer and template before full-artifact load and MoE parity. |
 
 Phase 1 remains active for Qwen2.5, Phi-3, Gemma 2, SmolLM3, and Qwen3 MoE.
 LFM2's completed exact row does not promote those families or any adjacent

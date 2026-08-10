@@ -8,10 +8,12 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { validateQualificationReport } from './check-model-qualification-report.mjs'
 import { HeaderInspectionError, MAX_PREFIX_BYTES } from './hf-qualification-header.mjs'
+import { SmolLM3TemplateQualificationError } from './hf-qualification-smollm3-template.mjs'
 import { TokenizerQualificationError } from './hf-qualification-tokenizer.mjs'
 import {
   artifactForRow,
   defaultCamelidBinary,
+  defaultLlamaTemplateAnalyzerBinary,
   defaultLlamaTokenizerBinary,
   firstUnresolvedStage,
   metadataStageFromHeader,
@@ -25,12 +27,16 @@ import {
   sourceSelectionForRow,
   summarizeBatchSourceHeads,
   summarizeHeaderInspections,
-  summarizeTokenizerInspections,
   summarizeSourceResolution,
   summarizeReports,
+  summarizeTemplatePreparations,
+  summarizeTokenizerInspections,
+  templatePreparationStageFromError,
+  templatePreparationStageFromPack,
   tokenizerStageFromError,
   tokenizerStageFromReceipt,
 } from './model-qualification-factory.mjs'
+import { qualify } from './model-qualification-runner.mjs'
 
 const execFileAsync = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -48,6 +54,12 @@ assert.equal(
   process.platform === 'win32'
     ? 'target/reference/llama.cpp-b9632/bin/llama-tokenize.exe'
     : 'target/reference/llama.cpp-b9632/bin/llama-tokenize',
+)
+assert.equal(
+  defaultLlamaTemplateAnalyzerBinary(),
+  process.platform === 'win32'
+    ? 'target/reference/llama.cpp-b9632/bin/llama-template-analysis.exe'
+    : 'target/reference/llama.cpp-b9632/bin/llama-template-analysis',
 )
 assert.deepEqual(
   summarizeBatchSourceHeads([
@@ -77,6 +89,34 @@ const qwen = roster.rows.find((row) => row.id === 'qwen2_5_0_5b_instruct_q8_0')
 const qwenMoe = roster.rows.find((row) => row.id === 'qwen3_30b_a3b_q8_0')
 const gemma = roster.rows.find((row) => row.id === 'gemma2_9b_it_q8_0')
 const smol = roster.rows.find((row) => row.id === 'smollm3_3b_q8_0')
+const committedSmolTemplatePack = JSON.parse(await readFile(
+  resolve(root, 'qa/prompt-packs/smollm3-chat-template-shapes-v1.json'),
+  'utf8',
+))
+
+const templatePackForFactory = () => {
+  const pack = structuredClone(committedSmolTemplatePack)
+  pack.inspector = {
+    ...pack.inspector,
+    version: `camelid v0.6.1-test-g${currentCommitAbbrev}`,
+    binary_sha256: '9'.repeat(64),
+    source_head: currentSourceHead,
+    source_tracked_dirty: false,
+    binary_commit_abbrev: currentCommitAbbrev,
+    binary_reports_dirty: false,
+    binary_matches_source_head: true,
+    clean_current_head: true,
+    binary_path_redacted: true,
+  }
+  return pack
+}
+const templateInspectorForFactory = () => structuredClone(templatePackForFactory().inspector)
+const templateBinaryIdentityForFactory = () => {
+  const identity = templateInspectorForFactory()
+  delete identity.source_tracked_dirty
+  delete identity.binary_path_redacted
+  return identity
+}
 
 assert.deepEqual(
   selectRows(roster, ['qwen3_30b_a3b_q8_0', 'lfm2_5_2_6b_q8_0']).map((row) => row.id),
@@ -238,6 +278,7 @@ const tokenizerReceiptFor = (row) => {
 }
 
 for (const [rowId, receiptPath] of [
+  ['qwen3_30b_a3b_q8_0', 'qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json'],
   ['gemma2_9b_it_q8_0', 'qa/model-qualification/gemma2-9b-it-q8-header-inspection.json'],
   ['smollm3_3b_q8_0', 'qa/model-qualification/smollm3-3b-q8-header-inspection.json'],
 ]) {
@@ -253,6 +294,30 @@ for (const [rowId, receiptPath] of [
     `${receiptPath} predates tracked-worktree provenance and must remain preparatory`,
   )
   assert.equal(durableStage.error_code, 'header_receipt_invalid')
+  if (rowId === qwenMoe.id) {
+    assert.equal(
+      durableReceipt.range.prefix_sha256,
+      '55c565264523c5862247d983f857b9034c04d762ee14fecfd68a827cdbb2d566',
+    )
+    assert.equal(durableReceipt.inspection.tensor_count, 579)
+    assert.equal(durableReceipt.inspection.metadata_count, 31)
+    assert.equal(durableReceipt.inspection.data_start_offset, 5_969_408)
+    assert.deepEqual(durableReceipt.inspection.observed, {
+      architecture: 'qwen3moe',
+      general_file_type: 7,
+      tokenizer_model: 'gpt2',
+      tokenizer_pre: 'qwen2',
+      headline_quant: 'Q8_0',
+    })
+    assert.deepEqual(durableReceipt.inspection.tensor_inventory, {
+      sha256: '8cf88e2856a5aff086e8ea0f2767e7af63a9feac1b721e7df676b472d9f2cdcf',
+      total_n_bytes: 32_477_962_240,
+      types: { Q8_0: 338, F32: 241 },
+    })
+    assert.equal(durableReceipt.support_claim, false)
+    assert.notEqual(durableRow.gates.tokenizer.status, 'pass')
+    assert.notEqual(durableRow.gates.template.status, 'pass')
+  }
 }
 
 let resolverCalls = 0
@@ -480,6 +545,117 @@ assert.equal(unknownTokenizerFailure.error_code, 'tokenizer_qualification_error'
 assert.equal(JSON.stringify(unknownTokenizerFailure).includes('private'), false)
 assert.equal(JSON.stringify(unknownTokenizerFailure).includes('test-secret-token'), false)
 
+const passingTemplatePreparation = templatePreparationStageFromPack(
+  smol,
+  templatePackForFactory(),
+  {
+    expectedSourceHead: currentSourceHead,
+    expectedInspector: templateInspectorForFactory(),
+  },
+)
+assert.equal(passingTemplatePreparation.status, 'blocked')
+assert.equal(passingTemplatePreparation.error_code, 'smollm3_template_runtime_hold')
+assert.equal(passingTemplatePreparation.preparation.status, 'pass')
+assert.equal(passingTemplatePreparation.range.requested_bytes, 32 * 1024 * 1024)
+assert.equal(passingTemplatePreparation.range.received_bytes, 32 * 1024 * 1024)
+assert.equal(passingTemplatePreparation.inspector.source_head, currentSourceHead)
+assert.equal(passingTemplatePreparation.scope.runtime_chat, 'blocked')
+assert.equal(passingTemplatePreparation.scope.template_gate, 'blocked')
+assert.equal(passingTemplatePreparation.scope.support_claim, false)
+assert.equal(passingTemplatePreparation.cases.length, 2)
+assert.equal(passingTemplatePreparation.cases.every((testCase) => testCase.oracle_exact_match), true)
+const compactTemplatePreparation = JSON.stringify(passingTemplatePreparation)
+assert.ok(Buffer.byteLength(compactTemplatePreparation) < 4 * 1024, 'factory projection must remain compact')
+for (const forbidden of [
+  'source_template',
+  'normalized_prompt"',
+  'messages',
+  'header_receipt',
+  'tokenizer_receipt',
+  'download_url',
+  'llama-template-analysis.exe',
+  '<|im_start|>',
+]) {
+  assert.equal(
+    compactTemplatePreparation.includes(forbidden),
+    false,
+    `factory template preparation must omit ${forbidden}`,
+  )
+}
+
+const staleTemplatePreparation = templatePreparationStageFromPack(
+  smol,
+  templatePackForFactory(),
+  {
+    expectedSourceHead: 'f'.repeat(40),
+    expectedInspector: templateInspectorForFactory(),
+  },
+)
+assert.equal(staleTemplatePreparation.status, 'fail')
+assert.equal(staleTemplatePreparation.error_code, 'template_preparation_receipt_invalid')
+
+const forgedTemplatePack = templatePackForFactory()
+const forgedTemplateHead = `11111111${'1'.repeat(32)}`
+forgedTemplatePack.inspector = {
+  ...forgedTemplatePack.inspector,
+  version: 'camelid v0.6.1-99-g11111111',
+  binary_sha256: '2'.repeat(64),
+  source_head: forgedTemplateHead,
+  source_tracked_dirty: false,
+  binary_commit_abbrev: '11111111',
+  binary_reports_dirty: false,
+  binary_matches_source_head: true,
+  clean_current_head: true,
+  binary_path_redacted: true,
+}
+const forgedTemplatePreparation = templatePreparationStageFromPack(
+  smol,
+  forgedTemplatePack,
+  {
+    expectedSourceHead: forgedTemplateHead,
+    expectedInspector: templateInspectorForFactory(),
+  },
+)
+assert.equal(forgedTemplatePreparation.status, 'fail')
+assert.equal(forgedTemplatePreparation.error_code, 'template_preparation_receipt_invalid')
+
+const tamperedTemplatePack = templatePackForFactory()
+tamperedTemplatePack.source_template.text = tamperedTemplatePack.source_template.text.replace(
+  '<|im_start|>',
+  '<|im_finish|>',
+)
+tamperedTemplatePack.runtime_chat_enabled = 'C:\\private\\template.gguf test-secret-token'
+const tamperedTemplatePreparation = templatePreparationStageFromPack(
+  smol,
+  tamperedTemplatePack,
+  {
+    expectedSourceHead: currentSourceHead,
+    expectedInspector: templateInspectorForFactory(),
+  },
+)
+assert.equal(tamperedTemplatePreparation.status, 'fail')
+assert.equal(tamperedTemplatePreparation.error_code, 'template_preparation_receipt_invalid')
+assert.equal(JSON.stringify(tamperedTemplatePreparation).includes('<|im_finish|>'), false)
+assert.equal(JSON.stringify(tamperedTemplatePreparation).includes('test-secret-token'), false)
+assert.equal(JSON.stringify(tamperedTemplatePreparation).includes('template.gguf'), false)
+
+const safeTemplateFailure = templatePreparationStageFromError(
+  new SmolLM3TemplateQualificationError('smollm3_template_oracle_unavailable'),
+)
+assert.deepEqual(safeTemplateFailure, {
+  status: 'blocked',
+  mode: 'remote_immutable_prefix_smollm3_template_preparation',
+  error_code: 'smollm3_template_oracle_unavailable',
+  reason: 'the pinned llama.cpp template analyzer package is unavailable',
+  preparation: { status: 'blocked' },
+})
+const unknownTemplateFailure = templatePreparationStageFromError(
+  new Error('C:\\private\\template.gguf test-secret-token'),
+)
+assert.equal(unknownTemplateFailure.error_code, 'smollm3_template_qualification_error')
+assert.equal(JSON.stringify(unknownTemplateFailure).includes('private'), false)
+assert.equal(JSON.stringify(unknownTemplateFailure).includes('test-secret-token'), false)
+
 const driftStage = await resolveSourceStage(qwen, {
   resolver: async () => ({ ...lockFor(qwen), sha256: '0'.repeat(64) }),
 })
@@ -562,6 +738,14 @@ assert.deepEqual(
   ]),
   { mode: 'live_huggingface', counts: { pass: 1, fail: 1, blocked: 1 } },
 )
+assert.deepEqual(
+  summarizeSourceResolution([{
+    sourcePreflight: null,
+    report: { stages: { source: { status: 'pass' } } },
+  }]),
+  { mode: 'live_huggingface', counts: { pass: 0, fail: 0, blocked: 0, not_run: 1 } },
+  'a skipped per-row preflight must not be mislabeled as a live Hugging Face pass',
+)
 
 assert.deepEqual(
   summarizeHeaderInspections([
@@ -593,11 +777,30 @@ assert.deepEqual(
   },
 )
 
+assert.deepEqual(
+  summarizeTemplatePreparations([
+    { templatePreparationOutcome: passingTemplatePreparation },
+    { templatePreparationOutcome: safeTemplateFailure },
+    { templatePreparationOutcome: null },
+  ]),
+  {
+    mode: 'remote_immutable_prefix_smollm3_template_preparation',
+    per_row_byte_budget: 32 * 1024 * 1024,
+    verified_receipt_requested_bytes: 32 * 1024 * 1024,
+    verified_receipt_received_bytes: 32 * 1024 * 1024,
+    counts: { pass: 0, fail: 0, blocked: 2, not_run: 1 },
+    preparation_results: { pass: 1, fail: 0, blocked: 1, not_run: 1 },
+    runtime_template_gate: 'blocked',
+    support_claim: false,
+  },
+)
+
 const factoryOut = await mkdtemp(join(tmpdir(), 'camelid-qualification-factory-test-'))
 try {
   let offlineResolverCalled = false
   let offlineHeaderInspectorCalled = false
   let offlineTokenizerInspectorCalled = false
+  let offlineTemplateInspectorCalled = false
   const offlineIndex = await runFactory({
     root,
     rows: [qwen.id],
@@ -614,13 +817,19 @@ try {
       offlineTokenizerInspectorCalled = true
       throw new Error('must not run')
     },
+    templateInspector: async () => {
+      offlineTemplateInspectorCalled = true
+      throw new Error('must not run')
+    },
   })
   assert.equal(offlineResolverCalled, false, 'the default factory mode must remain fully offline')
   assert.equal(offlineHeaderInspectorCalled, false, 'the default factory mode must not inspect remote headers')
   assert.equal(offlineTokenizerInspectorCalled, false, 'the default factory mode must not inspect remote tokenizers')
+  assert.equal(offlineTemplateInspectorCalled, false, 'the default factory mode must not inspect remote templates')
   assert.equal(Object.hasOwn(offlineIndex, 'source_resolution'), false, 'default index shape must remain unchanged')
   assert.equal(Object.hasOwn(offlineIndex, 'header_inspection'), false, 'default index shape must not gain a header summary')
   assert.equal(Object.hasOwn(offlineIndex, 'tokenizer_inspection'), false, 'default index shape must not gain a tokenizer summary')
+  assert.equal(Object.hasOwn(offlineIndex, 'template_preparation'), false, 'default index shape must not gain a template summary')
 
   const requested = [qwen.id, qwenMoe.id]
   const index = await runFactory({
@@ -926,6 +1135,370 @@ try {
   assert.equal(unsupportedTokenizerReport.stages.tokenizer.status, 'blocked')
   assert.equal(unsupportedTokenizerReport.stages.tokenizer.error_code, 'tokenizer_pack_unavailable')
   assert.deepEqual(validateQualificationReport(unsupportedTokenizerReport), [])
+
+  let exclusiveResolverCalls = 0
+  let exclusiveTemplateCalls = 0
+  await assert.rejects(
+    runFactory({
+      root,
+      rows: [smol.id],
+      outDir: join(factoryOut, 'template-mutually-exclusive'),
+      inspectHeader: true,
+      inspectTemplate: true,
+      sourceResolver: async () => {
+        exclusiveResolverCalls += 1
+        return lockFor(smol)
+      },
+      templateInspector: async () => {
+        exclusiveTemplateCalls += 1
+        return templatePackForFactory()
+      },
+    }),
+    /cannot be combined/,
+  )
+  assert.equal(exclusiveResolverCalls, 0, 'mutually exclusive lanes must fail before source resolution')
+  assert.equal(exclusiveTemplateCalls, 0, 'mutually exclusive lanes must fail before a prefix probe')
+
+  let unsupportedTemplateResolverCalls = 0
+  let unsupportedTemplateCalls = 0
+  const unsupportedTemplateOut = join(factoryOut, 'template-pack-unavailable')
+  const unsupportedTemplateIndex = await runFactory({
+    root,
+    rows: [qwen.id],
+    outDir: unsupportedTemplateOut,
+    inspectTemplate: true,
+    sourceResolver: async () => {
+      unsupportedTemplateResolverCalls += 1
+      return lockFor(qwen)
+    },
+    templateInspector: async () => {
+      unsupportedTemplateCalls += 1
+      return templatePackForFactory()
+    },
+  })
+  assert.equal(
+    unsupportedTemplateResolverCalls,
+    0,
+    'unsupported template rows must block before network source resolution',
+  )
+  assert.equal(unsupportedTemplateCalls, 0, 'unsupported rows must block before template inspection')
+  assert.deepEqual(unsupportedTemplateIndex.source_resolution, {
+    mode: 'live_huggingface',
+    counts: { pass: 0, fail: 0, blocked: 0, not_run: 1 },
+  })
+  assert.equal(
+    unsupportedTemplateIndex.rows[0].first_unresolved_stage,
+    'artifact',
+    'a skipped source preflight must not be reported as the first unresolved source gate',
+  )
+  assert.deepEqual(unsupportedTemplateIndex.template_preparation, {
+    mode: 'remote_immutable_prefix_smollm3_template_preparation',
+    per_row_byte_budget: 32 * 1024 * 1024,
+    verified_receipt_requested_bytes: 0,
+    verified_receipt_received_bytes: 0,
+    counts: { pass: 0, fail: 0, blocked: 1, not_run: 0 },
+    preparation_results: { pass: 0, fail: 0, blocked: 1, not_run: 0 },
+    runtime_template_gate: 'blocked',
+    support_claim: false,
+  })
+  const unsupportedTemplateReport = JSON.parse(await readFile(
+    join(unsupportedTemplateOut, `${qwen.id}.json`),
+    'utf8',
+  ))
+  assert.equal(unsupportedTemplateReport.stages.template.status, 'blocked')
+  assert.equal(unsupportedTemplateReport.stages.template.error_code, 'template_pack_unavailable')
+  assert.deepEqual(validateQualificationReport(unsupportedTemplateReport), [])
+
+  const cleanQualifier = async (options) => {
+    const report = await qualify(options)
+    report.source_head = currentSourceHead
+    report.source_dirty = false
+    report.source_inspection = 'observed'
+    return report
+  }
+  for (const localTemplateStatus of ['pass', 'fail']) {
+    let unsupportedLocalResolverCalls = 0
+    let unsupportedLocalTemplateCalls = 0
+    const unsupportedLocalOut = join(
+      factoryOut,
+      `template-unsupported-local-${localTemplateStatus}`,
+    )
+    const unsupportedLocalIndex = await runFactory({
+      root,
+      rows: [qwen.id],
+      outDir: unsupportedLocalOut,
+      inspectTemplate: true,
+      qualifier: async (options) => {
+        const report = await qualify(options)
+        report.stages.artifact = { status: 'pass' }
+        report.stages.template = localTemplateStatus === 'pass'
+          ? { status: 'pass' }
+          : {
+            status: 'fail',
+            error_code: 'local_template_mismatch',
+            reason: 'the exact local artifact failed its authoritative template comparison',
+          }
+        return report
+      },
+      sourceResolver: async () => {
+        unsupportedLocalResolverCalls += 1
+        return lockFor(qwen)
+      },
+      templateInspector: async () => {
+        unsupportedLocalTemplateCalls += 1
+        return templatePackForFactory()
+      },
+    })
+    assert.equal(unsupportedLocalResolverCalls, 0)
+    assert.equal(unsupportedLocalTemplateCalls, 0)
+    assert.deepEqual(unsupportedLocalIndex.template_preparation.preparation_results, {
+      pass: 0,
+      fail: 0,
+      blocked: 0,
+      not_run: 1,
+    })
+    assert.deepEqual(unsupportedLocalIndex.source_resolution, {
+      mode: 'live_huggingface',
+      counts: { pass: 0, fail: 0, blocked: 0, not_run: 1 },
+    })
+    assert.equal(
+      unsupportedLocalIndex.rows[0].first_unresolved_stage,
+      'metadata',
+      'an authoritative local template result must not imply a skipped live source failure',
+    )
+    const unsupportedLocalReport = JSON.parse(await readFile(
+      join(unsupportedLocalOut, `${qwen.id}.json`),
+      'utf8',
+    ))
+    assert.equal(unsupportedLocalReport.stages.template.status, localTemplateStatus)
+    assert.notEqual(unsupportedLocalReport.stages.template.error_code, 'template_pack_unavailable')
+  }
+  const trustedTemplateBinaryInspector = async (binary, { sourceRoot }) => {
+    assert.equal(sourceRoot, root)
+    assert.match(
+      binary,
+      process.platform === 'win32'
+        ? /target[\\/]release[\\/]camelid\.exe$/
+        : /target[\\/]release[\\/]camelid$/,
+    )
+    return templateBinaryIdentityForFactory()
+  }
+  let templateResolverCalls = 0
+  let templateCalls = 0
+  const templateOut = join(factoryOut, 'template-preparation-pass')
+  const templateIndex = await runFactory({
+    root,
+    rows: [smol.id],
+    outDir: templateOut,
+    inspectTemplate: true,
+    hfToken: 'test-secret-token',
+    qualifier: cleanQualifier,
+    sourceResolver: async ({ repo, file, revision, token }) => {
+      templateResolverCalls += 1
+      assert.equal(repo, smol.source.repo)
+      assert.equal(file, smol.source.file)
+      assert.equal(revision, smol.source.revision)
+      assert.equal(token, 'test-secret-token')
+      return lockFor(smol)
+    },
+    templateBinaryInspector: trustedTemplateBinaryInspector,
+    templateInspector: async (options) => {
+      templateCalls += 1
+      assert.equal(options.root, root)
+      assert.equal(options.rosterPath, resolve(root, 'qa/model-qualification/phase1-roster.json'))
+      assert.equal(options.prefixBytes, 32 * 1024 * 1024)
+      assert.equal(options.token, 'test-secret-token')
+      assert.deepEqual(options.initialLock, lockFor(smol))
+      assert.equal(typeof options.sourceResolver, 'function')
+      assert.match(
+        options.binary,
+        process.platform === 'win32'
+          ? /target[\\/]release[\\/]camelid\.exe$/
+          : /target[\\/]release[\\/]camelid$/,
+      )
+      assert.match(
+        options.analyzer,
+        process.platform === 'win32'
+          ? /target[\\/]reference[\\/]llama\.cpp-b9632[\\/]bin[\\/]llama-template-analysis\.exe$/
+          : /target[\\/]reference[\\/]llama\.cpp-b9632[\\/]bin[\\/]llama-template-analysis$/,
+      )
+      return templatePackForFactory()
+    },
+  })
+  assert.equal(templateResolverCalls, 1, 'factory must retain one exact-row source lock for the template lane')
+  assert.equal(templateCalls, 1)
+  assert.deepEqual(templateIndex.source_resolution, {
+    mode: 'live_huggingface',
+    counts: { pass: 1, fail: 0, blocked: 0 },
+  })
+  assert.deepEqual(templateIndex.template_preparation, {
+    mode: 'remote_immutable_prefix_smollm3_template_preparation',
+    per_row_byte_budget: 32 * 1024 * 1024,
+    verified_receipt_requested_bytes: 32 * 1024 * 1024,
+    verified_receipt_received_bytes: 32 * 1024 * 1024,
+    counts: { pass: 0, fail: 0, blocked: 1, not_run: 0 },
+    preparation_results: { pass: 1, fail: 0, blocked: 0, not_run: 0 },
+    runtime_template_gate: 'blocked',
+    support_claim: false,
+  })
+  const templateReport = JSON.parse(await readFile(join(templateOut, `${smol.id}.json`), 'utf8'))
+  assert.equal(templateReport.stages.artifact.status, 'blocked')
+  assert.equal(templateReport.stages.template.status, 'blocked')
+  assert.equal(templateReport.stages.template.error_code, 'smollm3_template_runtime_hold')
+  assert.equal(templateReport.stages.template.preparation.status, 'pass')
+  assert.equal(templateReport.stages.template.scope.template_gate, 'blocked')
+  assert.equal(templateReport.stages.template.scope.runtime_chat, 'blocked')
+  assert.equal(templateReport.stages.template.scope.support_claim, false)
+  assert.equal(templateReport.overall_status, 'blocked')
+  const serializedTemplateReport = JSON.stringify(templateReport)
+  for (const forbidden of [
+    'test-secret-token',
+    'download_url',
+    'source_template',
+    'normalized_prompt"',
+    'messages',
+    '<|im_start|>',
+    'llama-template-analysis.exe',
+  ]) {
+    assert.equal(serializedTemplateReport.includes(forbidden), false)
+  }
+  assert.deepEqual(validateQualificationReport(templateReport), [])
+
+  const unavailableTemplateIdentityOut = join(factoryOut, 'template-binary-identity-unavailable')
+  await runFactory({
+    root,
+    rows: [smol.id],
+    outDir: unavailableTemplateIdentityOut,
+    inspectTemplate: true,
+    qualifier: cleanQualifier,
+    sourceResolver: async () => lockFor(smol),
+    templateInspector: async () => templatePackForFactory(),
+    templateBinaryInspector: async () => null,
+  })
+  const unavailableTemplateIdentityReport = JSON.parse(await readFile(
+    join(unavailableTemplateIdentityOut, `${smol.id}.json`),
+    'utf8',
+  ))
+  assert.equal(unavailableTemplateIdentityReport.stages.template.status, 'blocked')
+  assert.equal(
+    unavailableTemplateIdentityReport.stages.template.error_code,
+    'template_inspector_identity_unavailable',
+  )
+  assert.deepEqual(validateQualificationReport(unavailableTemplateIdentityReport), [])
+
+  let untrackedNoiseTemplateCalls = 0
+  const untrackedNoiseTemplateOut = join(factoryOut, 'template-untracked-noise')
+  await runFactory({
+    root,
+    rows: [smol.id],
+    outDir: untrackedNoiseTemplateOut,
+    inspectTemplate: true,
+    qualifier: async (options) => {
+      const report = await cleanQualifier(options)
+      report.source_dirty = true
+      return report
+    },
+    sourceResolver: async () => lockFor(smol),
+    templateBinaryInspector: trustedTemplateBinaryInspector,
+    templateInspector: async () => {
+      untrackedNoiseTemplateCalls += 1
+      return templatePackForFactory()
+    },
+  })
+  assert.equal(
+    untrackedNoiseTemplateCalls,
+    1,
+    'runner dirty state includes untracked files; the harness owns the tracked-clean pre-fetch gate',
+  )
+  const untrackedNoiseTemplateReport = JSON.parse(await readFile(
+    join(untrackedNoiseTemplateOut, `${smol.id}.json`),
+    'utf8',
+  ))
+  assert.equal(untrackedNoiseTemplateReport.source_dirty, true)
+  assert.equal(untrackedNoiseTemplateReport.stages.template.status, 'blocked')
+  assert.equal(untrackedNoiseTemplateReport.stages.template.preparation.status, 'pass')
+
+  let authoritativeTemplateCalls = 0
+  const authoritativeTemplateOut = join(factoryOut, 'template-authoritative-local-fail')
+  await runFactory({
+    root,
+    rows: [smol.id],
+    outDir: authoritativeTemplateOut,
+    inspectTemplate: true,
+    qualifier: async (options) => {
+      const report = await cleanQualifier(options)
+      report.stages.artifact = { status: 'pass' }
+      report.stages.template = {
+        status: 'fail',
+        error_code: 'local_template_mismatch',
+        reason: 'the exact local artifact failed its authoritative template comparison',
+      }
+      return report
+    },
+    sourceResolver: async () => lockFor(smol),
+    templateInspector: async () => {
+      authoritativeTemplateCalls += 1
+      return templatePackForFactory()
+    },
+  })
+  assert.equal(
+    authoritativeTemplateCalls,
+    0,
+    'preparation evidence must not overwrite an authoritative local template result',
+  )
+  const authoritativeTemplateReport = JSON.parse(await readFile(
+    join(authoritativeTemplateOut, `${smol.id}.json`),
+    'utf8',
+  ))
+  assert.equal(authoritativeTemplateReport.stages.template.status, 'fail')
+  assert.equal(authoritativeTemplateReport.stages.template.error_code, 'local_template_mismatch')
+
+  let failedTemplateBatchCalls = 0
+  let failedTemplateBatchResolverCalls = 0
+  const failedTemplateBatchOut = join(factoryOut, 'template-row-local-failure')
+  const failedTemplateBatchIndex = await runFactory({
+    root,
+    rows: [smol.id, qwenMoe.id],
+    outDir: failedTemplateBatchOut,
+    inspectTemplate: true,
+    qualifier: cleanQualifier,
+    sourceResolver: async () => {
+      failedTemplateBatchResolverCalls += 1
+      return lockFor(smol)
+    },
+    templateInspector: async () => {
+      failedTemplateBatchCalls += 1
+      throw new Error('test-secret-token at C:\\private\\template.gguf')
+    },
+  })
+  assert.equal(failedTemplateBatchResolverCalls, 1, 'unsupported rows must skip source lookup in a mixed batch')
+  assert.equal(failedTemplateBatchCalls, 1, 'row-local analyzer failure must not abort a later row')
+  assert.equal(failedTemplateBatchIndex.rows.length, 2)
+  assert.deepEqual(failedTemplateBatchIndex.source_resolution, {
+    mode: 'live_huggingface',
+    counts: { pass: 1, fail: 0, blocked: 0, not_run: 1 },
+  })
+  assert.deepEqual(failedTemplateBatchIndex.template_preparation.counts, {
+    pass: 0,
+    fail: 0,
+    blocked: 2,
+    not_run: 0,
+  })
+  const failedTemplateReport = JSON.parse(await readFile(
+    join(failedTemplateBatchOut, `${smol.id}.json`),
+    'utf8',
+  ))
+  const continuedTemplateReport = JSON.parse(await readFile(
+    join(failedTemplateBatchOut, `${qwenMoe.id}.json`),
+    'utf8',
+  ))
+  assert.equal(failedTemplateReport.stages.template.error_code, 'smollm3_template_qualification_error')
+  assert.equal(continuedTemplateReport.stages.template.error_code, 'template_pack_unavailable')
+  assert.equal(JSON.stringify(failedTemplateBatchIndex).includes('test-secret-token'), false)
+  assert.equal(JSON.stringify(failedTemplateReport).includes('template.gguf'), false)
+  assert.equal(JSON.stringify(failedTemplateReport).includes('C:\\private'), false)
+  assert.deepEqual(validateQualificationReport(failedTemplateReport), [])
+  assert.deepEqual(validateQualificationReport(continuedTemplateReport), [])
 
   let invalidBudgetResolverCalled = false
   let invalidBudgetInspectorCalled = false

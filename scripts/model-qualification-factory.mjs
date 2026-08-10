@@ -7,6 +7,7 @@ import {
   DEFAULT_PREFIX_BYTES,
   MAX_PREFIX_BYTES,
   classifyHeaderInspectionError,
+  inspectBinaryIdentity,
   inspectRemoteHeader,
   normalizePrefixBytes,
 } from './hf-qualification-header.mjs'
@@ -18,6 +19,14 @@ import {
   tokenizerPackAvailable,
   tokenizerPrefixBytesForRow,
 } from './hf-qualification-tokenizer.mjs'
+import {
+  PREFIX_BYTES as SMOLLM3_TEMPLATE_PREFIX_BYTES,
+  classifySmolLM3TemplateQualificationError,
+  qualifySmolLM3Template,
+  smollm3TemplatePackAvailable,
+  smollm3TemplatePrefixBytesForRow,
+  validateShapePack as validateSmolLM3TemplateShapePack,
+} from './hf-qualification-smollm3-template.mjs'
 import { resolveHfSource, validateLockAgainstSelection } from './hf-qualification-source.mjs'
 import { deriveOverall, qualify, redactLocalPaths } from './model-qualification-runner.mjs'
 
@@ -69,6 +78,12 @@ function defaultLlamaTokenizerBinary() {
   return process.platform === 'win32'
     ? 'target/reference/llama.cpp-b9632/bin/llama-tokenize.exe'
     : 'target/reference/llama.cpp-b9632/bin/llama-tokenize'
+}
+
+function defaultLlamaTemplateAnalyzerBinary() {
+  return process.platform === 'win32'
+    ? 'target/reference/llama.cpp-b9632/bin/llama-template-analysis.exe'
+    : 'target/reference/llama.cpp-b9632/bin/llama-template-analysis'
 }
 
 function firstUnresolvedStage(report, gateOrder) {
@@ -600,6 +615,135 @@ function tokenizerStageFromError(error) {
   }
 }
 
+function templatePreparationStageFromPack(row, pack, {
+  expectedSourceHead,
+  expectedInspector,
+} = {}) {
+  if (!/^[0-9a-f]{40}$/.test(expectedSourceHead || '')
+    || !expectedInspector
+    || typeof expectedInspector !== 'object'
+    || Array.isArray(expectedInspector)) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix_smollm3_template_preparation',
+      error_code: 'template_preparation_receipt_invalid',
+      reason: 'bounded template preparation is not bound to the factory source HEAD',
+      preparation: { status: 'fail' },
+    }
+  }
+  const errors = validateSmolLM3TemplateShapePack(pack, {
+    expectedInspector,
+  })
+  if (errors.length
+    || pack?.row_id !== row.id
+    || expectedInspector.source_head !== expectedSourceHead
+    || pack?.inspector?.source_head !== expectedSourceHead) {
+    return {
+      status: 'fail',
+      mode: 'remote_immutable_prefix_smollm3_template_preparation',
+      error_code: 'template_preparation_receipt_invalid',
+      reason: 'bounded template preparation returned an invalid compact receipt',
+      preparation: { status: 'fail' },
+    }
+  }
+
+  return {
+    status: 'blocked',
+    mode: 'remote_immutable_prefix_smollm3_template_preparation',
+    error_code: 'smollm3_template_runtime_hold',
+    reason: 'bounded template preparation passed, but runtime chat remains on the architecture-wide typed HOLD',
+    preparation: {
+      status: 'pass',
+      schema: pack.schema,
+      pack_id: pack.pack_id,
+    },
+    source: {
+      repo: row.source.repo,
+      file: row.source.file,
+      revision: row.source.revision,
+      size_bytes: row.identity.size_bytes,
+      sha256: row.identity.sha256,
+      license: row.source.license,
+    },
+    range: {
+      requested_bytes: pack.bounded_prefix.requested_bytes,
+      received_bytes: pack.bounded_prefix.received_bytes,
+      content_range: {
+        start: pack.bounded_prefix.content_range.start,
+        end: pack.bounded_prefix.content_range.end,
+        total: pack.bounded_prefix.content_range.total,
+      },
+      prefix_sha256: pack.bounded_prefix.prefix_sha256,
+    },
+    inspector: {
+      version: pack.inspector.version,
+      binary_sha256: pack.inspector.binary_sha256,
+      source_head: pack.inspector.source_head,
+      binary_commit_abbrev: pack.inspector.binary_commit_abbrev,
+      binary_reports_dirty: pack.inspector.binary_reports_dirty,
+      binary_matches_source_head: pack.inspector.binary_matches_source_head,
+      source_tracked_dirty: pack.inspector.source_tracked_dirty,
+      clean_current_head: pack.inspector.clean_current_head,
+      binary_path_redacted: true,
+    },
+    oracle: {
+      project: pack.oracle.project,
+      build: pack.oracle.build,
+      revision: pack.oracle.revision,
+      reported_revision: pack.oracle.reported_revision,
+      analyzer_binary_sha256: pack.oracle.analyzer_binary_sha256,
+      companion_binary_sha256: pack.oracle.companion_binary_sha256,
+      package_manifest_sha256: pack.oracle.package_manifest_sha256,
+      archive_sha256: pack.oracle.archive_sha256,
+      executable_paths_redacted: true,
+      mode: pack.oracle.mode,
+    },
+    template: {
+      utf8_bytes: pack.source_template.utf8_bytes,
+      sha256: pack.source_template.sha256,
+    },
+    cases: pack.cases.map((testCase) => ({
+      id: testCase.id,
+      normalized_prompt_utf8_bytes: testCase.normalized_prompt_utf8_bytes,
+      normalized_prompt_sha256: testCase.normalized_prompt_sha256,
+      oracle_exact_match: testCase.oracle_exact_match_after_date_normalization
+        ?? testCase.oracle_core_exact_match_after_date_normalization,
+    })),
+    scope: {
+      prefix_sha256: 'all_received_prefix_bytes',
+      full_artifact_sha256: 'not_run',
+      tensor_payload_interpretation: 'not_run',
+      load: 'not_run',
+      generation: 'not_run',
+      http_apply_template: 'not_run',
+      runtime_chat: 'blocked',
+      template_gate: 'blocked',
+      support_claim: false,
+    },
+  }
+}
+
+function templatePreparationStageFromError(error) {
+  const failure = classifySmolLM3TemplateQualificationError(error)
+  return {
+    status: failure.status,
+    mode: 'remote_immutable_prefix_smollm3_template_preparation',
+    error_code: failure.error_code,
+    reason: failure.reason,
+    preparation: { status: failure.status },
+  }
+}
+
+function blockedTemplatePreparation(errorCode, reason) {
+  return {
+    status: 'blocked',
+    mode: 'remote_immutable_prefix_smollm3_template_preparation',
+    error_code: errorCode,
+    reason,
+    preparation: { status: 'blocked' },
+  }
+}
+
 function summarizeHeaderInspections(reports, prefixBytes) {
   const counts = { pass: 0, fail: 0, blocked: 0, not_run: 0 }
   let requestedBytes = 0
@@ -638,10 +782,39 @@ function summarizeTokenizerInspections(reports) {
   }
 }
 
+function summarizeTemplatePreparations(reports) {
+  const counts = { pass: 0, fail: 0, blocked: 0, not_run: 0 }
+  const preparationResults = { pass: 0, fail: 0, blocked: 0, not_run: 0 }
+  let requestedBytes = 0
+  let receivedBytes = 0
+  for (const { templatePreparationOutcome } of reports) {
+    const status = templatePreparationOutcome?.status || 'not_run'
+    const preparationStatus = templatePreparationOutcome?.preparation?.status || 'not_run'
+    counts[status] = (counts[status] || 0) + 1
+    preparationResults[preparationStatus] = (preparationResults[preparationStatus] || 0) + 1
+    if (preparationStatus === 'pass') {
+      requestedBytes += templatePreparationOutcome?.range?.requested_bytes || 0
+      receivedBytes += templatePreparationOutcome?.range?.received_bytes || 0
+    }
+  }
+  return {
+    mode: 'remote_immutable_prefix_smollm3_template_preparation',
+    per_row_byte_budget: SMOLLM3_TEMPLATE_PREFIX_BYTES,
+    verified_receipt_requested_bytes: requestedBytes,
+    verified_receipt_received_bytes: receivedBytes,
+    counts,
+    preparation_results: preparationResults,
+    runtime_template_gate: 'blocked',
+    support_claim: false,
+  }
+}
+
 function summarizeSourceResolution(reports) {
   const counts = { pass: 0, fail: 0, blocked: 0 }
-  for (const { report } of reports) {
-    const status = report.stages.source?.status
+  for (const item of reports) {
+    const status = Object.hasOwn(item, 'sourcePreflight')
+      ? item.sourcePreflight?.stage?.status || 'not_run'
+      : item.report?.stages?.source?.status
     counts[status] = (counts[status] || 0) + 1
   }
   return { mode: 'live_huggingface', counts }
@@ -660,14 +833,20 @@ function summarizeBatchSourceHeads(reports) {
 
 function summarizeReports(reports, gateOrder, { sourcePreflight = false } = {}) {
   const counts = { pass: 0, fail: 0, blocked: 0 }
-  const rows = reports.map(({ row, report, reportFile }) => {
+  const rows = reports.map((item) => {
+    const { row, report, reportFile } = item
+    const sourcePreflightAttempted = sourcePreflight && (
+      Object.hasOwn(item, 'sourcePreflight')
+        ? item.sourcePreflight !== null
+        : Boolean(report.stages.source)
+    )
     counts[report.overall_status] = (counts[report.overall_status] || 0) + 1
     return {
       priority: row.priority,
       row_id: row.id,
       disposition: row.disposition,
       overall_status: report.overall_status,
-      first_unresolved_stage: sourcePreflight && report.stages.source?.status !== 'pass'
+      first_unresolved_stage: sourcePreflightAttempted && report.stages.source?.status !== 'pass'
         ? 'source'
         : firstUnresolvedStage(report, gateOrder),
       report_file: reportFile,
@@ -689,7 +868,12 @@ async function runFactory(options) {
   }
   const inspectTokenizer = Boolean(options.inspectTokenizer)
   const inspectHeader = Boolean(options.inspectHeader || inspectTokenizer)
-  const sourcePreflightEnabled = Boolean(options.resolveSource || inspectHeader)
+  const inspectTemplate = Boolean(options.inspectTemplate)
+  if (inspectTemplate && inspectHeader) {
+    throw new Error('--inspect-template cannot be combined with --inspect-header or --inspect-tokenizer; each lane owns a bounded prefix fetch')
+  }
+  const baseSourcePreflightEnabled = Boolean(options.resolveSource || inspectHeader)
+  const sourceSummaryEnabled = Boolean(baseSourcePreflightEnabled || inspectTemplate)
   const prefixBytes = inspectHeader
     ? normalizePrefixBytes(options.prefixBytes ?? DEFAULT_PREFIX_BYTES)
     : DEFAULT_PREFIX_BYTES
@@ -705,7 +889,11 @@ async function runFactory(options) {
   const reports = []
   for (const row of rows) {
     const artifact = artifactForRow(row, modelsDir, options.artifact)
-    const sourcePreflight = sourcePreflightEnabled
+    const templatePackAvailable = smollm3TemplatePackAvailable(row.id)
+    const templatePrefixBytes = smollm3TemplatePrefixBytesForRow(row.id)
+    const rowSourcePreflightEnabled = baseSourcePreflightEnabled
+      || (inspectTemplate && templatePackAvailable)
+    const sourcePreflight = rowSourcePreflightEnabled
       ? await resolveSourcePreflight(row, {
         resolver: options.sourceResolver || resolveHfSource,
         token: hfToken,
@@ -725,6 +913,7 @@ async function runFactory(options) {
     })
     let headerOutcome = null
     let tokenizerOutcome = null
+    let templatePreparationOutcome = null
     if (resolvedSource) {
       report.stages.source = resolvedSource
       if (!sourcePassed && artifact) {
@@ -833,6 +1022,88 @@ async function runFactory(options) {
         report.stages.tokenizer = tokenizerOutcome
       }
     }
+    if (inspectTemplate) {
+      if (report.stages.artifact?.status === 'pass'
+        && ['pass', 'fail'].includes(report.stages.template?.status)) {
+        templatePreparationOutcome = {
+          status: 'not_run',
+          reason: report.stages.template.status === 'pass'
+            ? 'an exact local artifact already passed the authoritative template lane'
+            : 'an exact local artifact already failed the authoritative template lane; preparation evidence cannot overwrite that failure',
+          preparation: { status: 'not_run' },
+        }
+      } else if (!templatePackAvailable) {
+        templatePreparationOutcome = blockedTemplatePreparation(
+          'template_pack_unavailable',
+          'no bounded template-preparation pack is defined for this exact row',
+        )
+        report.stages.template = templatePreparationOutcome
+      } else if (!sourcePassed || !sourcePreflight?.lock) {
+        templatePreparationOutcome = blockedTemplatePreparation(
+          'template_source_preflight_blocked',
+          'bounded template preparation is downstream of a passing live source preflight',
+        )
+        report.stages.template = templatePreparationOutcome
+      } else if (!/^[0-9a-f]{40}$/.test(report.source_head || '')) {
+        templatePreparationOutcome = blockedTemplatePreparation(
+          'template_source_head_unavailable',
+          'bounded template preparation requires an observed factory source HEAD',
+        )
+        report.stages.template = templatePreparationOutcome
+      } else {
+        try {
+          const binary = resolve(root, options.camelid || defaultCamelidBinary())
+          const pack = await (options.templateInspector || qualifySmolLM3Template)({
+            root,
+            rosterPath,
+            binary,
+            analyzer: resolve(
+              root,
+              options.llamaTemplateAnalysis || defaultLlamaTemplateAnalyzerBinary(),
+            ),
+            prefixBytes: templatePrefixBytes,
+            token: hfToken,
+            initialLock: sourcePreflight.lock,
+            sourceResolver: options.sourceResolver || resolveHfSource,
+          })
+          let inspectedBinary = null
+          try {
+            const candidate = await (options.templateBinaryInspector || inspectBinaryIdentity)(
+              binary,
+              { sourceRoot: root },
+            )
+            if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+              throw new Error('invalid Camelid inspector identity')
+            }
+            inspectedBinary = candidate
+          } catch {
+            templatePreparationOutcome = blockedTemplatePreparation(
+              'template_inspector_identity_unavailable',
+              'the Camelid template inspector identity could not be independently rechecked',
+            )
+          }
+          if (inspectedBinary) {
+            templatePreparationOutcome = templatePreparationStageFromPack(row, pack, {
+              expectedSourceHead: report.source_head,
+              expectedInspector: {
+                version: inspectedBinary.version,
+                binary_sha256: inspectedBinary.binary_sha256,
+                source_head: inspectedBinary.source_head,
+                source_tracked_dirty: false,
+                binary_commit_abbrev: inspectedBinary.binary_commit_abbrev,
+                binary_reports_dirty: inspectedBinary.binary_reports_dirty,
+                binary_matches_source_head: inspectedBinary.binary_matches_source_head,
+                clean_current_head: inspectedBinary.clean_current_head,
+                binary_path_redacted: true,
+              },
+            })
+          }
+        } catch (error) {
+          templatePreparationOutcome = templatePreparationStageFromError(error)
+        }
+        report.stages.template = templatePreparationOutcome
+      }
+    }
     report.overall_status = deriveOverall(report.stages)
     report = redactLocalPaths(report, [
       [artifact, '<artifact>'],
@@ -840,11 +1111,19 @@ async function runFactory(options) {
     ])
     const reportFile = `${row.id}.json`
     await writeFile(resolve(outDir, reportFile), `${JSON.stringify(report, null, 2)}\n`)
-    reports.push({ row, report, reportFile, headerOutcome, tokenizerOutcome })
+    reports.push({
+      row,
+      report,
+      reportFile,
+      sourcePreflight,
+      headerOutcome,
+      tokenizerOutcome,
+      templatePreparationOutcome,
+    })
   }
 
   const summary = summarizeReports(reports, roster.gate_order, {
-    sourcePreflight: sourcePreflightEnabled,
+    sourcePreflight: sourceSummaryEnabled,
   })
   const sourceDirtyValues = reports.map(({ report }) => report.source_dirty)
   const sourceHeadSummary = summarizeBatchSourceHeads(reports)
@@ -862,7 +1141,7 @@ async function runFactory(options) {
     source_dirty: sourceDirtyValues.some((value) => value === null)
       ? null
       : sourceDirtyValues.some(Boolean),
-    ...(sourcePreflightEnabled
+    ...(sourceSummaryEnabled
       ? { source_resolution: summarizeSourceResolution(reports) }
       : {}),
     ...(inspectHeader
@@ -870,6 +1149,9 @@ async function runFactory(options) {
       : {}),
     ...(inspectTokenizer
       ? { tokenizer_inspection: summarizeTokenizerInspections(reports) }
+      : {}),
+    ...(inspectTemplate
+      ? { template_preparation: summarizeTemplatePreparations(reports) }
       : {}),
     ...summary,
   }
@@ -894,6 +1176,10 @@ Options:
   --prefix-bytes <n>       Per-row header range budget, max 64 MiB (default: 32 MiB)
   --inspect-tokenizer      Exact 32 MiB tokenizer/oracle lane; implies header + source
   --llama-tokenize <path>  Pinned llama-tokenize binary/package
+  --inspect-template       Exact 32 MiB SmolLM3 template-preparation lane; implies source
+                           and is mutually exclusive with header/tokenizer inspection
+  --llama-template-analysis <path>
+                           Pinned llama-template-analysis binary/package
   --run-smoke              Execute configured smoke probes
   --run-generation         Execute pinned greedy parity probes
   --prompt-limit <n>       Deliberately partial parity run (remains blocked)
@@ -910,6 +1196,7 @@ Options:
   }
   const inspectTokenizer = args.has('inspect-tokenizer')
   const inspectHeader = args.has('inspect-header') || inspectTokenizer
+  const inspectTemplate = args.has('inspect-template')
   const prefixBytes = args.has('prefix-bytes')
     ? normalizePrefixBytes(args.get('prefix-bytes'))
     : DEFAULT_PREFIX_BYTES
@@ -921,10 +1208,12 @@ Options:
     artifact: args.get('artifact'),
     camelid: args.get('camelid'),
     llamaTokenize: args.get('llama-tokenize'),
+    llamaTemplateAnalysis: args.get('llama-template-analysis'),
     outDir: args.get('out-dir'),
     resolveSource: args.has('resolve-source') || inspectHeader,
     inspectHeader,
     inspectTokenizer,
+    inspectTemplate,
     prefixBytes,
     runSmoke: args.has('run-smoke'),
     runGeneration: args.has('run-generation'),
@@ -936,6 +1225,7 @@ Options:
 export {
   artifactForRow,
   defaultCamelidBinary,
+  defaultLlamaTemplateAnalyzerBinary,
   defaultLlamaTokenizerBinary,
   firstUnresolvedStage,
   metadataStageFromHeader,
@@ -950,10 +1240,13 @@ export {
   summarizeBatchSourceHeads,
   summarizeHeaderInspections,
   summarizeTokenizerInspections,
+  summarizeTemplatePreparations,
   summarizeSourceResolution,
   summarizeReports,
   tokenizerStageFromError,
   tokenizerStageFromReceipt,
+  templatePreparationStageFromError,
+  templatePreparationStageFromPack,
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {

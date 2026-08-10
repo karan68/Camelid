@@ -594,7 +594,7 @@
             "qa/model-qualification/qwen3-30b-a3b-q8-source-report.json",
             "qa/model-qualification/qwen3-30b-a3b-q8-header-inspection.json"
           ],
-          "reason": "A bounded remote prefix confirms the qwen3moe/gpt2/qwen2 metadata and all 579 tensor descriptors against the pinned full length. The 32.48 GB payload is not local or fully rehashed, so exact-byte load/parity qualification remains blocked."
+          "reason": "A bounded remote prefix confirms the qwen3moe/gpt2/qwen2 metadata and all 579 tensor descriptors against the pinned full length, but the receipt predates tracked-worktree provenance. Rerun from a tracked-clean current HEAD before this gate can pass; the 32.48 GB payload is not local or fully rehashed."
         },
         "tokenizer": {
           "required": true,

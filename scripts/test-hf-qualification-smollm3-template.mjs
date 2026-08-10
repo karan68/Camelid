@@ -26,6 +26,8 @@ import {
   parseAnalyzerDefaultPrompt,
   qualifySmolLM3Template,
   runTemplateAnalyzer,
+  smollm3TemplatePackAvailable,
+  smollm3TemplatePrefixBytesForRow,
   validateShapePack,
 } from './hf-qualification-smollm3-template.mjs'
 import { HeaderInspectionError } from './hf-qualification-header.mjs'
@@ -171,6 +173,10 @@ assert.equal(
 
 assert.equal(normalizePrefixBytes(), PREFIX_BYTES)
 assert.equal(normalizePrefixBytes(String(PREFIX_BYTES)), PREFIX_BYTES)
+assert.equal(smollm3TemplatePackAvailable('smollm3_3b_q8_0'), true)
+assert.equal(smollm3TemplatePackAvailable('qwen2_5_0_5b_instruct_q8_0'), false)
+assert.equal(smollm3TemplatePrefixBytesForRow('smollm3_3b_q8_0'), PREFIX_BYTES)
+assert.equal(smollm3TemplatePrefixBytesForRow('unsupported'), null)
 for (const value of [0, PREFIX_BYTES - 1, PREFIX_BYTES + 1, '33554431', 'nope']) {
   assert.throws(
     () => normalizePrefixBytes(value),
@@ -452,6 +458,52 @@ assert.deepEqual(
   validateShapePack(await qualifySmolLM3Template(qualificationOptions, baseDeps)),
   [],
 )
+let reusedLockResolverCalls = 0
+assert.deepEqual(
+  validateShapePack(await qualifySmolLM3Template(
+    { ...qualificationOptions, initialLock: clone(lock) },
+    {
+      ...baseDeps,
+      resolveSource: async () => {
+        reusedLockResolverCalls += 1
+        return clone(lock)
+      },
+    },
+  )),
+  [],
+)
+assert.equal(
+  reusedLockResolverCalls,
+  1,
+  'an injected preflight lock must be reused initially while preserving the post-probe re-resolution',
+)
+await assert.rejects(
+  qualifySmolLM3Template(
+    { ...qualificationOptions, initialLock: { ...clone(lock), sha256: 'f'.repeat(64) } },
+    baseDeps,
+  ),
+  (error) => error.code === 'smollm3_template_source_identity_mismatch',
+)
+let trackedDirtyFetchCalls = 0
+await assert.rejects(
+  qualifySmolLM3Template(qualificationOptions, {
+    ...baseDeps,
+    readSourceState: async () => ({ ...clone(sourceState), tracked_dirty: true }),
+    inspectCamelid: undefined,
+    execImpl: async () => ({ stdout: inspectorIdentity.version, stderr: '' }),
+    readFileImpl: async () => Buffer.from('test binary'),
+    fetchPrefix: async () => {
+      trackedDirtyFetchCalls += 1
+      return range
+    },
+  }),
+  (error) => error.code === 'smollm3_template_inspector_unavailable',
+)
+assert.equal(
+  trackedDirtyFetchCalls,
+  0,
+  'the authoritative tracked-dirty check must fail before the bounded prefix fetch',
+)
 
 for (const primaryFails of [false, true]) {
   const tempRoot = await mkdtemp(join(tmpdir(), 'camelid-smollm3-prefix-cleanup-test-'))
@@ -581,6 +633,23 @@ await assert.rejects(
     resolveSource: async () => {
       lockReads += 1
       return lockReads === 1 ? clone(lock) : { ...clone(lock), download_url: `${lock.download_url}?drift=1` }
+    },
+  }),
+  (error) => error.code === 'smollm3_template_source_changed',
+)
+
+const mutatingLock = clone(lock)
+let mutatingLockReads = 0
+await assert.rejects(
+  qualifySmolLM3Template(qualificationOptions, {
+    ...baseDeps,
+    resolveSource: async () => {
+      mutatingLockReads += 1
+      if (mutatingLockReads === 2) {
+        mutatingLock.download_url = `${mutatingLock.download_url}?mutated=1`
+        mutatingLock.access.private = true
+      }
+      return mutatingLock
     },
   }),
   (error) => error.code === 'smollm3_template_source_changed',

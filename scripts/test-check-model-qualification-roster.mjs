@@ -24,6 +24,7 @@ assert.equal(roster.rows[1].gates.context.status, 'blocked', 'Qwen2.5 context re
 assert.match(roster.rows[1].gates.context.reason, /verifier transcript is absent/)
 assert.equal(summarizeRoster(roster)[3].next_gate, 'load_smoke', 'Gemma2 advances through exact-row metadata, tokenizer, and template evidence')
 assert.equal(summarizeRoster(roster)[4].next_gate, 'template', 'SmolLM3 advances through exact-row tokenizer evidence while preserving its dynamic-template HOLD')
+assert.equal(summarizeRoster(roster)[5].next_gate, 'metadata', 'Qwen3 MoE keeps metadata blocked until its bounded receipt has tracked-worktree provenance')
 
 assert.ok(
   errorsAfter((candidate) => { candidate.defaults.models_dir_env = 'CAMELID_MODEL_DIR' }).some((error) => error.includes('plural CAMELID_MODELS_DIR')),
