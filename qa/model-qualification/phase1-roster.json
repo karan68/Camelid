@@ -501,12 +501,12 @@
         },
         "tokenizer": {
           "required": true,
-          "status": "blocked",
+          "status": "pass",
           "evidence": [
             "src/tokenizer/mod.rs",
-            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json"
-          ],
-          "reason": "Camelid now resolves the exact row's smaug-bpe metadata as the pinned llama3 alias, and separately implements legacy smollm's two-pass splitter, but no exact-row token-id comparison against the pinned llama.cpp oracle has run."
+            "qa/model-qualification/fixtures/smollm3-tokenizer-pre-v1.json",
+            "qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json"
+          ]
         },
         "template": {
           "required": true,

@@ -307,6 +307,36 @@ assert(
 )
 
 const smolRow = roster.rows.find((row) => row.id === 'smollm3_3b_q8_0')
+const smolReceipt = JSON.parse(readFileSync(
+  new URL('../qa/model-qualification/smollm3-3b-q8-header-tokenizer-parity.json', import.meta.url),
+  'utf8',
+))
+assert.deepEqual(
+  validateSmolLM3TokenizerReceipt(smolReceipt, smolRow, roster.defaults),
+  [],
+  'durable SmolLM3 tokenizer evidence must remain bound to the exact row and oracle pack',
+)
+assert.equal(smolReceipt.result.case_count, SMOLLM3_CASES.length)
+assert.equal(smolReceipt.result.exact_match_count, SMOLLM3_CASES.length)
+assert.equal(smolReceipt.result.all_token_ids_match, true)
+assert.equal(smolReceipt.result.support_decision, 'smollm3_exact_row_tokenizer_gate_only')
+assert.equal(smolReceipt.provenance.status, 'clean_current_head_receipt')
+assert.equal(smolReceipt.provenance.clean_current_head, true)
+assert.deepEqual(
+  smolReceipt.cases.find((testCase) => testCase.id === 'empty_with_add_special').camelid_ids,
+  [],
+)
+assert.deepEqual(
+  smolReceipt.cases.find((testCase) => testCase.id === 'plain_ascii_with_add_special').camelid_ids,
+  [9_906],
+)
+assert.deepEqual(
+  smolReceipt.cases.find(
+    (testCase) => testCase.id === 'user_defined_tool_tags_without_parse_special',
+  ).camelid_ids,
+  [128_015, 5_018, 609, 3_332, 15_561, 9_388, 128_016],
+)
+
 const syntheticSmolCases = SMOLLM3_CASES.map((testCase) => {
   let ids = [42]
   if (testCase.id === 'empty_with_add_special') ids = []
