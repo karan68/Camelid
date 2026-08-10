@@ -2130,6 +2130,27 @@ enum Command {
         /// Port for the temporary llama-server instance.
         #[arg(long, default_value_t = 8189)]
         llama_port: u16,
+        /// KV cache type passed to llama-server for K (-ctk). Omit to use
+        /// llama.cpp's default.
+        #[arg(
+            long,
+            value_parser = ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
+        )]
+        llama_cache_type_k: Option<String>,
+        /// KV cache type passed to llama-server for V (-ctv). Omit to use
+        /// llama.cpp's default.
+        #[arg(
+            long,
+            value_parser = ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
+        )]
+        llama_cache_type_v: Option<String>,
+        /// Flash-attention mode passed to llama-server (-fa). Omit to use
+        /// llama.cpp's default.
+        #[arg(long, value_parser = ["on", "off", "auto"])]
+        llama_flash_attn: Option<String>,
+        /// Disable llama.cpp tensor repacking for the reference re-run.
+        #[arg(long)]
+        llama_no_repack: bool,
         /// Override Rayon worker threads for the Camelid re-run.
         #[arg(long)]
         threads: Option<usize>,
@@ -3869,6 +3890,10 @@ async fn main() -> anyhow::Result<()> {
             reference_only,
             llama_ctx,
             llama_port,
+            llama_cache_type_k,
+            llama_cache_type_v,
+            llama_flash_attn,
+            llama_no_repack,
             threads,
         } => {
             // Route a sealed agent-family receipt to its self-contained verifier
@@ -3910,6 +3935,10 @@ async fn main() -> anyhow::Result<()> {
                 mode,
                 llama_ctx,
                 llama_port,
+                llama_cache_type_k,
+                llama_cache_type_v,
+                llama_flash_attn,
+                llama_no_repack,
                 threads,
             })
             .await;

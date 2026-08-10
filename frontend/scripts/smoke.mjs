@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../src/lib/capabilities.js'
@@ -27,13 +27,23 @@ const modelId = args.get('model-id') || process.env.CAMELID_SMOKE_MODEL_ID || (m
 const requireGeneration = args.has('require-generation') || process.env.CAMELID_SMOKE_REQUIRE_GENERATION === '1'
 const allowGuardedChat = args.has('allow-guarded-chat') || process.env.CAMELID_SMOKE_ALLOW_GUARDED_CHAT === '1'
 const chatRepeats = Number.parseInt(args.get('chat-repeats') || process.env.CAMELID_SMOKE_CHAT_REPEATS || '1', 10)
+const streamMaxTokens = Number.parseInt(args.get('stream-max-tokens') || process.env.CAMELID_SMOKE_STREAM_MAX_TOKENS || '24', 10)
 const expectCompatibilityRow = args.get('expect-compatibility-row') || process.env.CAMELID_SMOKE_EXPECT_COMPATIBILITY_ROW || ''
 const expectCompatibilityStatus = args.get('expect-compatibility-status') || process.env.CAMELID_SMOKE_EXPECT_COMPATIBILITY_STATUS || ''
 const expectContractSupported = parseOptionalBoolean(args.get('expect-contract-supported') || process.env.CAMELID_SMOKE_EXPECT_CONTRACT_SUPPORTED, 'expect-contract-supported')
 const expectWebUiChat = args.get('expect-webui-chat') || process.env.CAMELID_SMOKE_EXPECT_WEBUI_CHAT || ''
+const expectLocalLaneClass = args.get('expect-local-lane-class') || process.env.CAMELID_SMOKE_EXPECT_LOCAL_LANE_CLASS || (expectContractSupported === true ? 'supported' : '')
+const expectGgufSha256 = normalizeSha256(args.get('expect-gguf-sha256') || process.env.CAMELID_SMOKE_EXPECT_GGUF_SHA256 || '')
+const requireLocalModel = args.has('require-local-model') || process.env.CAMELID_SMOKE_REQUIRE_LOCAL_MODEL === '1' || Boolean(expectLocalLaneClass || expectGgufSha256)
 
 if (!Number.isInteger(chatRepeats) || chatRepeats < 1) {
   throw new Error(`--chat-repeats must be a positive integer, got ${args.get('chat-repeats')}`)
+}
+if (!Number.isInteger(streamMaxTokens) || streamMaxTokens < 1) {
+  throw new Error(`--stream-max-tokens must be a positive integer, got ${args.get('stream-max-tokens')}`)
+}
+if (expectLocalLaneClass && !['supported', 'experimental_implemented', 'unsupported'].includes(expectLocalLaneClass)) {
+  throw new Error(`--expect-local-lane-class must be one of supported, experimental_implemented, unsupported; got ${expectLocalLaneClass}`)
 }
 
 if (loadTiny && modelPath) {
@@ -78,8 +88,89 @@ function assertExpected(label, actual, expected) {
   }
 }
 
+function normalizeSha256(value) {
+  if (!value) return ''
+  const normalized = String(value).trim().toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(normalized)) {
+    throw new Error(`--expect-gguf-sha256 must be 64 hexadecimal characters, got ${value}`)
+  }
+  return normalized
+}
+
+function normalizedPath(value) {
+  if (!value) return null
+  const normalized = resolve(String(value))
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+async function resolveExactLocalModel({ localModels, current, required }) {
+  const entries = Array.isArray(localModels?.models) ? localModels.models : []
+  const expectedFilename = modelPath
+    ? basename(modelPath)
+    : current?.lane?.gguf_filename || (current?.path ? basename(current.path) : '')
+  const matches = expectedFilename ? entries.filter(entry => entry?.filename === expectedFilename) : []
+  const local = matches.length === 1 ? matches[0] : null
+
+  if (!required) return local
+  if (!modelPath) throw new Error('--require-local-model needs --model <path> so exact path and size can be asserted')
+
+  const modelStats = await stat(modelPath)
+  assertExpected('current model id', current?.id ?? null, modelId)
+  assertExpected('current lane model id', current?.lane?.model_id ?? null, modelId)
+  assertExpected('current model path', normalizedPath(current?.path), normalizedPath(modelPath))
+  assertExpected('current lane filename', current?.lane?.gguf_filename ?? null, expectedFilename)
+  assertExpected('/api/models/local exact filename match count', matches.length, 1)
+  assertExpected('/api/models/local exact path', normalizedPath(localModels?.models_dir && local ? join(localModels.models_dir, local.filename) : null), normalizedPath(modelPath))
+  assertExpected('/api/models/local exact file size', local?.size_bytes ?? null, modelStats.size)
+
+  const actualSha256 = String(current?.lane?.gguf_sha256 || '').toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(actualSha256)) {
+    throw new Error(`current lane GGUF SHA-256 is missing or malformed: ${JSON.stringify(current?.lane?.gguf_sha256 ?? null)}`)
+  }
+  if (expectGgufSha256) assertExpected('current lane GGUF SHA-256', actualSha256, expectGgufSha256)
+  if (expectLocalLaneClass) assertExpected('/api/models/local lane_class', local?.lane_class ?? null, expectLocalLaneClass)
+
+  console.log(`✓ exact local identity filename=${expectedFilename}; size_bytes=${modelStats.size}; lane_class=${local.lane_class}; gguf_sha256=${actualSha256}`)
+  return local
+}
+
+function assertTerminalStreamEvidence(streamed, streamEventDetails, maxTokens) {
+  const eventTypes = streamEventDetails.map(event => event.type)
+  const finishIndexes = eventTypes.flatMap((type, index) => type === 'finish' ? [index] : [])
+  const usageIndexes = eventTypes.flatMap((type, index) => type === 'usage' ? [index] : [])
+  const doneIndexes = eventTypes.flatMap((type, index) => type === 'done' ? [index] : [])
+  if (finishIndexes.length !== 1) throw new Error(`chat stream must contain exactly one terminal finish event; got ${finishIndexes.length}`)
+  if (usageIndexes.length !== 1) throw new Error(`chat stream must contain exactly one include_usage event; got ${usageIndexes.length}`)
+  if (doneIndexes.length !== 1) throw new Error(`chat stream must contain exactly one [DONE] event; got ${doneIndexes.length}`)
+  const [finishIndex] = finishIndexes
+  const [usageIndex] = usageIndexes
+  const [doneIndex] = doneIndexes
+  if (!(finishIndex < usageIndex && usageIndex < doneIndex)) {
+    throw new Error(`chat stream terminal order must be finish, usage, [DONE]; got ${eventTypes.join(',')}`)
+  }
+  if (usageIndex !== doneIndex - 1 || doneIndex !== eventTypes.length - 1) {
+    throw new Error(`chat stream usage must be terminal immediately before [DONE], with no trailing events; got ${eventTypes.join(',')}`)
+  }
+  if (eventTypes.includes('error')) throw new Error('chat stream reported an error event before termination')
+  if (typeof streamed.finishReason !== 'string' || !streamed.finishReason) {
+    throw new Error(`chat stream did not preserve a terminal finish_reason: ${JSON.stringify(streamed.finishReason)}`)
+  }
+  const usage = streamed.usage
+  for (const field of ['prompt_tokens', 'completion_tokens', 'total_tokens']) {
+    if (!Number.isInteger(usage?.[field]) || usage[field] < 0) {
+      throw new Error(`chat stream terminal usage.${field} must be a non-negative integer; got ${JSON.stringify(usage?.[field])}`)
+    }
+  }
+  if (usage.total_tokens !== usage.prompt_tokens + usage.completion_tokens) {
+    throw new Error(`chat stream terminal usage total mismatch: ${JSON.stringify(usage)}`)
+  }
+  if (usage.completion_tokens < 1 || usage.completion_tokens > maxTokens) {
+    throw new Error(`chat stream completion_tokens must be between 1 and requested max_tokens=${maxTokens}; got ${usage.completion_tokens}`)
+  }
+}
+
 async function fetchStreamingChatCompletion(url, body) {
-  const streamEvents = []
+  const streamEventDetails = []
   const streamedSnapshots = []
   const response = await fetch(url, {
     method: 'POST',
@@ -94,13 +185,15 @@ async function fetchStreamingChatCompletion(url, body) {
     streamedSnapshots.push({ fullContent, firstContentMs: metrics.firstContentMs })
   }, {
     onStreamEvent(event) {
-      streamEvents.push(event.type)
+      streamEventDetails.push(event)
     },
   })
+  const streamEvents = streamEventDetails.map(event => event.type)
   if (!streamEvents.includes('bytes')) throw new Error('chat stream did not expose first-byte progress')
   if (!streamEvents.includes('content')) throw new Error('chat stream completed without any content delta')
   if (!streamedSnapshots.length) throw new Error('chat stream did not publish visible content before final completion')
-  return { streamed, streamEvents, streamedSnapshots }
+  assertTerminalStreamEvidence(streamed, streamEventDetails, body.max_tokens)
+  return { streamed, streamEvents, streamEventDetails, streamedSnapshots }
 }
 
 function pushU32(bytes, value) {
@@ -258,6 +351,13 @@ const { result: activeModelDetails } = health.active_model_id
   ? await timed('current_model', () => fetchJson(`${apiBase}/api/models/current`).catch(() => null))
   : { result: null }
 
+const { result: localModels } = await timed('local_models', () => fetchJson(`${apiBase}/api/models/local`))
+const activeLocalModel = await resolveExactLocalModel({
+  localModels,
+  current: activeModelDetails,
+  required: requireLocalModel,
+})
+
 const { result: capabilities } = await timed('capabilities', () => fetchJson(`${apiBase}/api/capabilities`))
 const supportGate = capabilities?.support_contract?.current_gate || 'none'
 const compatibilityRows = Array.isArray(capabilities?.model_compatibility) ? capabilities.model_compatibility.length : 0
@@ -270,20 +370,27 @@ console.log(`✓ /api/capabilities returned support gate: ${supportGate}; compat
 const activeModelFileType = activeModelDetails?.gguf?.metadata?.general?.file_type ?? activeModelDetails?.gguf?.metadata?.['general.file_type'] ?? null
 const activeModelQuant = activeModelFileType === null || activeModelFileType === undefined ? null : quantLabelFromGgufFileType(activeModelFileType) || `file_type ${activeModelFileType}`
 const activeModel = health.active_model_id ? {
+  ...(activeLocalModel || {}),
   id: health.active_model_id,
   name: health.active_model_id,
   runtime_model_name: health.active_model_id,
   model_path: activeModelDetails?.path || '',
-  quant: activeModelQuant,
+  quant: activeLocalModel?.quantization || activeModelQuant,
   provider_kind: 'local',
   status: health.generation_ready ? 'ready' : 'registered',
   loaded_now: Boolean(health.loaded_now ?? health.active_model_id),
   generation_ready: Boolean(health.generation_ready),
 } : null
 const activeCompatibilityHint = activeModel ? findCompatibilityHint(capabilities, activeModel) : null
-const activeSupportedByContract = activeModel ? isCompatibilitySupportedForModel(capabilities, activeModel) : false
+// Mirror chatGate's fail-closed identity precedence: once /api/models/local has
+// supplied a lane verdict, display-name matching may not override it.
+const activeSupportedByIdentity = activeModel
+  ? activeModel.lane_class
+    ? activeModel.lane_class === 'supported'
+    : isCompatibilitySupportedForModel(capabilities, activeModel)
+  : false
 if (activeModel) {
-  console.log(`✓ WebUI chat gate model=${activeModel.id}; quant=${activeModel.quant || 'unknown'}; ${compatibilityHintLabel(activeCompatibilityHint, 'no exact support row')}; contract_supported=${activeSupportedByContract}`)
+  console.log(`✓ WebUI chat gate model=${activeModel.id}; quant=${activeModel.quant || 'unknown'}; backend_lane=${activeModel.lane_class || 'not reported'}; ${compatibilityHintLabel(activeCompatibilityHint, 'no exact support row')}; artifact_supported=${activeSupportedByIdentity}`)
   console.log(`  WebUI contract note=${compatibilityHintCopy(activeCompatibilityHint)}`)
 }
 
@@ -293,23 +400,29 @@ if (expectCompatibilityRow) {
 if (expectCompatibilityStatus) {
   assertExpected('compatibility status', activeCompatibilityHint?.target?.status || null, expectCompatibilityStatus)
 }
-if (expectContractSupported !== null) {
-  assertExpected('contract supported', activeSupportedByContract, expectContractSupported)
-}
-
 if (requireGeneration && !health.generation_ready) {
   throw new Error('generation_ready=false after smoke setup; omit --require-generation to allow metadata/UI guardrail smoke runs')
 }
 
 const activeModelListed = Boolean(activeModel && modelIds.includes(activeModel.id))
 const activeChatGate = activeModel ? getChatGateState(capabilities, activeModel, { active_model_id: health.active_model_id, loaded_now: health.loaded_now ?? Boolean(health.active_model_id), generation_ready: Boolean(health.generation_ready) }) : null
-const qaChatBypass = Boolean(allowGuardedChat && health.generation_ready && activeModel && activeModelListed && !activeChatGate?.chatUnlocked)
-const webuiChatEnabled = Boolean(activeModelListed && activeChatGate?.chatUnlocked)
-const webuiChatState = webuiChatEnabled ? 'enabled' : 'blocked'
+const webuiChatState = !activeModelListed || !activeChatGate
+  ? 'blocked'
+  : activeChatGate.chatMode === 'supported'
+    ? 'enabled'
+    : activeChatGate.chatMode === 'experimental'
+      ? 'experimental'
+      : 'blocked'
+const webuiChatEnabled = webuiChatState === 'enabled' || webuiChatState === 'experimental'
+const qaChatBypass = Boolean(allowGuardedChat && health.generation_ready && activeModel && activeModelListed && !webuiChatEnabled)
+
+if (expectContractSupported !== null) {
+  assertExpected('contract supported', Boolean(activeChatGate?.contractSupported), expectContractSupported)
+}
 
 if (expectWebUiChat) {
-  if (!['enabled', 'blocked'].includes(expectWebUiChat)) {
-    throw new Error(`--expect-webui-chat must be one of enabled, blocked; got ${expectWebUiChat}`)
+  if (!['enabled', 'experimental', 'blocked'].includes(expectWebUiChat)) {
+    throw new Error(`--expect-webui-chat must be one of enabled, experimental, blocked; got ${expectWebUiChat}`)
   }
   assertExpected('WebUI chat state', webuiChatState, expectWebUiChat)
 }
@@ -322,15 +435,17 @@ if (webuiChatEnabled || qaChatBypass) {
   const { result: streamingChat, elapsedMs: streamingChatMs } = await timed('chat_completion_stream', () => fetchStreamingChatCompletion(`${apiBase}/v1/chat/completions`, {
     model: health.active_model_id || modelIds[0],
     messages: [{ role: 'user', content: 'hello' }],
-    // 24, not 4: rows that open a thinking channel (gemma4 12B) spend their
-    // first tokens inside the suppressed <|channel> span; a 4-token budget can
-    // legitimately produce zero VISIBLE deltas and fail require-generation.
-    max_tokens: 24,
+    // Thinking rows can spend their first tokens in a hidden reasoning channel.
+    // Keep the default bounded, but let exact-row qualification raise it enough
+    // to require an eventual visible content delta without fabricating a failure.
+    max_tokens: streamMaxTokens,
     stream: true,
+    stream_options: { include_usage: true },
     temperature: 0,
   }))
   console.log(`✓ streaming chat published ${streamingChat.streamedSnapshots.length} visible update(s) before final completion in ${(streamingChatMs / 1000).toFixed(2)}s: ${JSON.stringify(streamingChat.streamed.content)}`)
   console.log(`  stream_events=${streamingChat.streamEvents.join(',')}`)
+  console.log(`  terminal_finish_reason=${streamingChat.streamed.finishReason}; terminal_usage=${JSON.stringify(streamingChat.streamed.usage)}`)
 
   const chatTimings = []
   for (let idx = 0; idx < chatRepeats; idx += 1) {
@@ -399,7 +514,7 @@ if (webuiChatEnabled || qaChatBypass) {
 } else {
   const reason = !health.generation_ready
     ? 'generation is not ready'
-    : !activeChatGate?.chatUnlocked
+    : activeChatGate?.chatMode === 'blocked'
       ? 'the active model is blocked by the WebUI chat gate'
       : 'no active model is listed by /v1/models'
   console.log(`ℹ chat completion skipped because ${reason}; frontend should keep chat disabled${allowGuardedChat ? ' until a QA-only guarded chat rerun is requested' : ''}`)

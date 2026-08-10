@@ -22,6 +22,7 @@
     "smoke:ui": "node scripts/ui-regression-smoke.mjs",
     "smoke:ghost-moe-execution": "node scripts/ghost-moe-execution-plan-smoke.mjs",
     "smoke:streaming": "node scripts/streaming-parser-smoke.mjs",
+    "smoke:harness": "node scripts/smoke-harness-self-test.mjs",
     "smoke:capability-readiness": "node scripts/capability-readiness-smoke.mjs",
     "smoke:observatory": "node scripts/observatory-smoke.mjs",
     "smoke:workspace": "node scripts/workspace-agent-smoke.mjs",

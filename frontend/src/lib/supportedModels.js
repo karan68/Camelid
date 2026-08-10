@@ -87,6 +87,15 @@ export const SUPPORTED_MODELS = [
     blurb: 'Strong at reasoning, coding, and following detailed instructions.',
   },
   {
+    catalog_id: 'lfm2_5_2_6b_q8_0',
+    name: 'LFM2.5 2.6B',
+    repo_id: 'LiquidAI/LFM2.5-2.6B-GGUF',
+    filename: 'LFM2.5-2.6B-Q8_0.gguf',
+    size_bytes: 2874779456,
+    quant: 'Q8_0',
+    blurb: 'A compact hybrid chat model with a fast local runnable lane.',
+  },
+  {
     catalog_id: 'qwen3_0_6b_instruct_q8_0',
     name: 'Qwen3 0.6B',
     repo_id: 'Qwen/Qwen3-0.6B-GGUF',

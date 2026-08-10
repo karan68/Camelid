@@ -72,8 +72,8 @@ use crate::{
     model_default,
     model_source::{inspect_model_source, ModelSourceInspection, ModelSourceKind},
     receipt::{
-        self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
-        RECEIPT_SCHEMA_V1,
+        self, ExecutionLane, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult,
+        ReferenceIdentity, RECEIPT_SCHEMA_V1,
     },
     telemetry,
     tensor::{parse_byte_count_env, CpuTensor, Q8_0Block, TensorStore},
@@ -849,6 +849,7 @@ pub struct ChatCompletionRequest {
     /// Opt-in: attach a parity receipt to the (non-streaming) response. The
     /// receipt is a claim of output for the verifier to check â€” no reference
     /// runs here, so its parity block is emitted as not-compared.
+    #[serde(alias = "include_receipt")]
     pub camelid_receipt: Option<bool>,
     /// Opt-in gemma4 thinking mode: renders the reference's enable_thinking
     /// template (system turn opens with the `<|think|>` token). Thinking
@@ -4959,7 +4960,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke after tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, a checked exact 512-token chat bucket, and current-head API/WebUI/SSE smoke; tools, sampling beyond greedy, adjacent files, and broader context remain unclaimed. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -4982,7 +4983,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist; exact LFM2.5-2.6B Q8_0 adds tokenizer/template and 96/96 short greedy parity, native runnable-chat receipts, checked 512-token chat parity, and API/WebUI/SSE smoke. These are exact bounded-pack or checked-smoke lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
             SupportItem {
                 id: "Q4_K_M/Q5_K_M/Q3_K_M",
@@ -5052,6 +5053,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "mistral_instruct_exact_7b_v0_3_q8_0",
                 status: "supported_exact_row_smoke_lane",
                 notes: "exact Mistral-7B-Instruct-v0.3 Q8_0 has row-specific smoke support: tokenizer/template, deterministic and broader 50-token parity, checked bounded 512/1024/2048/4096/8192-context packs, GPU-vs-CPU greedy parity on the exact row, and a support-promotion API/WebUI smoke bundle. Exact row only; broader Mistral-family, other quants, model-native context, and full support are not implied.",
+            },
+            SupportItem {
+                id: "lfm2_5_exact_2_6b_q8_0",
+                status: "supported_exact_row_smoke_lane",
+                notes: "exact LFM2.5-2.6B-Q8_0.gguf only (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757): tokenizer/template and 96/96 short greedy parity against pinned llama.cpp, native runnable-chat receipts, exact 512-token chat parity, 128-token SSE with terminal usage, and Models-page exact-identity smoke. Tools fail closed; sampling beyond greedy, context above 512, neighboring LFM2 files/quants, CUDA, and broad-family support are not implied.",
             },
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
@@ -6396,6 +6402,174 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_output: "CMLD-M7B",
                 evidence: "exact tokenizer/template, deterministic 1-token/5-token, broader 50-token, and bounded 512/1024/2048/4096/8192 context evidence are green, GPU-vs-CPU greedy continuations match token-for-token on this exact row, and a support-promotion API/WebUI smoke bundle (qa/evidence-bundles/mistral-7b-v0.3-q8-support-promotion-*) records the promoted contract surface",
                 next_step: "repeat the current-head promotion smoke on contract-affecting changes; broader/full support still needs separate proof",
+            },
+            ModelCompatibilityTarget {
+                id: "mistral_nemo_instruct_2407_q4_k_m",
+                tool_capable: false,
+                family: "mistral",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_hold",
+                support_scope: "catalog_download_and_bounded_runtime_validation_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "the Metal and deterministic CPU K-quant lanes diverge after a five-token common prefix, the installed llama.cpp comparator exits 139 while loading this 12B artifact, and row-specific chat-template/API/WebUI/context/portability evidence is missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_39_case_tekken_oracle",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_on_metal_and_cpu",
+                parity_audited: "hold_cross_backend_divergence_at_generated_index_5_external_oracle_unavailable",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "not_started",
+                frontend_readiness_gate: "fail-closed: catalog availability is not support; chat remains experimental until row-specific template and generation parity plus API/WebUI evidence pass",
+                tested_context: "six_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "mistral_instruct_candidate_not_row_fixture_locked",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_admission_tokenizer_and_cross_backend_runtime_smoke",
+                latest_checked_result: "partial_pass_hold",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact public file Mistral-Nemo-Instruct-2407.Q4_K_M.gguf at immutable revision eba4e7492de28b8ab2ff44b0bb819004181b3db4 (sha256 5964f3e6d9c17b99e3d2174022048f3ec58b12ee8fefa987888e0562d070d52e, 7477204928 B) passes whole-file admission and all committed Tekken tokenizer oracle cases. Camelid Metal and deterministic CPU both generate, but match only the first five greedy tokens before index-5 divergence; installed llama.cpp exits 139 on both attempted load configurations. The cited bundle records the observed summary and explicit hold",
+                next_step: "capture a working pinned llama.cpp oracle, attribute or fix the index-5 backend frontier, fixture-lock the Nemo template, and run chat/API/WebUI smoke before support promotion",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen3_14b_q4_k_m",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_smoke",
+                support_scope: "catalog_download_and_bounded_cross_backend_raw_decode_smoke_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "external llama.cpp generated-token parity, row-specific ChatML/API/WebUI smoke, tool evaluation, bounded context, portability, and normalized performance evidence remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "qwen2_pre_tokenizer_admits_row_specific_oracle_not_run",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_on_metal_and_cpu",
+                parity_audited: "metal_equals_deterministic_cpu_for_8_of_8_raw_greedy_tokens_external_oracle_not_run",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "not_started",
+                frontend_readiness_gate: "fail-closed: catalog availability and internal cross-backend smoke do not satisfy the supported-row frontend gate",
+                tested_context: "five_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled_candidate",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_cross_backend_raw_decode_smoke",
+                latest_checked_result: "pass_active_validation_only",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact official Qwen3-14B-Q4_K_M.gguf at immutable revision 530227a7d994db8eca5ab5ced2fb692b614357fd (sha256 500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0, 9001752960 B) parses as qwen3/qwen2-pre with the standard Qwen3 ChatML template and loads its Q4_K/Q6_K/F32 mix. Metal and deterministic CPU emitted identical text and all 8/8 greedy token ids on the bounded raw prompt; no external-oracle or chat/API claim is made",
+                next_step: "run the existing Qwen3 ChatML 1/5/50 harness against pinned llama.cpp, then add API/WebUI, tool, and bounded-context evidence before support promotion",
+            },
+            ModelCompatibilityTarget {
+                id: "deepseek_r1_0528_qwen3_8b_q4_k_m",
+                tool_capable: false,
+                family: "qwen3_deepseek_r1",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_hold",
+                support_scope: "catalog_download_and_bounded_raw_runtime_validation_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "the native DeepSeek R1 <｜User｜>/<｜Assistant｜> renderer and tool envelope are not implemented, Metal and CPU raw decode diverge at generated index 2, and external-oracle/chat/API/WebUI/context/portability evidence is missing",
+                metadata_parses: "validated",
+                tokenizer_works: "qwen2_pre_tokenizer_admits_row_specific_oracle_not_run",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_raw_on_metal_and_cpu",
+                parity_audited: "hold_cross_backend_divergence_at_generated_index_2_external_oracle_not_run",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "fail_closed_native_template_unimplemented",
+                frontend_readiness_gate: "fail-closed: never borrow Qwen3 ChatML for this file; catalog availability is not chat support",
+                tested_context: "five_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "not_implemented_deepseek_r1_markers",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_metadata_and_cross_backend_raw_decode_smoke",
+                latest_checked_result: "partial_pass_hold",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact unsloth DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf at immutable revision eb48357c179d34dbf515983f798dfb8752a0f261 (sha256 a86349a4180c4e6bb43f874c29c404fa2be3f90b15509bd6d86f697dba724ec1, 5027785216 B) parses as qwen3 with 131072 context/YaRN and loads its Q4_K/Q6_K/F32 mix. Both Camelid lanes execute bounded raw generation, but diverge at generated index 2. Its embedded template is the original R1 marker/tool grammar, not ChatML, so chat remains refused until a dedicated renderer is fixture-locked",
+                next_step: "implement and fixture-lock the native R1 no-tools renderer first, keep tools refused, then resolve the index-2 backend frontier and run external-oracle plus API/WebUI gates",
+            },
+            ModelCompatibilityTarget {
+                id: "lfm2_5_2_6b_q8_0",
+                tool_capable: false,
+                family: "lfm2",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_greedy_runnable_chat_and_512_context_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "tool calling, sampling semantics beyond greedy, context beyond the checked 512-token chat bucket, CUDA and non-Metal GPU lanes, non-Apple-Silicon GPU execution, production throughput, neighboring LFM2 variants/quants, and normalized cross-platform support bundles remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_against_pinned_llamacpp",
+                tensors_load: "validated",
+                generation_runs: "raw_greedy_plus_non_streaming_and_streaming_runnable_chat_smoke",
+                parity_audited: "96_of_96_short_greedy_tokens_plus_tokenizer_template_and_512_chat_context_parity_pass",
+                performance_measured: "macos_m4_measurement_only_not_promoted_as_sla",
+                frontend_load_path_verified: "validated_current_head_windows_models_page_smoke",
+                frontend_readiness_gate: "green only when this exact hash-pinned GGUF row plus Q8_0 quant match /api/capabilities and /api/models/local reports lane_class=supported for the loaded exact bytes",
+                tested_context: "short_raw_and_chat_prompts_plus_exact_512_token_rendered_chat_prompt",
+                chat_template_renderer: "lfm2_5_chatml_open_think",
+                chat_template_shape_pack: "validated_three_shapes",
+                chat_template_shape_pack_id: "lfm2-chat-template-fixture-v1",
+                bounded_context_512_pack: "validated_bounded_pack",
+                bounded_context_512_pack_id: "lfm2-2.6b-q8-phase1-promotion-20260810",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "current_head_api_webui_sse_and_exact_512_chat_context",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/lfm2-2.6b-q8-phase1-promotion-20260810/manifest.json",
+                evidence: "exact LFM2.5-2.6B-Q8_0.gguf bytes (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757, 2874779456 B): tokenizer/template fixtures and 4 prompts x 24 greedy tokens match pinned llama.cpp b9632/acd79d603; native runnable chat emits sealed prompt/generated-token receipts; exact 512-token rendered chat matches the same oracle for 8/8 generated tokens and text; current-head Windows API/WebUI smoke covers non-streaming chat, 128-token SSE with terminal usage, exact local identity, and supported Models-page state",
+                next_step: "run the same normalized promotion bundle on the Mac resident Metal lane; add 1024+ chat context buckets before widening the checked context envelope",
             },
             ModelCompatibilityTarget {
                 id: "qwen3_0_6b_instruct_q8_0",
@@ -8464,6 +8638,153 @@ mod gemma4_template_tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn lfm2_runnable_receipt_opt_in_uses_chat_contract_and_streams_fail_closed() {
+        for field in ["camelid_receipt", "include_receipt"] {
+            let mut wire = serde_json::json!({
+                "model": "lfm2_5_2_6b_q8_0",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 8,
+                "temperature": 0,
+            });
+            wire[field] = serde_json::json!(true);
+            let req: ChatCompletionRequest =
+                serde_json::from_value(wire).expect("receipt opt-in parses");
+            assert_eq!(req.camelid_receipt, Some(true), "alias {field}");
+            let stamp = runnable_receipt_request_stamp(&req)
+                .expect("non-streaming receipt request is valid")
+                .expect("receipt was requested");
+            assert_eq!(stamp.endpoint, "/v1/chat/completions");
+            assert!(stamp.reproducible);
+        }
+
+        let streaming: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "lfm2_5_2_6b_q8_0",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "camelid_receipt": true,
+        }))
+        .expect("streaming receipt request parses");
+        let response = match runnable_receipt_request_stamp(&streaming) {
+            Err(response) => response,
+            Ok(_) => panic!("streaming runnable receipt must fail closed"),
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error")
+                .code,
+            "invalid_request_error"
+        );
+    }
+
+    #[test]
+    fn lfm2_runnable_stream_finish_exposes_ids_and_terminal_usage_is_exact() {
+        let prompt = [124_894, 10, 11, 12];
+        let generated = [20, 124_902, 21, 22];
+        let diagnostics = runnable_generation_diagnostics("lfm2", Some(&prompt), &generated);
+        let finish = runnable_stream_chunk(
+            "lfm2_5_2_6b_q8_0",
+            123,
+            serde_json::json!({}),
+            Some("stop"),
+            Some(diagnostics),
+        );
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(finish["camelid"]["architecture"], "lfm2");
+        assert_eq!(finish["camelid"]["lane"], "runnable");
+        assert_eq!(
+            finish["camelid"]["prompt_token_ids"],
+            serde_json::json!(prompt)
+        );
+        assert_eq!(
+            finish["camelid"]["generated_token_ids"],
+            serde_json::json!(generated)
+        );
+        assert!(finish.get("usage").is_none());
+
+        let usage =
+            runnable_stream_usage_chunk("lfm2_5_2_6b_q8_0", 123, prompt.len(), generated.len());
+        assert_eq!(usage["choices"], serde_json::json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], prompt.len());
+        assert_eq!(usage["usage"]["completion_tokens"], generated.len());
+        assert_eq!(
+            usage["usage"]["total_tokens"],
+            prompt.len() + generated.len()
+        );
+        assert!(usage.get("camelid").is_none());
+    }
+
+    #[test]
+    fn lfm2_runnable_chat_receipt_seals_exact_rendered_execution() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "lfm2_5_2_6b_q8_0",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "camelid_receipt": true,
+        }))
+        .expect("receipt request parses");
+        let stamp = runnable_receipt_request_stamp(&req)
+            .expect("receipt request valid")
+            .expect("receipt requested");
+        let prompt = [124_894, 1, 2, 3];
+        let generated = [4, 5, 6, 7];
+        let receipt = seal_server_receipt(
+            LaneIdentity {
+                model_id: "lfm2_5_2_6b_q8_0".to_string(),
+                gguf_sha256: "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757"
+                    .to_string(),
+                gguf_filename: "LFM2.5-2.6B-Q8_0.gguf".to_string(),
+                quantization: "Q8_0".to_string(),
+                architecture: "lfm2".to_string(),
+                tokenizer_kind: "gpt2_bpe".to_string(),
+                tokenizer_sha256: None,
+                camelid_version: "test".to_string(),
+                camelid_commit: "test".to_string(),
+            },
+            stamp,
+            4,
+            ServerReceiptResult {
+                prompt_token_ids: &prompt,
+                generated_token_ids: &generated,
+                generated_text: "reasoninganswer",
+                completion_tokens: generated.len(),
+                finish_reason: "length",
+            },
+            Some(ExecutionLane::Runnable),
+            None,
+        )
+        .expect("runnable chat receipt seals");
+
+        receipt
+            .verify_self_digest()
+            .expect("sealed digest verifies");
+        assert!(receipt.is_runnable());
+        assert_eq!(receipt.request.endpoint, "/v1/chat/completions");
+        assert_eq!(receipt.result.prompt_token_ids, prompt);
+        assert_eq!(receipt.result.generated_token_ids, generated);
+        assert_eq!(receipt.result.generated_text, "reasoninganswer");
+        assert!(!receipt.parity.compared_against_reference);
+        assert_eq!(receipt.reference.tool, "llama.cpp");
+    }
+
+    #[test]
+    fn lfm2_tools_stay_typed_fail_closed_after_receipt_support() {
+        let response = lfm2_runnable_lane_tools_rejection();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error")
+                .code,
+            "unsupported_tools"
+        );
     }
 
     #[test]
@@ -11043,15 +11364,127 @@ fn runnable_finish_reason(
     }
 }
 
+/// One completed runnable-serve generation. Text prompts retain their exact
+/// token ids so chat diagnostics and opt-in receipts can be replayed against an
+/// oracle. Vision prompts contain projected image embeddings that have no token
+/// id representation, so `prompt_token_ids` is deliberately absent there while
+/// `prompt_token_count` still drives OpenAI usage accounting.
+struct RunnableGenerationResult {
+    text: String,
+    generated_token_ids: Vec<u32>,
+    prompt_token_ids: Option<Vec<u32>>,
+    prompt_token_count: usize,
+}
+
+fn runnable_generation_diagnostics(
+    architecture: &str,
+    prompt_token_ids: Option<&[u32]>,
+    generated_token_ids: &[u32],
+) -> serde_json::Value {
+    let mut diagnostics = serde_json::json!({
+        "generated_token_ids": generated_token_ids,
+        "lane": "runnable",
+        "architecture": architecture,
+    });
+    if let Some(prompt_token_ids) = prompt_token_ids {
+        diagnostics["prompt_token_ids"] = serde_json::json!(prompt_token_ids);
+    }
+    diagnostics
+}
+
+fn runnable_stream_chunk(
+    model_id: &str,
+    created: u64,
+    delta: serde_json::Value,
+    finish_reason: Option<&str>,
+    camelid: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut chunk = serde_json::json!({
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+    });
+    if let Some(camelid) = camelid {
+        chunk["camelid"] = camelid;
+    }
+    chunk
+}
+
+fn runnable_stream_usage_chunk(
+    model_id: &str,
+    created: u64,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+/// Apply the same receipt request contract as dense chat before the runnable
+/// bridge short-circuits the common handler. Receipts describe one completed,
+/// non-streaming choice; asking for one on an SSE or multi-choice request must
+/// fail explicitly rather than being silently ignored.
+fn runnable_receipt_request_stamp(
+    req: &ChatCompletionRequest,
+) -> std::result::Result<Option<ReceiptRequestStamp>, Box<Response>> {
+    if !req.camelid_receipt.unwrap_or(false) {
+        return Ok(None);
+    }
+    if req.stream.unwrap_or(false) {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with stream:true; receipts record one complete non-streaming generation".to_string(),
+            Some("camelid_receipt"),
+        )));
+    }
+    if req.n.unwrap_or(1) > 1 {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with n greater than 1; a receipt records one complete generation".to_string(),
+            Some("camelid_receipt"),
+        )));
+    }
+    receipt_request_stamp(req).map(Some)
+}
+
+fn runnable_vision_receipt_rejection() -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "camelid_receipt is not supported with image input because projected image embeddings have no replayable prompt token ids"
+            .to_string(),
+        Some("camelid_receipt"),
+    )
+}
+
 /// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
 /// ChatML prompt (with tools when present), greedy-generate to EOG, split the
 /// `<think>` reasoning, and lift `<function=â€¦>` tool calls into structured `tool_calls`
 /// (the content keeps the tool-call text so the agent's client-side parser also lifts).
 async fn runnable_chat_nonstreaming(
+    state: &AppState,
     id: String,
     runtime: Arc<RunnableServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
+    let receipt_stamp = match runnable_receipt_request_stamp(req) {
+        Ok(stamp) => stamp,
+        Err(response) => return *response,
+    };
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
@@ -11105,6 +11538,9 @@ async fn runnable_chat_nonstreaming(
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
+    if receipt_stamp.is_some() && matches!(&prepared, RunnablePreparedPrompt::Vision { .. }) {
+        return runnable_vision_receipt_rejection();
+    }
     let sampling = match runnable_sampling_config(req) {
         Ok(config) => config,
         Err(response) => return response,
@@ -11114,8 +11550,14 @@ async fn runnable_chat_nonstreaming(
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
-            rt.generate_greedy(&prompt_ids, max_tokens, &sampling)
-                .map(|(text, ids)| (text, ids, prompt_token_count))
+            rt.generate_greedy(&prompt_ids, max_tokens, &sampling).map(
+                |(text, generated_token_ids)| RunnableGenerationResult {
+                    text,
+                    generated_token_ids,
+                    prompt_token_ids: Some(prompt_ids),
+                    prompt_token_count,
+                },
+            )
         }
         RunnablePreparedPrompt::Vision {
             prefix,
@@ -11123,18 +11565,32 @@ async fn runnable_chat_nonstreaming(
             suffix,
             min_image_tokens,
             max_image_tokens,
-        } => rt.generate_vision_greedy(
-            &prefix,
-            &image_bytes,
-            &suffix,
-            min_image_tokens,
-            max_image_tokens,
-            max_tokens,
-            &sampling,
-        ),
+        } => rt
+            .generate_vision_greedy(
+                &prefix,
+                &image_bytes,
+                &suffix,
+                min_image_tokens,
+                max_image_tokens,
+                max_tokens,
+                &sampling,
+            )
+            .map(
+                |(text, generated_token_ids, prompt_token_count)| RunnableGenerationResult {
+                    text,
+                    generated_token_ids,
+                    prompt_token_ids: None,
+                    prompt_token_count,
+                },
+            ),
     })
     .await;
-    let (text, ids, prompt_token_count) = match result {
+    let RunnableGenerationResult {
+        text,
+        generated_token_ids: ids,
+        prompt_token_ids,
+        prompt_token_count,
+    } = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             return api_error(
@@ -11158,7 +11614,7 @@ async fn runnable_chat_nonstreaming(
     // detokenization strips, so the text search below can never find it and the
     // whole think block would land in `content`.
     let (reasoning, content) = if runtime.architecture == "bitnet-b1.58" {
-        (None, text)
+        (None, text.clone())
     } else {
         split_think_by_token(&ids, &runtime.tokenizer).unwrap_or_else(|| split_ornith_think(&text))
     };
@@ -11183,6 +11639,22 @@ async fn runnable_chat_nonstreaming(
         Vec::new()
     };
     let finish_reason = runnable_finish_reason(!tool_calls.is_empty(), ids.len(), max_tokens);
+    let camelid_receipt = match (receipt_stamp, prompt_token_ids.as_deref()) {
+        (Some(stamp), Some(prompt_token_ids)) => {
+            build_runnable_server_receipt(
+                state,
+                &id,
+                stamp,
+                max_tokens as u32,
+                prompt_token_ids,
+                &ids,
+                &text,
+                finish_reason,
+            )
+            .await
+        }
+        _ => None,
+    };
 
     let mut message = serde_json::json!({ "role": "assistant", "content": content });
     if let Some(r) = reasoning {
@@ -11191,7 +11663,12 @@ async fn runnable_chat_nonstreaming(
     if !tool_calls.is_empty() {
         message["tool_calls"] = serde_json::Value::Array(tool_calls);
     }
-    let body = serde_json::json!({
+    let diagnostics = runnable_generation_diagnostics(
+        runtime.architecture.as_str(),
+        prompt_token_ids.as_deref(),
+        &ids,
+    );
+    let mut body = serde_json::json!({
         "id": "chatcmpl-runnable",
         "object": "chat.completion",
         "created": unix_secs(),
@@ -11202,16 +11679,14 @@ async fn runnable_chat_nonstreaming(
             "completion_tokens": ids.len(),
             "total_tokens": prompt_token_count + ids.len(),
         },
-        // Lane is the neutral "runnable" (the bridge serves qwen35, gemma2, and
-        // gemma3); the actual model architecture is disclosed separately so the
-        // label never misreports one arch as another (matches the parity-artifact
-        // shape in tests/runnable_parity.rs).
-        "camelid": {
-            "generated_token_ids": ids,
-            "lane": "runnable",
-            "architecture": runtime.architecture.as_str(),
-        },
+        // Lane is the neutral "runnable" (the bridge serves several
+        // architectures); prompt and generated ids make this exact run
+        // independently replayable without pretending it is a support claim.
+        "camelid": diagnostics,
     });
+    if let Some(receipt) = camelid_receipt {
+        body["camelid_receipt"] = serde_json::json!(receipt);
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
@@ -11231,6 +11706,9 @@ async fn runnable_chat_streaming(
     runtime: Arc<RunnableServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
+    if let Err(response) = runnable_receipt_request_stamp(req) {
+        return *response;
+    }
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
@@ -11306,7 +11784,7 @@ async fn runnable_chat_streaming(
 
     enum StreamItem {
         Token(u32),
-        Done(String, Vec<u32>, usize),
+        Done(RunnableGenerationResult),
         Fail(String),
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
@@ -11330,7 +11808,12 @@ async fn runnable_chat_streaming(
                         }
                     },
                 )
-                .map(|(text, ids)| (text, ids, prompt_token_count))
+                .map(|(text, generated_token_ids)| RunnableGenerationResult {
+                    text,
+                    generated_token_ids,
+                    prompt_token_ids: Some(prompt_ids),
+                    prompt_token_count,
+                })
             }
             RunnablePreparedPrompt::Vision {
                 prefix,
@@ -11338,24 +11821,33 @@ async fn runnable_chat_streaming(
                 suffix,
                 min_image_tokens,
                 max_image_tokens,
-            } => rt.generate_vision_greedy_streaming(
-                &prefix,
-                &image_bytes,
-                &suffix,
-                min_image_tokens,
-                max_image_tokens,
-                max_tokens,
-                &sampling,
-                |tok| {
-                    if send_tx.send(StreamItem::Token(tok)).is_err() {
-                        worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                },
-            ),
+            } => rt
+                .generate_vision_greedy_streaming(
+                    &prefix,
+                    &image_bytes,
+                    &suffix,
+                    min_image_tokens,
+                    max_image_tokens,
+                    max_tokens,
+                    &sampling,
+                    |tok| {
+                        if send_tx.send(StreamItem::Token(tok)).is_err() {
+                            worker_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    },
+                )
+                .map(
+                    |(text, generated_token_ids, prompt_token_count)| RunnableGenerationResult {
+                        text,
+                        generated_token_ids,
+                        prompt_token_ids: None,
+                        prompt_token_count,
+                    },
+                ),
         };
         match result {
-            Ok((text, ids, prompt_token_count)) => {
-                let _ = tx.send(StreamItem::Done(text, ids, prompt_token_count));
+            Ok(result) => {
+                let _ = tx.send(StreamItem::Done(result));
             }
             Err(e) => {
                 let _ = tx.send(StreamItem::Fail(e.to_string()));
@@ -11368,17 +11860,17 @@ async fn runnable_chat_streaming(
     let events = async_stream::stream! {
         // Keep the guard owned by the response body for its full lifetime.
         let _disconnect_guard = disconnect_guard;
-        let chunk = |delta: serde_json::Value, finish: Option<&str>| {
-            serde_json::json!({
-                "id": "chatcmpl-runnable",
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": id,
-                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
-            })
-        };
         yield Ok::<Event, std::convert::Infallible>(
-            Event::default().data(chunk(serde_json::json!({ "role": "assistant" }), None).to_string()),
+            Event::default().data(
+                runnable_stream_chunk(
+                    &id,
+                    created,
+                    serde_json::json!({ "role": "assistant" }),
+                    None,
+                    None,
+                )
+                .to_string(),
+            ),
         );
 
         // Per-phase incremental decode state. `emitted` counts bytes of the phase's
@@ -11395,7 +11887,7 @@ async fn runnable_chat_streaming(
         let mut phase_ids: Vec<u32> = Vec::new();
         let mut emitted = 0usize;
         let mut seen_visible = false;
-        type RunnableStreamResult = std::result::Result<(String, Vec<u32>, usize), String>;
+        type RunnableStreamResult = std::result::Result<RunnableGenerationResult, String>;
         let mut final_state: Option<RunnableStreamResult> = None;
 
         while let Some(item) = rx.recv().await {
@@ -11446,10 +11938,12 @@ async fn runnable_chat_streaming(
                         }
                         serde_json::json!({ "content": delta_text })
                     };
-                    yield Ok(Event::default().data(chunk(delta, None).to_string()));
+                    yield Ok(Event::default().data(
+                        runnable_stream_chunk(&id, created, delta, None, None).to_string(),
+                    ));
                 }
-                StreamItem::Done(text, ids, prompt_token_count) => {
-                    final_state = Some(Ok((text, ids, prompt_token_count)));
+                StreamItem::Done(result) => {
+                    final_state = Some(Ok(result));
                     break;
                 }
                 StreamItem::Fail(e) => {
@@ -11460,7 +11954,12 @@ async fn runnable_chat_streaming(
         }
 
         match final_state {
-            Some(Ok((text, ids, prompt_token_count))) => {
+            Some(Ok(RunnableGenerationResult {
+                text,
+                generated_token_ids: ids,
+                prompt_token_ids,
+                prompt_token_count,
+            })) => {
                 let content = if bitnet_stream {
                     text
                 } else {
@@ -11484,27 +11983,49 @@ async fn runnable_chat_streaming(
                         })
                         .collect();
                     yield Ok(Event::default().data(
-                        chunk(serde_json::json!({ "tool_calls": deltas }), None).to_string(),
+                        runnable_stream_chunk(
+                            &id,
+                            created,
+                            serde_json::json!({ "tool_calls": deltas }),
+                            None,
+                            None,
+                        )
+                        .to_string(),
                     ));
                 } else if parse_stream_tool_calls && !content.is_empty() {
                     yield Ok(Event::default().data(
-                        chunk(serde_json::json!({ "content": content }), None).to_string(),
+                        runnable_stream_chunk(
+                            &id,
+                            created,
+                            serde_json::json!({ "content": content }),
+                            None,
+                            None,
+                        )
+                        .to_string(),
                     ));
                 }
-                yield Ok(Event::default().data(chunk(serde_json::json!({}), Some(finish)).to_string()));
+                let diagnostics = runnable_generation_diagnostics(
+                    runtime.architecture.as_str(),
+                    prompt_token_ids.as_deref(),
+                    &ids,
+                );
+                yield Ok(Event::default().data(
+                    runnable_stream_chunk(
+                        &id,
+                        created,
+                        serde_json::json!({}),
+                        Some(finish),
+                        Some(diagnostics),
+                    )
+                    .to_string(),
+                ));
                 if include_usage {
-                    let usage = serde_json::json!({
-                        "id": "chatcmpl-runnable",
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": id,
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": prompt_token_count,
-                            "completion_tokens": ids.len(),
-                            "total_tokens": prompt_token_count + ids.len(),
-                        },
-                    });
+                    let usage = runnable_stream_usage_chunk(
+                        &id,
+                        created,
+                        prompt_token_count,
+                        ids.len(),
+                    );
                     yield Ok(Event::default().data(usage.to_string()));
                 }
             }
@@ -13462,17 +13983,7 @@ async fn llama_server_apply_template(
         false,
     ) {
         Ok(rendered) => rendered,
-        Err(err) => {
-            return api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_chat_template",
-                format!(
-                    "chat template rendering failed for loaded model {:?}: {err}",
-                    model.id
-                ),
-                Some("messages"),
-            )
-        }
+        Err(err) => return unsupported_chat_template_response(&model.id, &err),
     };
 
     (
@@ -14142,7 +14653,7 @@ async fn chat_completions(
             if req.stream.unwrap_or(false) {
                 return runnable_chat_streaming(id, runtime, &req).await;
             }
-            return runnable_chat_nonstreaming(id, runtime, &req).await;
+            return runnable_chat_nonstreaming(&state, id, runtime, &req).await;
         }
         Ok(None) => {}
         Err(resp) => return resp,
@@ -14571,6 +15082,80 @@ fn stop_spec_to_vec(stop: Option<&StopSpec>) -> Vec<String> {
 /// reference engine runs here, so the parity block is emitted not-compared:
 /// the receipt is a claim of output that `camelid verify-receipt` checks
 /// independently. It is not a support promotion for the lane.
+struct ServerReceiptResult<'a> {
+    prompt_token_ids: &'a [u32],
+    generated_token_ids: &'a [u32],
+    generated_text: &'a str,
+    completion_tokens: usize,
+    finish_reason: &'a str,
+}
+
+fn seal_server_receipt(
+    lane: LaneIdentity,
+    stamp: ReceiptRequestStamp,
+    effective_max_tokens: u32,
+    generated: ServerReceiptResult<'_>,
+    execution_lane: Option<ExecutionLane>,
+    execution_trace: Option<receipt::ExecutionTraceBlock>,
+) -> std::result::Result<ParityReceipt, receipt::ReceiptError> {
+    let mut receipt = ParityReceipt {
+        schema: RECEIPT_SCHEMA_V1.to_string(),
+        receipt_id: String::new(),
+        created_utc: receipt::rfc3339_utc_now(),
+        lane,
+        reference: ReferenceIdentity {
+            tool: "llama.cpp".to_string(),
+            binary: "llama-server".to_string(),
+            version: None,
+            commit: None,
+        },
+        request: receipt::ReceiptRequest {
+            endpoint: stamp.endpoint.to_string(),
+            messages_or_prompt: stamp.messages_or_prompt,
+            max_tokens: effective_max_tokens,
+            temperature: stamp.temperature,
+            top_p: stamp.top_p,
+            top_k: stamp.top_k,
+            seed: stamp.seed,
+            stop: stamp.stop,
+            response_format: stamp.response_format,
+        },
+        reproducible: stamp.reproducible,
+        result: ReceiptResult {
+            prompt_token_ids: generated.prompt_token_ids.to_vec(),
+            generated_token_ids: generated.generated_token_ids.to_vec(),
+            generated_text: generated.generated_text.to_string(),
+            completion_tokens: generated.completion_tokens as u32,
+            finish_reason: generated.finish_reason.to_string(),
+        },
+        parity: ParityBlock::not_compared(),
+        execution_lane,
+        execution_trace,
+        quality_tier: None,
+        signature: None,
+    };
+    receipt.seal()?;
+    Ok(receipt)
+}
+
+fn publish_server_receipt(
+    sealed: std::result::Result<ParityReceipt, receipt::ReceiptError>,
+) -> Option<ParityReceipt> {
+    let receipt = match sealed {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to seal camelid_receipt; omitting receipt");
+            return None;
+        }
+    };
+    telemetry::emit(telemetry::Event::ReceiptWritten {
+        receipt_id: receipt.receipt_id.clone(),
+        reproducible: receipt.reproducible,
+        gguf_sha256: Some(receipt.lane.gguf_sha256.clone()),
+    });
+    Some(receipt)
+}
+
 async fn build_server_receipt(
     state: &AppState,
     model_id: &str,
@@ -14596,54 +15181,58 @@ async fn build_server_receipt(
                 generated.generated_token_ids.len(),
             )
         });
-    let mut receipt = ParityReceipt {
-        schema: RECEIPT_SCHEMA_V1.to_string(),
-        receipt_id: String::new(),
-        created_utc: receipt::rfc3339_utc_now(),
+    publish_server_receipt(seal_server_receipt(
         lane,
-        reference: ReferenceIdentity {
-            tool: "llama.cpp".to_string(),
-            binary: "llama-server".to_string(),
-            version: None,
-            commit: None,
+        stamp,
+        effective_max_tokens,
+        ServerReceiptResult {
+            prompt_token_ids: &generated.prompt_token_ids,
+            generated_token_ids: &generated.generated_token_ids,
+            generated_text: &generated.text,
+            completion_tokens: generated.completion_tokens,
+            finish_reason: generated.finish_reason,
         },
-        request: receipt::ReceiptRequest {
-            endpoint: stamp.endpoint.to_string(),
-            messages_or_prompt: stamp.messages_or_prompt,
-            max_tokens: effective_max_tokens,
-            temperature: stamp.temperature,
-            top_p: stamp.top_p,
-            top_k: stamp.top_k,
-            seed: stamp.seed,
-            stop: stamp.stop,
-            response_format: stamp.response_format,
-        },
-        reproducible: stamp.reproducible,
-        result: ReceiptResult {
-            prompt_token_ids: generated.prompt_token_ids.clone(),
-            generated_token_ids: generated.generated_token_ids.clone(),
-            generated_text: generated.text.clone(),
-            completion_tokens: generated.completion_tokens as u32,
-            finish_reason: generated.finish_reason.to_string(),
-        },
-        parity: ParityBlock::not_compared(),
-        // This is the supported-lane serving path; leave the lane absent (= supported,
-        // the legacy default) so existing receipts keep their exact digests.
-        execution_lane: None,
+        // This is the supported-lane serving path; leave the lane absent (=
+        // supported, the legacy default) so existing receipts keep their exact
+        // digests.
+        None,
         execution_trace,
-        quality_tier: None,
-        signature: None,
+    ))
+}
+
+/// Runnable chat uses the same sealed receipt body as dense chat, but binds the
+/// runnable execution marker into the digest. That marker is required even for
+/// an exact supported catalog row: it describes HOW this request executed and
+/// never widens the support contract on its own.
+#[allow(clippy::too_many_arguments)]
+async fn build_runnable_server_receipt(
+    state: &AppState,
+    model_id: &str,
+    stamp: ReceiptRequestStamp,
+    effective_max_tokens: u32,
+    prompt_token_ids: &[u32],
+    generated_token_ids: &[u32],
+    generated_text: &str,
+    finish_reason: &str,
+) -> Option<ParityReceipt> {
+    let lane = {
+        let models = state.loaded_models.read().await;
+        models.get(model_id)?.lane.clone()
     };
-    if let Err(err) = receipt.seal() {
-        tracing::warn!(error = %err, "failed to seal camelid_receipt; omitting receipt");
-        return None;
-    }
-    telemetry::emit(telemetry::Event::ReceiptWritten {
-        receipt_id: receipt.receipt_id.clone(),
-        reproducible: receipt.reproducible,
-        gguf_sha256: Some(receipt.lane.gguf_sha256.clone()),
-    });
-    Some(receipt)
+    publish_server_receipt(seal_server_receipt(
+        lane,
+        stamp,
+        effective_max_tokens,
+        ServerReceiptResult {
+            prompt_token_ids,
+            generated_token_ids,
+            generated_text,
+            completion_tokens: generated_token_ids.len(),
+            finish_reason,
+        },
+        Some(ExecutionLane::Runnable),
+        None,
+    ))
 }
 
 /// Outcome of an in-process deterministic replay for `verify-receipt`.
@@ -15488,17 +16077,7 @@ async fn prepare_generation(
                     req.camelid_enable_thinking.unwrap_or(false),
                 ),
             }
-            .map_err(|err| {
-                api_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "unsupported_chat_template",
-                    format!(
-                        "chat template rendering failed for loaded model {:?}: {err}",
-                        model.id
-                    ),
-                    Some("messages"),
-                )
-            })?;
+            .map_err(|err| unsupported_chat_template_response(&model.id, &err))?;
             let mut token_ids = tokenizer
                 .encode(
                     &rendered_prompt.text,
@@ -19460,6 +20039,15 @@ fn render_chat_prompt_for_tokenization(
     render_chat_prompt_for_tokenization_for_model(messages, tokenizer, None)
 }
 
+fn unsupported_chat_template_response(model_id: &str, err: &MiniJinjaError) -> Response {
+    api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_chat_template",
+        format!("chat template rendering failed for loaded model {model_id:?}: {err}"),
+        Some("messages"),
+    )
+}
+
 fn render_chat_prompt_for_tokenization_for_model_result(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
@@ -19469,6 +20057,17 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     let exact_llama32_metadata_jinja_row =
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        // DeepSeek-R1-0528-Qwen3 declares qwen3 tensors but embeds its own
+        // full-width marker grammar. Refuse before metadata Jinja, ChatML, or
+        // the generic fallback can silently present a foreign prompt.
+        if is_deepseek_r1_native_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the loaded model uses the native DeepSeek R1 marker template; its no-tools \
+                 renderer is not implemented or fixture-locked, so chat fails closed instead \
+                 of borrowing Qwen3 ChatML or the generic role-colon renderer",
+            ));
+        }
         if metadata_chat_template_enabled() {
             return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
         }
@@ -19537,6 +20136,13 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        if is_deepseek_r1_native_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the native DeepSeek R1 tool envelope is not implemented or certified; tool \
+                 requests fail closed",
+            ));
+        }
         if is_smollm3_dynamic_chat_template(template) {
             return Err(MiniJinjaError::new(
                 MiniJinjaErrorKind::InvalidOperation,
@@ -20253,6 +20859,15 @@ fn is_qwen2_chatml_template(template: &str) -> bool {
 /// rendered by [`render_qwen3_chatml_prompt`] instead.
 fn is_qwen3_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>") && template.contains("<|im_end|>")
+}
+
+/// DeepSeek-R1-0528-Qwen3's native marker grammar. These full-width markers
+/// distinguish the row from Qwen3 ChatML even though both use the qwen3 tensor
+/// architecture and qwen2 BPE pre-tokenizer.
+fn is_deepseek_r1_native_chat_template(template: &str) -> bool {
+    template.contains("<｜begin▁of▁sentence｜>")
+        && template.contains("<｜User｜>")
+        && template.contains("<｜Assistant｜>")
 }
 
 /// Phi-4's compact marker template keeps every role marker adjacent to content:
@@ -22755,6 +23370,10 @@ mod tests {
             classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q8_0.gguf"),
             ModelLaneClass::Supported,
         );
+        assert_eq!(
+            classify_model_lane(Some("lfm2"), "LFM2.5-2.6B-Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
         // Non-catalog allowlisted artifact of a supported row (in-house requant
         // with no HF catalog source) â†’ Supported.
         assert_eq!(
@@ -22938,6 +23557,7 @@ mod tests {
             "Llama-3.2-1B-Instruct-IQ4_XS.gguf",
             "gemma-3-1b-it-Q8_0.gguf",
             "Qwen3-4B-Q4_K_M.gguf",
+            "LFM2.5-2.6B-Q8_0.gguf",
             "ornith-1.0-9b-Q8_0.gguf",
             "ornith-1.0-9b-Q4_K_M.gguf",
             "ornith-1.0-9b-Q3_K_M.gguf",
@@ -23390,6 +24010,7 @@ mod tests {
                 // within 1e-4. Raw-completion smoke only. See qa/iquant/ receipt.
                 "llama3_2_1b_instruct_iq4_xs",
                 "llama3_8b_instruct_q8_0",
+                "lfm2_5_2_6b_q8_0",
                 "mistral_7b_instruct_v0_3_q8_0",
                 // Nomic v1.5 Q8_0 bidirectional encoder: exact-row embeddings,
                 // embedding-similarity reranking, and Workspace semantic retrieval.
@@ -23435,6 +24056,7 @@ mod tests {
             BTreeSet::from([
                 "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 "llama_spm_decoder",
+                "lfm2_5_exact_2_6b_q8_0",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
                 "nomic_bert_encoder_exact_v1_5_q8_0",
                 "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
@@ -26456,6 +27078,68 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_r1_native_template_is_a_typed_422_for_chat_and_tools() {
+        let _guard = crate::test_support::env_lock();
+        let template = "{{ bos_token }}<｜begin▁of▁sentence｜>{% for message in messages %}{% if message['role'] == 'user' %}<｜User｜>{{ message['content'] }}{% else %}<｜Assistant｜>{{ message['content'] }}{% endif %}{% endfor %}";
+        assert!(is_deepseek_r1_native_chat_template(template));
+        assert!(!is_qwen3_chatml_template(template));
+        let tokenizer = llama3_tokenizer_with_template(template);
+        let messages = [ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        for metadata_renderer in [false, true] {
+            if metadata_renderer {
+                std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
+            } else {
+                std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+            }
+            let err = render_chat_prompt_for_tokenization_for_model_result(
+                &messages,
+                &tokenizer,
+                Some("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M"),
+                false,
+            )
+            .expect_err("native DeepSeek R1 chat must fail closed");
+            assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+            assert!(err
+                .to_string()
+                .contains("native DeepSeek R1 marker template"));
+            let response =
+                unsupported_chat_template_response("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M", &err);
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let details = response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error details");
+            assert_eq!(details.code, "unsupported_chat_template");
+        }
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+
+        let tools = [serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {}}
+        })];
+        let err = render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, &tools)
+            .expect_err("native DeepSeek R1 tools must fail closed");
+        assert!(err.to_string().contains("native DeepSeek R1 tool envelope"));
+        let response = unsupported_chat_template_response("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M", &err);
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ApiErrorDetails>()
+                .expect("typed API error details")
+                .code,
+            "unsupported_chat_template"
+        );
+    }
+
+    #[test]
     fn metadata_jinja_renderer_reports_undefined_variables_as_unsupported() {
         let _guard = crate::test_support::env_lock();
         std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
@@ -27733,6 +28417,32 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["general", "coding"],
         },
         CatalogItem {
+            catalog_id: "mistral_nemo_instruct_2407_q4_k_m",
+            name: "Mistral Nemo Instruct 2407 Q4_K_M (validation hold)",
+            repo_id: "MaziyarPanahi/Mistral-Nemo-Instruct-2407-GGUF",
+            filename: "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+            size_bytes: 7_477_204_928,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
+            architecture: "llama",
+            license: "apache-2.0",
+            task_tags: &["general", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "lfm2_5_2_6b_q8_0",
+            name: "LFM2.5 2.6B Q8_0",
+            repo_id: "LiquidAI/LFM2.5-2.6B-GGUF",
+            filename: "LFM2.5-2.6B-Q8_0.gguf",
+            size_bytes: 2_874_779_456,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "lfm2",
+            license: "LFM Open License v1.0",
+            task_tags: &["general", "reasoning"],
+        },
+        CatalogItem {
             catalog_id: "qwen3_0_6b_instruct_q8_0",
             name: "Qwen3 0.6B Q8_0",
             repo_id: "Qwen/Qwen3-0.6B-GGUF",
@@ -27805,6 +28515,19 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "qwen3",
+            license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "qwen3_14b_q4_k_m",
+            name: "Qwen3 14B Q4_K_M (active validation)",
+            repo_id: "Qwen/Qwen3-14B-GGUF",
+            filename: "Qwen3-14B-Q4_K_M.gguf",
+            size_bytes: 9_001_752_960,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
             architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["reasoning", "coding"],
@@ -27910,6 +28633,19 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen25",
             license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "deepseek_r1_0528_qwen3_8b_q4_k_m",
+            name: "DeepSeek R1 0528 Qwen3 8B Q4_K_M (validation hold)",
+            repo_id: "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+            filename: "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+            size_bytes: 5_027_785_216,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
+            architecture: "qwen3",
+            license: "mit",
             task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
@@ -29855,6 +30591,10 @@ const CURATED_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
         "Qwen3-4B-Q4_K_M.gguf",
         "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
     ),
+    (
+        "LFM2.5-2.6B-Q8_0.gguf",
+        "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+    ),
 ];
 
 /// Exact Prism model identities proven by the paired Metal/CUDA evidence
@@ -31737,6 +32477,88 @@ mod catalog_fit_tests {
             assert!(super::supported_compatibility_row_ids().contains(id));
             assert!(super::filename_is_supported_exact_row(filename));
         }
+    }
+
+    #[test]
+    fn catchup_catalog_rows_keep_their_exact_evidence_boundaries() {
+        let capabilities = super::capabilities_response();
+        let expected = [
+            (
+                "mistral_nemo_instruct_2407_q4_k_m",
+                "MaziyarPanahi/Mistral-Nemo-Instruct-2407-GGUF",
+                "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+                7_477_204_928,
+                "llama",
+                false,
+            ),
+            (
+                "qwen3_14b_q4_k_m",
+                "Qwen/Qwen3-14B-GGUF",
+                "Qwen3-14B-Q4_K_M.gguf",
+                9_001_752_960,
+                "qwen3",
+                false,
+            ),
+            (
+                "deepseek_r1_0528_qwen3_8b_q4_k_m",
+                "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+                "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+                5_027_785_216,
+                "qwen3",
+                false,
+            ),
+            (
+                "lfm2_5_2_6b_q8_0",
+                "LiquidAI/LFM2.5-2.6B-GGUF",
+                "LFM2.5-2.6B-Q8_0.gguf",
+                2_874_779_456,
+                "lfm2",
+                true,
+            ),
+        ];
+
+        for (id, repo, filename, size, architecture, supported) in expected {
+            let item = row(id);
+            assert_eq!(item.repo_id, repo, "{id} repo");
+            assert_eq!(item.filename, filename, "{id} filename");
+            assert_eq!(item.size_bytes, size, "{id} size");
+            let contract = capabilities
+                .model_compatibility
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .unwrap_or_else(|| panic!("{id} compatibility row"));
+            assert_eq!(
+                contract.status.starts_with("supported"),
+                supported,
+                "{id} support boundary"
+            );
+            assert_eq!(
+                super::classify_model_lane(Some(architecture), filename),
+                if supported {
+                    super::ModelLaneClass::Supported
+                } else {
+                    super::ModelLaneClass::ExperimentalImplemented
+                },
+                "{id} models-page lane"
+            );
+        }
+
+        assert_eq!(
+            super::classify_loaded_model_identity(
+                Some("lfm2"),
+                "LFM2.5-2.6B-Q8_0.gguf",
+                "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+            ),
+            super::ModelLaneClass::Supported
+        );
+        assert_eq!(
+            super::classify_loaded_model_identity(
+                Some("lfm2"),
+                "LFM2.5-2.6B-Q8_0.gguf",
+                &"00".repeat(32),
+            ),
+            super::ModelLaneClass::ExperimentalImplemented
+        );
     }
 
     #[test]

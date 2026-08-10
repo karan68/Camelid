@@ -48,6 +48,10 @@ pub struct VerifyOptions {
     pub mode: VerifyMode,
     pub llama_ctx: u32,
     pub llama_port: u16,
+    pub llama_cache_type_k: Option<String>,
+    pub llama_cache_type_v: Option<String>,
+    pub llama_flash_attn: Option<String>,
+    pub llama_no_repack: bool,
     pub threads: Option<usize>,
 }
 
@@ -512,6 +516,7 @@ fn run_isolated_verify_pass(
                 .arg(reference_ctx.to_string())
                 .arg("--llama-port")
                 .arg(options.llama_port.to_string());
+            cmd.args(llama_numeric_args(options));
         }
     }
     if let Some(threads) = options.threads {
@@ -597,6 +602,27 @@ struct ReferenceServer {
     _child: ChildGuard,
 }
 
+/// Explicit llama.cpp numerical-path flags selected by the verifier caller.
+/// Keeping these absent by default preserves the verifier's historical
+/// behavior; qualification harnesses can pin them when the comparator envelope
+/// requires a specific KV/attention/repacking path.
+fn llama_numeric_args(options: &VerifyOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(cache_type) = &options.llama_cache_type_k {
+        args.extend(["-ctk".to_string(), cache_type.clone()]);
+    }
+    if let Some(cache_type) = &options.llama_cache_type_v {
+        args.extend(["-ctv".to_string(), cache_type.clone()]);
+    }
+    if let Some(flash_attn) = &options.llama_flash_attn {
+        args.extend(["-fa".to_string(), flash_attn.clone()]);
+    }
+    if options.llama_no_repack {
+        args.push("--no-repack".to_string());
+    }
+    args
+}
+
 /// Spawn `llama-server` on the receipt's GGUF and wait until it is healthy.
 /// Called before the in-process Camelid replay loads any weights.
 fn start_reference_server(
@@ -621,20 +647,22 @@ fn start_reference_server(
             options.llama_port
         ));
     }
-    let child = Command::new(&options.llama_server)
-        .args([
-            "--host",
-            host,
-            "--port",
-            &options.llama_port.to_string(),
-            "-m",
-            &options.gguf.display().to_string(),
-            "-ngl",
-            "0",
-            "-c",
-            &options.llama_ctx.to_string(),
-            "--no-warmup",
-        ])
+    let mut command = Command::new(&options.llama_server);
+    command.args([
+        "--host",
+        host,
+        "--port",
+        &options.llama_port.to_string(),
+        "-m",
+        &options.gguf.display().to_string(),
+        "-ngl",
+        "0",
+        "-c",
+        &options.llama_ctx.to_string(),
+        "--no-warmup",
+    ]);
+    command.args(llama_numeric_args(options));
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -959,6 +987,37 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verifier_options() -> VerifyOptions {
+        VerifyOptions {
+            receipt_path: PathBuf::from("receipt.json"),
+            gguf: PathBuf::from("model.gguf"),
+            llama_server: "llama-server".to_string(),
+            mode: VerifyMode::ReferenceOnly,
+            llama_ctx: 640,
+            llama_port: 8243,
+            llama_cache_type_k: None,
+            llama_cache_type_v: None,
+            llama_flash_attn: None,
+            llama_no_repack: false,
+            threads: None,
+        }
+    }
+
+    #[test]
+    fn llama_numeric_args_are_explicit_and_ordered() {
+        let mut options = verifier_options();
+        assert!(llama_numeric_args(&options).is_empty());
+
+        options.llama_cache_type_k = Some("f32".to_string());
+        options.llama_cache_type_v = Some("f32".to_string());
+        options.llama_flash_attn = Some("off".to_string());
+        options.llama_no_repack = true;
+        assert_eq!(
+            llama_numeric_args(&options),
+            ["-ctk", "f32", "-ctv", "f32", "-fa", "off", "--no-repack"]
+        );
+    }
 
     #[test]
     fn first_divergent_index_matches_harness_semantics() {

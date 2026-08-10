@@ -335,6 +335,12 @@ for (const [id, filename, quant] of prismCatalogRows) {
     `${filename} must derive the Models-page Supported lane from its exact capability row`,
   )
 }
+
+const lfmCatalogItem = SUPPORTED_MODELS.find((item) => item.catalog_id === 'lfm2_5_2_6b_q8_0')
+assert.ok(lfmCatalogItem, 'LFM2.5 2.6B Q8_0 must be visible in the frontend curated catalog decoration')
+assert.equal(lfmCatalogItem.filename, 'LFM2.5-2.6B-Q8_0.gguf')
+assert.equal(lfmCatalogItem.size_bytes, 2874779456)
+assert.equal(lfmCatalogItem.quant, 'Q8_0')
 assert.equal(
   isCompatibilitySupportedForModel(prismCapabilityFixture, null, {
     catalog_id: 'ternary_bonsai_8b_pq2_0',
