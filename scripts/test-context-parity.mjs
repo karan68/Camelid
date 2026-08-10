@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   actualTokenGate,
   buildGenerationRequest,
+  buildLongPrompt,
   buildMessages,
   oracleConfig,
   parseArgs,
@@ -47,6 +48,10 @@ assert.deepEqual(buildGenerationRequest({ mode: 'raw', prompt: 'raw prompt', mes
   stream: false,
   camelid_receipt: true,
 })
+
+const longPrompt = buildLongPrompt(739)
+assert.equal(buildLongPrompt(739, '.'), `${longPrompt}.`)
+assert.equal(buildLongPrompt(739, ''), longPrompt)
 
 assert.deepEqual(actualTokenGate(512, '512'), {
   enabled: true,

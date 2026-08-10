@@ -3,7 +3,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { validateRoster } from './check-model-qualification-roster.mjs'
-import { qualify } from './model-qualification-runner.mjs'
+import { resolveHfSource, validateLockAgainstSelection } from './hf-qualification-source.mjs'
+import { deriveOverall, qualify, redactLocalPaths } from './model-qualification-runner.mjs'
 
 function parseArgs(argv) {
   const args = new Map()
@@ -49,7 +50,133 @@ function publicRosterLabel(root, rosterPath) {
   return candidate.split(sep).join('/')
 }
 
-function summarizeReports(reports, gateOrder) {
+function sourceSelectionForRow(row) {
+  return {
+    row_id: row.id,
+    repo: row.source.repo,
+    file: row.source.file,
+    revision: row.source.revision,
+    expected: {
+      size_bytes: row.identity.size_bytes,
+      sha256: row.identity.sha256,
+      license: row.source.license,
+    },
+  }
+}
+
+function sourceLookupErrorCode(error) {
+  const name = typeof error?.name === 'string' ? error.name.toLowerCase() : ''
+  const code = typeof error?.code === 'string' ? error.code.toLowerCase() : ''
+  const message = error instanceof Error ? error.message : String(error)
+  if (name === 'aborterror' || name === 'timeouterror' || ['etimedout', 'esockettimedout'].includes(code)) {
+    return 'timeout'
+  }
+  const httpStatus = /(?:request failed|http)\D*(\d{3})/i.exec(message)?.[1]
+  if (httpStatus) return `http_${httpStatus}`
+  if (/immutable 40-character revision/i.test(message)) return 'missing_immutable_revision'
+  if (/file .* is absent from/i.test(message)) return 'file_not_found_at_revision'
+  if (/positive byte size/i.test(message)) return 'missing_file_size'
+  if (/LFS SHA-256/i.test(message)) return 'missing_lfs_sha256'
+  if (['econnreset', 'econnrefused', 'enotfound', 'eai_again'].includes(code)) return 'network_error'
+  return 'source_lookup_error'
+}
+
+async function resolveSourceStage(row, {
+  resolver = resolveHfSource,
+  token = process.env.HF_TOKEN || null,
+} = {}) {
+  const selected = sourceSelectionForRow(row)
+  const missing = [
+    ['repo', selected.repo],
+    ['file', selected.file],
+    ['revision', selected.revision],
+    ['size_bytes', selected.expected.size_bytes],
+    ['sha256', selected.expected.sha256],
+    ['license', selected.expected.license],
+  ].filter(([, value]) => value === null || value === undefined || value === '')
+    .map(([field]) => field)
+  if (missing.length) {
+    return {
+      status: 'blocked',
+      resolution: 'live_huggingface',
+      reason: `roster source selector is not fully pinned: ${missing.join(', ')}`,
+    }
+  }
+
+  let lock
+  try {
+    lock = await resolver({
+      repo: selected.repo,
+      file: selected.file,
+      revision: selected.revision,
+      token,
+    })
+  } catch (error) {
+    const errorCode = sourceLookupErrorCode(error)
+    return {
+      status: 'blocked',
+      resolution: 'live_huggingface',
+      error_code: errorCode,
+      reason: `live Hugging Face source resolution could not complete (${errorCode})`,
+    }
+  }
+  if (!lock || typeof lock !== 'object' || Array.isArray(lock)) {
+    return {
+      status: 'blocked',
+      resolution: 'live_huggingface',
+      reason: 'live Hugging Face source resolution returned no source-lock object',
+    }
+  }
+
+  const access = {
+    gated: Boolean(lock.access?.gated),
+    private: Boolean(lock.access?.private),
+    disabled: Boolean(lock.access?.disabled),
+  }
+
+  try {
+    validateLockAgainstSelection(lock, selected)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return {
+      status: 'fail',
+      resolution: 'live_huggingface',
+      reason: message,
+      resolved: {
+        repo: lock.repo,
+        file: lock.file,
+        revision: lock.revision,
+        size_bytes: lock.size_bytes,
+        sha256: lock.sha256,
+        license: lock.license,
+        access,
+      },
+    }
+  }
+
+  return {
+    status: 'pass',
+    resolution: 'live_huggingface',
+    repo: lock.repo,
+    file: lock.file,
+    revision: lock.revision,
+    size_bytes: lock.size_bytes,
+    sha256: lock.sha256,
+    license: lock.license,
+    access,
+  }
+}
+
+function summarizeSourceResolution(reports) {
+  const counts = { pass: 0, fail: 0, blocked: 0 }
+  for (const { report } of reports) {
+    const status = report.stages.source?.status
+    counts[status] = (counts[status] || 0) + 1
+  }
+  return { mode: 'live_huggingface', counts }
+}
+
+function summarizeReports(reports, gateOrder, { sourcePreflight = false } = {}) {
   const counts = { pass: 0, fail: 0, blocked: 0 }
   const rows = reports.map(({ row, report, reportFile }) => {
     counts[report.overall_status] = (counts[report.overall_status] || 0) + 1
@@ -58,7 +185,9 @@ function summarizeReports(reports, gateOrder) {
       row_id: row.id,
       disposition: row.disposition,
       overall_status: report.overall_status,
-      first_unresolved_stage: firstUnresolvedStage(report, gateOrder),
+      first_unresolved_stage: sourcePreflight && report.stages.source?.status !== 'pass'
+        ? 'source'
+        : firstUnresolvedStage(report, gateOrder),
       report_file: reportFile,
     }
   })
@@ -87,22 +216,42 @@ async function runFactory(options) {
   const reports = []
   for (const row of rows) {
     const artifact = artifactForRow(row, modelsDir, options.artifact)
-    const report = await qualify({
+    const resolvedSource = options.resolveSource
+      ? await resolveSourceStage(row, { resolver: options.sourceResolver || resolveHfSource })
+      : null
+    const sourcePassed = !resolvedSource || resolvedSource.status === 'pass'
+    let report = await qualify({
       root,
       roster: options.roster,
       row: row.id,
-      artifact,
+      artifact: sourcePassed ? artifact : null,
       camelid: options.camelid,
-      runSmoke: options.runSmoke,
-      runGeneration: options.runGeneration,
+      runSmoke: sourcePassed && options.runSmoke,
+      runGeneration: sourcePassed && options.runGeneration,
       promptLimit: options.promptLimit,
     })
+    if (resolvedSource) {
+      report.stages.source = resolvedSource
+      if (!sourcePassed && artifact) {
+        report.stages.artifact = {
+          status: 'blocked',
+          reason: 'live source preflight did not pass; the local artifact was not inspected',
+        }
+      }
+      report.overall_status = deriveOverall(report.stages)
+      report = redactLocalPaths(report, [
+        [artifact, '<artifact>'],
+        [root, '<repo>'],
+      ])
+    }
     const reportFile = `${row.id}.json`
     await writeFile(resolve(outDir, reportFile), `${JSON.stringify(report, null, 2)}\n`)
     reports.push({ row, report, reportFile })
   }
 
-  const summary = summarizeReports(reports, roster.gate_order)
+  const summary = summarizeReports(reports, roster.gate_order, {
+    sourcePreflight: Boolean(options.resolveSource),
+  })
   const sourceDirtyValues = reports.map(({ report }) => report.source_dirty)
   const index = {
     schema: 'camelid.model-qualification-index/v1',
@@ -115,6 +264,9 @@ async function runFactory(options) {
     source_dirty: sourceDirtyValues.some((value) => value === null)
       ? null
       : sourceDirtyValues.some(Boolean),
+    ...(options.resolveSource
+      ? { source_resolution: summarizeSourceResolution(reports) }
+      : {}),
     ...summary,
   }
   await writeFile(resolve(outDir, 'index.json'), `${JSON.stringify(index, null, 2)}\n`)
@@ -133,6 +285,7 @@ Options:
   --artifact <path>        Exact artifact override; requires one selected row
   --camelid <path>         Camelid binary (default: target/release/camelid)
   --out-dir <path>         Scrubbed reports/index output directory
+  --resolve-source         Live-resolve each pinned HF selector before local probes
   --run-smoke              Execute configured smoke probes
   --run-generation         Execute pinned greedy parity probes
   --prompt-limit <n>       Deliberately partial parity run (remains blocked)
@@ -155,6 +308,7 @@ Options:
     artifact: args.get('artifact'),
     camelid: args.get('camelid'),
     outDir: args.get('out-dir'),
+    resolveSource: args.has('resolve-source'),
     runSmoke: args.has('run-smoke'),
     runGeneration: args.has('run-generation'),
     promptLimit,
@@ -166,8 +320,12 @@ export {
   artifactForRow,
   firstUnresolvedStage,
   publicRosterLabel,
+  resolveSourceStage,
   runFactory,
   selectRows,
+  sourceLookupErrorCode,
+  sourceSelectionForRow,
+  summarizeSourceResolution,
   summarizeReports,
 }
 

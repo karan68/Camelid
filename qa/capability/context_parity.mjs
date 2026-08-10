@@ -46,6 +46,7 @@ const row = need('row')
 const label = args.get('label') || row
 const mode = requestMode(args)
 const targetTokens = positiveInt(need('target-tokens'), '--target-tokens')
+const promptSuffix = args.get('prompt-suffix') || ''
 const kvBytesPerToken = positiveInt(need('kv-bytes-per-token'), '--kv-bytes-per-token')
 const llamaCtx = positiveInt(args.get('llama-ctx') || String(targetTokens + 64), '--llama-ctx')
 const maxGen = positiveInt(args.get('max-gen') || '8', '--max-gen')
@@ -116,7 +117,7 @@ async function waitUrl(url, ms = 120000) {
   throw new Error(`not reachable at ${url}: ${last?.message}`)
 }
 
-const prompt = buildLongPrompt(targetTokens)
+const prompt = buildLongPrompt(targetTokens, promptSuffix)
 const messages = buildMessages(prompt, args.get('system-message'))
 const endpoint = mode === 'chat' ? '/v1/chat/completions' : '/v1/completions'
 const requestBody = buildGenerationRequest({ mode, prompt, messages, maxGen })
@@ -155,6 +156,7 @@ try {
       gguf,
       request_mode: mode,
       target_tokens: targetTokens,
+      prompt_suffix: promptSuffix,
       actual_prompt_tokens: promptTokens,
       actual_prompt_tokens_gate: gate,
       preflight_projected_kv_bytes: preflightProjectedKv,
@@ -210,6 +212,7 @@ const summary = {
   request_mode: mode,
   endpoint,
   target_tokens: targetTokens,
+  prompt_suffix: promptSuffix,
   actual_prompt_tokens: promptTokens,
   actual_prompt_tokens_gate: gate,
   positions_exceed_8192: promptTokens > 8192,
