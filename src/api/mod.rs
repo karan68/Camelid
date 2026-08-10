@@ -7508,6 +7508,19 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             Some("path"),
         );
     }
+    // A repeated explicit id + identical resolved path is a true no-op. The
+    // load pipeline's idempotent fast path will reuse (and, where needed, heal)
+    // the existing runtime, so the live-memory fit preflight must not reject it
+    // as though a second copy were about to be allocated.
+    let idempotent_resident = match req.id.as_deref() {
+        Some(requested_id) => state
+            .loaded_models
+            .read()
+            .await
+            .get(requested_id)
+            .is_some_and(|loaded| loaded.path == path),
+        None => false,
+    };
     // What is resident BESIDES the model identity being requested. The same
     // path is idempotent only when the request also keeps the same explicit id
     // (or omits an id). A UI promotion smoke may intentionally replace the
@@ -7566,14 +7579,16 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // it on a blocking thread rather than stalling the async worker — consistent with
     // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
     // fall through to the load, where VramShortfall/KvCache remain the hard net.
-    let guard_path = path.clone();
-    {
-        let _reader = state.model_file_lifecycle.read().await;
-        if let Ok(Some(resp)) =
-            tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path, Some(&reclaim)))
-                .await
+    if !idempotent_resident {
+        let guard_path = path.clone();
         {
-            return resp;
+            let _reader = state.model_file_lifecycle.read().await;
+            if let Ok(Some(resp)) =
+                tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path, Some(&reclaim)))
+                    .await
+            {
+                return resp;
+            }
         }
     }
     match load_model_from_path(&state, path, req.id, req.set_active.unwrap_or(true)).await {
